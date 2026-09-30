@@ -38,7 +38,7 @@ file-format-xml = ["faucet-core/file-format-xml"]
 file-format-excel = ["faucet-core/file-format-excel"]
 file-format-avro = ["faucet-core/file-format-avro"]
 file-format-orc = ["faucet-core/file-format-orc", "arrow"]
-file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
+file-format-parquet = ["faucet-core/file-format-parquet", "arrow", "dep:parquet", "dep:bytes"]
 # The columnar (Arrow) path for Avro, ORC and Parquet.
 arrow = ["faucet-core/arrow", "dep:arrow"]
 # Decrypt files sealed by a sink's `encryption` block.

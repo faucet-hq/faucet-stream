@@ -7303,7 +7303,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -7336,10 +7336,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "source_sftp__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -7460,7 +7457,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -7493,10 +7490,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "source_s3__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -8322,7 +8316,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -8355,10 +8349,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "source_azure-blob__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -9780,7 +9771,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -9813,10 +9804,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "source_gcs__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -11729,7 +11717,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -11762,10 +11750,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "sink_sftp__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -11886,7 +11871,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -11919,10 +11904,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "sink_s3__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -13638,7 +13620,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -13671,10 +13653,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "sink_gcs__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -14348,7 +14327,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -14381,10 +14360,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "sink_azure-blob__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -20364,7 +20340,7 @@
                 {
                   "additionalProperties": true,
                   "title": "FileSourceConfig",
-                  "description": "Configuration for the local (and `http(s)://`) file source.",
+                  "description": "Configuration for the local (and `http(s)://`) file source.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                   "type": "object",
                   "properties": {
                     "path": {
@@ -20508,7 +20484,7 @@
                       "default": {}
                     },
                     "encryption": {
-                      "description": "Decrypt files sealed by the file or jsonl sink's `encryption` block\n(AES-256-GCM). JSON Lines and raw text written line by line are\nopened one line at a time; every other file is opened whole. A file\nthat is not sealed fails the read.",
+                      "description": "Decrypt files sealed by the file or jsonl sink's `encryption` block\n(AES-256-GCM). An encrypted file is read into memory whole: JSON Lines\nand raw text written line by line are then opened one line at a time,\nevery other file as one sealed body. A file that is not sealed fails\nthe read.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/source_file__EncryptionSpec"
@@ -22662,23 +22638,18 @@
                       }
                     },
                     "path": {
-                      "description": "Remote directory prefix under which JSON Lines objects are written.",
+                      "description": "Remote directory the files are written in.",
                       "type": "string"
                     },
                     "file_name": {
-                      "description": "File-name template inside `path` — the file sink's `path` file name\n(#777). May contain `{part}` (numbered files) and `${now.*}` tokens; a\ntrailing `/` is a subdirectory of `part-{part}<extension>` files. When\nset, `file_extension` is not used. Unset: files are named\n`<run id>-<part><file_extension>`.",
+                      "description": "File-name template inside `path` — the file sink's `path` file name\n(#777). May contain `{part}` (numbered files) and `${now.*}` tokens; a\ntrailing `/` is a subdirectory of `part-{part}<extension>` files. When\nset, `file_extension` is not used. Unset: every run writes new files\nnamed `<run id>-<part><file_extension>` (`<run id>` is a fresh\ntime-ordered UUID, `<part>` is `00001`, `00002`, …).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
-                    "mode": {
-                      "description": "What to do when a file of the same name already exists: `overwrite`\n(default), `append` (JSON Lines, CSV, raw text) or `error_if_exists`\n(#777).",
-                      "$ref": "#/$defs/sink_sftp__FileMode",
-                      "default": "overwrite"
-                    },
                     "write_mode": {
-                      "description": "`overwrite` stages the run's files in a hidden directory and moves\nthem in only after a successful run (#777). Default `append`.",
+                      "description": "`append` (default) or `overwrite`: write the run's files into a\nhidden swap area and move them into place only after a successful\nrun, then remove files of an earlier run that match `file_name` and\nwere not rewritten (#777). The move is one file at a time, so a\nreader listing the destination while it runs can see new files beside\nold ones; a move that was interrupted is finished by the next run.\nNeeds `file_name`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "$ref": "#/$defs/sink_sftp__FileWriteMode",
                       "default": "append"
                     },
@@ -22728,7 +22699,7 @@
                       "minimum": 0
                     },
                     "max_bytes_per_file": {
-                      "description": "Maximum **bytes** per file before rolling to a new one (#618).\n\nRows are a poor proxy for file size, so a rows-only cap either writes\ntiny files for narrow data or unbounded ones for wide data. This is\nalso what bounds peak memory: the open file's body is buffered until it\nrolls. `None` (the default) removes the byte cap; a single record\nlarger than the cap still gets its own file rather than being split.",
+                      "description": "Maximum **bytes** per file before rolling to a new one (#618).\n\nRows are a poor proxy for file size, so a rows-only cap either writes\ntiny files for narrow data or unbounded ones for wide data. It also\nbounds the scratch disk each file needs while it is built. Counted on\nthe records' JSON length before any `compression` codec. `None` (the\ndefault) removes the byte cap; a single record larger than the cap\nstill gets its own file rather than being split.",
                       "type": [
                         "integer",
                         "null",
@@ -22770,22 +22741,21 @@
                       }
                     },
                     "parquet": {
-                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.",
-                      "$ref": "#/$defs/sink_sftp__RemoteParquetOptions",
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+                      "$ref": "#/$defs/sink_sftp__ParquetOptions",
                       "default": {
-                        "compression": "zstd",
                         "row_group_size": 1048576
                       }
                     },
                     "json_lines": {
-                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.",
+                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "$ref": "#/$defs/sink_sftp__JsonLinesOptions",
                       "default": {
                         "pretty": false
                       }
                     },
                     "encryption": {
-                      "description": "Encrypt files at rest (#777; the `encryption` feature).",
+                      "description": "Encrypt files at rest (#777; the `encryption` feature). Scratch\nfiles are not encrypted while the run is in progress; those holding\nplaintext are kept in a private directory.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_sftp__EncryptionSpec"
@@ -22794,8 +22764,23 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "if_exists": {
+                      "$ref": "#/$defs/sink_sftp__IfExists",
+                      "default": "replace",
+                      "description": "What to do when a file of the same name already exists\n(`if_exists`): `replace` it (default), `append` to it (JSON Lines, CSV,\nraw text) or fail with `error` (#777). Needs `file_name`. `mode` is\naccepted as another name for this key, and `overwrite` /\n`error_if_exists` for its values.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog."
+                    },
+                    "scratch_dir": {
+                      "description": "Directory the sink builds each file in before uploading it\n(default: the system temporary directory). JSON Lines and raw text\nneed scratch space for the whole file; every\nother format needs room for each file being built (up to\n`concurrency` of them while uploads are in flight). A private\nsubdirectory is created in it for each sink.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
-                  }
+                  },
+                  "x-faucet-aliases": [
+                    "mode"
+                  ]
                 },
                 true
               ]
@@ -22975,19 +22960,14 @@
                       "default": ""
                     },
                     "path": {
-                      "description": "Object key template inside the bucket, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: objects are named `<prefix><run id>-<part><file_extension>`.",
+                      "description": "Object key template inside the bucket, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: every run writes new objects named\n`<prefix><run id>-<part><file_extension>` (`<run id>` is a fresh\ntime-ordered UUID, `<part>` is `00001`, `00002`, …).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
-                    "mode": {
-                      "description": "What to do when an object of the same name already exists:\n`overwrite` (default), `append` (JSON Lines, CSV, raw text) or\n`error_if_exists` (#777).",
-                      "$ref": "#/$defs/sink_s3__FileMode",
-                      "default": "overwrite"
-                    },
                     "write_mode": {
-                      "description": "`overwrite` stages the run's objects under a hidden prefix and swaps\nthem in only after a successful run (#777). Default `append`.",
+                      "description": "`append` (default) or `overwrite`: write the run's objects into a\nhidden swap area and move them into place only after a successful\nrun, then remove objects of an earlier run that match `path` and\nwere not rewritten (#777). The move is one object at a time, so a\nreader listing the destination while it runs can see new objects beside\nold ones; a move that was interrupted is finished by the next run.\nNeeds `path`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "$ref": "#/$defs/sink_s3__FileWriteMode",
                       "default": "append"
                     },
@@ -23026,7 +23006,7 @@
                       "minimum": 0
                     },
                     "max_bytes_per_file": {
-                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size — 10k wide rows and 10k\n`{\"id\":1}` rows differ by orders of magnitude — so a rows-only cap\neither writes tiny objects for narrow data or unbounded ones for wide\ndata. This is also what bounds peak memory: the open object's body is\nbuffered until it rolls. Counted on the **uncompressed** body, before\nany `compression` codec, so the threshold means the same thing whatever\nthe codec. `None` (the default) removes the byte cap.\n\nA single record larger than the cap still gets its own object rather\nthan being split (which would corrupt it) or dropped.",
+                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size — 10k wide rows and 10k\n`{\"id\":1}` rows differ by orders of magnitude — so a rows-only cap\neither writes tiny objects for narrow data or unbounded ones for wide\ndata. It also bounds the scratch disk each object in a format other\nthan JSON Lines or raw text needs while it is built. Counted on the\nrecords' JSON length before any `compression` codec (on the columnar\nParquet path, their in-memory Arrow size), so the threshold means the\nsame thing whatever the codec. `None` (the default) removes the byte\ncap.\n\nA single record larger than the cap still gets its own object rather\nthan being split (which would corrupt it) or dropped.",
                       "type": [
                         "integer",
                         "null",
@@ -23093,22 +23073,21 @@
                       }
                     },
                     "parquet": {
-                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.",
-                      "$ref": "#/$defs/sink_s3__RemoteParquetOptions",
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+                      "$ref": "#/$defs/sink_s3__ParquetOptions",
                       "default": {
-                        "compression": "zstd",
                         "row_group_size": 1048576
                       }
                     },
                     "json_lines": {
-                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.",
+                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "$ref": "#/$defs/sink_s3__JsonLinesOptions",
                       "default": {
                         "pretty": false
                       }
                     },
                     "encryption": {
-                      "description": "Encrypt objects at rest (#777; the `encryption` feature).",
+                      "description": "Encrypt objects at rest (#777; the `encryption` feature). Scratch\nfiles are not encrypted while the run is in progress; those holding\nplaintext are kept in a private directory.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_s3__EncryptionSpec"
@@ -23117,8 +23096,23 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "if_exists": {
+                      "$ref": "#/$defs/sink_s3__IfExists",
+                      "default": "replace",
+                      "description": "What to do when an object of the same name already exists\n(`if_exists`): `replace` it (default), `append` to it (JSON Lines, CSV,\nraw text) or fail with `error` (#777). Needs `path`. `mode` is\naccepted as another name for this key, and `overwrite` /\n`error_if_exists` for its values.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog."
+                    },
+                    "scratch_dir": {
+                      "description": "Directory the sink builds each object in before uploading it\n(default: the system temporary directory). JSON Lines and raw text\ngo up in parts as they are written and need no scratch space; every\nother format needs room for each object being built (up to\n`concurrency` of them while uploads are in flight). A private\nsubdirectory is created in it for each sink.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
-                  }
+                  },
+                  "x-faucet-aliases": [
+                    "mode"
+                  ]
                 },
                 true
               ]
@@ -24236,10 +24230,10 @@
               "anyOf": [
                 {
                   "x-faucet-aliases": [
-                    "max_rows_per_file"
+                    "mode"
                   ],
                   "title": "FileSinkConfig",
-                  "description": "Configuration for the local file sink.",
+                  "description": "Configuration for the local file sink.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                   "type": "object",
                   "properties": {
                     "path": {
@@ -24252,22 +24246,17 @@
                       "default": "auto"
                     },
                     "compression": {
-                      "description": "Compression: `auto` (default) resolves from the suffix (`.gz`, `.zst`).\nNot applicable to Parquet, Avro or Excel, which compress internally.",
+                      "description": "Compression of the finished file: `auto` (default) resolves from the\nsuffix (`.gz`, `.zst`). It applies to every format; Parquet, Avro and\nExcel already compress internally, so a codec on them compresses the\nfile a second time and most readers then cannot open it without\ndecompressing first.",
                       "$ref": "#/$defs/sink_file__CompressionConfig",
                       "default": "auto"
                     },
-                    "mode": {
-                      "description": "What to do with a file that already exists (default `overwrite`).",
-                      "$ref": "#/$defs/sink_file__FileMode",
-                      "default": "overwrite"
-                    },
                     "write_mode": {
-                      "description": "`append` (default) or `overwrite` — replace the destination's output\nset atomically when the run succeeds.",
+                      "description": "`append` (default) or `overwrite` — replace the destination's whole\noutput set when the run succeeds.",
                       "$ref": "#/$defs/sink_file__FileWriteMode",
                       "default": "append"
                     },
                     "max_records_per_file": {
-                      "description": "Roll to a new file after this many records. `max_rows_per_file` is\naccepted as another name.",
+                      "description": "Roll to a new file after this many records.",
                       "type": [
                         "integer",
                         "null",
@@ -24277,7 +24266,7 @@
                       "minimum": 0
                     },
                     "max_bytes_per_file": {
-                      "description": "Roll to a new file once the current one reaches this many bytes. A\nsingle page larger than the cap still lands in one file.",
+                      "description": "Roll to a new file once the current one reaches about this many\nbytes, counted on the records' JSON length before compression (on the\ncolumnar Parquet path, their in-memory Arrow size). A single page\nlarger than the cap still lands in one file.",
                       "type": [
                         "integer",
                         "null",
@@ -24337,10 +24326,9 @@
                       }
                     },
                     "parquet": {
-                      "description": "Compression, row groups and an optional explicit schema, used when\nthe format is Parquet.",
+                      "description": "Compression (default `snappy`), row groups and an optional explicit\nschema, used when the format is Parquet.",
                       "$ref": "#/$defs/sink_file__ParquetOptions",
                       "default": {
-                        "compression": "snappy",
                         "row_group_size": 1048576
                       }
                     },
@@ -24352,7 +24340,7 @@
                       }
                     },
                     "encryption": {
-                      "description": "Encrypt the output at rest (AES-256-GCM). Uncompressed JSON Lines and\nraw text seal each record on its own line (base64), exactly as the\njsonl sink does, so the file stays appendable. Every other file —\ncompressed JSON Lines included — is sealed whole when it is\nfinalised, after any `compression`; appending to one decrypts it\nfirst. The file source's `encryption` block reads both back.",
+                      "description": "Encrypt the output at rest (AES-256-GCM). Uncompressed JSON Lines and\nraw text seal each record on its own line (base64), exactly as the\njsonl sink does, so the file stays appendable. Every other file —\ncompressed JSON Lines included — is sealed whole when it is\npublished, after any `compression`; appending to one decrypts it\nfirst. Appending to an existing file that is not sealed the same way\nis refused. The file source's `encryption` block reads both back.\nScratch files are not encrypted while the run is in progress; those\nholding plaintext are readable by their owner only.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_file__EncryptionSpec"
@@ -24361,6 +24349,11 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "if_exists": {
+                      "$ref": "#/$defs/sink_file__IfExists",
+                      "default": "replace",
+                      "description": "What to do with a file that already exists (default `replace`):\n`replace` it, `append` to it (JSON Lines, CSV, raw text), or fail\nwith `error`. `mode` is accepted as another name for this field, and\n`overwrite` / `error_if_exists` for its values."
                     }
                   },
                   "additionalProperties": true
@@ -24504,19 +24497,14 @@
                       "default": ""
                     },
                     "path": {
-                      "description": "Object key template inside the container, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: objects are named `<prefix><run id>-<part><file_extension>`.",
+                      "description": "Object key template inside the bucket, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: every run writes new objects named\n`<prefix><run id>-<part><file_extension>` (`<run id>` is a fresh\ntime-ordered UUID, `<part>` is `00001`, `00002`, …).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
-                    "mode": {
-                      "description": "What to do when an object of the same name already exists:\n`overwrite` (default), `append` (JSON Lines, CSV, raw text) or\n`error_if_exists` (#777).",
-                      "$ref": "#/$defs/sink_gcs__FileMode",
-                      "default": "overwrite"
-                    },
                     "write_mode": {
-                      "description": "`overwrite` stages the run's objects under a hidden prefix and swaps\nthem in only after a successful run (#777). Default `append`.",
+                      "description": "`append` (default) or `overwrite`: write the run's objects into a\nhidden swap area and move them into place only after a successful\nrun, then remove objects of an earlier run that match `path` and\nwere not rewritten (#777). The move is one object at a time, so a\nreader listing the destination while it runs can see new objects beside\nold ones; a move that was interrupted is finished by the next run.\nNeeds `path`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "$ref": "#/$defs/sink_gcs__FileWriteMode",
                       "default": "append"
                     },
@@ -24548,7 +24536,7 @@
                       "minimum": 0
                     },
                     "max_bytes_per_file": {
-                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size, so a rows-only cap either writes\ntiny objects for narrow data or unbounded ones for wide data. This is\nalso what bounds peak memory: the open object's body is buffered until\nit rolls. Counted on the uncompressed body, before any `compression`\ncodec, so the threshold means the same thing whatever the codec.\n`None` (the default) removes the byte cap. A single record larger than\nthe cap still gets its own object rather than being split or dropped.",
+                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size, so a rows-only cap either writes\ntiny objects for narrow data or unbounded ones for wide data. It also\nbounds the scratch disk each object needs while it is built. Counted\non the records' JSON length before any `compression` codec (on the\ncolumnar Parquet path, their in-memory Arrow size), so the threshold\nmeans the same thing whatever the codec.\n`None` (the default) removes the byte cap. A single record larger than\nthe cap still gets its own object rather than being split or dropped.",
                       "type": [
                         "integer",
                         "null",
@@ -24622,22 +24610,21 @@
                       }
                     },
                     "parquet": {
-                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.",
-                      "$ref": "#/$defs/sink_gcs__RemoteParquetOptions",
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+                      "$ref": "#/$defs/sink_gcs__ParquetOptions",
                       "default": {
-                        "compression": "zstd",
                         "row_group_size": 1048576
                       }
                     },
                     "json_lines": {
-                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.",
+                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "$ref": "#/$defs/sink_gcs__JsonLinesOptions",
                       "default": {
                         "pretty": false
                       }
                     },
                     "encryption": {
-                      "description": "Encrypt objects at rest (#777; the `encryption` feature).",
+                      "description": "Encrypt objects at rest (#777; the `encryption` feature). Scratch\nfiles are not encrypted while the run is in progress; those holding\nplaintext are kept in a private directory.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_gcs__EncryptionSpec"
@@ -24646,8 +24633,23 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "if_exists": {
+                      "$ref": "#/$defs/sink_gcs__IfExists",
+                      "default": "replace",
+                      "description": "What to do when an object of the same name already exists\n(`if_exists`): `replace` it (default), `append` to it (JSON Lines, CSV,\nraw text) or fail with `error` (#777). Needs `path`. `mode` is\naccepted as another name for this key, and `overwrite` /\n`error_if_exists` for its values.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog."
+                    },
+                    "scratch_dir": {
+                      "description": "Directory the sink builds each object in before uploading it\n(default: the system temporary directory). JSON Lines and raw text\nneed scratch space for the whole object; every\nother format needs room for each object being built (up to\n`concurrency` of them while uploads are in flight). A private\nsubdirectory is created in it for each sink.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
-                  }
+                  },
+                  "x-faucet-aliases": [
+                    "mode"
+                  ]
                 },
                 true
               ]
@@ -25155,19 +25157,14 @@
                       "default": ""
                     },
                     "path": {
-                      "description": "Object key template inside the container, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: objects are named `<prefix><run id>-<part><file_extension>`.",
+                      "description": "Object key template inside the container, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: every run writes new objects named\n`<prefix><run id>-<part><file_extension>` (`<run id>` is a fresh\ntime-ordered UUID, `<part>` is `00001`, `00002`, …).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
-                    "mode": {
-                      "description": "What to do when an object of the same name already exists:\n`overwrite` (default), `append` (JSON Lines, CSV, raw text) or\n`error_if_exists` (#777).",
-                      "$ref": "#/$defs/sink_azure-blob__FileMode",
-                      "default": "overwrite"
-                    },
                     "write_mode": {
-                      "description": "`overwrite` stages the run's objects under a hidden prefix and swaps\nthem in only after a successful run (#777). Default `append`.",
+                      "description": "`append` (default) or `overwrite`: write the run's blobs into a\nhidden swap area and move them into place only after a successful\nrun, then remove blobs of an earlier run that match `path` and\nwere not rewritten (#777). The move is one blob at a time, so a\nreader listing the destination while it runs can see new blobs beside\nold ones; a move that was interrupted is finished by the next run.\nNeeds `path`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "$ref": "#/$defs/sink_azure-blob__FileWriteMode",
                       "default": "append"
                     },
@@ -25192,7 +25189,7 @@
                       "minimum": 0
                     },
                     "max_bytes_per_file": {
-                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size, so a rows-only cap either writes\ntiny objects for narrow data or unbounded ones for wide data. Counted\non the uncompressed body, before any `compression` codec. `None` (the\ndefault) removes the byte cap; a single record larger than the cap\nstill gets its own object rather than being split or dropped.",
+                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size, so a rows-only cap either writes\ntiny objects for narrow data or unbounded ones for wide data. Counted\non the records' JSON length before any `compression` codec (on the\ncolumnar Parquet path, their in-memory Arrow size). `None` (the\ndefault) removes the byte cap; a single record larger than the cap\nstill gets its own object rather than being split or dropped.",
                       "type": [
                         "integer",
                         "null",
@@ -25259,22 +25256,21 @@
                       }
                     },
                     "parquet": {
-                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.",
-                      "$ref": "#/$defs/sink_azure-blob__RemoteParquetOptions",
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+                      "$ref": "#/$defs/sink_azure-blob__ParquetOptions",
                       "default": {
-                        "compression": "zstd",
                         "row_group_size": 1048576
                       }
                     },
                     "json_lines": {
-                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.",
+                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "$ref": "#/$defs/sink_azure-blob__JsonLinesOptions",
                       "default": {
                         "pretty": false
                       }
                     },
                     "encryption": {
-                      "description": "Encrypt objects at rest (#777; the `encryption` feature).",
+                      "description": "Encrypt blobs at rest (#777; the `encryption` feature). Scratch\nfiles are not encrypted while the run is in progress; those holding\nplaintext are kept in a private directory.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_azure-blob__EncryptionSpec"
@@ -25283,11 +25279,26 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "if_exists": {
+                      "$ref": "#/$defs/sink_azure-blob__IfExists",
+                      "default": "replace",
+                      "description": "What to do when a blob of the same name already exists\n(`if_exists`): `replace` it (default), `append` to it (JSON Lines, CSV,\nraw text) or fail with `error` (#777). Needs `path`. `mode` is\naccepted as another name for this key, and `overwrite` /\n`error_if_exists` for its values.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog."
+                    },
+                    "scratch_dir": {
+                      "description": "Directory the sink builds each blob in before uploading it\n(default: the system temporary directory). JSON Lines and raw text\ngo up in parts as they are written and need no scratch space; every\nother format needs room for each blob being built (up to\n`concurrency` of them while uploads are in flight). A private\nsubdirectory is created in it for each sink.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "title": "AzureBlobSinkConfig",
                   "description": "Configuration for the Azure Blob sink connector.",
-                  "type": "object"
+                  "type": "object",
+                  "x-faucet-aliases": [
+                    "mode"
+                  ]
                 },
                 true
               ]
@@ -27782,7 +27793,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -27815,10 +27826,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "source_file__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -28322,28 +28330,8 @@
         }
       ]
     },
-    "sink_file__FileMode": {
-      "description": "What happens when a file this run writes already exists.",
-      "oneOf": [
-        {
-          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
-          "type": "string",
-          "const": "overwrite"
-        },
-        {
-          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
-          "type": "string",
-          "const": "append"
-        },
-        {
-          "description": "Fail the run instead of touching an existing file.",
-          "type": "string",
-          "const": "error_if_exists"
-        }
-      ]
-    },
     "sink_file__FileWriteMode": {
-      "description": "Pipeline-level write mode.",
+      "description": "Pipeline-level write mode (`write_mode`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "oneOf": [
         {
           "description": "Write this run's files; leave everything else in place.",
@@ -28351,7 +28339,7 @@
           "const": "append"
         },
         {
-          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "description": "Replace the destination's whole output set. The run writes into a\nhidden swap area beside the destination; only when it succeeds are the\nfiles moved into place, and then files of an earlier run that match\nthe path template and were not rewritten are removed. A failed or\ncancelled run leaves the previous output untouched. The move is not\natomic across files: a reader listing the destination while it runs\ncan see some new files beside some old ones. A move that was\ninterrupted is finished by the next run before it writes anything.",
           "type": "string",
           "const": "overwrite"
         }
@@ -28367,7 +28355,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
           "type": [
             "boolean",
             "string"
@@ -28400,10 +28388,7 @@
           "default": "widen"
         }
       },
-      "additionalProperties": true,
-      "x-faucet-aliases": [
-        "write_headers"
-      ]
+      "additionalProperties": true
     },
     "sink_file__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -28487,13 +28472,19 @@
       ]
     },
     "sink_file__ParquetOptions": {
-      "description": "Parquet write options.",
+      "description": "Parquet write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "compression": {
-          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_file__ParquetCodec",
-          "default": "snappy"
+          "description": "Column-chunk compression. Unset, it is `zstd` on the object-store and\nSFTP sinks and `snappy` on the local file sink. A file-level\n`compression` codec, when one applies, compresses the finished file\non top of this.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sink_file__ParquetCodec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "row_group_size": {
           "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
@@ -28522,12 +28513,12 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "description": "Uncompressed pages.",
           "type": "string",
           "const": "none"
         },
         {
-          "description": "Snappy (the default): fast and universally readable.",
+          "description": "Snappy: fast and universally readable.",
           "type": "string",
           "const": "snappy"
         },
@@ -29512,11 +29503,11 @@
       ]
     },
     "source_file__ParquetReadOptions": {
-      "description": "Parquet read options.",
+      "description": "Parquet reader options (the `parquet:` block of an object-store source).",
       "type": "object",
       "properties": {
         "columns": {
-          "description": "Top-level columns to read. Only these column chunks are decoded.\nDefault: every column. A name a file does not have is an error, not\nan empty column.",
+          "description": "Decode only these top-level columns. A name missing from an object is\nan error naming the object and its columns. Unset: every column.",
           "type": [
             "array",
             "null"
@@ -29797,11 +29788,11 @@
       ]
     },
     "sink_file__JsonLinesOptions": {
-      "description": "JSON Lines write options.",
+      "description": "JSON Lines write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "pretty": {
-          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line, which the\nfile source cannot read back.",
           "type": [
             "boolean",
             "string"
@@ -29841,6 +29832,26 @@
           "description": "AES-256-GCM authenticated encryption (the default and only option).",
           "type": "string",
           "const": "aes-256-gcm"
+        }
+      ]
+    },
+    "sink_file__IfExists": {
+      "description": "What happens when a file this run writes already exists (`if_exists`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+      "oneOf": [
+        {
+          "const": "replace",
+          "description": "Replace that one file: the new file is built beside it and swapped in,\nso the old contents stay readable until the new ones are complete.\n`overwrite` is accepted as another name.",
+          "type": "string"
+        },
+        {
+          "const": "append",
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Fail the run instead of touching an existing file.\n`error_if_exists` is accepted as another name.",
+          "type": "string"
         }
       ]
     },
@@ -29968,28 +29979,8 @@
       },
       "additionalProperties": true
     },
-    "sink_azure-blob__FileMode": {
-      "description": "What happens when a file this run writes already exists.",
-      "oneOf": [
-        {
-          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
-          "type": "string",
-          "const": "overwrite"
-        },
-        {
-          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
-          "type": "string",
-          "const": "append"
-        },
-        {
-          "description": "Fail the run instead of touching an existing file.",
-          "type": "string",
-          "const": "error_if_exists"
-        }
-      ]
-    },
     "sink_azure-blob__FileWriteMode": {
-      "description": "Pipeline-level write mode.",
+      "description": "Pipeline-level write mode (`write_mode`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "oneOf": [
         {
           "description": "Write this run's files; leave everything else in place.",
@@ -29997,18 +29988,18 @@
           "const": "append"
         },
         {
-          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "description": "Replace the destination's whole output set. The run writes into a\nhidden swap area beside the destination; only when it succeeds are the\nfiles moved into place, and then files of an earlier run that match\nthe path template and were not rewritten are removed. A failed or\ncancelled run leaves the previous output untouched. The move is not\natomic across files: a reader listing the destination while it runs\ncan see some new files beside some old ones. A move that was\ninterrupted is finished by the next run before it writes anything.",
           "type": "string",
           "const": "overwrite"
         }
       ]
     },
     "sink_azure-blob__JsonLinesOptions": {
-      "description": "JSON Lines write options.",
+      "description": "JSON Lines write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "pretty": {
-          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line, which the\nfile source cannot read back.",
           "type": [
             "boolean",
             "string"
@@ -30022,12 +30013,12 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "description": "Uncompressed pages.",
           "type": "string",
           "const": "none"
         },
         {
-          "description": "Snappy (the default): fast and universally readable.",
+          "description": "Snappy: fast and universally readable.",
           "type": "string",
           "const": "snappy"
         },
@@ -30072,13 +30063,19 @@
       "additionalProperties": true
     },
     "sink_azure-blob__ParquetOptions": {
-      "description": "Parquet write options.",
+      "description": "Parquet write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "compression": {
-          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_azure-blob__ParquetCodec",
-          "default": "snappy"
+          "description": "Column-chunk compression. Unset, it is `zstd` on the object-store and\nSFTP sinks and `snappy` on the local file sink. A file-level\n`compression` codec, when one applies, compresses the finished file\non top of this.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sink_azure-blob__ParquetCodec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "row_group_size": {
           "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
@@ -30228,28 +30225,8 @@
       },
       "additionalProperties": true
     },
-    "sink_gcs__FileMode": {
-      "description": "What happens when a file this run writes already exists.",
-      "oneOf": [
-        {
-          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
-          "type": "string",
-          "const": "overwrite"
-        },
-        {
-          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
-          "type": "string",
-          "const": "append"
-        },
-        {
-          "description": "Fail the run instead of touching an existing file.",
-          "type": "string",
-          "const": "error_if_exists"
-        }
-      ]
-    },
     "sink_gcs__FileWriteMode": {
-      "description": "Pipeline-level write mode.",
+      "description": "Pipeline-level write mode (`write_mode`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "oneOf": [
         {
           "description": "Write this run's files; leave everything else in place.",
@@ -30257,18 +30234,18 @@
           "const": "append"
         },
         {
-          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "description": "Replace the destination's whole output set. The run writes into a\nhidden swap area beside the destination; only when it succeeds are the\nfiles moved into place, and then files of an earlier run that match\nthe path template and were not rewritten are removed. A failed or\ncancelled run leaves the previous output untouched. The move is not\natomic across files: a reader listing the destination while it runs\ncan see some new files beside some old ones. A move that was\ninterrupted is finished by the next run before it writes anything.",
           "type": "string",
           "const": "overwrite"
         }
       ]
     },
     "sink_gcs__JsonLinesOptions": {
-      "description": "JSON Lines write options.",
+      "description": "JSON Lines write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "pretty": {
-          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line, which the\nfile source cannot read back.",
           "type": [
             "boolean",
             "string"
@@ -30282,12 +30259,12 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "description": "Uncompressed pages.",
           "type": "string",
           "const": "none"
         },
         {
-          "description": "Snappy (the default): fast and universally readable.",
+          "description": "Snappy: fast and universally readable.",
           "type": "string",
           "const": "snappy"
         },
@@ -30332,13 +30309,19 @@
       "additionalProperties": true
     },
     "sink_gcs__ParquetOptions": {
-      "description": "Parquet write options.",
+      "description": "Parquet write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "compression": {
-          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_gcs__ParquetCodec",
-          "default": "snappy"
+          "description": "Column-chunk compression. Unset, it is `zstd` on the object-store and\nSFTP sinks and `snappy` on the local file sink. A file-level\n`compression` codec, when one applies, compresses the finished file\non top of this.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sink_gcs__ParquetCodec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "row_group_size": {
           "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
@@ -30488,28 +30471,8 @@
       },
       "additionalProperties": true
     },
-    "sink_s3__FileMode": {
-      "description": "What happens when a file this run writes already exists.",
-      "oneOf": [
-        {
-          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
-          "type": "string",
-          "const": "overwrite"
-        },
-        {
-          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
-          "type": "string",
-          "const": "append"
-        },
-        {
-          "description": "Fail the run instead of touching an existing file.",
-          "type": "string",
-          "const": "error_if_exists"
-        }
-      ]
-    },
     "sink_s3__FileWriteMode": {
-      "description": "Pipeline-level write mode.",
+      "description": "Pipeline-level write mode (`write_mode`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "oneOf": [
         {
           "description": "Write this run's files; leave everything else in place.",
@@ -30517,18 +30480,18 @@
           "const": "append"
         },
         {
-          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "description": "Replace the destination's whole output set. The run writes into a\nhidden swap area beside the destination; only when it succeeds are the\nfiles moved into place, and then files of an earlier run that match\nthe path template and were not rewritten are removed. A failed or\ncancelled run leaves the previous output untouched. The move is not\natomic across files: a reader listing the destination while it runs\ncan see some new files beside some old ones. A move that was\ninterrupted is finished by the next run before it writes anything.",
           "type": "string",
           "const": "overwrite"
         }
       ]
     },
     "sink_s3__JsonLinesOptions": {
-      "description": "JSON Lines write options.",
+      "description": "JSON Lines write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "pretty": {
-          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line, which the\nfile source cannot read back.",
           "type": [
             "boolean",
             "string"
@@ -30542,12 +30505,12 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "description": "Uncompressed pages.",
           "type": "string",
           "const": "none"
         },
         {
-          "description": "Snappy (the default): fast and universally readable.",
+          "description": "Snappy: fast and universally readable.",
           "type": "string",
           "const": "snappy"
         },
@@ -30592,13 +30555,19 @@
       "additionalProperties": true
     },
     "sink_s3__ParquetOptions": {
-      "description": "Parquet write options.",
+      "description": "Parquet write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "compression": {
-          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_s3__ParquetCodec",
-          "default": "snappy"
+          "description": "Column-chunk compression. Unset, it is `zstd` on the object-store and\nSFTP sinks and `snappy` on the local file sink. A file-level\n`compression` codec, when one applies, compresses the finished file\non top of this.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sink_s3__ParquetCodec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "row_group_size": {
           "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
@@ -30766,28 +30735,8 @@
       },
       "additionalProperties": true
     },
-    "sink_sftp__FileMode": {
-      "description": "What happens when a file this run writes already exists.",
-      "oneOf": [
-        {
-          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
-          "type": "string",
-          "const": "overwrite"
-        },
-        {
-          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
-          "type": "string",
-          "const": "append"
-        },
-        {
-          "description": "Fail the run instead of touching an existing file.",
-          "type": "string",
-          "const": "error_if_exists"
-        }
-      ]
-    },
     "sink_sftp__FileWriteMode": {
-      "description": "Pipeline-level write mode.",
+      "description": "Pipeline-level write mode (`write_mode`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "oneOf": [
         {
           "description": "Write this run's files; leave everything else in place.",
@@ -30795,18 +30744,18 @@
           "const": "append"
         },
         {
-          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "description": "Replace the destination's whole output set. The run writes into a\nhidden swap area beside the destination; only when it succeeds are the\nfiles moved into place, and then files of an earlier run that match\nthe path template and were not rewritten are removed. A failed or\ncancelled run leaves the previous output untouched. The move is not\natomic across files: a reader listing the destination while it runs\ncan see some new files beside some old ones. A move that was\ninterrupted is finished by the next run before it writes anything.",
           "type": "string",
           "const": "overwrite"
         }
       ]
     },
     "sink_sftp__JsonLinesOptions": {
-      "description": "JSON Lines write options.",
+      "description": "JSON Lines write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "pretty": {
-          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line, which the\nfile source cannot read back.",
           "type": [
             "boolean",
             "string"
@@ -30820,12 +30769,12 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "description": "Uncompressed pages.",
           "type": "string",
           "const": "none"
         },
         {
-          "description": "Snappy (the default): fast and universally readable.",
+          "description": "Snappy: fast and universally readable.",
           "type": "string",
           "const": "snappy"
         },
@@ -30870,13 +30819,19 @@
       "additionalProperties": true
     },
     "sink_sftp__ParquetOptions": {
-      "description": "Parquet write options.",
+      "description": "Parquet write options.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "compression": {
-          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_sftp__ParquetCodec",
-          "default": "snappy"
+          "description": "Column-chunk compression. Unset, it is `zstd` on the object-store and\nSFTP sinks and `snappy` on the local file sink. A file-level\n`compression` codec, when one applies, compresses the finished file\non top of this.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sink_sftp__ParquetCodec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "row_group_size": {
           "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
@@ -31010,133 +30965,85 @@
       },
       "additionalProperties": true
     },
-    "sink_azure-blob__RemoteParquetOptions": {
-      "description": "Parquet write options for the object-store and SFTP sinks: the same\nfields as [`ParquetOptions`], but `compression` defaults to `zstd`, which\nis what those sinks wrote before the shared writer — smaller objects to\nupload and store.",
-      "type": "object",
-      "properties": {
-        "compression": {
-          "description": "Column-chunk compression (default `zstd`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_azure-blob__ParquetCodec",
-          "default": "zstd"
+    "sink_azure-blob__IfExists": {
+      "description": "What happens when a file this run writes already exists (`if_exists`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+      "oneOf": [
+        {
+          "const": "replace",
+          "description": "Replace that one file: the new file is built beside it and swapped in,\nso the old contents stay readable until the new ones are complete.\n`overwrite` is accepted as another name.",
+          "type": "string"
         },
-        "row_group_size": {
-          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 1048576
+        {
+          "const": "append",
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string"
         },
-        "schema": {
-          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/sink_azure-blob__ParquetField"
-          }
+        {
+          "const": "error",
+          "description": "Fail the run instead of touching an existing file.\n`error_if_exists` is accepted as another name.",
+          "type": "string"
         }
-      },
-      "additionalProperties": true
+      ]
     },
-    "sink_gcs__RemoteParquetOptions": {
-      "description": "Parquet write options for the object-store and SFTP sinks: the same\nfields as [`ParquetOptions`], but `compression` defaults to `zstd`, which\nis what those sinks wrote before the shared writer — smaller objects to\nupload and store.",
-      "type": "object",
-      "properties": {
-        "compression": {
-          "description": "Column-chunk compression (default `zstd`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_gcs__ParquetCodec",
-          "default": "zstd"
+    "sink_gcs__IfExists": {
+      "description": "What happens when a file this run writes already exists (`if_exists`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+      "oneOf": [
+        {
+          "const": "replace",
+          "description": "Replace that one file: the new file is built beside it and swapped in,\nso the old contents stay readable until the new ones are complete.\n`overwrite` is accepted as another name.",
+          "type": "string"
         },
-        "row_group_size": {
-          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 1048576
+        {
+          "const": "append",
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string"
         },
-        "schema": {
-          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/sink_gcs__ParquetField"
-          }
+        {
+          "const": "error",
+          "description": "Fail the run instead of touching an existing file.\n`error_if_exists` is accepted as another name.",
+          "type": "string"
         }
-      },
-      "additionalProperties": true
+      ]
     },
-    "sink_s3__RemoteParquetOptions": {
-      "description": "Parquet write options for the object-store and SFTP sinks: the same\nfields as [`ParquetOptions`], but `compression` defaults to `zstd`, which\nis what those sinks wrote before the shared writer — smaller objects to\nupload and store.",
-      "type": "object",
-      "properties": {
-        "compression": {
-          "description": "Column-chunk compression (default `zstd`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_s3__ParquetCodec",
-          "default": "zstd"
+    "sink_s3__IfExists": {
+      "description": "What happens when a file this run writes already exists (`if_exists`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+      "oneOf": [
+        {
+          "const": "replace",
+          "description": "Replace that one file: the new file is built beside it and swapped in,\nso the old contents stay readable until the new ones are complete.\n`overwrite` is accepted as another name.",
+          "type": "string"
         },
-        "row_group_size": {
-          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 1048576
+        {
+          "const": "append",
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string"
         },
-        "schema": {
-          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/sink_s3__ParquetField"
-          }
+        {
+          "const": "error",
+          "description": "Fail the run instead of touching an existing file.\n`error_if_exists` is accepted as another name.",
+          "type": "string"
         }
-      },
-      "additionalProperties": true
+      ]
     },
-    "sink_sftp__RemoteParquetOptions": {
-      "description": "Parquet write options for the object-store and SFTP sinks: the same\nfields as [`ParquetOptions`], but `compression` defaults to `zstd`, which\nis what those sinks wrote before the shared writer — smaller objects to\nupload and store.",
-      "type": "object",
-      "properties": {
-        "compression": {
-          "description": "Column-chunk compression (default `zstd`). File-level `compression`\ndoes not apply to Parquet.",
-          "$ref": "#/$defs/sink_sftp__ParquetCodec",
-          "default": "zstd"
+    "sink_sftp__IfExists": {
+      "description": "What happens when a file this run writes already exists (`if_exists`).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+      "oneOf": [
+        {
+          "const": "replace",
+          "description": "Replace that one file: the new file is built beside it and swapped in,\nso the old contents stay readable until the new ones are complete.\n`overwrite` is accepted as another name.",
+          "type": "string"
         },
-        "row_group_size": {
-          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 1048576
+        {
+          "const": "append",
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string"
         },
-        "schema": {
-          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/sink_sftp__ParquetField"
-          }
+        {
+          "const": "error",
+          "description": "Fail the run instead of touching an existing file.\n`error_if_exists` is accepted as another name.",
+          "type": "string"
         }
-      },
-      "additionalProperties": true
+      ]
     }
   }
 }
