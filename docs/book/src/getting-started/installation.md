@@ -90,7 +90,7 @@ binary you need. Connector features are named **`source-<name>`** and **`sink-<n
 **Bare minimum** — the smallest useful binary (REST in, JSON Lines out):
 
 ```bash
-cargo install faucet-cli --no-default-features --features "source-rest,sink-jsonl"
+cargo install faucet-cli --no-default-features --features "source-rest,sink-file"
 ```
 
 **Add a source or sink** — list the connectors you want (plus `transforms` if you need in-flight shaping):

@@ -1,7 +1,5 @@
 //! `faucet init` — scaffold a starter `pipeline.yaml` from each connector's
-//! JSON Schema. Defaults to a `rest` → `jsonl` pipeline so `faucet init` with
-//! no flags continues to produce the same shape it did before this command
-//! grew schema-driven scaffolding.
+//! JSON Schema. Defaults to a `rest` → `file` pipeline.
 
 use std::collections::HashMap;
 
@@ -13,7 +11,7 @@ use crate::init_template::schema_to_yaml_template_with_choices;
 use crate::registry;
 
 const DEFAULT_SOURCE: &str = "rest";
-const DEFAULT_SINK: &str = "jsonl";
+const DEFAULT_SINK: &str = "file";
 const DEFAULT_NAME: &str = "my-pipeline";
 const CONFIG_INDENT: usize = 8;
 
@@ -171,7 +169,7 @@ fn render_singer_config(
          \x20     # The tap's own config (secret-resolved by faucet). Fill in as the tap needs:\n\
          \x20     tap_config: {{}}\n\
          \x20 sink:\n\
-         \x20   type: jsonl\n\
+         \x20   type: file\n\
          \x20   config:\n\
          \x20     path: ./out/records.jsonl\n"
     )
@@ -360,7 +358,7 @@ fn render_pipeline(
     body.push_str("  # Optional Dead Letter Queue.\n");
     body.push_str("  # dlq:\n");
     body.push_str("  #   sink:\n");
-    body.push_str("  #     type: jsonl\n");
+    body.push_str("  #     type: file\n");
     body.push_str("  #     config: { path: ./dlq.jsonl }\n");
     body.push_str("  #   on_batch_error: propagate   # or dlq_all\n\n");
     body.push_str("# Optional matrix block. Each row picks a template via ref:\n");

@@ -1237,7 +1237,8 @@ pub struct DlqInspectArgs {
     /// Number of sample records to show. Default: 5.
     #[arg(long, default_value_t = 5)]
     pub limit: usize,
-    /// Key for a DLQ sealed at rest by the jsonl sink's `encryption` block.
+    /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
+    /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
     /// with the `encryption` feature.
     #[arg(long = "encryption-key")]
@@ -1269,7 +1270,8 @@ pub struct DlqReplayArgs {
     /// Report what would be replayed without writing to the sink.
     #[arg(long)]
     pub dry_run: bool,
-    /// Key for a DLQ sealed at rest by the jsonl sink's `encryption` block.
+    /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
+    /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
     /// with the `encryption` feature.
     #[arg(long = "encryption-key")]
@@ -1622,7 +1624,8 @@ pub struct DlqDiscardArgs {
     /// `<file>.archived.jsonl` sibling.
     #[arg(long)]
     pub delete: bool,
-    /// Key for a DLQ sealed at rest by the jsonl sink's `encryption` block.
+    /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
+    /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
     /// with the `encryption` feature.
     #[arg(long = "encryption-key")]
@@ -2617,8 +2620,8 @@ pub struct InitArgs {
     /// Defaults to `rest`. Run `faucet list` to see what is compiled in.
     #[arg(long)]
     pub source: Option<String>,
-    /// Sink connector kind to scaffold (e.g. `jsonl`, `bigquery`).
-    /// Defaults to `jsonl`. Run `faucet list` to see what is compiled in.
+    /// Sink connector kind to scaffold (e.g. `file`, `bigquery`).
+    /// Defaults to `file`. Run `faucet list` to see what is compiled in.
     #[arg(long)]
     pub sink: Option<String>,
     /// Output file path. Defaults to `pipeline.yaml`.

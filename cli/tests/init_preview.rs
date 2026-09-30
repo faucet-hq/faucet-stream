@@ -66,9 +66,9 @@ async fn init_renders_csv_to_jsonl_template_with_required_markers() {
     );
 }
 
-#[cfg(all(feature = "source-rest", feature = "sink-jsonl"))]
+#[cfg(all(feature = "source-rest", feature = "sink-file"))]
 #[tokio::test]
-async fn init_defaults_to_rest_to_jsonl() {
+async fn init_defaults_to_rest_to_file() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("pipeline.yaml");
 
@@ -90,7 +90,7 @@ async fn init_defaults_to_rest_to_jsonl() {
     let body = std::fs::read_to_string(&out).unwrap();
     assert!(body.contains("name: my-pipeline\n"), "{body}");
     assert!(body.contains("      type: rest\n"), "{body}");
-    assert!(body.contains("      type: jsonl\n"), "{body}");
+    assert!(body.contains("      type: file\n"), "{body}");
 }
 
 #[tokio::test]
