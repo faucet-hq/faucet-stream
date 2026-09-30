@@ -9,6 +9,9 @@ format layer, so a file reads the same here as it does from a bucket.
 `faucet-source-csv` stays as it was for existing configs. Use this crate for
 anything new, CSV included.
 
+**Experimental** (PRINCIPLES.md §3): this block's shape may change in a minor
+release; any change is called out in the changelog.
+
 ```toml
 [dependencies]
 faucet-source-file = { version = "1.0.0", features = ["file-formats"] }
@@ -37,6 +40,12 @@ source:
 
 Every listing is sorted by path, so runs are deterministic. Symlinks are
 followed. An unreadable file or directory fails the run with its path.
+
+A directory or glob never reads a file sink's unfinished output: scratch files
+(`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`, `-seal`, `-prev`) and anything
+inside the `.faucet-overwrite-*` swap directory of an overwrite run that has
+not committed are skipped. A path that names one file directly is read as
+given.
 
 `{key}` placeholders in `path` are filled from the fetch context (a library
 caller's `fetch_with_context`), as the `csv` and `parquet` sources do.
@@ -84,9 +93,10 @@ Values are strings; cast them with a `cast` transform.
 
 ### Parquet
 
-`parquet.columns` projects the read: only those column chunks are decoded, on
-both the row and the columnar path, and a name a file does not have fails
-naming the columns it does have. Nulls are explicit: a null column is read as
+`parquet.columns` projects the read — the same `parquet:` block as the S3, GCS
+and Azure Blob sources: only those column chunks are decoded, on both the row
+and the columnar path, and a name a file does not have fails naming the
+columns it does have. An empty list is refused at load. Nulls are explicit: a null column is read as
 `"key": null` (the `parquet` source omitted the key).
 
 Compression (`compression: auto | gzip | zstd | none`) resolves per file from
@@ -97,8 +107,8 @@ before decoding, because those formats need random access or a whole stream.
 
 `encryption: { key, previous_keys }` (feature `encryption`) reads files the
 `file` or `jsonl` sink encrypted: a file sealed whole is decrypted and then
-decompressed; JSON Lines or raw text sealed line by line is decrypted a line at
-a time. A file or line that is not sealed fails the read rather than being
+decompressed; JSON Lines or raw text sealed line by line is read whole and
+then decrypted a line at a time. A file or line that is not sealed fails the read rather than being
 trusted as plaintext.
 
 ## Coming from the csv or parquet source

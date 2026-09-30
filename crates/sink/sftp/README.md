@@ -150,17 +150,20 @@ This sink writes through the same file-writing layer as the local
 [`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
 format and option the file sink does, with the same field names:
 
+**Experimental** (PRINCIPLES.md §3): this block's shape may change in a minor release; any change is called out in the changelog.
+
 | Field | Values | Notes |
 |---|---|---|
 | `format` | `json_lines` (default), `json_array`, `csv`, `xml`, `xlsx`, `avro`, `parquet`, `raw_text`, `auto` | `auto` takes the format from `file_name`'s extension (else `file_extension`), looking through `.gz` / `.zst`. `parquet` needs the `arrow` feature; the other shared formats their `file-format-*` feature. |
 | `file_name` | a name template | file name template: `{part}` numbers the files, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` files. |
-| `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when a file of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
-| `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's files under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
+| `if_exists` | `replace` (default), `append`, `error` | What happens when a file of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. `mode` is accepted as another name for this key, and `overwrite` / `error_if_exists` for its values. |
+| `write_mode` | `append` (default), `overwrite` | `overwrite` writes the run's files under a hidden `.faucet-overwrite-…/` prefix and moves them into place only after a successful run; a failed run leaves the old output untouched. The move is one file at a time: a reader listing the prefix while it runs can see new files beside old ones, and a move that stops half-way is finished by the next run. |
 | `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`**, like the S3 and GCS sinks — smaller objects to move; the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each file's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
+| `scratch_dir` | a local directory | Where files are built before upload (default: the system temporary directory; a private subdirectory is created in it). Every file is built whole before it is uploaded, so this needs room for up to `concurrency` + 1 files. Scratch files are not encrypted while the run is in progress. |
 
-`mode` and `write_mode: overwrite` need `file_name`: without it every run
+`if_exists: append` / `error` and `write_mode: overwrite` need `file_name`: without it every run
 writes new, uniquely named files (`<run id>-<part><file_extension>`), so
 there is nothing to replace or append to.
 
@@ -170,7 +173,7 @@ with one upload to a hidden temporary name followed by a rename into place when 
 partial file, and a bookmark never advances past records that are not
 there.
 
-Files land under `path`. SFTP has no replacing rename, so replacing an existing file (`mode: overwrite` on a fixed name, or promoting a staged file over an existing one) removes it first; new names are published atomically.
+Files land under `path`. SFTP has no replacing rename, so replacing an existing file (`if_exists: replace` on a fixed name, or moving an overwrite run's file over an existing one) removes it first; new names are published atomically.
 
 ```yaml
 sink:

@@ -440,21 +440,24 @@ This sink writes through the same file-writing layer as the local
 [`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
 format and option the file sink does, with the same field names:
 
+**Experimental** (PRINCIPLES.md §3): this block's shape may change in a minor release; any change is called out in the changelog.
+
 | Field | Values | Notes |
 |---|---|---|
 | `format` | `json_lines` (default), `json_array`, `csv`, `xml`, `xlsx`, `avro`, `parquet`, `raw_text`, `auto` | `auto` takes the format from `path`'s extension (else `file_extension`), looking through `.gz` / `.zst`. `parquet` needs the `arrow` feature; the other shared formats their `file-format-*` feature. |
 | `path` | a name template | object name template: `{part}` numbers the objects, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` objects. |
-| `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when an object of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
-| `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's objects under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
+| `if_exists` | `replace` (default), `append`, `error` | What happens when an object of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. `mode` is accepted as another name for this key, and `overwrite` / `error_if_exists` for its values. |
+| `write_mode` | `append` (default), `overwrite` | `overwrite` writes the run's objects under a hidden `.faucet-overwrite-…/` prefix and moves them into place only after a successful run; a failed run leaves the old output untouched. The move is one object at a time: a reader listing the prefix while it runs can see new objects beside old ones, and a move that stops half-way is finished by the next run. |
 | `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`** — the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each object's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
+| `scratch_dir` | a local directory | Where objects are built before upload (default: the system temporary directory; a private subdirectory is created in it). JSON Lines and raw text go up as a multipart upload while they are written and need no scratch space; other formats need room for each object being built (up to `concurrency` of them). Scratch files are not encrypted while the run is in progress. |
 
-`mode` and `write_mode: overwrite` need `path`: without it every run
+`if_exists: append` / `error` and `write_mode: overwrite` need `path`: without it every run
 writes new, uniquely named objects (`<run id>-<part><file_extension>`), so
 there is nothing to replace or append to.
 
-**Publishing.** Each object is built in a local scratch file and published
+**Publishing.** JSON Lines and raw text go up as a multipart upload while they are written — memory holds at most `concurrency` parts, and no scratch file is written — and the object becomes visible when it closes. Every other object is built in a local scratch file and published
 with one upload (multipart past 8 MiB, parts in parallel up to `concurrency`, completed only after every part landed and aborted on failure) when it closes — at `max_records_per_file` /
 `max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
 partial object, and a bookmark never advances past records that are not
