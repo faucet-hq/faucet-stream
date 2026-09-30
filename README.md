@@ -299,8 +299,8 @@ connector depends only on `faucet-core`, so any source works with any sink.
 
 These numbers are reproducible, and the [methodology](BENCHMARKS.md) includes the caveats.
 Each workload moves 1M rows on one machine, compared with Meltano running the equivalent
-Singer pipeline. They were measured with the `csv` source and `jsonl` sink, which are now
-deprecated in favour of the `file` connectors (not yet re-measured):
+Singer pipeline. The two JSONL workloads were measured with the `csv` source and `jsonl`
+sink, now deprecated in favour of the `file` connectors, and have not been re-measured:
 
 | Workload | Bottleneck | faucet | Meltano | Speed-up |
 |---|---|---:|---:|---:|
