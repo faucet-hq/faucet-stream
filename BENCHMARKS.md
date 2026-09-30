@@ -53,8 +53,8 @@ the 1M CSV is ~10× that).
 
 | Scenario | Bottleneck | faucet | Meltano |
 |---|---|---|---|
-| **A — CSV → JSONL** (no infra, always run) | parse/serialize (best case) | `source-csv` → `sink-jsonl` | `tap-csv` → `target-jsonl` |
-| **B — Postgres → JSONL** (needs Docker) | typed row decode | `source-postgres` → `sink-jsonl` | `tap-postgres` → `target-jsonl` |
+| **A — CSV → JSONL** (no infra, always run) | parse/serialize (best case) | `source-file` → `sink-file` (recorded numbers: `source-csv` → `sink-jsonl`) | `tap-csv` → `target-jsonl` |
+| **B — Postgres → JSONL** (needs Docker) | typed row decode | `source-postgres` → `sink-file` (recorded numbers: `sink-jsonl`) | `tap-postgres` → `target-jsonl` |
 | **C — Postgres → Postgres** (needs Docker) | **destination write (sink-bound)** | `source-postgres` → `sink-postgres` | `tap-postgres` → `target-postgres` |
 
 ### Measurement
@@ -71,7 +71,7 @@ the 1M CSV is ~10× that).
 ```bash
 # 1. Build the release binary the harness uses
 cargo build -p faucet-cli --release \
-  --no-default-features --features "source-csv,sink-jsonl,source-postgres,sink-postgres"
+  --no-default-features --features "source-file,sink-file,file-format-csv,source-postgres,sink-postgres"
 
 # 2. Run (installs an isolated Meltano venv on first run)
 scripts/run-bench.sh            # 1,000,000 rows, 5 runs (Scenario A)

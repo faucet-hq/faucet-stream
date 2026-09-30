@@ -28,7 +28,7 @@ benchmarks/
 - A release `faucet` binary with the CSV/JSONL and Postgres source+sink features:
   ```bash
   cargo build -p faucet-cli --release \
-    --no-default-features --features "source-csv,sink-jsonl,source-postgres,sink-postgres"
+    --no-default-features --features "source-file,sink-file,file-format-csv,source-postgres,sink-postgres"
   ```
 - [`hyperfine`](https://github.com/sharkdp/hyperfine) for wall-clock timing.
 - A Meltano-compatible Python (3.9–3.12; the harness defaults to `python3.12`,

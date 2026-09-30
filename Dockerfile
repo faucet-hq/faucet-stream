@@ -20,7 +20,7 @@
 #     -t faucet:rest-pg-s3 .
 #
 #   # Escape hatch — pass a raw cargo feature list verbatim.
-#   docker build --build-arg FEATURES="observability,serve,source-rest,sink-jsonl" -t faucet:min .
+#   docker build --build-arg FEATURES="observability,serve,source-rest,sink-file" -t faucet:min .
 #
 # Feature selection precedence (first match wins):
 #   1. FEATURES set            -> used verbatim (with --no-default-features).

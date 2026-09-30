@@ -29,7 +29,7 @@ demo: ## Run a no-infrastructure smoke test (CSV -> JSONL)
 	@cat target/demo/out.jsonl
 
 bench-build: ## Build the release faucet binary used by the benchmark harness
-	cargo build -p faucet-cli --release --no-default-features --features "source-csv,sink-jsonl,source-postgres,sink-postgres"
+	cargo build -p faucet-cli --release --no-default-features --features "source-file,sink-file,file-format-csv,source-postgres,sink-postgres"
 
 bench: bench-build ## Run the Meltano comparison benchmark (1M rows, CSV->JSONL) — see BENCHMARKS.md
 	scripts/run-bench.sh
