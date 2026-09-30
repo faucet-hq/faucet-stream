@@ -129,6 +129,64 @@ async fn replay_picks_up_the_configs_dlq_encryption_block() {
     assert_eq!(rows, vec![json!({"id": 7, "ok": true})]);
 }
 
+/// A `type: file` DLQ writing JSON Lines seals each line the way the jsonl
+/// sink did, and replay picks its key up from the config the same way.
+#[cfg(feature = "sink-file")]
+#[tokio::test]
+async fn replay_picks_up_a_file_dlqs_encryption_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dir.path().join("dlq.jsonl");
+    let out = dir.path().join("out.jsonl");
+    let sink = faucet_sink_file::FileSink::new(
+        faucet_sink_file::FileSinkConfig::new(dlq.to_str().unwrap()).encryption(
+            faucet_core::EncryptionSpec {
+                key: KEY.into(),
+                previous_keys: vec![],
+                algorithm: Default::default(),
+            },
+        ),
+    )
+    .unwrap();
+    sink.write_batch(&[envelope("quality", json!({"id": 9}))])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+
+    let cfg_yaml = format!(
+        concat!(
+            "version: 1\nname: replay\npipeline:\n",
+            "  source: {{ type: csv, config: {{ path: /dev/null }} }}\n",
+            "  sink: {{ type: file, config: {{ path: {out} }} }}\n",
+            "  dlq:\n    sink:\n      type: file\n",
+            "      config: {{ path: {dlq}, encryption: {{ key: \"{key}\" }} }}\n",
+        ),
+        out = out.display(),
+        dlq = dlq.display(),
+        key = KEY,
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    let outcome = dlq_replay::replay(
+        &cfg,
+        dlq.to_str().unwrap(),
+        ReplayInputs {
+            decryptor: Default::default(),
+            reason: None,
+            failed_dlq: None,
+            row: None,
+            dry_run: false,
+            pipeline_name: "replay".into(),
+            execution: None,
+            auth: build_auth_catalog(None).unwrap(),
+            clock: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.candidates, 1);
+    assert_eq!(outcome.records_written, 1);
+    assert_eq!(read_lines(&out), vec![json!({"id": 9})]);
+}
+
 #[tokio::test]
 async fn discard_filters_sealed_envelopes_and_preserves_lines_verbatim() {
     let dir = tempfile::tempdir().unwrap();
