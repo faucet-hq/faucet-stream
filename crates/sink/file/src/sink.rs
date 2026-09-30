@@ -1,9 +1,8 @@
 //! The local file sink: the shared file writer over the local backend.
 
-use crate::config::{FileSinkConfig, FileWriteMode};
-use async_trait::async_trait;
-use faucet_common_file::write::{FileWriter, LocalBackend, NameTemplate, blocking};
-use faucet_core::{FaucetError, FileFormat, Sink, WriteMode};
+use crate::config::FileSinkConfig;
+use faucet_common_file::write::{FileWriter, LocalBackend, SinkIdentity, WriterSink};
+use faucet_core::{FaucetError, FileFormat};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,86 +10,93 @@ use std::sync::Arc;
 /// Writes records to local files. See the crate docs.
 pub struct FileSink {
     config: FileSinkConfig,
-    local: Arc<LocalBackend>,
-    writer: FileWriter,
+    inner: WriterSink,
 }
 
 impl FileSink {
     /// Build the sink, validating the config.
     pub fn new(config: FileSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let settings = config.settings()?;
+        let write = config.write_config();
+        let settings = write.settings()?;
         if settings.codec != faucet_core::Compression::None {
             faucet_core::warn_mismatch(&config.path, settings.codec);
         }
-        let (dir, template) = NameTemplate::from_path(
-            &config.path,
-            settings.format,
-            settings.codec,
-            settings.rolls_over(),
-        )
-        .map_err(|e| faucet_common_file::config_context("file sink", e))?;
-        let local = Arc::new(LocalBackend::new(
-            &dir,
-            &template.staging_name(),
-            config.create_dirs,
-        ));
+        let (dir, template) = write.local_layout(&settings)?;
+        let local = Arc::new(LocalBackend::new(&dir, &template, config.create_dirs));
         let writer = FileWriter::new(settings, template, local.clone())?;
+        let identity = FileIdentity {
+            dataset_uri: dataset_uri(&config.path),
+            dir: local.dir().to_path_buf(),
+            create_dirs: config.create_dirs,
+            readback: readback_config(&config, &writer, local.dir()),
+        };
         Ok(Self {
             config,
-            local,
-            writer,
+            inner: WriterSink::new(writer, identity),
         })
     }
 
     /// The resolved format.
     pub fn format(&self) -> FileFormat {
-        self.writer.settings().format
+        self.inner.format()
     }
 
     /// The config the sink was built with.
     pub fn config(&self) -> &FileSinkConfig {
         &self.config
     }
-
-    fn overwriting(&self) -> bool {
-        self.config.write_mode == FileWriteMode::Overwrite
-    }
-
-    /// The config of a `file` source that reads this sink's output back.
-    fn readback_config(&self) -> Value {
-        let template = self.writer.template();
-        let path = if template.numbered() {
-            self.local
-                .dir()
-                .join(template.name.replace(crate::config::PART_TOKEN, "*"))
-        } else {
-            self.local.dir().join(&template.name)
-        };
-        let format = self.format();
-        let mut cfg = serde_json::json!({
-            "path": path.to_string_lossy(),
-            "format": format.as_str(),
-        });
-        if format == FileFormat::Csv {
-            cfg["csv"] = serde_json::to_value(&self.config.csv).unwrap_or(Value::Null);
-        }
-        if format == FileFormat::Xml {
-            cfg["xml"] = serde_json::to_value(&self.config.xml).unwrap_or(Value::Null);
-        }
-        if format == FileFormat::Xlsx {
-            cfg["excel"] = serde_json::to_value(&self.config.excel).unwrap_or(Value::Null);
-        }
-        #[cfg(feature = "encryption")]
-        if let Some(spec) = &self.config.encryption {
-            cfg["encryption"] = serde_json::to_value(spec).unwrap_or(Value::Null);
-        }
-        cfg
-    }
 }
 
-#[async_trait]
-impl Sink for FileSink {
+faucet_common_file::delegate_sink!(FileSink, inner);
+
+fn dataset_uri(path: &str) -> String {
+    let p = Path::new(path);
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    format!("file://{}", abs.display())
+}
+
+/// The config of a `file` source that reads the output back, or `None` when
+/// the source cannot: pretty-printed JSON Lines is not one record per line.
+fn readback_config(config: &FileSinkConfig, writer: &FileWriter, dir: &Path) -> Option<Value> {
+    let settings = writer.settings();
+    if settings.format == FileFormat::JsonLines && settings.json_lines.pretty {
+        return None;
+    }
+    let template = writer.template();
+    let path = if template.numbered() {
+        dir.join(template.name.replace(crate::config::PART_TOKEN, "*"))
+    } else {
+        dir.join(&template.name)
+    };
+    let mut cfg = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "format": settings.format.as_str(),
+        "compression": serde_json::to_value(config.compression).ok()?,
+    });
+    match settings.format {
+        FileFormat::Csv => cfg["csv"] = serde_json::to_value(&config.csv).ok()?,
+        FileFormat::Xml => cfg["xml"] = serde_json::to_value(&config.xml).ok()?,
+        FileFormat::Xlsx => cfg["excel"] = serde_json::to_value(&config.excel).ok()?,
+        _ => {}
+    }
+    #[cfg(feature = "encryption")]
+    if let Some(spec) = &config.encryption {
+        cfg["encryption"] = serde_json::to_value(spec).ok()?;
+    }
+    Some(cfg)
+}
+
+/// What the local file sink supplies to the shared sink.
+struct FileIdentity {
+    dataset_uri: String,
+    dir: PathBuf,
+    create_dirs: bool,
+    readback: Option<Value>,
+}
+
+#[faucet_core::async_trait]
+impl SinkIdentity for FileIdentity {
     fn connector_name(&self) -> &'static str {
         "file"
     }
@@ -101,125 +107,68 @@ impl Sink for FileSink {
     }
 
     fn dataset_uri(&self) -> String {
-        let p = Path::new(&self.config.path);
-        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-        format!("file://{}", abs.display())
-    }
-
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
-    }
-
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
-        &[WriteMode::Append, WriteMode::Overwrite]
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.overwriting()
-    }
-
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.begin_overwrite())
-    }
-
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.commit_overwrite())
-    }
-
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.abort_overwrite())
-    }
-
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.complete())
+        self.dataset_uri.clone()
     }
 
     fn readback_source(&self) -> Option<(String, Value)> {
-        Some(("file".into(), self.readback_config()))
-    }
-
-    async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
-        self.writer.local_outputs()
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        blocking(|| self.writer.write_rows(records))
-    }
-
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        matches!(self.format(), FileFormat::Parquet | FileFormat::Avro)
-    }
-
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
-        &self,
-        batch: &arrow::array::RecordBatch,
-    ) -> Result<usize, FaucetError> {
-        #[cfg(feature = "file-format-parquet")]
-        if self.format() == FileFormat::Parquet {
-            return blocking(|| self.writer.write_batch(batch));
-        }
-        let rows = faucet_core::columnar::record_batch_to_values(batch)?;
-        self.write_batch(&rows).await
-    }
-
-    async fn flush(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.flush())
+        self.readback.clone().map(|cfg| ("file".into(), cfg))
     }
 
     async fn check(
         &self,
         _ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
-        use faucet_core::check::{CheckReport, Probe};
-        let start = std::time::Instant::now();
-        let dir = self.local.dir().to_path_buf();
-        let probe = blocking(|| {
-            let mut target = dir.clone();
-            if !target.is_dir() {
-                if !self.config.create_dirs {
-                    return Probe::fail_hint(
-                        "io",
-                        start.elapsed(),
-                        format!("directory {} does not exist", dir.display()),
-                        "create it, or set `create_dirs: true`",
-                    );
-                }
-                while !target.is_dir() {
-                    match target.parent() {
-                        Some(p) if !p.as_os_str().is_empty() => target = p.to_path_buf(),
-                        _ => {
-                            target = PathBuf::from(".");
-                            break;
-                        }
-                    }
-                }
-            }
-            let probe_file = target.join(format!(".faucet_doctor_probe-{}", std::process::id()));
-            match std::fs::write(&probe_file, b"") {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&probe_file);
-                    Probe::pass("io", start.elapsed())
-                }
-                Err(e) => Probe::fail_hint(
-                    "io",
-                    start.elapsed(),
-                    format!("cannot write to directory {}: {e}", target.display()),
-                    "make the directory writable by the current user",
-                ),
-            }
-        });
+        use faucet_core::check::CheckReport;
+        let (dir, create_dirs) = (self.dir.clone(), self.create_dirs);
+        let probe = tokio::task::spawn_blocking(move || probe_dir(&dir, create_dirs))
+            .await
+            .map_err(|e| FaucetError::Sink(format!("file sink: the probe did not finish: {e}")))?;
         Ok(CheckReport::single(probe))
+    }
+}
+
+fn probe_dir(dir: &Path, create_dirs: bool) -> faucet_core::check::Probe {
+    use faucet_core::check::Probe;
+    let start = std::time::Instant::now();
+    let mut target = dir.to_path_buf();
+    if !target.is_dir() {
+        if !create_dirs {
+            return Probe::fail_hint(
+                "io",
+                start.elapsed(),
+                format!("directory {} does not exist", dir.display()),
+                "create it, or set `create_dirs: true`",
+            );
+        }
+        while !target.is_dir() {
+            match target.parent() {
+                Some(p) if !p.as_os_str().is_empty() => target = p.to_path_buf(),
+                _ => {
+                    target = PathBuf::from(".");
+                    break;
+                }
+            }
+        }
+    }
+    let probe_file = target.join(format!(".faucet_doctor_probe-{}", std::process::id()));
+    match std::fs::write(&probe_file, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe_file);
+            Probe::pass("io", start.elapsed())
+        }
+        Err(e) => Probe::fail_hint(
+            "io",
+            start.elapsed(),
+            format!("cannot write to directory {}: {e}", target.display()),
+            "make the directory writable by the current user",
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faucet_core::{Sink, WriteMode};
     use serde_json::json;
 
     fn sink(dir: &Path, v: Value) -> FileSink {
@@ -379,7 +328,7 @@ mod tests {
             lines(&d.path().join("o-00001.jsonl")),
             vec![json!({"n": 1})]
         );
-        assert!(!life.local.staging_dir().exists());
+        assert!(!d.path().join(".faucet-overwrite-o-_part_.jsonl").exists());
     }
 
     #[tokio::test]
@@ -407,11 +356,17 @@ mod tests {
         let (kind, cfg) = s.readback_source().unwrap();
         assert_eq!(kind, "file");
         assert!(cfg["path"].as_str().unwrap().ends_with("sub/x.jsonl"));
-        let r = sink(d.path(), json!({"path": "p-{part}.csv"})).readback_config();
-        assert!(r["path"].as_str().unwrap().ends_with("p-*.csv"));
+        let back = |v: Value| sink(d.path(), v).readback_source().map(|(_, c)| c);
+        let r = back(json!({"path": "p-{part}.csv.gz"})).unwrap();
+        assert_eq!(r["compression"], json!("auto"));
+        assert!(
+            back(json!({"path": "p.jsonl", "json_lines": {"pretty": true}})).is_none(),
+            "pretty JSON Lines cannot be read back one record per line"
+        );
+        assert!(r["path"].as_str().unwrap().ends_with("p-*.csv.gz"));
         assert!(r["csv"].is_object());
-        assert!(sink(d.path(), json!({"path": "a.xml"})).readback_config()["xml"].is_object());
-        assert!(sink(d.path(), json!({"path": "a.xlsx"})).readback_config()["excel"].is_object());
+        assert!(back(json!({"path": "a.xml"})).unwrap()["xml"].is_object());
+        assert!(back(json!({"path": "a.xlsx"})).unwrap()["excel"].is_object());
         let rel = FileSink::new(FileSinkConfig::new("rel.jsonl")).unwrap();
         assert!(rel.dataset_uri().ends_with("/rel.jsonl"));
     }
@@ -434,15 +389,5 @@ mod tests {
             assert!(e.to_string().contains("ro/x.jsonl"), "{e}");
         }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[test]
-    fn blocking_runs_without_a_runtime() {
-        assert_eq!(blocking(|| 7), 7);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_in_place_on_a_multi_thread_runtime() {
-        assert_eq!(blocking(|| 3), 3);
     }
 }

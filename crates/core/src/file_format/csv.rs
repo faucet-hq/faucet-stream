@@ -372,9 +372,10 @@ mod tests {
     }
 
     #[test]
-    fn write_headers_is_another_name_for_has_headers() {
-        let o: CsvOptions = serde_json::from_value(json!({"write_headers": false})).unwrap();
+    fn has_headers_has_one_name() {
+        let o: CsvOptions = serde_json::from_value(json!({"has_headers": false})).unwrap();
         assert!(!o.has_headers);
         assert_eq!(o.on_unknown_field, super::super::CsvUnknownField::Widen);
+        assert!(serde_json::from_value::<CsvOptions>(json!({"write_headers": false})).is_err());
     }
 }

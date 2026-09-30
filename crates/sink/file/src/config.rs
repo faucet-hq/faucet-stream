@@ -7,18 +7,21 @@ use faucet_core::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use faucet_common_file::write::WriteSettings;
 pub use faucet_common_file::write::{
-    DEFAULT_ROW_GROUP_SIZE, FileMode, FileWriteMode, JsonLinesOptions, PART_TOKEN, ParquetCodec,
+    DEFAULT_ROW_GROUP_SIZE, FileWriteMode, IfExists, JsonLinesOptions, PART_TOKEN, ParquetCodec,
     ParquetField, ParquetOptions, ParquetType,
 };
+use faucet_common_file::write::{WriteConfig, WriteSettings};
 
 pub use faucet_common_file::FileFormatChoice as FileSinkFormat;
 
 /// Configuration for the local file sink.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(extend("x-faucet-aliases" = ["max_rows_per_file"]))]
+#[schemars(extend("x-faucet-aliases" = ["mode"]))]
 pub struct FileSinkConfig {
     /// The file to write, as a template. `{part}` is replaced by the rollover
     /// part number (`00001`, `00002`, …); with a rollover cap and no `{part}`,
@@ -32,27 +35,30 @@ pub struct FileSinkConfig {
     /// read-only and refused.
     #[serde(default)]
     pub format: FileSinkFormat,
-    /// Compression: `auto` (default) resolves from the suffix (`.gz`, `.zst`).
-    /// Not applicable to Parquet, Avro or Excel, which compress internally.
+    /// Compression of the finished file: `auto` (default) resolves from the
+    /// suffix (`.gz`, `.zst`). It applies to every format; Parquet, Avro and
+    /// Excel already compress internally, so a codec on them compresses the
+    /// file a second time and most readers then cannot open it without
+    /// decompressing first.
     #[serde(default)]
     pub compression: CompressionConfig,
-    /// What to do with a file that already exists (default `overwrite`).
-    #[serde(default)]
-    pub mode: FileMode,
-    /// `append` (default) or `overwrite` — replace the destination's output
-    /// set atomically when the run succeeds.
+    /// What to do with a file that already exists (default `replace`):
+    /// `replace` it, `append` to it (JSON Lines, CSV, raw text), or fail
+    /// with `error`. `mode` is accepted as another name for this field, and
+    /// `overwrite` / `error_if_exists` for its values.
+    #[serde(default, alias = "mode")]
+    pub if_exists: IfExists,
+    /// `append` (default) or `overwrite` — replace the destination's whole
+    /// output set when the run succeeds.
     #[serde(default)]
     pub write_mode: FileWriteMode,
-    /// Roll to a new file after this many records. `max_rows_per_file` is
-    /// accepted as another name.
-    #[serde(
-        default,
-        alias = "max_rows_per_file",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Roll to a new file after this many records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_records_per_file: Option<usize>,
-    /// Roll to a new file once the current one reaches this many bytes. A
-    /// single page larger than the cap still lands in one file.
+    /// Roll to a new file once the current one reaches about this many
+    /// bytes, counted on the records' JSON length before compression (on the
+    /// columnar Parquet path, their in-memory Arrow size). A single page
+    /// larger than the cap still lands in one file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes_per_file: Option<usize>,
     /// Create missing parent directories (default `true`).
@@ -74,8 +80,8 @@ pub struct FileSinkConfig {
     /// Writer schema and block codec, used when the format is Avro.
     #[serde(default)]
     pub avro: AvroOptions,
-    /// Compression, row groups and an optional explicit schema, used when
-    /// the format is Parquet.
+    /// Compression (default `snappy`), row groups and an optional explicit
+    /// schema, used when the format is Parquet.
     #[serde(default)]
     pub parquet: ParquetOptions,
     /// Pretty-printing, used when the format is JSON Lines.
@@ -85,8 +91,11 @@ pub struct FileSinkConfig {
     /// raw text seal each record on its own line (base64), exactly as the
     /// jsonl sink does, so the file stays appendable. Every other file —
     /// compressed JSON Lines included — is sealed whole when it is
-    /// finalised, after any `compression`; appending to one decrypts it
-    /// first. The file source's `encryption` block reads both back.
+    /// published, after any `compression`; appending to one decrypts it
+    /// first. Appending to an existing file that is not sealed the same way
+    /// is refused. The file source's `encryption` block reads both back.
+    /// Scratch files are not encrypted while the run is in progress; those
+    /// holding plaintext are readable by their owner only.
     #[cfg(feature = "encryption")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<faucet_core::EncryptionSpec>,
@@ -107,7 +116,7 @@ impl FileSinkConfig {
             path: path.into(),
             format: FileSinkFormat::Auto,
             compression: CompressionConfig::Auto,
-            mode: FileMode::Overwrite,
+            if_exists: IfExists::Replace,
             write_mode: FileWriteMode::Append,
             max_records_per_file: None,
             max_bytes_per_file: None,
@@ -149,9 +158,9 @@ impl FileSinkConfig {
         self
     }
 
-    /// Set the existing-file mode.
-    pub fn mode(mut self, mode: FileMode) -> Self {
-        self.mode = mode;
+    /// Set what happens to an existing file.
+    pub fn if_exists(mut self, if_exists: IfExists) -> Self {
+        self.if_exists = if_exists;
         self
     }
 
@@ -213,22 +222,31 @@ impl FileSinkConfig {
         self.max_records_per_file.is_some() || self.max_bytes_per_file.is_some()
     }
 
+    /// The config's write fields in the shared writer's shape.
+    pub fn write_config(&self) -> WriteConfig {
+        WriteConfig {
+            connector: "file sink",
+            path: Some(self.path.clone()),
+            format: self.format.explicit(),
+            compression: self.compression,
+            opts: self.format_options(),
+            parquet: self.parquet.clone(),
+            default_parquet_codec: ParquetCodec::Snappy,
+            json_lines: self.json_lines.clone(),
+            if_exists: self.if_exists,
+            write_mode: self.write_mode,
+            max_records_per_file: self.max_records_per_file,
+            max_bytes_per_file: self.max_bytes_per_file,
+            #[cfg(feature = "encryption")]
+            encryption: self.encryption.clone(),
+            ..WriteConfig::default()
+        }
+    }
+
     /// The format this config writes. Refuses ORC, a path whose extension
     /// names no format, and a directory path without an explicit format.
     pub fn resolved_format(&self) -> Result<FileFormat, FaucetError> {
-        if self.is_directory() && self.format.explicit().is_none() {
-            return Err(FaucetError::Config(format!(
-                "file sink: '{}' is a directory, so there is no extension to take the format \
-                 from — set `format`",
-                self.path
-            )));
-        }
-        let name = self.path.replace(PART_TOKEN, "");
-        let format = self
-            .format
-            .resolve_writable(&name)
-            .map_err(|e| FaucetError::Config(format!("file sink: {e}")))?;
-        Ok(format)
+        Ok(self.write_config().settings()?.format)
     }
 
     /// The compression codec for the resolved path.
@@ -241,40 +259,13 @@ impl FileSinkConfig {
 
     /// Validate every combination that would otherwise fail mid-run.
     pub fn validate(&self) -> Result<(), FaucetError> {
-        faucet_common_file::require_path("file sink", &self.path)?;
         faucet_core::validate_batch_size(self.batch_size)?;
-        if self.path.matches(PART_TOKEN).count() > 1 {
-            return Err(FaucetError::Config(format!(
-                "file sink: '{}' has more than one `{{part}}`",
-                self.path
-            )));
-        }
-        let settings = self.settings()?;
-        let (_, template) = faucet_common_file::write::NameTemplate::from_path(
-            &self.path,
-            settings.format,
-            settings.codec,
-            settings.rolls_over(),
-        )
-        .map_err(|e| faucet_common_file::config_context("file sink", e))?;
-        settings.validate_for(&template)
+        self.write_config().validate()
     }
 
     /// The storage-independent write settings for the shared writer.
     pub fn settings(&self) -> Result<WriteSettings, FaucetError> {
-        let mut s = WriteSettings::new(self.resolved_format()?, self.resolved_compression());
-        s.opts = self.format_options();
-        s.parquet = self.parquet.clone();
-        s.json_lines = self.json_lines.clone();
-        s.mode = self.mode;
-        s.write_mode = self.write_mode;
-        s.max_records_per_file = self.max_records_per_file;
-        s.max_bytes_per_file = self.max_bytes_per_file;
-        #[cfg(feature = "encryption")]
-        {
-            s.encryption = self.encryption.clone();
-        }
-        Ok(s)
+        self.write_config().settings()
     }
 
     /// The per-format option blocks in the shape the shared encoders want.
@@ -289,15 +280,11 @@ impl FileSinkConfig {
     }
 
     /// What a failed batch write leaves behind (#737): a page lands in a
-    /// temporary file and becomes visible only when a flush renames it, so a
+    /// scratch file and becomes visible only when a flush publishes it, so a
     /// failed write never exposes part of a page — but a page can span a
-    /// rollover, and files finalised by an earlier rollover stay.
+    /// rollover, and files closed by an earlier rollover stay.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        if self.rolls_over() {
-            faucet_core::BatchAtomicity::BestEffort
-        } else {
-            faucet_core::BatchAtomicity::Atomic
-        }
+        self.write_config().batch_atomicity()
     }
 }
 
@@ -315,7 +302,7 @@ mod tests {
         let c = FileSinkConfig::new("out/x.jsonl")
             .format(FileSinkFormat::JsonLines)
             .compression(CompressionConfig::None)
-            .mode(FileMode::Append)
+            .if_exists(IfExists::Append)
             .write_mode(FileWriteMode::Append)
             .max_records_per_file(5)
             .max_bytes_per_file(10)
@@ -332,9 +319,10 @@ mod tests {
         let d = cfg(json!({"path": "a.jsonl"}));
         assert!(d.create_dirs);
         assert_eq!(d.batch_size, DEFAULT_BATCH_SIZE);
-        assert_eq!(d.mode, FileMode::Overwrite);
+        assert_eq!(d.if_exists, IfExists::Replace);
         assert_eq!(d.write_mode, FileWriteMode::Append);
-        assert_eq!(d.parquet.compression, ParquetCodec::Snappy);
+        assert_eq!(d.parquet.compression, None);
+        assert_eq!(d.settings().unwrap().parquet_codec(), ParquetCodec::Snappy);
         assert!(!d.rolls_over());
     }
 
@@ -395,11 +383,11 @@ mod tests {
             (json!({"path": "a.json", "mode": "append"}), "append"),
             (
                 json!({"path": "a.jsonl", "mode": "append", "write_mode": "overwrite"}),
-                "must be `overwrite`",
+                "must be `replace`",
             ),
             (
-                json!({"path": "a.jsonl", "mode": "error_if_exists", "write_mode": "overwrite"}),
-                "must be `overwrite`",
+                json!({"path": "a.jsonl", "if_exists": "error", "write_mode": "overwrite"}),
+                "must be `replace`",
             ),
         ];
         for (v, needle) in bad {

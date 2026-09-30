@@ -8,12 +8,15 @@
 //! renamed into place on flush, so a crashed run never leaves a
 //! complete-looking partial file, and `write_mode: overwrite` replaces the
 //! whole output set only when the run succeeds.
+//!
+//! **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+//! minor release; any change is called out in the changelog.
 
 pub mod config;
 mod sink;
 
 pub use config::{
-    FileMode, FileSinkConfig, FileSinkFormat, FileWriteMode, JsonLinesOptions, PART_TOKEN,
+    FileSinkConfig, FileSinkFormat, FileWriteMode, IfExists, JsonLinesOptions, PART_TOKEN,
     ParquetCodec, ParquetField, ParquetOptions, ParquetType,
 };
 pub use faucet_core::{FaucetError, Sink};

@@ -50,7 +50,7 @@ async fn csv_output_matches_the_csv_sink() {
             faucet_sink_csv::CsvSinkConfig::new(p(dir.path(), "old2.csv"))
                 .delimiter(b';')
                 .write_headers(false),
-            json!({"path": p(dir.path(), "new2.csv"), "csv": {"delimiter": ";", "write_headers": false}}),
+            json!({"path": p(dir.path(), "new2.csv"), "csv": {"delimiter": ";", "has_headers": false}}),
         ),
     ] {
         let old_path = old_cfg.path.clone();
@@ -205,15 +205,6 @@ async fn json_lines_output_matches_the_jsonl_sink() {
     );
 }
 
-#[tokio::test]
-async fn max_rows_per_file_is_accepted_for_max_records_per_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg: faucet_sink_file::FileSinkConfig =
-        serde_json::from_value(json!({"path": p(dir.path(), "a.jsonl"), "max_rows_per_file": 2}))
-            .unwrap();
-    assert_eq!(cfg.max_records_per_file, Some(2));
-}
-
 fn read_parquet(path: &str) -> (Vec<Value>, parquet::file::metadata::ParquetMetaData) {
     let file = std::fs::File::open(path).unwrap();
     let builder =
@@ -265,7 +256,7 @@ async fn parquet_output_matches_the_parquet_sink() {
 
     let none = p(dir.path(), "u.parquet");
     pages(
-        &sink(json!({"path": none, "parquet": {"compression": "uncompressed"}})),
+        &sink(json!({"path": none, "parquet": {"compression": "none"}})),
         &[metrics(2)],
     )
     .await

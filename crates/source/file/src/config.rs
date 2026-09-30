@@ -47,6 +47,9 @@ fn default_http_retries() -> u32 {
 }
 
 /// Configuration for the local (and `http(s)://`) file source.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileSourceConfig {
@@ -115,9 +118,10 @@ pub struct FileSourceConfig {
     #[serde(default)]
     pub parquet: ParquetReadOptions,
     /// Decrypt files sealed by the file or jsonl sink's `encryption` block
-    /// (AES-256-GCM). JSON Lines and raw text written line by line are
-    /// opened one line at a time; every other file is opened whole. A file
-    /// that is not sealed fails the read.
+    /// (AES-256-GCM). An encrypted file is read into memory whole: JSON Lines
+    /// and raw text written line by line are then opened one line at a time,
+    /// every other file as one sealed body. A file that is not sealed fails
+    /// the read.
     #[cfg(feature = "encryption")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<faucet_core::EncryptionSpec>,

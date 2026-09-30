@@ -27,14 +27,6 @@ pub(crate) enum Failure {
     Dirty(FaucetError),
 }
 
-impl Failure {
-    pub fn into_error(self) -> FaucetError {
-        match self {
-            Self::Clean(e) | Self::Dirty(e) => e,
-        }
-    }
-}
-
 fn dirty(e: FaucetError) -> Failure {
     Failure::Dirty(e)
 }
@@ -963,13 +955,5 @@ mod tests {
             0,
             "default permissions for a non-private file"
         );
-    }
-
-    #[test]
-    fn failures_keep_their_error() {
-        let e = Failure::Clean(FaucetError::Sink("c".into())).into_error();
-        assert_eq!(e.to_string(), FaucetError::Sink("c".into()).to_string());
-        let e = Failure::Dirty(FaucetError::Sink("d".into())).into_error();
-        assert_eq!(e.to_string(), FaucetError::Sink("d".into()).to_string());
     }
 }

@@ -5,7 +5,12 @@
 //!
 //! Formats resolve per file from the extension (through a `.gz` / `.zst`
 //! suffix) unless one is set; incremental mode reads only files that are new
-//! since the previous run, by modification time or by name.
+//! since the previous run, by modification time or by name. A directory or
+//! glob skips a file sink's unfinished output: its scratch files and the swap
+//! area of an overwrite run that has not committed.
+//!
+//! **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+//! minor release; any change is called out in the changelog.
 
 pub mod config;
 #[cfg(feature = "encryption")]

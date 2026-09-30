@@ -197,7 +197,6 @@ fn default_delimiter() -> String {
 /// CSV dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(extend("x-faucet-aliases" = ["write_headers"]))]
 pub struct CsvOptions {
     /// Field separator. A single character; `"\t"` is accepted for tabs.
     #[serde(default = "default_delimiter")]
@@ -205,8 +204,8 @@ pub struct CsvOptions {
     /// Whether the first row names the fields. When false, fields are named
     /// `column_0`, `column_1`, … — the same fallback the REST source and the
     /// `csv` connector already use. On write it decides whether a header row
-    /// is written; `write_headers` is accepted as another name for it.
-    #[serde(default = "default_true", alias = "write_headers")]
+    /// is written.
+    #[serde(default = "default_true")]
     pub has_headers: bool,
     /// Quote character. A single byte; default `"`.
     #[serde(default = "default_quote")]
