@@ -566,9 +566,9 @@ jobs:
         # because the full aggregate now includes observability).
         features:
           - "full"
-          - "source-rest,sink-jsonl,sink-stdout,transforms"
-          - "observability,source-rest,sink-jsonl,sink-stdout,transforms"
-          - "otel,source-rest,sink-jsonl,sink-stdout,transforms"
+          - "source-rest,sink-file,sink-stdout,transforms"
+          - "observability,source-rest,sink-file,sink-stdout,transforms"
+          - "otel,source-rest,sink-file,sink-stdout,transforms"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
