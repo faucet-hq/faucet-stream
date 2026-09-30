@@ -62,7 +62,7 @@ pub struct CsvSinkConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[deprecated(
-    since = "1.3.0",
+    since = "1.4.0",
     note = "use faucet-sink-file: FileSinkConfig with `format: csv`, CSV options under `csv:`"
 )]
 pub enum OnUnknownField {

@@ -171,7 +171,7 @@ impl ParquetSinkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[deprecated(
-    since = "1.3.0",
+    since = "1.4.0",
     note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
 )]
 pub enum ParquetDestination {
@@ -187,7 +187,7 @@ pub enum ParquetDestination {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[deprecated(
-    since = "1.3.0",
+    since = "1.4.0",
     note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
 )]
 pub struct ParquetS3Destination {
@@ -212,7 +212,7 @@ pub struct ParquetS3Destination {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[deprecated(
-    since = "1.3.0",
+    since = "1.4.0",
     note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
 )]
 pub enum SchemaSource {
@@ -226,7 +226,7 @@ pub enum SchemaSource {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[deprecated(
-    since = "1.3.0",
+    since = "1.4.0",
     note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
 )]
 pub enum ParquetCompression {

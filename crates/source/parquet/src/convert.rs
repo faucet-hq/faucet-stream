@@ -13,7 +13,7 @@ use serde_json::Value;
 /// Encode a single Arrow `RecordBatch` as a `Vec<serde_json::Value>` where
 /// each element is the JSON object representation of one row.
 #[deprecated(
-    since = "1.4.0",
+    since = "1.5.0",
     note = "use faucet-source-file (FileSourceConfig with `format: parquet`), or faucet-source-s3 for S3 locations"
 )]
 pub fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<Value>, FaucetError> {

@@ -131,7 +131,7 @@ impl ParquetSourceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[deprecated(
-    since = "1.4.0",
+    since = "1.5.0",
     note = "use faucet-source-file (FileSourceConfig with `format: parquet`), or faucet-source-s3 for S3 locations"
 )]
 pub enum ParquetLocation {
@@ -153,7 +153,7 @@ pub enum ParquetLocation {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[deprecated(
-    since = "1.4.0",
+    since = "1.5.0",
     note = "use faucet-source-file (FileSourceConfig with `format: parquet`), or faucet-source-s3 for S3 locations"
 )]
 pub struct ParquetS3Config {

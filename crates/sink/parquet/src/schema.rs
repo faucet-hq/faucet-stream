@@ -18,7 +18,7 @@ use serde_json::Value;
 /// Non-object values in the sample are skipped (we don't have a record-shaped
 /// thing to learn from).
 #[deprecated(
-    since = "1.3.0",
+    since = "1.4.0",
     note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
 )]
 pub fn infer_schema(records: &[Value], sample_size: usize) -> Result<SchemaRef, FaucetError> {
