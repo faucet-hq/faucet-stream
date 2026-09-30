@@ -14,5 +14,5 @@ pipeline:
     type: file
     config:
       path: events.jsonl
-      mode: append
+      if_exists: append
       json_lines: { pretty: false }
