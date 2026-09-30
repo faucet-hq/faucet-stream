@@ -363,6 +363,7 @@ impl GcsSinkConfig {
 
     /// This config's write fields in the shared writer's shape, mapped by
     /// the same rules as every other file-writing sink (#783).
+    #[allow(clippy::needless_update)]
     pub fn write_config(&self) -> faucet_common_file::write::WriteConfig {
         faucet_common_file::write::WriteConfig {
             connector: "GCS sink",
