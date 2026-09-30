@@ -79,7 +79,7 @@ pipeline:
     type: file
     config:
       path: ./changes.jsonl
-      mode: append
+      if_exists: append
   state:
     type: file
     config:

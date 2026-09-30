@@ -358,7 +358,7 @@ sink:
   config:
     path: ./out/contacts/${now.date}/contacts-{part}.csv.gz
     max_records_per_file: 100000   # or max_bytes_per_file; `{part}` numbers the files
-    mode: overwrite                # an existing file is replaced; append | error_if_exists
+    if_exists: replace             # an existing file is replaced; append | error
     write_mode: overwrite          # replace the whole part set, only when the run succeeds
 ```
 
@@ -373,7 +373,7 @@ after a successful run; a failed run leaves the previous output as it was.
 Every option works with every writable format: `compression` (a Parquet or
 Avro file is compressed whole on top of its own codec), `encryption`, rollover
 by records or bytes, `{part}` templates and directories, and both write modes.
-The one refusal is `mode: append` to a single whole-document file (JSON array,
+The one refusal is `if_exists: append` to a single whole-document file (JSON array,
 XML, Excel, Avro, Parquet), which cannot be extended without a rewrite — a
 numbered output appends new parts instead. ORC is read-only and refused.
 
@@ -424,13 +424,18 @@ sink:
     parquet: { compression: zstd, row_group_size: 131072 }
 ```
 
-Each object is built locally and published with one upload when it closes —
-multipart on S3 past 8 MiB, a resumable upload on GCS, a committed block list
-on Azure, a temporary name renamed into place on SFTP — so a reader never sees
-a partial object and a bookmark never advances past one that is not there.
-Without `path` the sinks keep their original naming, a fresh
-`<run id>-<part><file_extension>` per object, so `mode` and
-`write_mode: overwrite` need a `path` to have something to replace. The
+On S3 and Azure, JSON Lines and raw text stream straight into multipart parts
+(a block list on Azure) while the object is open, so memory is about
+`concurrency` × part size and nothing is written to local disk. Every other
+format — and every format on GCS and SFTP — is built in a scratch file under
+`scratch_dir` (default: the system temp directory, so size it for your largest
+object) and uploaded when it closes: a resumable upload on GCS, a temporary
+name renamed into place on SFTP. Either way the object appears only when it is
+complete, so a reader never sees a partial object and a bookmark never advances
+past one that is not there. Without `path` each object gets a fresh name,
+`{prefix}{uuidv7}-00001{file_extension}` (numbered on rollover), so
+`if_exists` and `write_mode: overwrite` need a `path` to have something to
+replace. The
 format × option matrix that pins the local sink runs against MinIO,
 fake-gcs-server, Azurite and an SFTP server too.
 
@@ -485,12 +490,12 @@ kind and move these fields:
 | csv source `has_headers`, `delimiter`, `quote`, `flexible`, `null_values` | `csv.has_headers`, `csv.delimiter` and `csv.quote` (one-character strings: `";"` rather than `59`, `"'"` rather than `39`), `csv.flexible`, `csv.null_values` |
 | csv sink `delimiter` (a byte), `write_headers` | `csv.delimiter` (a one-character string), `csv.has_headers` |
 | csv sink `on_unknown_field` (default `warn`) | `csv.on_unknown_field` (default `widen`: a later field becomes a new column instead of being dropped) |
-| csv / jsonl sink `append: true` | `mode: append` |
+| csv / jsonl sink `append: true` | `if_exists: append` |
 | jsonl sink `pretty` | `json_lines.pretty` |
 | jsonl sink `encryption` | `encryption` |
 | parquet source `source: {type: local_path, path}` / `{type: glob, pattern}` | `path` |
 | parquet source `columns` | `parquet.columns` |
-| parquet sink `destination: {type: local_path, path}` | `path`; for a directory of numbered files use `dir/part-{part}.parquet` with `mode: append` |
+| parquet sink `destination: {type: local_path, path}` | `path`; for a directory of numbered files use `dir/part-{part}.parquet` with `if_exists: append` |
 | parquet sink `compression`, `row_group_size` | `parquet.compression`, `parquet.row_group_size` |
 | parquet sink `max_rows_per_file` | `max_records_per_file` |
 | parquet sink `schema: {type: inferred, sample_size}` | drop it: the file sink infers from every record |
@@ -512,6 +517,33 @@ Two differences to know about:
   when it is complete, so a reader never sees a half-written file. Because of
   that, two rows cannot append to the same `type: file` path at once; give each
   row its own path. The old kinds still allow it.
+
+## Behaviour changes
+
+The `file` connectors, `faucet-common-file` and the file-writing fields of the
+`s3`, `gcs`, `azure-blob` and `sftp` sinks (`path` / `file_name`, `if_exists`,
+`write_mode`, `parquet`, `json_lines`, `encryption`, `scratch_dir`) are
+**Experimental**: their shape may change in a minor release, and every change
+is listed here. Renamed keys and values keep working as aliases, and
+`faucet validate` / `faucet run` print one line naming the new spelling.
+
+- **`mode` is now `if_exists`**, with the values `replace` (default), `append`
+  and `error`. `mode:` and the values `overwrite` / `error_if_exists` still work.
+- **Removed aliases:** `csv.write_headers` (use `csv.has_headers`),
+  `max_rows_per_file` (use `max_records_per_file`) and the Parquet codec
+  `uncompressed` (use `none`).
+- **One `parquet:` block** on every file-writing sink. Only the default codec
+  differs: `snappy` on the `file` sink, `zstd` on the object-store sinks.
+- **SFTP rollover** caps each file at `min(batch_size, max_records_per_file)`,
+  like the other sinks; it used to prefer `max_records_per_file`.
+- **Default object names** on `s3`, `gcs`, `azure-blob` and `sftp` without a
+  `path` / `file_name` are `{prefix}{uuidv7}-00001{ext}` (numbered on rollover),
+  where they used to be `{prefix}{uuid}{ext}`.
+- **Object-store uploads:** S3 and Azure stream JSON Lines and raw text as
+  multipart parts again (no scratch file); other formats, and every format on
+  GCS and SFTP, are built under `scratch_dir`.
+- Internally the `write_mode: overwrite` staging area is now called the "swap"
+  area; the hidden `.faucet-overwrite-*` directory on disk is unchanged.
 
 ## See also
 
