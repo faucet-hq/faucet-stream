@@ -206,3 +206,72 @@ async fn a_byte_cap_rolls_objects_without_stranding_an_upload() {
         pending.uploads()
     );
 }
+
+/// #783: a `write_mode: overwrite` commit promotes the swap area with
+/// server-side copies and removes the previous run's objects and the swap
+/// area with batched `DeleteObjects` requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overwrite_commit_replaces_the_previous_objects() {
+    let (_c, endpoint) = start_minio().await;
+    let client = seed(&endpoint).await;
+    for i in 0..5 {
+        client
+            .put_object()
+            .bucket(TEST_BUCKET)
+            .key(format!("ow/part-{i:05}9.jsonl"))
+            .body(b"{\"stale\":true}\n".to_vec().into())
+            .send()
+            .await
+            .expect("seed stale object");
+    }
+    let cfg: S3SinkConfig = serde_json::from_value(json!({
+        "bucket": TEST_BUCKET,
+        "path": "ow/part-{part}.jsonl",
+        "write_mode": "overwrite",
+        "max_records_per_file": 2,
+    }))
+    .unwrap();
+    let sink = build_sink(&endpoint, cfg).await;
+    assert!(sink.is_overwrite());
+    sink.begin_overwrite().await.expect("begin");
+    let page: Vec<Value> = (0..5).map(|i| json!({ "id": i })).collect();
+    sink.write_batch(&page).await.expect("write");
+    sink.flush().await.expect("flush");
+    sink.commit_overwrite().await.expect("commit");
+
+    let listed = client
+        .list_objects_v2()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("list");
+    let keys: Vec<String> = listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    assert_eq!(keys.len(), 3, "three new parts and nothing else: {keys:?}");
+    let mut ids = Vec::new();
+    for key in &keys {
+        assert!(key.starts_with("ow/part-"), "{key}");
+        let body = client
+            .get_object()
+            .bucket(TEST_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .expect("get")
+            .body
+            .collect()
+            .await
+            .expect("read")
+            .into_bytes();
+        for line in String::from_utf8(body.to_vec()).unwrap().lines() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert!(v.get("stale").is_none(), "{key}: {line}");
+            ids.push(v["id"].as_i64().unwrap());
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+}
