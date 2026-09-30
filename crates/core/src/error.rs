@@ -157,6 +157,22 @@ pub enum FaucetError {
 }
 
 impl FaucetError {
+    /// A storage client's failure, typed by its HTTP status when it has one:
+    /// a 429 or 5xx becomes [`HttpStatus`](Self::HttpStatus) (so the
+    /// resilience policy retries it) with `message` as the body; anything
+    /// else, including a failure with no response, is a
+    /// [`Sink`](Self::Sink) error carrying `message`.
+    pub fn sink_status(status: Option<u16>, url: impl Into<String>, message: String) -> Self {
+        match status {
+            Some(status) if status == 429 || status >= 500 => FaucetError::HttpStatus {
+                status,
+                url: url.into(),
+                body: message,
+            },
+            _ => FaucetError::Sink(message),
+        }
+    }
+
     /// Whether this error is transient and the request should be retried.
     ///
     /// Retriable errors:
@@ -193,6 +209,22 @@ impl FaucetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_status_types_only_retryable_statuses() {
+        for status in [429, 500, 503] {
+            let e = FaucetError::sink_status(Some(status), "s3://b/k", "m".into());
+            assert!(
+                matches!(e, FaucetError::HttpStatus { status: s, ref url, ref body }
+                    if s == status && url == "s3://b/k" && body == "m")
+            );
+            assert!(e.is_retriable());
+        }
+        for status in [None, Some(403), Some(404)] {
+            let e = FaucetError::sink_status(status, "u", "m".into());
+            assert!(matches!(e, FaucetError::Sink(ref m) if m == "m"), "{e:?}");
+        }
+    }
 
     #[test]
     fn http_status_5xx_is_retriable() {
