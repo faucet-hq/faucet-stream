@@ -183,3 +183,45 @@ jobs:
             fi
             attempt=$(( attempt + 1 ))
           done
+
+      # crates.io makes the publishing account the only owner of a brand-new
+      # crate. Add the org team to every crate this run released (its
+      # `<crate>-v<version>` tag points at this commit), so each crate is owned
+      # by both the publisher and github:faucet-hq:owners. Runs after a failed
+      # publish too, because a partial release still published some crates.
+      # Needs CARGO_REGISTRY_TOKEN with the change-owners scope, owned by a
+      # member of the faucet-hq/owners GitHub team.
+      - name: Add github:faucet-hq:owners to the crates this run released
+        if: ${{ !cancelled() }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          TEAM: github:faucet-hq:owners
+          UA: faucet-stream release (https://github.com/faucet-hq/faucet-stream)
+        run: |
+          git fetch --quiet --force --tags origin
+          mapfile -t crates < <(git tag --points-at "$GITHUB_SHA" | sed -nE 's/^(.+)-v[0-9]+\.[0-9]+\.[0-9]+.*$/\1/p' | sort -u)
+          if [ "${#crates[@]}" -eq 0 ]; then
+            echo "No crates released at $GITHUB_SHA."
+            exit 0
+          fi
+          failed=0
+          for crate in "${crates[@]}"; do
+            owners=$(curl -fsS -A "$UA" "https://crates.io/api/v1/crates/${crate}/owners" | jq -r '.users[].login') || {
+              echo "::error::${crate}: could not read its crates.io owners"
+              failed=$((failed + 1))
+              continue
+            }
+            if grep -qxF "$TEAM" <<<"$owners"; then
+              echo "${crate}: already owned by ${TEAM}"
+            elif cargo owner --add "$TEAM" "$crate"; then
+              echo "${crate}: added ${TEAM}"
+            else
+              echo "::error::${crate}: cargo owner --add ${TEAM} failed"
+              failed=$((failed + 1))
+            fi
+            sleep 1
+          done
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::${failed} released crate(s) still lack ${TEAM}. CARGO_REGISTRY_TOKEN needs the change-owners scope and must belong to a member of that team."
+            exit 1
+          fi
