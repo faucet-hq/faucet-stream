@@ -65,7 +65,8 @@ impl DeltaSource {
         let state = table
             .snapshot()
             .map_err(|e| FaucetError::Source(format!("delta: table has no snapshot: {e}")))?;
-        let arrow_schema = state.snapshot().arrow_schema();
+        let arrow_schema =
+            faucet_common_delta::arrow_bridge::schema_from_delta(&state.snapshot().arrow_schema())?;
         let partition_cols = state.metadata().partition_columns().to_vec();
 
         let paths = table

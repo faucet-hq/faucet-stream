@@ -76,6 +76,15 @@ pub fn infer_arrow_schema(records: &[Value], sample_size: usize) -> Result<Schem
     Ok(Arc::new(force_nullable(raw)))
 }
 
+/// [`infer_arrow_schema`] in the Arrow version `deltalake` writes with — the
+/// schema the Delta sink creates tables and decodes batches against.
+pub fn infer_delta_schema(
+    records: &[Value],
+    sample_size: usize,
+) -> Result<deltalake::arrow::datatypes::SchemaRef, FaucetError> {
+    crate::arrow_bridge::schema_to_delta(infer_arrow_schema(records, sample_size)?.as_ref())
+}
+
 /// Recursively force every field in the schema to be nullable.
 fn force_nullable(schema: Schema) -> Schema {
     let metadata = schema.metadata.clone();
@@ -166,6 +175,19 @@ mod tests {
             schema.field_with_name("x").unwrap().data_type(),
             &DataType::Float64
         );
+    }
+
+    #[test]
+    fn delta_schema_matches_workspace_inference() {
+        let records = vec![json!({"id": 1, "meta": {"a": "z"}, "tags": [1.5]})];
+        let delta = infer_delta_schema(&records, 10).unwrap();
+        let workspace = infer_arrow_schema(&records, 10).unwrap();
+        assert_eq!(
+            crate::arrow_bridge::schema_from_delta(&delta).unwrap(),
+            workspace
+        );
+        assert!(delta.fields().iter().all(|f| f.is_nullable()));
+        assert!(infer_delta_schema(&[], 10).is_err());
     }
 
     #[test]

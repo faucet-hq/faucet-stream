@@ -13,9 +13,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use deltalake::arrow::array::Int64Array;
+use deltalake::arrow::datatypes::{DataType, Field, Schema};
+use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::kernel::StructType;
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake::operations::create::CreateBuilder;

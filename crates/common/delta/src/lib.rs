@@ -23,6 +23,7 @@
 //! All config types derive `Serialize`, `Deserialize`, and `JsonSchema` so they
 //! round-trip through YAML/JSON configs and CLI introspection.
 
+pub mod arrow_bridge;
 pub mod connection;
 pub mod convert;
 pub mod credentials;
