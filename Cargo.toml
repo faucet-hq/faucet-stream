@@ -396,6 +396,10 @@ object_store = "0.13"
 # enabled — append uses the low-level RecordBatchWriter and reads enumerate
 # active parquet files directly, keeping the dependency tree slim.
 deltalake = { version = "0.32.4", default-features = false, features = ["rustls"] }
+# deltalake 0.32.4 pulls buoyant_kernel 0.22, which accepts any derive 1.x but
+# breaks on 1.2.0 (removed parse_column_name). Hold it below 1.2 until the
+# deltalake 1.x upgrade (#795).
+buoyant_kernel_derive = ">=1.0, <1.2"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 flate2 = "1"
 zstd = "0.13"
