@@ -344,6 +344,20 @@ jobs:
           cargo build -p faucet-cli --no-default-features --features full
           ./target/debug/faucet conformance --export --require-all > connectors.json
           gh release upload "${{ needs.plan.outputs.tag }}" connectors.json --clobber
+      # notify-site fires minutes after the release burst, long before this
+      # job finishes, so that rebuild still reads the previous feed. Rebuild
+      # the site again now that the feed is attached.
+      - name: Rebuild the site with the new connector feed
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN || secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::Set SITE_DISPATCH_TOKEN (or RELEASE_PLZ_TOKEN) with contents:write on faucet-hq/faucet-hq.github.io; the site picks up the feed at its next scheduled build"
+            exit 0
+          fi
+          gh api --method POST repos/faucet-hq/faucet-hq.github.io/dispatches \
+            -f event_type=faucet-release \
+            -f "client_payload[tag]=${{ needs.plan.outputs.tag }}"
 
   publish-homebrew-formula:
     needs:

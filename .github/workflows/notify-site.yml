@@ -4,6 +4,10 @@ name: Notify site of a release
 # site's /changelog (built from these GitHub releases) shows it immediately
 # instead of at the site's next scheduled rebuild.
 #
+# The Connector Hub feed (connectors.json) is attached to the CLI release
+# much later, by release-binaries.yml's connector-export job, which sends
+# its own dispatch once the upload lands.
+#
 # release-plz publishes one GitHub release per crate, so a single release of
 # the project fires this dozens of times. The concurrency group plus the short
 # wait below collapse that burst into one dispatch after the last release.
