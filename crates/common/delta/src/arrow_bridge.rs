@@ -19,13 +19,13 @@ pub fn schema_from_delta(
     let mut buf = Vec::new();
     {
         let mut writer = delta_arrow::ipc::writer::StreamWriter::try_new(&mut buf, schema)
-            .map_err(|e| bridge_error("encode Delta schema", e))?;
+            .map_err(|e| bridge_error("encode Delta schema", &e))?;
         writer
             .finish()
-            .map_err(|e| bridge_error("encode Delta schema", e))?;
+            .map_err(|e| bridge_error("encode Delta schema", &e))?;
     }
     let reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(buf), None)
-        .map_err(|e| bridge_error("decode Delta schema", e))?;
+        .map_err(|e| bridge_error("decode Delta schema", &e))?;
     Ok(reader.schema())
 }
 
@@ -36,13 +36,13 @@ pub fn schema_to_delta(
     let mut buf = Vec::new();
     {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, schema)
-            .map_err(|e| bridge_error("encode schema", e))?;
+            .map_err(|e| bridge_error("encode schema", &e))?;
         writer
             .finish()
-            .map_err(|e| bridge_error("encode schema", e))?;
+            .map_err(|e| bridge_error("encode schema", &e))?;
     }
     let reader = delta_arrow::ipc::reader::StreamReader::try_new(Cursor::new(buf), None)
-        .map_err(|e| bridge_error("decode schema", e))?;
+        .map_err(|e| bridge_error("decode schema", &e))?;
     Ok(reader.schema())
 }
 
@@ -53,24 +53,31 @@ pub fn batch_to_delta(
     let mut buf = Vec::new();
     {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
-            .map_err(|e| bridge_error("encode batch", e))?;
+            .map_err(|e| bridge_error("encode batch", &e))?;
         writer
             .write(batch)
-            .map_err(|e| bridge_error("encode batch", e))?;
+            .map_err(|e| bridge_error("encode batch", &e))?;
         writer
             .finish()
-            .map_err(|e| bridge_error("encode batch", e))?;
+            .map_err(|e| bridge_error("encode batch", &e))?;
     }
     let mut reader = delta_arrow::ipc::reader::StreamReader::try_new(Cursor::new(buf), None)
-        .map_err(|e| bridge_error("decode batch", e))?;
-    match reader.next() {
-        Some(batch) => batch.map_err(|e| bridge_error("decode batch", e)),
-        None => Err(bridge_error("decode batch", "the stream held no batch")),
+        .map_err(|e| bridge_error("decode batch", &e))?;
+    first_batch(reader.next())
+}
+
+/// The single batch a one-batch IPC stream decodes to.
+fn first_batch(
+    next: Option<Result<delta_arrow::record_batch::RecordBatch, delta_arrow::error::ArrowError>>,
+) -> Result<delta_arrow::record_batch::RecordBatch, FaucetError> {
+    match next {
+        Some(batch) => batch.map_err(|e| bridge_error("decode batch", &e)),
+        None => Err(bridge_error("decode batch", &"the stream held no batch")),
     }
 }
 
-fn bridge_error(what: &str, e: impl std::fmt::Display) -> FaucetError {
-    FaucetError::Custom(format!("delta: arrow bridge could not {what}: {e}").into())
+fn bridge_error(what: &str, detail: &dyn std::fmt::Display) -> FaucetError {
+    FaucetError::Custom(format!("delta: arrow bridge could not {what}: {detail}").into())
 }
 
 #[cfg(test)]
@@ -188,11 +195,19 @@ mod tests {
     }
 
     #[test]
-    fn bridge_errors_name_the_step() {
-        let err = bridge_error("decode batch", "boom").to_string();
+    fn a_stream_without_a_batch_is_an_error() {
+        let err = first_batch(None).unwrap_err().to_string();
         assert!(
-            err.contains("arrow bridge could not decode batch: boom"),
+            err.contains("arrow bridge could not decode batch: the stream held no batch"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_batch_that_fails_to_decode_is_an_error() {
+        let decode = delta_arrow::error::ArrowError::IpcError("truncated".into());
+        let err = first_batch(Some(Err(decode))).unwrap_err().to_string();
+        assert!(err.contains("arrow bridge could not decode batch"), "{err}");
+        assert!(err.contains("truncated"), "{err}");
     }
 }
