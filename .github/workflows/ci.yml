@@ -769,24 +769,17 @@ jobs:
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          # Temporarily unguarded (2026-09-21): these five cannot be *built* at
-          # all under a fresh dependency resolution, so there is no API to
-          # compare. `deltalake 0.32.4` (the latest) pulls `buoyant_kernel
-          # 0.22.2`, which declares `buoyant_kernel_derive ^1`; upstream then
-          # published `buoyant_kernel_derive 1.2.0`, a *minor* release that
-          # removed the `parse_column_name!` macro the 0.22 line calls.
+          # Temporarily unguarded (2026-09-21): the published versions of these
+          # five cannot be *built* under a fresh dependency resolution, so
+          # there is no baseline API to compare against. They used
+          # `deltalake 0.32.4`, whose `buoyant_kernel 0.22.2` declares
+          # `buoyant_kernel_derive ^1`; upstream's `buoyant_kernel_derive 1.2.0`
+          # removed the `parse_column_name!` macro the 0.22 line calls (#794).
           #
-          # Our committed `Cargo.lock` holds 1.1.0, so every other job is green.
-          # cargo-semver-checks builds each crate from a generated manifest
-          # rather than the workspace lockfile, re-resolves, and takes 1.2.0.
-          # A `=1.1.0` pin does not reach it (tried as a dev-dependency in
-          # d7abb758 and reverted — dev-deps are not in that manifest), and the
-          # only pin that would means adding an unused runtime dependency to
-          # five published crates, which every downstream user would then see.
-          #
-          # Excluding them is internal, reversible, and honest about what is
-          # unguarded. Restore the moment upstream yanks 1.2.0 or `deltalake`
-          # moves to the `buoyant_kernel` 0.28 line that pairs with it.
+          # #795 moves the Delta crates to `deltalake 1.x` (the
+          # `buoyant_kernel` 0.28 line built for derive 1.2), so the *current*
+          # code builds again. Restore these five once that release is
+          # published: it becomes the baseline, and it builds.
           #
           # The RabbitMQ (#561), Oracle (#710), Iceberg source (#711), DynamoDB
           # (#712) and Databricks sink (#713) crates are new and have no

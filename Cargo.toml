@@ -395,11 +395,7 @@ object_store = "0.13"
 # matching the workspace arrow/parquet pins. datafusion is deliberately NOT
 # enabled — append uses the low-level RecordBatchWriter and reads enumerate
 # active parquet files directly, keeping the dependency tree slim.
-deltalake = { version = "0.32.4", default-features = false, features = ["rustls"] }
-# deltalake 0.32.4 pulls buoyant_kernel 0.22, which accepts any derive 1.x but
-# breaks on 1.2.0 (removed parse_column_name). Hold it below 1.2 until the
-# deltalake 1.x upgrade (#795).
-buoyant_kernel_derive = ">=1.0, <1.2"
+deltalake = { version = "1.1.0", default-features = false, features = ["rustls"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 flate2 = "1"
 zstd = "0.13"

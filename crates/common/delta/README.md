@@ -13,7 +13,13 @@ Provides:
   `storage_options` block (flattened into both connector configs) plus the
   open-table, time-travel, storage-option, and handler-registration helpers.
 - **`convert`** — Arrow ⇆ JSON conversion (`record_batch_to_json`,
-  `infer_arrow_schema`) reused by the source (read) and sink (write).
+  `infer_arrow_schema`, and `infer_delta_schema` for the Arrow version
+  `deltalake` writes with) reused by the source (read) and sink (write).
+- **`arrow_bridge`** — `deltalake` 1.x is built on a newer Arrow major than the
+  rest of faucet-stream. `schema_from_delta`, `schema_to_delta` and
+  `batch_to_delta` carry schemas and batches across through the Arrow IPC
+  format, which preserves nested types, dictionaries, timezones, metadata and
+  nulls. A batch crossing costs one buffer copy.
 
 Cloud object-store backends are opt-in cargo features (`s3`, `azure`, `gcs`)
 that forward to the matching delta-rs feature; the default build supports the

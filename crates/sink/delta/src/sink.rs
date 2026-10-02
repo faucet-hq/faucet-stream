@@ -16,15 +16,16 @@
 
 use std::collections::HashSet;
 
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use deltalake::DeltaTable;
+use deltalake::arrow::datatypes::SchemaRef;
+use deltalake::arrow::json::ReaderBuilder;
+use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::kernel::StructType;
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
-use faucet_common_delta::convert::infer_arrow_schema;
+use faucet_common_delta::convert::infer_delta_schema;
 use faucet_core::{FaucetError, WriteMode};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -93,7 +94,7 @@ impl DeltaSink {
         records: &[Value],
     ) -> Result<(), FaucetError> {
         if state.schema.is_none() {
-            let schema = infer_arrow_schema(records, self.config.effective_sample_size())?;
+            let schema = infer_delta_schema(records, self.config.effective_sample_size())?;
             state.schema = Some(schema);
         }
         let schema = state.schema.clone().expect("schema set above");
@@ -181,7 +182,7 @@ impl DeltaSink {
     ) -> Result<RecordBatch, FaucetError> {
         warn_on_unknown_fields(warned_fields, &schema, records);
 
-        let mut decoder = arrow_json::ReaderBuilder::new(schema.clone())
+        let mut decoder = ReaderBuilder::new(schema.clone())
             .build_decoder()
             .map_err(|e| FaucetError::Sink(format!("delta: could not build json decoder: {e}")))?;
         decoder.serialize(records).map_err(|e| {
@@ -367,10 +368,14 @@ impl faucet_core::Sink for DeltaSink {
     /// first records); partition columns must be present in the batch (the Delta
     /// source appends them), matching the JSON path's create-table contract.
     #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(&self, batch: &RecordBatch) -> Result<usize, FaucetError> {
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<usize, FaucetError> {
         if batch.num_rows() == 0 {
             return Ok(0);
         }
+        let batch = faucet_common_delta::arrow_bridge::batch_to_delta(batch)?;
         let mut state = self.state.lock().await;
         if state.schema.is_none() {
             state.schema = Some(batch.schema());
@@ -380,7 +385,7 @@ impl faucet_core::Sink for DeltaSink {
         let rows = batch.num_rows();
         let writer = state.writer.as_mut().expect("writer set");
         writer
-            .write(batch.clone())
+            .write(batch)
             .await
             .map_err(|e| FaucetError::Sink(format!("delta: columnar write failed: {e}")))?;
         state.pending = true;

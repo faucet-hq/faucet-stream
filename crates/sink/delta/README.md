@@ -37,7 +37,9 @@ Cloud backends require the matching crate feature: `s3`, `azure`, `gcs`.
 The **`arrow`** feature opts this sink into the columnar fast path (#375): when
 the source is also Arrow-capable (e.g. `faucet-source-parquet` /
 `faucet-source-delta`), batches are written straight through delta-rs's
-`RecordBatchWriter` with no `serde_json::Value` materialization.
+`RecordBatchWriter` with no `serde_json::Value` materialization. delta-rs uses a
+newer Arrow major than the rest of faucet-stream, so each incoming batch is
+converted once through the Arrow IPC format (one buffer copy) on its way in.
 
 ```yaml
 pipeline:
