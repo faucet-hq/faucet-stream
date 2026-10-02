@@ -174,6 +174,11 @@ and `build` commits are included in the changelog body for completeness but do
 not trigger a version bump (`release_commits` filter in `release-plz.toml`). A
 README-only edit never causes a spurious publish.
 
+**Crate ownership.** crates.io makes the publishing account the only owner of
+a brand-new crate. After publishing, the release job adds the
+`github:faucet-hq:owners` team to every crate it released, so each crate is
+owned by both the publisher and the team.
+
 **Manual fallback.** `.github/workflows/release.yml` (`Release (manual fallback)`)
 is kept as a `workflow_dispatch` workflow for ad-hoc / bulk re-publishes (e.g.
 after a registry incident, or to re-publish all 46 crates from a known-good
@@ -189,8 +194,10 @@ release-plz release    --dry-run     # prints what it would publish, in order
 ```
 
 **Tokens required (configured in repo Settings → Secrets).**
-- `CARGO_REGISTRY_TOKEN` — crates.io API token with publish scope for every
-  `faucet-*` crate.
+- `CARGO_REGISTRY_TOKEN` — crates.io API token with the `publish-new`,
+  `publish-update` and `change-owners` scopes for every `faucet-*` crate,
+  owned by a member of the `faucet-hq/owners` GitHub team. `change-owners` is
+  what lets the release job add the team to new crates.
 - `RELEASE_PLZ_TOKEN` (optional but recommended) — a PAT or GitHub App token
   with `contents: write` + `pull-requests: write`. Without it the release PR
   is opened by the default `GITHUB_TOKEN`, which by GitHub policy does **not**
