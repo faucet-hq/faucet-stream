@@ -316,7 +316,8 @@ gcloud-gax = "1.4"
 # stack (avoids the dual-jwt compile_error in gcloud-auth).
 gcloud-pubsub = { version = "1", default-features = false, features = ["auth", "rustls-tls", "jwt-rust-crypto"] }
 gcloud-auth = { version = "1", default-features = false, features = ["rustls-tls", "jwt-rust-crypto"] }
-aws-sdk-kinesis = "1"
+# 1.125: `Record::partition_key()` returns `Option<&str>`.
+aws-sdk-kinesis = "1.125"
 aws-sdk-dynamodb = "1"
 aws-sdk-dynamodbstreams = "1"
 aws-sdk-s3 = "1"

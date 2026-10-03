@@ -100,7 +100,7 @@ pub(crate) fn decode_payload(
 /// Assemble the emitted record: decoded payload + Kinesis metadata. Pure.
 pub(crate) fn assemble_record(
     payload: Value,
-    partition_key: &str,
+    partition_key: Option<&str>,
     sequence: &str,
     shard_id: &str,
     arrival_ms: Option<i64>,
@@ -445,7 +445,7 @@ mod tests {
     fn record_assembly_shape() {
         let r = assemble_record(
             serde_json::json!({"x": 1}),
-            "user-7",
+            Some("user-7"),
             "495",
             "shardId-000000000002",
             Some(1_716_700_000_123),
@@ -455,5 +455,12 @@ mod tests {
         assert_eq!(r["sequence_number"], "495");
         assert_eq!(r["shard_id"], "shardId-000000000002");
         assert_eq!(r["approximate_arrival_timestamp_ms"], 1_716_700_000_123i64);
+    }
+
+    #[test]
+    fn record_without_a_partition_key_carries_null() {
+        let r = assemble_record(serde_json::json!({"x": 1}), None, "495", "s", None);
+        assert!(r["partition_key"].is_null());
+        assert_eq!(r["sequence_number"], "495");
     }
 }
