@@ -104,7 +104,7 @@ impl IntegrityCheck for Md5RawCheck {
     fn finalize(self: Box<Self>, _total: u64) -> Result<(), String> {
         use md5::Digest as _;
         let got = self.hasher.finalize();
-        if got.as_slice() == self.expected.as_slice() {
+        if got[..] == self.expected[..] {
             Ok(())
         } else {
             Err(

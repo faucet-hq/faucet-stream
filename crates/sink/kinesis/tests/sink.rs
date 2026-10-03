@@ -103,7 +103,7 @@ async fn read_all(client: &aws_sdk_kinesis::Client, stream: &str) -> Vec<(String
             for r in resp.records() {
                 out.push((
                     shard.shard_id().to_string(),
-                    r.partition_key().to_string(),
+                    r.partition_key().unwrap_or_default().to_string(),
                     serde_json::from_slice(r.data().as_ref()).expect("json payload"),
                 ));
             }
