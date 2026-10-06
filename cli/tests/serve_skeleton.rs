@@ -50,6 +50,7 @@ fn test_config(listen: &str) -> ServeConfig {
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     ServeConfig::from_args(args).unwrap()
 }

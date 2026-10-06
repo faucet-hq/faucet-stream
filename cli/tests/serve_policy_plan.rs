@@ -1,7 +1,7 @@
 //! Control-plane tests for data-flow policies (#702) and plan / impact (#707):
 //! `faucet serve --policy` refuses a violating submission (422 + a
 //! `policy.denied` audit entry), warns on a violating template registration,
-//! audits a runtime backstop denial, serves `POST /v1/plan` to a viewer, and
+//! audits a runtime backstop denial, serves `POST /v1/plan` to an operator, and
 //! annotates datasets with owners / consumers (`operator`+) that
 //! `POST /v1/plan { impact: true }` then reports.
 #![cfg(all(
@@ -93,6 +93,7 @@ fn serve_args(
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     }
 }
 
@@ -263,10 +264,19 @@ async fn policy_refuses_submissions_warns_on_templates_and_audits_runtime_denial
     assert_eq!(runtime["run_id"], rec["run_id"]);
     assert!(runtime["result"].as_str().unwrap().starts_with("denied"));
 
-    // A viewer can plan the violating config: the verdict is in the report.
+    // Planning loads the config on the server, so a viewer is refused…
     let resp = client
         .post(format!("{base}/v1/plan"))
         .bearer_auth("viewer-tok")
+        .json(&json!({ "config": violating }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    // …and an operator plans the violating config: the verdict is in the report.
+    let resp = client
+        .post(format!("{base}/v1/plan"))
+        .bearer_auth("op-tok")
         .json(&json!({ "config": violating, "sample": [{ "id": "1", "email": "a@x.io" }] }))
         .send()
         .await
@@ -443,7 +453,7 @@ async fn consumers_endpoint_and_plan_impact_over_chained_pipelines() {
     // is breaking, its contract v3 is named, its owner + the dashboard listed.
     let resp = client
         .post(format!("{base}/v1/plan"))
-        .bearer_auth("viewer-tok")
+        .bearer_auth("op-tok")
         .json(&json!({
             "config": a,
             "sample": [{ "id": "1", "amount": "10" }],
@@ -476,7 +486,7 @@ async fn consumers_endpoint_and_plan_impact_over_chained_pipelines() {
     // Adding a column is additive and stops at A's own sink.
     let resp = client
         .post(format!("{base}/v1/plan"))
-        .bearer_auth("viewer-tok")
+        .bearer_auth("op-tok")
         .json(&json!({
             "config": a,
             "sample": [{ "id": "1", "email": "a@x.io", "amount": "10", "country": "fr" }],

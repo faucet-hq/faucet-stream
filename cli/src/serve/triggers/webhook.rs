@@ -101,7 +101,7 @@ pub async fn handle(
                 retry_after_secs: 5,
             })
         }
-        FireOutcome::Error(msg) => {
+        FireOutcome::Error(msg) | FireOutcome::Failed(msg) => {
             state
                 .triggers()
                 .record_err(&name, msg.clone(), super::watcher::UNHEALTHY_THRESHOLD);

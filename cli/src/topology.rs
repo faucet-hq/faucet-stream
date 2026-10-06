@@ -577,7 +577,7 @@ async fn build_topology_inner(
                         }
                         .map(|b| b.attributes.clone())
                         .unwrap_or_default();
-                        Box::new(faucet_core::PolicySink::new(
+                        let policy_sink = faucet_core::PolicySink::new(
                             sink,
                             std::sync::Arc::new(compiled),
                             faucet_core::SinkFacts {
@@ -589,7 +589,17 @@ async fn build_topology_inner(
                                 pipeline: cfg.name.clone().unwrap_or_default(),
                                 row: (*id).clone(),
                             },
-                        )) as Box<_>
+                        );
+                        Box::new(match cfg.pipeline.masking.as_ref() {
+                            Some(masking) => policy_sink.with_masking(std::sync::Arc::new(
+                                faucet_core::CompiledMasking::compile_for_sink(
+                                    masking,
+                                    &[id.as_str(), template_name, k.as_str()],
+                                )
+                                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
+                            )),
+                            None => policy_sink,
+                        }) as Box<_>
                     }
                     _ => sink,
                 };
@@ -745,11 +755,14 @@ pub async fn preview_records(
                 "source",
             )?;
             let source = build_source(&k, c, auth, None).await?;
-            let records = source.fetch_all().await?;
-            out.push((
-                id.clone(),
-                records.into_iter().take(limit).collect::<Vec<_>>(),
-            ));
+            let sample = crate::preview_sample::sample(
+                source.as_ref(),
+                &[],
+                limit,
+                crate::preview_sample::PREVIEW_TIMEOUT,
+            )
+            .await?;
+            out.push((id.clone(), sample.records));
         }
     }
     if out.is_empty() {

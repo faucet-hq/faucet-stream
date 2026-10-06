@@ -12,7 +12,10 @@
 //! forced to `at_least_once` (pair with `write_mode: upsert` for idempotent
 //! replays). Deterministic idempotency keys (`backfill:{hash}:{unit}`) make
 //! re-POSTing the same backfill replay-safe: already-submitted units are
-//! replayed, unsubmitted ones proceed — the API-level resume.
+//! replayed, unsubmitted ones proceed. With a `state:` block, a range that was
+//! submitted before is refused unless the request says `resume` (continue it)
+//! or `restart` (clear each unit's state and run it again), because each unit
+//! would otherwise resume its old bookmark and read nothing.
 //!
 //! Bookmark-range backfills (`--from-bookmark`) are CLI-only: they seed
 //! scoped state and wrap the source in-process, which a fire-and-forget
@@ -69,6 +72,35 @@ pub struct BackfillSubmitRequest {
     /// would leave them waiting forever.
     #[serde(default)]
     pub callback: Option<crate::serve::callback::CallbackSpec>,
+    /// Continue a backfill of this exact range that was submitted before:
+    /// already-submitted units replay, the rest are submitted.
+    #[serde(default)]
+    pub resume: bool,
+    /// Run a previously submitted range again from scratch: each unit's scoped
+    /// state is deleted and every unit is submitted as a new run.
+    #[serde(default)]
+    pub restart: bool,
+}
+
+/// The durable record that a range was submitted, kept in the pipeline's state
+/// store so a later re-POST cannot silently resume each unit's old bookmark.
+#[derive(Debug, Serialize, Deserialize)]
+struct SubmittedRange {
+    descriptor: String,
+    submitted_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    generation: u32,
+}
+
+fn submitted_range_key(base_name: &str, hash: &str) -> String {
+    format!("{base_name}::__serve_backfill__::{hash}")
+}
+
+fn unit_idempotency_key(hash: &str, generation: u32, unit: &str) -> String {
+    match generation {
+        0 => format!("backfill:{hash}:{unit}"),
+        g => format!("backfill:{hash}:g{g}:{unit}"),
+    }
 }
 
 /// One planned unit's submission outcome.
@@ -126,6 +158,13 @@ pub async fn submit_backfill(
         });
     }
 
+    if req.resume && req.restart {
+        return Err(ServeError::Unprocessable {
+            message: "`resume` and `restart` are mutually exclusive".to_string(),
+            details: None,
+        });
+    }
+
     // Validate the config loads/expands and gate the window scoping exactly
     // like the CLI: every root's source must reference a `${backfill.*}` /
     // `${now.*}` token or each unit would replay identical data.
@@ -134,6 +173,7 @@ pub async fn submit_backfill(
         req.config_format.into(),
         state.default_base().as_ref(),
         crate::serve::runner::server_policy(&state).as_deref(),
+        state.caller_origin(),
     )
     .await?;
     let unscoped: Vec<&str> = loaded
@@ -182,6 +222,9 @@ pub async fn submit_backfill(
     );
     let hash = range_hash(&descriptor);
 
+    let generation =
+        guard_prior_range(&loaded, &req, &base_name, &hash, &descriptor, &units).await?;
+
     // Parse the RAW submitted document once; each unit rewrites a copy. The
     // raw body (not the default-merged config) is submitted so the runner's
     // own merge/validate path applies per unit.
@@ -210,7 +253,7 @@ pub async fn submit_backfill(
                 end: unit.end.to_rfc3339(),
                 status: "not_submitted".into(),
                 run_id: None,
-                error: Some("run queue full — re-POST the same request to continue".into()),
+                error: Some(QUEUE_FULL.into()),
             });
             continue;
         }
@@ -228,7 +271,7 @@ pub async fn submit_backfill(
             timeout_secs: req.timeout_secs,
             doctor_first: false,
             callback: None,
-            idempotency_key: Some(format!("backfill:{hash}:{}", unit.id)),
+            idempotency_key: Some(unit_idempotency_key(&hash, generation, &unit.id)),
             clock: Some(unit.start.to_rfc3339()),
             concurrency: None,
             require_approval: false,
@@ -236,6 +279,7 @@ pub async fn submit_backfill(
             budget: None,
             approved_change: None,
             selection: None,
+            trusted_config: false,
         };
         match runner::submit(state.clone(), submit, actor.clone()).await {
             Ok(resp) => {
@@ -259,7 +303,7 @@ pub async fn submit_backfill(
                     end: unit.end.to_rfc3339(),
                     status: "not_submitted".into(),
                     run_id: None,
-                    error: Some("run queue full — re-POST the same request to continue".into()),
+                    error: Some(QUEUE_FULL.into()),
                 });
             }
             Err(other) => return Err(other),
@@ -276,6 +320,91 @@ pub async fn submit_backfill(
             units: reports,
         }),
     ))
+}
+
+const QUEUE_FULL: &str =
+    "run queue full — re-POST the same request with `\"resume\": true` to continue";
+
+/// Refuse a range that was submitted before unless the caller chose `resume`
+/// or `restart` (audit #789 SERVE-13, the serve side of #321 H3). Without a
+/// `state:` block no unit keeps a bookmark, so a re-run is always fresh and
+/// nothing is recorded. Returns the idempotency-key generation to submit with.
+async fn guard_prior_range(
+    loaded: &crate::serve::load::LoadedSubmission,
+    req: &BackfillSubmitRequest,
+    base_name: &str,
+    hash: &str,
+    descriptor: &str,
+    units: &[crate::backfill::plan::BackfillUnit],
+) -> Result<u32, ServeError> {
+    let roots: Vec<&crate::expand::ExpandedNode> = loaded
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
+        .collect();
+    let Some(spec) = roots.iter().find_map(|n| n.state.as_ref()) else {
+        return Ok(0);
+    };
+    let internal = |e: crate::error::CliError| ServeError::Internal(e.to_string());
+    let store = crate::state::build_state_store(spec)
+        .await
+        .map_err(internal)?;
+    let key = submitted_range_key(base_name, hash);
+    let prior = match store
+        .get(&key)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?
+    {
+        Some(v) => Some(
+            serde_json::from_value::<SubmittedRange>(v)
+                .map_err(|e| ServeError::Internal(format!("backfill range marker: {e}")))?,
+        ),
+        None => None,
+    };
+    let generation = match prior {
+        None => 0,
+        Some(p) if req.resume => return Ok(p.generation),
+        Some(p) if req.restart => {
+            for node in &roots {
+                let Some(node_spec) = node.state.as_ref() else {
+                    continue;
+                };
+                let node_store = crate::state::build_state_store(node_spec)
+                    .await
+                    .map_err(internal)?;
+                for unit in units {
+                    let unit_name = format!("{base_name}-backfill-{}", unit.id);
+                    node_store
+                        .delete(&crate::executor::build_state_key(
+                            &unit_name, &node.id, None,
+                        ))
+                        .await
+                        .map_err(|e| ServeError::Internal(e.to_string()))?;
+                }
+            }
+            p.generation + 1
+        }
+        Some(p) => {
+            return Err(ServeError::Conflict(format!(
+                "this range was already backfilled (submitted {}); each unit would resume \
+                 from its old bookmark and read nothing — pass `\"resume\": true` to continue \
+                 that backfill or `\"restart\": true` to clear each unit's state and run it again",
+                p.submitted_at.to_rfc3339()
+            )));
+        }
+    };
+    let marker = SubmittedRange {
+        descriptor: descriptor.to_string(),
+        submitted_at: chrono::Utc::now(),
+        generation,
+    };
+    let value = serde_json::to_value(&marker)
+        .map_err(|e| ServeError::Internal(format!("backfill range marker: {e}")))?;
+    store
+        .put(&key, &value)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    Ok(generation)
 }
 
 /// Rewrite the submitted document for one unit: substitute `${backfill.*}`
@@ -334,6 +463,17 @@ mod tests {
         );
         // The rewritten document is itself a loadable pipeline config.
         crate::config::parse_with_extension(&out, "yaml").expect("unit doc parses");
+    }
+
+    #[test]
+    fn a_restart_generation_gives_every_unit_a_fresh_key() {
+        assert_eq!(unit_idempotency_key("h", 0, "u"), "backfill:h:u");
+        assert_eq!(unit_idempotency_key("h", 2, "u"), "backfill:h:g2:u");
+        assert_eq!(
+            submitted_range_key("orders", "h"),
+            "orders::__serve_backfill__::h"
+        );
+        faucet_core::state::validate_state_key(&submitted_range_key("orders", "h")).unwrap();
     }
 
     #[test]

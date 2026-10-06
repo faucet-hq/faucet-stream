@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+pub use faucet_common_singer::InheritEnv;
 use faucet_core::{FaucetError, JsonSchema, Value, WriteMode, WriteSpec};
 use serde::{Deserialize, Serialize};
 
@@ -48,9 +49,18 @@ pub struct SingerSinkConfig {
     #[serde(default = "empty_object")]
     pub target_config: Value,
 
-    /// Extra environment variables for the target process.
+    /// Extra environment variables for the target process, set on top of
+    /// whatever `inherit_env` passes.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// Which of faucet's environment variables the target receives: `true`
+    /// (default) the whole environment, `false` only `PATH`, `HOME`, `LANG`,
+    /// `LC_ALL` and `TMPDIR`, or a list of variable names passed on top of
+    /// that baseline. Set it to keep faucet's own credentials away from the
+    /// target.
+    #[serde(default)]
+    pub inherit_env: InheritEnv,
 
     /// The Singer stream name records are sent under. The `faucet` CLI fills
     /// it from the matrix row id (or the pipeline name for a single-row
@@ -115,6 +125,7 @@ impl SingerSinkConfig {
             args: Vec::new(),
             target_config: empty_object(),
             env: BTreeMap::new(),
+            inherit_env: InheritEnv::default(),
             stream: None,
             schema: None,
             key_properties: None,

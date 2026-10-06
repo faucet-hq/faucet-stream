@@ -238,6 +238,10 @@ pub struct ChangeRequest {
     /// tenant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The proposed run's config was written by the server's operator (a
+    /// registered template), not by the requester. Set by the server only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trusted_config: bool,
 }
 
 impl ChangeRequest {
@@ -249,10 +253,39 @@ impl ChangeRequest {
         self
     }
 
+    /// The record as `actor` may read it: a callback's headers are masked for
+    /// everyone but an admin, and the proposed config for anyone who cannot
+    /// approve a change.
+    pub fn redacted_for(mut self, actor: &AuthContext) -> Self {
+        if actor.role == Role::Admin {
+            return self;
+        }
+        if let Some(headers) = self
+            .payload
+            .pointer_mut("/callback/headers")
+            .and_then(Value::as_object_mut)
+        {
+            for v in headers.values_mut() {
+                *v = Value::String(REDACTED.to_string());
+            }
+        }
+        if !actor
+            .role
+            .grants(crate::serve::rbac::Permission::ChangeApprove)
+            && let Some(config) = self.payload.get_mut("config")
+        {
+            *config = Value::String(REDACTED.to_string());
+        }
+        self
+    }
+
     fn touch(&mut self) {
         self.updated_at = Utc::now();
     }
 }
+
+/// What a masked value reads as.
+pub const REDACTED: &str = "***";
 
 /// `GET /v1/changes` filter.
 #[derive(Debug, Clone, Default)]
@@ -290,6 +323,10 @@ pub struct NewChange {
     pub reason: Option<String>,
     #[serde(default)]
     pub budget: Option<BudgetSpec>,
+    /// Set in-process for a run proposed from a registered template; never
+    /// accepted from a client.
+    #[serde(skip)]
+    pub trusted_config: bool,
 }
 
 /// Executing a `template_launch` request needs this much of the launch body.
@@ -302,7 +339,7 @@ pub struct LaunchPayload {
 }
 
 fn store_err(e: HistoryError) -> ServeError {
-    ServeError::Internal(format!("change store: {e}"))
+    ServeError::from_history("change store", e)
 }
 
 fn sha_hex(canonical: &str) -> String {
@@ -407,6 +444,7 @@ async fn plan_run(
         format,
         actor.tenant.as_deref(),
         req.selection.as_ref(),
+        state.origin(req.trusted_config),
     )
     .await?;
     runner::policy_gate(state, actor, &loaded).await?;
@@ -561,11 +599,13 @@ async fn plan_for(
     actor: &AuthContext,
     kind: ChangeKind,
     payload: &Value,
+    trusted: bool,
 ) -> Result<ChangePlan, ServeError> {
     match kind {
         ChangeKind::Run => {
-            let req: SubmitRequest = serde_json::from_value(payload.clone())
+            let mut req: SubmitRequest = serde_json::from_value(payload.clone())
                 .map_err(|e| ServeError::BadConfig(format!("run payload: {e}")))?;
+            req.trusted_config = trusted;
             plan_run(state, actor, &req).await
         }
         #[cfg(feature = "templates")]
@@ -584,7 +624,7 @@ async fn plan_for(
         }
         #[cfg(not(feature = "templates"))]
         ChangeKind::TemplateRegister | ChangeKind::TemplateLaunch => {
-            let _ = (state, actor);
+            let _ = (state, actor, trusted);
             Err(ServeError::Unprocessable {
                 message: "template changes require a server built with the `templates` feature"
                     .into(),
@@ -642,7 +682,7 @@ pub async fn create(
             obj.remove("reason");
         }
     }
-    let plan = plan_for(state, actor, new.kind, &payload).await?;
+    let plan = plan_for(state, actor, new.kind, &payload, new.trusted_config).await?;
     let policy = state.approvals();
     let rule = policy.effective(new.kind);
     let now = Utc::now();
@@ -666,6 +706,7 @@ pub async fn create(
         template: None,
         error: None,
         tenant: actor.tenant.clone(),
+        trusted_config: new.trusted_config,
     };
     save(state, &change).await?;
     record_metric(change.kind, "requested");
@@ -882,7 +923,15 @@ async fn execute(
     };
     // Re-plan against the world as it is now. A planning failure (the
     // template is gone, the config no longer loads) fails the request.
-    let fresh = match plan_for(state, &requester, change.kind, &change.payload).await {
+    let fresh = match plan_for(
+        state,
+        &requester,
+        change.kind,
+        &change.payload,
+        change.trusted_config,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
     };
@@ -925,6 +974,7 @@ async fn execute(
             req.require_approval = false;
             req.reason = None;
             req.approved_change = Some(change.id.clone());
+            req.trusted_config = change.trusted_config;
             req.budget = match (req.budget.take(), change.budget.clone()) {
                 (Some(a), Some(b)) => Some(a.merge(&b)),
                 (a, b) => a.or(b),
@@ -1211,6 +1261,7 @@ mod tests {
             template: None,
             error: None,
             tenant: Some("acme".into()),
+            trusted_config: false,
         };
         assert!(ChangeListFilter::default().matches(&c));
         assert!(
@@ -1298,7 +1349,36 @@ mod tests {
             template: None,
             error: None,
             tenant: None,
+            trusted_config: false,
         }
+    }
+
+    #[test]
+    fn responses_mask_what_the_reader_may_not_see() {
+        let mut c = stored(
+            ChangeKind::Run,
+            json!({"config": "pipeline: {}", "callback": {"url": "u", "headers": {"authorization": "Bearer x"}}}),
+            "m",
+            1,
+        );
+        let who = |role| AuthContext {
+            principal: "p".into(),
+            role,
+            source_ip: None,
+            tenant: None,
+        };
+        let admin = c.clone().redacted_for(&who(Role::Admin));
+        assert_eq!(admin.payload, c.payload);
+        let op = c.clone().redacted_for(&who(Role::Operator));
+        assert_eq!(op.payload["config"], "pipeline: {}");
+        assert_eq!(op.payload["callback"]["headers"]["authorization"], REDACTED);
+        let viewer = c.clone().redacted_for(&who(Role::Viewer));
+        assert_eq!(viewer.payload["config"], REDACTED);
+        c.payload = json!({"id": "t"});
+        assert_eq!(
+            c.clone().redacted_for(&who(Role::Viewer)).payload,
+            c.payload
+        );
     }
 
     #[tokio::test]
@@ -1377,6 +1457,7 @@ mod tests {
                 payload: json!({"nope": 1}),
                 reason: None,
                 budget: None,
+                trusted_config: false,
             },
         )
         .await
@@ -1393,6 +1474,7 @@ mod tests {
                     max_records: Some(0),
                     ..Default::default()
                 }),
+                trusted_config: false,
             },
         )
         .await
@@ -1433,6 +1515,7 @@ mod tests {
                     max_records: Some(50),
                     ..Default::default()
                 }),
+                trusted_config: false,
             },
         )
         .await
@@ -1460,7 +1543,7 @@ mod tests {
         c = stored(ChangeKind::Run, payload, "stale", 1);
         c.plan.as_mut().unwrap().rows.clear();
         save(&state, &c).await.unwrap();
-        let fresh_rows = plan_for(&state, &actor("bob"), ChangeKind::Run, &c.payload)
+        let fresh_rows = plan_for(&state, &actor("bob"), ChangeKind::Run, &c.payload, false)
             .await
             .unwrap()
             .rows;
@@ -1503,6 +1586,7 @@ mod tests {
             payload,
             reason: None,
             budget: None,
+            trusted_config: false,
         };
         for (kind, needle) in [
             (ChangeKind::TemplateRegister, "template_register payload"),

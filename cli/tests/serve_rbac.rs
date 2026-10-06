@@ -73,6 +73,7 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     }
 }
 
@@ -409,23 +410,14 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     //   the server to read a path on its filesystem. That is the same trust
     //   boundary as run logs (which carry record data) and is why the DLQ
     //   endpoints are not exposed to the public internet.
-    // - `/v1/plan` — plans a config: expands it, runs a caller-supplied sample
-    //   through the offline harness, reads the catalog. No sink is written and
-    //   no run starts; the one connector it builds is the sink, for its
-    //   non-mutating `check()` probe — the same as `POST /v1/doctor` does, but
-    //   doctor stays operator-only because it probes *sources* with real reads.
     // - `/v1/status` — assembles a health report from state, history and the
     //   DLQ; the POST form only carries the config in a body. `--probe` builds
-    //   the sink for its read-only watermark read, nothing more.
+    //   the sink for its read-only watermark read, nothing more. A viewer may
+    //   name a registered template; an inline config needs `Doctor`.
     // - `/v1/mirror/{name}` — reads a mirror's state store (#731); the POST
-    //   form only carries the config in a body.
-    const READ_ONLY_POSTS: &[&str] = &[
-        "/mcp",
-        "/v1/dlq/inspect",
-        "/v1/plan",
-        "/v1/status",
-        "/v1/mirror/{name}",
-    ];
+    //   form only carries the config in a body, gated like `/v1/status`.
+    const READ_ONLY_POSTS: &[&str] =
+        &["/mcp", "/v1/dlq/inspect", "/v1/status", "/v1/mirror/{name}"];
     if READ_ONLY_POSTS.contains(&path) {
         return false;
     }

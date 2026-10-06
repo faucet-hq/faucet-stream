@@ -71,7 +71,8 @@ each a `{ name, token, role }` where role is `viewer` (read-only), `operator`
 the audit log).
 
 ```yaml
-# auth.yaml — tokens can use ${env:…}/${secret:…} interpolation
+# auth.yaml — tokens resolve ${env:…} / ${file:…} / ${secret:…} and
+# secret-manager references (${vault:…}, …) when the server starts
 principals:
   - { name: alice, token: "${env:ALICE_TOKEN}", role: admin }
   - { name: ci,    token: "${env:CI_TOKEN}",    role: operator }
@@ -83,7 +84,15 @@ faucet serve --auth-config auth.yaml --history postgres://…/faucet
 ```
 
 A viewer's `POST /v1/runs` returns `403`; its `GET /v1/runs` returns `200`.
-`--auth-config` is mutually exclusive with `--auth-token` / `--no-auth`.
+`--auth-config` is mutually exclusive with `--auth-token` / `--no-auth`. A
+reference that does not resolve refuses the start, and a token still holding
+`${` is refused — never accepted literally. No config the server loads can read
+those variables or files, nor `FAUCET_VAULT_KEY` and the server's own token
+variables.
+
+A config submitted over HTTP or MCP may not use the `singer` source or sink —
+they run a program on the host — unless the server is started with
+`--allow-subprocess-connectors`. Registered templates may.
 
 **Every mutating action** (`run.submit` / `run.cancel` / `run.delete`) **and every
 denied attempt** is written to a tamper-evident audit log — principal, role,
@@ -188,10 +197,19 @@ faucet serve --history 'sqlite:/var/lib/faucet/runs.db'
 ```
 
 Both create their schema on first connect. If the backend is unreachable at
-startup, or fails at runtime, serve **degrades to the in-memory store** so it
-stays up: it logs once, sets the `faucet_serve_history_degraded` gauge, and
-`/readyz` returns `503`. Persisted records are not migrated into the fallback —
-degraded mode is a stay-alive, not a replica. Terminal records are retained for
+startup, or becomes unreachable at runtime (a refused or dropped connection, a
+pool timeout, an I/O error, a server shutting down or out of connections — each
+retried a few times first), serve **degrades** so it stays up: it logs once,
+sets the `faucet_serve_history_degraded` gauge, and `/readyz` returns `503`.
+Any other database error (a constraint, a decode failure, lock contention) is
+returned to the request that hit it and never degrades the server.
+
+While degraded, run records, logs, audit, catalog and usage go to an in-memory
+store so runs keep going. Templates, tenants, connections, change requests and
+`queue_depth` trigger edges are **not** served from that empty store: those
+requests fail with `503` until the backend is back. Every lease tick probes the
+backend and leaves degraded mode as soon as it answers; records written to
+memory meanwhile are not copied back. Terminal records are retained for
 `--retain-terminal-runs-secs` (default 7 days).
 
 ### Multi-instance orphan recovery (run-ownership leases)

@@ -28,6 +28,7 @@ pub async fn doctor(
         req.config_format.into(),
         state.default_base().as_ref(),
         crate::serve::runner::server_policy(&state).as_deref(),
+        state.caller_origin(),
     )
     .await?;
     let report = run_doctor_first(&state, &loaded).await?;

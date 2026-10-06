@@ -160,9 +160,13 @@ Unit runs are named `{name}-backfill-{unit}` and labelled
 `backfill=<range-hash>` + `backfill_unit=<unit>`; the pipeline `name` is
 rewritten per unit so state keys stay namespaced, and delivery is forced to
 at-least-once. Deterministic idempotency keys (`backfill:{hash}:{unit}`) make
-**re-POSTing the same body replay-safe**: already-submitted units replay,
-unsubmitted ones proceed — the API-level resume (a full queue marks the
-remainder `not_submitted`; just re-POST). A config carrying `shard: { count }`
+re-POSTing the same body replay-safe: already-submitted units replay,
+unsubmitted ones proceed. With a `state:` block the range is recorded, and a
+later POST of it is refused with `409` unless it sets `"resume": true`
+(continue it — the HTTP form of `--resume`) or `"restart": true` (delete each
+unit's scoped state and run every unit again — `--restart`), so a re-backfill
+can never silently start past its old bookmark. A full queue marks the
+remainder `not_submitted`; re-POST with `"resume": true`. A config carrying `shard: { count }`
 makes each unit a sharded run tracked via shard progress, so a single wide
 window scales horizontally under `serve --cluster`. Bookmark-range backfills
 are CLI-only. Requires the `RunWrite` permission (operator); audited as

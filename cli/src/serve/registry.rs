@@ -165,6 +165,16 @@ impl Registry {
         fired
     }
 
+    /// Fire every live run and shard token. Returns how many were fired.
+    pub fn cancel_all(&self) -> usize {
+        let mut fired = 0usize;
+        for entry in self.tokens.iter() {
+            entry.value().cancel();
+            fired += 1;
+        }
+        fired
+    }
+
     /// Run ids with a live cancellation token — i.e. runs this instance has
     /// registered and not yet finished.
     ///
@@ -217,6 +227,17 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_all_fires_every_run_and_shard_token() {
+        let r = Registry::new(4);
+        let run = CancellationToken::new();
+        let shard = CancellationToken::new();
+        r.register("a".into(), run.clone());
+        r.register_shard("b", "0", shard.clone());
+        assert_eq!(r.cancel_all(), 2);
+        assert!(run.is_cancelled() && shard.is_cancelled());
+    }
 
     #[test]
     fn reserve_respects_capacity() {

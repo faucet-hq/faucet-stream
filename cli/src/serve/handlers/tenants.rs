@@ -36,8 +36,8 @@ use std::sync::Arc;
 const DEFAULT_FANOUT_CONCURRENCY: usize = 4;
 const MAX_FANOUT_CONCURRENCY: usize = 64;
 
-fn store_err(e: impl std::fmt::Display) -> ServeError {
-    ServeError::Internal(format!("tenant store: {e}"))
+fn store_err(e: crate::serve::history::HistoryError) -> ServeError {
+    ServeError::from_history("tenant store", e)
 }
 
 /// The actor, acting for `tenant`.
@@ -482,6 +482,11 @@ pub async fn submit_tenant_run(
     Path(tenant): Path<String>,
     Json(req): Json<SubmitRequest>,
 ) -> Result<Response, ServeError> {
+    if actor.tenant.is_some() {
+        return Err(ServeError::Forbidden(
+            crate::serve::handlers::runs::TENANT_RAW_CONFIG.to_string(),
+        ));
+    }
     let actor = for_tenant(&actor, &tenant);
     match runner::submit_gated(state, req, actor).await? {
         SubmitOutcome::Accepted(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),

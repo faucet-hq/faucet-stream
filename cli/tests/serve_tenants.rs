@@ -81,6 +81,7 @@ fn serve_args(
         vault_key: Some("test-vault-key".into()),
         vault_previous_key: Vec::new(),
         connect_providers: Some(providers),
+        allow_subprocess_connectors: false,
     }
 }
 
@@ -445,12 +446,60 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         )
         .await;
     assert_eq!(code, 403);
-    // A plain submission by a scoped principal runs for its tenant.
+    // A scoped principal may not submit a config of its own, through any
+    // route: it runs registered templates only.
+    let raw = json!({"config": template(&data.uri(), &out, &state_dir).replace("name: tenant-sync", "name: scoped")});
+    for route in ["/v1/runs", "/v1/tenants/acme/runs"] {
+        let (code, err) = api.post("acme-tok", route, raw.clone()).await;
+        assert_eq!(code, 403, "{route}: {err}");
+        assert!(err.to_string().contains("registered templates"), "{err}");
+    }
+    let (code, err) = api
+        .post(
+            "acme-tok",
+            "/v1/changes",
+            json!({"kind": "run", "payload": raw.clone()}),
+        )
+        .await;
+    assert_eq!(code, 403, "{err}");
+    // An unscoped operator may still run a config for the tenant.
+    let (code, r) = api.post("op-tok", "/v1/tenants/acme/runs", raw).await;
+    assert_eq!(code, 202, "{r}");
+    api.wait_run(r["run_id"].as_str().unwrap()).await;
+    // The same idempotency key from two tenants starts two runs.
+    let mut keyed = Vec::new();
+    for tenant in ["acme", "globex"] {
+        let (code, r) = api
+            .post(
+                "op-tok",
+                &format!("/v1/tenants/{tenant}/templates/{id}/runs"),
+                json!({"idempotency_key": "nightly-2026-10-01"}),
+            )
+            .await;
+        assert_eq!(code, 202, "{tenant}: {r}");
+        let rec = api.wait_run(r["run_id"].as_str().unwrap()).await;
+        assert_eq!(rec["tenant"], tenant, "{rec}");
+        keyed.push(r["run_id"].as_str().unwrap().to_string());
+    }
+    assert_ne!(keyed[0], keyed[1]);
+    let (code, again) = api
+        .post(
+            "acme-tok",
+            &format!("/v1/tenants/acme/templates/{id}/runs"),
+            json!({"idempotency_key": "nightly-2026-10-01"}),
+        )
+        .await;
+    assert_eq!(code, 202, "{again}");
+    assert_eq!(
+        again["run_id"],
+        keyed[0].as_str(),
+        "a replay within the tenant"
+    );
     let (code, r) = api
         .post(
             "acme-tok",
-            "/v1/runs",
-            json!({"config": template(&data.uri(), &out, &state_dir).replace("name: tenant-sync", "name: scoped")}),
+            &format!("/v1/tenants/acme/templates/{id}/runs"),
+            json!({}),
         )
         .await;
     assert_eq!(code, 202, "{r}");
@@ -922,6 +971,86 @@ async fn a_schedule_trigger_fans_a_template_out_to_every_tenant() {
         assert!(done, "no scheduled run completed for {t}");
         assert!(lines(&out.join(format!("out-{t}.jsonl"))) >= 1);
     }
+}
+
+/// SERVE-10: one tenant whose fire fails deterministically (a missing label
+/// its `${tenant.labels.*}` routing needs) must not stop the schedule for the
+/// other tenants — the schedule advances tick after tick.
+#[cfg(all(feature = "triggers", feature = "schedule"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_tenant_does_not_stop_a_scheduled_fan_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}]})))
+        .mount(&data)
+        .await;
+    let out = dir.path().join("out");
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&out).unwrap();
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(
+        &triggers,
+        "version: 1\ntriggers:\n  - name: every-second\n    type: schedule\n    cron: \"* * * * * *\"\n    template: { id: tenant-sync }\n    tenants: all\n",
+    )
+    .unwrap();
+    let api = spawn_with(dir.path(), None, "http://127.0.0.1:9", Some(triggers)).await;
+    for (t, labels) in [
+        ("acme", json!({"region": "eu"})),
+        ("broken", json!({})),
+        ("globex", json!({"region": "us"})),
+    ] {
+        let (code, _) = api
+            .post(
+                "admin-tok",
+                "/v1/tenants",
+                json!({"id": t, "labels": labels}),
+            )
+            .await;
+        assert_eq!(code, 201);
+        let (code, _) = api
+            .post(
+                "op-tok",
+                &format!("/v1/tenants/{t}/connections"),
+                json!({"name": "api", "provider": {"type": "static", "config": {"token": "t"}}}),
+            )
+            .await;
+        assert_eq!(code, 201);
+    }
+    let body = template(&data.uri(), &out, &state_dir).replace(
+        "out-${tenant.id}.jsonl",
+        "out-${tenant.id}-${tenant.labels.region}.jsonl",
+    );
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": body, "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    for t in ["acme", "globex"] {
+        let mut ticks = std::collections::BTreeSet::new();
+        for _ in 0..400 {
+            let (_, page) = api.get("admin-tok", &format!("/v1/runs?tenant={t}")).await;
+            for r in page["runs"].as_array().unwrap() {
+                if r["labels"]["faucet.trigger.name"] == "every-second" {
+                    ticks.insert(r["labels"]["faucet.trigger.tick"].to_string());
+                }
+            }
+            if ticks.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            ticks.len() >= 2,
+            "the schedule stalled for {t} behind the failing tenant: {ticks:?}"
+        );
+    }
+    let (_, page) = api.get("admin-tok", "/v1/runs?tenant=broken").await;
+    assert!(page["runs"].as_array().unwrap().is_empty());
 }
 
 /// `max_concurrent_runs` refuses a submission over the limit with 429.

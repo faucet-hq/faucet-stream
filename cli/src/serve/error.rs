@@ -53,6 +53,15 @@ pub enum ServeError {
 }
 
 impl ServeError {
+    /// A run-history failure: a degraded backend is a retryable `503`, any
+    /// other failure a `500` prefixed with `context`.
+    pub fn from_history(context: &str, e: crate::serve::history::HistoryError) -> Self {
+        match e {
+            crate::serve::history::HistoryError::Degraded(m) => ServeError::Unavailable(m),
+            other => ServeError::Internal(format!("{context}: {other}")),
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
             ServeError::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -147,6 +156,15 @@ impl IntoResponse for ServeError {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    #[test]
+    fn a_degraded_history_is_a_retryable_503() {
+        use crate::serve::history::HistoryError;
+        let e = ServeError::from_history("tenant store", HistoryError::Degraded("down".into()));
+        assert_eq!(e.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let e = ServeError::from_history("tenant store", HistoryError::Backend("bad".into()));
+        assert!(matches!(e, ServeError::Internal(m) if m.starts_with("tenant store:")));
+    }
 
     #[test]
     fn maps_variants_to_status_codes() {

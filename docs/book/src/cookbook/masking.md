@@ -103,9 +103,13 @@ matches the rule if *any* configured criterion matches:
 
 **Nested paths.** Rules match dot-paths like `user.email` or
 `contacts.0.email`. A `field_pattern` or `fields` entry that names a container
-(an object or array) rewrites the entire subtree — see the
-`fields: [address]` case in `masking_tests.yaml`, which redacts the whole
-`address` object.
+(an object or array) covers the entire subtree: `redact` replaces the
+container wholesale (see the `fields: [address]` case in
+`masking_tests.yaml`), while `hash`, `tokenize` and `partial` rewrite every
+non-null scalar inside it — so `fields: [phones]` with `hash` hashes each
+element of a `phones` array. The rule wins over any later rule for those
+leaves, and a [data-flow policy](./policies.md) counts every leaf as masked
+with that action.
 
 ### Actions
 

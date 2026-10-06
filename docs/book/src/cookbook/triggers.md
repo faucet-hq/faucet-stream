@@ -190,8 +190,7 @@ The injected token `${trigger.depth}` contains the observed length, and
 ```bash
 FAUCET_SERVE_AUTH_TOKEN=s3cret \
 cargo run -p faucet-cli --features "triggers,triggers-redis" -- \
-  serve --no-auth \
-  --triggers ./triggers.yaml
+  serve --triggers ./triggers.yaml
 ```
 
 Push a job:

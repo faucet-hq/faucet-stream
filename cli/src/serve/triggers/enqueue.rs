@@ -20,6 +20,10 @@ pub enum FireOutcome {
     Dropped(&'static str),
     /// An error building or submitting the run.
     Error(String),
+    /// The submission was refused for a reason a retry cannot fix (a bad
+    /// config, a failed validation, a missing tenant). Only produced inside a
+    /// tenant fan-out, where it becomes that tenant's own outcome.
+    Failed(String),
 }
 
 impl FireOutcome {
@@ -85,6 +89,7 @@ pub fn build_submit_request(
         budget: None,
         approved_change: None,
         selection: compiled.spec.run.selection.clone(),
+        trusted_config: true,
     }
 }
 
@@ -116,12 +121,60 @@ pub async fn fire(
     let mut outcomes = Vec::with_capacity(targets.len());
     for tenant in targets {
         let outcome = fire_one(state, compiled, &event, fired_at, tenant.as_deref()).await;
-        if let (Some(t), FireOutcome::Error(e)) = (&tenant, &outcome) {
-            tracing::warn!(trigger = compiled.name(), tenant = %t, error = %e, "tenant fire failed");
-        }
+        let outcome = match (tenant, outcome) {
+            (Some(t), FireOutcome::Failed(e)) => {
+                tenant_fire_failed(state, compiled.name(), &t, &e).await;
+                FireOutcome::Coalesced
+            }
+            (Some(t), FireOutcome::Error(e)) => {
+                tracing::warn!(trigger = compiled.name(), tenant = %t, error = %e, "tenant fire failed; retrying");
+                FireOutcome::Error(e)
+            }
+            (None, FireOutcome::Failed(e)) => FireOutcome::Error(e),
+            (_, other) => other,
+        };
         outcomes.push(outcome);
     }
     combine(outcomes)
+}
+
+/// One tenant's fire was refused for a reason a retry cannot fix: record it
+/// for that tenant (log, metric, the tenant's own notifications) so the fan-out
+/// can still commit for every other tenant.
+async fn tenant_fire_failed(state: &ServerState, trigger: &str, tenant: &str, error: &str) {
+    tracing::warn!(
+        trigger,
+        tenant,
+        error,
+        "tenant fire refused; the other tenants still run"
+    );
+    metrics::tenant_failed(trigger, tenant);
+    #[cfg(feature = "tenants")]
+    crate::serve::tenants::notify_tenant(
+        state,
+        tenant,
+        crate::notify::NotifyEvent::run_failure(
+            trigger,
+            "",
+            "trigger_fire",
+            format!("trigger `{trigger}` could not start a run for tenant `{tenant}`: {error}"),
+        ),
+    )
+    .await;
+    #[cfg(not(feature = "tenants"))]
+    let _ = state;
+}
+
+fn is_deterministic(e: &crate::serve::error::ServeError) -> bool {
+    use crate::serve::error::ServeError;
+    matches!(
+        e,
+        ServeError::BadConfig(_)
+            | ServeError::Unprocessable { .. }
+            | ServeError::Forbidden(_)
+            | ServeError::NotFound
+            | ServeError::Unauthorized
+    )
 }
 
 /// Fold per-tenant outcomes into one: any drop wins (a poller must retry;
@@ -244,6 +297,12 @@ async fn fire_one(
             metrics::dropped(compiled.name(), "tenant_limit");
             FireOutcome::Dropped("tenant_limit")
         }
+        Err(crate::serve::error::ServeError::Conflict(m)) if kind == "queue_depth" => {
+            metrics::error(compiled.name(), kind);
+            FireOutcome::Error(format!(
+                "edge idempotency key already used for a different run, not committing: {m}"
+            ))
+        }
         Err(crate::serve::error::ServeError::Conflict(m)) => {
             tracing::info!(trigger = compiled.name(), reason = %m, "trigger fire coalesced");
             metrics::coalesced(compiled.name());
@@ -251,7 +310,11 @@ async fn fire_one(
         }
         Err(e) => {
             metrics::error(compiled.name(), kind);
-            FireOutcome::Error(e.api_error().error.message)
+            if is_deterministic(&e) {
+                FireOutcome::Failed(e.api_error().error.message)
+            } else {
+                FireOutcome::Error(e.api_error().error.message)
+            }
         }
     }
 }
@@ -354,6 +417,21 @@ async fn submit_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_refusals_a_retry_cannot_fix_are_deterministic() {
+        use crate::serve::error::ServeError;
+        assert!(is_deterministic(&ServeError::BadConfig("x".into())));
+        assert!(is_deterministic(&ServeError::NotFound));
+        assert!(is_deterministic(&ServeError::Forbidden("x".into())));
+        assert!(is_deterministic(&ServeError::Unprocessable {
+            message: "x".into(),
+            details: None
+        }));
+        assert!(!is_deterministic(&ServeError::Unavailable("x".into())));
+        assert!(!is_deterministic(&ServeError::Internal("x".into())));
+        assert!(!FireOutcome::Failed("x".into()).committed());
+    }
 
     #[test]
     fn combine_prefers_drops_then_errors_then_ids() {

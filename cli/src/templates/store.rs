@@ -17,6 +17,15 @@ use crate::serve::load::ConfigFormat;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Map a registry read/write failure: a degraded run-history backend is
+/// [`CliError::HistoryUnavailable`] (retryable), anything else internal.
+pub(crate) fn registry_err(what: &str, e: history::HistoryError) -> CliError {
+    match e {
+        history::HistoryError::Degraded(m) => CliError::HistoryUnavailable(m),
+        other => CliError::Internal(format!("{what}: {other}")),
+    }
+}
 use std::time::Duration;
 
 /// The registry handle. Any `RunHistory` backend will do — `faucet serve` passes
@@ -219,7 +228,7 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
     if let Some(prev) = store
         .template_get(id.as_str(), None)
         .await
-        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
         && prev.kind != kind
     {
         return Err(CliError::Config(format!(
@@ -264,7 +273,7 @@ pub async fn preview_register(
     let previous_version = store
         .template_get(prelude.id.as_str(), None)
         .await
-        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
         .map(|r| r.version);
     let rows = match &prelude.pipeline {
         Some(cfg) => crate::expand::expand(cfg)?
@@ -300,7 +309,7 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
         None => store
             .template_get(id.as_str(), None)
             .await
-            .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+            .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
             .and_then(|prev| prev.description)
             .or_else(|| match kind {
                 // Hub templates carry their own description.
@@ -327,21 +336,21 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
     let record = store
         .template_register(&draft)
         .await
-        .map_err(|e| CliError::Internal(format!("template registry write: {e}")))?;
+        .map_err(|e| crate::templates::store::registry_err("template registry write", e))?;
 
     // Point the requested channels at the version just created.
     for tag in &req.tags {
         store
             .template_set_tag(&record.id, tag.as_str(), record.version)
             .await
-            .map_err(|e| CliError::Internal(format!("template channel write: {e}")))?;
+            .map_err(|e| crate::templates::store::registry_err("template channel write", e))?;
     }
     // `--launch` is the only way a register makes a version live.
     if req.launch {
         store
             .template_launch(&record.id, record.version, req.created_by.as_deref())
             .await
-            .map_err(|e| CliError::Internal(format!("template launch write: {e}")))?;
+            .map_err(|e| crate::templates::store::registry_err("template launch write", e))?;
     }
     Ok(record)
 }
@@ -522,7 +531,7 @@ pub async fn list_with_state(store: &TemplateStore) -> CliResult<Vec<TemplateSum
     let mut out = store
         .template_list()
         .await
-        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?;
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?;
     for summary in &mut out {
         summary.state = Some(template_state(store, &summary.id).await?);
     }
@@ -535,7 +544,7 @@ pub async fn template_state(store: &TemplateStore, id: &str) -> CliResult<Templa
     store
         .template_state(id)
         .await
-        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))
 }
 
 /// Confirm a version exists, returning a typed error naming it if not.
@@ -543,7 +552,7 @@ async fn require_version(store: &TemplateStore, id: &str, version: u32) -> CliRe
     if store
         .template_get(id, Some(version))
         .await
-        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
         .is_none()
     {
         return Err(CliError::UnknownPipelineTemplate {
@@ -573,7 +582,7 @@ pub async fn promote(
     store
         .template_set_tag(id, tag.as_str(), version)
         .await
-        .map_err(|e| CliError::Internal(format!("template channel write: {e}")))?;
+        .map_err(|e| crate::templates::store::registry_err("template channel write", e))?;
     Ok(version)
 }
 
@@ -624,7 +633,7 @@ pub async fn launch(
     let seq = store
         .template_launch(id, version, launched_by)
         .await
-        .map_err(|e| CliError::Internal(format!("template launch write: {e}")))?;
+        .map_err(|e| crate::templates::store::registry_err("template launch write", e))?;
     Ok(LaunchOutcome {
         version,
         replaced: before.stable,
@@ -678,7 +687,7 @@ pub async fn set_deprecated(
     store
         .template_set_deprecation(id, record.as_ref())
         .await
-        .map_err(|e| CliError::Internal(format!("template deprecation write: {e}")))?;
+        .map_err(|e| crate::templates::store::registry_err("template deprecation write", e))?;
     Ok(TemplateStatus::derive(state.stable.is_some(), deprecated))
 }
 
@@ -702,7 +711,7 @@ pub async fn set_version_deprecated(
     store
         .template_set_version_deprecation(id, version, record.as_ref())
         .await
-        .map_err(|e| CliError::Internal(format!("template version deprecation write: {e}")))
+        .map_err(|e| crate::templates::store::registry_err("template version deprecation write", e))
 }
 
 /// The warning a run of `version` carries, if the template or that version is
@@ -771,7 +780,7 @@ pub async fn materialize(
     let record = store
         .template_get(id, Some(version))
         .await
-        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
         .ok_or_else(|| CliError::UnknownPipelineTemplate {
             id: id.to_string(),
             version: Some(version),
@@ -1085,7 +1094,7 @@ async fn fetch_version(store: &TemplateStore, id: &str, version: u32) -> CliResu
     store
         .template_get(id, Some(version))
         .await
-        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
         .ok_or_else(|| CliError::UnknownPipelineTemplate {
             id: id.to_string(),
             version: Some(version),
@@ -1154,6 +1163,18 @@ pub async fn resolve_store_url(url: &str) -> CliResult<TemplateStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_degraded_registry_is_history_unavailable() {
+        assert!(matches!(
+            registry_err("read", history::HistoryError::Degraded("down".into())),
+            CliError::HistoryUnavailable(m) if m == "down"
+        ));
+        assert!(matches!(
+            registry_err("read", history::HistoryError::Backend("x".into())),
+            CliError::Internal(m) if m.starts_with("read:")
+        ));
+    }
     use crate::serve::history::memory::MemoryHistory;
     use serde_json::json;
 

@@ -23,7 +23,12 @@ paths:
       description: >
         Validate + interpolate the config synchronously (4xx on error), then
         queue the run and return immediately. Long-running execution is
-        asynchronous — poll `GET /v1/runs/{id}`.
+        asynchronous — poll `GET /v1/runs/{id}`. 403 for a tenant-scoped
+        principal (it runs registered templates only) and for a config that
+        references the server's own credentials; 422 for a subprocess
+        connector (`singer`) unless the server runs with
+        `--allow-subprocess-connectors`. Idempotency keys are scoped to the
+        tenant a run is for.
       operationId: submitRun
       requestBody:
         required: true
@@ -50,6 +55,7 @@ paths:
                       change: { $ref: "#/components/schemas/ChangeRequest" }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
         "413": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
@@ -393,7 +399,9 @@ paths:
         next run resumes. Reads only — nothing runs. The config is inline
         (`config`) or a registered template (`template`, `templates` builds).
         A failed pipeline is a result, not an error. Requires `StatusRead`
-        (viewer+); audited as `status`.
+        (viewer+) with a `template`; an inline `config` is loaded on the
+        server and needs the operator role (403 otherwise). Audited as
+        `status`.
       operationId: getStatus
       security: [{ bearerAuth: [] }]
       parameters:
@@ -417,7 +425,8 @@ paths:
       summary: One-screen pipeline health, config in the body (#732)
       description: >
         `GET /v1/status` with the config (and template `params`) in a JSON
-        body instead of the query string. Read-only; `StatusRead` (viewer+).
+        body instead of the query string. Read-only; `StatusRead` (viewer+)
+        with a `template`, operator with an inline `config`.
       operationId: postStatus
       security: [{ bearerAuth: [] }]
       requestBody:
@@ -458,7 +467,8 @@ paths:
         error. Read from the mirror's state store, so it answers whether the
         mirror runs in this server or in a separate `faucet mirror` process.
         The config is inline (`config`) or a registered template (`template`).
-        Requires `StatusRead` (viewer+); audited as `mirror.status`.
+        Requires `StatusRead` (viewer+) with a `template`; an inline `config`
+        needs the operator role. Audited as `mirror.status`.
       operationId: getMirrorStatus
       security: [{ bearerAuth: [] }]
       parameters:
@@ -480,7 +490,8 @@ paths:
       summary: Per-table status of a mirror, config in the body (#731)
       description: >
         `GET /v1/mirror/{name}` with the config (and template `params`) in a
-        JSON body. Read-only; `StatusRead` (viewer+).
+        JSON body. Read-only; `StatusRead` (viewer+) with a `template`,
+        operator with an inline `config`.
       operationId: postMirrorStatus
       security: [{ bearerAuth: [] }]
       requestBody:
@@ -622,7 +633,9 @@ paths:
         (`breaking` / `additive` / `unknown`). The server's `--policy` (#702)
         is evaluated for the row and reported under `policy`. Nothing is
         written and no run starts; the sink is built only for its
-        non-mutating `check()` probe. Requires the `Plan` permission (viewer).
+        non-mutating `check()` probe. The config is loaded on the server (its
+        references resolve, discovery reaches its hosts), so it requires the
+        `Plan` permission (operator).
         `impact` requires the `catalog` Cargo feature (422 otherwise).
       operationId: planConfig
       security: [{ bearerAuth: [] }]
@@ -665,8 +678,12 @@ paths:
         forward-sync bookmark), `delivery` forced to `at_least_once`, the
         `${now.*}` clock set to the unit's window start, and a deterministic
         idempotency key (`backfill:{hash}:{unit}`). Re-POSTing the same body
-        is replay-safe: already-submitted units replay, the rest submit — the
-        API-level resume. A config carrying `shard: { count }` makes each unit
+        is replay-safe: already-submitted units replay, the rest submit. When
+        the config has a `state:` block the submitted range is recorded there,
+        and a later POST of the same range is refused with 409 unless it sets
+        `resume` (continue — submitted units replay) or `restart` (delete each
+        unit's scoped state and submit every unit as a new run), because each
+        unit would otherwise resume its old bookmark and read nothing. A config carrying `shard: { count }` makes each unit
         a sharded run tracked via shard progress. Requires the `RunWrite`
         permission (operator). Bookmark-range backfills are CLI-only
         (`faucet backfill --from-bookmark`).
@@ -688,6 +705,8 @@ paths:
                 name: { type: string }
                 labels: { type: object, additionalProperties: { type: string } }
                 timeout_secs: { type: integer, description: "Per-unit run timeout" }
+                resume: { type: boolean, default: false, description: "Continue a range submitted before (stateful configs)" }
+                restart: { type: boolean, default: false, description: "Clear each unit's scoped state and run a range submitted before again" }
       responses:
         "202":
           description: Units planned; one run submitted per unit
@@ -714,6 +733,8 @@ paths:
         "400": { description: Malformed body / range / window / timezone, config invalid, or a root source is not window-scoped }
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the required permission }
+        "409": { description: A stateful config's range was submitted before and neither `resume` nor `restart` is set }
+        "422": { description: "`resume` and `restart` both set, or a `callback` was supplied" }
   /v1/dlq/inspect:
     post:
       summary: Inspect a dead-letter-queue location (read-only)
@@ -952,7 +973,10 @@ paths:
         summary), the requester, and an optional budget the approved run must
         honour. Nothing happens until the approvers named by the `approvals:`
         block of `--auth-config` approve it. Requires `ChangeRequest`
-        (operator). A data-flow policy violation is a 422.
+        (operator); 403 for a tenant-scoped principal. A data-flow policy
+        violation is a 422. Every change-request response masks callback
+        `headers` for non-admins and the proposed `config` for principals
+        that cannot approve.
       operationId: createChange
       security: [{ bearerAuth: [] }]
       requestBody:
@@ -1416,7 +1440,9 @@ paths:
         namespaced `{tenant}::{pipeline}::{row}`, and the tenant's limits
         apply (429 at `max_concurrent_runs`; the per-run ceilings join the
         budget). 409 when the tenant is suspended or a referenced connection
-        is missing or needs re-authorization. Requires `RunWrite` (operator).
+        is missing or needs re-authorization. Requires `RunWrite` (operator);
+        403 for a tenant-scoped principal, which runs registered templates
+        only (`POST /v1/tenants/{tenant}/templates/{id}/runs`).
       operationId: submitTenantRun
       security: [{ bearerAuth: [] }]
       parameters:
@@ -2014,6 +2040,10 @@ paths:
         (`{"version":"pre-prod"}`). Re-launching the already-live version is a
         no-op (`already_launched: true`), keeping `previous` a real rollback
         target. A deprecated template refuses to launch — revive it first.
+        409 when the server runs with `--require-approval template_launch`
+        (propose it with `POST /v1/changes` instead); the same applies to
+        `/rollback`, `/tags`, a register that launches or assigns channels,
+        and a non-dry-run `/v1/templates/sync`.
         Requires the `TemplateAdmin` permission (admin) and the `templates`
         Cargo feature.
       operationId: launchTemplate

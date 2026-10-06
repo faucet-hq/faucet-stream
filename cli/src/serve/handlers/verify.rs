@@ -63,6 +63,7 @@ pub async fn verify(
         req.config_format.into(),
         state.default_base().as_ref(),
         crate::serve::runner::server_policy(&state).as_deref(),
+        state.caller_origin(),
     )
     .await?;
     let auth = build_auth_catalog(loaded.cfg.auth.as_ref()).map_err(cli_to_serve)?;

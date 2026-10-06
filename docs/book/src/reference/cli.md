@@ -246,7 +246,9 @@ See the [source discovery cookbook](../cookbook/discover.md).
 
 Runs the first root row's source and prints records (via the stdout sink).
 Children aren't previewed because they need parent records to resolve
-`${parent.path}` tokens.
+`${parent.path}` tokens. It reads pages only until `--limit` transformed
+records are collected, and stops after 30 seconds with what it has (a WARN says
+so), so previewing a large table or an endless stream never reads it all.
 
 ```bash
 faucet preview pipeline.yaml --limit 10
@@ -1252,7 +1254,8 @@ Selected flags (`faucet serve --help` for the full list):
 |------|---------|
 | `--listen <addr>` | Bind address (default `127.0.0.1:8080`; env `FAUCET_SERVE_LISTEN`). |
 | `--auth-token <t>` / `--no-auth` | Bearer token (prefer the env var) or explicit no-auth opt-in. |
-| `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — enables role enforcement + the `GET /v1/audit` log. Mutually exclusive with `--auth-token`/`--no-auth`. |
+| `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — enables role enforcement + the `GET /v1/audit` log. Tokens resolve `${env:}` / `${file:}` / secret-manager references at startup; an unresolvable one refuses the start. Mutually exclusive with `--auth-token`/`--no-auth`. |
+| `--allow-subprocess-connectors` | Let a config submitted over HTTP or MCP use connectors that run a program on the host (`singer`). Off by default (`422`); configs for a tenant are refused regardless, registered templates are always allowed. See [Subprocess connectors](http-api.md#subprocess-connectors). |
 | `--read-token <t>` / `--write-token <t>` / `--admin-token <t>` | The three-token shorthand for the same RBAC (`viewer` / `operator` / `admin`) with no file to author — prefer the env vars `FAUCET_SERVE_{READ,WRITE,ADMIN}_TOKEN`. Any subset may be set; mutually exclusive with `--auth-token` / `--auth-config` / `--no-auth`. See the [role × route matrix](http-api.md#role--route-matrix). |
 | `--max-concurrent-runs <n>` / `--max-queued-runs <n>` | Concurrency + queue caps (429 past the queue). |
 | `--history <url>` | `postgres://…` / `sqlite:…` for durable run history (feature-gated; default in-memory). |
@@ -1270,7 +1273,7 @@ Selected flags (`faucet serve --help` for the full list):
 | `--preview-default-rows <n>` | Rows a preview loads when the request omits `row_count_to_load` — the soft cap (default `500`; env `FAUCET_SERVE_PREVIEW_DEFAULT_ROWS`). `0` = the whole dataset by default. |
 | `--preview-max-rows <n>` | Ceiling on one preview's rows — the hard cap (default `5000`; env `FAUCET_SERVE_PREVIEW_MAX_ROWS`). A larger `row_count_to_load` is clamped to it, never honoured. **`0` lifts the ceiling**, which is what makes `row_count_to_load=all` load an entire dataset. |
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](./triggers.md). |
-| `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. |
+| `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`) and cannot be combined with `--templates-sync`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
 | `--vault-key <key>` | Key that seals tenant connection credentials at rest (AES-256-GCM; env `FAUCET_VAULT_KEY`). Without it the server refuses to store or open [tenant connections](../cookbook/embedded-integrations.md). Requires the `tenants` feature. |
 | `--vault-previous-key <key>` | A previous vault key, tried when opening credentials sealed before a rotation; never used to seal. Repeatable. |

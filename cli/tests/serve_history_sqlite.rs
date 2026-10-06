@@ -398,6 +398,7 @@ async fn server_with_sqlite_history_persists_runs() {
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
@@ -999,6 +1000,41 @@ mod templates {
         );
     }
 
+    async fn assert_prune_keeps_live_versions(s: &dyn RunHistory) {
+        for _ in 0..3 {
+            s.template_register(&draft("orders", None)).await.unwrap();
+        }
+        s.template_launch("orders", 1, None).await.unwrap();
+        s.template_launch("orders", 2, None).await.unwrap();
+        s.template_set_tag("orders", "prod", 3).await.unwrap();
+        for _ in 0..22 {
+            s.template_register(&draft("orders", None)).await.unwrap();
+        }
+        let versions = s.template_versions("orders").await.unwrap();
+        assert_eq!(versions.len(), 23, "20 newest + the three live ones");
+        for live in [1, 2, 3] {
+            assert!(versions.contains(&live), "version {live} must survive");
+        }
+        assert!(!versions.contains(&4) && !versions.contains(&5));
+        let st = s.template_state("orders").await.unwrap();
+        assert_eq!((st.stable, st.previous), (Some(2), Some(1)));
+        assert_eq!(st.tags.get("prod"), Some(&3));
+        assert!(
+            s.template_get("orders", Some(2)).await.unwrap().is_some(),
+            "the launched version still resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_never_removes_the_launched_previous_or_channel_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir, "tpl-prune.db").await;
+        assert_prune_keeps_live_versions(&s).await;
+        let memory =
+            faucet_cli::serve::history::memory::MemoryHistory::new(Duration::from_secs(60));
+        assert_prune_keeps_live_versions(&memory).await;
+    }
+
     #[tokio::test]
     async fn deleting_a_version_cascades_to_channels_and_launch_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -1398,6 +1434,7 @@ async fn change_requests_round_trip_and_filter() {
             template: None,
             error: None,
             tenant: None,
+            trusted_config: false,
         }
     };
     store
@@ -1458,4 +1495,28 @@ async fn change_requests_round_trip_and_filter() {
             .len(),
         1
     );
+}
+
+/// SERVE-11: the shared queue_depth edge on SQLite — seeded past any
+/// per-process ordinal, disarmed by a rise, re-armed by a drain, and a failed
+/// fire's rise retracted so the same ordinal is retried.
+#[tokio::test]
+async fn trigger_edges_rise_once_rearm_and_retract() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = store_with(&dir, "edges.db", Duration::from_secs(30), "a").await;
+    let b = store_with(&dir, "edges.db", Duration::from_secs(30), "b").await;
+    let first = a.trigger_edge_rise("drain").await.unwrap().unwrap();
+    assert!(first > 1_000_000, "seeded from the clock: {first}");
+    assert_eq!(b.trigger_edge_rise("drain").await.unwrap(), None);
+    b.trigger_edge_rearm("drain").await.unwrap();
+    let second = b.trigger_edge_rise("drain").await.unwrap().unwrap();
+    assert_eq!(second, first + 1);
+    a.trigger_edge_retract("drain", first).await.unwrap();
+    assert_eq!(
+        a.trigger_edge_rise("drain").await.unwrap(),
+        None,
+        "stale retract"
+    );
+    a.trigger_edge_retract("drain", second).await.unwrap();
+    assert_eq!(a.trigger_edge_rise("drain").await.unwrap(), Some(second));
 }

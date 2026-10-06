@@ -28,6 +28,11 @@ fn redact_record(rec: &mut RunRecord) {
     }
 }
 
+/// Why a tenant-scoped principal may not submit a config of its own: loading
+/// one resolves references and builds connectors on the server.
+pub const TENANT_RAW_CONFIG: &str = "a tenant-scoped principal runs registered templates \
+     only: trigger one with POST /v1/tenants/{tenant}/templates/{id}/runs";
+
 /// `POST /v1/runs` → 202. The auth middleware injects the resolved
 /// [`AuthContext`] so `submit` can attribute the `run.submit` audit record.
 pub async fn submit_run(
@@ -35,6 +40,9 @@ pub async fn submit_run(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<SubmitRequest>,
 ) -> Result<axum::response::Response, ServeError> {
+    if actor.tenant.is_some() {
+        return Err(ServeError::Forbidden(TENANT_RAW_CONFIG.to_string()));
+    }
     match runner::submit_gated(state, req, actor).await? {
         SubmitOutcome::Accepted(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
         // The server (or the caller) wants approval first (#703): the body
@@ -159,6 +167,9 @@ pub async fn cancel_run(
             .request_cancel(&id)
             .await
             .map_err(|e| ServeError::Internal(e.to_string()))?;
+        if rec.status == crate::serve::history::RunStatus::Sharded {
+            crate::serve::runner::maybe_finalize_parent(&state, &id).await;
+        }
         crate::serve::audit::write(&state, &actor, "run.cancel", Some(id.clone()), None, "ok")
             .await;
         return Ok(StatusCode::ACCEPTED);
@@ -374,9 +385,13 @@ pub async fn rollback_run(
         }
     };
     // Which config: the caller's, else the stored one (cluster mode).
-    let (config, format) = match (req.config, rec.config_body.as_deref()) {
-        (Some(c), _) => (c, req.config_format.into()),
-        (None, Some(stored)) => (stored.to_string(), rec.config_format.unwrap_or_default()),
+    let (config, format, origin) = match (req.config, rec.config_body.as_deref()) {
+        (Some(c), _) => (c, req.config_format.into(), state.caller_origin()),
+        (None, Some(stored)) => (
+            stored.to_string(),
+            rec.config_format.unwrap_or_default(),
+            crate::serve::load::BodyOrigin::Trusted,
+        ),
         (None, None) => {
             return Err(ServeError::Unprocessable {
                 message: format!(
@@ -392,6 +407,7 @@ pub async fn rollback_run(
         format,
         state.default_base().as_ref(),
         crate::serve::runner::server_policy(&state).as_deref(),
+        origin,
     )
     .await?;
     let auth = crate::auth_catalog::build_auth_catalog(loaded.cfg.auth.as_ref())

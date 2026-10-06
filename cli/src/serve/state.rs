@@ -64,6 +64,9 @@ struct Inner {
     /// Fallback expiry of a pending change request when the approval policy
     /// sets none (`--approval-expiry-secs`).
     approval_expiry: Duration,
+    /// Whether a caller-supplied config may use subprocess connectors
+    /// (`--allow-subprocess-connectors`).
+    allow_subprocess_connectors: bool,
 }
 
 impl ServerState {
@@ -105,6 +108,7 @@ impl ServerState {
                 tenants: RwLock::new(Arc::new(Default::default())),
                 require_approval: config.require_approval.clone(),
                 approval_expiry: config.approval_expiry,
+                allow_subprocess_connectors: config.allow_subprocess_connectors,
             }),
         }
     }
@@ -113,6 +117,24 @@ impl ServerState {
     /// (`--require-approval`, #703).
     pub fn requires_approval(&self, kind: crate::serve::changes::ChangeKind) -> bool {
         self.inner.require_approval.contains(&kind)
+    }
+
+    /// How a config the request carried is loaded: subprocess connectors only
+    /// with `--allow-subprocess-connectors`.
+    pub fn caller_origin(&self) -> crate::serve::load::BodyOrigin {
+        crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: self.inner.allow_subprocess_connectors,
+        }
+    }
+
+    /// The origin of a body: [`Self::caller_origin`] unless the server's
+    /// operator wrote it.
+    pub fn origin(&self, trusted: bool) -> crate::serve::load::BodyOrigin {
+        if trusted {
+            crate::serve::load::BodyOrigin::Trusted
+        } else {
+            self.caller_origin()
+        }
     }
 
     /// The change kinds `--require-approval` names.
@@ -327,6 +349,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         }
     }
 

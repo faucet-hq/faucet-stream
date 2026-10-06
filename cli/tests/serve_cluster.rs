@@ -306,3 +306,66 @@ async fn two_process_cluster_reassigns_on_kill() {
         "every run reached a terminal state on the survivor B"
     );
 }
+
+fn sharded(id: &str) -> RunRecord {
+    let mut r = pending(id);
+    r.status = RunStatus::Sharded;
+    r
+}
+
+fn shards(n: usize) -> Vec<faucet_cli::serve::history::ShardInsert> {
+    (0..n)
+        .map(|i| faucet_cli::serve::history::ShardInsert {
+            shard_id: i.to_string(),
+            descriptor: serde_json::json!({ "i": i }),
+            size_estimate: Some((n - i) as u64),
+        })
+        .collect()
+}
+
+/// SERVE-14: cancelling a sharded run stops every shard that has not started —
+/// including one requeued after its worker's lease lapsed — and the run ends
+/// `cancelled`, not `failed`.
+#[tokio::test]
+async fn cancelling_a_sharded_run_stops_its_pending_shards_and_ends_cancelled() {
+    use faucet_cli::serve::history::ShardOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let a = backend(&dir, "c.db", Duration::from_secs(60), "inst-a").await;
+    let b = backend(&dir, "c.db", Duration::from_millis(50), "inst-b").await;
+    a.upsert(&sharded("big")).await.unwrap();
+    a.insert_shards("big", &shards(4)).await.unwrap();
+
+    assert_eq!(b.claim_shards(1).await.unwrap().len(), 1);
+    assert_eq!(a.claim_shards(1).await.unwrap().len(), 1);
+    a.request_cancel("big").await.unwrap();
+
+    let p = a.shard_progress("big").await.unwrap();
+    assert_eq!((p.pending, p.cancelled, p.running), (0, 2, 2));
+    assert!(a.claim_shards(10).await.unwrap().is_empty());
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let report = a.reclaim_shards(5).await.unwrap();
+    assert_eq!(report.requeued, 1, "b's lapsed shard is reclaimed");
+    assert!(a.claim_shards(10).await.unwrap().is_empty());
+    let p = a.shard_progress("big").await.unwrap();
+    assert_eq!(
+        (p.pending, p.cancelled, p.running),
+        (0, 3, 1),
+        "a reclaimed shard of a cancel-requested run is cancelled, not requeued"
+    );
+
+    assert!(
+        a.finalize_shard("big", "1", ShardOutcome::Cancelled)
+            .await
+            .unwrap()
+    );
+    let p = a.shard_progress("big").await.unwrap();
+    assert!(p.all_terminal());
+    assert_eq!(p.parent_outcome().0, RunStatus::Cancelled);
+
+    assert_eq!(a.finalize_completed_sharded_parents().await.unwrap(), 1);
+    assert_eq!(
+        a.get("big").await.unwrap().unwrap().status,
+        RunStatus::Cancelled
+    );
+}

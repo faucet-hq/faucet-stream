@@ -52,9 +52,9 @@ pub struct MaskingOutcome {
 /// Each record is walked depth-first; for every field (including nested object
 /// keys and array elements, addressed by dot-path such as `user.contacts.0.email`)
 /// the first rule that matches wins and its action rewrites the value. A
-/// name-based match (`field_pattern` / `fields`) can target a whole subtree
-/// (redacted wholesale); value detectors and the hash/tokenize/partial actions
-/// operate on scalar leaves.
+/// name-based match (`field_pattern` / `fields`) can target a whole subtree:
+/// `redact` replaces it wholesale and the hash/tokenize/partial actions rewrite
+/// every scalar leaf inside it. Value detectors operate on scalar leaves.
 pub fn apply_masking(records: Vec<Value>, masking: &CompiledMasking) -> MaskingOutcome {
     let mut out = MaskingOutcome {
         records: Vec::with_capacity(records.len()),
@@ -78,12 +78,14 @@ fn mask_node(node: &mut Value, path: &str, m: &CompiledMasking, hits: &mut Vec<M
                 hits.push(hit(rule, detector));
                 return; // replaced wholesale — do not recurse
             }
-            // Scalar-only actions: apply to a scalar leaf, otherwise fall
-            // through and recurse into the container's children.
             action => {
                 if let Some(s) = scalar_to_string(node) {
                     *node = Value::String(apply_scalar_action(action, &s, &m.hasher));
                     hits.push(hit(rule, detector));
+                    return;
+                }
+                if matches!(node, Value::Object(_) | Value::Array(_)) {
+                    mask_leaves(node, rule, action, &m.hasher, hits);
                     return;
                 }
             }
@@ -105,6 +107,34 @@ fn mask_node(node: &mut Value, path: &str, m: &CompiledMasking, hits: &mut Vec<M
             }
         }
         _ => {}
+    }
+}
+
+/// Apply a scalar-only action to every scalar leaf of a name-matched subtree.
+fn mask_leaves(
+    node: &mut Value,
+    rule: &CompiledRule,
+    action: &MaskAction,
+    hasher: &hash::Hasher,
+    hits: &mut Vec<MaskHit>,
+) {
+    match node {
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                mask_leaves(v, rule, action, hasher, hits);
+            }
+        }
+        Value::Array(items) => {
+            for v in items.iter_mut() {
+                mask_leaves(v, rule, action, hasher, hits);
+            }
+        }
+        leaf => {
+            if let Some(s) = scalar_to_string(leaf) {
+                *leaf = Value::String(apply_scalar_action(action, &s, hasher));
+                hits.push(hit(rule, None));
+            }
+        }
     }
 }
 
@@ -377,17 +407,75 @@ mod tests {
     }
 
     #[test]
-    fn scalar_action_on_container_falls_through_to_children() {
-        // A hash rule matching an object by name can't hash the object, so it
-        // recurses; the inner email detector then fires.
+    fn scalar_action_on_container_masks_every_leaf_before_later_rules() {
         let m = compile(json!({
+            "key": "k",
             "rules": [
                 { "match": { "field_pattern": "^blob$" }, "action": { "type": "hash" } },
                 { "match": { "value_detector": "email" }, "action": { "type": "redact" } }
             ]
         }));
         let out = apply_masking(vec![json!({"blob": {"e": "a@b.com"}})], &m);
-        assert_eq!(out.records[0]["blob"]["e"], json!("***"));
+        let e = out.records[0]["blob"]["e"].as_str().unwrap();
+        assert_eq!(
+            e.len(),
+            64,
+            "the name-matched hash rule wins over the detector"
+        );
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].action, "hash");
+    }
+
+    #[test]
+    fn hash_on_name_matched_array_masks_each_element() {
+        let m = compile(json!({
+            "key": "k",
+            "rules": [{ "match": { "fields": ["phones"] }, "action": { "type": "hash" } }]
+        }));
+        let out = apply_masking(
+            vec![json!({"phones": ["+14155552671", "+14155550000", null], "id": 1})],
+            &m,
+        );
+        let phones = out.records[0]["phones"].as_array().unwrap();
+        for p in &phones[..2] {
+            let s = p.as_str().unwrap();
+            assert_eq!(s.len(), 64);
+            assert!(!s.contains("415"));
+        }
+        assert_eq!(phones[2], json!(null));
+        assert_eq!(out.records[0]["id"], json!(1));
+        assert_eq!(out.hits.len(), 2);
+    }
+
+    #[test]
+    fn partial_on_anchored_pattern_masks_nested_object_leaves() {
+        let m = compile(json!({
+            "rules": [{ "match": { "field_pattern": "^card$" },
+                        "action": { "type": "partial", "keep_last": 4 } }]
+        }));
+        let out = apply_masking(
+            vec![json!({"card": {"number": "4111111111111111", "exp": {"m": 12, "ok": true}}})],
+            &m,
+        );
+        let card = &out.records[0]["card"];
+        assert_eq!(card["number"], json!("************1111"));
+        assert_eq!(card["exp"]["m"], json!("**"));
+        assert_eq!(card["exp"]["ok"], json!("****"));
+        assert_eq!(out.hits.len(), 3);
+    }
+
+    #[test]
+    fn tokenize_on_anchored_pattern_masks_nested_object_leaves() {
+        let m = compile(json!({
+            "key": "k",
+            "rules": [{ "match": { "field_pattern": "^card$" },
+                        "action": { "type": "tokenize", "prefix": "tok_" } }]
+        }));
+        let out = apply_masking(vec![json!({"card": {"number": "4111111111111111"}})], &m);
+        let n = out.records[0]["card"]["number"].as_str().unwrap();
+        assert!(n.starts_with("tok_"));
+        assert!(!n.contains("4111"));
+        assert_eq!(out.hits.len(), 1);
     }
 
     #[test]

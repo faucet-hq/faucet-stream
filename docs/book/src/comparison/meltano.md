@@ -85,7 +85,7 @@ What carries over and what changes:
 |---|---|
 | `pip_url` / executable | install the target yourself; `target_command` is its path or `PATH` name |
 | loader `config:` | `target_config:` — written to a private (0600) temp file passed as `--config`; its values are scrubbed from the target's stderr in faucet's logs and errors |
-| environment variables | `env:` |
+| environment variables | `env:` — on top of faucet's own environment, which `inherit_env: false` (or a list of names) narrows to a baseline |
 | stream name | the matrix row id (or the pipeline `name` for a single-row config); override with `stream:` |
 | `key_properties` from the tap | `write_mode: upsert` + `key: [...]` (or `key_properties:`) |
 | full-table / `ACTIVATE_VERSION` | `write_mode: overwrite` — records carry the run's version and `ACTIVATE_VERSION` is sent only after a successful run |

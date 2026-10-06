@@ -17,20 +17,22 @@ use crate::process::write_temp;
 pub async fn discover(config: &SingerSourceConfig) -> Result<Value, FaucetError> {
     let config_file = write_temp("config", &config.tap_config)?;
 
-    let output = Command::new(&config.executable)
+    let mut command = Command::new(&config.executable);
+    command
         .arg("--config")
         .arg(config_file.path())
         .arg("--discover")
         .args(&config.args)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|e| {
-            FaucetError::Source(format!(
-                "failed to spawn tap '{}' for discovery: {e}",
-                config.executable
-            ))
-        })?;
+        .stdin(Stdio::null());
+    if let Some(env) = config.inherit_env.from_process() {
+        command.env_clear().envs(env);
+    }
+    let output = command.output().await.map_err(|e| {
+        FaucetError::Source(format!(
+            "failed to spawn tap '{}' for discovery: {e}",
+            config.executable
+        ))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

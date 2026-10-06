@@ -27,8 +27,8 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status`, `GET`/`POST /v1/mirror/{name}`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
-| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
+| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, `POST /v1/plan`, `/v1/status` and `/v1/mirror/{name}` with an inline `config`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
 | `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete), pipeline state (`/v1/state/{pipeline}/{row}`) and `GET /v1/audit` |
 
 ```yaml
@@ -42,6 +42,13 @@ principals:
 ```bash
 faucet serve --auth-config auth.yaml
 ```
+
+Tokens resolve `${env:VAR}`, `${file:PATH}`, `${secret:VAR}` and secret-manager
+references (`${vault:…}`, `${aws-sm:…}`, …) when the server starts; a variable
+or file that does not resolve refuses the start, and a token that still holds
+`${` after resolution is refused rather than accepted literally. The variables
+and files an auth config reads are then out of reach of every config the
+server loads (see [Server credentials](#server-credentials)).
 
 The same file may carry an `approvals:` block — who may approve which
 [change requests](../cookbook/approvals.md), how many approvals each kind
@@ -63,8 +70,11 @@ A principal may carry `tenant: <id>` to confine it to one tenant
 only `/v1/tenants/<its id>/…`, its own runs, change requests and usage (lists
 are filtered; another tenant's run or route is a `404`, so existence does not
 leak), the schema catalog, template reads and `GET /v1/whoami`. Every global
-administrative route is a `403`, and a plain `POST /v1/runs` runs for its
-tenant.
+administrative route is a `403`. It runs **registered templates only**
+(`POST /v1/tenants/<its id>/templates/{id}/runs`): a config of its own — `POST
+/v1/runs`, `POST /v1/tenants/<its id>/runs`, `POST /v1/changes` — is a `403`,
+because a submitted config resolves references and builds connectors on the
+server. An unscoped operator may still submit a config for a tenant.
 
 ```yaml
 principals:
@@ -102,7 +112,7 @@ someone does.
 | `POST /v1/runs`, `DELETE /v1/runs/{id}`, `POST /v1/runs/{id}/cancel` | — | ✓ | ✓ |
 | `POST /v1/backfill` | — | ✓ | ✓ |
 | `POST /v1/verify` | — | ✓ | ✓ |
-| `POST /v1/plan` | ✓ | ✓ | ✓ |
+| `POST /v1/plan` | — | ✓ | ✓ |
 | `POST /v1/runs/{id}/rollback` | — | — | ✓ |
 | `GET /v1/schemas`, `/v1/schemas/{kind}/{name}` | ✓ | ✓ | ✓ |
 | `POST /v1/doctor` | — | ✓ | ✓ |
@@ -112,8 +122,8 @@ someone does.
 | `GET /v1/catalog/*` | ✓ | ✓ | ✓ |
 | `POST /v1/catalog/datasets/{id}/consumers` | — | ✓ | ✓ |
 | `GET /v1/usage` | ✓ | ✓ | ✓ |
-| `GET`/`POST /v1/status` | ✓ | ✓ | ✓ |
-| `GET`/`POST /v1/mirror/{name}` | ✓ | ✓ | ✓ |
+| `GET`/`POST /v1/status` | ✓² | ✓ | ✓ |
+| `GET`/`POST /v1/mirror/{name}` | ✓² | ✓ | ✓ |
 | `GET`/`PUT`/`DELETE /v1/state/{pipeline}/{row}` | — | — | ✓ |
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
@@ -137,14 +147,13 @@ someone does.
 | *any unclassified `/v1` route* | — | — | ✓ |
 
 ¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
+² With a registered `template`. An inline `config` is loaded on the server, so it needs `operator` (`403` for a viewer).
 
-Three entries are POSTs a **read** token can reach, because they change nothing:
+Two entries are POSTs a **read** token can reach, because they change nothing:
 
 - `POST /mcp` — the MCP transport's baseline is a read scope; its one mutating
-  tool (`run_pipeline`) re-checks `RunWrite` inside the handler.
-- `POST /v1/plan` — plans a config: expands it, runs a caller-supplied sample
-  through the offline harness, reads the catalog. No sink is written and no
-  run starts.
+  tool (`run_pipeline`) re-checks `RunWrite` inside the handler, and the tools
+  that load a config (`validate_config`, `preview`) need `operator`.
 - `POST /v1/dlq/inspect` — summarises a DLQ location. The location is
   caller-supplied, so a read token can ask the server to read a path on its
   filesystem. That is the same trust boundary as run logs (which carry record
@@ -164,6 +173,26 @@ and publishing templates need `admin`; `operator` triggers registered templates
 principals promoted to `role: admin`. The MCP `register_template` /
 `launch_template` / `rollback_template` / `deprecate_template` tools follow the
 same rule.
+
+### Server credentials
+
+A config the server loads — submitted, planned, probed, or a template — can
+never read the server's own credentials. `${env:}` / `${secret:}` of
+`FAUCET_VAULT_KEY`, `FAUCET_SERVE_AUTH_TOKEN` and the
+`FAUCET_SERVE_{READ,WRITE,ADMIN}_TOKEN` trio, of any variable an
+`--auth-config` token is read from, `${file:}` of a file an auth-config token
+is read from, and `${file:}` of anything under `/proc` are refused with `403`.
+
+### Subprocess connectors
+
+The `singer` source and sink run a program named in their config. A config
+**the request carries** (`POST /v1/runs`, `/v1/doctor`, `/v1/plan`,
+`/v1/status`, `/v1/backfill`, `/v1/verify`, `/v1/dlq/replay`, a rollback with
+a `config`, MCP `validate_config` / `preview` / `run_pipeline`) may use them
+only when the server was started with `--allow-subprocess-connectors`;
+otherwise it is a `422`. A config submitted for a tenant is refused even then.
+Registered templates and the triggers file are written by the server's
+operator and may always use them.
 
 **Who am I.** `GET /v1/whoami` returns the caller's `principal`, `role` and
 `permissions` to any authenticated caller (`--no-auth` and `--auth-token`
@@ -215,8 +244,8 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `POST` | `/v1/templates/sync` | `200` | Pull the `--templates-sync` origins into the registry — `{origin?, dry_run?}`; one report per origin, appends only (admin / `TemplateAdmin`; requires the `templates-sync` feature; `422` when the server has no origins) |
 | `POST` | `/v1/templates/{id}/publish` | `200` | Write one version back to an origin — `{origin, version?}` (admin / `TemplateAdmin`; `templates-sync`) |
 | `GET` | `/v1/whoami` | `200` | The caller's `principal`, `role` and `permissions` (every role / `Identity`) |
-| `GET` / `POST` | `/v1/status` | `200` | [Pipeline health](#pipeline-status-and-state) per row, from an inline `config` or a registered `template` (viewer / `StatusRead`) |
-| `GET` / `POST` | `/v1/mirror/{name}` | `200` | [Per-table mirror status](#mirror-status) from the mirror's state store (viewer / `StatusRead`) |
+| `GET` / `POST` | `/v1/status` | `200` | [Pipeline health](#pipeline-status-and-state) per row, from an inline `config` (operator) or a registered `template` (viewer / `StatusRead`) |
+| `GET` / `POST` | `/v1/mirror/{name}` | `200` | [Per-table mirror status](#mirror-status) from the mirror's state store (viewer / `StatusRead` with a `template`; operator with an inline `config`) |
 | `GET` | `/v1/state/{pipeline}/{row}` | `200` | A row's bookmark, envelope sequence and markers (admin / `StateAdmin`) |
 | `PUT` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Move the row's bookmark (admin / `StateAdmin`); `409` while a run holds the row |
 | `DELETE` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Reset the row so its next run re-syncs (admin / `StateAdmin`); `409` while a run holds the row |
@@ -269,7 +298,8 @@ Request body:
 - **`timeout_secs`** — wall-clock cap; on expiry the run is marked failed.
 - **`doctor_first`** — run preflight probes before executing; on any failure the
   submit returns `422` with the doctor report in `error.details`.
-- **`idempotency_key`** — replay protection (see cookbook).
+- **`idempotency_key`** — replay protection (see cookbook). Keys are scoped to
+  the tenant a run is for, so two tenants sending the same key start two runs.
 - **`clock`** — overrides the `${now.*}` clock for backfills (default: submit time).
 - **`concurrency`** — overrides this run's **connector** concurrency: how many
   concurrent connections/fetches the source and sink may use, whatever the
@@ -436,6 +466,25 @@ of a run. `budget` on a run or a change request (`max_records`, `max_bytes`,
 `max_duration_secs`, `allowed_sinks`) is merged with the config's own
 `budget:` block, the stricter of each ceiling winning.
 
+A template trigger that becomes a change request stores the template body
+unresolved (`${env:}` / `${file:}` / secret references stay tokens and resolve
+when the approved run executes), so a trigger that supplies a `secret: true`
+param or `env` overrides is refused with `422`. Responses mask what the reader
+may not see: callback `headers` for everyone but an admin, and the proposed
+`config` for a principal that cannot approve (a viewer). A tenant-scoped
+principal cannot `POST /v1/changes` (`403`); its gated template triggers
+become change requests on their own.
+
+With `--require-approval template_register` / `template_launch`, the template
+lifecycle routes refuse with `409` and point at `POST /v1/changes`:
+`POST /v1/templates` (both kinds when it also launches or assigns channels),
+`/launch`, `/rollback` and `/tags` (`template_launch`) and a non-dry-run
+`/v1/templates/sync` (either kind); the MCP `register_template` /
+`launch_template` / `rollback_template` tools refuse the same way. An approved
+change executes through the registry. `--templates-sync` registers and
+launches on its own schedule, so the server refuses to start with it and
+either template kind gated.
+
 A refused approval is a `403` naming the rule (role, named principals,
 self-approval); a request that is not `pending`, or a second approval by the
 same principal, is a `409`. Audited as `change.requested` / `approved` /
@@ -462,6 +511,8 @@ server shows as `running` — every submitted run carries a `pipeline` label
 to its pipeline whatever the run is named. Name the config with `config` (inline YAML / JSON,
 `config_format`) **or** `template` (+ `version`, a number or channel,
 default `stable`; `sink` for a source template; `params` in the POST body).
+A viewer may name a `template`; an inline `config` is loaded on the server
+(its references resolve and its connectors are built), so it needs `operator`.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -491,7 +542,8 @@ table — `phase` (`pending` / `snapshotting` / `active` / `paused` / `dropped` 
 the mirror runs in this server or in a separate `faucet mirror` process. Name
 the config with `config` or `template` as for `/v1/status`; its `name:` must
 equal `{name}` (else `422`), and a mirror that has not started is a `422`.
-Viewer-readable (`StatusRead`); audited as `mirror.status`.
+Viewer-readable (`StatusRead`) with a `template`; an inline `config` needs
+`operator`. Audited as `mirror.status`.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" --get \
@@ -846,7 +898,9 @@ cookbook](../cookbook/backfill.md) for the model.
   "timezone": "UTC",
   "name": "orders",
   "labels": {"requester": "airflow"},
-  "timeout_secs": 3600
+  "timeout_secs": 3600,
+  "resume": false,
+  "restart": false
 }
 ```
 
@@ -860,6 +914,13 @@ cookbook](../cookbook/backfill.md) for the model.
   pipeline `name` is rewritten per unit so state keys never touch the live
   bookmark). `delivery` is forced to `at_least_once`; `timeout_secs` applies
   per unit.
+- **`resume`** / **`restart`** — with a `state:` block the submitted range is
+  recorded in that state store, and a later POST of the same range is refused
+  with `409`: each unit would resume its old bookmark and read nothing. Set
+  `resume: true` to continue that backfill (submitted units replay, the rest
+  submit) or `restart: true` to delete each unit's scoped state and submit
+  every unit as a new run. Setting both is a `422`. Without a `state:` block no
+  unit keeps a bookmark, so the range is not recorded.
 
 `202` response: `{backfill, descriptor, planned, submitted, units: [{unit,
 start, end, status, run_id?, error?}]}` where `backfill` is the stable range
@@ -867,7 +928,8 @@ hash carried as the `backfill` label on every unit run (plus a `backfill_unit`
 label). Each unit is submitted with the deterministic idempotency key
 `backfill:{hash}:{unit}`, so **re-POSTing the same body is replay-safe** —
 already-submitted units replay their existing run, the rest submit (a full
-queue marks the remainder `not_submitted`; re-POST to continue). A config
+queue marks the remainder `not_submitted`; re-POST with `resume: true` to
+continue). A config
 carrying `shard: {count}` makes each unit a sharded run tracked via shard
 progress. Requires `RunWrite` (operator); audited as `backfill.submit`.
 
@@ -905,7 +967,9 @@ block) applies; `impact` with `impact: true` — the downstream datasets,
 contracts, owners and declared consumers the planned schema affects, each
 with a severity (`breaking` / `additive` / `unknown`), walked over this
 server's catalog. Nothing is written and no run starts (the sink is built
-only for its non-mutating probe), so it is `Plan` (viewer); audited as
+only for its non-mutating probe), but the config is loaded on the server —
+its references resolve and discovery reaches its hosts — so it is `Plan`
+(operator); audited as
 `plan`. `impact` needs the `catalog` feature (`422` otherwise).
 
 **Policy refusals.** With `faucet serve --policy FILE`, every submission
@@ -1022,11 +1086,11 @@ Every error is a JSON `ApiError`:
 |--------|------|
 | `400` | Malformed body / parse / interpolation failure; a `schedule:` block in the config |
 | `401` | Missing/invalid bearer token |
-| `403` | Authenticated, but the principal's role lacks the required permission (RBAC) |
+| `403` | Authenticated, but the principal's role lacks the required permission (RBAC); a tenant-scoped principal submitting a config; a config that reads the [server's own credentials](#server-credentials) |
 | `404` | Unknown `run_id` |
-| `409` | `DELETE` on a running run; idempotency key reused with a different payload; a pipeline-state change while a run holds the row |
+| `409` | `DELETE` on a running run; idempotency key reused with a different payload; a pipeline-state change while a run holds the row; a template lifecycle call the server gates behind approval |
 | `413` | Body exceeds `--body-limit-bytes` |
-| `422` | Expand/validation failure; `doctor_first` failed (report in `details`) |
+| `422` | Expand/validation failure; `doctor_first` failed (report in `details`); a [subprocess connector](#subprocess-connectors) without `--allow-subprocess-connectors` |
 | `429` | Run queue full (carries `Retry-After`) |
 | `500` | Internal error |
 

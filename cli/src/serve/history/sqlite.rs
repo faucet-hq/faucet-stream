@@ -183,11 +183,17 @@ mod shard_tests {
 
         // B does not own it → cannot finalize.
         assert!(
-            !b.finalize_shard("run1", "0", true).await.unwrap(),
+            !b.finalize_shard("run1", "0", crate::serve::history::ShardOutcome::Completed)
+                .await
+                .unwrap(),
             "a non-owner must not finalize the shard"
         );
         // A owns it → finalize succeeds.
-        assert!(a.finalize_shard("run1", "0", true).await.unwrap());
+        assert!(
+            a.finalize_shard("run1", "0", crate::serve::history::ShardOutcome::Completed)
+                .await
+                .unwrap()
+        );
 
         let p = a.shard_progress("run1").await.unwrap();
         assert_eq!(p.completed, 1);

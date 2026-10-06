@@ -150,6 +150,10 @@ Useful alert expressions:
   run was poisoned; investigate the per-run error.
 - `faucet_serve_history_degraded == 1` — history backend is down; cluster
   coordination is impaired (instances continue locally but cannot share runs).
+  An instance that cannot renew its run and shard leases for two heartbeats
+  (two thirds of `--lease-ttl-secs`) cancels every run and shard it is
+  executing, before the leases expire, so a peer that reclaims them never runs
+  them at the same time.
 
 ## Delivery guarantees and double-run boundary
 

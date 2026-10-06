@@ -10,41 +10,6 @@ use crate::serve::state::ServerState;
 use async_trait::async_trait;
 use std::time::Duration;
 
-/// Edge detector. Fires once when depth first reaches `threshold`; re-arms only
-/// after depth drops below `threshold`.
-#[derive(Debug)]
-pub struct Edge {
-    threshold: u64,
-    armed: bool,
-    edge_ordinal: u64,
-}
-
-impl Edge {
-    pub fn new(threshold: u64) -> Self {
-        Self {
-            threshold,
-            armed: true,
-            edge_ordinal: 0,
-        }
-    }
-
-    /// Feed a depth reading. Returns `Some(edge_ordinal)` if this reading is a
-    /// rising-edge fire, else `None`.
-    pub fn on_depth(&mut self, depth: u64) -> Option<u64> {
-        if depth >= self.threshold {
-            if self.armed {
-                self.armed = false;
-                self.edge_ordinal += 1;
-                return Some(self.edge_ordinal);
-            }
-            None
-        } else {
-            self.armed = true; // dropped below → re-arm
-            None
-        }
-    }
-}
-
 /// The IO seam: returns the current depth of the queue.
 #[async_trait]
 pub trait DepthProbe: Send + Sync {
@@ -52,10 +17,16 @@ pub trait DepthProbe: Send + Sync {
     fn queue_label(&self) -> String;
 }
 
+/// Polls a queue and fires once per rising crossing of `threshold`, re-arming
+/// only after the depth drops below it. The edge (armed flag + ordinal) lives
+/// in the run history, so the idempotency key `trig:<name>:edge:<ordinal>` is
+/// never reused after a restart and every cluster instance agrees on which
+/// instance fired a crossing.
 pub struct QueueDepthWatcher {
     name: String,
     probe: Box<dyn DepthProbe>,
-    edge: Edge,
+    threshold: u64,
+    known_armed: bool,
     poll: Duration,
     compiled: std::sync::Arc<super::compiled::CompiledTrigger>,
 }
@@ -70,7 +41,8 @@ impl QueueDepthWatcher {
         Self {
             name: compiled.name().to_string(),
             probe,
-            edge: Edge::new(threshold),
+            threshold,
+            known_armed: false,
             poll,
             compiled,
         }
@@ -91,9 +63,26 @@ impl Watcher for QueueDepthWatcher {
 
     async fn poll(&mut self, state: &ServerState) -> Result<bool, String> {
         let depth = self.probe.depth().await?;
-        let Some(edge) = self.edge.on_depth(depth) else {
+        let history = state.history();
+        if depth < self.threshold {
+            if !self.known_armed {
+                history
+                    .trigger_edge_rearm(&self.name)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.known_armed = true;
+            }
+            return Ok(false);
+        }
+        let Some(edge) = history
+            .trigger_edge_rise(&self.name)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            self.known_armed = false;
             return Ok(false);
         };
+        self.known_armed = false;
         let event = TriggerEvent::QueueDepth {
             queue: self.probe.queue_label(),
             depth,
@@ -102,9 +91,10 @@ impl Watcher for QueueDepthWatcher {
         let fired_at = chrono::Utc::now().to_rfc3339();
         let outcome = enqueue::fire(state, &self.compiled, event, &fired_at).await;
         if !outcome.committed() {
-            // Dropped/error: re-arm so the next poll retries the same edge.
-            self.edge.armed = true;
-            self.edge.edge_ordinal -= 1;
+            history
+                .trigger_edge_retract(&self.name, edge)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(outcome.committed())
     }
@@ -274,14 +264,22 @@ mod kafka_probe {
 mod tests {
     use super::*;
 
-    #[test]
-    fn edge_fires_once_then_suppresses_until_drain() {
-        let mut e = Edge::new(5);
-        assert_eq!(e.on_depth(0), None);
-        assert_eq!(e.on_depth(5), Some(1)); // rising edge
-        assert_eq!(e.on_depth(9), None); // still high → suppressed
-        assert_eq!(e.on_depth(6), None);
-        assert_eq!(e.on_depth(0), None); // drained → re-arm
-        assert_eq!(e.on_depth(7), Some(2)); // next rising edge → new ordinal
+    #[tokio::test]
+    async fn the_edge_fires_once_per_crossing_and_retracts_a_failed_fire() {
+        use crate::serve::history::RunHistory;
+        let h = crate::serve::history::memory::MemoryHistory::new(Duration::from_secs(60));
+        assert_eq!(h.trigger_edge_rise("q").await.unwrap(), Some(1));
+        assert_eq!(h.trigger_edge_rise("q").await.unwrap(), None);
+        h.trigger_edge_rearm("q").await.unwrap();
+        assert_eq!(h.trigger_edge_rise("q").await.unwrap(), Some(2));
+        h.trigger_edge_retract("q", 1).await.unwrap();
+        assert_eq!(
+            h.trigger_edge_rise("q").await.unwrap(),
+            None,
+            "stale retract"
+        );
+        h.trigger_edge_retract("q", 2).await.unwrap();
+        assert_eq!(h.trigger_edge_rise("q").await.unwrap(), Some(2), "retried");
+        h.trigger_edge_rearm("other").await.unwrap();
     }
 }

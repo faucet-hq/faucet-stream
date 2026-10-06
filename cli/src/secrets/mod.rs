@@ -370,6 +370,33 @@ pub async fn resolve_secrets_with(cfg: &mut PipelineConfig, set: &ResolverSet) -
     visit_config_values_mut(cfg, |v| substitute(v, &cache))
 }
 
+/// Resolve every secret directive in an arbitrary document in place — for
+/// files that are not pipeline configs (`faucet serve --auth-config`).
+pub async fn resolve_value(value: &mut Value) -> CliResult<()> {
+    let mut set = ResolverSet::default();
+    let mut refs = BTreeSet::new();
+    collect_refs(value, &mut refs);
+    for scheme in refs
+        .iter()
+        .map(|(s, _)| s.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        set.insert(make_resolver(scheme)?);
+    }
+    resolve_value_with(value, &set).await
+}
+
+/// [`resolve_value`] with a caller-supplied resolver set.
+pub async fn resolve_value_with(value: &mut Value, set: &ResolverSet) -> CliResult<()> {
+    let mut refs = BTreeSet::new();
+    collect_refs(value, &mut refs);
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let cache = fetch_all(&refs, set).await?;
+    substitute(value, &cache)
+}
+
 /// Fetch every reference concurrently (bounded), de-duplicated by the result
 /// map, registering each resolved value for redaction.
 async fn fetch_all(
@@ -489,6 +516,27 @@ pipeline:
         resolve_secrets_with(&mut cfg, &set).await.unwrap();
         let token = &cfg.pipeline.source.as_ref().unwrap().config["auth"]["config"]["token"];
         assert_eq!(token, "RESOLVED");
+    }
+
+    #[tokio::test]
+    async fn resolve_value_substitutes_any_document() {
+        let mut set = ResolverSet::default();
+        set.insert(Arc::new(FakeResolver {
+            scheme: "vault",
+            value: "tok-from-vault".into(),
+        }));
+        let mut doc = serde_json::json!({"principals": [{"token": "${vault:kv/app#t}"}], "n": 1});
+        resolve_value_with(&mut doc, &set).await.unwrap();
+        assert_eq!(doc["principals"][0]["token"], "tok-from-vault");
+        let mut plain = serde_json::json!({"a": "b"});
+        resolve_value(&mut plain).await.unwrap();
+        assert_eq!(plain, serde_json::json!({"a": "b"}));
+        let mut unknown = serde_json::json!({"a": "${no-such-scheme:x}"});
+        resolve_value(&mut unknown).await.unwrap();
+        let mut disabled = serde_json::json!({"a": "${azure-kv:v/s}"});
+        if !cfg!(feature = "secrets-azure-kv") {
+            assert!(resolve_value(&mut disabled).await.is_err());
+        }
     }
 
     #[tokio::test]

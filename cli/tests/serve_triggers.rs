@@ -48,6 +48,7 @@ fn test_config() -> ServeConfig {
         approval_expiry: std::time::Duration::from_secs(86_400),
         vault: None,
         connect_providers_path: None,
+        allow_subprocess_connectors: false,
     }
 }
 
@@ -201,6 +202,147 @@ async fn webhook_trigger_enqueues_exactly_one_run() {
         "idempotency must dedupe the replay — got {} runs",
         page2.runs.len()
     );
+}
+
+fn webhook_event(query: &[(&str, &str)]) -> faucet_cli::serve::triggers::context::TriggerEvent {
+    faucet_cli::serve::triggers::context::TriggerEvent::Webhook {
+        method: "POST".into(),
+        body: "{\"dataset\":\"orders\"}".into(),
+        headers: Default::default(),
+        query: query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        idem: "cookbook-1".into(),
+    }
+}
+
+/// SERVE-09: the cookbook's trigger configs — tokens inside quoted scalars and
+/// embedded in longer strings — substitute to the raw value.
+#[tokio::test]
+async fn cookbook_trigger_configs_substitute_into_quoted_and_embedded_scalars() {
+    use faucet_cli::serve::triggers::context::TriggerEvent;
+    use faucet_cli::serve::triggers::enqueue::resolve_config_text;
+    use faucet_cli::serve::triggers::spec::PipelineRef;
+
+    let dir = tempfile::tempdir().unwrap();
+    let s3_load = dir.path().join("s3_load.yaml");
+    std::fs::write(
+        &s3_load,
+        r#"version: 1
+name: s3-load
+pipeline:
+  source:
+    type: s3
+    config:
+      bucket: "${trigger.bucket}"
+      prefix: "${trigger.object_key}"   # exact key → single-object read
+      region: us-east-1
+      file_format: json_lines
+  sink:
+    type: postgres
+    config:
+      connection_url: "${env:PG_URL}"
+      table_name: events_raw
+      column_mapping: { type: jsonb, column: payload }
+"#,
+    )
+    .unwrap();
+    let object = TriggerEvent::Object {
+        bucket: "my-bucket".into(),
+        key: "incoming/2026/10/06/data:part-1.jsonl".into(),
+        size: 10,
+        last_modified: "2026-10-06T00:00:00Z".into(),
+    };
+    let text = resolve_config_text(
+        &PipelineRef::Path(s3_load.display().to_string()),
+        &object,
+        "load-dropped-files",
+        "2026-10-06T00:00:01Z",
+    )
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_yaml::from_str(&text).unwrap();
+    assert_eq!(v["pipeline"]["source"]["config"]["bucket"], "my-bucket");
+    assert_eq!(
+        v["pipeline"]["source"]["config"]["prefix"],
+        "incoming/2026/10/06/data:part-1.jsonl"
+    );
+    assert_eq!(
+        v["pipeline"]["sink"]["config"]["connection_url"], "${env:PG_URL}",
+        "other directives are left for the loader"
+    );
+
+    let sync = dir.path().join("sync.yaml");
+    std::fs::write(
+        &sync,
+        r#"# pipeline that uses the request body as a REST source filter
+pipeline:
+  source:
+    type: rest
+    config:
+      url: "https://api.example.com/orders?dataset=${trigger.query.dataset}"
+      auth: { type: bearer, config: { token: "${env:API_TOKEN}" } }
+  sink:
+    type: file
+    config:
+      path: "./out/${trigger.fired_at}.jsonl"
+"#,
+    )
+    .unwrap();
+    let text = resolve_config_text(
+        &PipelineRef::Path(sync.display().to_string()),
+        &webhook_event(&[("dataset", "orders")]),
+        "sync-hook",
+        "2026-10-06T00:00:01Z",
+    )
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_yaml::from_str(&text).unwrap();
+    assert_eq!(
+        v["pipeline"]["source"]["config"]["url"],
+        "https://api.example.com/orders?dataset=orders"
+    );
+    assert_eq!(
+        v["pipeline"]["sink"]["config"]["path"],
+        "./out/2026-10-06T00:00:01Z.jsonl"
+    );
+}
+
+/// SERVE-09 end to end: a webhook fire whose pipeline uses quoted and embedded
+/// `${trigger.*}` tokens runs and writes where the tokens say.
+#[tokio::test]
+async fn a_webhook_fire_with_quoted_and_embedded_tokens_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.csv"), "a,b\n1,2\n").unwrap();
+    let pipeline = dir.path().join("sync.yaml");
+    std::fs::write(
+        &pipeline,
+        "version: 1\nname: sync\npipeline:\n  source:\n    type: csv\n    config:\n      path: \"${trigger.query.dir}/in.csv\"\n  sink:\n    type: jsonl\n    config:\n      path: ${trigger.query.dir}/out-${trigger.query.dataset}.jsonl\n",
+    )
+    .unwrap();
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: sync-hook\n    type: webhook\n    config: {}\n",
+        pipeline.display()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let event = webhook_event(&[("dir", dir.path().to_str().unwrap()), ("dataset", "orders")]);
+    let now = chrono::Utc::now().to_rfc3339();
+    let outcome =
+        faucet_cli::serve::triggers::enqueue::fire(&state, &compiled.triggers[0], event, &now)
+            .await;
+    assert!(
+        matches!(
+            outcome,
+            faucet_cli::serve::triggers::enqueue::FireOutcome::Enqueued(_)
+        ),
+        "expected Enqueued, got {outcome:?}"
+    );
+    wait_for_runs(&state, 1).await;
+    let written = std::fs::read_to_string(dir.path().join("out-orders.jsonl")).unwrap();
+    assert_eq!(written.lines().count(), 1, "{written}");
 }
 
 #[cfg(feature = "triggers-object-store")]
@@ -371,6 +513,115 @@ async fn queue_depth_fires_once_on_rising_edge() {
     }
 }
 
+/// SERVE-11: a queue_depth edge ordinal is durable and shared. After a
+/// restart the next crossing gets a new key (it is not swallowed by the old
+/// claim), and two instances watching the same queue fire a crossing once.
+#[cfg(all(
+    feature = "serve-history-sqlite",
+    any(feature = "triggers-redis", feature = "triggers-kafka")
+))]
+#[tokio::test]
+async fn queue_depth_edges_survive_a_restart_and_fire_once_across_instances() {
+    use async_trait::async_trait;
+    use faucet_cli::serve::history::sqlite::SqliteHistory;
+    use faucet_cli::serve::triggers::queue_depth::{DepthProbe, QueueDepthWatcher};
+    use faucet_cli::serve::triggers::watcher::Watcher;
+    use std::sync::Mutex;
+
+    struct Depths(Mutex<Vec<u64>>);
+    #[async_trait]
+    impl DepthProbe for Depths {
+        async fn depth(&self) -> Result<u64, String> {
+            let mut v = self.0.lock().unwrap();
+            Ok(if v.is_empty() { 0 } else { v.remove(0) })
+        }
+        fn queue_label(&self) -> String {
+            "jobs".into()
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drain\n    type: queue_depth\n    threshold: 5\n    queue: {{ type: redis, url: \"redis://x\", key: jobs }}\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let url = format!("sqlite:{}", dir.path().join("h.db").display());
+    let instance = |id: &'static str| {
+        let url = url.clone();
+        let compiled = &compiled;
+        async move {
+            let history = Arc::new(
+                SqliteHistory::connect(
+                    &url,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(30),
+                    id.into(),
+                )
+                .await
+                .unwrap(),
+            ) as Arc<dyn RunHistory>;
+            ServerState::new(
+                &test_config(),
+                None,
+                CancellationToken::new(),
+                history,
+                LogHub::new(),
+                None,
+                TriggersHandle::from_compiled(&compiled.triggers),
+            )
+        }
+    };
+    let watcher = |depths: Vec<u64>| {
+        QueueDepthWatcher::new(
+            Arc::new(compiled.triggers[0].clone()),
+            Box::new(Depths(Mutex::new(depths))),
+            5,
+            Duration::from_secs(30),
+        )
+    };
+
+    let first = instance("a").await;
+    let mut w = watcher(vec![9]);
+    assert!(w.poll(&first).await.unwrap(), "first crossing fires");
+    wait_for_runs(&first, 1).await;
+
+    let restarted = instance("a").await;
+    let mut w = watcher(vec![0, 9]);
+    assert!(!w.poll(&restarted).await.unwrap(), "drained: re-arm");
+    assert!(
+        w.poll(&restarted).await.unwrap(),
+        "the next crossing after a restart gets a new key and fires"
+    );
+    wait_for_runs(&restarted, 2).await;
+
+    let peer = instance("b").await;
+    let mut a = watcher(vec![0, 9]);
+    let mut b = watcher(vec![0, 9]);
+    assert!(!a.poll(&restarted).await.unwrap());
+    assert!(!b.poll(&peer).await.unwrap());
+    assert!(a.poll(&restarted).await.unwrap(), "one instance fires");
+    assert!(
+        !b.poll(&peer).await.unwrap(),
+        "the peer sees the crossing taken"
+    );
+    wait_for_runs(&restarted, 3).await;
+    let page = restarted
+        .history()
+        .list(&ListFilter {
+            limit: 1_000,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.runs.len(), 3, "one run per crossing");
+}
+
 // ── HTTP-boundary tests ───────────────────────────────────────────────────────
 //
 // These drive the REAL `faucet serve` HTTP listener (spawned via `run_server`,
@@ -439,6 +690,7 @@ async fn spawn_serve_with_triggers(
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

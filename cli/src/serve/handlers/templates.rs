@@ -33,6 +33,7 @@ fn map_err(e: crate::error::CliError) -> ServeError {
     match e {
         CliError::UnknownPipelineTemplate { .. } => ServeError::NotFound,
         CliError::Internal(m) => ServeError::Internal(m),
+        CliError::HistoryUnavailable(m) => ServeError::Unavailable(m),
         other if crate::select::is_selection_error(&other) => {
             ServeError::BadConfig(other.to_string())
         }
@@ -48,6 +49,22 @@ fn map_err(e: crate::error::CliError) -> ServeError {
 /// restarts and shares them across a cluster.
 fn store(state: &ServerState) -> TemplateStore {
     state.history()
+}
+
+/// Refuse a lifecycle call whose change kind the server gates behind an
+/// approved change request (`--require-approval`, #703). An approved request
+/// executes through the template store, not these handlers.
+fn approval_gate(
+    state: &ServerState,
+    kinds: &[crate::serve::changes::ChangeKind],
+) -> Result<(), ServeError> {
+    match kinds.iter().find(|k| state.requires_approval(**k)) {
+        Some(k) => Err(ServeError::Conflict(format!(
+            "this server requires an approved change request for {k} (--require-approval): \
+             propose it with POST /v1/changes (kind `{k}`) and have it approved"
+        ))),
+        None => Ok(()),
+    }
 }
 
 // ── POST /v1/templates ──────────────────────────────────────────────────────
@@ -80,6 +97,15 @@ pub async fn register_template(
     Extension(actor): Extension<AuthContext>,
     Json(body): Json<RegisterBody>,
 ) -> Result<(StatusCode, Json<TemplateSummary>), ServeError> {
+    use crate::serve::changes::ChangeKind;
+    if body.launch || !body.tags.is_empty() {
+        approval_gate(
+            &state,
+            &[ChangeKind::TemplateRegister, ChangeKind::TemplateLaunch],
+        )?;
+    } else {
+        approval_gate(&state, &[ChangeKind::TemplateRegister])?;
+    }
     let record = crate::templates::register(
         &store(&state),
         RegisterRequest {
@@ -573,6 +599,7 @@ pub async fn promote_template(
     Path(id): Path<String>,
     Json(body): Json<PromoteBody>,
 ) -> Result<Json<PromoteResponse>, ServeError> {
+    approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
     let version = crate::templates::promote(
         &store(&state),
         &id,
@@ -633,6 +660,7 @@ pub async fn launch_template(
     Path(id): Path<String>,
     Json(body): Json<LaunchBody>,
 ) -> Result<Json<LaunchResponse>, ServeError> {
+    approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
     let target = body.version.unwrap_or_else(VersionSelector::newest);
     let outcome = crate::templates::launch(&store(&state), &id, target, Some(&actor.principal))
         .await
@@ -646,6 +674,7 @@ pub async fn rollback_template(
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<LaunchResponse>, ServeError> {
+    approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
     let outcome = crate::templates::rollback(&store(&state), &id, Some(&actor.principal))
         .await
         .map_err(map_err)?;
@@ -994,7 +1023,9 @@ pub async fn trigger_template_outcome(
     // (#456 C5). What cannot be deferred is a value the *caller* supplied, so
     // those are refused below.
     let clustered = state.cluster().enabled();
-    let mode = if clustered {
+    let gated =
+        body.require_approval || state.requires_approval(crate::serve::changes::ChangeKind::Run);
+    let mode = if clustered || gated {
         crate::templates::Materialize::Persisted
     } else {
         crate::templates::Materialize::Local
@@ -1030,19 +1061,29 @@ pub async fn trigger_template_outcome(
     // config exactly like a param and is equally likely to be a credential —
     // #456 M4). Both are refused rather than written to a shared database that is
     // deliberately not a secret store.
-    if clustered && (materialized.used_secret_params || !body.env.is_empty()) {
+    if (clustered || gated) && (materialized.used_secret_params || !body.env.is_empty()) {
         let what = if materialized.used_secret_params {
             "declares `secret: true` param(s)"
         } else {
             "was triggered with `env` overrides"
         };
+        let why = if gated {
+            "this trigger needs an approved change request, which stores the materialized \
+             config for the approvers to review — and would store the value with it"
+        } else {
+            "a clustered server persists the materialized config so a peer can execute it — \
+             which would store the value in the shared run-history database"
+        };
+        let alternative = if gated {
+            "trigger it on a server that does not require approval for runs"
+        } else {
+            "trigger it on a non-clustered server"
+        };
         return Err(ServeError::Unprocessable {
             message: format!(
-                "this template {what}, and a clustered server persists the materialized config \
-                 so a peer can execute it — which would store the value in the shared \
-                 run-history database. Reference the secret from the template body instead \
-                 (`${{env:VAR}}`, `${{vault:…}}`, `${{aws-sm:…}}`, … — all resolved on the \
-                 executing instance, never persisted), or trigger it on a non-clustered server"
+                "this template {what}, and {why}. Reference the secret from the template body \
+                 instead (`${{env:VAR}}`, `${{vault:…}}`, `${{aws-sm:…}}`, … — all resolved on \
+                 the executing instance, never persisted), or {alternative}"
             ),
             details: None,
         });
@@ -1086,6 +1127,7 @@ pub async fn trigger_template_outcome(
         budget: body.budget,
         approved_change: None,
         selection: materialized.selection.clone(),
+        trusted_config: true,
     };
     let run = match runner::submit_gated(state.clone(), req, actor.clone()).await? {
         runner::SubmitOutcome::Accepted(run) => run,
@@ -2359,6 +2401,15 @@ pub async fn sync_templates(
 ) -> Result<Json<SyncResponse>, ServeError> {
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let file = require_sync(&state)?;
+    if !body.dry_run {
+        approval_gate(
+            &state,
+            &[
+                crate::serve::changes::ChangeKind::TemplateRegister,
+                crate::serve::changes::ChangeKind::TemplateLaunch,
+            ],
+        )?;
+    }
     let results = crate::templates::sync::sync_all(
         &store(&state),
         &file,

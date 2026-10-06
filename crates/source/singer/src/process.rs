@@ -92,6 +92,9 @@ impl TapProcess {
         }
 
         command.args(&cfg.args);
+        if let Some(env) = cfg.inherit_env.from_process() {
+            command.env_clear().envs(env);
+        }
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

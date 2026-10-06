@@ -683,13 +683,34 @@ pub fn latest_per_id(mut records: Vec<TemplateRecord>) -> Vec<TemplateSummary> {
     out
 }
 
-/// The version numbers to delete so at most [`VERSION_RETAIN`] remain for an id.
-pub fn versions_to_prune(mut versions: Vec<u32>) -> Vec<u32> {
+/// The versions a prune must keep whatever their age: the launched version, the
+/// rollback target and every channel target.
+pub fn protected_versions(
+    launches: &[LaunchRecord],
+    tags: &BTreeMap<String, u32>,
+) -> std::collections::BTreeSet<u32> {
+    stable_version(launches)
+        .into_iter()
+        .chain(previous_version(launches))
+        .chain(tags.values().copied())
+        .collect()
+}
+
+/// The version numbers to delete so at most [`VERSION_RETAIN`] remain for an id,
+/// never including a `protected` one.
+pub fn versions_to_prune(
+    mut versions: Vec<u32>,
+    protected: &std::collections::BTreeSet<u32>,
+) -> Vec<u32> {
     if versions.len() <= VERSION_RETAIN {
         return Vec::new();
     }
-    versions.sort_unstable_by(|a, b| b.cmp(a)); // newest first
-    versions.split_off(VERSION_RETAIN)
+    versions.sort_unstable_by(|a, b| b.cmp(a));
+    versions
+        .split_off(VERSION_RETAIN)
+        .into_iter()
+        .filter(|v| !protected.contains(v))
+        .collect()
 }
 
 #[cfg(test)]
@@ -741,11 +762,28 @@ mod tests {
 
     #[test]
     fn prunes_only_beyond_the_retain_window() {
-        assert!(versions_to_prune((1..=VERSION_RETAIN as u32).collect()).is_empty());
-        let prune = versions_to_prune((1..=(VERSION_RETAIN as u32 + 3)).collect());
-        // The three oldest go.
+        let none = std::collections::BTreeSet::new();
+        assert!(versions_to_prune((1..=VERSION_RETAIN as u32).collect(), &none).is_empty());
+        let prune = versions_to_prune((1..=(VERSION_RETAIN as u32 + 3)).collect(), &none);
         assert_eq!(prune, vec![3, 2, 1]);
-        assert!(versions_to_prune(vec![]).is_empty());
+        assert!(versions_to_prune(vec![], &none).is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_the_launched_previous_and_channel_versions() {
+        let launch = |seq: u32, version: u32| LaunchRecord {
+            seq,
+            version,
+            launched_at: DateTime::from_timestamp(seq as i64, 0).unwrap(),
+            launched_by: None,
+        };
+        let launches = vec![launch(3, 2), launch(2, 1), launch(1, 4)];
+        let tags = BTreeMap::from([("prod".to_string(), 3)]);
+        let protected = protected_versions(&launches, &tags);
+        assert_eq!(protected.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+        let protected = protected_versions(&launches, &tags);
+        let prune = versions_to_prune((1..=(VERSION_RETAIN as u32 + 5)).collect(), &protected);
+        assert_eq!(prune, vec![5, 4]);
     }
 
     #[test]

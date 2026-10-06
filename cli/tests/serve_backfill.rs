@@ -51,6 +51,7 @@ fn test_config(listen: &str) -> ServeConfig {
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     ServeConfig::from_args(args).unwrap()
 }
@@ -200,6 +201,104 @@ async fn backfill_submits_one_run_per_unit_and_replays_on_repost() {
     assert_eq!(resp.status(), 202);
     let replay: Value = resp.json().await.unwrap();
     assert_eq!(replay["units"][0]["run_id"], first_run_id.as_str());
+
+    server.abort();
+}
+
+async fn wait_completed(client: &reqwest::Client, url: &str, want: usize) {
+    for _ in 0..200 {
+        let runs: Value = client
+            .get(format!("{url}/v1/runs?limit=50"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let items = runs["runs"].as_array().cloned().unwrap_or_default();
+        if items.iter().filter(|r| r["status"] == "completed").count() >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{want} unit runs never completed");
+}
+
+/// SERVE-13: with a durable `state:` block a re-POST of a range that already
+/// ran is refused instead of silently resuming each unit's old bookmark;
+/// `resume` continues it, `restart` clears each unit's state and runs it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stateful_backfill_refuses_a_rerun_unless_resumed_or_restarted() {
+    use faucet_core::StateStore as _;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.db").display().to_string();
+    seed_sqlite(&src).await;
+    let out_dir = dir.path().join("out").display().to_string();
+    let state_dir = dir.path().join("state");
+    let config = format!(
+        "{}  state:\n    type: file\n    config: {{ path: \"{}\" }}\n",
+        scoped_config(&src, &out_dir),
+        state_dir.display()
+    );
+    let (url, client, server) = boot().await;
+    let body = |extra: Value| {
+        let mut b = json!({
+            "config": config,
+            "from": "2026-06-01",
+            "to": "2026-06-03",
+            "window": "1d",
+        });
+        if let Value::Object(m) = extra {
+            b.as_object_mut().unwrap().extend(m);
+        }
+        b
+    };
+    let post = |b: Value| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let r = client
+                .post(format!("{url}/v1/backfill"))
+                .json(&b)
+                .send()
+                .await
+                .unwrap();
+            let status = r.status().as_u16();
+            (status, r.json::<Value>().await.unwrap())
+        }
+    };
+
+    let (status, first) = post(body(json!({}))).await;
+    assert_eq!(status, 202, "{first}");
+    let first_run = first["units"][0]["run_id"].as_str().unwrap().to_string();
+    wait_completed(&client, &url, 2).await;
+
+    let (status, refused) = post(body(json!({}))).await;
+    assert_eq!(status, 409, "{refused}");
+    let msg = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("resume") && msg.contains("restart"), "{msg}");
+
+    let (status, both) = post(body(json!({"resume": true, "restart": true}))).await;
+    assert_eq!(status, 422, "{both}");
+
+    let (status, resumed) = post(body(json!({"resume": true}))).await;
+    assert_eq!(status, 202, "{resumed}");
+    assert_eq!(resumed["units"][0]["run_id"], first_run.as_str());
+
+    let store = faucet_core::FileStateStore::new(&state_dir);
+    let unit_key = "orders-backfill-20260601T000000Z::row-0";
+    store
+        .put(unit_key, &json!({"day": "2026-06-30"}))
+        .await
+        .unwrap();
+    let (status, restarted) = post(body(json!({"restart": true}))).await;
+    assert_eq!(status, 202, "{restarted}");
+    assert_ne!(restarted["units"][0]["run_id"], first_run.as_str());
+    assert!(
+        store.get(unit_key).await.unwrap().is_none(),
+        "restart clears each unit's scoped state"
+    );
+    wait_completed(&client, &url, 4).await;
 
     server.abort();
 }

@@ -8,8 +8,8 @@ use crate::executor::{ExecuteOptions, RunSummary, run_expanded};
 use crate::registry::build_source;
 use crate::serve::error::ServeError;
 use crate::serve::history::{Claim, InvocationRecord, RunRecord, RunStatus};
-use crate::serve::history::{ClaimedShard, ShardInsert};
-use crate::serve::load::{ConfigFormat, LoadedSubmission, load_submission_scoped};
+use crate::serve::history::{ClaimedShard, ShardInsert, ShardOutcome};
+use crate::serve::load::{BodyOrigin, ConfigFormat, LoadedSubmission, load_submission_scoped};
 use crate::serve::rbac::AuthContext;
 use crate::serve::state::ServerState;
 use crate::serve::{idempotency, metrics};
@@ -88,6 +88,10 @@ pub struct SubmitRequest {
     /// sharded run applies the same subset. Omitted: every row runs.
     #[serde(default)]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// Set in-process when the server's operator wrote the config (a
+    /// registered template, the triggers file), never accepted from a client.
+    #[serde(skip)]
+    pub trusted_config: bool,
 }
 
 /// What a gated submission produced (#703).
@@ -136,6 +140,7 @@ pub async fn submit_gated(
                 payload,
                 reason,
                 budget,
+                trusted_config: req.trusted_config,
             },
         )
         .await?;
@@ -206,13 +211,14 @@ pub(crate) async fn load_selected(
     format: ConfigFormat,
     tenant: Option<&str>,
     selection: Option<&crate::select::SelectionRequest>,
+    origin: BodyOrigin,
 ) -> Result<LoadedSubmission, ServeError> {
     if selection.is_some() && is_topology_body(body, format) {
         return Err(ServeError::BadConfig(
             crate::select::TOPOLOGY_REFUSAL.to_string(),
         ));
     }
-    let mut loaded = load_for(state, body, format, tenant).await?;
+    let mut loaded = load_for(state, body, format, tenant, origin).await?;
     if let Some(sel) = selection {
         let nodes = std::mem::take(&mut loaded.nodes);
         loaded.nodes = sel.apply(&loaded.cfg, nodes).map_err(|e| {
@@ -243,6 +249,7 @@ pub(crate) async fn load_for(
     body: &str,
     format: ConfigFormat,
     tenant: Option<&str>,
+    origin: BodyOrigin,
 ) -> Result<LoadedSubmission, ServeError> {
     let scope = match tenant {
         None => None,
@@ -253,6 +260,7 @@ pub(crate) async fn load_for(
         format,
         state.default_base().as_ref(),
         server_policy(state).as_deref(),
+        origin,
         scope,
     )
     .await
@@ -344,6 +352,7 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             format,
             rec.tenant.as_deref(),
             rec.selection.as_ref(),
+            BodyOrigin::Trusted,
         )
         .await
         {
@@ -533,7 +542,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             tracing::error!(run_id, shard_id, "claimed shard's run has no stored config");
             let _ = state
                 .history()
-                .finalize_shard(&run_id, &shard_id, false)
+                .finalize_shard(&run_id, &shard_id, ShardOutcome::Failed)
                 .await;
             maybe_finalize_parent(&state, &run_id).await;
             return;
@@ -545,6 +554,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             format,
             run.tenant.as_deref(),
             run.selection.as_ref(),
+            BodyOrigin::Trusted,
         )
         .await
         {
@@ -558,7 +568,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
                 );
                 let _ = state
                     .history()
-                    .finalize_shard(&run_id, &shard_id, false)
+                    .finalize_shard(&run_id, &shard_id, ShardOutcome::Failed)
                     .await;
                 maybe_finalize_parent(&state, &run_id).await;
                 return;
@@ -596,7 +606,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             run_id: run_id.clone(),
             shard_id: shard_id.clone(),
         };
-        let success = execute_shard(
+        let outcome = execute_shard(
             &state,
             loaded,
             &run_id,
@@ -612,7 +622,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 
         match state
             .history()
-            .finalize_shard(&run_id, &shard_id, success)
+            .finalize_shard(&run_id, &shard_id, outcome)
             .await
         {
             Ok(true) => {}
@@ -628,8 +638,8 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 }
 
 /// Run one shard's pipeline (single node, source narrowed via `opts.shard`).
-/// Returns `true` on clean completion. Does not touch the parent run record —
-/// the caller finalizes the shard and the parent.
+/// Does not touch the parent run record — the caller finalizes the shard and
+/// the parent.
 #[allow(clippy::too_many_arguments)]
 async fn execute_shard(
     state: &ServerState,
@@ -642,12 +652,12 @@ async fn execute_shard(
     clock_flag: Option<String>,
     concurrency: Option<usize>,
     submitted_at: DateTime<Utc>,
-) -> bool {
+) -> ShardOutcome {
     let auth = match loaded.auth_catalog() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard auth catalog: {e}");
-            return false;
+            return ShardOutcome::Failed;
         }
     };
     let LoadedSubmission { cfg, nodes, tenant } = loaded;
@@ -663,7 +673,7 @@ async fn execute_shard(
                 "shard clock: {}",
                 e.api_error().error.message
             );
-            return false;
+            return ShardOutcome::Failed;
         }
     };
     let resilience = match &cfg.resilience {
@@ -671,7 +681,7 @@ async fn execute_shard(
             Ok(p) => Some(p),
             Err(e) => {
                 tracing::error!(run_id, shard_id, "shard resilience: {e}");
-                return false;
+                return ShardOutcome::Failed;
             }
         },
         None => None,
@@ -681,7 +691,7 @@ async fn execute_shard(
         Ok(l) => l,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard lineage: {e}");
-            return false;
+            return ShardOutcome::Failed;
         }
     };
 
@@ -692,7 +702,7 @@ async fn execute_shard(
         Ok(u) => u,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard usage: {e}");
-            return false;
+            return ShardOutcome::Failed;
         }
     };
     let opts = ExecuteOptions {
@@ -785,14 +795,18 @@ async fn execute_shard(
             }
         }
     };
-    matches!(terminal, Terminal::Completed { .. })
+    match terminal {
+        Terminal::Completed { .. } => ShardOutcome::Completed,
+        Terminal::Cancelled => ShardOutcome::Cancelled,
+        _ => ShardOutcome::Failed,
+    }
 }
 
 /// Finalize a `Sharded` parent run once all its shards are terminal. The last
 /// shard to finish always observes `all_terminal` (its own `finalize_shard`
 /// committed first), so the run never lingers `Sharded`. A benign double-finalize
 /// (two shards finishing simultaneously) writes the same terminal status twice.
-async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
+pub(crate) async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
     let progress = match state.history().shard_progress(run_id).await {
         Ok(p) => p,
         Err(e) => {
@@ -803,14 +817,7 @@ async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
     if !progress.all_terminal() {
         return;
     }
-    let success = progress.failed == 0;
-    let status = if success {
-        RunStatus::Completed
-    } else {
-        RunStatus::Failed
-    };
-    let error =
-        (!success).then(|| format!("{}/{} shard(s) failed", progress.failed, progress.total));
+    let (status, error) = progress.parent_outcome();
     // Status-fenced finalize: transitions the parent only while it is still
     // `Sharded`, and does NOT re-stamp owner/lease on the terminal record, so a
     // near-simultaneous double-finalize from two instances has a single winner
@@ -821,7 +828,7 @@ async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
         .await
     {
         Ok(true) => {
-            metrics::record_run_finished(status, if success { "ok" } else { "error" });
+            metrics::record_run_finished(status, status.finished_reason());
             tracing::info!(
                 run_id,
                 shards = progress.total,
@@ -971,6 +978,7 @@ pub async fn submit(
         format,
         actor.tenant.as_deref(),
         req.selection.as_ref(),
+        state.origin(req.trusted_config),
     )
     .await?;
     policy_gate(&state, &actor, &loaded).await?;
@@ -1038,9 +1046,10 @@ pub async fn submit(
             req.concurrency,
             &req.labels,
         );
+        let key = idempotency_scope(actor.tenant.as_deref(), key);
         match state
             .history()
-            .claim_idempotency(key, &fp, &run_id, state.idempotency_retention())
+            .claim_idempotency(&key, &fp, &run_id, state.idempotency_retention())
             .await
             .map_err(|e| match e {
                 // Degraded backend can't safely honor idempotency → 503, retry.
@@ -1050,7 +1059,7 @@ pub async fn submit(
             Claim::Fresh => {}
             Claim::Replay(existing) => {
                 metrics::record_idempotency_hit();
-                return replay_response(&state, &existing).await;
+                return replay_response(&state, &actor, &existing).await;
             }
             Claim::Conflict => {
                 return Err(ServeError::Conflict(
@@ -1289,18 +1298,36 @@ pub(crate) async fn run_doctor_first(
 }
 
 /// Build the replay response for an idempotency hit (the existing run's status).
-async fn replay_response(state: &ServerState, run_id: &str) -> Result<SubmitResponse, ServeError> {
+async fn replay_response(
+    state: &ServerState,
+    actor: &AuthContext,
+    run_id: &str,
+) -> Result<SubmitResponse, ServeError> {
     let rec = state
         .history()
         .get(run_id)
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?
         .ok_or(ServeError::NotFound)?;
+    if !actor.sees_tenant(rec.tenant.as_deref()) {
+        return Err(ServeError::Conflict(
+            "idempotency key reused with a different payload".into(),
+        ));
+    }
     Ok(SubmitResponse {
         run_id: rec.run_id,
         status: rec.status,
         submitted_at: rec.submitted_at,
     })
+}
+
+/// The key an idempotency claim is stored under: a tenant's keys live in
+/// their own namespace, so two tenants sending the same key never meet.
+pub(crate) fn idempotency_scope(tenant: Option<&str>, key: &str) -> String {
+    match tenant {
+        Some(t) => format!("tenant:{t}:{key}"),
+        None => key.to_string(),
+    }
 }
 
 /// Releases a queue reservation on drop unless [`Self::defuse`]d. Guarantees the
@@ -1980,6 +2007,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_replay_never_reveals_another_tenants_run() {
+        assert_eq!(idempotency_scope(None, "k"), "k");
+        assert_eq!(idempotency_scope(Some("acme"), "k"), "tenant:acme:k");
+        let state = crate::serve::test_support::test_state();
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, Utc::now());
+        rec.tenant = Some("acme".into());
+        state.history().upsert(&rec).await.unwrap();
+        let globex = AuthContext {
+            tenant: Some("globex".into()),
+            ..admin_actor()
+        };
+        assert!(matches!(
+            replay_response(&state, &globex, "r1").await,
+            Err(ServeError::Conflict(_))
+        ));
+        assert_eq!(
+            replay_response(&state, &admin_actor(), "r1")
+                .await
+                .unwrap()
+                .run_id,
+            "r1"
+        );
+    }
+
     #[test]
     fn classify_ok_no_failures_is_completed() {
         let summary = RunSummary {
@@ -2082,6 +2134,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2118,6 +2171,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            trusted_config: false,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -2174,6 +2228,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2203,6 +2258,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            trusted_config: false,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -2256,6 +2312,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         ServerState::new(
@@ -2383,6 +2440,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         // A backend that is degraded from startup (primary unreachable).
         let history = Arc::new(FallbackHistory::degraded_at_startup(
@@ -2416,6 +2474,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            trusted_config: false,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(
@@ -2489,6 +2548,7 @@ mod tests {
                 approval_expiry: std::time::Duration::from_secs(86_400),
                 vault: None,
                 connect_providers_path: None,
+                allow_subprocess_connectors: false,
             };
             ServerState::new(
                 &cfg,
@@ -2503,9 +2563,15 @@ mod tests {
         }
 
         async fn loaded(yaml: &str) -> LoadedSubmission {
-            crate::serve::load::load_submission(yaml, ConfigFormat::Yaml, None, None)
-                .await
-                .expect("load submission")
+            crate::serve::load::load_submission(
+                yaml,
+                ConfigFormat::Yaml,
+                None,
+                None,
+                BodyOrigin::Trusted,
+            )
+            .await
+            .expect("load submission")
         }
 
         async fn seed_run(state: &ServerState, run_id: &str, status: RunStatus) {
@@ -2646,7 +2712,11 @@ mod tests {
             for i in 0..3 {
                 state
                     .history()
-                    .finalize_shard("r", &i.to_string(), true)
+                    .finalize_shard(
+                        "r",
+                        &i.to_string(),
+                        crate::serve::history::ShardOutcome::Completed,
+                    )
                     .await
                     .unwrap();
             }
@@ -2664,12 +2734,12 @@ mod tests {
             seed_sharded_with_shards(&state, "r", 2).await;
             state
                 .history()
-                .finalize_shard("r", "0", true)
+                .finalize_shard("r", "0", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             state
                 .history()
-                .finalize_shard("r", "1", false)
+                .finalize_shard("r", "1", crate::serve::history::ShardOutcome::Failed)
                 .await
                 .unwrap();
             maybe_finalize_parent(&state, "r").await;
@@ -2687,7 +2757,7 @@ mod tests {
             // Only one shard finalized → run stays Sharded.
             state
                 .history()
-                .finalize_shard("r", "0", true)
+                .finalize_shard("r", "0", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             maybe_finalize_parent(&state, "r").await;
@@ -2767,7 +2837,11 @@ mod tests {
                 Utc::now(),
             )
             .await;
-            assert!(ok, "csv→jsonl shard should complete");
+            assert_eq!(
+                ok,
+                ShardOutcome::Completed,
+                "csv→jsonl shard should complete"
+            );
             let written = std::fs::read_to_string(&output).unwrap();
             assert_eq!(written.lines().count(), 2, "both rows written");
             assert!(written.contains("alice") && written.contains("bob"));
@@ -2907,7 +2981,11 @@ mod tests {
                 Utc::now(),
             )
             .await;
-            assert!(!ok, "malformed resilience → shard fails fast");
+            assert_eq!(
+                ok,
+                ShardOutcome::Failed,
+                "malformed resilience → shard fails fast"
+            );
         }
 
         #[tokio::test]
@@ -2960,10 +3038,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let state = sqlite_state(dir.path()).await;
             seed_run(&state, "r", RunStatus::Sharded).await;
-            // request_cancel is fire-and-forget; verify it took effect by reading
-            // back via pending_shard_cancellations after a shard is claimed below.
-            state.history().request_cancel("r").await.unwrap();
-            // Insert + claim a shard so this instance owns a running shard under r.
+            // Insert + claim a shard so this instance owns a running shard under r,
+            // then flag the parent (a cancel-requested parent's shards are never
+            // claimed, so the claim has to come first).
             use crate::serve::history::ShardInsert;
             state
                 .history()
@@ -2979,6 +3056,7 @@ mod tests {
                 .unwrap();
             let claimed = state.history().claim_shards(1).await.unwrap();
             assert_eq!(claimed.len(), 1, "shard claimed (running, owned)");
+            state.history().request_cancel("r").await.unwrap();
 
             let flagged = state.history().pending_shard_cancellations().await.unwrap();
             assert_eq!(
@@ -3004,12 +3082,12 @@ mod tests {
             // Runs A (flagged) and C (NOT flagged) each get one shard; claim both
             // so they are running+owned here.
             seed_run(&state, "A", RunStatus::Sharded).await;
-            state.history().request_cancel("A").await.unwrap();
             state.history().insert_shards("A", &one("0")).await.unwrap();
             seed_run(&state, "C", RunStatus::Sharded).await;
             state.history().insert_shards("C", &one("0")).await.unwrap();
             let claimed = state.history().claim_shards(8).await.unwrap();
             assert_eq!(claimed.len(), 2, "A and C shards claimed (running)");
+            state.history().request_cancel("A").await.unwrap();
 
             // Run B: flagged, but its shard stays PENDING (inserted after the
             // claim, never claimed) → must be excluded (the join requires a
@@ -3036,7 +3114,11 @@ mod tests {
             for i in 0..3 {
                 state
                     .history()
-                    .finalize_shard("r", &i.to_string(), true)
+                    .finalize_shard(
+                        "r",
+                        &i.to_string(),
+                        crate::serve::history::ShardOutcome::Completed,
+                    )
                     .await
                     .unwrap();
             }
@@ -3071,17 +3153,17 @@ mod tests {
             seed_sharded_with_shards(&state, "r", 3).await;
             state
                 .history()
-                .finalize_shard("r", "0", true)
+                .finalize_shard("r", "0", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             state
                 .history()
-                .finalize_shard("r", "1", false)
+                .finalize_shard("r", "1", crate::serve::history::ShardOutcome::Failed)
                 .await
                 .unwrap();
             state
                 .history()
-                .finalize_shard("r", "2", true)
+                .finalize_shard("r", "2", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             let n = state
@@ -3104,7 +3186,7 @@ mod tests {
             // Only one shard terminal → the parent stays sharded.
             state
                 .history()
-                .finalize_shard("r", "0", true)
+                .finalize_shard("r", "0", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             let n = state

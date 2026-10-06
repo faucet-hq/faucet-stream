@@ -93,6 +93,8 @@ pub struct MemoryHistory {
     changes: Mutex<BTreeMap<String, crate::serve::changes::ChangeRequest>>,
     /// Tenants, connections, connect sessions and the state ledger (#709).
     tenants: Mutex<TenantState>,
+    /// queue_depth trigger edges: trigger → (last ordinal, armed).
+    trigger_edges: Mutex<std::collections::HashMap<String, (u64, bool)>>,
     /// Retention window for idempotency claims (separate from run retention).
     idem_retention: Duration,
 }
@@ -120,6 +122,7 @@ impl MemoryHistory {
             usage: Mutex::new(VecDeque::new()),
             changes: Mutex::new(BTreeMap::new()),
             tenants: Mutex::new(TenantState::default()),
+            trigger_edges: Mutex::new(std::collections::HashMap::new()),
             idem_retention,
         }
     }
@@ -901,35 +904,77 @@ impl RunHistory for MemoryHistory {
         }
     }
 
+    async fn trigger_edge_rise(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        let mut edges = self
+            .trigger_edges
+            .lock()
+            .map_err(|_| HistoryError::Backend("trigger edge lock poisoned".into()))?;
+        let (ordinal, armed) = edges.entry(trigger.to_string()).or_insert((0, true));
+        if !*armed {
+            return Ok(None);
+        }
+        *armed = false;
+        *ordinal += 1;
+        Ok(Some(*ordinal))
+    }
+
+    async fn trigger_edge_rearm(&self, trigger: &str) -> Result<(), HistoryError> {
+        let mut edges = self
+            .trigger_edges
+            .lock()
+            .map_err(|_| HistoryError::Backend("trigger edge lock poisoned".into()))?;
+        if let Some((_, armed)) = edges.get_mut(trigger) {
+            *armed = true;
+        }
+        Ok(())
+    }
+
+    async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
+        let mut edges = self
+            .trigger_edges
+            .lock()
+            .map_err(|_| HistoryError::Backend("trigger edge lock poisoned".into()))?;
+        if let Some((current, armed)) = edges.get_mut(trigger)
+            && *current == ordinal
+            && !*armed
+        {
+            *current -= 1;
+            *armed = true;
+        }
+        Ok(())
+    }
+
     // ── Pipeline-template registry (#444) ────────────────────────────────────
 
     async fn template_register(
         &self,
         draft: &templates::TemplateDraft,
     ) -> Result<templates::TemplateRecord, HistoryError> {
-        let mut store = self
-            .templates
-            .lock()
-            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
-        let id = draft.id.to_string();
-        let versions = store.entry(id.clone()).or_default();
-        let next = versions.keys().copied().max().unwrap_or(0) + 1;
-        let record = templates::TemplateRecord {
-            id,
-            version: next,
-            kind: draft.kind,
-            name: draft.name.clone(),
-            description: draft.description.clone(),
-            body: draft.body.clone(),
-            format: draft.format,
-            params: draft.params.clone(),
-            created_at: Utc::now(),
-            created_by: draft.created_by.clone(),
+        let (record, all) = {
+            let mut store = self
+                .templates
+                .lock()
+                .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+            let id = draft.id.to_string();
+            let versions = store.entry(id.clone()).or_default();
+            let next = versions.keys().copied().max().unwrap_or(0) + 1;
+            let record = templates::TemplateRecord {
+                id,
+                version: next,
+                kind: draft.kind,
+                name: draft.name.clone(),
+                description: draft.description.clone(),
+                body: draft.body.clone(),
+                format: draft.format,
+                params: draft.params.clone(),
+                created_at: Utc::now(),
+                created_by: draft.created_by.clone(),
+            };
+            versions.insert(next, record.clone());
+            let all: Vec<u32> = versions.keys().copied().collect();
+            (record, all)
         };
-        versions.insert(next, record.clone());
-        for stale in templates::versions_to_prune(versions.keys().copied().collect()) {
-            versions.remove(&stale);
-        }
+        self.prune_template_versions(&record.id, all).await?;
         Ok(record)
     }
 

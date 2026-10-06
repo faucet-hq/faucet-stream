@@ -271,7 +271,8 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 |------|---------|
 | `--listen <addr>` | Bind address (default `127.0.0.1:8080`; env `FAUCET_SERVE_LISTEN`). |
 | `--auth-token <t>` / `--no-auth` | Bearer token (prefer the env var) or explicit no-auth opt-in. |
-| `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — role enforcement + admin-only `GET /v1/audit`. Mutually exclusive with `--auth-token`/`--no-auth`. |
+| `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — role enforcement + admin-only `GET /v1/audit`. Tokens resolve `${env:}` / `${file:}` / secret-manager references at startup. Mutually exclusive with `--auth-token`/`--no-auth`. |
+| `--allow-subprocess-connectors` | Let a config submitted over HTTP / MCP use `singer` (it runs a program on the host). Off by default; tenant configs are refused regardless; registered templates are always allowed. |
 | `--max-concurrent-runs` / `--max-queued-runs` | Concurrency + queue caps (submit past the queue → 429 + `Retry-After`). |
 | `--history <url>` | `postgres://…` / `sqlite:…` for durable history (`serve-history-postgres` / `serve-history-sqlite`; default in-memory). |
 | `--default-config <path>` | Workspace defaults merged **under** every submitted run. |
@@ -441,7 +442,10 @@ the `approvals:` block of `--auth-config` approve it (#703). faucet re-plans
 at approval and refuses to run a change whose plan moved underneath the
 approver (`invalidated`). `faucet serve --require-approval run` turns every
 `POST /v1/runs` and template trigger into a pending request; the MCP
-`propose_run` / `propose_template` tools let agents file requests. See the
+`propose_run` / `propose_template` tools let agents file requests.
+`--require-approval template_register,template_launch` makes the template
+lifecycle routes and MCP tools answer `409` (and cannot be combined with
+`--templates-sync`). See the
 [approvals cookbook](../docs/book/src/cookbook/approvals.md).
 
 #### Tenants (`--vault-key`, `--connect-providers`)
@@ -461,7 +465,8 @@ tenant's connections, binds `${tenant.*}`, keeps state under
 `{tenant}::{pipeline}::{row}`, and carries the tenant on its run, usage, audit
 and change records. Rotated refresh tokens are written back; a revoked grant
 marks the connection `needs_reauth`, notifies the tenant and pauses its runs.
-A principal with `tenant:` in `--auth-config` is confined to one tenant.
+A principal with `tenant:` in `--auth-config` is confined to one tenant and
+runs registered templates only (a config of its own is a `403`).
 `DELETE /v1/tenants/{t}` removes everything faucet holds for it. See the
 [embedded integrations cookbook](../docs/book/src/cookbook/embedded-integrations.md).
 

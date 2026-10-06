@@ -216,7 +216,7 @@ impl Watcher for ObjectArrivalWatcher {
                             fired = true;
                         }
                         FireOutcome::Dropped(_) => break, // backpressure: stop; retry next poll
-                        FireOutcome::Error(_) => break,
+                        FireOutcome::Error(_) | FireOutcome::Failed(_) => break,
                         _ => {}
                     }
                 }

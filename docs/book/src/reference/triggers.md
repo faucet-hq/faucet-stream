@@ -47,7 +47,13 @@ tenant — its connections, `${tenant.*}` values, state namespace and limits
 ([embedded integrations](../cookbook/embedded-integrations.md); needs the
 `tenants` feature). Each tenant's idempotency key is the trigger's key
 suffixed `:<tenant>`; a tenant that is suspended, at its limit, or missing a
-connection is skipped and logged.
+connection is skipped and logged. A tenant whose run is refused for a reason a
+retry cannot fix (a missing `${tenant.labels.*}` label, a config that fails
+validation) is reported for that tenant only — a WARN log,
+`faucet_serve_trigger_tenant_failures_total` and a `run_failure` event through
+the tenant's own `notifications:` — and the fire still counts for every other
+tenant, so a schedule keeps advancing. Only a transient failure (the run
+history unavailable, a full queue) retries the whole fire.
 
 The triggers file is **validated strictly at load time**: an unknown or
 misspelled field on a trigger entry (e.g. `debounce_sec` for `debounce_secs`) or
@@ -77,6 +83,12 @@ start_at: now               # now (only objects seen after startup) | beginning 
 ```
 
 **`${trigger.*}` tokens injected into the run config:**
+
+Tokens are substituted inside each string value of the parsed config, with the
+raw value: `bucket: "${trigger.bucket}"`, `prefix: in/${trigger.object_key}`
+and `bucket: ${trigger.bucket}` all yield a plain string, and a value holding
+`:`, quotes or newlines stays inside its scalar. A whole-value token is always a
+string (`size: ${trigger.size}` gives `"42"`). Mapping keys are not substituted.
 
 *`mode: per_object` — one token set per object:*
 
@@ -207,8 +219,14 @@ Redis requires the `triggers-redis` feature; Kafka requires `triggers-kafka`.
 | `${trigger.queue}` | The queue key / topic name |
 | `${trigger.depth}` | Observed depth (as a string) that crossed the threshold |
 
-**Idempotency key:** `trig:<name>:edge:<monotonic_edge_ordinal>` — the
-ordinal increments on each rising edge, producing a unique key per fire.
+**Idempotency key:** `trig:<name>:edge:<edge_ordinal>`. The edge — whether it
+is armed, and its ordinal — is stored in the run history, not in the watcher:
+a rising crossing disarms it and takes the next ordinal, a drain below the
+threshold re-arms it. So a restart never reuses an ordinal (the next crossing
+always gets a new key) and, on a shared SQL history, exactly one instance fires
+each crossing. A fire that is dropped or fails gives its ordinal back so the
+next poll retries the same crossing. With the in-memory history the edge is
+per-process, like the idempotency claims it pairs with.
 
 ### `schedule`
 
@@ -320,14 +338,16 @@ faucet schema triggers     # print the JSON Schema for the triggers file
 | `faucet_serve_trigger_runs_coalesced_total` | Counter | `trigger` | Fires coalesced — webhook debounce, or an idempotency-conflict no-op |
 | `faucet_serve_trigger_runs_dropped_total` | Counter | `trigger`, `reason` | Fires dropped because the run queue was full (`reason="queue_full"`) |
 | `faucet_serve_trigger_errors_total` | Counter | `trigger`, `type` | Watcher errors (poll failures, etc.) |
+| `faucet_serve_trigger_tenant_failures_total` | Counter | `trigger`, `tenant` | Fan-out fires refused for one tenant while the other tenants ran |
 
 ## Cluster note
 
 When running a cluster (`--cluster` + shared `--history` DB), every instance
 loads the same `--triggers` file and spawns independent watchers. Idempotency
 keys are deterministic (derived from object key + last_modified, the
-dedupe header value, or a rising-edge ordinal), so concurrent fires from
-multiple instances resolve to a single run via the shared idempotency claim.
+dedupe header value, or a rising-edge ordinal stored in the shared history), so
+concurrent fires from multiple instances resolve to a single run via the shared
+idempotency claim.
 No additional coordination is required.
 
 ## Feature flags

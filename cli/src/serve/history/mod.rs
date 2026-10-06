@@ -60,6 +60,14 @@ impl RunStatus {
             Self::Cancelled => "cancelled",
         }
     }
+    /// The `reason` label `faucet_serve_runs_total` records for a terminal status.
+    pub fn finished_reason(self) -> &'static str {
+        match self {
+            Self::Completed => "ok",
+            Self::Cancelled => "cancelled",
+            _ => "error",
+        }
+    }
     /// Parse a lowercase status name (inverse of [`as_str`](Self::as_str)).
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.trim() {
@@ -354,6 +362,12 @@ pub enum HistoryError {
     /// `503` so the caller can retry once the backend recovers (#146 M5).
     #[error("{0}")]
     Degraded(String),
+    /// The backend could not be reached: a refused, dropped or timed-out
+    /// connection, a pool timeout, an I/O error, or a server that is shutting
+    /// down or out of connections. The only failure that may trip the
+    /// degraded fallback.
+    #[error("run-history backend error: {0}")]
+    Unreachable(String),
 }
 
 impl HistoryError {
@@ -364,9 +378,15 @@ impl HistoryError {
             Self::BackendClassified { transience, .. } => *transience,
             // A degraded backend recovers on its own, so a caller retrying is
             // exactly the right response.
-            Self::Degraded(_) => Transience::Transient,
+            Self::Degraded(_) | Self::Unreachable(_) => Transience::Transient,
             _ => Transience::Unknown,
         }
+    }
+
+    /// Whether the backend could not be reached at all (see
+    /// [`Unreachable`](Self::Unreachable)).
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable(_))
     }
 
     /// Whether retrying the failed call could plausibly succeed. Everything but
@@ -409,13 +429,47 @@ pub struct ShardProgress {
     pub failed: usize,
     pub running: usize,
     pub pending: usize,
+    pub cancelled: usize,
 }
 
 impl ShardProgress {
     /// True when every shard has reached a terminal state (and at least one
     /// exists) — i.e. the parent run can be finalized.
     pub fn all_terminal(&self) -> bool {
-        self.total > 0 && self.completed + self.failed == self.total
+        self.total > 0 && self.completed + self.failed + self.cancelled == self.total
+    }
+
+    /// The parent run's terminal status and error once every shard is terminal:
+    /// any cancelled shard means the run was cancelled, else any failure fails it.
+    pub fn parent_outcome(&self) -> (RunStatus, Option<String>) {
+        if self.cancelled > 0 {
+            (RunStatus::Cancelled, None)
+        } else if self.failed > 0 {
+            (
+                RunStatus::Failed,
+                Some(format!("{}/{} shard(s) failed", self.failed, self.total)),
+            )
+        } else {
+            (RunStatus::Completed, None)
+        }
+    }
+}
+
+/// How one shard ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl ShardOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShardOutcome::Completed => "completed",
+            ShardOutcome::Failed => "failed",
+            ShardOutcome::Cancelled => "cancelled",
+        }
     }
 }
 
@@ -676,16 +730,16 @@ pub trait RunHistory: Send + Sync {
         Ok(ReclaimReport::default())
     }
 
-    /// Owner-fenced terminal write for one shard (`running` → `completed`/`failed`),
+    /// Owner-fenced terminal write for one shard (`running` → `completed`/`failed`/`cancelled`),
     /// only if this instance still owns it. Returns `true` if the write landed.
     /// Default: `false`.
     async fn finalize_shard(
         &self,
         run_id: &str,
         shard_id: &str,
-        success: bool,
+        outcome: ShardOutcome,
     ) -> Result<bool, HistoryError> {
-        let _ = (run_id, shard_id, success);
+        let _ = (run_id, shard_id, outcome);
         Ok(false)
     }
 
@@ -714,6 +768,39 @@ pub trait RunHistory: Send + Sync {
     /// nothing to finalize.
     async fn finalize_completed_sharded_parents(&self) -> Result<usize, HistoryError> {
         Ok(0)
+    }
+
+    // ── queue_depth trigger edges (#789 SERVE-11) ────────────────────────────
+
+    /// Record a rising crossing for `trigger`: when its edge is armed (or has
+    /// never been seen), disarm it and return the next edge ordinal; when it is
+    /// already disarmed (this or another instance fired the crossing), `None`.
+    /// The ordinal is durable and shared, so a restart or a peer never reuses
+    /// one. Default: unsupported.
+    async fn trigger_edge_rise(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        let _ = trigger;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support queue_depth trigger edges".into(),
+        ))
+    }
+
+    /// The depth fell below the threshold: arm the edge again. Default:
+    /// unsupported.
+    async fn trigger_edge_rearm(&self, trigger: &str) -> Result<(), HistoryError> {
+        let _ = trigger;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support queue_depth trigger edges".into(),
+        ))
+    }
+
+    /// Undo a rise whose fire did not commit, so the next poll retries the same
+    /// ordinal. Only applies while `ordinal` is still the latest. Default:
+    /// unsupported.
+    async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
+        let _ = (trigger, ordinal);
+        Err(HistoryError::Backend(
+            "this run-history backend does not support queue_depth trigger edges".into(),
+        ))
     }
 
     // ── Audit log (RBAC, #205) ───────────────────────────────────────────────
@@ -1305,6 +1392,33 @@ pub trait RunHistory: Send + Sync {
         ))
     }
 
+    /// Delete the versions of `id` past [`templates::VERSION_RETAIN`], keeping the
+    /// launched version, the rollback target and every channel target, through
+    /// the same cascade as [`template_delete`](Self::template_delete).
+    async fn prune_template_versions(
+        &self,
+        id: &str,
+        versions: Vec<u32>,
+    ) -> Result<(), HistoryError> {
+        if versions.len() <= templates::VERSION_RETAIN {
+            return Ok(());
+        }
+        let protected = templates::protected_versions(
+            &self.template_launches(id).await?,
+            &self.template_tags(id).await?,
+        );
+        for stale in templates::versions_to_prune(versions, &protected) {
+            self.template_delete(id, Some(stale)).await?;
+        }
+        Ok(())
+    }
+
+    /// While degraded, probe the persistent backend and leave degraded mode
+    /// if it answers. Returns whether it recovered. Default: nothing to recover.
+    async fn recover_degraded(&self) -> bool {
+        false
+    }
+
     /// True when the backend is in fallback mode (drives `/readyz`). Always false
     /// for memory.
     fn degraded(&self) -> bool;
@@ -1679,6 +1793,7 @@ mod tests {
             failed: 0,
             running: 1,
             pending: 1,
+            cancelled: 0,
         };
         assert!(!p.all_terminal());
         // All terminal (mix of completed + failed sums to total).
@@ -1688,8 +1803,30 @@ mod tests {
             failed: 1,
             running: 0,
             pending: 0,
+            cancelled: 0,
         };
         assert!(p.all_terminal());
+        assert_eq!(
+            p.parent_outcome(),
+            (RunStatus::Failed, Some("1/3 shard(s) failed".into()))
+        );
+        p.cancelled = 1;
+        p.failed = 0;
+        assert!(p.all_terminal());
+        assert_eq!(p.parent_outcome(), (RunStatus::Cancelled, None));
+        p.cancelled = 0;
+        p.completed = 3;
+        assert_eq!(p.parent_outcome(), (RunStatus::Completed, None));
+    }
+
+    #[test]
+    fn shard_outcomes_and_finished_reasons_are_stable_labels() {
+        assert_eq!(ShardOutcome::Completed.as_str(), "completed");
+        assert_eq!(ShardOutcome::Failed.as_str(), "failed");
+        assert_eq!(ShardOutcome::Cancelled.as_str(), "cancelled");
+        assert_eq!(RunStatus::Completed.finished_reason(), "ok");
+        assert_eq!(RunStatus::Cancelled.finished_reason(), "cancelled");
+        assert_eq!(RunStatus::Failed.finished_reason(), "error");
     }
 
     #[tokio::test]
@@ -1699,7 +1836,11 @@ mod tests {
         assert_eq!(h.insert_shards("r", &[]).await.unwrap(), 0);
         assert!(h.claim_shards(8).await.unwrap().is_empty());
         assert_eq!(h.renew_shard_leases().await.unwrap(), 0);
-        assert!(!h.finalize_shard("r", "0", true).await.unwrap());
+        assert!(
+            !h.finalize_shard("r", "0", ShardOutcome::Completed)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             h.shard_progress("r").await.unwrap(),
             ShardProgress::default()

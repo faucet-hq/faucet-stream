@@ -134,7 +134,18 @@ faucet serve --auth-config auth.yaml --require-approval run,template_launch
   each window as a `run` change); the MCP `run_pipeline` tool points the agent
   at `propose_run`.
 - `template_register` / `template_launch`: those kinds must come through
-  `POST /v1/changes`.
+  `POST /v1/changes`. `POST /v1/templates` (both kinds when it also launches or
+  assigns channels), `/launch`, `/rollback`, `/tags` and a non-dry-run
+  `/v1/templates/sync` answer `409`, as do the MCP `register_template` /
+  `launch_template` / `rollback_template` tools. `--templates-sync` registers
+  and launches on its own schedule, so it cannot be combined with either kind.
+
+A template trigger that waits for approval stores the template body with its
+`${env:}` / `${file:}` / secret references still unresolved — they resolve
+when the approved run executes — so a trigger carrying a `secret: true` param
+or `env` overrides is refused with `422`. Change-request responses hide
+callback `headers` from everyone but admins and the proposed `config` from
+principals that cannot approve.
 
 `--approval-expiry-secs` sets the default window when the auth config does not.
 

@@ -294,6 +294,10 @@ pub const DDL: &[&str] = &[
         state_key TEXT NOT NULL,\
         body TEXT NOT NULL,\
         PRIMARY KEY (tenant, state_key))",
+    "CREATE TABLE IF NOT EXISTS faucet_serve_trigger_edges (\
+        trigger_name TEXT PRIMARY KEY,\
+        ordinal TEXT NOT NULL,\
+        armed TEXT NOT NULL)",
 ];
 
 /// The usage-listing cap for `filter`.
@@ -366,6 +370,12 @@ pub struct Stmts {
     pub cancel_pending: String,
     /// Request cancellation of an in-flight run owned by another instance.
     pub request_cancel: String,
+    pub cancel_pending_shards: String,
+    pub cancel_requeued_shards: String,
+    pub trigger_edge_init: String,
+    pub trigger_edge_rise: String,
+    pub trigger_edge_rearm: String,
+    pub trigger_edge_retract: String,
     /// List run IDs owned by this instance that have a pending cancellation request.
     pub pending_cancellations: String,
     /// Upsert this instance's membership heartbeat into `faucet_serve_instances`.
@@ -795,6 +805,29 @@ impl Stmts {
             request_cancel: "UPDATE faucet_serve_runs \
                 SET cancel_requested = $1 WHERE run_id = $2 AND status IN ('running','sharded')"
                 .into(),
+            cancel_pending_shards: "UPDATE faucet_serve_shards \
+                SET status = 'cancelled', finished_at = $1 \
+                WHERE run_id = $2 AND status = 'pending'"
+                .into(),
+            trigger_edge_init: "INSERT INTO faucet_serve_trigger_edges (trigger_name, ordinal, armed) \
+                VALUES ($1, $2, '1') ON CONFLICT (trigger_name) DO NOTHING"
+                .into(),
+            trigger_edge_rise: "UPDATE faucet_serve_trigger_edges \
+                SET ordinal = CAST(CAST(ordinal AS BIGINT) + 1 AS TEXT), armed = '0' \
+                WHERE trigger_name = $1 AND armed = '1' RETURNING ordinal"
+                .into(),
+            trigger_edge_rearm: "UPDATE faucet_serve_trigger_edges SET armed = '1' \
+                WHERE trigger_name = $1 AND armed = '0'"
+                .into(),
+            trigger_edge_retract: "UPDATE faucet_serve_trigger_edges \
+                SET ordinal = CAST(CAST(ordinal AS BIGINT) - 1 AS TEXT), armed = '1' \
+                WHERE trigger_name = $1 AND ordinal = $2 AND armed = '0'"
+                .into(),
+            cancel_requeued_shards: "UPDATE faucet_serve_shards \
+                SET status = 'cancelled', finished_at = $1 \
+                WHERE status = 'pending' AND run_id IN \
+                (SELECT run_id FROM faucet_serve_runs WHERE cancel_requested IS NOT NULL)"
+                .into(),
             pending_cancellations: "SELECT run_id FROM faucet_serve_runs \
                 WHERE status = 'running' AND owner = $1 AND cancel_requested IS NOT NULL"
                 .into(),
@@ -823,7 +856,7 @@ impl Stmts {
                 .into(),
             claim_shards_select: "SELECT s.run_id, s.shard_id, s.descriptor, r.body \
                 FROM faucet_serve_shards s JOIN faucet_serve_runs r ON r.run_id = s.run_id \
-                WHERE s.status = 'pending' \
+                WHERE s.status = 'pending' AND r.cancel_requested IS NULL \
                 ORDER BY CAST(COALESCE(s.size_estimate, '0') AS BIGINT) DESC, s.run_id, s.shard_id \
                 LIMIT $1"
                 .into(),
@@ -1183,6 +1216,29 @@ impl Stmts {
             request_cancel: "UPDATE faucet_serve_runs \
                 SET cancel_requested = ? WHERE run_id = ? AND status IN ('running','sharded')"
                 .into(),
+            cancel_pending_shards: "UPDATE faucet_serve_shards \
+                SET status = 'cancelled', finished_at = ? \
+                WHERE run_id = ? AND status = 'pending'"
+                .into(),
+            trigger_edge_init: "INSERT INTO faucet_serve_trigger_edges (trigger_name, ordinal, armed) \
+                VALUES (?, ?, '1') ON CONFLICT (trigger_name) DO NOTHING"
+                .into(),
+            trigger_edge_rise: "UPDATE faucet_serve_trigger_edges \
+                SET ordinal = CAST(CAST(ordinal AS INTEGER) + 1 AS TEXT), armed = '0' \
+                WHERE trigger_name = ? AND armed = '1' RETURNING ordinal"
+                .into(),
+            trigger_edge_rearm: "UPDATE faucet_serve_trigger_edges SET armed = '1' \
+                WHERE trigger_name = ? AND armed = '0'"
+                .into(),
+            trigger_edge_retract: "UPDATE faucet_serve_trigger_edges \
+                SET ordinal = CAST(CAST(ordinal AS INTEGER) - 1 AS TEXT), armed = '1' \
+                WHERE trigger_name = ? AND ordinal = ? AND armed = '0'"
+                .into(),
+            cancel_requeued_shards: "UPDATE faucet_serve_shards \
+                SET status = 'cancelled', finished_at = ? \
+                WHERE status = 'pending' AND run_id IN \
+                (SELECT run_id FROM faucet_serve_runs WHERE cancel_requested IS NOT NULL)"
+                .into(),
             pending_cancellations: "SELECT run_id FROM faucet_serve_runs \
                 WHERE status = 'running' AND owner = ? AND cancel_requested IS NOT NULL"
                 .into(),
@@ -1211,7 +1267,7 @@ impl Stmts {
                 .into(),
             claim_shards_select: "SELECT s.run_id, s.shard_id, s.descriptor, r.body \
                 FROM faucet_serve_shards s JOIN faucet_serve_runs r ON r.run_id = s.run_id \
-                WHERE s.status = 'pending' \
+                WHERE s.status = 'pending' AND r.cancel_requested IS NULL \
                 ORDER BY CAST(COALESCE(s.size_estimate, '0') AS INTEGER) DESC, s.run_id, s.shard_id \
                 LIMIT ?"
                 .into(),
@@ -1580,19 +1636,44 @@ pub fn threshold(now: DateTime<Utc>, window: Duration) -> String {
 /// the macro below maps through this, so no caller has to grep the rendered
 /// message to decide whether retrying is worthwhile (PRINCIPLES §6, #654 M1).
 pub fn classify_backend_error(e: sqlx::Error) -> HistoryError {
-    HistoryError::BackendClassified {
-        message: e.to_string(),
-        transience: transience_of(&e),
+    classified(e.to_string(), &e)
+}
+
+fn classified(message: String, e: &sqlx::Error) -> HistoryError {
+    if unreachable_of(e) {
+        HistoryError::Unreachable(message)
+    } else {
+        HistoryError::BackendClassified {
+            message,
+            transience: transience_of(e),
+        }
     }
+}
+
+/// Whether a driver error means the database could not be reached, as opposed
+/// to the database answering with an error.
+pub fn unreachable_of(e: &sqlx::Error) -> bool {
+    use sqlx::Error as E;
+    match e {
+        E::PoolTimedOut | E::PoolClosed | E::Io(_) | E::Tls(_) | E::WorkerCrashed => true,
+        E::Database(db) => unreachable_code(db.code().as_deref()),
+        _ => false,
+    }
+}
+
+/// Pure code → reachability: Postgres class `08` (connection exception),
+/// `57P01`–`57P03` (shutting down / cannot connect now) and `53300` (no free
+/// connection slot). A SQLite code never means "unreachable": the database is
+/// a local file, so a failure to open it is a configuration error.
+pub fn unreachable_code(code: Option<&str>) -> bool {
+    matches!(code, Some(c) if c.len() == SQLSTATE_LEN
+        && (c.starts_with("08") || matches!(c, "57P01" | "57P02" | "57P03" | "53300")))
 }
 
 /// [`classify_backend_error`] with a phase prefix, for the connect / DDL steps
 /// whose message needs to name what was being attempted.
 pub fn classify_backend_error_with_context(context: &str, e: sqlx::Error) -> HistoryError {
-    HistoryError::BackendClassified {
-        message: format!("{context}: {e}"),
-        transience: transience_of(&e),
-    }
+    classified(format!("{context}: {e}"), &e)
 }
 
 /// Transience of a driver error, from its variant (and, for a database-reported
@@ -2421,8 +2502,15 @@ macro_rules! impl_sql_history {
             ) -> Result<(), $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
+                let now = sql::fmt_ts(chrono::Utc::now());
                 sqlx::query(&self.stmts.request_cancel)
-                    .bind(sql::fmt_ts(chrono::Utc::now()))
+                    .bind(&now)
+                    .bind(run_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                sqlx::query(&self.stmts.cancel_pending_shards)
+                    .bind(&now)
                     .bind(run_id)
                     .execute(&self.pool)
                     .await
@@ -2668,6 +2756,13 @@ macro_rules! impl_sql_history {
                         }
                     }
                 }
+                if report.requeued > 0 {
+                    sqlx::query(&self.stmts.cancel_requeued_shards)
+                        .bind(&now_s)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(backend)?;
+                }
                 Ok(report)
             }
 
@@ -2675,11 +2770,11 @@ macro_rules! impl_sql_history {
                 &self,
                 run_id: &str,
                 shard_id: &str,
-                success: bool,
+                outcome: $crate::serve::history::ShardOutcome,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let status = if success { "completed" } else { "failed" };
+                let status = outcome.as_str();
                 let now_s = sql::fmt_ts(chrono::Utc::now());
                 let n = sqlx::query(&self.stmts.finalize_shard)
                     .bind(status)
@@ -2717,6 +2812,7 @@ macro_rules! impl_sql_history {
                         "completed" => p.completed += n,
                         "failed" => p.failed += n,
                         "running" => p.running += n,
+                        "cancelled" => p.cancelled += n,
                         _ => p.pending += n,
                     }
                 }
@@ -2738,6 +2834,65 @@ macro_rules! impl_sql_history {
                     ids.push(r.try_get::<String, _>("run_id").map_err(backend)?);
                 }
                 Ok(ids)
+            }
+
+            async fn trigger_edge_rise(
+                &self,
+                trigger: &str,
+            ) -> Result<Option<u64>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                // A fresh edge starts at the current millisecond so its ordinals
+                // never repeat keys an older, per-process counter already used.
+                let seed = chrono::Utc::now().timestamp_millis().max(0).to_string();
+                sqlx::query(&self.stmts.trigger_edge_init)
+                    .bind(trigger)
+                    .bind(&seed)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let row = sqlx::query(&self.stmts.trigger_edge_rise)
+                    .bind(trigger)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let ordinal: String = row.try_get("ordinal").map_err(backend)?;
+                ordinal.parse().map(Some).map_err(|e| {
+                    $crate::serve::history::HistoryError::Backend(format!(
+                        "trigger edge ordinal '{ordinal}': {e}"
+                    ))
+                })
+            }
+
+            async fn trigger_edge_rearm(
+                &self,
+                trigger: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.trigger_edge_rearm)
+                    .bind(trigger)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn trigger_edge_retract(
+                &self,
+                trigger: &str,
+                ordinal: u64,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.trigger_edge_retract)
+                    .bind(trigger)
+                    .bind(ordinal.to_string())
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
             }
 
             async fn finalize_completed_sharded_parents(
@@ -2763,7 +2918,7 @@ macro_rules! impl_sql_history {
                     if !progress.all_terminal() {
                         continue;
                     }
-                    let success = progress.failed == 0;
+                    let (status, error) = progress.parent_outcome();
                     // Read-modify-write the body so the surfaced record stays
                     // consistent (status, finished_at, error) with the column.
                     let Some(body_row) = sqlx::query(&self.stmts.select_body)
@@ -2782,17 +2937,10 @@ macro_rules! impl_sql_history {
                         continue;
                     }
                     let now = chrono::Utc::now();
-                    rec.status = if success {
-                        RunStatus::Completed
-                    } else {
-                        RunStatus::Failed
-                    };
+                    rec.status = status;
                     rec.finished_at = Some(now);
-                    if !success {
-                        rec.error = Some(format!(
-                            "{}/{} shard(s) failed",
-                            progress.failed, progress.total
-                        ));
+                    if error.is_some() {
+                        rec.error = error;
                     }
                     let new_body = sql::encode_body(&rec)?;
                     let n = sqlx::query(&self.stmts.finalize_sharded_parent)
@@ -2808,7 +2956,7 @@ macro_rules! impl_sql_history {
                         finalized += 1;
                         $crate::serve::metrics::record_run_finished(
                             rec.status,
-                            if success { "ok" } else { "error" },
+                            rec.status.finished_reason(),
                         );
                         tracing::info!(
                             run_id,
@@ -3876,13 +4024,7 @@ macro_rules! impl_sql_history {
                             // Bound the version history so a template
                             // re-registered on every deploy can't grow forever.
                             let keep = self.template_versions(&id).await?;
-                            for stale in templates::versions_to_prune(keep) {
-                                let _ = sqlx::query(&self.stmts.template_delete_version)
-                                    .bind(&id)
-                                    .bind(stale.to_string())
-                                    .execute(&self.pool)
-                                    .await;
-                            }
+                            self.prune_template_versions(&id, keep).await?;
                             return Ok(record);
                         }
                         Err(e) if attempt < sql::CLAIM_ATTEMPTS => {
@@ -4572,6 +4714,38 @@ mod tests {
             !err.is_retriable(),
             "a syntax error must not be retried at the connect gate"
         );
+    }
+
+    #[test]
+    fn only_a_backend_that_cannot_be_reached_is_unreachable() {
+        for code in ["08006", "08001", "57P01", "57P03", "53300"] {
+            assert!(unreachable_code(Some(code)), "{code}");
+        }
+        for code in ["40001", "23505", "42601"] {
+            assert!(!unreachable_code(Some(code)), "{code}");
+        }
+        assert!(
+            !unreachable_code(Some("5")),
+            "SQLITE_BUSY is contention, not reachability"
+        );
+        assert!(
+            !unreachable_code(Some("14")),
+            "SQLITE_CANTOPEN is configuration"
+        );
+        assert!(!unreachable_code(None));
+        assert!(unreachable_of(&sqlx::Error::PoolTimedOut));
+        assert!(unreachable_of(&sqlx::Error::PoolClosed));
+        assert!(unreachable_of(&sqlx::Error::Io(std::io::Error::other(
+            "reset"
+        ))));
+        assert!(!unreachable_of(&sqlx::Error::RowNotFound));
+        let err = classify_backend_error(sqlx::Error::PoolTimedOut);
+        assert!(err.is_unreachable());
+        assert_eq!(err.transience(), Transience::Transient);
+        assert!(err.to_string().starts_with("run-history backend error:"));
+        let err = classify_backend_error(db("08006"));
+        assert!(err.is_unreachable());
+        assert!(!classify_backend_error(db("23505")).is_unreachable());
     }
 
     #[test]
