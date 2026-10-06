@@ -233,6 +233,14 @@ fn build_add_column_sql(table: &str, col: &str, t: SqlBaseType) -> String {
 /// target's defaults, generated columns and constraints, which a
 /// `CREATE TABLE … AS SELECT` clone drops (#789 SQL-43). `None` when the text
 /// is not a recognisable `CREATE TABLE`.
+fn staging_definition(create_sql: &str, staging: &str, table: &str) -> Result<String, FaucetError> {
+    staging_ddl(create_sql, staging).ok_or_else(|| {
+        FaucetError::Sink(format!(
+            "sqlite overwrite: cannot derive a staging table from the definition of '{table}'"
+        ))
+    })
+}
+
 fn staging_ddl(create_sql: &str, staging: &str) -> Option<String> {
     let lower = create_sql.to_ascii_lowercase();
     let mut pos = lower.find("create")?;
@@ -1130,12 +1138,7 @@ impl faucet_core::Sink for SqliteSink {
                 self.config.table_name
             ))
         })?;
-        let ddl = staging_ddl(&create_sql, &self.staging_table()).ok_or_else(|| {
-            FaucetError::Sink(format!(
-                "sqlite overwrite: cannot derive a staging table from the definition of '{}'",
-                self.config.table_name
-            ))
-        })?;
+        let ddl = staging_definition(&create_sql, &self.staging_table(), &self.config.table_name)?;
         sqlx::query(&ddl)
             .execute(&self.pool)
             .await
@@ -1539,6 +1542,12 @@ mod tests {
         assert_eq!(staging_ddl("SELECT 1", "s"), None);
         assert_eq!(staging_ddl("CREATE TABLE \"unterminated", "s"), None);
         assert_eq!(staging_ddl("CREATE TABLE", "s"), None);
+        assert!(
+            staging_definition("CREATE VIEW v AS SELECT 1", "s", "v")
+                .unwrap_err()
+                .to_string()
+                .contains("'v'")
+        );
     }
     use crate::config::SqliteSinkConfig;
     use faucet_core::Sink as _;

@@ -472,15 +472,12 @@ mod tests {
         .await
         .unwrap();
         let ctx = HashMap::new();
-        let mut stream = source.stream_pages(&ctx, 100);
-        let mut error = None;
-        while let Some(page) = futures::StreamExt::next(&mut stream).await {
-            if let Err(e) = page {
-                error = Some(e.to_string());
-                break;
-            }
-        }
-        let error = error.expect("the stream must not end cleanly");
+        let pages: Vec<_> = futures::StreamExt::collect(source.stream_pages(&ctx, 100)).await;
+        let error = pages
+            .into_iter()
+            .find_map(Result::err)
+            .expect("the stream must not end cleanly")
+            .to_string();
         assert!(error.contains("column d"), "{error}");
         assert!(source.fetch_all().await.is_err());
     }
