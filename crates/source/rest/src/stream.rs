@@ -3192,9 +3192,10 @@ impl faucet_core::Source for RestStream {
                     .bytes_stream()
                     .map_err(std::io::Error::other);
                 let reader = tokio_util::io::StreamReader::new(body);
-                let ndjson_chunks = crate::format::csv_reader_to_ndjson_stream_with_nulls(
+                let ndjson_chunks = crate::format::csv_reader_to_ndjson_stream_with_options(
                     reader,
                     delimiter,
+                    self.config.csv_quote,
                     has_headers,
                     self.config.csv_null_values.clone(),
                 );

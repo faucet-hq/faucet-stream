@@ -165,10 +165,23 @@ pub async fn csv_to_ndjson_with_nulls(
     has_headers: bool,
     null_values: &[String],
 ) -> Result<(Vec<u8>, u64), FaucetError> {
+    csv_to_ndjson_with_options(bytes, delimiter, b'"', has_headers, null_values).await
+}
+
+/// [`csv_to_ndjson_with_nulls`] with an explicit quote character, so a
+/// `csv_quote` other than `"` parses exactly as the `Value` path does.
+pub async fn csv_to_ndjson_with_options(
+    bytes: &[u8],
+    delimiter: u8,
+    quote: u8,
+    has_headers: bool,
+    null_values: &[String],
+) -> Result<(Vec<u8>, u64), FaucetError> {
     use futures::StreamExt as _;
     let mut rdr = csv_async::AsyncReaderBuilder::new()
         .has_headers(false)
         .delimiter(delimiter)
+        .quote(quote)
         .flexible(true)
         .create_reader(bytes);
     let mut records = rdr.records();
@@ -220,11 +233,27 @@ pub fn csv_reader_to_ndjson_stream_with_nulls<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    csv_reader_to_ndjson_stream_with_options(reader, delimiter, b'"', has_headers, null_values)
+}
+
+/// [`csv_reader_to_ndjson_stream_with_nulls`] with an explicit quote character,
+/// so a `csv_quote` other than `"` parses exactly as the `Value` path does.
+pub fn csv_reader_to_ndjson_stream_with_options<R>(
+    reader: R,
+    delimiter: u8,
+    quote: u8,
+    has_headers: bool,
+    null_values: Vec<String>,
+) -> impl futures::Stream<Item = Result<Vec<u8>, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     use futures::StreamExt as _;
     async_stream::try_stream! {
         let mut rdr = csv_async::AsyncReaderBuilder::new()
             .has_headers(false)
             .delimiter(delimiter)
+            .quote(quote)
             .flexible(true)
             .create_reader(reader);
         let mut records = rdr.records();
@@ -819,6 +848,44 @@ mod tests {
         assert_eq!(recs[0]["id"], "1");
         assert_eq!(recs[0]["name"], "Alice");
         assert_eq!(recs[1]["name"], "Bob");
+    }
+
+    /// A non-default `csv_quote` must parse identically on the native NDJSON
+    /// converters and the `Value` path (#789 API-10).
+    #[tokio::test]
+    async fn a_custom_quote_parses_the_same_on_the_native_and_value_paths() {
+        use futures::StreamExt as _;
+        let csv = b"id,note\n1,'a, b'\n2,'it''s'\n";
+        let dialect = CsvDialect {
+            quote: b'\'',
+            ..Default::default()
+        };
+        let expected = parse_csv_with(csv, dialect).await.unwrap();
+        assert_eq!(expected[0]["note"], "a, b");
+        assert_eq!(expected[1]["note"], "it's");
+
+        let (buffered, rows) = csv_to_ndjson_with_options(csv, b',', b'\'', true, &[])
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+        let streamed: Vec<u8> = csv_reader_to_ndjson_stream_with_options(
+            std::io::Cursor::new(csv.to_vec()),
+            b',',
+            b'\'',
+            true,
+            Vec::new(),
+        )
+        .map(|chunk| chunk.unwrap())
+        .concat()
+        .await;
+        for ndjson in [buffered, streamed] {
+            let parsed: Vec<Value> = String::from_utf8(ndjson)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(parsed, expected);
+        }
     }
 
     /// The native NDJSON converter (#633) must produce byte-identical output to
