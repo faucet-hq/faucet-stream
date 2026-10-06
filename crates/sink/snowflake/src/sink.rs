@@ -439,6 +439,20 @@ impl SnowflakeSink {
     /// `OBJECT` / `ARRAY`) is stringified by the `::string` cast rather than
     /// stored as structured JSON; this sink maps records to scalar columns.
     fn build_insert(&self, records: &[Value]) -> Result<(String, String), FaucetError> {
+        let payload = Value::Array(records.to_vec()).to_string();
+        Ok((self.insert_from(records, "?")?, payload))
+    }
+
+    /// The page INSERT with its JSON payload inlined as an escaped string
+    /// literal, for the multi-statement exactly-once request where the SQL API
+    /// accepts no bindings (SQL-44).
+    fn build_insert_inline(&self, records: &[Value]) -> Result<String, FaucetError> {
+        let payload = Value::Array(records.to_vec()).to_string();
+        self.insert_from(records, &idempotent::sql_string_literal(&payload))
+    }
+
+    /// `INSERT … SELECT … FROM TABLE(FLATTEN(input => PARSE_JSON(<input>)))`.
+    fn insert_from(&self, records: &[Value], input: &str) -> Result<String, FaucetError> {
         let columns = Self::column_union(records)?;
 
         // `quote_ident` produces a `"`-escaped quoted identifier, which is also
@@ -454,16 +468,14 @@ impl SnowflakeSink {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let payload = Value::Array(records.to_vec()).to_string();
-        let sql = format!(
-            "INSERT INTO {}.{}.{} ({}) SELECT {} FROM TABLE(FLATTEN(input => PARSE_JSON(?)))",
+        Ok(format!(
+            "INSERT INTO {}.{}.{} ({}) SELECT {} FROM TABLE(FLATTEN(input => PARSE_JSON({input})))",
             quote_ident(&self.config.database),
             quote_ident(&self.config.schema),
             quote_ident(&self.config.table),
             col_list,
             projection,
-        );
-        Ok((sql, payload))
+        ))
     }
 }
 
@@ -627,33 +639,31 @@ impl faucet_core::Sink for SnowflakeSink {
         token: &str,
     ) -> Result<usize, FaucetError> {
         self.ensure_commit_table().await?;
+        if !records.is_empty() {
+            self.ensure_table_ready(records).await?;
+        }
 
-        let (sql, bindings, count) = if records.is_empty() {
-            let sql =
-                idempotent::build_commit_only_statement(&self.config.database, &self.config.schema);
-            let bindings = json!({
-                "1": { "type": "TEXT", "value": scope },
-                "2": { "type": "TEXT", "value": token },
-            });
-            (sql, bindings, idempotent::COMMIT_ONLY_STATEMENT_COUNT)
-        } else {
-            let (insert_sql, payload) = self.build_insert(records)?;
-            let sql = idempotent::build_transaction_statement(
-                &insert_sql,
+        let (sql, count) = if records.is_empty() {
+            let sql = idempotent::build_commit_only_statement_inline(
                 &self.config.database,
                 &self.config.schema,
+                scope,
+                token,
             );
-            let bindings = json!({
-                "1": { "type": "TEXT", "value": payload },
-                "2": { "type": "TEXT", "value": scope },
-                "3": { "type": "TEXT", "value": token },
-            });
-            (sql, bindings, idempotent::TRANSACTION_STATEMENT_COUNT)
+            (sql, idempotent::COMMIT_ONLY_STATEMENT_COUNT)
+        } else {
+            let sql = idempotent::build_transaction_statement_inline(
+                &self.build_insert_inline(records)?,
+                &self.config.database,
+                &self.config.schema,
+                scope,
+                token,
+            );
+            (sql, idempotent::TRANSACTION_STATEMENT_COUNT)
         };
 
         let parameters = json!({ "MULTI_STATEMENT_COUNT": count.to_string() });
-        self.execute_statement(&sql, Some(bindings), Some(parameters))
-            .await?;
+        self.execute_statement(&sql, None, Some(parameters)).await?;
 
         tracing::info!(
             table = %format!(

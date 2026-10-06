@@ -17,8 +17,11 @@ fn make_records(n: usize) -> Vec<Value> {
     (0..n).map(|i| json!({"id": i, "name": "row"})).collect()
 }
 
+/// `create_table: false` keeps the request counts below about the watermark
+/// table and the transaction; `exactly_once_creates_the_target_table` covers
+/// the target's own DDL.
 fn sample_config() -> SnowflakeSinkConfig {
-    SnowflakeSinkConfig::new(
+    let mut c = SnowflakeSinkConfig::new(
         "xy12345",
         "WH",
         "DB",
@@ -27,7 +30,9 @@ fn sample_config() -> SnowflakeSinkConfig {
         SnowflakeAuth::OAuth {
             token: "tok".into(),
         },
-    )
+    );
+    c.create_table = false;
+    c
 }
 
 fn endpoint(server: &MockServer) -> String {
@@ -79,7 +84,8 @@ async fn write_batch_idempotent_sends_one_atomic_multi_statement_transaction() {
     assert!(ddl.get("parameters").is_none(), "DDL is single-statement");
 
     // Request 2: the atomic transaction — BEGIN + INSERT + MERGE + COMMIT,
-    // MULTI_STATEMENT_COUNT "4", and the three positional bindings.
+    // MULTI_STATEMENT_COUNT "4", and no bindings: the SQL API rejects bind
+    // variables in a multi-statement request (SQL-44).
     let tx: Value = serde_json::from_slice(&requests[1].body).unwrap();
     let tx_sql = tx["statement"].as_str().unwrap();
     assert!(tx_sql.starts_with("BEGIN;"), "sql: {tx_sql}");
@@ -88,16 +94,15 @@ async fn write_batch_idempotent_sends_one_atomic_multi_statement_transaction() {
     assert!(tx_sql.trim_end().ends_with("COMMIT;"), "sql: {tx_sql}");
     assert_eq!(tx["parameters"]["MULTI_STATEMENT_COUNT"], "4");
 
-    // Binding 1 = the JSON page payload; 2 = scope; 3 = token.
-    let payload: Value =
-        serde_json::from_str(tx["bindings"]["1"]["value"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        payload,
-        json!([{"id": 0, "name": "row"}, {"id": 1, "name": "row"}])
+    assert!(tx.get("bindings").is_none(), "body: {tx}");
+    assert!(!tx_sql.contains('?'), "sql: {tx_sql}");
+    assert!(
+        tx_sql.contains(r#"PARSE_JSON('[{"id":0,"name":"row"},{"id":1,"name":"row"}]')"#),
+        "sql: {tx_sql}"
     );
-    assert_eq!(tx["bindings"]["1"]["type"], "TEXT");
-    assert_eq!(tx["bindings"]["2"]["value"], SCOPE);
-    assert_eq!(tx["bindings"]["3"]["value"], TOKEN);
+    assert!(tx_sql.contains(&format!(
+        "SELECT '{SCOPE}' AS \"scope\", '{TOKEN}' AS \"token\""
+    )));
 }
 
 #[tokio::test]
@@ -198,10 +203,10 @@ async fn empty_page_still_commits_the_token() {
     assert!(!tx_sql.contains("INSERT INTO"), "no page insert: {tx_sql}");
     assert!(tx_sql.contains("MERGE INTO"), "sql: {tx_sql}");
     assert_eq!(tx["parameters"]["MULTI_STATEMENT_COUNT"], "3");
-    // Commit-only bindings: 1 = scope, 2 = token (no payload).
-    assert_eq!(tx["bindings"]["1"]["value"], SCOPE);
-    assert_eq!(tx["bindings"]["2"]["value"], TOKEN);
-    assert!(tx["bindings"].get("3").is_none());
+    assert!(tx.get("bindings").is_none(), "body: {tx}");
+    assert!(tx_sql.contains(&format!(
+        "SELECT '{SCOPE}' AS \"scope\", '{TOKEN}' AS \"token\""
+    )));
 }
 
 #[tokio::test]
@@ -443,4 +448,48 @@ async fn idempotent_write_respects_poll_timeout() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("poll_timeout"), "err: {err}");
+}
+
+/// SQL-44: a first exactly-once page with `create_table: true` creates the
+/// target before the transaction, and quotes / backslashes in the payload and
+/// token survive the inlined literals.
+#[tokio::test]
+async fn exactly_once_creates_the_target_table() {
+    let server = MockServer::start().await;
+    mount_success(&server).await;
+    let mut cfg = sample_config();
+    cfg.create_table = true;
+    let sink = SnowflakeSink::new(cfg)
+        .unwrap()
+        .with_endpoint(endpoint(&server));
+    let token = r#"00000000000000000009#{"k":"it's"}"#;
+    sink.write_batch_idempotent(&[json!({"id": 1, "note": r"O'Brien \ x"})], SCOPE, token)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let sqls: Vec<String> = requests
+        .iter()
+        .map(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            body["statement"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(sqls.len(), 3, "watermark DDL + target DDL + transaction");
+    assert!(
+        sqls[1].starts_with("CREATE TABLE IF NOT EXISTS \"DB\".\"PUBLIC\".\"events\""),
+        "{}",
+        sqls[1]
+    );
+    assert!(sqls[2].starts_with("BEGIN;"));
+    assert!(
+        sqls[2].contains(r#"PARSE_JSON('[{"id":1,"note":"O''Brien \\\\ x"}]')"#),
+        "{}",
+        sqls[2]
+    );
+    assert!(
+        sqls[2].contains(r#"'00000000000000000009#{"k":"it''s"}' AS "token""#),
+        "{}",
+        sqls[2]
+    );
 }
