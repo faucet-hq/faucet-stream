@@ -51,6 +51,22 @@ Singer **target** as a faucet sink; the protocol types both share live in
 | `flush_on_state` | bool | `true` | Flush a page (and checkpoint) on every STATE message |
 | `idle_timeout_secs` | int | — | Abort if no output arrives within this many seconds |
 | `on_malformed` | `skip` \| `fail` | `skip` | What to do with a non-Singer output line |
+| `inherit_env` | bool \| string[] | `true` | Which of faucet's environment variables the tap sees — see [Environment](#environment--inherit_env) |
+
+## Environment — `inherit_env`
+
+The tap runs as a child of faucet and, by default, sees faucet's whole
+environment, as it would from a shell. That includes whatever credentials
+faucet itself holds there (cloud keys, vault tokens, a `faucet serve`
+server's secrets). To keep them away from the tap:
+
+```yaml
+inherit_env: false                 # only PATH, HOME, LANG, LC_ALL, TMPDIR
+inherit_env: [TAP_API_TOKEN]       # that baseline plus the listed variables
+```
+
+Pass credentials the tap needs through `tap_config` (resolved by faucet and
+written to a private file) rather than through the environment.
 
 ## Catalog-driven stream selection
 

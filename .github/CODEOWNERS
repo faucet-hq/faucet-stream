@@ -1,0 +1,6 @@
+/.github/workflows/ @pecsorabs
+/.github/CODEOWNERS @pecsorabs
+/.github/dependabot.yml @pecsorabs
+/Dockerfile @pecsorabs
+/release-plz.toml @pecsorabs
+/dist-workspace.toml @pecsorabs

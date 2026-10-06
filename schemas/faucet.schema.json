@@ -18298,6 +18298,11 @@
                       "description": "How to handle a line that is not valid Singer JSON. Default\n[`MalformedPolicy::Skip`].",
                       "$ref": "#/$defs/source_singer__MalformedPolicy",
                       "default": "skip"
+                    },
+                    "inherit_env": {
+                      "description": "Which of faucet's environment variables the tap receives: `true`\n(default) the whole environment, `false` only `PATH`, `HOME`, `LANG`,\n`LC_ALL` and `TMPDIR`, or a list of variable names passed on top of\nthat baseline. Set it to keep faucet's own credentials away from the tap.",
+                      "$ref": "#/$defs/source_singer__InheritEnv",
+                      "default": true
                     }
                   }
                 },
@@ -22852,7 +22857,7 @@
                         "type": "string"
                       },
                       "default": {},
-                      "description": "Extra environment variables for the target process.",
+                      "description": "Extra environment variables for the target process, set on top of\nwhatever `inherit_env` passes.",
                       "type": "object"
                     },
                     "flush_on": {
@@ -22869,6 +22874,11 @@
                         "integer",
                         "string"
                       ]
+                    },
+                    "inherit_env": {
+                      "$ref": "#/$defs/sink_singer__InheritEnv",
+                      "default": true,
+                      "description": "Which of faucet's environment variables the target receives: `true`\n(default) the whole environment, `false` only `PATH`, `HOME`, `LANG`,\n`LC_ALL` and `TMPDIR`, or a list of variable names passed on top of\nthat baseline. Set it to keep faucet's own credentials away from the\ntarget."
                     },
                     "key": {
                       "default": [],
@@ -31049,6 +31059,44 @@
           "const": "error",
           "description": "Fail the run instead of touching an existing file.\n`error_if_exists` is accepted as another name.",
           "type": "string"
+        }
+      ]
+    },
+    "source_singer__InheritEnv": {
+      "description": "The `inherit_env` setting of a Singer tap or target.\n\n`true` (the default) passes faucet's whole environment, as a shell would.\n`false` passes only [`BASELINE_ENV`], keeping credentials faucet holds in\nits environment (cloud keys, vault tokens, server secrets) away from the\nsubprocess. A list passes the baseline plus the named variables.",
+      "anyOf": [
+        {
+          "description": "`true` inherits everything; `false` only the baseline.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        {
+          "description": "The baseline plus these variable names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "sink_singer__InheritEnv": {
+      "description": "The `inherit_env` setting of a Singer tap or target.\n\n`true` (the default) passes faucet's whole environment, as a shell would.\n`false` passes only [`BASELINE_ENV`], keeping credentials faucet holds in\nits environment (cloud keys, vault tokens, server secrets) away from the\nsubprocess. A list passes the baseline plus the named variables.",
+      "anyOf": [
+        {
+          "description": "`true` inherits everything; `false` only the baseline.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        {
+          "description": "The baseline plus these variable names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       ]
     }

@@ -11,11 +11,15 @@
 //! - [`redact`] — the conservative config-value [`Redactor`] applied to
 //!   anything echoed from the subprocess.
 //! - [`temp`] — private (0600) temp files for `--config` and friends.
+//! - [`env`](mod@env) — [`InheritEnv`], which of faucet's environment variables the
+//!   subprocess receives.
 
+pub mod env;
 pub mod message;
 pub mod redact;
 pub mod temp;
 
+pub use env::{BASELINE_ENV, InheritEnv};
 pub use message::{SingerMessage, parse_line};
 pub use redact::{Redactor, secret_like_values};
 pub use temp::write_private_json;

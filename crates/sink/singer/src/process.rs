@@ -77,6 +77,9 @@ impl TargetProcess {
         let config_file =
             write_private_json("config", &cfg.target_config).map_err(FaucetError::Sink)?;
         let mut command = Command::new(&cfg.target_command);
+        if let Some(env) = cfg.inherit_env.from_process() {
+            command.env_clear().envs(env);
+        }
         command
             .arg("--config")
             .arg(config_file.path())

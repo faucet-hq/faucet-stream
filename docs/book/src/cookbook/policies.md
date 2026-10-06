@@ -118,7 +118,9 @@ Per row the report says **what the static pass knows**:
   row as opaque.
 - A column the row's masking policy provably rewrites at that sink
   (name-matched rules, honouring `applies_to`) counts as **masked**, so
-  `mask: [hash]` is satisfied by a `hash` masking rule on that field.
+  `mask: [hash]` is satisfied by a `hash` masking rule on that field. The
+  match is the masking pass's own: `fields` names the full dot-path, and a
+  rule on a container (`fields: [phones]`) masks every leaf beneath it.
 
 Topology graphs (`pipeline.nodes`) are evaluated per sink node from the
 pipeline-level contract; any transform node in the graph makes the labels
@@ -131,7 +133,9 @@ value that only looks like PII — the **policy sink** catches. It is the
 outermost sink decorator (after masking, so a masked value no longer trips
 its detector): every record's scalar leaves are classified by name and by
 value detector and the same rules are evaluated against the sink's
-attributes.
+attributes. A label on a container (`fields: [phones]`) covers every leaf
+beneath it (`phones.0`, `phones.1`), and a leaf the masking pass rewrote by
+name counts as masked with that action, exactly as in the static pass.
 
 - `on_runtime: fail` — the page is refused before it is written;
   `faucet run` fails with `Policy `pii-eu` violated on column `mail`` and

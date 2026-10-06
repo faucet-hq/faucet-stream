@@ -25,5 +25,5 @@ pub mod spec;
 
 pub use compile::{CompiledClassification, CompiledPolicy};
 pub use evaluate::{ColumnFacts, SinkFacts, Violation, ViolationKind, evaluate, rule_applies};
-pub use sink::{PolicyScope, PolicySink, classify_record};
+pub use sink::{PolicyScope, PolicySink, classify_record, classify_record_masked};
 pub use spec::{Classification, MASK_ACTIONS, PolicyRule, PolicySpec, RuleWhen, RuntimeAction};
