@@ -279,3 +279,68 @@ async fn stale_reads_fetch_all_and_check_probe() {
     assert_eq!(source.connector_name(), "spanner");
     assert!(source.config_schema().is_object());
 }
+
+// ── SQL-30: TIMESTAMP and NUMERIC cursors compare by value ──────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamp_and_numeric_cursors_keep_rows_of_every_fraction_width() {
+    let Some(emu) = support::start_emulator().await else {
+        return;
+    };
+    support::create_database(
+        &emu.host,
+        "cursors",
+        &["CREATE TABLE ev (id INT64 NOT NULL, ts TIMESTAMP, n NUMERIC) PRIMARY KEY (id)"],
+    )
+    .await;
+    let client = support::raw_client(&emu.host, "cursors").await;
+    support::execute_dml(
+        &client,
+        "INSERT INTO ev (id, ts, n) VALUES \
+         (1, TIMESTAMP '2024-01-01T00:00:00Z', NUMERIC '9'), \
+         (2, TIMESTAMP '2024-01-01T00:00:00.5Z', NUMERIC '10')",
+    )
+    .await;
+
+    let mut ts = cfg(
+        &emu.host,
+        "cursors",
+        "SELECT * FROM ev WHERE ts > TIMESTAMP(@bookmark)",
+    );
+    ts.replication = SpannerReplication::Incremental {
+        column: "ts".into(),
+        initial_value: json!("2023-12-31T00:00:00Z"),
+    };
+    let source = SpannerSource::new(ts).await.expect("source");
+    let (rows, bookmark) = drain(&source).await;
+    assert_eq!(rows.len(), 2, "both widths kept: {rows:?}");
+    let bookmark = bookmark.expect("bookmark");
+    let instant = chrono::DateTime::parse_from_rfc3339(bookmark.as_str().unwrap()).unwrap();
+    assert_eq!(instant.timestamp_subsec_millis(), 500, "{bookmark}");
+    support::execute_dml(
+        &client,
+        "INSERT INTO ev (id, ts, n) VALUES (3, TIMESTAMP '2024-01-01T00:00:00.75Z', NUMERIC '100')",
+    )
+    .await;
+    source.apply_start_bookmark(bookmark).await.unwrap();
+    let (again, _) = drain(&source).await;
+    let ids: Vec<i64> = again.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![3], "the row in the bookmark's second is read");
+
+    let mut num = cfg(
+        &emu.host,
+        "cursors",
+        "SELECT * FROM ev WHERE n > CAST(@bookmark AS NUMERIC) ORDER BY id",
+    );
+    num.replication = SpannerReplication::Incremental {
+        column: "n".into(),
+        initial_value: json!("9"),
+    };
+    let source = SpannerSource::new(num)
+        .await
+        .expect("NUMERIC cursor accepted");
+    let (rows, bookmark) = drain(&source).await;
+    let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![2, 3]);
+    assert_eq!(bookmark, Some(json!("100")));
+}

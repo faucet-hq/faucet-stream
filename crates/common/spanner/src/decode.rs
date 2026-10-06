@@ -51,12 +51,10 @@ fn type_code(ty: Option<&Type>) -> TypeCode {
 
 /// Whether the named column in a result's metadata is Spanner `NUMERIC`.
 ///
-/// The source uses this to reject an incremental-replication cursor on a NUMERIC
-/// column: NUMERIC decodes to a JSON *string* (to preserve precision), so the
-/// generic replication comparison orders it lexicographically (`"9" > "10"`),
-/// which would advance the bookmark incorrectly and skip or re-read rows. INT64
-/// (JSON number) and TIMESTAMP/DATE (RFC-3339 string, lexicographic == chrono)
-/// cursors are unaffected. Checked once the first page's metadata is known.
+/// `NUMERIC` decodes to a JSON *string* (to preserve precision) and `TIMESTAMP`
+/// to Spanner's variable-width RFC 3339 text (trailing fractional zeros are
+/// trimmed, so text order is not time order); the replication comparison orders
+/// both by value, so either works as an incremental cursor.
 pub fn column_is_numeric(fields: &[Field], name: &str) -> bool {
     fields
         .iter()
