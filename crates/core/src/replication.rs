@@ -168,7 +168,7 @@ pub fn filter_incremental_path(
                     }
                 }
             }
-            Some(v) if type_rank(v) != type_rank(start) => {
+            Some(v) if !comparable(v, start) => {
                 tracing::warn!(
                     key = key.as_str(),
                     "incremental replication: record key type does not match the bookmark \
@@ -190,9 +190,10 @@ pub fn filter_incremental_path(
 
 /// Filter `records` to only those where `record[key] > start`.
 ///
-/// `key` is a literal top-level field. Strings compare lexicographically
-/// (ISO-8601 dates compare correctly this way); integers compare exactly
-/// (no `f64` precision loss); floats compare as `f64`.
+/// `key` is a literal top-level field. Values compare by what they hold (see
+/// [`json_gt`]): decimal strings numerically, timestamp strings as instants,
+/// integers exactly (no `f64` precision loss), floats as `f64`, other strings
+/// lexicographically.
 ///
 /// Records missing the key (or holding `null`) are **kept** and a warning is
 /// logged (#747): dropping them silently is data loss. Likewise a record whose
@@ -237,8 +238,7 @@ pub fn max_replication_value<'a>(records: &'a [Value], key: &str) -> Option<&'a 
 }
 
 /// Return the larger of two replication values using the same ordering as
-/// [`max_replication_value`] (string lexicographic, numeric for numbers,
-/// falling back to `a` on type mismatch).
+/// [`max_replication_value`] (see [`json_gt`]; falling back to `a` on a tie).
 pub fn max_value(a: Value, b: Value) -> Value {
     match json_compare(&a, &b) {
         Ordering::Less => b,
@@ -268,16 +268,174 @@ fn number_as_i128(n: &serde_json::Number) -> Option<i128> {
         .or_else(|| n.as_u64().map(i128::from))
 }
 
+/// Whether two replication values can be ordered against each other: the same
+/// JSON type, or a number and a decimal string (sources such as Oracle emit a
+/// `NUMBER` as a number when it fits `f64` exactly and as a string otherwise).
+fn comparable(a: &Value, b: &Value) -> bool {
+    type_rank(a) == type_rank(b) || numeric_text(a).is_some() && numeric_text(b).is_some()
+}
+
+/// The decimal text of a number or a decimal string.
+fn numeric_text(v: &Value) -> Option<std::borrow::Cow<'_, str>> {
+    match v {
+        Value::Number(n) => Some(std::borrow::Cow::Owned(n.to_string())),
+        Value::String(s) if Decimal::parse(s).is_some() => Some(std::borrow::Cow::Borrowed(s)),
+        _ => None,
+    }
+}
+
+/// An exact decimal: `0.d₁d₂… × 10^exp` with no leading or trailing zero
+/// digits (`digits` empty means zero). Arbitrary length, so a DECIMAL(38)
+/// cursor orders exactly.
+#[derive(Debug, PartialEq, Eq)]
+struct Decimal {
+    negative: bool,
+    digits: Vec<u8>,
+    exp: i64,
+}
+
+impl Decimal {
+    fn parse(text: &str) -> Option<Self> {
+        let s = text.trim();
+        let (negative, s) = match s.as_bytes().first()? {
+            b'-' => (true, &s[1..]),
+            b'+' => (false, &s[1..]),
+            _ => (false, s),
+        };
+        let (mantissa, exponent) = match s.find(['e', 'E']) {
+            Some(i) => (&s[..i], s[i + 1..].parse::<i64>().ok()?),
+            None => (s, 0),
+        };
+        let (int, frac) = match mantissa.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (mantissa, ""),
+        };
+        if int.is_empty() && frac.is_empty()
+            || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
+        let mut point = i64::try_from(int.len()).ok()?;
+        let leading = digits.iter().take_while(|d| **d == 0).count();
+        digits.drain(..leading);
+        point -= i64::try_from(leading).ok()?;
+        while digits.last() == Some(&0) {
+            digits.pop();
+        }
+        let exp = if digits.is_empty() {
+            0
+        } else {
+            point.checked_add(exponent)?
+        };
+        Some(Self {
+            negative: negative && !digits.is_empty(),
+            digits,
+            exp,
+        })
+    }
+
+    fn signum(&self) -> i8 {
+        match (self.digits.is_empty(), self.negative) {
+            (true, _) => 0,
+            (false, true) => -1,
+            (false, false) => 1,
+        }
+    }
+
+    fn cmp_magnitude(&self, other: &Self) -> Ordering {
+        self.exp
+            .cmp(&other.exp)
+            .then_with(|| self.digits.cmp(&other.digits))
+    }
+}
+
+impl Ord for Decimal {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.signum().cmp(&other.signum()) {
+            Ordering::Equal => match self.signum() {
+                1 => self.cmp_magnitude(other),
+                -1 => other.cmp_magnitude(self),
+                _ => Ordering::Equal,
+            },
+            unequal => unequal,
+        }
+    }
+}
+
+impl PartialOrd for Decimal {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A timestamp string as an instant: RFC 3339 with an offset (a space may
+/// replace the `T`), compared in UTC; or the same without an offset, compared
+/// as a local date-time against another offset-less value.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Instant {
+    Zoned(DateTime<Utc>),
+    Naive(chrono::NaiveDateTime),
+}
+
+impl Instant {
+    fn parse(text: &str) -> Option<Self> {
+        let s = text.trim();
+        if s.len() < 19 || !s.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let normalized = if s.as_bytes()[10] == b' ' {
+            let mut t = s.to_string();
+            t.replace_range(10..11, "T");
+            std::borrow::Cow::Owned(t)
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        };
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
+            return Some(Self::Zoned(dt.with_timezone(&Utc)));
+        }
+        chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f")
+            .ok()
+            .map(Self::Naive)
+    }
+}
+
+/// Order two strings by what they hold: both decimals → numerically, both
+/// instants of the same kind → chronologically, otherwise lexicographically.
+fn compare_strings(x: &str, y: &str) -> Ordering {
+    if let (Some(a), Some(b)) = (Decimal::parse(x), Decimal::parse(y)) {
+        return a.cmp(&b);
+    }
+    match (Instant::parse(x), Instant::parse(y)) {
+        (Some(a @ Instant::Zoned(_)), Some(b @ Instant::Zoned(_)))
+        | (Some(a @ Instant::Naive(_)), Some(b @ Instant::Naive(_))) => a.cmp(&b),
+        _ => x.cmp(y),
+    }
+}
+
 /// Total ordering over JSON values used for replication bookmarks.
 ///
 /// - Numbers: compared exactly as `i128` when both are integral (so cursors
 ///   above 2^53 don't lose precision); otherwise as `f64`, with NaN ordered
 ///   last.
-/// - Same-type scalars/containers: natural ordering (strings lexicographic,
-///   bools `false < true`, arrays element-wise, objects by serialized form).
+/// - Strings: decimal strings numerically and exactly (`"99" < "100"`),
+///   timestamps chronologically after normalizing offsets and fraction widths,
+///   anything else lexicographically.
+/// - A number against a decimal string: numerically.
+/// - Other same-type values: natural ordering (bools `false < true`, arrays
+///   element-wise, objects by serialized form).
 /// - Different types: ordered by [`type_rank`] so the result is always total.
 pub(crate) fn json_compare(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
+        (Value::Number(_), Value::String(_)) | (Value::String(_), Value::Number(_)) => {
+            match (numeric_text(a), numeric_text(b)) {
+                (Some(x), Some(y)) => match (Decimal::parse(&x), Decimal::parse(&y)) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    _ => type_rank(a).cmp(&type_rank(b)),
+                },
+                _ => type_rank(a).cmp(&type_rank(b)),
+            }
+        }
         (Value::Number(an), Value::Number(bn)) => {
             match (number_as_i128(an), number_as_i128(bn)) {
                 (Some(ai), Some(bi)) => ai.cmp(&bi),
@@ -295,7 +453,7 @@ pub(crate) fn json_compare(a: &Value, b: &Value) -> Ordering {
                 }
             }
         }
-        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => compare_strings(x, y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Array(x), Value::Array(y)) => {
@@ -316,8 +474,9 @@ pub(crate) fn json_compare(a: &Value, b: &Value) -> Ordering {
 }
 
 /// Total-order "greater than" over JSON values, using the same comparison
-/// [`filter_incremental`] applies to replication keys (numbers numerically,
-/// strings lexicographically — so RFC3339 timestamps order correctly). Public
+/// [`filter_incremental`] applies to replication keys (numbers and decimal
+/// strings numerically, timestamp strings chronologically, other strings
+/// lexicographically). Public
 /// so callers bounding a replay window (e.g. `faucet backfill --to-bookmark`)
 /// compare exactly like the incremental filter does.
 pub fn json_gt(a: &Value, b: &Value) -> bool {
@@ -867,6 +1026,129 @@ mod tests {
         let start = json!("2024-06-01"); // string bookmark vs numeric key
         let filtered = filter_incremental(records, "seq", &start);
         assert_eq!(filtered.len(), 1, "type mismatch must not silently drop");
+    }
+
+    fn cmp(a: Value, b: Value) -> Ordering {
+        json_compare(&a, &b)
+    }
+
+    #[test]
+    fn decimal_strings_order_numerically_and_exactly() {
+        use Ordering::*;
+        let cases = [
+            ("99", "100", Less),
+            ("100", "99", Greater),
+            ("989", "99", Greater),
+            ("007", "7", Equal),
+            ("1.50", "1.5", Equal),
+            ("0.000", "-0", Equal),
+            ("-1", "0", Less),
+            ("-10", "-9", Less),
+            ("-0.5", "-0.25", Less),
+            ("1e3", "999", Greater),
+            ("1E-2", "0.01", Equal),
+            ("+5", "5", Equal),
+            (".5", "0.4", Greater),
+            (
+                "12345678901234567890123456789012345678",
+                "12345678901234567890123456789012345677",
+                Greater,
+            ),
+            (
+                "0.000000000000000000000000000000000002",
+                "0.000000000000000000000000000000000001",
+                Greater,
+            ),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(cmp(json!(a), json!(b)), want, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn decimal_parse_rejects_what_is_not_a_number() {
+        for text in [
+            "",
+            "-",
+            ".",
+            "1.2.3",
+            "1e",
+            "12a",
+            "2024-06-01",
+            "e5",
+            "1e9999999999999999999",
+        ] {
+            assert!(Decimal::parse(text).is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_decimal_string_bookmark_keeps_larger_rows() {
+        let records: Vec<Value> = ["100", "989", "50", "99"]
+            .iter()
+            .map(|v| json!({ "k": v }))
+            .collect();
+        let kept = filter_incremental(records, "k", &json!("99"));
+        let ks: Vec<&str> = kept.iter().map(|r| r["k"].as_str().unwrap()).collect();
+        assert_eq!(ks, ["100", "989"]);
+    }
+
+    #[test]
+    fn numbers_and_decimal_strings_compare_numerically() {
+        assert_eq!(cmp(json!(100), json!("99")), Ordering::Greater);
+        assert_eq!(
+            cmp(json!("123456789012345678901234567890"), json!(5)),
+            Ordering::Greater
+        );
+        assert_eq!(cmp(json!(2.5), json!("2.50")), Ordering::Equal);
+        let records = vec![
+            json!({"k": 7}),
+            json!({"k": 123456789012345678901234567890_f64}),
+        ];
+        let kept = filter_incremental(records, "k", &json!("6.5"));
+        assert_eq!(kept.len(), 2);
+        assert_eq!(
+            max_value(json!("12345678901234567890"), json!(12)),
+            json!("12345678901234567890")
+        );
+        assert_eq!(max_value(json!("12"), json!(13)), json!(13));
+    }
+
+    #[test]
+    fn timestamps_order_as_instants_across_offsets_and_fraction_widths() {
+        use Ordering::*;
+        let cases = [
+            ("2024-01-01T10:00:00+05:00", "2024-01-01T06:00:00Z", Less),
+            ("2024-01-01T10:00:00.5Z", "2024-01-01T10:00:00.45Z", Greater),
+            ("2024-01-01T10:00:00Z", "2024-01-01T10:00:00.000Z", Equal),
+            ("2024-01-01 10:00:00+00:00", "2024-01-01T09:59:59Z", Greater),
+            ("2024-01-01T10:00:00.5", "2024-01-01T10:00:00.45", Greater),
+            ("2024-01-01 10:00:00", "2024-01-01T09:00:00", Greater),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(cmp(json!(a), json!(b)), want, "{a} vs {b}");
+        }
+        let records = vec![
+            json!({"t": "2024-01-01T08:00:00+01:00"}),
+            json!({"t": "2024-01-01T08:00:00-01:00"}),
+        ];
+        let kept = filter_incremental(records, "t", &json!("2024-01-01T08:00:00Z"));
+        assert_eq!(kept, vec![json!({"t": "2024-01-01T08:00:00-01:00"})]);
+    }
+
+    #[test]
+    fn mixed_or_unparseable_strings_stay_lexicographic() {
+        assert_eq!(
+            cmp(json!("2024-01-01T10:00:00Z"), json!("2024-01-01T10:00:00")),
+            "2024-01-01T10:00:00Z".cmp("2024-01-01T10:00:00")
+        );
+        assert_eq!(cmp(json!("b"), json!("a")), Ordering::Greater);
+        assert_eq!(
+            cmp(json!("2024-13-99T99:99:99"), json!("2024")),
+            Ordering::Greater
+        );
+        assert_eq!(cmp(json!("abc"), json!(5)), Ordering::Greater);
+        assert_eq!(cmp(json!(true), json!("1")), Ordering::Less);
     }
 
     // ── ReplicationBind (#513) ──────────────────────────────────────────────
