@@ -1541,6 +1541,11 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
     }
     check_file_sink_paths(&out)?;
     check_truncating_fan_out(&out)?;
+    if cfg.verify.as_ref().is_some_and(|v| v.after_run) {
+        for node in out.iter().filter(|n| matches!(n.role, NodeRole::Root)) {
+            crate::destination::check_verify_scope(node, &out)?;
+        }
+    }
     Ok(out)
 }
 

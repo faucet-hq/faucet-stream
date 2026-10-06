@@ -377,3 +377,24 @@ async fn limit_on_an_overwrite_row_leaves_the_destination_unchanged() {
     assert!(!summary.had_failures(), "{summary:?}");
     assert_eq!(count(&db, "customers").await, 3, "a real run still swaps");
 }
+
+#[test]
+fn post_run_verify_is_refused_on_overwrite_and_shared_destinations() {
+    let verify = "verify: { key: [id] }\n";
+    let e = expand_err(&overwrite_rows("sqlite::memory:", "in.csv", "", verify));
+    assert!(e.contains("after_run"), "{e}");
+
+    let shared = "version: 1\nname: v\nverify: { key: [id] }\npipeline:\n  source:\n    type: \
+                  csv\n    config: { path: in.csv }\n  sink:\n    type: sqlite\n    config:\n      \
+                  database_url: 'sqlite::memory:'\n      table_name: t\n      column_mapping: \
+                  auto_map\nmatrix:\n  - id: a\n  - id: b\n";
+    let e = expand_err(shared);
+    assert!(e.contains("covers only part of the destination"), "{e}");
+
+    let off = shared.replace(
+        "verify: { key: [id] }",
+        "verify: { key: [id], after_run: false }",
+    );
+    let cfg = PipelineConfig::from_text(&off, Path::new("t.yaml")).unwrap();
+    assert_eq!(expand(&cfg).unwrap().len(), 2);
+}
