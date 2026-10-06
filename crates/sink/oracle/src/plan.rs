@@ -360,12 +360,16 @@ pub(crate) fn ignoring(ddl: &str, codes: &[i32]) -> String {
     )
 }
 
-/// Oracle type for a planned column. Doubles are IEEE `BINARY_DOUBLE` (a
+/// Oracle type for a planned column. A column whose first-page values are all
+/// whole numbers is an unconstrained `NUMBER`: `NUMBER(19)` has scale 0, so a
+/// later `99.95` was silently rounded to `100` (SQL-16); only a key column, which
+/// must stay integral, is `NUMBER(38)`. Doubles are IEEE `BINARY_DOUBLE` (a
 /// `NUMBER` cannot hold 1e300 or 1e-300); key text is bounded (`CLOB` cannot be
 /// indexed); other text is `CLOB` so no value is ever truncated.
 pub(crate) fn column_type(t: SqlBaseType, is_key: bool) -> &'static str {
     match t {
-        SqlBaseType::Integer => "NUMBER(19)",
+        SqlBaseType::Integer if is_key => "NUMBER(38)",
+        SqlBaseType::Integer => "NUMBER",
         SqlBaseType::Double => "BINARY_DOUBLE",
         SqlBaseType::Boolean => "NUMBER(1)",
         SqlBaseType::Text | SqlBaseType::Json if is_key => "VARCHAR2(1000 CHAR)",
@@ -603,9 +607,137 @@ pub(crate) fn case_records(records: &[Value], upper: bool) -> std::borrow::Cow<'
     )
 }
 
+/// The column a record key addresses: the exact name, else — for a key that
+/// matches nothing exactly — the column its upper-case form names, when that
+/// column is all upper case. Unquoted Oracle DDL (`CREATE TABLE T (ID …)`)
+/// stores names upper-cased, and lower-case keys from most sources would
+/// otherwise match nothing under `identifier_case: preserve` (SQL-17).
+pub(crate) fn column_for<'a>(key: &str, columns: &'a [String]) -> Option<&'a str> {
+    if let Some(c) = columns.iter().find(|c| c.as_str() == key) {
+        return Some(c);
+    }
+    let upper = key.to_uppercase();
+    columns
+        .iter()
+        .find(|c| c.as_str() == upper && c.as_str() == c.to_uppercase())
+        .map(String::as_str)
+}
+
+/// Rename every record key that addresses a column only through
+/// [`column_for`]'s upper-case fallback. A record already carrying the column's
+/// exact name keeps its own value for it.
+pub(crate) fn fold_to_columns<'a>(
+    records: &'a [Value],
+    columns: &[String],
+) -> std::borrow::Cow<'a, [Value]> {
+    let needs = |o: &serde_json::Map<String, Value>| {
+        o.keys()
+            .any(|k| column_for(k, columns).is_some_and(|c| c != k && !o.contains_key(c)))
+    };
+    if !records.iter().any(|r| r.as_object().is_some_and(needs)) {
+        return std::borrow::Cow::Borrowed(records);
+    }
+    std::borrow::Cow::Owned(
+        records
+            .iter()
+            .map(|r| match r {
+                Value::Object(o) => Value::Object(
+                    o.iter()
+                        .map(|(k, v)| match column_for(k, columns) {
+                            Some(c) if c != k && !o.contains_key(c) => (c.to_string(), v.clone()),
+                            _ => (k.clone(), v.clone()),
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// `key` mapped through [`column_for`]; a name that matches no column is kept.
+pub(crate) fn fold_names(names: &[String], columns: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|n| column_for(n, columns).unwrap_or(n).to_string())
+        .collect()
+}
+
+/// The table to write when `table` itself does not exist: its upper-case form,
+/// when that exists — a table created with unquoted DDL (SQL-17). Otherwise
+/// `table` (created as written).
+pub(crate) fn pick_table(table: &str, exact_exists: bool, upper_exists: bool) -> String {
+    let upper = table.to_uppercase();
+    if !exact_exists && upper != table && upper_exists {
+        upper
+    } else {
+        table.to_string()
+    }
+}
+
+/// The error for a non-empty chunk whose keys match no column of `table`.
+pub(crate) fn no_columns_error(table: &str, records: &[Value]) -> FaucetError {
+    let mut keys: Vec<&str> = records
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.keys().map(String::as_str))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.truncate(10);
+    FaucetError::Sink(format!(
+        "oracle: none of the record keys {keys:?} match a column of {table} — nothing would be \
+         written. Check `table` and the column names (Oracle names are case-sensitive once \
+         quoted; `identifier_case: upper` matches tables created with unquoted DDL), or set \
+         `on_unknown_field: drop` to skip such records"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lower_case_keys_reach_unquoted_upper_case_columns() {
+        let cols = vec!["ID".to_string(), "NAME".to_string(), "mixed".to_string()];
+        assert_eq!(column_for("ID", &cols), Some("ID"));
+        assert_eq!(column_for("id", &cols), Some("ID"));
+        assert_eq!(column_for("Name", &cols), Some("NAME"));
+        assert_eq!(column_for("mixed", &cols), Some("mixed"));
+        assert_eq!(column_for("MIXED", &cols), None);
+        assert_eq!(column_for("other", &cols), None);
+
+        let recs = vec![json!({"id": 1, "name": "a"}), json!({"ID": 2, "id": 9})];
+        let folded = fold_to_columns(&recs, &cols);
+        assert_eq!(folded[0], json!({"ID": 1, "NAME": "a"}));
+        assert_eq!(folded[1], json!({"ID": 2, "id": 9}));
+        let exact = vec![json!({"ID": 1})];
+        assert!(matches!(
+            fold_to_columns(&exact, &cols),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            fold_names(&["id".to_string(), "zzz".to_string()], &cols),
+            vec!["ID".to_string(), "zzz".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unquoted_table_is_found_by_its_upper_case_name() {
+        assert_eq!(pick_table("events", false, true), "EVENTS");
+        assert_eq!(pick_table("app.events", false, true), "APP.EVENTS");
+        assert_eq!(pick_table("events", true, true), "events");
+        assert_eq!(pick_table("events", false, false), "events");
+        assert_eq!(pick_table("EVENTS", false, true), "EVENTS");
+    }
+
+    #[test]
+    fn the_zero_column_error_names_the_keys_and_the_fix() {
+        let err =
+            no_columns_error("\"T\"", &[json!({"b": 1, "a": 2}), json!({"a": 3})]).to_string();
+        assert!(err.contains("[\"a\", \"b\"]"), "{err}");
+        assert!(err.contains("identifier_case: upper"), "{err}");
+    }
 
     fn col(name: &str, ty: &str, precision: Option<i64>, scale: Option<i64>) -> ColumnInfo {
         ColumnInfo {
@@ -795,11 +927,13 @@ mod tests {
         .unwrap();
         let sql = create_table_sql("\"T\"", &planned, &["SKU".to_string()]).unwrap();
         assert!(sql.contains("\"SKU\" VARCHAR2(1000 CHAR)"), "{sql}");
-        assert!(sql.contains("\"QTY\" NUMBER(19)"), "{sql}");
+        assert!(sql.contains("\"QTY\" NUMBER,"), "{sql}");
         assert!(sql.contains("\"OK\" NUMBER(1)"), "{sql}");
         assert!(sql.contains("\"P\" BINARY_DOUBLE"), "{sql}");
         assert!(sql.contains("\"DOC\" CLOB"), "{sql}");
         assert!(sql.ends_with("PRIMARY KEY (\"SKU\"))"), "{sql}");
+        let int_keyed = create_table_sql("\"T\"", &planned, &["QTY".to_string()]).unwrap();
+        assert!(int_keyed.contains("\"QTY\" NUMBER(38)"), "{int_keyed}");
         let unkeyed = create_table_sql("\"T\"", &planned, &[]).unwrap();
         assert!(!unkeyed.contains("PRIMARY KEY"));
         assert_eq!(

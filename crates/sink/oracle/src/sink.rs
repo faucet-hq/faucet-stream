@@ -16,13 +16,14 @@ use faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX;
 use faucet_core::{FaucetError, RowOutcome, Sink, WriteMode, WritePlan};
 use serde_json::Value;
 
-use crate::config::{IdentifierCase, OracleColumnMapping, OracleSinkConfig};
+use crate::config::{IdentifierCase, OnUnknownField, OracleColumnMapping, OracleSinkConfig};
 use crate::plan::{
     BindKind, COLUMNS_SQL, ColumnInfo, ORA_NAME_IN_USE, TABLE_EXISTS_SQL, add_column_sql,
     case_records, clone_table_sql, column_from_row, create_json_table_sql, create_table_sql,
-    delete_sql, dictionary_binds, drop_table_sql, encode_row, ignoring, insert_sql, merge_sql,
-    relax_null_sql, rename_sql, resolve_insert_columns, schema_from_columns, swap_sql,
-    token_merge_sql, token_select_sql, token_table, token_table_ddl, widen_column_sql,
+    delete_sql, dictionary_binds, drop_table_sql, encode_row, fold_names, fold_to_columns,
+    ignoring, insert_sql, merge_sql, no_columns_error, pick_table, relax_null_sql, rename_sql,
+    resolve_insert_columns, schema_from_columns, swap_sql, token_merge_sql, token_select_sql,
+    token_table, token_table_ddl, widen_column_sql,
 };
 
 /// Oracle Database sink.
@@ -259,7 +260,11 @@ impl Inner {
                     .filter(|c| c.insertable)
                     .map(|c| c.name.clone())
                     .collect();
-                let cols = resolve_insert_columns(&insertable, chunk, *on_unknown_field)?;
+                let cols = resolve_insert_columns(
+                    &insertable,
+                    &fold_to_columns(chunk, &insertable),
+                    *on_unknown_field,
+                )?;
                 let kinds = cols
                     .iter()
                     .map(|c| {
@@ -272,6 +277,16 @@ impl Inner {
                 (cols, kinds)
             }
         };
+        let names: Vec<String> = match &self.config.column_mapping {
+            OracleColumnMapping::AutoColumns { .. } => self
+                .columns(conn)?
+                .into_iter()
+                .filter(|c| c.insertable)
+                .map(|c| c.name)
+                .collect(),
+            OracleColumnMapping::JsonColumn { .. } => Vec::new(),
+        };
+        let chunk = fold_to_columns(chunk, &names);
         let rows = chunk
             .iter()
             .enumerate()
@@ -306,6 +321,9 @@ impl Inner {
         for chunk in self.chunks(records) {
             let (cols, kinds, rows) = self.prepare(conn, chunk)?;
             if cols.is_empty() {
+                if !self.drops_unknown() {
+                    return Err(no_columns_error(self.effective().1, chunk));
+                }
                 base += chunk.len();
                 continue;
             }
@@ -336,11 +354,15 @@ impl Inner {
 
     /// Apply a planned upsert/delete batch (no commit).
     fn apply_plan(&self, conn: &Connection, plan: &WritePlan) -> Result<usize, FaucetError> {
-        let key = &self.config.write.key;
+        let names: Vec<String> = self.columns(conn)?.into_iter().map(|c| c.name).collect();
+        let key = &fold_names(&self.config.write.key, &names);
         let mut affected = 0;
         for chunk in self.chunks(&plan.upserts) {
             let (cols, kinds, rows) = self.prepare(conn, chunk)?;
             if cols.is_empty() {
+                if !self.drops_unknown() {
+                    return Err(no_columns_error(&self.target_quoted, chunk));
+                }
                 continue;
             }
             let rows = rows
@@ -392,8 +414,43 @@ impl Inner {
         Ok(affected)
     }
 
-    fn plan(&self, records: &[Value]) -> Result<WritePlan, FaucetError> {
-        let plan = faucet_core::plan_writes(records, &self.config.write);
+    /// Whether `on_unknown_field: drop` lets a record with no matching key be
+    /// skipped rather than refused.
+    fn drops_unknown(&self) -> bool {
+        matches!(
+            self.config.column_mapping,
+            OracleColumnMapping::AutoColumns {
+                on_unknown_field: OnUnknownField::Drop
+            }
+        )
+    }
+
+    /// The page with record keys (and the write `key`) mapped onto the table's
+    /// columns through the unquoted-identifier fallback (SQL-17).
+    fn fold_page(
+        &self,
+        conn: &Connection,
+        records: &[Value],
+    ) -> Result<(Vec<Value>, faucet_core::WriteSpec), FaucetError> {
+        let mut spec = self.config.write.clone();
+        if !matches!(
+            self.config.column_mapping,
+            OracleColumnMapping::AutoColumns { .. }
+        ) || records.is_empty()
+        {
+            return Ok((records.to_vec(), spec));
+        }
+        let names: Vec<String> = self.columns(conn)?.into_iter().map(|c| c.name).collect();
+        spec.key = fold_names(&spec.key, &names);
+        Ok((fold_to_columns(records, &names).into_owned(), spec))
+    }
+
+    fn plan(
+        &self,
+        records: &[Value],
+        spec: &faucet_core::WriteSpec,
+    ) -> Result<WritePlan, FaucetError> {
+        let plan = faucet_core::plan_writes(records, spec);
         if let Some((idx, msg)) = plan.failed.first() {
             return Err(FaucetError::Sink(format!(
                 "oracle {}: row {idx}: {msg}",
@@ -435,19 +492,49 @@ impl Inner {
     }
 }
 
+/// The table to write: `table` as written, or its upper-case form when only
+/// that exists (created with unquoted DDL, SQL-17) — so a missing lower-case
+/// name is not created as a shadow table nobody reads.
+async fn resolve_table(
+    pool: &OraclePool,
+    timeout: Option<Duration>,
+    table: String,
+) -> Result<String, FaucetError> {
+    if table == table.to_uppercase() {
+        return Ok(table);
+    }
+    let pool = pool.clone();
+    blocking(move || {
+        let conn = checkout(&pool, Side::Sink, timeout)?;
+        let exists = |t: &str| -> Result<bool, FaucetError> {
+            let (owner, name) = dictionary_binds(t)?;
+            let n: i64 = conn
+                .query_row_as(TABLE_EXISTS_SQL, &[&owner, &name])
+                .map_err(|e| sink_err("table probe", &e))?;
+            Ok(n > 0)
+        };
+        let exact = exists(&table)?;
+        let upper = !exact && exists(&table.to_uppercase())?;
+        Ok(pick_table(&table, exact, upper))
+    })
+    .await
+}
+
 impl OracleSink {
     /// Validate, connect, and (in `json_column` mode) create the table.
     pub async fn new(config: OracleSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let config = config.normalized();
-        let target = config.table.clone();
+        let pool = connect_pool(&config.connection, config.max_connections).await?;
+        let timeout = call_timeout(config.statement_timeout_secs);
+        let target = resolve_table(&pool, timeout, config.table.clone()).await?;
         let staging = format!("{target}{OVERWRITE_STAGING_SUFFIX}");
         let inner = Inner {
             target_quoted: quote_table_oracle(&target)?,
             staging_quoted: quote_table_oracle(&staging)?,
             token_table: token_table(&target)?,
-            pool: connect_pool(&config.connection, config.max_connections).await?,
-            timeout: call_timeout(config.statement_timeout_secs),
+            pool,
+            timeout,
             target,
             staging,
             config,
@@ -498,8 +585,9 @@ impl Sink for OracleSink {
         self.run(move |i| {
             let conn = i.conn()?;
             i.ensure_table_ready(&conn, &records)?;
+            let (records, spec) = i.fold_page(&conn, &records)?;
             if i.is_keyed() {
-                let plan = i.plan(&records)?;
+                let plan = i.plan(&records, &spec)?;
                 return in_transaction(&conn, |c| i.apply_plan(c, &plan));
             }
             in_transaction(&conn, |c| {
@@ -519,8 +607,9 @@ impl Sink for OracleSink {
             .run(move |i| {
                 let conn = i.conn()?;
                 i.ensure_table_ready(&conn, &records)?;
+                let (records, spec) = i.fold_page(&conn, &records)?;
                 if i.is_keyed() {
-                    let plan = faucet_core::plan_writes(&records, &i.config.write);
+                    let plan = faucet_core::plan_writes(&records, &spec);
                     in_transaction(&conn, |c| i.apply_plan(c, &plan))?;
                     let mut out = vec![None; records.len()];
                     for (idx, msg) in plan.failed {
@@ -558,8 +647,13 @@ impl Sink for OracleSink {
                 i.ensure_table_ready(&conn, &records)?;
             }
             i.ensure_token_table(&conn)?;
+            let (records, spec) = if records.is_empty() {
+                (records, i.config.write.clone())
+            } else {
+                i.fold_page(&conn, &records)?
+            };
             let plan = if i.is_keyed() {
-                Some(i.plan(&records)?)
+                Some(i.plan(&records, &spec)?)
             } else {
                 None
             };
