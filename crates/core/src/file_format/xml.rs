@@ -42,27 +42,32 @@ pub fn decode(bytes: &[u8], record_element: &str) -> Result<Vec<Value>, FaucetEr
     }
 }
 
-/// Every value stored under `key`, at any depth, flattened out of arrays.
+/// Every value stored under `key`, at any depth, flattened out of arrays, in
+/// document order.
 fn collect(v: &Value, key: &str, out: &mut Vec<Value>) {
-    match v {
-        Value::Object(map) => {
-            for (k, child) in map {
-                if k == key {
-                    match child {
-                        Value::Array(items) => out.extend(items.iter().cloned()),
-                        other => out.push(other.clone()),
-                    }
-                } else {
-                    collect(child, key, out);
+    enum Work<'a> {
+        Visit(&'a Value),
+        Emit(&'a Value),
+    }
+    let mut pending = vec![Work::Visit(v)];
+    while let Some(work) = pending.pop() {
+        match work {
+            Work::Emit(Value::Array(items)) => out.extend(items.iter().cloned()),
+            Work::Emit(other) => out.push(other.clone()),
+            Work::Visit(Value::Object(map)) => {
+                for (k, child) in map.iter().rev() {
+                    pending.push(if k == key {
+                        Work::Emit(child)
+                    } else {
+                        Work::Visit(child)
+                    });
                 }
             }
-        }
-        Value::Array(items) => {
-            for i in items {
-                collect(i, key, out);
+            Work::Visit(Value::Array(items)) => {
+                pending.extend(items.iter().rev().map(Work::Visit));
             }
+            Work::Visit(_) => {}
         }
-        _ => {}
     }
 }
 
@@ -234,6 +239,11 @@ fn finish(obj: Map<String, Value>, text: String) -> Value {
     }
 }
 
+/// The deepest element nesting [`to_json`] accepts. Deeper documents are
+/// refused with a typed error: the resulting value is nested once per level,
+/// and walking or dropping an unbounded one would overflow the stack.
+pub const MAX_XML_DEPTH: usize = 256;
+
 /// Compact XML → JSON.
 pub fn to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
     let text = std::str::from_utf8(bytes)
@@ -249,6 +259,11 @@ pub fn to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
         {
             Event::Eof => break,
             Event::Start(e) => {
+                if names.len() >= MAX_XML_DEPTH {
+                    return Err(FaucetError::Source(format!(
+                        "xml: elements are nested more than {MAX_XML_DEPTH} levels deep"
+                    )));
+                }
                 names.push(local(e.name().as_ref()));
                 stack.push((attrs(&e), String::new()));
             }
@@ -303,6 +318,58 @@ mod tests {
             decode(xml, "row").expect("decode"),
             vec![json!({"id": "1", "n": "a"}), json!({"id": "2", "n": "b"})]
         );
+    }
+
+    fn nested(depth: usize) -> Vec<u8> {
+        format!("{}x{}", "<a>".repeat(depth), "</a>".repeat(depth)).into_bytes()
+    }
+
+    #[test]
+    fn a_hostile_nesting_depth_is_refused_rather_than_overflowing_the_stack() {
+        let err = decode(&nested(250_000), "row").expect_err("too deep");
+        assert!(err.to_string().contains("nested more than"), "{err}");
+    }
+
+    #[test]
+    fn nesting_up_to_the_limit_still_decodes() {
+        let v = to_json(&nested(MAX_XML_DEPTH)).expect("at the limit");
+        let mut cur = &v;
+        for _ in 0..MAX_XML_DEPTH {
+            cur = &cur["a"];
+        }
+        assert_eq!(cur, &json!("x"));
+        assert!(to_json(&nested(MAX_XML_DEPTH + 1)).is_err());
+    }
+
+    fn collect_recursive(v: &Value, key: &str, out: &mut Vec<Value>) {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    if k == key {
+                        match child {
+                            Value::Array(items) => out.extend(items.iter().cloned()),
+                            other => out.push(other.clone()),
+                        }
+                    } else {
+                        collect_recursive(child, key, out);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|i| collect_recursive(i, key, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_iterative_walk_matches_a_recursive_one() {
+        let xml = br#"<r><row><id>1</id></row><g><row><id>2</id><row><id>2.1</id></row></row><h><row><id>3</id></row></h></g><row><id>4</id></row><z><row><id>5</id></row></z></r>"#;
+        let doc = to_json(xml).expect("json");
+        let mut iterative = Vec::new();
+        collect(&doc, "row", &mut iterative);
+        let mut recursive = Vec::new();
+        collect_recursive(&doc, "row", &mut recursive);
+        assert_eq!(iterative.len(), 5);
+        assert_eq!(iterative, recursive);
     }
 
     #[test]
