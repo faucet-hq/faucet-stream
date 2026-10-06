@@ -274,3 +274,106 @@ fn a_dlq_path_shared_with_a_data_sink_is_refused() {
     let e = expand_err(yaml);
     assert!(e.contains("give the DLQ its own path"), "{e}");
 }
+
+// ── CLI-02 / CLI-04 / CLI-05 / CLI-08 / CLI-09 ─────────────────────────────
+
+fn overwrite_rows(db: &str, input: &str, rows: &str, extra: &str) -> String {
+    format!(
+        "version: 1\nname: ow\n{extra}pipeline:\n  source:\n    type: csv\n    config: {{ path: \
+         '{input}' }}\n  sink:\n    type: sqlite\n    config:\n      database_url: '{db}'\n      \
+         table_name: customers\n      column_mapping: auto_map\n      write_mode: overwrite\n\
+         {rows}"
+    )
+}
+
+const US_EU: &str = "matrix:\n  - id: us\n  - id: eu\n";
+
+#[tokio::test]
+async fn a_selection_that_leaves_out_an_overwrite_peer_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sqlite(dir.path(), "dst.db", &[]).await;
+    let input = write(dir.path(), "in.csv", "id\n1\n");
+    let yaml = overwrite_rows(&db, &input, US_EU, "");
+    let cfg = PipelineConfig::from_text(&yaml, Path::new("t.yaml")).unwrap();
+    let sel: faucet_cli::select::SelectionRequest =
+        serde_json::from_value(serde_json::json!({"select": ["eu"]})).unwrap();
+    let e = sel
+        .apply(&cfg, expand(&cfg).unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("'us'") && e.contains("customers"), "{e}");
+    let both: faucet_cli::select::SelectionRequest =
+        serde_json::from_value(serde_json::json!({"select": ["us", "eu"]})).unwrap();
+    assert_eq!(both.apply(&cfg, expand(&cfg).unwrap()).unwrap().len(), 2);
+
+    let cfg_path = write(dir.path(), "ow.yaml", &yaml);
+    Command::cargo_bin("faucet")
+        .unwrap()
+        .args(["run", &cfg_path, "--select", "eu", "--no-env-file"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not part of this run"));
+}
+
+#[tokio::test]
+async fn overwrite_peers_in_different_levels_are_refused_before_any_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sqlite(
+        dir.path(),
+        "dst.db",
+        &[
+            "CREATE TABLE customers (id TEXT)",
+            "INSERT INTO customers VALUES ('old')",
+        ],
+    )
+    .await;
+    let input = write(dir.path(), "in.csv", "id\n1\n");
+    let rows = "matrix:\n  - id: first\n  - id: second\n    depends_on: [first]\n";
+    let e = run(&overwrite_rows(&db, &input, rows, ""), opts("ow"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("one runs after the other"), "{e}");
+    assert_eq!(count(&db, "customers").await, 1, "nothing was replaced");
+}
+
+#[tokio::test]
+async fn a_sharded_run_cannot_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sqlite(dir.path(), "dst.db", &[]).await;
+    let input = write(dir.path(), "in.csv", "id\n1\n");
+    let yaml = overwrite_rows(&db, &input, "", "");
+    let mut o = opts("ow");
+    o.shard = Some(faucet_core::ShardSpec::new("s0", serde_json::json!({})));
+    let e = run(&yaml, o).await.unwrap_err().to_string();
+    assert!(e.contains("source-sharded"), "{e}");
+
+    let e = expand_err(&overwrite_rows(&db, &input, "", "shard: { count: 2 }\n"));
+    assert!(e.contains("`shard:`"), "{e}");
+}
+
+#[tokio::test]
+async fn limit_on_an_overwrite_row_leaves_the_destination_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sqlite(
+        dir.path(),
+        "dst.db",
+        &[
+            "CREATE TABLE customers (id TEXT)",
+            "INSERT INTO customers VALUES ('a'), ('b'), ('c'), ('d'), ('e')",
+        ],
+    )
+    .await;
+    let input = write(dir.path(), "in.csv", "id\n1\n2\n3\n");
+    let mut o = opts("ow");
+    o.limit = Some(1);
+    let summary = run(&overwrite_rows(&db, &input, "", ""), o).await.unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    assert_eq!(count(&db, "customers").await, 5);
+
+    let summary = run(&overwrite_rows(&db, &input, "", ""), opts("ow"))
+        .await
+        .unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    assert_eq!(count(&db, "customers").await, 3, "a real run still swaps");
+}

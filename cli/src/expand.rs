@@ -1134,6 +1134,14 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         // derivation so an EO source + idempotent sink cannot slip overwrite
         // onto the atomic-watermark path.
         if matches!(mode, faucet_core::WriteMode::Overwrite) {
+            if cfg.shard.is_some() {
+                return Err(CliError::Config(format!(
+                    "row '{}': write_mode: overwrite cannot be combined with `shard:` — each \
+                     shard would swap in only its own slice of the data, replacing the rest. \
+                     Remove `shard:` or use `write_mode: upsert`",
+                    ids[i]
+                )));
+            }
             if delivery == faucet_core::DeliveryMode::ExactlyOnce {
                 return Err(CliError::Config(format!(
                     "row '{}': write_mode: overwrite is incompatible with delivery: exactly_once \

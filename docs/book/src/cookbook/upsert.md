@@ -355,6 +355,24 @@ creates the alias); a concrete index of that name is rejected at `begin`.
 - `delivery: exactly_once` — a full replace has no per-page watermark to resume from.
 - `schema.on_drift: evolve` — the staging target is a pre-run clone, so evolving the live target mid-run would leave the staged data a column short at swap time.
 - Scoped cleanup (`complete_for`) — cleanup requires `write_mode: upsert`; a full overwrite already removes source-deleted rows wholesale.
+- `shard:` — each shard would swap in only its own slice, replacing the rest of the table.
+- A post-run `verify:` check (`after_run`, the default) — the swap happens after the run, so the check would read the replaced table. Set `after_run: false` and run `faucet verify` afterwards.
+
+### Every writer of a destination swaps together
+
+Rows that write the same destination with `write_mode: overwrite` (or several
+fan-out invocations of one row) are staged and swapped **once**, together.
+A run that would include only some of them is refused rather than replacing the
+table with a subset:
+
+- a selection (`--select`, `--only`, `--skip`, `--tag`, a serve/MCP/template
+  selection) or a parked `status:` that leaves a sharing row out — widen the
+  selection, or give the rows separate destinations;
+- sharing rows that run one after the other (`parent:` / `depends_on`), since
+  each level would commit its own swap.
+
+`faucet run --limit N` on an overwrite row writes its sample to staging and
+then **discards** it: the destination is left unchanged (a warning says so).
 
 ## Scoped / windowed overwrite (#518)
 

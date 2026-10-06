@@ -462,6 +462,9 @@ pub fn run_expanded_boxed(
 
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
+    if !opts.dry_run {
+        check_overwrite_plan(&nodes, &opts)?;
+    }
     let on_error = opts
         .execution
         .as_ref()
@@ -1010,7 +1013,18 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         // together, atomically.
         let level_cancelled = level_cancel.is_cancelled() || cancel.is_cancelled();
         for (gi, group) in overwrite_groups.iter().enumerate() {
-            let must_abort = level_cancelled || failed_overwrite_groups.contains(&gi);
+            // `--limit` writes a sample: committing it would replace the whole
+            // destination with N rows (#789 CLI-05), so the staged sample is
+            // always discarded.
+            if opts.limit.is_some() {
+                tracing::warn!(
+                    dest = %group.dest,
+                    "--limit on a `write_mode: overwrite` row: the staged sample is discarded \
+                     and the destination is left unchanged"
+                );
+            }
+            let must_abort =
+                level_cancelled || failed_overwrite_groups.contains(&gi) || opts.limit.is_some();
             let mut cfg = group.cfg.clone();
             mark_overwrite_staging(&group.kind, &mut cfg, group.members > 1);
             let sink = build_sink(&group.kind, cfg, &opts.auth).await?;
@@ -1111,6 +1125,24 @@ async fn resolve_product_dims(
         )));
     }
     Ok(Some(resolved))
+}
+
+/// Refuse a run whose overwrite swaps would replace a destination with only
+/// part of its data (#789): a source-sharded run (each shard would commit its
+/// own swap — CLI-02), or rows sharing one destination that run in different
+/// levels (each level commits its own swap — CLI-04).
+fn check_overwrite_plan(nodes: &[ExpandedNode], opts: &ExecuteOptions) -> CliResult<()> {
+    if opts.shard.is_some()
+        && let Some(node) = nodes.iter().find(|n| crate::destination::is_overwrite(n))
+    {
+        return Err(CliError::Config(format!(
+            "row '{}': a source-sharded run cannot write `write_mode: overwrite` — each shard \
+             would swap in only its own slice of the data. Remove `shard:` or use \
+             `write_mode: upsert`",
+            node.id
+        )));
+    }
+    crate::destination::check_overwrite_levels(nodes)
 }
 
 /// A group of overwrite fan-out invocations sharing one physical destination

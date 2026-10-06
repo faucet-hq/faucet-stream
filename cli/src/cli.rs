@@ -2084,6 +2084,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
     /// Stop after writing this many records to the sink. Default: unlimited.
+    /// A `write_mode: overwrite` destination is left unchanged (the sample is
+    /// discarded).
     #[arg(long)]
     pub limit: Option<usize>,
     /// Override the state-store directory (file backend only).

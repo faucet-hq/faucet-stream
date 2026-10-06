@@ -330,7 +330,10 @@ pub(crate) async fn execute(
     // selection flags) returns every row unchanged.
     let selection =
         crate::select::RunSelection::from_args(&args.selection, cfg.selection.as_ref())?;
+    let all_nodes = nodes.clone();
     let nodes = crate::select::select_nodes(nodes, &selection, !cfg.matrix.is_empty())?;
+    crate::destination::check_overwrite_selection(&all_nodes, &nodes)?;
+    drop(all_nodes);
     // Data-flow policy static gate (#702): a labelled column heading for a
     // sink its rules forbid refuses the whole run before any connector is
     // built. Rows the runtime selection dropped are not judged.
