@@ -59,8 +59,8 @@ async fn conformance_bounded_memory() {
 /// validates config (no eager connect), so the channel connect happens at read
 /// time and fails with a typed `FaucetError`. Port 1 refuses connections
 /// immediately on all platforms. Unary is used deliberately — its single
-/// connect attempt surfaces the error directly (ServerStreaming would retry
-/// forever on the unlimited default `reconnect_max_attempts`). A real
+/// connect attempt surfaces the error directly (ServerStreaming would first
+/// spend its `reconnect_max_attempts` budget on backoff). A real
 /// descriptor set is still required to construct the source, so reuse the
 /// shared fixture path; the connect fails before the RPC method is invoked.
 fn unreachable_source() -> GrpcStream {
