@@ -11,6 +11,7 @@ keywords = ["s3", "aws", "storage", "etl", "pipeline"]
 categories.workspace = true
 
 [dependencies]
+faucet-common-file.workspace = true
 faucet-core.workspace = true
 schemars.workspace = true
 serde.workspace = true

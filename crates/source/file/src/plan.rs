@@ -180,21 +180,8 @@ fn io_err(path: &Path, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Source(format!("file source: '{}': {e}", path.display()))
 }
 
-/// Whether `path` is unfinished output of a file sink: one of its scratch
-/// files, or a file in the swap area of an overwrite run that has not
-/// committed. A directory or glob listing skips it.
 fn unfinished_output(path: &Path) -> bool {
-    use faucet_common_file::write::{is_scratch_name, is_swap_dir_name};
-    let name = |c: std::path::Component<'_>| c.as_os_str().to_str().map(str::to_string);
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(is_scratch_name)
-        || path
-            .parent()
-            .into_iter()
-            .flat_map(Path::components)
-            .filter_map(name)
-            .any(|c| is_swap_dir_name(&c))
+    faucet_common_file::write::is_unfinished_output_path(path)
 }
 
 /// List the regular files `path` names: itself, a directory's files

@@ -125,7 +125,7 @@ impl AzureBlobSource {
                 ))
             })?;
             let name = meta.location.to_string();
-            if name.is_empty() {
+            if name.is_empty() || faucet_common_file::write::is_unfinished_output_key(&name) {
                 continue;
             }
             names.push(name);

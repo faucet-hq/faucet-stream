@@ -11,6 +11,7 @@ keywords = ["azure", "blob", "adls", "storage", "etl"]
 categories.workspace = true
 
 [dependencies]
+faucet-common-file.workspace = true
 faucet-core.workspace = true
 faucet-common-azure.workspace = true
 schemars.workspace = true

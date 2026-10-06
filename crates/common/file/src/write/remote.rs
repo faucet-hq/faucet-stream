@@ -58,6 +58,13 @@ pub trait ObjectClient: Send + Sync {
         }
         Ok(())
     }
+    /// Whether [`upload`](Self::upload) writes a temporary object named by
+    /// [`upload_scratch_key`](super::upload_scratch_key) and renames it into
+    /// place, so a crash can leave one behind for the next run to remove.
+    /// Default `false` (an atomic put leaves nothing).
+    fn leaves_upload_scratch(&self) -> bool {
+        false
+    }
     /// Move `from` to `to`, replacing `to`. Default: a server-side copy is
     /// not assumed, so the object is downloaded and re-uploaded, then
     /// `from` deleted; stores with a copy or rename override it.
@@ -152,6 +159,7 @@ pub struct RemoteBackend {
     multipart: Option<Arc<dyn MultipartClient>>,
     base: String,
     swap: String,
+    template: NameTemplate,
     scratch: tempfile::TempDir,
     uploads: usize,
     slots: Arc<tokio::sync::Semaphore>,
@@ -195,6 +203,7 @@ impl RemoteBackend {
         )))?;
         Ok(Self {
             swap: format!("{base}{}/", template.swap_dir_name()),
+            template: template.clone(),
             base,
             client,
             multipart: None,
@@ -323,7 +332,17 @@ impl StorageBackend for RemoteBackend {
         self.scratch.path().join(format!("{tag}-{safe}"))
     }
 
-    async fn prepare(&self, _area: Area) -> Result<(), FaucetError> {
+    /// Remove upload scratch a crashed run of this output left behind.
+    async fn prepare(&self, area: Area) -> Result<(), FaucetError> {
+        if !self.client.leaves_upload_scratch() {
+            return Ok(());
+        }
+        let prefix = self.prefix(area).to_string();
+        for name in direct_children(&prefix, self.client.list(&prefix).await?) {
+            if self.template.owns_scratch(&name) {
+                self.client.delete(&format!("{prefix}{name}")).await?;
+            }
+        }
         Ok(())
     }
 
@@ -593,6 +612,7 @@ pub(crate) mod tests {
         pub parts_put: AtomicUsize,
         pub renames: AtomicUsize,
         pub lists: AtomicUsize,
+        pub upload_scratch: AtomicBool,
     }
 
     impl Mem {
@@ -627,6 +647,9 @@ pub(crate) mod tests {
     impl ObjectClient for Mem {
         fn describe(&self, key: &str) -> String {
             format!("mem://{key}")
+        }
+        fn leaves_upload_scratch(&self) -> bool {
+            self.upload_scratch.load(SeqCst)
         }
         async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
             self.lists.fetch_add(1, SeqCst);

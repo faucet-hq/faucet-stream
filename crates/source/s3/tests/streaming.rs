@@ -707,3 +707,36 @@ async fn stream_pages_json_array_objects_read_concurrently_and_stay_ordered() {
         .collect();
     assert_eq!(ids, (1..=120).collect::<Vec<i64>>());
 }
+
+/// #789 FILE-06: a sink's scratch files and an uncommitted overwrite's swap
+/// area under the prefix are not data.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sinks_unfinished_output_is_not_listed() {
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(
+        &endpoint,
+        &[
+            ("o/a.jsonl".to_string(), jsonl_body(1, 1)),
+            ("o/a.jsonl.faucet-tmp".to_string(), jsonl_body(2, 2)),
+            (
+                "o/.faucet-overwrite-a.jsonl/a.jsonl".to_string(),
+                jsonl_body(3, 3),
+            ),
+            (
+                "o/.faucet-overwrite-a.jsonl/.faucet-swap".to_string(),
+                String::new(),
+            ),
+        ],
+    )
+    .await;
+    let source = build_source(&endpoint, S3SourceConfig::new(TEST_BUCKET).prefix("o/")).await;
+    let records = source.fetch_with_context(&HashMap::new()).await.unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["id"], 1);
+    let datasets = source.discover().await.unwrap();
+    assert!(
+        datasets.iter().all(|d| !d.name.contains("faucet")),
+        "{:?}",
+        datasets.iter().map(|d| &d.name).collect::<Vec<_>>()
+    );
+}

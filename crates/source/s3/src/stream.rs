@@ -148,7 +148,7 @@ impl S3Source {
 
             for object in response.contents() {
                 let key: &str = object.key().unwrap_or_default();
-                if key.is_empty() {
+                if key.is_empty() || faucet_common_file::write::is_unfinished_output_key(key) {
                     continue;
                 }
                 keys.push(key.to_string());
@@ -1112,14 +1112,19 @@ impl faucet_core::Source for S3Source {
             .common_prefixes()
             .iter()
             .filter_map(|p| p.prefix())
-            .filter(|p| !p.is_empty())
+            .filter(|p| {
+                !p.is_empty()
+                    && !p
+                        .split('/')
+                        .any(faucet_common_file::write::is_swap_dir_name)
+            })
             .map(str::to_string)
             .collect();
         let objects: Vec<String> = response
             .contents()
             .iter()
             .filter_map(|o| o.key())
-            .filter(|k| !k.is_empty())
+            .filter(|k| !k.is_empty() && !faucet_common_file::write::is_unfinished_output_key(k))
             .map(str::to_string)
             .collect();
 

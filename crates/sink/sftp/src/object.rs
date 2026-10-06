@@ -174,6 +174,10 @@ impl ObjectClient for SftpObjects {
         )
     }
 
+    fn leaves_upload_scratch(&self) -> bool {
+        true
+    }
+
     async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
         let conn = self.connection().await?;
         let (dir, start) = split_prefix(prefix);
@@ -223,7 +227,10 @@ impl ObjectClient for SftpObjects {
         if let Some(dir) = parent(key) {
             self.create_dirs(&conn, dir).await?;
         }
-        let tmp = format!("{key}.faucet-tmp-{}", uuid::Uuid::new_v4().simple());
+        let tmp = faucet_common_file::write::upload_scratch_key(
+            key,
+            &uuid::Uuid::new_v4().simple().to_string(),
+        );
         let sftp = conn.session();
         let result = async {
             let local = tokio::fs::File::open(from)

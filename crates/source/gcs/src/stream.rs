@@ -132,7 +132,9 @@ impl GcsSource {
                     self.config.bucket
                 ))
             })?;
-            if object.name.is_empty() {
+            if object.name.is_empty()
+                || faucet_common_file::write::is_unfinished_output_key(&object.name)
+            {
                 continue;
             }
             names.push(object.name);
@@ -1116,9 +1118,17 @@ impl faucet_core::Source for GcsSource {
             .objects
             .into_iter()
             .map(|o| o.name)
-            .filter(|n| !n.is_empty())
+            .filter(|n| !n.is_empty() && !faucet_common_file::write::is_unfinished_output_key(n))
             .collect();
-        Ok(descriptors_from_listing(response.prefixes, objects))
+        let prefixes = response
+            .prefixes
+            .into_iter()
+            .filter(|p| {
+                !p.split('/')
+                    .any(faucet_common_file::write::is_swap_dir_name)
+            })
+            .collect();
+        Ok(descriptors_from_listing(prefixes, objects))
     }
 }
 

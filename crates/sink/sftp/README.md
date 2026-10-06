@@ -9,12 +9,15 @@ directory. Append-only.
 ## Atomic writes
 
 Each object is uploaded to a hidden temporary name beside its destination
-(`<name>.faucet-tmp-<uuid>`) and then **renamed** to its final name. A
+(`<name>.faucet-tmp-upload-<id>`) and then **renamed** to its final name. A
 consumer watching the directory therefore never observes a partially-written
 file — a downstream reader either sees the complete object or does not see it
 at all. On a server with the `posix-rename@openssh.com` extension (OpenSSH
 has it) the rename also replaces an existing file atomically; on a plain
 SFTP v3 server an existing file of that name is removed first (#783).
+An upload a crashed run left under that name is removed when the next run of
+the same output starts, and the file, s3, gcs, azure-blob and sftp sources
+skip such names.
 
 Only the server's typed "no such file" status counts as a missing file. Any
 other failed stat, listing or remove (a permission error, a path that cannot

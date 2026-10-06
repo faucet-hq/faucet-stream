@@ -42,7 +42,7 @@ Every listing is sorted by path, so runs are deterministic. Symlinks are
 followed. An unreadable file or directory fails the run with its path.
 
 A directory or glob never reads a file sink's unfinished output: scratch files
-(`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`, `-seal`, `-prev`) and anything
+(`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`, `-seal`, `-prev`, `-upload-<id>`) and anything
 inside the `.faucet-overwrite-*` swap directory of an overwrite run that has
 not committed are skipped. A path that names one file directly is read as
 given.

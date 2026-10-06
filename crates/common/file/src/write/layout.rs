@@ -19,6 +19,9 @@ pub(crate) const BODY_ROLE: &str = "-body";
 pub(crate) const OLD_ROLE: &str = "-old";
 pub(crate) const SEAL_ROLE: &str = "-seal";
 pub(crate) const PREV_ROLE: &str = "-prev";
+/// What follows [`TMP_SUFFIX`] on an upload in flight to a store that has no
+/// atomic put (SFTP), before a unique id: `<name>.faucet-tmp-upload-<id>`.
+pub const UPLOAD_ROLE: &str = "-upload-";
 /// Prefix of the swap area an overwrite run (`write_mode: overwrite`) writes
 /// into before its files are moved into place.
 pub const SWAP_PREFIX: &str = ".faucet-overwrite-";
@@ -32,6 +35,36 @@ pub fn is_scratch_name(name: &str) -> bool {
     scratch_base(name).is_some()
 }
 
+/// The temporary name an upload of `key` is written under before it is
+/// renamed into place. Readers skip it like any other scratch file.
+pub fn upload_scratch_key(key: &str, id: &str) -> String {
+    format!("{key}{TMP_SUFFIX}{UPLOAD_ROLE}{id}")
+}
+
+/// Whether the object `key` (`/`-separated) is unfinished output of a file
+/// sink: a scratch file, or anything inside the swap area of an overwrite run
+/// that has not committed. A listing of a sink's output must skip it.
+pub fn is_unfinished_output_key(key: &str) -> bool {
+    let mut parts = key.split('/').filter(|p| !p.is_empty()).collect::<Vec<_>>();
+    let Some(name) = parts.pop() else {
+        return false;
+    };
+    is_scratch_name(name) || parts.into_iter().any(is_swap_dir_name)
+}
+
+/// [`is_unfinished_output_key`] for a local path.
+pub fn is_unfinished_output_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_scratch_name)
+        || path
+            .parent()
+            .into_iter()
+            .flat_map(Path::components)
+            .filter_map(|c| c.as_os_str().to_str())
+            .any(is_swap_dir_name)
+}
+
 /// Whether `name` (a directory name) is the swap area of an overwrite run,
 /// whose files are not part of the output until the run commits.
 pub fn is_swap_dir_name(name: &str) -> bool {
@@ -43,7 +76,10 @@ pub fn is_swap_dir_name(name: &str) -> bool {
 fn scratch_base(name: &str) -> Option<&str> {
     let i = name.rfind(TMP_SUFFIX)?;
     let role = &name[i + TMP_SUFFIX.len()..];
-    (role.is_empty() || SCRATCH_ROLES.contains(&role)).then_some(&name[..i])
+    (role.is_empty()
+        || SCRATCH_ROLES.contains(&role)
+        || role.len() > UPLOAD_ROLE.len() && role.starts_with(UPLOAD_ROLE))
+    .then_some(&name[..i])
 }
 
 /// The file-name template of one output set. `{part}` is present when the
@@ -292,5 +328,30 @@ mod tests {
             tmp_path(Path::new("a/b.csv"), TMP_SUFFIX),
             PathBuf::from("a/b.csv.faucet-tmp")
         );
+    }
+
+    #[test]
+    fn unfinished_output_keys_and_upload_scratch() {
+        let up = upload_scratch_key("out/a.csv", "abc");
+        assert_eq!(up, "out/a.csv.faucet-tmp-upload-abc");
+        assert!(is_unfinished_output_key(&up));
+        assert!(!is_scratch_name("a.csv.faucet-tmp-upload-"));
+        assert!(is_unfinished_output_key(
+            "out/.faucet-overwrite-a_.csv/a.csv"
+        ));
+        assert!(is_unfinished_output_key(
+            "out/.faucet-overwrite-a_.csv/.faucet-swap"
+        ));
+        assert!(!is_unfinished_output_key("out/a.csv"));
+        assert!(!is_unfinished_output_key(""));
+        assert!(is_unfinished_output_path(Path::new(
+            "o/.faucet-overwrite-x/a"
+        )));
+        assert!(is_unfinished_output_path(Path::new("o/a.faucet-tmp")));
+        assert!(!is_unfinished_output_path(Path::new("o/a.csv")));
+        let t = NameTemplate {
+            name: "a.csv".into(),
+        };
+        assert!(t.owns_scratch("a.csv.faucet-tmp-upload-1f"));
     }
 }

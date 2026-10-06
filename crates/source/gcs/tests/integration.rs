@@ -750,3 +750,28 @@ async fn parquet_columns_project_on_both_read_paths() {
         "{err}"
     );
 }
+
+/// #789 FILE-06: a sink's scratch files and an uncommitted overwrite's swap
+/// area under the prefix are not data.
+#[tokio::test]
+async fn a_sinks_unfinished_output_is_not_listed() {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    for (name, body) in [
+        ("o/a.jsonl", "{\"id\":1}\n"),
+        ("o/a.jsonl.faucet-tmp", "{\"id\":2}\n"),
+        ("o/.faucet-overwrite-a.jsonl/a.jsonl", "{\"id\":3}\n"),
+    ] {
+        seed_object(&host, &bucket, name, body, "application/x-ndjson").await;
+    }
+    let config = GcsSourceConfig::new(&bucket)
+        .prefix("o/")
+        .auth(GcsCredentials::Anonymous)
+        .storage_host(&host);
+    let source = GcsSource::new(config).await.unwrap();
+    let records = source.fetch_with_context(&HashMap::new()).await.unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let datasets = source.discover().await.unwrap();
+    assert!(datasets.iter().all(|d| !d.name.contains("faucet")));
+}

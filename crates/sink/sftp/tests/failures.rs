@@ -154,3 +154,33 @@ async fn a_parquet_sink_encodes_batches_before_any_upload() {
     assert!(s.flush().await.is_err(), "no server to upload to");
     assert!(!sink(1, "/data/p/", json!({})).supports_columnar());
 }
+
+/// #789 FILE-06: an upload a crashed run left under its scratch name is
+/// removed when the next run of the same output starts; a scratch file of
+/// another output is kept, and the published file never carries the name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_run_removes_stale_upload_scratch_of_its_output() {
+    let Some((_c, port)) = server().await else {
+        return;
+    };
+    let s = session(port).await;
+    let _ = s.create_dir("data/out").await;
+    put(&s, "data/out/x.jsonl.faucet-tmp-upload-dead").await;
+    put(&s, "data/out/other.csv.faucet-tmp-upload-live").await;
+
+    let sk = sink(port, "data/out", json!({"file_name": "x.jsonl"}));
+    write_and_flush(&sk, &[json!({"id": 1})]).await.unwrap();
+
+    let mut names: Vec<String> = s
+        .read_dir("data/out")
+        .await
+        .unwrap()
+        .map(|e| e.file_name())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["other.csv.faucet-tmp-upload-live", "x.jsonl"],
+        "{names:?}"
+    );
+}

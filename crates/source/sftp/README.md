@@ -31,6 +31,13 @@ Connection, authentication, and host-key verification come from
 
 The SFTP source is not resumable — every page carries no bookmark.
 
+## Faucet sinks' unfinished output
+
+A directory listing skips a faucet sink's scratch files: an SFTP sink's
+in-flight or orphaned upload (`<name>.faucet-tmp-upload-<id>`) and the other
+`*.faucet-tmp*` names. The listing is not recursive, so an overwrite run's
+`.faucet-overwrite-*` swap directory is never read.
+
 ## Example
 
 ```yaml

@@ -151,6 +151,9 @@ impl SftpSource {
                 continue;
             }
             let name = entry.file_name();
+            if faucet_common_file::write::is_scratch_name(&name) {
+                continue;
+            }
             if let Some(pattern) = &self.config.glob
                 && !glob_match(pattern, &name)
             {

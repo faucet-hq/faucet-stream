@@ -40,6 +40,14 @@ Source-specific fields:
 | `verify_checksum` | bool | `false` | **Not supported on Azure Blob** — `true` is rejected at config load. See [Read-integrity verification](#read-integrity-verification). |
 | `compression` | enum | `auto` | `auto` / `gzip` / `zstd` (requires the `compression` feature). |
 
+## Faucet sinks' unfinished output
+
+A listing skips what a faucet file sink writing to the same prefix has not
+finished: scratch objects (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`,
+`-seal`, `-prev`, `-upload-<id>`) and everything inside the
+`.faucet-overwrite-*` swap area of an overwrite run that has not committed
+(also left behind by a crashed run). Discovery skips them too.
+
 ## Read-integrity verification
 
 A transfer that terminates early but *cleanly* — a truncated body that still
