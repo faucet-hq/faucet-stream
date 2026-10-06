@@ -1259,6 +1259,24 @@ mod tests {
         assert_eq!(out["isError"], true);
     }
 
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn gated_lifecycle_tools_refuse_before_touching_the_registry() {
+        use crate::serve::changes::ChangeKind;
+        let c = ctx(true).with_approval_required(vec![
+            ChangeKind::TemplateRegister,
+            ChangeKind::TemplateLaunch,
+        ]);
+        for tool in ["register_template", "launch_template", "rollback_template"] {
+            let out = call_tool(&c, tool, &json!({"id": "t", "config": "x"})).await;
+            assert_eq!(out["isError"], true, "{tool}: {out}");
+            assert!(
+                out.to_string().contains("propose_template"),
+                "{tool}: {out}"
+            );
+        }
+    }
+
     #[test]
     fn template_lifecycle_tools_honour_required_approval() {
         use crate::serve::changes::ChangeKind;

@@ -807,6 +807,50 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_auth_config_file_resolves_and_protects_its_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.yaml");
+        let tok = dir.path().join("tok");
+        std::fs::write(&tok, "tok-from-file").unwrap();
+        // SAFETY: a variable only this test reads.
+        unsafe { std::env::set_var("FAUCET_RBAC_UNIT_TOKEN", "tok-from-env") };
+        std::fs::write(
+            &path,
+            format!(
+                "principals:\n  - {{ name: a, token: \"${{secret:FAUCET_RBAC_UNIT_TOKEN}}\", role: admin }}\n  - {{ name: b, token: \"${{file:{}}}\", role: viewer }}\n",
+                tok.display()
+            ),
+        )
+        .unwrap();
+        let cfg = RbacConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.authenticate("tok-from-env").unwrap().principal, "a");
+        assert_eq!(
+            cfg.authenticate("tok-from-file").unwrap().role,
+            Role::Viewer
+        );
+        let refs = crate::serve::load::server_secret_refs(&serde_json::json!([
+            "${env:FAUCET_RBAC_UNIT_TOKEN}",
+            format!("${{file:{}}}", tok.display())
+        ]));
+        assert_eq!(refs.len(), 2, "{refs:?}");
+
+        assert!(RbacConfig::from_file(&dir.path().join("missing.yaml")).is_err());
+        std::fs::write(&path, "principals: [").unwrap();
+        assert!(RbacConfig::from_file(&path).is_err());
+        std::fs::write(
+            &path,
+            "principals:\n  - { name: a, token: \"${vault:kv/x#t}\", role: admin }\n",
+        )
+        .unwrap();
+        let err = RbacConfig::from_file(&path).unwrap_err().to_string();
+        if cfg!(feature = "secrets-vault") {
+            assert!(err.contains("auth-config"), "{err}");
+        } else {
+            assert!(err.contains("vault"), "{err}");
+        }
+    }
+
     fn spec(name: &str, token: &str, role: Role) -> PrincipalSpec {
         PrincipalSpec {
             name: name.into(),

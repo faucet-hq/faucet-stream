@@ -2010,6 +2010,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_replay_never_reveals_another_tenants_run() {
+        assert_eq!(idempotency_scope(None, "k"), "k");
+        assert_eq!(idempotency_scope(Some("acme"), "k"), "tenant:acme:k");
+        let state = crate::serve::test_support::test_state();
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, Utc::now());
+        rec.tenant = Some("acme".into());
+        state.history().upsert(&rec).await.unwrap();
+        let globex = AuthContext {
+            tenant: Some("globex".into()),
+            ..admin_actor()
+        };
+        assert!(matches!(
+            replay_response(&state, &globex, "r1").await,
+            Err(ServeError::Conflict(_))
+        ));
+        assert_eq!(
+            replay_response(&state, &admin_actor(), "r1")
+                .await
+                .unwrap()
+                .run_id,
+            "r1"
+        );
+    }
+
     #[test]
     fn classify_ok_no_failures_is_completed() {
         let summary = RunSummary {
