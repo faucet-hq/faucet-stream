@@ -21655,7 +21655,7 @@
                       "default": true
                     },
                     "commit_rows": {
-                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\n`None` (the default) accumulates the **whole run** into one commit.\nSet it to bound how much is buffered, or to commit progressively on a\nlong run. `0` means the same as `None`.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
+                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\nWhen neither `commit_rows` nor `commit_bytes` is set, a group commits\nat 100,000 rows or ~256 MiB, whichever comes first, so a large load\nnever buffers the whole run in memory. `0` means no row limit. A\nfailed group commit keeps its uncommitted rows for the retry.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
                       "type": [
                         "integer",
                         "null",
@@ -21665,7 +21665,7 @@
                       "minimum": 0
                     },
                     "commit_bytes": {
-                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `None` (the default) removes the byte\nthreshold.",
+                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `0` means no byte limit; see\n[`commit_rows`](Self::commit_rows) for the default when both are unset.",
                       "type": [
                         "integer",
                         "null",
@@ -24762,7 +24762,7 @@
                       "default": true
                     },
                     "commit_rows": {
-                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\n`None` (the default) accumulates the **whole run** into one commit.\nSet it to bound how much is buffered, or to commit progressively on a\nlong run. `0` means the same as `None`.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
+                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\nWhen neither `commit_rows` nor `commit_bytes` is set, a group commits\nat 100,000 rows or ~256 MiB, whichever comes first, so a large load\nnever buffers the whole run in memory. `0` means no row limit. A\nfailed group commit keeps its uncommitted rows for the retry.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
                       "type": [
                         "integer",
                         "null",
@@ -24772,7 +24772,7 @@
                       "minimum": 0
                     },
                     "commit_bytes": {
-                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `None` (the default) removes the byte\nthreshold.",
+                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `0` means no byte limit; see\n[`commit_rows`](Self::commit_rows) for the default when both are unset.",
                       "type": [
                         "integer",
                         "null",
