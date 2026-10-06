@@ -748,6 +748,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_is_a_no_op_unless_degraded_with_a_reachable_primary() {
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        assert!(!healthy.try_recover().await, "not degraded");
+        let first = healthy.trigger_edge_rise("q").await.unwrap().unwrap();
+        healthy.trigger_edge_retract("q", first).await.unwrap();
+        healthy.trigger_edge_rearm("q").await.unwrap();
+
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(healthy.try_recover().await, "the primary answers again");
+        assert!(!healthy.is_degraded());
+
+        let startup = FallbackHistory::degraded_at_startup(Duration::from_secs(60), "test");
+        assert!(!startup.try_recover().await, "no primary to recover to");
+        assert!(startup.trigger_edge_rise("q").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn defaults_are_inert_and_changes_and_usage_forward() {
         let bare = AlwaysFail;
         assert!(bare.change_upsert(&change("c0")).await.is_err());

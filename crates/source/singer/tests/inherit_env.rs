@@ -60,3 +60,10 @@ async fn discovery_honours_inherit_env() {
         .unwrap();
     assert_eq!(baseline["cargo"], "");
 }
+
+#[tokio::test]
+async fn discovery_reports_a_tap_that_cannot_be_spawned() {
+    let cfg = SingerSourceConfig::new("/nonexistent/faucet-test-tap", "s");
+    let err = discover(&cfg).await.unwrap_err().to_string();
+    assert!(err.contains("failed to spawn tap"), "{err}");
+}

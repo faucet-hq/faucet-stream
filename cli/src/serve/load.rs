@@ -66,7 +66,24 @@ pub fn protect_file(path: &std::path::Path) {
 }
 
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+/// Resolve `.` and `..` without touching the filesystem, for a path that does
+/// not exist (so `/tmp/../proc/x` is still recognised as `/proc/x`).
+fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn env_is_protected(name: &str) -> bool {
@@ -478,6 +495,17 @@ pub async fn load_submission_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_that_normalizes_into_proc_is_protected() {
+        assert!(file_is_protected("/proc/self/environ"));
+        assert!(file_is_protected("/tmp/../proc/self/environ"));
+        assert!(file_is_protected("/nonexistent/./../proc/1/environ"));
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/a/./b/../c")),
+            std::path::PathBuf::from("/a/c")
+        );
+    }
     use serde_json::json;
 
     fn base() -> Value {

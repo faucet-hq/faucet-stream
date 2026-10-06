@@ -1737,6 +1737,48 @@ mod tests {
         assert!(h.get("live").await.unwrap().is_some());
     }
 
+    /// Poison `m` by panicking on another thread while holding it.
+    fn poison<T: Send>(m: &std::sync::Mutex<T>) {
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _guard = m.lock().unwrap();
+                    panic!("poison the lock");
+                })
+                .join();
+        });
+        assert!(m.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_lock_is_a_backend_error_not_a_panic() {
+        use crate::serve::history::templates::{TemplateDraft, TemplateId};
+        let h = MemoryHistory::new(std::time::Duration::from_secs(3600));
+        poison(&h.trigger_edges);
+        for err in [
+            h.trigger_edge_rise("q").await.unwrap_err(),
+            h.trigger_edge_rearm("q").await.unwrap_err(),
+            h.trigger_edge_retract("q", 1).await.unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("poisoned"), "{err}");
+        }
+        poison(&h.templates);
+        let err = h
+            .template_register(&TemplateDraft {
+                id: TemplateId::parse("orders").unwrap(),
+                name: None,
+                description: None,
+                body: "version: 1\n".into(),
+                format: crate::serve::load::ConfigFormat::Yaml,
+                params: Default::default(),
+                created_by: None,
+                kind: crate::hub::TemplateKind::Pipeline,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("poisoned"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_version_deprecation_round_trips_skips_newest_and_cascades() {
         use crate::serve::history::templates::{DeprecationRecord, TemplateDraft, TemplateId};

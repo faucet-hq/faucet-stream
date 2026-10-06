@@ -1592,6 +1592,12 @@ pub fn fmt_ts(dt: DateTime<Utc>) -> String {
 
 /// Zero-pad a run-log sequence to a fixed 20 digits (the width of `u64::MAX`) so
 /// it sorts lexically = numerically as a TEXT column (#529).
+/// A stored queue_depth edge ordinal.
+pub fn parse_edge_ordinal(raw: &str) -> Result<u64, HistoryError> {
+    raw.parse()
+        .map_err(|e| HistoryError::Backend(format!("trigger edge ordinal '{raw}': {e}")))
+}
+
 pub fn pad_seq(seq: u64) -> String {
     format!("{seq:020}")
 }
@@ -2860,11 +2866,7 @@ macro_rules! impl_sql_history {
                     return Ok(None);
                 };
                 let ordinal: String = row.try_get("ordinal").map_err(backend)?;
-                ordinal.parse().map(Some).map_err(|e| {
-                    $crate::serve::history::HistoryError::Backend(format!(
-                        "trigger edge ordinal '{ordinal}': {e}"
-                    ))
-                })
+                $crate::serve::history::sql::parse_edge_ordinal(&ordinal).map(Some)
             }
 
             async fn trigger_edge_rearm(
@@ -4496,6 +4498,13 @@ pub(crate) use impl_sql_history;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_ordinals_parse_or_name_the_bad_value() {
+        assert_eq!(parse_edge_ordinal("42").unwrap(), 42);
+        let err = parse_edge_ordinal("x1").unwrap_err().to_string();
+        assert!(err.contains("trigger edge ordinal 'x1'"), "{err}");
+    }
 
     #[test]
     fn postgres_shard_statements_are_built() {

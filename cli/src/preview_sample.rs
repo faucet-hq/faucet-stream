@@ -76,7 +76,9 @@ mod tests {
             &self,
             _: &HashMap<String, Value>,
         ) -> Result<Vec<Value>, FaucetError> {
-            unreachable!("a preview must stream, never fetch everything")
+            Err(FaucetError::Source(
+                "a preview must stream, never fetch everything".into(),
+            ))
         }
 
         fn stream_pages<'a>(
@@ -124,6 +126,10 @@ mod tests {
             pages.load(Ordering::SeqCst),
             3,
             "only the pages the limit needs"
+        );
+        assert!(
+            src.fetch_with_context(&HashMap::new()).await.is_err(),
+            "the fixture refuses a whole-dataset read"
         );
     }
 

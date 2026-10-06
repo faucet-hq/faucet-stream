@@ -217,6 +217,7 @@ async fn auth_config_references_resolve_and_stay_out_of_reach() {
         "${secret:FAUCET_VAULT_KEY}".to_string(),
         format!("${{file:{}}}", token_file.display()),
         "${file:/proc/self/environ}".to_string(),
+        "${file:/nonexistent/../proc/self/environ}".to_string(),
     ] {
         let (code, err) = api
             .post(

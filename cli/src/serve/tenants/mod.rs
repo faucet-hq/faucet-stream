@@ -732,6 +732,12 @@ fn decode_state_spec(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_store_error_maps_to_a_serve_error_naming_the_tenant_store() {
+        let err = store_err(crate::serve::history::HistoryError::Backend("boom".into()));
+        assert!(format!("{err:?}").contains("boom"), "{err:?}");
+    }
+
     use crate::serve::history::RunRecord;
 
     fn tenant(id: &str) -> TenantRecord {

@@ -241,14 +241,12 @@ impl russh::client::Handler for ClientHandler {
                     )))
                 }
             }
-            HostKeyPolicy::AcceptNew => {
-                let path = default_known_hosts_path().ok_or_else(|| {
-                    HandlerError::HostKey(
-                        "cannot locate ~/.ssh/known_hosts: no home directory".to_string(),
-                    )
-                })?;
-                accept_new_at(&self.host, self.port, server_public_key, &path)
-            }
+            HostKeyPolicy::AcceptNew => accept_new_in(
+                &self.host,
+                self.port,
+                server_public_key,
+                default_known_hosts_path(),
+            ),
         }
     }
 }
@@ -279,6 +277,20 @@ fn accept_new_decision(
     } else {
         AcceptNewDecision::Changed
     }
+}
+
+/// [`accept_new_at`] against `known_hosts`, the user's file when a home
+/// directory exists.
+fn accept_new_in(
+    host: &str,
+    port: u16,
+    presented: &russh::keys::PublicKey,
+    known_hosts: Option<std::path::PathBuf>,
+) -> Result<bool, HandlerError> {
+    let path = known_hosts.ok_or_else(|| {
+        HandlerError::HostKey("cannot locate ~/.ssh/known_hosts: no home directory".to_string())
+    })?;
+    accept_new_at(host, port, presented, &path)
 }
 
 fn accept_new_at(
@@ -690,9 +702,39 @@ mod tests {
 
     #[test]
     fn default_known_hosts_path_is_under_home() {
-        if let Some(p) = default_known_hosts_path() {
-            assert!(p.ends_with(".ssh/known_hosts"));
-        }
+        assert!(default_known_hosts_path().is_none_or(|p| p.ends_with(".ssh/known_hosts")));
+    }
+
+    #[test]
+    fn accept_new_needs_a_known_hosts_file_and_reports_a_failed_write() {
+        let err = accept_new_in("sftp.example", 22, &key(ED25519_A), None).unwrap_err();
+        assert!(err.to_string().contains("no home directory"), "{err}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        assert!(accept_new_in("sftp.example", 22, &key(ED25519_A), Some(path.clone())).unwrap());
+        assert!(path.is_file(), "the first key is learned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_known_hosts_file_that_cannot_be_written_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = accept_new_at(
+            "sftp.example",
+            22,
+            &key(ED25519_A),
+            &locked.join("known_hosts"),
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("failed to record new host key"),
+            "{err}"
+        );
     }
 
     #[test]

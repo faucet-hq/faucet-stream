@@ -706,6 +706,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_store_error_maps_to_a_serve_error_naming_the_tenant_store() {
+        let err = store_err(crate::serve::history::HistoryError::Backend("boom".into()));
+        assert!(format!("{err:?}").contains("boom"), "{err:?}");
+    }
+
+    #[test]
     fn skips_are_readiness_errors() {
         assert!(is_skip(&ServeError::Conflict("x".into())));
         assert!(is_skip(&ServeError::TooManyRequests("x".into())));
