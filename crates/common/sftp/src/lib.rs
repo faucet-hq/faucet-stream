@@ -242,34 +242,80 @@ impl russh::client::Handler for ClientHandler {
                 }
             }
             HostKeyPolicy::AcceptNew => {
-                match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
-                    Ok(true) => Ok(true),
-                    Ok(false) => {
-                        russh::keys::known_hosts::learn_known_hosts(
-                            &self.host,
-                            self.port,
-                            server_public_key,
-                        )
-                        .map_err(|e| {
-                            HandlerError::HostKey(format!(
-                                "failed to record new host key for {}:{}: {e}",
-                                self.host, self.port
-                            ))
-                        })?;
-                        tracing::info!(
-                            host = %self.host,
-                            port = self.port,
-                            "recorded new SFTP host key (accept-new policy)"
-                        );
-                        Ok(true)
-                    }
-                    Err(e) => Err(HandlerError::HostKey(format!(
-                        "host key for {}:{} changed or is invalid: {e}",
-                        self.host, self.port
-                    ))),
-                }
+                let path = default_known_hosts_path().ok_or_else(|| {
+                    HandlerError::HostKey(
+                        "cannot locate ~/.ssh/known_hosts: no home directory".to_string(),
+                    )
+                })?;
+                accept_new_at(&self.host, self.port, server_public_key, &path)
             }
         }
+    }
+}
+
+fn default_known_hosts_path() -> Option<std::path::PathBuf> {
+    std::env::home_dir().map(|home| home.join(".ssh").join("known_hosts"))
+}
+
+/// What trust-on-first-use does with a presented host key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptNewDecision {
+    Known,
+    Learn,
+    Changed,
+}
+
+/// Any recorded key for the host pins it: a presented key is accepted only when
+/// it equals one of them, whatever its algorithm, so a server answering with a
+/// different key type cannot slip past as "new".
+fn accept_new_decision(
+    recorded: &[russh::keys::PublicKey],
+    presented: &russh::keys::PublicKey,
+) -> AcceptNewDecision {
+    if recorded.is_empty() {
+        AcceptNewDecision::Learn
+    } else if recorded.iter().any(|k| k == presented) {
+        AcceptNewDecision::Known
+    } else {
+        AcceptNewDecision::Changed
+    }
+}
+
+fn accept_new_at(
+    host: &str,
+    port: u16,
+    presented: &russh::keys::PublicKey,
+    path: &std::path::Path,
+) -> Result<bool, HandlerError> {
+    let recorded: Vec<_> = russh::keys::known_hosts::known_host_keys_path(host, port, path)
+        .map_err(|e| HandlerError::HostKey(format!("known_hosts lookup failed: {e}")))?
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect();
+    match accept_new_decision(&recorded, presented) {
+        AcceptNewDecision::Known => Ok(true),
+        AcceptNewDecision::Learn => {
+            russh::keys::known_hosts::learn_known_hosts_path(host, port, presented, path).map_err(
+                |e| {
+                    HandlerError::HostKey(format!(
+                        "failed to record new host key for {host}:{port}: {e}"
+                    ))
+                },
+            )?;
+            tracing::info!(
+                host = %host,
+                port,
+                "recorded new SFTP host key (accept-new policy)"
+            );
+            Ok(true)
+        }
+        AcceptNewDecision::Changed => Err(HandlerError::HostKey(format!(
+            "host key for {host}:{port} changed: the presented {} key matches none of the {} \
+             key(s) recorded in {}",
+            presented.algorithm(),
+            recorded.len(),
+            path.display()
+        ))),
     }
 }
 
@@ -570,6 +616,83 @@ mod tests {
         let dbg = format!("{auth:?}");
         assert!(!dbg.contains("topsecret"), "passphrase leaked: {dbg}");
         assert!(dbg.contains("/k"), "path should still be visible");
+    }
+
+    const ED25519_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILozywbDgXaQa69Wbtm7wCUIQgWrpRikYZPGSeRm8ULm";
+    const ED25519_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDOQ3AnmbLNmWYPOodPL6rtC++IrO7oB/wdCcz7TWAyL";
+    const ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFGy7eFxcAApM1fBomZnvTZ4B3+AK5KUhUhMuAFVffBj5C0RPOb9PI2vnBw6MmnPZfn94Dwi/z+mjg50EI7rNpk=";
+
+    fn key(s: &str) -> russh::keys::PublicKey {
+        russh::keys::PublicKey::from_openssh(s).unwrap()
+    }
+
+    #[test]
+    fn accept_new_decision_pins_any_recorded_key_regardless_of_algorithm() {
+        let (a, b, ec) = (key(ED25519_A), key(ED25519_B), key(ECDSA));
+        assert_eq!(accept_new_decision(&[], &a), AcceptNewDecision::Learn);
+        assert_eq!(
+            accept_new_decision(std::slice::from_ref(&a), &a),
+            AcceptNewDecision::Known
+        );
+        assert_eq!(
+            accept_new_decision(std::slice::from_ref(&a), &b),
+            AcceptNewDecision::Changed
+        );
+        assert_eq!(
+            accept_new_decision(std::slice::from_ref(&a), &ec),
+            AcceptNewDecision::Changed,
+            "a different algorithm must not be learned as a new key"
+        );
+        assert_eq!(
+            accept_new_decision(&[a.clone(), ec.clone()], &ec),
+            AcceptNewDecision::Known
+        );
+    }
+
+    #[test]
+    fn accept_new_learns_once_then_rejects_a_key_of_another_algorithm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ssh").join("known_hosts");
+        let (a, ec) = (key(ED25519_A), key(ECDSA));
+
+        assert!(accept_new_at("sftp.example", 2222, &a, &path).unwrap());
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            recorded.contains("[sftp.example]:2222 ssh-ed25519 "),
+            "{recorded}"
+        );
+
+        assert!(accept_new_at("sftp.example", 2222, &a, &path).unwrap());
+        let err = accept_new_at("sftp.example", 2222, &ec, &path).unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            recorded,
+            "nothing learned"
+        );
+
+        assert!(accept_new_at("other.example", 22, &ec, &path).unwrap());
+    }
+
+    #[test]
+    fn accept_new_surfaces_an_unreadable_known_hosts_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, "sftp.example ssh-ed25519 not-base64!!\n").unwrap();
+        let err = accept_new_at("sftp.example", 22, &key(ED25519_A), &path).unwrap_err();
+        assert!(
+            err.to_string().contains("known_hosts lookup failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn default_known_hosts_path_is_under_home() {
+        if let Some(p) = default_known_hosts_path() {
+            assert!(p.ends_with(".ssh/known_hosts"));
+        }
     }
 
     #[test]
