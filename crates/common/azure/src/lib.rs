@@ -11,6 +11,7 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use faucet_core::FaucetError;
 use object_store::ObjectStore;
@@ -173,6 +174,36 @@ pub struct AzureConnection {
     /// `devstoreaccount1` credentials.
     #[serde(default)]
     pub use_emulator: bool,
+    /// Seconds one request (including reading its body) may take. Unset (the
+    /// default) means no limit, since a blob body is read at the pace of the
+    /// sink and a total deadline would cut long reads off mid-body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Seconds to wait for a connection to the storage endpoint. Defaults to 10.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Retries of a failed request, including resuming an interrupted body
+    /// read. Defaults to 10.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+    /// Seconds after a request first went out during which it may still be
+    /// retried or its body resumed. Defaults to 600. Keep it within the
+    /// lifetime of the credential (a SAS token or bearer token), since a
+    /// retry reuses the original request's credentials.
+    #[serde(default = "default_retry_timeout_secs")]
+    pub retry_timeout_secs: u64,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_max_retries() -> usize {
+    10
+}
+
+fn default_retry_timeout_secs() -> u64 {
+    600
 }
 
 impl AzureConnection {
@@ -185,7 +216,27 @@ impl AzureConnection {
             endpoint: None,
             allow_http: false,
             use_emulator: false,
+            timeout_secs: None,
+            connect_timeout_secs: default_connect_timeout_secs(),
+            max_retries: default_max_retries(),
+            retry_timeout_secs: default_retry_timeout_secs(),
         }
+    }
+
+    /// The HTTP client options and retry policy [`build_store`] applies.
+    pub fn client_settings(&self) -> (object_store::ClientOptions, object_store::RetryConfig) {
+        let mut options = object_store::ClientOptions::new()
+            .with_connect_timeout(Duration::from_secs(self.connect_timeout_secs));
+        options = match self.timeout_secs {
+            Some(secs) => options.with_timeout(Duration::from_secs(secs)),
+            None => options.with_timeout_disabled(),
+        };
+        let retry = object_store::RetryConfig {
+            max_retries: self.max_retries,
+            retry_timeout: Duration::from_secs(self.retry_timeout_secs),
+            ..Default::default()
+        };
+        (options, retry)
     }
 
     /// Set the storage-account name.
@@ -231,7 +282,11 @@ pub fn build_store(conn: &AzureConnection) -> Result<Arc<dyn ObjectStore>, Fauce
         ));
     }
 
-    let mut builder = MicrosoftAzureBuilder::from_env().with_container_name(&conn.container);
+    let (options, retry) = conn.client_settings();
+    let mut builder = MicrosoftAzureBuilder::from_env()
+        .with_container_name(&conn.container)
+        .with_client_options(options)
+        .with_retry(retry);
 
     if let Some(account) = &conn.account {
         builder = builder.with_account(account);
@@ -458,5 +513,25 @@ mod tests {
                     tenant_id: "tid".into(),
                 });
         assert!(build_store(&conn).is_ok());
+    }
+
+    #[test]
+    fn client_settings_default_to_no_total_timeout_and_a_long_retry_window() {
+        let conn: AzureConnection = serde_json::from_value(json!({"container": "c"})).unwrap();
+        assert_eq!(conn.timeout_secs, None);
+        assert_eq!(conn.connect_timeout_secs, 10);
+        let (_, retry) = conn.client_settings();
+        assert_eq!(retry.max_retries, 10);
+        assert_eq!(retry.retry_timeout, Duration::from_secs(600));
+
+        let tuned: AzureConnection = serde_json::from_value(json!({
+            "container": "c", "timeout_secs": 60, "max_retries": 2, "retry_timeout_secs": 30
+        }))
+        .unwrap();
+        let (_, retry) = tuned.client_settings();
+        assert_eq!(retry.max_retries, 2);
+        assert_eq!(retry.retry_timeout, Duration::from_secs(30));
+        build_store(&tuned.clone().account("acct")).unwrap();
+        build_store(&AzureConnection::new("c").account("acct")).unwrap();
     }
 }

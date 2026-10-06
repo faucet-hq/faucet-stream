@@ -17740,6 +17740,46 @@
                       ],
                       "default": false
                     },
+                    "timeout_secs": {
+                      "description": "Seconds one request (including reading its body) may take. Unset (the\ndefault) means no limit, since a blob body is read at the pace of the\nsink and a total deadline would cut long reads off mid-body.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Seconds to wait for a connection to the storage endpoint. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "max_retries": {
+                      "description": "Retries of a failed request, including resuming an interrupted body\nread. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "retry_timeout_secs": {
+                      "description": "Seconds after a request first went out during which it may still be\nretried or its body resumed. Defaults to 600. Keep it within the\nlifetime of the credential (a SAS token or bearer token), since a\nretry reuses the original request's credentials.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 600
+                    },
                     "prefix": {
                       "description": "Object name prefix filter. Ignored when `object_keys` is set.",
                       "type": [
@@ -20847,6 +20887,46 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "timeout_secs": {
+                      "description": "Seconds one request (including reading its body) may take. Unset (the\ndefault) means no limit, since a blob body is read at the pace of the\nsink and a total deadline would cut long reads off mid-body.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Seconds to wait for a connection to the storage endpoint. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "max_retries": {
+                      "description": "Retries of a failed request, including resuming an interrupted body\nread. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "retry_timeout_secs": {
+                      "description": "Seconds after a request first went out during which it may still be\nretried or its body resumed. Defaults to 600. Keep it within the\nlifetime of the credential (a SAS token or bearer token), since a\nretry reuses the original request's credentials.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 600
                     },
                     "prefix": {
                       "description": "Object name prefix filter. Ignored when `object_keys` is set.",
@@ -25286,6 +25366,46 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "timeout_secs": {
+                      "description": "Seconds one request (including reading its body) may take. Unset (the\ndefault) means no limit, since a blob body is read at the pace of the\nsink and a total deadline would cut long reads off mid-body.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Seconds to wait for a connection to the storage endpoint. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "max_retries": {
+                      "description": "Retries of a failed request, including resuming an interrupted body\nread. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "retry_timeout_secs": {
+                      "description": "Seconds after a request first went out during which it may still be\nretried or its body resumed. Defaults to 600. Keep it within the\nlifetime of the credential (a SAS token or bearer token), since a\nretry reuses the original request's credentials.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 600
                     },
                     "prefix": {
                       "description": "Object-name prefix for written objects.",

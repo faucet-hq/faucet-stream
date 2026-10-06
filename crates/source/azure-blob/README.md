@@ -21,6 +21,10 @@ Connection fields come from `faucet-common-azure` and are set at the top level:
 | `endpoint` | string | Custom blob endpoint (emulator / sovereign cloud). |
 | `allow_http` | bool | Permit plaintext HTTP (Azurite). |
 | `use_emulator` | bool | Target the Azurite emulator. |
+| `timeout_secs` | int | Seconds one request, body included, may take. Unset (default) = no limit, so a long body read paced by the pipeline is not cut off. |
+| `connect_timeout_secs` | int | Seconds to wait for a connection (default `10`). |
+| `max_retries` | int | Retries of a failed request, including resuming an interrupted body read (default `10`). |
+| `retry_timeout_secs` | int | Seconds after a request first went out during which it may still be retried or resumed (default `600`); keep it within the credential's lifetime. |
 
 Source-specific fields:
 
