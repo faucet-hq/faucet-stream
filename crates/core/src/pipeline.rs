@@ -2052,7 +2052,9 @@ where
                             // them is retried before aborting — same as the default
                             // and exactly-once paths. Inert when no policy is set
                             // (the macro's `None` arm is a bare `.await`).
-                            with_retry!("flush", sink.flush())?;
+                            if !defer_bookmarks {
+                                with_retry!("flush", sink.flush())?;
+                            }
                             let _dlq_flush_timer = crate::observability::DurationGuard::new(
                                 "faucet_sink_dlq_flush_duration_seconds",
                                 metric_labels.clone(),
@@ -2197,7 +2199,9 @@ where
                             }
                         }
                         if let Some(bookmark) = page.bookmark {
-                            with_retry!("flush", sink.flush())?;
+                            if !defer_bookmarks {
+                                with_retry!("flush", sink.flush())?;
+                            }
                             let bm_labels =
                                 crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
                             crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
@@ -2234,7 +2238,12 @@ where
                 "DLQ sink flush failed during error unwind; original error preserved"
             );
         }
-        if let Err(flush_err) = sink.flush().await {
+        if defer_bookmarks {
+            tracing::info!(
+                "pipeline run failed during overwrite; sink flush skipped so the \
+                 destination is unchanged"
+            );
+        } else if let Err(flush_err) = sink.flush().await {
             tracing::warn!(
                 error = %flush_err,
                 "sink flush failed during error unwind; original error preserved"
@@ -7964,5 +7973,175 @@ mod cleanup_tests {
                 .any(|e| e.starts_with("write:")),
             "Value path must run: {events:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod overwrite_flush_tests {
+    use super::*;
+    use crate::dlq::{DlqConfig, OnBatchError};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    struct Pages {
+        fail_on_page: Option<usize>,
+    }
+
+    #[async_trait]
+    impl Source for Pages {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            unreachable!("Pipeline::run drives stream_pages")
+        }
+        fn stream_pages<'a>(
+            &'a self,
+            _ctx: &'a std::collections::HashMap<String, Value>,
+            _batch_size: usize,
+        ) -> std::pin::Pin<
+            Box<dyn futures_core::Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>,
+        > {
+            let fail = self.fail_on_page;
+            Box::pin(async_stream::try_stream! {
+                for page in 1..=3usize {
+                    if fail == Some(page) {
+                        Err(FaucetError::Source(format!("page {page} failed")))?;
+                    }
+                    yield StreamPage {
+                        records: vec![json!({"i": page})],
+                        bookmark: Some(json!(page)),
+                    };
+                }
+            })
+        }
+    }
+
+    struct Recorder {
+        events: Arc<Mutex<Vec<String>>>,
+        overwrite: bool,
+    }
+
+    impl Recorder {
+        fn new(overwrite: bool) -> (Self, Arc<Mutex<Vec<String>>>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    events: events.clone(),
+                    overwrite,
+                },
+                events,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Sink for Recorder {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.events.lock().unwrap().push("write".into());
+            Ok(records.len())
+        }
+        async fn flush(&self) -> Result<(), FaucetError> {
+            self.events.lock().unwrap().push("flush".into());
+            Ok(())
+        }
+        fn is_overwrite(&self) -> bool {
+            self.overwrite
+        }
+        async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+            self.events.lock().unwrap().push("begin".into());
+            Ok(())
+        }
+        async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+            self.events.lock().unwrap().push("commit".into());
+            Ok(())
+        }
+        async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+            self.events.lock().unwrap().push("abort".into());
+            Ok(())
+        }
+    }
+
+    fn flushes(events: &Arc<Mutex<Vec<String>>>) -> usize {
+        events.lock().unwrap().iter().filter(|e| *e == "flush").count()
+    }
+
+    #[tokio::test]
+    async fn a_failed_overwrite_never_flushes_the_main_sink() {
+        let source = Pages {
+            fail_on_page: Some(2),
+        };
+        let (sink, events) = Recorder::new(true);
+        assert!(Pipeline::new(&source, &sink).run().await.is_err());
+        let log = events.lock().unwrap().clone();
+        assert_eq!(flushes(&events), 0, "{log:?}");
+        assert!(log.contains(&"abort".to_string()));
+        assert!(!log.contains(&"commit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_overwrite_with_a_dlq_never_flushes_the_main_sink() {
+        let source = Pages {
+            fail_on_page: Some(2),
+        };
+        let (sink, events) = Recorder::new(true);
+        let (dlq_sink, _) = Recorder::new(false);
+        let dlq = DlqConfig {
+            on_batch_error: OnBatchError::Propagate,
+            ..DlqConfig::new(Arc::new(dlq_sink))
+        };
+        assert!(
+            Pipeline::new(&source, &sink)
+                .with_dlq(dlq)
+                .run()
+                .await
+                .is_err()
+        );
+        assert_eq!(flushes(&events), 0, "{:?}", events.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_flushes_once_at_the_end_despite_intermediate_bookmarks() {
+        let source = Pages { fail_on_page: None };
+        let (sink, events) = Recorder::new(true);
+        let result = Pipeline::new(&source, &sink).run().await.unwrap();
+        assert_eq!(result.records_written, 3);
+        let log = events.lock().unwrap().clone();
+        assert_eq!(flushes(&events), 1, "{log:?}");
+        let flush_at = log.iter().position(|e| e == "flush").unwrap();
+        let last_write = log.iter().rposition(|e| e == "write").unwrap();
+        let commit_at = log.iter().position(|e| e == "commit").unwrap();
+        assert!(last_write < flush_at && flush_at < commit_at, "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_with_a_dlq_flushes_once_at_the_end() {
+        let source = Pages { fail_on_page: None };
+        let (sink, events) = Recorder::new(true);
+        let (dlq_sink, _) = Recorder::new(false);
+        Pipeline::new(&source, &sink)
+            .with_dlq(DlqConfig::new(Arc::new(dlq_sink)))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(flushes(&events), 1, "{:?}", events.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_append_still_flushes_on_every_bookmark_and_on_failure() {
+        let (sink, events) = Recorder::new(false);
+        Pipeline::new(&Pages { fail_on_page: None }, &sink)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(flushes(&events), 4);
+
+        let (failing, fail_events) = Recorder::new(false);
+        let failing_source = Pages {
+            fail_on_page: Some(2),
+        };
+        assert!(Pipeline::new(&failing_source, &failing).run().await.is_err());
+        assert_eq!(flushes(&fail_events), 2);
     }
 }

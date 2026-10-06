@@ -802,6 +802,49 @@ async fn direct_overwrite_streams_one_load_across_pages() {
     );
 }
 
+/// A direct overwrite flushed mid-stream must not truncate the target a second
+/// time: the session that re-opens after the first finalize appends.
+#[tokio::test]
+async fn direct_overwrite_reopened_after_a_flush_appends() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_resumable(&server, "/resumable/ovw-2", "load-ovw-2").await;
+
+    let mut config = config_overwrite();
+    config.media_load = true;
+    config.create_table = false;
+    config.upload_base_url = Some(server.uri());
+    let config = with_sa_auth(config, &server);
+    let (sink, _sa) = build_sink(&server, config).await;
+
+    sink.begin_overwrite().await.expect("direct begin");
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("page 1");
+    sink.flush().await.expect("first finalize");
+    sink.write_batch(&[json!({"id": 2, "name": "b"})])
+        .await
+        .expect("page 2");
+    sink.flush().await.expect("second finalize");
+
+    let dispositions: Vec<String> = server
+        .received_requests()
+        .await
+        .expect("recording")
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().starts_with("/upload/"))
+        .map(|r| {
+            let body: serde_json::Value = serde_json::from_slice(&r.body).expect("job json");
+            body["configuration"]["load"]["writeDisposition"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(dispositions, ["WRITE_TRUNCATE", "WRITE_APPEND"]);
+}
+
 /// Append + `media_load` streams pages into one `WRITE_APPEND` resumable load,
 /// finalized on `flush`.
 #[tokio::test]
