@@ -83,8 +83,8 @@ impl TenantsRuntime {
     }
 }
 
-fn store_err(e: impl std::fmt::Display) -> ServeError {
-    ServeError::Internal(format!("tenant store: {e}"))
+fn store_err(e: crate::serve::history::HistoryError) -> ServeError {
+    ServeError::from_history("tenant store", e)
 }
 
 /// A tenant's record, or 404.

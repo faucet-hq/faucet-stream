@@ -197,10 +197,19 @@ faucet serve --history 'sqlite:/var/lib/faucet/runs.db'
 ```
 
 Both create their schema on first connect. If the backend is unreachable at
-startup, or fails at runtime, serve **degrades to the in-memory store** so it
-stays up: it logs once, sets the `faucet_serve_history_degraded` gauge, and
-`/readyz` returns `503`. Persisted records are not migrated into the fallback —
-degraded mode is a stay-alive, not a replica. Terminal records are retained for
+startup, or becomes unreachable at runtime (a refused or dropped connection, a
+pool timeout, an I/O error, a server shutting down or out of connections — each
+retried a few times first), serve **degrades** so it stays up: it logs once,
+sets the `faucet_serve_history_degraded` gauge, and `/readyz` returns `503`.
+Any other database error (a constraint, a decode failure, lock contention) is
+returned to the request that hit it and never degrades the server.
+
+While degraded, run records, logs, audit, catalog and usage go to an in-memory
+store so runs keep going. Templates, tenants, connections, change requests and
+`queue_depth` trigger edges are **not** served from that empty store: those
+requests fail with `503` until the backend is back. Every lease tick probes the
+backend and leaves degraded mode as soon as it answers; records written to
+memory meanwhile are not copied back. Terminal records are retained for
 `--retain-terminal-runs-secs` (default 7 days).
 
 ### Multi-instance orphan recovery (run-ownership leases)

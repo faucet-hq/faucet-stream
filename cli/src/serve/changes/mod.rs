@@ -339,7 +339,7 @@ pub struct LaunchPayload {
 }
 
 fn store_err(e: HistoryError) -> ServeError {
-    ServeError::Internal(format!("change store: {e}"))
+    ServeError::from_history("change store", e)
 }
 
 fn sha_hex(canonical: &str) -> String {

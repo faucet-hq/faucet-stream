@@ -33,6 +33,7 @@ fn map_err(e: crate::error::CliError) -> ServeError {
     match e {
         CliError::UnknownPipelineTemplate { .. } => ServeError::NotFound,
         CliError::Internal(m) => ServeError::Internal(m),
+        CliError::HistoryUnavailable(m) => ServeError::Unavailable(m),
         other if crate::select::is_selection_error(&other) => {
             ServeError::BadConfig(other.to_string())
         }

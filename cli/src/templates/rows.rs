@@ -30,7 +30,7 @@ async fn record(
     store
         .template_get(id, Some(version))
         .await
-        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
         .ok_or_else(|| CliError::UnknownPipelineTemplate {
             id: id.to_string(),
             version: Some(version),

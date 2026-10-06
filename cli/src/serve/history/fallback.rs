@@ -1,11 +1,21 @@
 //! Degradation wrapper around a persistent run-history backend (Phase 5 of
 //! #127). While the primary (Postgres/SQLite) backend is healthy, every call
-//! goes to it. The first time a call errors — or if the backend could not be
-//! reached at startup — the wrapper flips to **degraded**: it logs once, sets
-//! the `faucet_serve_history_degraded` gauge, surfaces `503` on `/readyz` via
-//! [`RunHistory::degraded`], and serves all subsequent calls from an in-memory
-//! backend so the server stays up (spec §11). Data already in the primary is not
-//! migrated — degraded mode is a stay-alive fallback, not a replica.
+//! goes to it. A call that fails because the backend is **unreachable** (a
+//! refused/dropped connection, a pool timeout, an I/O error) is retried a few
+//! times; if it still fails — or the backend could not be reached at startup —
+//! the wrapper flips to **degraded**: it logs once, sets the
+//! `faucet_serve_history_degraded` gauge and surfaces `503` on `/readyz` via
+//! [`RunHistory::degraded`]. Any other failure (a constraint, a decode error,
+//! lock contention that outlived the busy timeout) is returned to the caller
+//! and never trips the wrapper (#789 SERVE-04).
+//!
+//! While degraded, run records, logs, audit, catalog and usage are served from
+//! an in-memory store so runs keep going; templates, tenants, connections,
+//! change requests, trigger edges and lease heartbeats fail with
+//! [`HistoryError::Degraded`] (`503`) instead, because an empty store would
+//! answer them wrongly. [`FallbackHistory::try_recover`] probes the primary on
+//! every lease tick and leaves degraded mode when it answers. Data written to
+//! memory while degraded is not migrated back.
 
 use super::memory::MemoryHistory;
 use super::{
@@ -16,6 +26,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Calls made against the primary for one request when it is unreachable.
+const PRIMARY_ATTEMPTS: u32 = 3;
+/// First retry delay; later ones grow ×4.
+const RETRY_BASE: Duration = Duration::from_millis(50);
+/// A run id no run can have — the recovery probe's read.
+const RECOVERY_PROBE_ID: &str = "__faucet_history_recovery_probe__";
 
 pub struct FallbackHistory {
     /// Persistent backend; `None` when it was unreachable at startup.
@@ -56,6 +73,36 @@ impl FallbackHistory {
         self.primary.is_none() || self.degraded.load(Ordering::Acquire)
     }
 
+    fn unavailable(&self) -> HistoryError {
+        HistoryError::Degraded(format!(
+            "the {} run-history backend is unreachable; retry once it recovers",
+            self.label
+        ))
+    }
+
+    /// While degraded, ask the primary for a trivial read; when it answers,
+    /// leave degraded mode. Returns whether the wrapper recovered.
+    pub async fn try_recover(&self) -> bool {
+        if !self.degraded.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(p) = self.primary.as_ref() else {
+            return false;
+        };
+        if p.get(RECOVERY_PROBE_ID).await.is_err() {
+            return false;
+        }
+        if self.degraded.swap(false, Ordering::AcqRel) {
+            tracing::warn!(
+                backend = self.label,
+                "run-history backend reachable again; leaving degraded mode (records \
+                 written while degraded stay in memory only)"
+            );
+            crate::serve::metrics::set_history_degraded(false);
+        }
+        true
+    }
+
     /// Record a primary-backend failure and flip to degraded (log + metric once).
     fn trip(&self, err: &HistoryError) {
         if !self.degraded.swap(true, Ordering::AcqRel) {
@@ -70,21 +117,69 @@ impl FallbackHistory {
     }
 }
 
-/// Run `$call` against the primary backend; on the first error, trip into
-/// degraded mode and re-run it against the in-memory fallback. Once degraded,
-/// skip the primary entirely.
+/// Run `$call` against the primary, retrying a connectivity failure a few
+/// times with a short backoff. Any other failure is returned at once.
+macro_rules! primary {
+    ($self:ident, $primary:ident => $pcall:expr) => {{
+        let $primary = $self
+            .primary
+            .as_ref()
+            .expect("primary checked by the caller");
+        let mut attempt = 1u32;
+        loop {
+            match $pcall.await {
+                Err(e) if e.is_unreachable() && attempt < PRIMARY_ATTEMPTS => {
+                    tokio::time::sleep(RETRY_BASE * 4u32.pow(attempt - 1)).await;
+                    attempt += 1;
+                }
+                other => break other,
+            }
+        }
+    }};
+}
+
+/// Run-record, log, audit, catalog and usage traffic: served by the primary
+/// while it is healthy. Only a connectivity failure that survives the retries
+/// trips the wrapper, after which the in-memory fallback serves the call (and
+/// later ones until the primary answers a recovery probe). Any other error is
+/// the caller's.
 macro_rules! via {
     ($self:ident, $primary:ident => $pcall:expr, $fb:ident => $fcall:expr) => {{
-        if !$self.is_degraded()
-            && let Some($primary) = $self.primary.as_ref()
-        {
-            match $pcall.await {
+        if !$self.is_degraded() && $self.primary.is_some() {
+            match primary!($self, $primary => $pcall) {
                 Ok(v) => return Ok(v),
-                Err(e) => $self.trip(&e),
+                Err(e) if e.is_unreachable() => $self.trip(&e),
+                Err(e) => return Err(e),
             }
         }
         let $fb = &$self.fallback;
         $fcall.await
+    }};
+}
+
+/// Shared state that must never be served from the empty in-memory store —
+/// templates, tenants, connections, change requests, trigger edges — and the
+/// lease heartbeats whose memory no-op would hide that this instance can no
+/// longer renew: these fail with [`HistoryError::Degraded`] while the primary
+/// is unreachable. A wrapper that started degraded has no primary, so the
+/// in-memory store is its only (and authoritative) store.
+macro_rules! strict {
+    ($self:ident, $primary:ident => $pcall:expr, $fb:ident => $fcall:expr) => {{
+        if $self.primary.is_none() {
+            let $fb = &$self.fallback;
+            return $fcall.await;
+        }
+        if $self.is_degraded() {
+            return Err($self.unavailable());
+        }
+        match primary!($self, $primary => $pcall) {
+            Ok(v) => Ok(v),
+            Err(e) if e.is_unreachable() => {
+                $self.trip(&e);
+                Err($self.unavailable())
+            }
+            Err(e) => Err(e),
+        }
     }};
 }
 
@@ -100,12 +195,11 @@ impl RunHistory for FallbackHistory {
         // Idempotency is correctness-critical, so it does NOT use the generic
         // `via!` fall-through. While the primary is healthy it is the
         // authoritative claim store; its first error trips degraded.
-        if !self.is_degraded()
-            && let Some(p) = self.primary.as_ref()
-        {
-            match p.claim_idempotency(key, fingerprint, run_id, window).await {
+        if !self.is_degraded() && self.primary.is_some() {
+            match primary!(self, p => p.claim_idempotency(key, fingerprint, run_id, window)) {
                 Ok(v) => return Ok(v),
-                Err(e) => self.trip(&e),
+                Err(e) if e.is_unreachable() => self.trip(&e),
+                Err(e) => return Err(e),
             }
         }
         // Tripped from a healthy primary: the in-memory fallback cannot see
@@ -157,7 +251,7 @@ impl RunHistory for FallbackHistory {
     }
 
     async fn renew_leases(&self) -> Result<usize, HistoryError> {
-        via!(self, p => p.renew_leases(), f => f.renew_leases())
+        strict!(self, p => p.renew_leases(), f => f.renew_leases())
     }
 
     async fn claim_pending(&self, limit: usize) -> Result<Vec<RunRecord>, HistoryError> {
@@ -192,7 +286,7 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.pending_cancellations(), f => f.pending_cancellations())
     }
     async fn heartbeat_instance(&self, beat: &InstanceHeartbeat) -> Result<(), HistoryError> {
-        via!(self, p => p.heartbeat_instance(beat), f => f.heartbeat_instance(beat))
+        strict!(self, p => p.heartbeat_instance(beat), f => f.heartbeat_instance(beat))
     }
     async fn live_instances(&self, ttl: Duration) -> Result<Vec<InstanceRecord>, HistoryError> {
         via!(self, p => p.live_instances(ttl), f => f.live_instances(ttl))
@@ -214,7 +308,7 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.claim_shards(limit), f => f.claim_shards(limit))
     }
     async fn renew_shard_leases(&self) -> Result<usize, HistoryError> {
-        via!(self, p => p.renew_shard_leases(), f => f.renew_shard_leases())
+        strict!(self, p => p.renew_shard_leases(), f => f.renew_shard_leases())
     }
     async fn reclaim_shards(&self, max_attempts: u32) -> Result<ReclaimReport, HistoryError> {
         via!(self, p => p.reclaim_shards(max_attempts), f => f.reclaim_shards(max_attempts))
@@ -240,13 +334,13 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.finalize_completed_sharded_parents(), f => f.finalize_completed_sharded_parents())
     }
     async fn trigger_edge_rise(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
-        via!(self, p => p.trigger_edge_rise(trigger), f => f.trigger_edge_rise(trigger))
+        strict!(self, p => p.trigger_edge_rise(trigger), f => f.trigger_edge_rise(trigger))
     }
     async fn trigger_edge_rearm(&self, trigger: &str) -> Result<(), HistoryError> {
-        via!(self, p => p.trigger_edge_rearm(trigger), f => f.trigger_edge_rearm(trigger))
+        strict!(self, p => p.trigger_edge_rearm(trigger), f => f.trigger_edge_rearm(trigger))
     }
     async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
-        via!(self, p => p.trigger_edge_retract(trigger, ordinal), f => f.trigger_edge_retract(trigger, ordinal))
+        strict!(self, p => p.trigger_edge_retract(trigger, ordinal), f => f.trigger_edge_retract(trigger, ordinal))
     }
 
     async fn record_audit(&self, entry: &AuditEntry) -> Result<(), HistoryError> {
@@ -308,92 +402,92 @@ impl RunHistory for FallbackHistory {
         &self,
         tenant: &super::tenants::TenantRecord,
     ) -> Result<(), HistoryError> {
-        via!(self, p => p.tenant_upsert(tenant), f => f.tenant_upsert(tenant))
+        strict!(self, p => p.tenant_upsert(tenant), f => f.tenant_upsert(tenant))
     }
     async fn tenant_get(
         &self,
         id: &str,
     ) -> Result<Option<super::tenants::TenantRecord>, HistoryError> {
-        via!(self, p => p.tenant_get(id), f => f.tenant_get(id))
+        strict!(self, p => p.tenant_get(id), f => f.tenant_get(id))
     }
     async fn tenant_list(&self) -> Result<Vec<super::tenants::TenantRecord>, HistoryError> {
-        via!(self, p => p.tenant_list(), f => f.tenant_list())
+        strict!(self, p => p.tenant_list(), f => f.tenant_list())
     }
     async fn tenant_delete(&self, id: &str) -> Result<bool, HistoryError> {
-        via!(self, p => p.tenant_delete(id), f => f.tenant_delete(id))
+        strict!(self, p => p.tenant_delete(id), f => f.tenant_delete(id))
     }
     async fn connection_upsert(
         &self,
         connection: &super::tenants::ConnectionRecord,
     ) -> Result<(), HistoryError> {
-        via!(self, p => p.connection_upsert(connection), f => f.connection_upsert(connection))
+        strict!(self, p => p.connection_upsert(connection), f => f.connection_upsert(connection))
     }
     async fn connection_get(
         &self,
         tenant: &str,
         name: &str,
     ) -> Result<Option<super::tenants::ConnectionRecord>, HistoryError> {
-        via!(self, p => p.connection_get(tenant, name), f => f.connection_get(tenant, name))
+        strict!(self, p => p.connection_get(tenant, name), f => f.connection_get(tenant, name))
     }
     async fn connection_list(
         &self,
         tenant: &str,
     ) -> Result<Vec<super::tenants::ConnectionRecord>, HistoryError> {
-        via!(self, p => p.connection_list(tenant), f => f.connection_list(tenant))
+        strict!(self, p => p.connection_list(tenant), f => f.connection_list(tenant))
     }
     async fn connection_delete(&self, tenant: &str, name: &str) -> Result<bool, HistoryError> {
-        via!(self, p => p.connection_delete(tenant, name), f => f.connection_delete(tenant, name))
+        strict!(self, p => p.connection_delete(tenant, name), f => f.connection_delete(tenant, name))
     }
     async fn connect_session_put(
         &self,
         session: &super::tenants::ConnectSession,
     ) -> Result<(), HistoryError> {
-        via!(self, p => p.connect_session_put(session), f => f.connect_session_put(session))
+        strict!(self, p => p.connect_session_put(session), f => f.connect_session_put(session))
     }
     async fn connect_session_take(
         &self,
         state: &str,
     ) -> Result<Option<super::tenants::ConnectSession>, HistoryError> {
-        via!(self, p => p.connect_session_take(state), f => f.connect_session_take(state))
+        strict!(self, p => p.connect_session_take(state), f => f.connect_session_take(state))
     }
     async fn tenant_run_link(&self, run_id: &str, tenant: &str) -> Result<(), HistoryError> {
-        via!(self, p => p.tenant_run_link(run_id, tenant), f => f.tenant_run_link(run_id, tenant))
+        strict!(self, p => p.tenant_run_link(run_id, tenant), f => f.tenant_run_link(run_id, tenant))
     }
     async fn tenant_state_ref_add(
         &self,
         state_ref: &super::tenants::TenantStateRef,
     ) -> Result<(), HistoryError> {
-        via!(self, p => p.tenant_state_ref_add(state_ref), f => f.tenant_state_ref_add(state_ref))
+        strict!(self, p => p.tenant_state_ref_add(state_ref), f => f.tenant_state_ref_add(state_ref))
     }
     async fn tenant_state_refs(
         &self,
         tenant: &str,
     ) -> Result<Vec<super::tenants::TenantStateRef>, HistoryError> {
-        via!(self, p => p.tenant_state_refs(tenant), f => f.tenant_state_refs(tenant))
+        strict!(self, p => p.tenant_state_refs(tenant), f => f.tenant_state_refs(tenant))
     }
     async fn change_delete(&self, id: &str) -> Result<bool, HistoryError> {
-        via!(self, p => p.change_delete(id), f => f.change_delete(id))
+        strict!(self, p => p.change_delete(id), f => f.change_delete(id))
     }
     async fn usage_delete_runs(&self, run_ids: &[String]) -> Result<usize, HistoryError> {
-        via!(self, p => p.usage_delete_runs(run_ids), f => f.usage_delete_runs(run_ids))
+        strict!(self, p => p.usage_delete_runs(run_ids), f => f.usage_delete_runs(run_ids))
     }
     async fn change_upsert(
         &self,
         change: &crate::serve::changes::ChangeRequest,
     ) -> Result<(), HistoryError> {
-        via!(self, p => p.change_upsert(change), f => f.change_upsert(change))
+        strict!(self, p => p.change_upsert(change), f => f.change_upsert(change))
     }
     async fn change_get(
         &self,
         id: &str,
     ) -> Result<Option<crate::serve::changes::ChangeRequest>, HistoryError> {
-        via!(self, p => p.change_get(id), f => f.change_get(id))
+        strict!(self, p => p.change_get(id), f => f.change_get(id))
     }
     async fn change_list(
         &self,
         filter: &crate::serve::changes::ChangeListFilter,
     ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
-        via!(self, p => p.change_list(filter), f => f.change_list(filter))
+        strict!(self, p => p.change_list(filter), f => f.change_list(filter))
     }
     async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
         via!(self, p => p.usage_record(record), f => f.usage_record(record))
@@ -478,25 +572,25 @@ impl RunHistory for FallbackHistory {
         &self,
         draft: &crate::serve::history::templates::TemplateDraft,
     ) -> Result<crate::serve::history::templates::TemplateRecord, HistoryError> {
-        via!(self, p => p.template_register(draft), f => f.template_register(draft))
+        strict!(self, p => p.template_register(draft), f => f.template_register(draft))
     }
     async fn template_get(
         &self,
         id: &str,
         version: Option<u32>,
     ) -> Result<Option<crate::serve::history::templates::TemplateRecord>, HistoryError> {
-        via!(self, p => p.template_get(id, version), f => f.template_get(id, version))
+        strict!(self, p => p.template_get(id, version), f => f.template_get(id, version))
     }
     async fn template_list(
         &self,
     ) -> Result<Vec<crate::serve::history::templates::TemplateSummary>, HistoryError> {
-        via!(self, p => p.template_list(), f => f.template_list())
+        strict!(self, p => p.template_list(), f => f.template_list())
     }
     async fn template_versions(&self, id: &str) -> Result<Vec<u32>, HistoryError> {
-        via!(self, p => p.template_versions(id), f => f.template_versions(id))
+        strict!(self, p => p.template_versions(id), f => f.template_versions(id))
     }
     async fn template_delete(&self, id: &str, version: Option<u32>) -> Result<usize, HistoryError> {
-        via!(self, p => p.template_delete(id, version), f => f.template_delete(id, version))
+        strict!(self, p => p.template_delete(id, version), f => f.template_delete(id, version))
     }
     async fn template_set_tag(
         &self,
@@ -504,16 +598,16 @@ impl RunHistory for FallbackHistory {
         tag: &str,
         version: u32,
     ) -> Result<(), HistoryError> {
-        via!(self, p => p.template_set_tag(id, tag, version), f => f.template_set_tag(id, tag, version))
+        strict!(self, p => p.template_set_tag(id, tag, version), f => f.template_set_tag(id, tag, version))
     }
     async fn template_tags(
         &self,
         id: &str,
     ) -> Result<std::collections::BTreeMap<String, u32>, HistoryError> {
-        via!(self, p => p.template_tags(id), f => f.template_tags(id))
+        strict!(self, p => p.template_tags(id), f => f.template_tags(id))
     }
     async fn template_delete_tag(&self, id: &str, tag: &str) -> Result<bool, HistoryError> {
-        via!(self, p => p.template_delete_tag(id, tag), f => f.template_delete_tag(id, tag))
+        strict!(self, p => p.template_delete_tag(id, tag), f => f.template_delete_tag(id, tag))
     }
     async fn template_launch(
         &self,
@@ -521,7 +615,7 @@ impl RunHistory for FallbackHistory {
         version: u32,
         launched_by: Option<&str>,
     ) -> Result<Option<u32>, HistoryError> {
-        via!(
+        strict!(
             self,
             p => p.template_launch(id, version, launched_by),
             f => f.template_launch(id, version, launched_by)
@@ -531,14 +625,14 @@ impl RunHistory for FallbackHistory {
         &self,
         id: &str,
     ) -> Result<Vec<crate::serve::history::templates::LaunchRecord>, HistoryError> {
-        via!(self, p => p.template_launches(id), f => f.template_launches(id))
+        strict!(self, p => p.template_launches(id), f => f.template_launches(id))
     }
     async fn template_set_deprecation(
         &self,
         id: &str,
         record: Option<&crate::serve::history::templates::DeprecationRecord>,
     ) -> Result<(), HistoryError> {
-        via!(
+        strict!(
             self,
             p => p.template_set_deprecation(id, record),
             f => f.template_set_deprecation(id, record)
@@ -550,7 +644,7 @@ impl RunHistory for FallbackHistory {
         version: u32,
         record: Option<&crate::serve::history::templates::DeprecationRecord>,
     ) -> Result<(), HistoryError> {
-        via!(
+        strict!(
             self,
             p => p.template_set_version_deprecation(id, version, record),
             f => f.template_set_version_deprecation(id, version, record)
@@ -561,7 +655,7 @@ impl RunHistory for FallbackHistory {
         &self,
         id: &str,
     ) -> Result<Vec<crate::serve::history::templates::VersionDeprecation>, HistoryError> {
-        via!(
+        strict!(
             self,
             p => p.template_version_deprecations(id),
             f => f.template_version_deprecations(id)
@@ -572,11 +666,15 @@ impl RunHistory for FallbackHistory {
         &self,
         id: &str,
     ) -> Result<Option<crate::serve::history::templates::DeprecationRecord>, HistoryError> {
-        via!(self, p => p.template_deprecation(id), f => f.template_deprecation(id))
+        strict!(self, p => p.template_deprecation(id), f => f.template_deprecation(id))
     }
 
     fn degraded(&self) -> bool {
         self.is_degraded()
+    }
+
+    async fn recover_degraded(&self) -> bool {
+        self.try_recover().await
     }
 }
 
@@ -585,7 +683,7 @@ mod tests {
     use super::*;
     use crate::serve::history::RunStatus;
 
-    /// A primary backend whose every call fails — drives the degrade path.
+    /// A primary backend that cannot be reached — drives the degrade path.
     struct AlwaysFail;
 
     #[async_trait]
@@ -597,25 +695,25 @@ mod tests {
             _: &str,
             _: Duration,
         ) -> Result<Claim, HistoryError> {
-            Err(HistoryError::Backend("down".into()))
+            Err(HistoryError::Unreachable("down".into()))
         }
         async fn upsert(&self, _: &RunRecord) -> Result<(), HistoryError> {
-            Err(HistoryError::Backend("down".into()))
+            Err(HistoryError::Unreachable("down".into()))
         }
         async fn get(&self, _: &str) -> Result<Option<RunRecord>, HistoryError> {
-            Err(HistoryError::Backend("down".into()))
+            Err(HistoryError::Unreachable("down".into()))
         }
         async fn list(&self, _: &ListFilter) -> Result<ListPage, HistoryError> {
-            Err(HistoryError::Backend("down".into()))
+            Err(HistoryError::Unreachable("down".into()))
         }
         async fn delete(&self, _: &str) -> Result<DeleteOutcome, HistoryError> {
-            Err(HistoryError::Backend("down".into()))
+            Err(HistoryError::Unreachable("down".into()))
         }
         async fn purge_expired(&self, _: Duration) -> Result<usize, HistoryError> {
-            Err(HistoryError::Backend("down".into()))
+            Err(HistoryError::Unreachable("down".into()))
         }
         async fn recover_orphans(&self) -> Result<usize, HistoryError> {
-            Err(HistoryError::Backend("down".into()))
+            Err(HistoryError::Unreachable("down".into()))
         }
         fn degraded(&self) -> bool {
             false
@@ -672,12 +770,32 @@ mod tests {
                 .is_empty()
         );
         assert!(fb.usage_list(&usage).await.unwrap().is_empty());
-        // The primary refuses the write, so the store trips and memory serves.
-        fb.change_upsert(&change("c1")).await.unwrap();
-        assert!(fb.degraded());
-        assert_eq!(fb.change_get("c1").await.unwrap().unwrap().id, "c1");
-        assert_eq!(fb.change_list(&Default::default()).await.unwrap().len(), 1);
-        assert!(fb.usage_list(&usage).await.unwrap().is_empty());
+        // Usage records ride the run-record path: an unreachable primary trips
+        // the store and memory serves them.
+        let tripped =
+            FallbackHistory::healthy(Box::new(AlwaysFail), Duration::from_secs(60), "test");
+        tripped
+            .upsert(&RunRecord::queued(
+                "r".into(),
+                None,
+                Default::default(),
+                None,
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(tripped.degraded());
+        assert!(tripped.usage_list(&usage).await.unwrap().is_empty());
+        // Change requests are never served from the empty memory store: once
+        // degraded they fail with a retryable `Degraded` error.
+        assert!(matches!(
+            tripped.change_upsert(&change("c1")).await,
+            Err(HistoryError::Degraded(_))
+        ));
+        assert!(matches!(
+            tripped.change_get("c1").await,
+            Err(HistoryError::Degraded(_))
+        ));
     }
 
     #[tokio::test]

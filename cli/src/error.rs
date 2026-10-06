@@ -423,6 +423,12 @@ pub enum CliError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// The run-history backend that stores templates, tenants and change
+    /// requests is unreachable; the request can be retried once it recovers.
+    #[cfg(feature = "serve")]
+    #[error("{0}")]
+    HistoryUnavailable(String),
+
     /// A secret-manager directive used a scheme whose backend feature was not
     /// compiled into this binary.
     #[error(

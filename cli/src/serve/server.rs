@@ -440,11 +440,90 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
     }
 }
 
+/// How long ago this instance last renewed its leases, and whether it has
+/// already fenced itself for the current outage.
+#[derive(Debug)]
+pub struct LeaseHealth {
+    last_renewed: std::time::Instant,
+    fenced: bool,
+}
+
+impl LeaseHealth {
+    pub fn new(now: std::time::Instant) -> Self {
+        Self {
+            last_renewed: now,
+            fenced: false,
+        }
+    }
+
+    /// Record one heartbeat outcome. Returns `true` exactly once per outage:
+    /// when renewal has failed for `fence_after`, which the caller sets short
+    /// of the lease TTL so this instance stops before peers may reclaim.
+    pub fn observe(
+        &mut self,
+        renewed: bool,
+        now: std::time::Instant,
+        fence_after: Duration,
+    ) -> bool {
+        if renewed {
+            self.last_renewed = now;
+            self.fenced = false;
+            return false;
+        }
+        if self.fenced || now.duration_since(self.last_renewed) < fence_after {
+            return false;
+        }
+        self.fenced = true;
+        true
+    }
+}
+
+/// One lease-heartbeat step: probe a degraded history back to health, renew
+/// this instance's run (and, clustered, shard) leases, and — clustered — when
+/// renewal has failed for `fence_after`, cancel every local run and shard so a
+/// peer that reclaims them once their leases expire never runs them at the
+/// same time (#789 SERVE-04). Returns how many local runs and shards were
+/// cancelled.
+pub async fn maintain_leases(
+    state: &ServerState,
+    health: &mut LeaseHealth,
+    fence_after: Duration,
+) -> usize {
+    if state.history().recover_degraded().await {
+        tracing::info!("run-history backend recovered");
+    }
+    let mut renewed = true;
+    if let Err(e) = state.history().renew_leases().await {
+        tracing::warn!(error = %e, "lease heartbeat (renew_leases) failed");
+        renewed = false;
+    }
+    if state.cluster().enabled()
+        && let Err(e) = state.history().renew_shard_leases().await
+    {
+        tracing::warn!(error = %e, "cluster: renew_shard_leases failed");
+        renewed = false;
+    }
+    if !health.observe(renewed, std::time::Instant::now(), fence_after)
+        || !state.cluster().enabled()
+    {
+        return 0;
+    }
+    let cancelled = state.registry().cancel_all();
+    tracing::error!(
+        cancelled,
+        unrenewed_secs = fence_after.as_secs(),
+        "cluster: could not renew run leases; cancelling every local run and shard before \
+         the leases expire so a peer that reclaims them never runs them concurrently"
+    );
+    cancelled
+}
+
 pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: CancellationToken) {
     let cluster = state.cluster().clone();
     // Member-liveness window ≈ the real lease TTL (period == lease_ttl/3), so a
     // member must miss ~3 heartbeats before peers treat it as gone.
     let member_ttl = period.saturating_mul(3);
+    let mut health = LeaseHealth::new(std::time::Instant::now());
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // consume the immediate first tick
@@ -452,9 +531,7 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => {
-                if let Err(e) = state.history().renew_leases().await {
-                    tracing::warn!(error = %e, "lease heartbeat (renew_leases) failed");
-                }
+                maintain_leases(&state, &mut health, member_ttl.saturating_sub(period)).await;
                 if cluster.enabled() {
                     refresh_membership(&state, member_ttl).await;
                     // Failover reclaim (re-run orphans).
@@ -469,12 +546,8 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "cluster: reclaim_orphans failed"),
                     }
-                    // Mode B (#230): heartbeat this instance's running shards, and
-                    // rebalance shards whose owner's lease expired (requeue →
-                    // another worker, or poison past max_attempts).
-                    if let Err(e) = state.history().renew_shard_leases().await {
-                        tracing::warn!(error = %e, "cluster: renew_shard_leases failed");
-                    }
+                    // Mode B (#230): rebalance shards whose owner's lease expired
+                    // (requeue → another worker, or poison past max_attempts).
                     match state.history().reclaim_shards(cluster.max_attempts()).await {
                         Ok(r) if r.requeued > 0 || r.failed > 0 => {
                             crate::serve::metrics::record_shards_reclaimed(r.requeued, r.failed);
@@ -913,6 +986,25 @@ mod tests {
     use crate::serve::history::{RunRecord, RunStatus};
     use chrono::Utc;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn lease_health_fences_once_per_outage_after_the_window() {
+        let t0 = std::time::Instant::now();
+        let window = Duration::from_secs(20);
+        let mut h = LeaseHealth::new(t0);
+        assert!(!h.observe(false, t0 + Duration::from_secs(10), window));
+        assert!(h.observe(false, t0 + Duration::from_secs(20), window));
+        assert!(
+            !h.observe(false, t0 + Duration::from_secs(40), window),
+            "once"
+        );
+        assert!(!h.observe(true, t0 + Duration::from_secs(41), window));
+        assert!(!h.observe(false, t0 + Duration::from_secs(50), window));
+        assert!(
+            h.observe(false, t0 + Duration::from_secs(61), window),
+            "a new outage"
+        );
+    }
 
     #[test]
     fn lease_interval_is_third_of_ttl_floored_at_one_sec() {

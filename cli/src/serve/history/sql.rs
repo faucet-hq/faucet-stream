@@ -1636,19 +1636,44 @@ pub fn threshold(now: DateTime<Utc>, window: Duration) -> String {
 /// the macro below maps through this, so no caller has to grep the rendered
 /// message to decide whether retrying is worthwhile (PRINCIPLES §6, #654 M1).
 pub fn classify_backend_error(e: sqlx::Error) -> HistoryError {
-    HistoryError::BackendClassified {
-        message: e.to_string(),
-        transience: transience_of(&e),
+    classified(e.to_string(), &e)
+}
+
+fn classified(message: String, e: &sqlx::Error) -> HistoryError {
+    if unreachable_of(e) {
+        HistoryError::Unreachable(message)
+    } else {
+        HistoryError::BackendClassified {
+            message,
+            transience: transience_of(e),
+        }
     }
+}
+
+/// Whether a driver error means the database could not be reached, as opposed
+/// to the database answering with an error.
+pub fn unreachable_of(e: &sqlx::Error) -> bool {
+    use sqlx::Error as E;
+    match e {
+        E::PoolTimedOut | E::PoolClosed | E::Io(_) | E::Tls(_) | E::WorkerCrashed => true,
+        E::Database(db) => unreachable_code(db.code().as_deref()),
+        _ => false,
+    }
+}
+
+/// Pure code → reachability: Postgres class `08` (connection exception),
+/// `57P01`–`57P03` (shutting down / cannot connect now) and `53300` (no free
+/// connection slot). A SQLite code never means "unreachable": the database is
+/// a local file, so a failure to open it is a configuration error.
+pub fn unreachable_code(code: Option<&str>) -> bool {
+    matches!(code, Some(c) if c.len() == SQLSTATE_LEN
+        && (c.starts_with("08") || matches!(c, "57P01" | "57P02" | "57P03" | "53300")))
 }
 
 /// [`classify_backend_error`] with a phase prefix, for the connect / DDL steps
 /// whose message needs to name what was being attempted.
 pub fn classify_backend_error_with_context(context: &str, e: sqlx::Error) -> HistoryError {
-    HistoryError::BackendClassified {
-        message: format!("{context}: {e}"),
-        transience: transience_of(&e),
-    }
+    classified(format!("{context}: {e}"), &e)
 }
 
 /// Transience of a driver error, from its variant (and, for a database-reported
@@ -4689,6 +4714,38 @@ mod tests {
             !err.is_retriable(),
             "a syntax error must not be retried at the connect gate"
         );
+    }
+
+    #[test]
+    fn only_a_backend_that_cannot_be_reached_is_unreachable() {
+        for code in ["08006", "08001", "57P01", "57P03", "53300"] {
+            assert!(unreachable_code(Some(code)), "{code}");
+        }
+        for code in ["40001", "23505", "42601"] {
+            assert!(!unreachable_code(Some(code)), "{code}");
+        }
+        assert!(
+            !unreachable_code(Some("5")),
+            "SQLITE_BUSY is contention, not reachability"
+        );
+        assert!(
+            !unreachable_code(Some("14")),
+            "SQLITE_CANTOPEN is configuration"
+        );
+        assert!(!unreachable_code(None));
+        assert!(unreachable_of(&sqlx::Error::PoolTimedOut));
+        assert!(unreachable_of(&sqlx::Error::PoolClosed));
+        assert!(unreachable_of(&sqlx::Error::Io(std::io::Error::other(
+            "reset"
+        ))));
+        assert!(!unreachable_of(&sqlx::Error::RowNotFound));
+        let err = classify_backend_error(sqlx::Error::PoolTimedOut);
+        assert!(err.is_unreachable());
+        assert_eq!(err.transience(), Transience::Transient);
+        assert!(err.to_string().starts_with("run-history backend error:"));
+        let err = classify_backend_error(db("08006"));
+        assert!(err.is_unreachable());
+        assert!(!classify_backend_error(db("23505")).is_unreachable());
     }
 
     #[test]

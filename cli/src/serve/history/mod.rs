@@ -362,6 +362,12 @@ pub enum HistoryError {
     /// `503` so the caller can retry once the backend recovers (#146 M5).
     #[error("{0}")]
     Degraded(String),
+    /// The backend could not be reached: a refused, dropped or timed-out
+    /// connection, a pool timeout, an I/O error, or a server that is shutting
+    /// down or out of connections. The only failure that may trip the
+    /// degraded fallback.
+    #[error("run-history backend error: {0}")]
+    Unreachable(String),
 }
 
 impl HistoryError {
@@ -372,9 +378,15 @@ impl HistoryError {
             Self::BackendClassified { transience, .. } => *transience,
             // A degraded backend recovers on its own, so a caller retrying is
             // exactly the right response.
-            Self::Degraded(_) => Transience::Transient,
+            Self::Degraded(_) | Self::Unreachable(_) => Transience::Transient,
             _ => Transience::Unknown,
         }
+    }
+
+    /// Whether the backend could not be reached at all (see
+    /// [`Unreachable`](Self::Unreachable)).
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable(_))
     }
 
     /// Whether retrying the failed call could plausibly succeed. Everything but
@@ -1399,6 +1411,12 @@ pub trait RunHistory: Send + Sync {
             self.template_delete(id, Some(stale)).await?;
         }
         Ok(())
+    }
+
+    /// While degraded, probe the persistent backend and leave degraded mode
+    /// if it answers. Returns whether it recovered. Default: nothing to recover.
+    async fn recover_degraded(&self) -> bool {
+        false
     }
 
     /// True when the backend is in fallback mode (drives `/readyz`). Always false

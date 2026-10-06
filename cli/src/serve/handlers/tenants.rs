@@ -36,8 +36,8 @@ use std::sync::Arc;
 const DEFAULT_FANOUT_CONCURRENCY: usize = 4;
 const MAX_FANOUT_CONCURRENCY: usize = 64;
 
-fn store_err(e: impl std::fmt::Display) -> ServeError {
-    ServeError::Internal(format!("tenant store: {e}"))
+fn store_err(e: crate::serve::history::HistoryError) -> ServeError {
+    ServeError::from_history("tenant store", e)
 }
 
 /// The actor, acting for `tenant`.
