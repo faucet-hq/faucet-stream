@@ -53,7 +53,9 @@ pub async fn handle(
     // endpoints and `faucet template` do.
     let ctx = crate::mcp::McpContext::new(auth, can_mutate)
         .with_config_execution(can_execute_config)
-        .with_template_admin(actor.role.grants(Permission::TemplateAdmin));
+        .with_template_admin(actor.role.grants(Permission::TemplateAdmin))
+        .with_submitted_origin(state.caller_origin())
+        .with_approval_required(state.require_approval().to_vec());
     #[cfg(feature = "templates")]
     let ctx = ctx.with_templates(state.history());
     // Change requests (#703): an agent that may submit a run may propose one.

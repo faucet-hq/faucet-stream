@@ -285,6 +285,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

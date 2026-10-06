@@ -48,6 +48,7 @@ fn test_config() -> ServeConfig {
         approval_expiry: std::time::Duration::from_secs(86_400),
         vault: None,
         connect_providers_path: None,
+        allow_subprocess_connectors: false,
     }
 }
 
@@ -439,6 +440,7 @@ async fn spawn_serve_with_triggers(
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

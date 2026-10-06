@@ -9,7 +9,7 @@ use crate::registry::build_source;
 use crate::serve::error::ServeError;
 use crate::serve::history::{Claim, InvocationRecord, RunRecord, RunStatus};
 use crate::serve::history::{ClaimedShard, ShardInsert};
-use crate::serve::load::{ConfigFormat, LoadedSubmission, load_submission_scoped};
+use crate::serve::load::{BodyOrigin, ConfigFormat, LoadedSubmission, load_submission_scoped};
 use crate::serve::rbac::AuthContext;
 use crate::serve::state::ServerState;
 use crate::serve::{idempotency, metrics};
@@ -88,6 +88,10 @@ pub struct SubmitRequest {
     /// sharded run applies the same subset. Omitted: every row runs.
     #[serde(default)]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// Set in-process when the server's operator wrote the config (a
+    /// registered template, the triggers file), never accepted from a client.
+    #[serde(skip)]
+    pub trusted_config: bool,
 }
 
 /// What a gated submission produced (#703).
@@ -136,6 +140,7 @@ pub async fn submit_gated(
                 payload,
                 reason,
                 budget,
+                trusted_config: req.trusted_config,
             },
         )
         .await?;
@@ -206,13 +211,14 @@ pub(crate) async fn load_selected(
     format: ConfigFormat,
     tenant: Option<&str>,
     selection: Option<&crate::select::SelectionRequest>,
+    origin: BodyOrigin,
 ) -> Result<LoadedSubmission, ServeError> {
     if selection.is_some() && is_topology_body(body, format) {
         return Err(ServeError::BadConfig(
             crate::select::TOPOLOGY_REFUSAL.to_string(),
         ));
     }
-    let mut loaded = load_for(state, body, format, tenant).await?;
+    let mut loaded = load_for(state, body, format, tenant, origin).await?;
     if let Some(sel) = selection {
         let nodes = std::mem::take(&mut loaded.nodes);
         loaded.nodes = sel.apply(&loaded.cfg, nodes).map_err(|e| {
@@ -243,6 +249,7 @@ pub(crate) async fn load_for(
     body: &str,
     format: ConfigFormat,
     tenant: Option<&str>,
+    origin: BodyOrigin,
 ) -> Result<LoadedSubmission, ServeError> {
     let scope = match tenant {
         None => None,
@@ -253,6 +260,7 @@ pub(crate) async fn load_for(
         format,
         state.default_base().as_ref(),
         server_policy(state).as_deref(),
+        origin,
         scope,
     )
     .await
@@ -344,6 +352,7 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             format,
             rec.tenant.as_deref(),
             rec.selection.as_ref(),
+            BodyOrigin::Trusted,
         )
         .await
         {
@@ -545,6 +554,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             format,
             run.tenant.as_deref(),
             run.selection.as_ref(),
+            BodyOrigin::Trusted,
         )
         .await
         {
@@ -971,6 +981,7 @@ pub async fn submit(
         format,
         actor.tenant.as_deref(),
         req.selection.as_ref(),
+        state.origin(req.trusted_config),
     )
     .await?;
     policy_gate(&state, &actor, &loaded).await?;
@@ -1038,9 +1049,10 @@ pub async fn submit(
             req.concurrency,
             &req.labels,
         );
+        let key = idempotency_scope(actor.tenant.as_deref(), key);
         match state
             .history()
-            .claim_idempotency(key, &fp, &run_id, state.idempotency_retention())
+            .claim_idempotency(&key, &fp, &run_id, state.idempotency_retention())
             .await
             .map_err(|e| match e {
                 // Degraded backend can't safely honor idempotency → 503, retry.
@@ -1050,7 +1062,7 @@ pub async fn submit(
             Claim::Fresh => {}
             Claim::Replay(existing) => {
                 metrics::record_idempotency_hit();
-                return replay_response(&state, &existing).await;
+                return replay_response(&state, &actor, &existing).await;
             }
             Claim::Conflict => {
                 return Err(ServeError::Conflict(
@@ -1289,18 +1301,36 @@ pub(crate) async fn run_doctor_first(
 }
 
 /// Build the replay response for an idempotency hit (the existing run's status).
-async fn replay_response(state: &ServerState, run_id: &str) -> Result<SubmitResponse, ServeError> {
+async fn replay_response(
+    state: &ServerState,
+    actor: &AuthContext,
+    run_id: &str,
+) -> Result<SubmitResponse, ServeError> {
     let rec = state
         .history()
         .get(run_id)
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?
         .ok_or(ServeError::NotFound)?;
+    if !actor.sees_tenant(rec.tenant.as_deref()) {
+        return Err(ServeError::Conflict(
+            "idempotency key reused with a different payload".into(),
+        ));
+    }
     Ok(SubmitResponse {
         run_id: rec.run_id,
         status: rec.status,
         submitted_at: rec.submitted_at,
     })
+}
+
+/// The key an idempotency claim is stored under: a tenant's keys live in
+/// their own namespace, so two tenants sending the same key never meet.
+pub(crate) fn idempotency_scope(tenant: Option<&str>, key: &str) -> String {
+    match tenant {
+        Some(t) => format!("tenant:{t}:{key}"),
+        None => key.to_string(),
+    }
 }
 
 /// Releases a queue reservation on drop unless [`Self::defuse`]d. Guarantees the
@@ -2082,6 +2112,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2118,6 +2149,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            trusted_config: false,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -2174,6 +2206,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2203,6 +2236,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            trusted_config: false,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -2256,6 +2290,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         ServerState::new(
@@ -2383,6 +2418,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         // A backend that is degraded from startup (primary unreachable).
         let history = Arc::new(FallbackHistory::degraded_at_startup(
@@ -2416,6 +2452,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            trusted_config: false,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(
@@ -2489,6 +2526,7 @@ mod tests {
                 approval_expiry: std::time::Duration::from_secs(86_400),
                 vault: None,
                 connect_providers_path: None,
+                allow_subprocess_connectors: false,
             };
             ServerState::new(
                 &cfg,
@@ -2503,9 +2541,15 @@ mod tests {
         }
 
         async fn loaded(yaml: &str) -> LoadedSubmission {
-            crate::serve::load::load_submission(yaml, ConfigFormat::Yaml, None, None)
-                .await
-                .expect("load submission")
+            crate::serve::load::load_submission(
+                yaml,
+                ConfigFormat::Yaml,
+                None,
+                None,
+                BodyOrigin::Trusted,
+            )
+            .await
+            .expect("load submission")
         }
 
         async fn seed_run(state: &ServerState, run_id: &str, status: RunStatus) {

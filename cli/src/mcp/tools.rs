@@ -312,7 +312,10 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
             } else if !ctx.allow_template_admin {
                 Err(TEMPLATE_ADMIN_GATE.to_string())
             } else {
-                register_template(ctx, args).await
+                match approval_gate(ctx, &register_kinds(args)) {
+                    Err(e) => Err(e),
+                    Ok(()) => register_template(ctx, args).await,
+                }
             }
         }
         #[cfg(feature = "templates")]
@@ -322,7 +325,10 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
             } else if !ctx.allow_template_admin {
                 Err(TEMPLATE_ADMIN_GATE.to_string())
             } else {
-                launch_template(ctx, args).await
+                match approval_gate(ctx, &[crate::serve::changes::ChangeKind::TemplateLaunch]) {
+                    Err(e) => Err(e),
+                    Ok(()) => launch_template(ctx, args).await,
+                }
             }
         }
         #[cfg(feature = "templates")]
@@ -332,7 +338,10 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
             } else if !ctx.allow_template_admin {
                 Err(TEMPLATE_ADMIN_GATE.to_string())
             } else {
-                rollback_template(ctx, args).await
+                match approval_gate(ctx, &[crate::serve::changes::ChangeKind::TemplateLaunch]) {
+                    Err(e) => Err(e),
+                    Ok(()) => rollback_template(ctx, args).await,
+                }
             }
         }
         #[cfg(feature = "templates")]
@@ -360,6 +369,39 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
         // Redact any resolved secret material that reached an error string.
         Err(msg) => tool_error(crate::secrets::registry::redact(&msg)),
     }
+}
+
+/// Refuse a template-lifecycle tool whose change kind the server gates
+/// behind an approved change request.
+#[cfg_attr(not(feature = "templates"), allow(dead_code))]
+fn approval_gate(
+    ctx: &McpContext,
+    kinds: &[crate::serve::changes::ChangeKind],
+) -> Result<(), String> {
+    match kinds.iter().find(|k| ctx.approval_required.contains(k)) {
+        Some(k) => Err(format!(
+            "this server requires an approved change request for {k} \
+             (--require-approval); use propose_template instead"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// What a `register_template` call changes: a register, and a launch when it
+/// also launches the version or points a channel at it.
+#[cfg_attr(not(feature = "templates"), allow(dead_code))]
+fn register_kinds(args: &Value) -> Vec<crate::serve::changes::ChangeKind> {
+    use crate::serve::changes::ChangeKind;
+    let launches = args.get("launch").and_then(Value::as_bool).unwrap_or(false)
+        || args
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|t| !t.is_empty());
+    let mut kinds = vec![ChangeKind::TemplateRegister];
+    if launches {
+        kinds.push(ChangeKind::TemplateLaunch);
+    }
+    kinds
 }
 
 /// The MCP-facing rendering of a change request: everything an agent needs
@@ -409,6 +451,7 @@ async fn propose_run(p: &crate::mcp::ChangeProposer, args: &Value) -> Result<Str
             payload,
             reason: Some(reason.to_string()),
             budget,
+            trusted_config: false,
         },
     )
     .await
@@ -455,6 +498,7 @@ async fn propose_template(p: &crate::mcp::ChangeProposer, args: &Value) -> Resul
             payload,
             reason: Some(reason.to_string()),
             budget: None,
+            trusted_config: false,
         },
     )
     .await
@@ -554,6 +598,19 @@ fn parse_config_with(text: &str, mode: crate::params::BindMode) -> Result<Pipeli
     PipelineConfig::from_value(doc).map_err(|e| e.to_string())
 }
 
+/// Refuse a caller-supplied config the server would refuse on `POST /v1/runs`:
+/// one that reads the server's own credentials, or (without
+/// `--allow-subprocess-connectors`) uses a subprocess connector.
+fn screen_config(ctx: &McpContext, text: &str) -> Result<(), String> {
+    let Some(origin) = ctx.submitted else {
+        return Ok(());
+    };
+    let doc: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    crate::serve::load::refuse_server_secrets(&doc)
+        .and_then(|()| crate::serve::load::refuse_subprocess(&doc, origin, false))
+        .map_err(|e| e.api_error().error.message)
+}
+
 /// Read-only introspection: a config whose required params arrive later still
 /// validates, against type-shaped placeholders.
 fn parse_config(text: &str) -> Result<PipelineConfig, String> {
@@ -562,6 +619,7 @@ fn parse_config(text: &str) -> Result<PipelineConfig, String> {
 
 async fn validate_config(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let text = str_arg(args, "config")?;
+    screen_config(ctx, text)?;
     let cfg = parse_config(text)?;
 
     if crate::topology::is_topology(&cfg) {
@@ -606,6 +664,7 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
         .map(|n| (n as usize).clamp(1, PREVIEW_MAX))
         .unwrap_or(10);
 
+    screen_config(ctx, text)?;
     let cfg = parse_config(text)?;
     if crate::topology::is_topology(&cfg) {
         return crate::topology::preview_to_string(&cfg, &ctx.auth, limit)
@@ -662,6 +721,7 @@ fn selection_arg(args: &Value) -> Result<Option<crate::select::SelectionRequest>
 
 async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let text = str_arg(args, "config")?;
+    screen_config(ctx, text)?;
     let selection = selection_arg(args)?;
     let dry_run = args
         .get("dry_run")
@@ -1197,6 +1257,51 @@ mod tests {
         )
         .await;
         assert_eq!(out["isError"], true);
+    }
+
+    #[test]
+    fn template_lifecycle_tools_honour_required_approval() {
+        use crate::serve::changes::ChangeKind;
+        assert_eq!(
+            register_kinds(&json!({})),
+            vec![ChangeKind::TemplateRegister]
+        );
+        assert_eq!(
+            register_kinds(&json!({"launch": true})),
+            vec![ChangeKind::TemplateRegister, ChangeKind::TemplateLaunch]
+        );
+        assert_eq!(register_kinds(&json!({"tags": ["prod"]})).len(), 2);
+        let c = ctx(true).with_approval_required(vec![ChangeKind::TemplateLaunch]);
+        assert!(approval_gate(&c, &[ChangeKind::TemplateRegister]).is_ok());
+        let err = approval_gate(&c, &register_kinds(&json!({"launch": true}))).unwrap_err();
+        assert!(
+            err.contains("template_launch") && err.contains("propose_template"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_origin_screens_submitted_configs() {
+        let c = ctx(true).with_submitted_origin(crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: false,
+        });
+        let singer = "version: 1\npipeline:\n  source: { type: singer, config: { executable: /bin/sh, stream: x } }\n  sink: { type: stdout, config: {} }\n";
+        for tool in ["validate_config", "preview", "run_pipeline"] {
+            let out = call_tool(&c, tool, &json!({"config": singer})).await;
+            assert_eq!(out["isError"], true, "{tool}: {out}");
+            assert!(
+                out.to_string().contains("--allow-subprocess-connectors"),
+                "{out}"
+            );
+        }
+        let secret = "version: 1\npipeline:\n  source: { type: csv, config: { path: \"${env:FAUCET_VAULT_KEY}\" } }\n  sink: { type: stdout, config: {} }\n";
+        let out = call_tool(&c, "validate_config", &json!({"config": secret})).await;
+        assert!(
+            out.to_string().contains("server's own credentials"),
+            "{out}"
+        );
+        assert!(screen_config(&c, "{[bad").is_err());
+        assert!(screen_config(&ctx(true), singer).is_ok());
     }
 
     #[tokio::test]

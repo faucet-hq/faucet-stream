@@ -398,6 +398,7 @@ async fn server_with_sqlite_history_persists_runs() {
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
@@ -1398,6 +1399,7 @@ async fn change_requests_round_trip_and_filter() {
             template: None,
             error: None,
             tenant: None,
+            trusted_config: false,
         }
     };
     store

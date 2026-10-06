@@ -109,6 +109,7 @@ mod tests {
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
             connect_providers_path: None,
+            allow_subprocess_connectors: false,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         ServerState::new(

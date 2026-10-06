@@ -144,6 +144,9 @@ pub struct ServeConfig {
     pub vault: Option<VaultKeys>,
     /// Path to a `--connect-providers` file (#709).
     pub connect_providers_path: Option<PathBuf>,
+    /// Whether a caller-supplied config may use connectors that run a program
+    /// on the server (`--allow-subprocess-connectors`).
+    pub allow_subprocess_connectors: bool,
 }
 
 /// The vault key (`--vault-key`) and previous keys (`--vault-previous-key`).
@@ -199,6 +202,20 @@ impl ServeConfig {
                     require_approval.push(kind);
                 }
             }
+        }
+        if args.templates_sync.is_some()
+            && let Some(kind) = require_approval.iter().find(|k| {
+                matches!(
+                    k,
+                    crate::serve::changes::ChangeKind::TemplateRegister
+                        | crate::serve::changes::ChangeKind::TemplateLaunch
+                )
+            })
+        {
+            return Err(CliError::Serve(format!(
+                "--templates-sync registers and launches templates on its own schedule, which \
+                 would bypass --require-approval {kind}; drop one of the two"
+            )));
         }
         if args.approval_expiry_secs == 0 {
             return Err(CliError::Serve(
@@ -389,6 +406,7 @@ impl ServeConfig {
                 }
             }),
             connect_providers_path: args.connect_providers,
+            allow_subprocess_connectors: args.allow_subprocess_connectors,
         })
     }
 }
@@ -418,6 +436,25 @@ mod tests {
         empty.no_auth = true;
         empty.vault_key = Some(String::new());
         assert!(ServeConfig::from_args(empty).unwrap().vault.is_none());
+    }
+
+    #[test]
+    fn template_sync_cannot_bypass_template_approval() {
+        let mut a = base_args();
+        a.no_auth = true;
+        a.templates_sync = Some("sync.yaml".into());
+        a.require_approval = vec!["run".into()];
+        a.allow_subprocess_connectors = true;
+        let cfg = ServeConfig::from_args(a.clone()).unwrap();
+        assert!(cfg.allow_subprocess_connectors);
+        for kind in ["template_register", "template_launch"] {
+            a.require_approval = vec![format!("run,{kind}")];
+            let err = ServeConfig::from_args(a.clone()).unwrap_err().to_string();
+            assert!(
+                err.contains("--templates-sync") && err.contains(kind),
+                "{err}"
+            );
+        }
     }
 
     fn base_args() -> crate::cli::ServeArgs {
@@ -464,6 +501,7 @@ mod tests {
             vault_key: None,
             vault_previous_key: Vec::new(),
             connect_providers: None,
+            allow_subprocess_connectors: false,
         }
     }
 

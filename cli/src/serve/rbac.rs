@@ -71,8 +71,10 @@ pub enum Permission {
     Identity,
     /// Plan a config without running it (`POST /v1/plan`, #283/#707): the
     /// resolved row, an offline sample pass, the schema delta and the
-    /// downstream impact. Read-only — nothing is written, no connector runs
-    /// against a destination — so every role from `viewer` up.
+    /// downstream impact. Nothing is written, but the submitted config is
+    /// loaded on the server — its `${env:}` / `${file:}` / secret references
+    /// resolve and discovery fan-out reaches its hosts — so `operator` up, like
+    /// `POST /v1/doctor`.
     Plan,
     /// Annotate a catalogued dataset with owners and declared consumers
     /// (`POST /v1/catalog/datasets/{id}/consumers`, #707). Changes shared
@@ -173,7 +175,6 @@ impl Role {
                         | TemplateRead
                         | LocalOutputRead
                         | Identity
-                        | Plan
                         | UsageRead
                         | ChangeRead
                         | StatusRead
@@ -344,13 +345,34 @@ impl AuthContext {
 
 impl RbacConfig {
     /// Load + validate an `--auth-config` file (YAML or JSON).
+    ///
+    /// `${env:}` / `${file:}` / `${secret:}` and secret-manager references
+    /// (`${vault:…}`, …) resolve before the file is read, and the variables and
+    /// files they name are protected from every config the server loads. A
+    /// token that still contains `${` is refused.
     pub fn from_file(path: &Path) -> CliResult<Self> {
+        let at = |e: &dyn std::fmt::Display| {
+            CliError::Serve(format!("--auth-config {}: {e}", path.display()))
+        };
         let text = std::fs::read_to_string(path).map_err(|e| {
             CliError::Serve(format!("reading --auth-config {}: {e}", path.display()))
         })?;
-        let file: AuthConfigFile = serde_yaml::from_str(&text).map_err(|e| {
+        let mut doc: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| {
             CliError::Serve(format!("parsing --auth-config {}: {e}", path.display()))
         })?;
+        protect_references(&doc);
+        crate::interpolate::interpolate_value(&mut doc).map_err(|e| at(&e))?;
+        resolve_secret_refs(&mut doc).map_err(|e| at(&e))?;
+        let file: AuthConfigFile = serde_json::from_value(doc).map_err(|e| {
+            CliError::Serve(format!("parsing --auth-config {}: {e}", path.display()))
+        })?;
+        if let Some(p) = file.principals.iter().find(|p| p.token.contains("${")) {
+            return Err(at(&format!(
+                "principal '{}' has a token containing an unresolved `${{…}}` reference; use \
+                 `${{env:VAR}}`, `${{file:PATH}}` or a secret-manager reference",
+                p.name
+            )));
+        }
         let mut cfg = Self::new(file.principals)?;
         if let Some(approvals) = file.approvals {
             approvals
@@ -484,6 +506,53 @@ impl RbacConfig {
     }
 }
 
+/// Protect every environment variable and file an auth config reads from, so
+/// no loaded pipeline config can read a principal's token.
+fn protect_references(doc: &serde_json::Value) {
+    use crate::interpolate::{Directive, iter_directives};
+    fn walk(v: &serde_json::Value) {
+        match v {
+            serde_json::Value::String(s) => {
+                for (_, dir) in iter_directives(s) {
+                    if let Directive::LoadTime { prefix, body } = dir {
+                        match prefix {
+                            "env" | "secret" => crate::serve::load::protect_env(body),
+                            "file" => crate::serve::load::protect_file(Path::new(body)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(walk),
+            serde_json::Value::Object(map) => map.values().for_each(walk),
+            _ => {}
+        }
+    }
+    walk(doc);
+}
+
+/// Resolve secret-manager references in an auth config. Runs on its own
+/// thread and runtime, so it works whether or not the caller is inside one.
+fn resolve_secret_refs(doc: &mut serde_json::Value) -> CliResult<()> {
+    let mut refs = std::collections::BTreeSet::new();
+    crate::secrets::collect_refs(doc, &mut refs);
+    if refs.is_empty() {
+        return Ok(());
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| CliError::Serve(format!("secret resolution runtime: {e}")))?
+                    .block_on(crate::secrets::resolve_value(doc))
+            })
+            .join()
+            .unwrap_or_else(|_| Err(CliError::Serve("secret resolution panicked".into())))
+    })
+}
+
 /// The permission a `(method, matched-route-template)` pair requires. `None`
 /// means the route has no specific mapping and is therefore admin-only (fail
 /// closed for any route added without an explicit entry here).
@@ -503,7 +572,8 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         // Content verification (#701): a repair writes through the sink, so
         // the whole endpoint is `RunWrite` (operator+).
         (&Method::POST, "/v1/verify") => Some(RunWrite),
-        // Plan (#283/#707) is a pure read: no sink is written, no run starts.
+        // Plan (#283/#707) writes nothing, but loads the submitted config on
+        // the server, so operator+.
         (&Method::POST, "/v1/plan") => Some(Plan),
         (&Method::POST, "/v1/runs/{id}/rollback") => Some(Rollback),
         (&Method::POST, "/v1/dlq/inspect") => Some(DlqRead),
@@ -519,7 +589,9 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         // Cost & usage accounting (#704): a priced read of what the catalog
         // already shows, so viewer+.
         (&Method::GET, "/v1/usage") => Some(UsageRead),
-        // Multi-table mirror status (#731): a read of the mirror's state, viewer+.
+        // Multi-table mirror status (#731): a read of the mirror's state, viewer+
+        // when the mirror is named by a registered template; an inline config
+        // needs `Doctor` (checked in the handler).
         (&Method::GET | &Method::POST, "/v1/mirror/{name}") => Some(StatusRead),
         // Change requests (#703). Reading is viewer+; proposing needs the run
         // scope; approving/rejecting reach the route as operator+ and the
@@ -561,8 +633,8 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::POST, "/v1/templates/{id}/publish") => Some(TemplateAdmin),
         (&Method::POST, "/v1/reload") => Some(Reload),
         (&Method::GET, "/v1/whoami") => Some(Identity),
-        // Pipeline health (#732) is a pure read — viewer+; the POST form only
-        // carries the config in a body.
+        // Pipeline health (#732) is a pure read — viewer+ for a registered
+        // template; an inline config needs `Doctor` (checked in the handler).
         (&Method::GET | &Method::POST, "/v1/status") => Some(StatusRead),
         // Durable state (#735): even reading is admin-only, next to the verbs
         // that move or reset a bookmark.
@@ -1045,8 +1117,10 @@ mod tests {
         assert!(!Role::Viewer.grants(Permission::Reload));
         assert!(!Role::Operator.grants(Permission::Reload));
         assert!(Role::Admin.grants(Permission::Reload));
-        // Plan is a read (viewer+); annotating shared metadata is operator+.
-        assert!(Role::Viewer.grants(Permission::Plan));
+        // Plan loads the submitted config on the server: operator+, like
+        // doctor; annotating shared metadata is operator+ too.
+        assert!(!Role::Viewer.grants(Permission::Plan));
+        assert!(Role::Operator.grants(Permission::Plan));
         assert!(!Role::Viewer.grants(Permission::CatalogAnnotate));
         assert!(Role::Operator.grants(Permission::CatalogAnnotate));
         // Usage accounting is a priced read of the catalog's volumes: viewer+.

@@ -2004,6 +2004,12 @@ pub struct ServeArgs {
     /// authorization-code providers tenants can connect through.
     #[arg(long, value_name = "PATH")]
     pub connect_providers: Option<PathBuf>,
+    /// Let a config submitted over HTTP or MCP use connectors that run a
+    /// program on this host (`singer`). Off by default: such a config would run
+    /// any executable with the server's environment. Configs submitted for a
+    /// tenant are refused regardless; registered templates are always allowed.
+    #[arg(long)]
+    pub allow_subprocess_connectors: bool,
     /// Restrict per-run completion callbacks (`callback` on a submit) to these
     /// hosts. Repeatable. When unset, any host is permitted **except**
     /// link-local / cloud-metadata addresses, which are always refused unless

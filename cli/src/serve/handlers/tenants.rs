@@ -482,6 +482,11 @@ pub async fn submit_tenant_run(
     Path(tenant): Path<String>,
     Json(req): Json<SubmitRequest>,
 ) -> Result<Response, ServeError> {
+    if actor.tenant.is_some() {
+        return Err(ServeError::Forbidden(
+            crate::serve::handlers::runs::TENANT_RAW_CONFIG.to_string(),
+        ));
+    }
     let actor = for_tenant(&actor, &tenant);
     match runner::submit_gated(state, req, actor).await? {
         SubmitOutcome::Accepted(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),

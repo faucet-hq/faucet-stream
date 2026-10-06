@@ -85,6 +85,7 @@ pub fn build_submit_request(
         budget: None,
         approved_change: None,
         selection: compiled.spec.run.selection.clone(),
+        trusted_config: true,
     }
 }
 

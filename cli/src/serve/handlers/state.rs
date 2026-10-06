@@ -64,8 +64,17 @@ fn cli_to_serve(e: CliError) -> ServeError {
 /// Load the config a request names; returns it with its pipeline name.
 async fn resolve(
     state: &ServerState,
+    actor: &AuthContext,
     src: &ConfigSource,
 ) -> Result<(PipelineConfig, String), ServeError> {
+    if src.config.is_some() && !actor.role.grants(crate::serve::rbac::Permission::Doctor) {
+        return Err(ServeError::Forbidden(
+            "an inline `config` is loaded on the server (its `${env:}` / `${file:}` / secret \
+             references resolve and its connectors are built), which needs the operator role; \
+             name a registered `template` instead"
+                .into(),
+        ));
+    }
     let policy = crate::serve::runner::server_policy(state);
     let loaded = match (&src.config, &src.template) {
         (Some(_), Some(_)) => {
@@ -79,6 +88,7 @@ async fn resolve(
                 src.config_format.into(),
                 state.default_base().as_ref(),
                 policy.as_deref(),
+                state.caller_origin(),
             )
             .await?
         }
@@ -89,6 +99,7 @@ async fn resolve(
                 crate::serve::load::ConfigFormat::Json,
                 state.default_base().as_ref(),
                 policy.as_deref(),
+                crate::serve::load::BodyOrigin::Trusted,
             )
             .await?
         }
@@ -171,7 +182,7 @@ async fn status_for(
     actor: &AuthContext,
     req: StatusRequest,
 ) -> Result<Json<StatusReport>, ServeError> {
-    let (cfg, name) = resolve(state, &req.source).await?;
+    let (cfg, name) = resolve(state, actor, &req.source).await?;
     let target = PipelineTarget::resolve(&cfg, &name).map_err(cli_to_serve)?;
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref()).map_err(cli_to_serve)?;
     let stores = Stores::build(&target, None)
@@ -292,7 +303,7 @@ async fn mirror_for(
     name: &str,
     src: &ConfigSource,
 ) -> Result<Json<crate::replication::status::MirrorStatus>, ServeError> {
-    let (cfg, pipeline) = resolve(state, src).await?;
+    let (cfg, pipeline) = resolve(state, actor, src).await?;
     if pipeline != name {
         return Err(ServeError::Unprocessable {
             message: format!("the config names pipeline '{pipeline}', not mirror '{name}'"),
@@ -330,10 +341,11 @@ pub async fn post_mirror(
 
 async fn target_for(
     state: &ServerState,
+    actor: &AuthContext,
     pipeline: &str,
     src: &ConfigSource,
 ) -> Result<(PipelineConfig, PipelineTarget), ServeError> {
-    let (cfg, name) = resolve(state, src).await?;
+    let (cfg, name) = resolve(state, actor, src).await?;
     if name != pipeline {
         return Err(ServeError::Unprocessable {
             message: format!(
@@ -368,7 +380,7 @@ pub async fn get_state(
     Path((pipeline, row)): Path<(String, String)>,
     Query(q): Query<SourceQuery>,
 ) -> Result<Json<Value>, ServeError> {
-    let (_, target) = target_for(&state, &pipeline, &q.source()).await?;
+    let (_, target) = target_for(&state, &actor, &pipeline, &q.source()).await?;
     let stores = Stores::build(&target, None).await.map_err(cli_to_serve)?;
     let report = ops::show(&target, &stores, Some(&row), Utc::now())
         .await
@@ -403,7 +415,7 @@ pub async fn put_state(
     Path((pipeline, row)): Path<(String, String)>,
     Json(body): Json<SetBody>,
 ) -> Result<Json<ops::SetOutcome>, ServeError> {
-    let (cfg, target) = target_for(&state, &pipeline, &body.source).await?;
+    let (cfg, target) = target_for(&state, &actor, &pipeline, &body.source).await?;
     refuse_active(&state, &pipeline, body.force).await?;
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref()).map_err(cli_to_serve)?;
     let stores = Stores::build(&target, None).await.map_err(cli_to_serve)?;
@@ -468,7 +480,7 @@ pub async fn delete_state(
         sink: q.sink.clone(),
     }
     .source();
-    let (cfg, target) = target_for(&state, &pipeline, &source).await?;
+    let (cfg, target) = target_for(&state, &actor, &pipeline, &source).await?;
     refuse_active(&state, &pipeline, q.force).await?;
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref()).map_err(cli_to_serve)?;
     let stores = Stores::build(&target, None).await.map_err(cli_to_serve)?;

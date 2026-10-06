@@ -134,6 +134,7 @@ pub async fn submit_backfill(
         req.config_format.into(),
         state.default_base().as_ref(),
         crate::serve::runner::server_policy(&state).as_deref(),
+        state.caller_origin(),
     )
     .await?;
     let unscoped: Vec<&str> = loaded
@@ -236,6 +237,7 @@ pub async fn submit_backfill(
             budget: None,
             approved_change: None,
             selection: None,
+            trusted_config: false,
         };
         match runner::submit(state.clone(), submit, actor.clone()).await {
             Ok(resp) => {

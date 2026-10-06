@@ -636,6 +636,7 @@ mod tests {
             template: None,
             error: None,
             tenant: None,
+            trusted_config: false,
         }
     }
 

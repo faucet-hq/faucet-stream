@@ -70,6 +70,7 @@ async fn spawn_server(port: u16, dir: &Path) {
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
@@ -132,7 +133,13 @@ async fn mirror_status_over_http() {
     };
 
     assert_eq!(get("shop", None).send().await.unwrap().status(), 401);
-    let not_started = get("shop", Some("viewer-tok")).send().await.unwrap();
+    let refused = get("shop", Some("viewer-tok")).send().await.unwrap();
+    assert_eq!(
+        refused.status(),
+        403,
+        "an inline config needs the operator role"
+    );
+    let not_started = get("shop", Some("admin-tok")).send().await.unwrap();
     assert_eq!(not_started.status(), 422);
     let body: Value = not_started.json().await.unwrap();
     assert!(body.to_string().contains("has not started"), "{body}");
@@ -163,7 +170,7 @@ async fn mirror_status_over_http() {
         .await
         .unwrap();
 
-    let ok = get("shop", Some("viewer-tok")).send().await.unwrap();
+    let ok = get("shop", Some("admin-tok")).send().await.unwrap();
     assert_eq!(ok.status(), 200);
     let status: Value = ok.json().await.unwrap();
     assert_eq!(status["mode"], "tables");
@@ -180,7 +187,7 @@ async fn mirror_status_over_http() {
 
     let posted = client
         .post(format!("{base}/v1/mirror/shop"))
-        .bearer_auth("viewer-tok")
+        .bearer_auth("admin-tok")
         .json(&json!({ "config": cfg }))
         .send()
         .await
@@ -189,7 +196,7 @@ async fn mirror_status_over_http() {
     let posted: Value = posted.json().await.unwrap();
     assert_eq!(posted["summary"]["by_phase"]["refused"], 1);
 
-    let wrong = get("other", Some("viewer-tok")).send().await.unwrap();
+    let wrong = get("other", Some("admin-tok")).send().await.unwrap();
     assert_eq!(wrong.status(), 422);
 
     let audit: Value = client

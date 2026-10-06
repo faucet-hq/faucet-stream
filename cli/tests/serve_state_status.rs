@@ -1,6 +1,7 @@
 //! `GET|POST /v1/status` (#732) and `GET|PUT|DELETE /v1/state/{pipeline}/{row}`
 //! (#735) on a real RBAC server: status from an inline config and from a
-//! registered template, RBAC (viewers read status, only admins touch state),
+//! registered template, RBAC (viewers read a template's status, an inline config
+//! needs an operator, only admins touch state),
 //! the move / reset verbs against the file store, the 409 while a run is in
 //! flight, and the audit trail.
 #![cfg(all(
@@ -79,6 +80,7 @@ async fn spawn_server(port: u16, dir: &Path) {
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
+        allow_subprocess_connectors: false,
     };
     let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
@@ -168,11 +170,19 @@ async fn status_and_state_endpoints() {
     let rec = wait_run(&base, &client, &run_id).await;
     assert_eq!(rec["status"], "completed", "{rec}");
 
-    // Status: a viewer may read it, via query string and body.
+    // Status with an inline config loads it on the server: operator+.
     let resp = client
         .get(format!("{base}/v1/status"))
         .query(&[("config", config.as_str())])
         .bearer_auth("viewer-tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    let resp = client
+        .get(format!("{base}/v1/status"))
+        .query(&[("config", config.as_str())])
+        .bearer_auth("admin-tok")
         .send()
         .await
         .unwrap();
@@ -184,7 +194,7 @@ async fn status_and_state_endpoints() {
     assert_eq!(report["rows"][0]["last_success"]["records"], 2);
     let resp = client
         .post(format!("{base}/v1/status"))
-        .bearer_auth("viewer-tok")
+        .bearer_auth("admin-tok")
         .json(&json!({ "config": config, "row": "row-0", "probe": true }))
         .send()
         .await
@@ -199,7 +209,7 @@ async fn status_and_state_endpoints() {
     ] {
         let resp = client
             .post(format!("{base}/v1/status"))
-            .bearer_auth("viewer-tok")
+            .bearer_auth("admin-tok")
             .json(&body)
             .send()
             .await
@@ -446,7 +456,7 @@ pipeline:
     // Status reports the run in flight.
     let report: Value = client
         .post(format!("{base}/v1/status"))
-        .bearer_auth("viewer-tok")
+        .bearer_auth("admin-tok")
         .json(&json!({ "config": config }))
         .send()
         .await

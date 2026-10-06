@@ -24,6 +24,11 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 const DEFAULT_LIMIT: usize = 200;
+
+/// Why a tenant-scoped principal may not propose a change directly.
+const TENANT_PROPOSAL: &str = "a tenant-scoped principal runs registered templates only \
+     (POST /v1/tenants/{tenant}/templates/{id}/runs); a run that needs approval becomes a \
+     change request there";
 const MAX_LIMIT: usize = 2000;
 
 /// `POST /v1/changes` → 201 with the pending request (plan included).
@@ -32,8 +37,11 @@ pub async fn create_change(
     Extension(actor): Extension<AuthContext>,
     Json(body): Json<NewChange>,
 ) -> Result<(StatusCode, Json<ChangeRequest>), ServeError> {
+    if actor.tenant.is_some() {
+        return Err(ServeError::Forbidden(TENANT_PROPOSAL.to_string()));
+    }
     let change = changes::create(&state, &actor, body).await?;
-    Ok((StatusCode::CREATED, Json(change)))
+    Ok((StatusCode::CREATED, Json(change.redacted_for(&actor))))
 }
 
 /// `GET /v1/changes` query string.
@@ -72,7 +80,13 @@ pub async fn list_changes(
         tenant: actor.tenant_filter(q.tenant)?,
         limit: q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
     };
-    Ok(Json(changes::list(&state, &filter).await?))
+    Ok(Json(
+        changes::list(&state, &filter)
+            .await?
+            .into_iter()
+            .map(|c| c.redacted_for(&actor))
+            .collect(),
+    ))
 }
 
 /// A change request the principal may see, or 404 (#709).
@@ -94,7 +108,11 @@ pub async fn get_change(
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<ChangeRequest>, ServeError> {
-    Ok(Json(visible_change(&state, &actor, &id).await?))
+    Ok(Json(
+        visible_change(&state, &actor, &id)
+            .await?
+            .redacted_for(&actor),
+    ))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -115,7 +133,11 @@ pub async fn approve_change(
 ) -> Result<Json<ChangeRequest>, ServeError> {
     let comment = body.and_then(|b| b.0.comment);
     visible_change(&state, &actor, &id).await?;
-    Ok(Json(changes::approve(&state, &actor, &id, comment).await?))
+    Ok(Json(
+        changes::approve(&state, &actor, &id, comment)
+            .await?
+            .redacted_for(&actor),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +158,8 @@ pub async fn reject_change(
     }
     visible_change(&state, &actor, &id).await?;
     Ok(Json(
-        changes::reject(&state, &actor, &id, body.reason).await?,
+        changes::reject(&state, &actor, &id, body.reason)
+            .await?
+            .redacted_for(&actor),
     ))
 }

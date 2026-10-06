@@ -59,6 +59,15 @@ pub struct McpContext {
     /// identity, so `propose_run` / `propose_template` create pending requests
     /// as that principal. Absent (the stdio transport) = not advertised.
     pub changes: Option<ChangeProposer>,
+    /// How a config passed to `validate_config` / `preview` / `run_pipeline` is
+    /// screened: the HTTP transport passes the server's caller origin, so the
+    /// server's own credentials and (without `--allow-subprocess-connectors`)
+    /// subprocess connectors are refused. `None` on the stdio transport, which
+    /// runs as the local user.
+    pub submitted: Option<crate::serve::load::BodyOrigin>,
+    /// Change kinds the server requires an approved change request for
+    /// (`--require-approval`); the template-lifecycle tools refuse them.
+    pub approval_required: Vec<crate::serve::changes::ChangeKind>,
 }
 
 /// What the MCP `propose_*` tools need to file a change request (#703).
@@ -89,7 +98,21 @@ impl McpContext {
             #[cfg(feature = "templates")]
             templates: None,
             changes: None,
+            submitted: None,
+            approval_required: Vec::new(),
         }
+    }
+
+    /// Screen caller-supplied configs as the server does (`origin`).
+    pub fn with_submitted_origin(mut self, origin: crate::serve::load::BodyOrigin) -> Self {
+        self.submitted = Some(origin);
+        self
+    }
+
+    /// The change kinds the server gates behind approval.
+    pub fn with_approval_required(mut self, kinds: Vec<crate::serve::changes::ChangeKind>) -> Self {
+        self.approval_required = kinds;
+        self
     }
 
     /// Attach a change-request proposer (#703), enabling `propose_run` /

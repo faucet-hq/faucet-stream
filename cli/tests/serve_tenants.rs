@@ -81,6 +81,7 @@ fn serve_args(
         vault_key: Some("test-vault-key".into()),
         vault_previous_key: Vec::new(),
         connect_providers: Some(providers),
+        allow_subprocess_connectors: false,
     }
 }
 
@@ -445,12 +446,60 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         )
         .await;
     assert_eq!(code, 403);
-    // A plain submission by a scoped principal runs for its tenant.
+    // A scoped principal may not submit a config of its own, through any
+    // route: it runs registered templates only.
+    let raw = json!({"config": template(&data.uri(), &out, &state_dir).replace("name: tenant-sync", "name: scoped")});
+    for route in ["/v1/runs", "/v1/tenants/acme/runs"] {
+        let (code, err) = api.post("acme-tok", route, raw.clone()).await;
+        assert_eq!(code, 403, "{route}: {err}");
+        assert!(err.to_string().contains("registered templates"), "{err}");
+    }
+    let (code, err) = api
+        .post(
+            "acme-tok",
+            "/v1/changes",
+            json!({"kind": "run", "payload": raw.clone()}),
+        )
+        .await;
+    assert_eq!(code, 403, "{err}");
+    // An unscoped operator may still run a config for the tenant.
+    let (code, r) = api.post("op-tok", "/v1/tenants/acme/runs", raw).await;
+    assert_eq!(code, 202, "{r}");
+    api.wait_run(r["run_id"].as_str().unwrap()).await;
+    // The same idempotency key from two tenants starts two runs.
+    let mut keyed = Vec::new();
+    for tenant in ["acme", "globex"] {
+        let (code, r) = api
+            .post(
+                "op-tok",
+                &format!("/v1/tenants/{tenant}/templates/{id}/runs"),
+                json!({"idempotency_key": "nightly-2026-10-01"}),
+            )
+            .await;
+        assert_eq!(code, 202, "{tenant}: {r}");
+        let rec = api.wait_run(r["run_id"].as_str().unwrap()).await;
+        assert_eq!(rec["tenant"], tenant, "{rec}");
+        keyed.push(r["run_id"].as_str().unwrap().to_string());
+    }
+    assert_ne!(keyed[0], keyed[1]);
+    let (code, again) = api
+        .post(
+            "acme-tok",
+            &format!("/v1/tenants/acme/templates/{id}/runs"),
+            json!({"idempotency_key": "nightly-2026-10-01"}),
+        )
+        .await;
+    assert_eq!(code, 202, "{again}");
+    assert_eq!(
+        again["run_id"],
+        keyed[0].as_str(),
+        "a replay within the tenant"
+    );
     let (code, r) = api
         .post(
             "acme-tok",
-            "/v1/runs",
-            json!({"config": template(&data.uri(), &out, &state_dir).replace("name: tenant-sync", "name: scoped")}),
+            &format!("/v1/tenants/acme/templates/{id}/runs"),
+            json!({}),
         )
         .await;
     assert_eq!(code, 202, "{r}");
