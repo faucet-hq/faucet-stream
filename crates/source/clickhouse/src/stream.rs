@@ -1,14 +1,12 @@
 //! The ClickHouse [`Source`] implementation — HTTP client, query execution,
-//! streaming JSONEachRow decode, and incremental-replication bookkeeping.
+//! streaming typed decode, and incremental-replication bookkeeping.
 
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use faucet_common_clickhouse::{
-    apply_auth, build_client, parse_json_each_row, query_params, sql_literal,
-};
+use faucet_common_clickhouse::{apply_auth, build_client, query_params, sql_literal};
 use faucet_core::check::{CheckContext, CheckReport, Probe};
 use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
@@ -18,7 +16,7 @@ use serde_json::Value;
 
 use crate::config::{ClickHouseReplication, ClickHouseSourceConfig};
 
-/// ClickHouse query source (HTTP interface, `JSONEachRow`).
+/// ClickHouse query source (HTTP interface, typed compact JSON rows).
 pub struct ClickHouseSource {
     config: ClickHouseSourceConfig,
     client: reqwest::Client,
@@ -57,12 +55,9 @@ impl ClickHouseSource {
             .clone()
     }
 
-    /// Build the POST request that runs `query` and returns `JSONEachRow`.
+    /// Build the POST request that runs `query` and returns typed compact JSON rows.
     fn request(&self, query: String) -> reqwest::RequestBuilder {
-        let params = query_params(
-            &self.config.connection.database,
-            &[("default_format", "JSONEachRow")],
-        );
+        let params = query_params(&self.config.connection.database, crate::decode::SETTINGS);
         let req = self.client.post(&self.base_url).query(&params).body(query);
         apply_auth(req, &self.config.connection)
     }
@@ -81,7 +76,7 @@ impl ClickHouseSource {
         let body = resp.text().await.map_err(|e| {
             FaucetError::Source(format!("ClickHouse: reading response failed: {e}"))
         })?;
-        let records = parse_json_each_row(&body)?;
+        let records = crate::decode::CompactDecoder::decode_all(&body)?;
 
         let mut running_max: Option<Value> = None;
         let records = apply_incremental(records, incr.as_ref(), &mut running_max);
@@ -228,21 +223,6 @@ fn split_complete_lines(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     lines
 }
 
-/// Parse one raw JSONEachRow line into a JSON value. Blank lines yield `None`.
-/// Invalid UTF-8 or JSON surfaces as a typed [`FaucetError::Source`].
-fn parse_line(line: &[u8]) -> Result<Option<Value>, FaucetError> {
-    let text = std::str::from_utf8(line)
-        .map_err(|e| FaucetError::Source(format!("ClickHouse: non-UTF-8 response line: {e}")))?
-        .trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    let value: Value = serde_json::from_str(text).map_err(|e| {
-        FaucetError::Source(format!("ClickHouse: failed to parse JSONEachRow line: {e}"))
-    })?;
-    Ok(Some(value))
-}
-
 /// Derive a default state-store key from the connection host + a query
 /// fingerprint, stable across runs.
 fn default_state_key(config: &ClickHouseSourceConfig) -> String {
@@ -291,7 +271,7 @@ impl Source for ClickHouseSource {
 
     /// Stream rows straight off the HTTP response body without buffering the
     /// whole result set: bytes are accumulated, split into complete
-    /// `JSONEachRow` lines, and yielded in [`ClickHouseSourceConfig::batch_size`]
+    /// response lines, and yielded in [`ClickHouseSourceConfig::batch_size`]
     /// pages. The final page carries the incremental bookmark (when replicating
     /// incrementally) so the pipeline persists only after everything before it
     /// is written.
@@ -316,6 +296,7 @@ impl Source for ClickHouseSource {
             let mut body = resp.bytes_stream();
 
             let mut buf: Vec<u8> = Vec::new();
+            let mut decoder = crate::decode::CompactDecoder::default();
             let mut page: Vec<Value> = Vec::with_capacity(cap);
             let mut running_max: Option<Value> = None;
             let mut total = 0usize;
@@ -324,7 +305,7 @@ impl Source for ClickHouseSource {
                 let bytes = chunk_result.map_err(FaucetError::Http)?;
                 buf.extend_from_slice(&bytes);
                 for line in split_complete_lines(&mut buf) {
-                    if let Some(value) = parse_line(&line)? {
+                    if let Some(value) = decoder.push_line(&line)? {
                         page.push(value);
                         if page.len() >= chunk {
                             let ready = std::mem::replace(&mut page, Vec::with_capacity(cap));
@@ -339,7 +320,7 @@ impl Source for ClickHouseSource {
             }
             // Trailing line without a terminating newline (ClickHouse always
             // newline-terminates, but be robust).
-            if let Some(value) = parse_line(&buf)? {
+            if let Some(value) = decoder.push_line(&buf)? {
                 page.push(value);
             }
 
@@ -631,19 +612,6 @@ mod tests {
         buf.extend_from_slice(b"1}\n");
         let lines = split_complete_lines(&mut buf);
         assert_eq!(lines, vec![b"{\"a\":1}".to_vec()]);
-    }
-
-    #[test]
-    fn parse_line_handles_blank_and_valid_and_invalid() {
-        assert_eq!(parse_line(b"").unwrap(), None);
-        assert_eq!(parse_line(b"   ").unwrap(), None);
-        assert_eq!(parse_line(b"{\"a\":1}").unwrap(), Some(json!({"a": 1})));
-        assert!(parse_line(b"not-json").is_err());
-    }
-
-    #[test]
-    fn parse_line_rejects_invalid_utf8() {
-        assert!(parse_line(&[0xff, 0xfe]).is_err());
     }
 
     #[test]

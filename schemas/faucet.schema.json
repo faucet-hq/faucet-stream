@@ -17540,7 +17540,7 @@
                       ]
                     },
                     "query": {
-                      "description": "SQL `SELECT` query to run. The output format is set to `JSONEachRow`\nvia the request settings, so **do not** append a `FORMAT` clause. Use\nthe literal `@bookmark` token to push the incremental cursor down into\nthe `WHERE` clause; use `{key}` tokens to inject parent-context values in\na matrix child.",
+                      "description": "SQL `SELECT` query to run. The output format is set via the request\nsettings (`JSONCompactEachRowWithNamesAndTypes`, decoded by column\ntype), so **do not** append a `FORMAT` clause. Use\nthe literal `@bookmark` token to push the incremental cursor down into\nthe `WHERE` clause; use `{key}` tokens to inject parent-context values in\na matrix child.",
                       "type": "string"
                     },
                     "batch_size": {

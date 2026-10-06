@@ -7,7 +7,7 @@
 //! the ClickHouse [HTTP interface](https://clickhouse.com/docs/en/interfaces/http)
 //! via [`reqwest`](https://crates.io/crates/reqwest).
 //!
-//! Runs a SQL `SELECT`, streams the `JSONEachRow` response body straight into
+//! Runs a SQL `SELECT`, streams the typed `JSONCompactEachRowWithNamesAndTypes` response body into
 //! [`StreamPage`](faucet_core::StreamPage)s (bytes are line-buffered and decoded
 //! incrementally, so memory stays bounded regardless of result size), and
 //! supports incremental replication via a tracking column (see
@@ -28,6 +28,7 @@
 //! ```
 
 mod config;
+mod decode;
 mod stream;
 
 pub use config::{ClickHouseReplication, ClickHouseSourceConfig};
