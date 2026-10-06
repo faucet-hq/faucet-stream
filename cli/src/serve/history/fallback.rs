@@ -239,6 +239,15 @@ impl RunHistory for FallbackHistory {
     async fn finalize_completed_sharded_parents(&self) -> Result<usize, HistoryError> {
         via!(self, p => p.finalize_completed_sharded_parents(), f => f.finalize_completed_sharded_parents())
     }
+    async fn trigger_edge_rise(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        via!(self, p => p.trigger_edge_rise(trigger), f => f.trigger_edge_rise(trigger))
+    }
+    async fn trigger_edge_rearm(&self, trigger: &str) -> Result<(), HistoryError> {
+        via!(self, p => p.trigger_edge_rearm(trigger), f => f.trigger_edge_rearm(trigger))
+    }
+    async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
+        via!(self, p => p.trigger_edge_retract(trigger, ordinal), f => f.trigger_edge_retract(trigger, ordinal))
+    }
 
     async fn record_audit(&self, entry: &AuditEntry) -> Result<(), HistoryError> {
         via!(self, p => p.record_audit(entry), f => f.record_audit(entry))

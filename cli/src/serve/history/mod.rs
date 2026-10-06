@@ -758,6 +758,39 @@ pub trait RunHistory: Send + Sync {
         Ok(0)
     }
 
+    // ── queue_depth trigger edges (#789 SERVE-11) ────────────────────────────
+
+    /// Record a rising crossing for `trigger`: when its edge is armed (or has
+    /// never been seen), disarm it and return the next edge ordinal; when it is
+    /// already disarmed (this or another instance fired the crossing), `None`.
+    /// The ordinal is durable and shared, so a restart or a peer never reuses
+    /// one. Default: unsupported.
+    async fn trigger_edge_rise(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        let _ = trigger;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support queue_depth trigger edges".into(),
+        ))
+    }
+
+    /// The depth fell below the threshold: arm the edge again. Default:
+    /// unsupported.
+    async fn trigger_edge_rearm(&self, trigger: &str) -> Result<(), HistoryError> {
+        let _ = trigger;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support queue_depth trigger edges".into(),
+        ))
+    }
+
+    /// Undo a rise whose fire did not commit, so the next poll retries the same
+    /// ordinal. Only applies while `ordinal` is still the latest. Default:
+    /// unsupported.
+    async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
+        let _ = (trigger, ordinal);
+        Err(HistoryError::Backend(
+            "this run-history backend does not support queue_depth trigger edges".into(),
+        ))
+    }
+
     // ── Audit log (RBAC, #205) ───────────────────────────────────────────────
 
     /// Append one audit record. Best-effort but visible: the caller logs a

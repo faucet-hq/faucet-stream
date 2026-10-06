@@ -294,6 +294,10 @@ pub const DDL: &[&str] = &[
         state_key TEXT NOT NULL,\
         body TEXT NOT NULL,\
         PRIMARY KEY (tenant, state_key))",
+    "CREATE TABLE IF NOT EXISTS faucet_serve_trigger_edges (\
+        trigger_name TEXT PRIMARY KEY,\
+        ordinal TEXT NOT NULL,\
+        armed TEXT NOT NULL)",
 ];
 
 /// The usage-listing cap for `filter`.
@@ -368,6 +372,10 @@ pub struct Stmts {
     pub request_cancel: String,
     pub cancel_pending_shards: String,
     pub cancel_requeued_shards: String,
+    pub trigger_edge_init: String,
+    pub trigger_edge_rise: String,
+    pub trigger_edge_rearm: String,
+    pub trigger_edge_retract: String,
     /// List run IDs owned by this instance that have a pending cancellation request.
     pub pending_cancellations: String,
     /// Upsert this instance's membership heartbeat into `faucet_serve_instances`.
@@ -801,6 +809,20 @@ impl Stmts {
                 SET status = 'cancelled', finished_at = $1 \
                 WHERE run_id = $2 AND status = 'pending'"
                 .into(),
+            trigger_edge_init: "INSERT INTO faucet_serve_trigger_edges (trigger_name, ordinal, armed) \
+                VALUES ($1, $2, '1') ON CONFLICT (trigger_name) DO NOTHING"
+                .into(),
+            trigger_edge_rise: "UPDATE faucet_serve_trigger_edges \
+                SET ordinal = CAST(CAST(ordinal AS BIGINT) + 1 AS TEXT), armed = '0' \
+                WHERE trigger_name = $1 AND armed = '1' RETURNING ordinal"
+                .into(),
+            trigger_edge_rearm: "UPDATE faucet_serve_trigger_edges SET armed = '1' \
+                WHERE trigger_name = $1 AND armed = '0'"
+                .into(),
+            trigger_edge_retract: "UPDATE faucet_serve_trigger_edges \
+                SET ordinal = CAST(CAST(ordinal AS BIGINT) - 1 AS TEXT), armed = '1' \
+                WHERE trigger_name = $1 AND ordinal = $2 AND armed = '0'"
+                .into(),
             cancel_requeued_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = $1 \
                 WHERE status = 'pending' AND run_id IN \
@@ -1197,6 +1219,20 @@ impl Stmts {
             cancel_pending_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = ? \
                 WHERE run_id = ? AND status = 'pending'"
+                .into(),
+            trigger_edge_init: "INSERT INTO faucet_serve_trigger_edges (trigger_name, ordinal, armed) \
+                VALUES (?, ?, '1') ON CONFLICT (trigger_name) DO NOTHING"
+                .into(),
+            trigger_edge_rise: "UPDATE faucet_serve_trigger_edges \
+                SET ordinal = CAST(CAST(ordinal AS INTEGER) + 1 AS TEXT), armed = '0' \
+                WHERE trigger_name = ? AND armed = '1' RETURNING ordinal"
+                .into(),
+            trigger_edge_rearm: "UPDATE faucet_serve_trigger_edges SET armed = '1' \
+                WHERE trigger_name = ? AND armed = '0'"
+                .into(),
+            trigger_edge_retract: "UPDATE faucet_serve_trigger_edges \
+                SET ordinal = CAST(CAST(ordinal AS INTEGER) - 1 AS TEXT), armed = '1' \
+                WHERE trigger_name = ? AND ordinal = ? AND armed = '0'"
                 .into(),
             cancel_requeued_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = ? \
@@ -2773,6 +2809,65 @@ macro_rules! impl_sql_history {
                     ids.push(r.try_get::<String, _>("run_id").map_err(backend)?);
                 }
                 Ok(ids)
+            }
+
+            async fn trigger_edge_rise(
+                &self,
+                trigger: &str,
+            ) -> Result<Option<u64>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                // A fresh edge starts at the current millisecond so its ordinals
+                // never repeat keys an older, per-process counter already used.
+                let seed = chrono::Utc::now().timestamp_millis().max(0).to_string();
+                sqlx::query(&self.stmts.trigger_edge_init)
+                    .bind(trigger)
+                    .bind(&seed)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let row = sqlx::query(&self.stmts.trigger_edge_rise)
+                    .bind(trigger)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let ordinal: String = row.try_get("ordinal").map_err(backend)?;
+                ordinal.parse().map(Some).map_err(|e| {
+                    $crate::serve::history::HistoryError::Backend(format!(
+                        "trigger edge ordinal '{ordinal}': {e}"
+                    ))
+                })
+            }
+
+            async fn trigger_edge_rearm(
+                &self,
+                trigger: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.trigger_edge_rearm)
+                    .bind(trigger)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn trigger_edge_retract(
+                &self,
+                trigger: &str,
+                ordinal: u64,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.trigger_edge_retract)
+                    .bind(trigger)
+                    .bind(ordinal.to_string())
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
             }
 
             async fn finalize_completed_sharded_parents(

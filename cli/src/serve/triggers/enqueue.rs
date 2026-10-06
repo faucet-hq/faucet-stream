@@ -297,6 +297,12 @@ async fn fire_one(
             metrics::dropped(compiled.name(), "tenant_limit");
             FireOutcome::Dropped("tenant_limit")
         }
+        Err(crate::serve::error::ServeError::Conflict(m)) if kind == "queue_depth" => {
+            metrics::error(compiled.name(), kind);
+            FireOutcome::Error(format!(
+                "edge idempotency key already used for a different run, not committing: {m}"
+            ))
+        }
         Err(crate::serve::error::ServeError::Conflict(m)) => {
             tracing::info!(trigger = compiled.name(), reason = %m, "trigger fire coalesced");
             metrics::coalesced(compiled.name());

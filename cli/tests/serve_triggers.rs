@@ -513,6 +513,115 @@ async fn queue_depth_fires_once_on_rising_edge() {
     }
 }
 
+/// SERVE-11: a queue_depth edge ordinal is durable and shared. After a
+/// restart the next crossing gets a new key (it is not swallowed by the old
+/// claim), and two instances watching the same queue fire a crossing once.
+#[cfg(all(
+    feature = "serve-history-sqlite",
+    any(feature = "triggers-redis", feature = "triggers-kafka")
+))]
+#[tokio::test]
+async fn queue_depth_edges_survive_a_restart_and_fire_once_across_instances() {
+    use async_trait::async_trait;
+    use faucet_cli::serve::history::sqlite::SqliteHistory;
+    use faucet_cli::serve::triggers::queue_depth::{DepthProbe, QueueDepthWatcher};
+    use faucet_cli::serve::triggers::watcher::Watcher;
+    use std::sync::Mutex;
+
+    struct Depths(Mutex<Vec<u64>>);
+    #[async_trait]
+    impl DepthProbe for Depths {
+        async fn depth(&self) -> Result<u64, String> {
+            let mut v = self.0.lock().unwrap();
+            Ok(if v.is_empty() { 0 } else { v.remove(0) })
+        }
+        fn queue_label(&self) -> String {
+            "jobs".into()
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drain\n    type: queue_depth\n    threshold: 5\n    queue: {{ type: redis, url: \"redis://x\", key: jobs }}\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let url = format!("sqlite:{}", dir.path().join("h.db").display());
+    let instance = |id: &'static str| {
+        let url = url.clone();
+        let compiled = &compiled;
+        async move {
+            let history = Arc::new(
+                SqliteHistory::connect(
+                    &url,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(30),
+                    id.into(),
+                )
+                .await
+                .unwrap(),
+            ) as Arc<dyn RunHistory>;
+            ServerState::new(
+                &test_config(),
+                None,
+                CancellationToken::new(),
+                history,
+                LogHub::new(),
+                None,
+                TriggersHandle::from_compiled(&compiled.triggers),
+            )
+        }
+    };
+    let watcher = |depths: Vec<u64>| {
+        QueueDepthWatcher::new(
+            Arc::new(compiled.triggers[0].clone()),
+            Box::new(Depths(Mutex::new(depths))),
+            5,
+            Duration::from_secs(30),
+        )
+    };
+
+    let first = instance("a").await;
+    let mut w = watcher(vec![9]);
+    assert!(w.poll(&first).await.unwrap(), "first crossing fires");
+    wait_for_runs(&first, 1).await;
+
+    let restarted = instance("a").await;
+    let mut w = watcher(vec![0, 9]);
+    assert!(!w.poll(&restarted).await.unwrap(), "drained: re-arm");
+    assert!(
+        w.poll(&restarted).await.unwrap(),
+        "the next crossing after a restart gets a new key and fires"
+    );
+    wait_for_runs(&restarted, 2).await;
+
+    let peer = instance("b").await;
+    let mut a = watcher(vec![0, 9]);
+    let mut b = watcher(vec![0, 9]);
+    assert!(!a.poll(&restarted).await.unwrap());
+    assert!(!b.poll(&peer).await.unwrap());
+    assert!(a.poll(&restarted).await.unwrap(), "one instance fires");
+    assert!(
+        !b.poll(&peer).await.unwrap(),
+        "the peer sees the crossing taken"
+    );
+    wait_for_runs(&restarted, 3).await;
+    let page = restarted
+        .history()
+        .list(&ListFilter {
+            limit: 1_000,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.runs.len(), 3, "one run per crossing");
+}
+
 // ── HTTP-boundary tests ───────────────────────────────────────────────────────
 //
 // These drive the REAL `faucet serve` HTTP listener (spawned via `run_server`,

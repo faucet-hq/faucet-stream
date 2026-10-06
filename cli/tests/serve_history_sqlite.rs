@@ -1496,3 +1496,27 @@ async fn change_requests_round_trip_and_filter() {
         1
     );
 }
+
+/// SERVE-11: the shared queue_depth edge on SQLite — seeded past any
+/// per-process ordinal, disarmed by a rise, re-armed by a drain, and a failed
+/// fire's rise retracted so the same ordinal is retried.
+#[tokio::test]
+async fn trigger_edges_rise_once_rearm_and_retract() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = store_with(&dir, "edges.db", Duration::from_secs(30), "a").await;
+    let b = store_with(&dir, "edges.db", Duration::from_secs(30), "b").await;
+    let first = a.trigger_edge_rise("drain").await.unwrap().unwrap();
+    assert!(first > 1_000_000, "seeded from the clock: {first}");
+    assert_eq!(b.trigger_edge_rise("drain").await.unwrap(), None);
+    b.trigger_edge_rearm("drain").await.unwrap();
+    let second = b.trigger_edge_rise("drain").await.unwrap().unwrap();
+    assert_eq!(second, first + 1);
+    a.trigger_edge_retract("drain", first).await.unwrap();
+    assert_eq!(
+        a.trigger_edge_rise("drain").await.unwrap(),
+        None,
+        "stale retract"
+    );
+    a.trigger_edge_retract("drain", second).await.unwrap();
+    assert_eq!(a.trigger_edge_rise("drain").await.unwrap(), Some(second));
+}
