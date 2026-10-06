@@ -2704,6 +2704,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "138646b9af2c5d7f1804ea4bf93afc597737d2bd4f7341d67c48b03316976eb1"
 dependencies = [
  "byteorder",
+ "chrono",
  "codepage",
  "encoding_rs",
  "log",
@@ -6849,6 +6850,7 @@ dependencies = [
  "metrics-util",
  "quick-xml 0.37.5",
  "reqwest 0.13.3",
+ "rust_xlsxwriter",
  "schemars 1.2.1",
  "serde",
  "serde_json",

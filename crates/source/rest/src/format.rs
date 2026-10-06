@@ -513,11 +513,30 @@ pub fn parse_excel(
 }
 
 #[cfg(feature = "excel")]
+/// An Excel date/time cell as text: `YYYY-MM-DD` for a whole day, an ISO
+/// timestamp otherwise, an ISO 8601 duration for a time span. The workbook's
+/// 1904 date system is honoured. A serial outside chrono's range keeps the
+/// raw number.
+fn excel_datetime_text(dt: &calamine::ExcelDateTime) -> String {
+    if dt.is_duration() {
+        return dt
+            .as_duration()
+            .map_or_else(|| dt.as_f64().to_string(), |d| d.to_string());
+    }
+    match dt.as_datetime() {
+        Some(t) if t.time() == chrono::NaiveTime::MIN => t.date().to_string(),
+        Some(t) => t.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+        None => dt.as_f64().to_string(),
+    }
+}
+
+#[cfg(feature = "excel")]
 fn cell_to_string(cell: &calamine::Data) -> String {
     use calamine::Data;
     match cell {
         Data::String(s) => s.clone(),
         Data::Empty => String::new(),
+        Data::DateTime(dt) => excel_datetime_text(dt),
         other => other.to_string(),
     }
 }
@@ -533,7 +552,7 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
         Data::Float(f) => serde_json::Number::from_f64(*f)
             .map(Value::Number)
             .unwrap_or(Value::Null),
-        Data::DateTime(dt) => Value::String(dt.to_string()),
+        Data::DateTime(dt) => Value::String(excel_datetime_text(dt)),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::String(s.clone()),
         Data::Error(e) => Value::String(format!("{e:?}")),
     }

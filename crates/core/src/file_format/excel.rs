@@ -180,11 +180,29 @@ fn float_to_value(f: f64) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// An Excel date/time cell as text: `YYYY-MM-DD` for a whole day, an ISO
+/// timestamp otherwise, an ISO 8601 duration for a time span. The workbook's
+/// 1904 date system is honoured. A serial outside chrono's range keeps the
+/// raw number.
+fn excel_datetime_text(dt: &calamine::ExcelDateTime) -> String {
+    if dt.is_duration() {
+        return dt
+            .as_duration()
+            .map_or_else(|| dt.as_f64().to_string(), |d| d.to_string());
+    }
+    match dt.as_datetime() {
+        Some(t) if t.time() == chrono::NaiveTime::MIN => t.date().to_string(),
+        Some(t) => t.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+        None => dt.as_f64().to_string(),
+    }
+}
+
 fn cell_to_string(cell: &calamine::Data) -> String {
     use calamine::Data;
     match cell {
         Data::String(s) => s.clone(),
         Data::Empty => String::new(),
+        Data::DateTime(dt) => excel_datetime_text(dt),
         other => other.to_string(),
     }
 }
@@ -201,7 +219,7 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
         // integer is what makes a write→read round trip faithful; without it
         // every count comes back as `1.0`.
         Data::Float(f) => float_to_value(*f),
-        Data::DateTime(dt) => Value::String(dt.to_string()),
+        Data::DateTime(dt) => Value::String(excel_datetime_text(dt)),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::String(s.clone()),
         Data::Error(e) => Value::String(format!("{e:?}")),
     }
@@ -338,13 +356,32 @@ mod tests {
             cell_to_value(&Data::Error(CellErrorType::Div0)),
             json!("Div0")
         );
-        // A datetime cell becomes a non-empty string.
-        let dt = Data::DateTime(ExcelDateTime::new(
-            45000.5,
-            ExcelDateTimeType::DateTime,
-            false,
-        ));
-        assert!(matches!(cell_to_value(&dt), Value::String(s) if !s.is_empty()));
+        let dt = |v, ty, is_1904| Data::DateTime(ExcelDateTime::new(v, ty, is_1904));
+        assert_eq!(
+            cell_to_value(&dt(45000.5, ExcelDateTimeType::DateTime, false)),
+            json!("2023-03-15T12:00:00")
+        );
+        assert_eq!(
+            cell_to_value(&dt(45000.0, ExcelDateTimeType::DateTime, false)),
+            json!("2023-03-15")
+        );
+        assert_eq!(
+            cell_to_value(&dt(43538.0, ExcelDateTimeType::DateTime, true)),
+            json!("2023-03-15"),
+            "the 1904 date system is honoured"
+        );
+        assert_eq!(
+            cell_to_value(&dt(1.5, ExcelDateTimeType::TimeDelta, false)),
+            json!("PT129600S")
+        );
+        assert_eq!(
+            cell_to_string(&dt(45000.0, ExcelDateTimeType::DateTime, false)),
+            "2023-03-15"
+        );
+        assert_eq!(
+            cell_to_value(&dt(1e12, ExcelDateTimeType::DateTime, false)),
+            json!("1000000000000")
+        );
     }
 
     /// Header cells are read as text. An empty header must be the empty
@@ -407,5 +444,32 @@ mod tests {
         );
         // A value inside the exact range is still a typed number.
         assert_eq!(back[0]["small"], json!(42));
+    }
+
+    /// #789 FILE-07: a date-formatted cell in a real workbook reads back as a
+    /// date, not the serial number.
+    #[test]
+    fn a_date_cell_reads_back_as_a_date() {
+        use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        ws.write_string(0, 0, "day").unwrap();
+        ws.write_string(0, 1, "at").unwrap();
+        let date = Format::new().set_num_format("yyyy-mm-dd");
+        let stamp = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
+        ws.write_datetime_with_format(1, 0, ExcelDateTime::from_ymd(2023, 3, 15).unwrap(), &date)
+            .unwrap();
+        ws.write_datetime_with_format(
+            1,
+            1,
+            ExcelDateTime::parse_from_str("2023-03-15 12:30:00").unwrap(),
+            &stamp,
+        )
+        .unwrap();
+        let bytes = wb.save_to_buffer().unwrap();
+        assert_eq!(
+            decode(&bytes, None, 0).unwrap(),
+            vec![json!({"day": "2023-03-15", "at": "2023-03-15T12:30:00"})]
+        );
     }
 }

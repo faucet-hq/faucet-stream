@@ -120,6 +120,9 @@ sink:
 - **`json_lines` / `json_array`** are lossless: any JSON value round-trips.
 - **`xlsx`** carries numbers and booleans as themselves. A spreadsheet stores
   every number as a double, so an integral value reads back as an integer.
+  A date-formatted cell reads back as text: `2023-03-15` for a whole day,
+  `2023-03-15T12:30:00` otherwise, an ISO 8601 duration for a time span
+  (workbooks on the 1904 date system included).
 - **`csv` and `xml` are text formats.** Every value comes back a string; a
   number written as `42` reads back as `"42"`. Use a
   [`cast` transform](./transforms.md) if downstream needs the type.
