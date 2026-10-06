@@ -18,6 +18,22 @@ pub enum ValueFormat {
     Bytes,
 }
 
+/// What to do with a message whose payload does not decode under
+/// `value_format`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDecodeError {
+    /// Fail the run. The message stays unacked, so Pub/Sub redelivers it and
+    /// the next run fails at it again until it is removed.
+    #[default]
+    Fail,
+    /// Drop the message: it is acked with its page and no record is emitted.
+    Skip,
+    /// Emit the record with the payload base64-encoded under `data` and the
+    /// decode error under `decode_error`.
+    Raw,
+}
+
 /// The default JSON key the per-message attribute map is surfaced under.
 pub const DEFAULT_ATTRIBUTES_KEY: &str = "__attributes";
 
@@ -60,6 +76,23 @@ pub struct PubsubSourceConfig {
     /// messages are acked once the pipeline has durably written the page.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// What to do with a message whose payload does not decode. Default
+    /// `fail`.
+    #[serde(default)]
+    pub on_decode_error: OnDecodeError,
+
+    /// Ack deadline, in seconds, the source keeps renewing on every message it
+    /// has pulled but not yet acked (while a page is assembled and while the
+    /// sink writes it), so a slow page is not redelivered into the same run.
+    /// Renewed every 5 s (or every third of the window, if shorter). `0`
+    /// disables renewal. Range 10–600. Default 60.
+    #[serde(default = "default_ack_deadline_extension_secs")]
+    pub ack_deadline_extension_secs: u32,
+}
+
+fn default_ack_deadline_extension_secs() -> u32 {
+    60
 }
 
 fn default_attributes_key() -> String {
@@ -84,6 +117,8 @@ impl PubsubSourceConfig {
             idle_termination_secs: None,
             max_messages: None,
             batch_size: default_batch_size(),
+            on_decode_error: OnDecodeError::default(),
+            ack_deadline_extension_secs: default_ack_deadline_extension_secs(),
         }
     }
 
@@ -124,6 +159,15 @@ impl PubsubSourceConfig {
                 "pubsub source: max_messages must be at least 1".into(),
             ));
         }
+        if self.ack_deadline_extension_secs != 0
+            && !(10..=600).contains(&self.ack_deadline_extension_secs)
+        {
+            return Err(FaucetError::Config(format!(
+                "pubsub source: ack_deadline_extension_secs must be 10..=600 or 0 to disable \
+                 renewal (got {})",
+                self.ack_deadline_extension_secs
+            )));
+        }
         Ok(())
     }
 }
@@ -147,6 +191,21 @@ mod tests {
         assert_eq!(c.max_messages_per_pull, 100);
         assert_eq!(c.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
         assert!(c.idle_termination_secs.is_none() && c.max_messages.is_none());
+        assert_eq!(c.on_decode_error, OnDecodeError::Fail);
+        assert_eq!(c.ack_deadline_extension_secs, 60);
+    }
+
+    #[test]
+    fn ack_deadline_extension_bounds() {
+        let mut c = valid();
+        c.ack_deadline_extension_secs = 0;
+        c.validate().unwrap();
+        c.ack_deadline_extension_secs = 9;
+        assert!(c.validate().is_err());
+        c.ack_deadline_extension_secs = 601;
+        assert!(c.validate().is_err());
+        c.ack_deadline_extension_secs = 600;
+        c.validate().unwrap();
     }
 
     #[test]

@@ -21,7 +21,14 @@ source:
     idle_termination_secs: 30         # stop after N idle seconds
     max_messages: 100000              # or stop after N messages
     batch_size: 1000                  # records per page (0 = one page per drain)
+    on_decode_error: fail             # fail | skip | raw  (default fail)
+    ack_deadline_extension_secs: 60   # 10..=600, 0 = no renewal (default 60)
 ```
+
+`on_decode_error` handles a payload that does not decode under `value_format`:
+`fail` stops the run (the message stays unacked, so the next run fails at it
+again), `skip` acks it with its page and emits nothing, `raw` emits it with the
+payload base64-encoded under `data` and the error under `decode_error`.
 
 At least one of `idle_termination_secs` / `max_messages` **must** be set so a
 batch run terminates (mirrors the Kafka / Kinesis sources).
@@ -57,7 +64,13 @@ Messages are acked at **durable page boundaries**: a page's messages are acked
 only after the pipeline has written that page to the sink and persisted its
 bookmark. A crash between the sink write and the ack redelivers those messages
 on the next run — never data loss, but duplicates are possible. Pair with an
-upsert sink keyed on `message_id` when replays must converge.
+upsert sink keyed on `message_id` when replays must converge. Acks go out as one
+`Acknowledge` RPC per 500 messages.
+
+While a message is held — its page being assembled or written — the source
+renews its ack deadline to `ack_deadline_extension_secs` (every 5 s), so a page
+that outlives the subscription's ack deadline is not redelivered into the same
+run.
 
 **Exactly-once delivery is not supported** — Pub/Sub offers no primitive that
 composes with faucet's atomic-watermark model. The bookmark this source
