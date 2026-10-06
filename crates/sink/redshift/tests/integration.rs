@@ -352,3 +352,85 @@ async fn check_probe_passes() {
         "all probes should pass against a reachable database: {report:?}"
     );
 }
+
+/// SQL-04: a group commit that fails keeps the earlier pages' rows, so the
+/// next `flush` (a resilience retry) loads them instead of finding nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_group_keeps_earlier_pages_for_the_retry() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (id BIGINT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let mut cfg = insert_config(port, "events", 1);
+    cfg.commit_rows = Some(2);
+    let sink = RedshiftSink::new(cfg).await.expect("sink builds");
+
+    sink.write_batch(&[json!({"id": 1})])
+        .await
+        .expect("buffered");
+    sqlx::query("ALTER TABLE events RENAME TO events_away")
+        .execute(&pool)
+        .await
+        .expect("hide table");
+    sink.write_batch(&[json!({"id": 2})])
+        .await
+        .expect_err("the group commit fails");
+    sqlx::query("ALTER TABLE events_away RENAME TO events")
+        .execute(&pool)
+        .await
+        .expect("restore table");
+    sink.flush()
+        .await
+        .expect("the retry loads the restored row");
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM events ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("read back");
+    assert_eq!(ids, vec![1], "page 2 stays the caller's to retry or route");
+    pool.close().await;
+}
+
+/// SQL-21: the DLQ path flushes buffered pages, loads this page alone and
+/// names exactly which of its rows did not land.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_dlq_path_commits_per_page_and_reports_each_row() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (id BIGINT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let mut cfg = insert_config(port, "events", 1);
+    cfg.commit_rows = Some(100);
+    let sink = RedshiftSink::new(cfg).await.expect("sink builds");
+
+    sink.write_batch(&[json!({"id": 1})])
+        .await
+        .expect("buffered");
+    let outcomes = sink
+        .write_batch_partial(&[json!({"id": 2}), json!({"id": "not a number"})])
+        .await
+        .expect("per-row outcomes");
+    assert!(outcomes[0].is_ok());
+    assert!(
+        outcomes[1]
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("redshift"))
+    );
+    assert_eq!(
+        row_count(&pool, "events").await,
+        2,
+        "earlier page flushed first"
+    );
+
+    sink.write_batch_partial(&[json!({"id": "nope"})])
+        .await
+        .expect_err("nothing of the page landed");
+    assert!(sink.write_batch_partial(&[]).await.unwrap().is_empty());
+    pool.close().await;
+}

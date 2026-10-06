@@ -115,9 +115,10 @@ pub struct RedshiftSinkConfig {
     /// operation per small page. Records now accumulate across `write_batch`
     /// calls and commit once per threshold, plus once at `flush`.
     ///
-    /// `None` (the default) accumulates the **whole run** into one commit.
-    /// Set it to bound how much is buffered, or to commit progressively on a
-    /// long run. `0` means the same as `None`.
+    /// When neither `commit_rows` nor `commit_bytes` is set, a group commits
+    /// at 100,000 rows or ~256 MiB, whichever comes first, so a large load
+    /// never buffers the whole run in memory. `0` means no row limit. A
+    /// failed group commit keeps its uncommitted rows for the retry.
     ///
     /// Only the append path accumulates: `delivery: exactly_once` and the DLQ
     /// path commit per page, because a watermark must land with its own page
@@ -126,8 +127,8 @@ pub struct RedshiftSinkConfig {
     pub commit_rows: Option<usize>,
     /// Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)
     /// (#617). Rows are a poor proxy for how much work a warehouse commit is;
-    /// this bounds the buffered size. `None` (the default) removes the byte
-    /// threshold.
+    /// this bounds the buffered size. `0` means no byte limit; see
+    /// [`commit_rows`](Self::commit_rows) for the default when both are unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_bytes: Option<usize>,
     /// Optional schema (namespace) qualifying [`table_name`](Self::table_name).
