@@ -76,6 +76,27 @@ For an overwrite the check is whole-table: if the target no longer holds this
 run's rows, a later overwrite replaced them, and the kept copy is that run's
 input — not yours.
 
+A key the run changed that a later run then **deleted** is a conflict too:
+restoring its before-image would resurrect a row someone removed on purpose.
+
+### Rolling back a run that is not the newest
+
+Undoing a run also rewinds the bookmark (and the exactly-once watermark) to
+where they stood before it, so the next run re-reads what was undone. When
+later runs followed, that rewind would make the next run re-read and re-write
+their data too. So rolling back any run but the newest retained one is
+refused, the report naming the later runs:
+
+```
+rollback BLOCKED: run 019…a on row 'orders' (sqlite sqlite:///mirror.db#orders, append mode)
+  later runs: 019…b, 019…c
+  note: 2 later run(s) wrote this destination since (019…b, 019…c); roll those back first (newest first), or pass --force to undo only this run's rows and leave the bookmark where the later runs put it
+```
+
+Roll back newest first, or pass `--force` to undo only that run's destination
+changes: the bookmark and watermark then stay where the later runs left them,
+so the undone rows are not read again.
+
 ## Over HTTP and in the console
 
 `POST /v1/runs/{id}/rollback` undoes one invocation of a run submitted to

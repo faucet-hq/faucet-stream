@@ -519,26 +519,46 @@ async fn append_and_overwrite_runs_are_undone() {
     let id1 = s1.invocations[0].run_id.clone().unwrap();
     let s2 = run(&append).await;
     assert!(!s2.had_failures());
+    let id2 = s2.invocations[0].run_id.clone().unwrap();
     assert_eq!(rows(&d.dst).await.len(), 8, "append twice");
-    let report = faucet_cli::rollback::rollback(
-        &append,
-        RollbackInputs {
-            run_id: id1,
-            row: None,
-            dry_run: false,
-            force: false,
-            pipeline_name: "mirror".into(),
-            auth: Default::default(),
-        },
-    )
-    .await
-    .unwrap();
+    let undo = |run_id: String, force: bool| RollbackInputs {
+        run_id,
+        row: None,
+        dry_run: false,
+        force,
+        pipeline_name: "mirror".into(),
+        auth: Default::default(),
+    };
+    // Run 1 is not the newest: undoing it would rewind the bookmark past run 2.
+    let refused = faucet_cli::rollback::rollback(&append, undo(id1.clone(), false))
+        .await
+        .unwrap();
+    assert!(refused.blocked(), "{refused:?}");
+    assert_eq!(refused.later_runs, vec![id2.clone()]);
+    assert!(!refused.outcome.applied);
+    assert!(refused.outcome.note.as_deref().unwrap().contains(&id2));
+    assert_eq!(rows(&d.dst).await.len(), 8, "refused: untouched");
+
+    let report = faucet_cli::rollback::rollback(&append, undo(id1, true))
+        .await
+        .unwrap();
     assert_eq!((report.outcome.deleted, report.outcome.applied), (4, true));
+    assert!(
+        !report.bookmark_rewound,
+        "a forced undo of an older run keeps the later run's bookmark"
+    );
     assert_eq!(
         rows(&d.dst).await.len(),
         4,
         "only the first run's rows went"
     );
+    // Run 2 is the newest: it would roll back without force.
+    let mut dry = undo(id2, false);
+    dry.dry_run = true;
+    let newest = faucet_cli::rollback::rollback(&append, dry).await.unwrap();
+    assert!(!newest.blocked(), "{newest:?}");
+    assert!(newest.later_runs.is_empty());
+    assert_eq!(newest.outcome.deleted, 4);
 
     // Overwrite: the replaced table is kept and swapped back.
     let overwrite = load(&config_yaml(

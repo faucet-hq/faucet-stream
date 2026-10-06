@@ -188,6 +188,12 @@ pub struct RollbackReport {
     /// The rollback was refused because a later run changed the keys and
     /// `force` was not set (a dry run reports whether it *would* be).
     pub blocked: bool,
+    /// Retained runs newer than this one. Undoing a run that is not the newest
+    /// is refused without `force`; with `force` only its destination changes
+    /// are undone and the bookmark and watermark are left where the later runs
+    /// put them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub later_runs: Vec<String>,
 }
 
 impl RollbackReport {
@@ -230,39 +236,57 @@ pub async fn rollback_node(
             ROLLBACK_SINK_KINDS.join(", ")
         )));
     }
-    let opts = RollbackOptions {
-        run_id_column: marker.run_id_column.clone(),
-        mode: marker.mode,
-        force: inputs.force,
-        dry_run: inputs.dry_run,
-    };
-    let outcome = sink.rollback_run(&marker.run_id, &opts).await?;
-    let mut report = RollbackReport {
+    let ik = state::index_key(&marker.state_key);
+    let later_runs = RunIndex::decode(store.get(&ik).await?.as_ref()).later(&marker.run_id);
+    let base = |outcome: RollbackOutcome, blocked: bool| RollbackReport {
         run_id: marker.run_id.clone(),
         row: node.id.clone(),
         sink_kind: node.sink.kind.clone(),
         dataset: marker.sink_uri.clone(),
         mode: marker.mode,
         dry_run: inputs.dry_run,
-        blocked: outcome.conflicts > 0 && !inputs.force,
+        blocked,
         outcome,
         bookmark_rewound: false,
         token_rewound: false,
+        later_runs: later_runs.clone(),
     };
+    let refuse = !later_runs.is_empty() && !inputs.force;
+    let opts = RollbackOptions {
+        run_id_column: marker.run_id_column.clone(),
+        mode: marker.mode,
+        force: inputs.force,
+        dry_run: inputs.dry_run || refuse,
+        later_runs: !later_runs.is_empty(),
+    };
+    if refuse {
+        let mut outcome = sink.rollback_run(&marker.run_id, &opts).await?;
+        outcome.applied = false;
+        outcome.note = Some(later_runs_note(&later_runs));
+        return Ok(base(outcome, true));
+    }
+    let outcome = sink.rollback_run(&marker.run_id, &opts).await?;
+    let blocked = outcome.conflicts > 0 && !inputs.force;
+    let mut report = base(outcome, blocked);
     if !report.outcome.applied || inputs.dry_run {
         return Ok(report);
     }
     // The destination is undone; now make the next run re-read what was
     // undone: bookmark, then watermark, then drop what made the run undoable.
-    match &marker.bookmark_before {
-        Some(b) => store.put(&marker.state_key, b).await?,
-        None => store.delete(&marker.state_key).await?,
-    }
-    report.bookmark_rewound = true;
-    if marker.delivery == DeliveryMode::ExactlyOnce {
-        sink.rewind_commit_token(&marker.state_key, marker.token_before.as_deref())
-            .await?;
-        report.token_rewound = true;
+    // A forced undo of a run that later runs followed leaves both alone:
+    // rewinding them would make the next run re-read and re-append the later
+    // runs' data.
+    if later_runs.is_empty() {
+        match &marker.bookmark_before {
+            Some(b) => store.put(&marker.state_key, b).await?,
+            None => store.delete(&marker.state_key).await?,
+        }
+        report.bookmark_rewound = true;
+        if marker.delivery == DeliveryMode::ExactlyOnce {
+            sink.rewind_commit_token(&marker.state_key, marker.token_before.as_deref())
+                .await?;
+            report.token_rewound = true;
+        }
     }
     if let Err(e) = sink.forget_run(&marker.run_id).await {
         tracing::warn!(run_id = %marker.run_id, error = %e, "could not drop the run's journal");
@@ -270,7 +294,6 @@ pub async fn rollback_node(
     store
         .delete(&state::marker_key(&marker.state_key, &marker.run_id))
         .await?;
-    let ik = state::index_key(&marker.state_key);
     let mut index = RunIndex::decode(store.get(&ik).await?.as_ref());
     index.remove(&marker.run_id);
     store
@@ -288,6 +311,17 @@ pub async fn rollback_node(
         "run rolled back"
     );
     Ok(report)
+}
+
+/// Why a rollback of a run that later runs followed was refused.
+fn later_runs_note(later: &[String]) -> String {
+    format!(
+        "{n} later run(s) wrote this destination since ({ids}); roll those back first (newest \
+         first), or pass --force to undo only this run's rows and leave the bookmark where \
+         the later runs put it",
+        n = later.len(),
+        ids = later.join(", ")
+    )
 }
 
 /// Find the root node whose state holds `run_id`'s marker (or the given row),
@@ -469,6 +503,7 @@ mod tests {
             bookmark_rewound: false,
             token_rewound: false,
             blocked: true,
+            later_runs: vec![],
         };
         assert!(base.blocked());
         let ok = RollbackReport {
