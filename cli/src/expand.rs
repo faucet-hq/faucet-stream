@@ -850,6 +850,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         if let Some(row_ts) = row.transforms.as_ref() {
             transforms.extend(row_ts.iter().cloned());
         }
+        apply_cdc_image_policy(
+            &merged_source.kind,
+            &merged_source.config,
+            &mut transforms,
+            row_id,
+        )?;
         let state = row.state.clone().or_else(|| cfg.pipeline.state.clone());
         // Row override wins; fall back to the top-level delivery mode.
         let delivery = row.delivery.unwrap_or(cfg.delivery);
@@ -1554,6 +1560,54 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
 /// replace the output, keeping only the last parent's rows. Backstop for
 /// hand-written configs and deployment overlays; the Template Hub composer
 /// refuses the pairing earlier.
+/// Settle `cdc_unwrap`'s `on_missing_image` for a mongodb-cdc source, which is
+/// the one built-in whose missing `after` image depends on its own config.
+///
+/// - `full_document: off` / `when_available` delivers no image on most updates,
+///   so the mirror would fail on its first update: refused here unless the
+///   transform says `on_missing_image: drop`.
+/// - `update_lookup` reads the document at delivery time; a missing image means
+///   it was deleted since, and that delete event follows. Dropping is correct,
+///   and failing would wedge the run on replay, so an unset policy becomes
+///   `drop`.
+/// - `required` always carries the image, so the default `fail` stays.
+fn apply_cdc_image_policy(
+    source_kind: &str,
+    source_config: &Value,
+    transforms: &mut [TransformSpec],
+    row_id: &str,
+) -> CliResult<()> {
+    if source_kind != "mongodb-cdc" {
+        return Ok(());
+    }
+    let full_document = source_config
+        .get("full_document")
+        .and_then(Value::as_str)
+        .unwrap_or("off");
+    for t in transforms.iter_mut().filter(|t| t.kind == "cdc_unwrap") {
+        if t.config.get("on_missing_image").is_some() {
+            continue;
+        }
+        match full_document {
+            "update_lookup" => {
+                if let Value::Object(map) = &mut t.config {
+                    map.insert("on_missing_image".into(), Value::String("drop".into()));
+                }
+            }
+            "off" | "when_available" => {
+                return Err(CliError::Config(format!(
+                    "row `{row_id}`: mongodb-cdc with `full_document: {full_document}` sends \
+                     updates without an `after` image, so `cdc_unwrap` cannot mirror them. Set \
+                     `full_document: update_lookup` (or `required` with collection post-images \
+                     enabled), or `on_missing_image: drop` on the transform to skip them"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
     for n in nodes {
         let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
@@ -1977,6 +2031,106 @@ mod tests {
 
     fn cfg(yaml: &str) -> PipelineConfig {
         parse_with_extension(yaml, "yaml").unwrap()
+    }
+
+    fn cdc_unwrap(config: serde_json::Value) -> Vec<TransformSpec> {
+        vec![TransformSpec {
+            kind: "cdc_unwrap".into(),
+            config,
+        }]
+    }
+
+    #[test]
+    fn mongodb_cdc_without_a_post_image_refuses_cdc_unwrap() {
+        for full_document in [None, Some("off"), Some("when_available")] {
+            let source = match full_document {
+                Some(f) => serde_json::json!({ "full_document": f }),
+                None => serde_json::json!({}),
+            };
+            let mut ts = cdc_unwrap(serde_json::json!({}));
+            let err = apply_cdc_image_policy("mongodb-cdc", &source, &mut ts, "r")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("row `r`") && err.contains("update_lookup"),
+                "{err}"
+            );
+        }
+        let mut ts = cdc_unwrap(serde_json::json!({ "on_missing_image": "drop" }));
+        apply_cdc_image_policy("mongodb-cdc", &serde_json::json!({}), &mut ts, "r").unwrap();
+        assert_eq!(ts[0].config["on_missing_image"], "drop");
+    }
+
+    #[test]
+    fn mongodb_cdc_update_lookup_drops_a_missing_image_and_required_keeps_failing() {
+        let mut ts = cdc_unwrap(serde_json::json!({}));
+        apply_cdc_image_policy(
+            "mongodb-cdc",
+            &serde_json::json!({ "full_document": "update_lookup" }),
+            &mut ts,
+            "r",
+        )
+        .unwrap();
+        assert_eq!(ts[0].config["on_missing_image"], "drop");
+
+        let mut ts = cdc_unwrap(serde_json::json!({ "on_missing_image": "fail" }));
+        apply_cdc_image_policy(
+            "mongodb-cdc",
+            &serde_json::json!({ "full_document": "update_lookup" }),
+            &mut ts,
+            "r",
+        )
+        .unwrap();
+        assert_eq!(
+            ts[0].config["on_missing_image"], "fail",
+            "an explicit choice wins"
+        );
+
+        let mut ts = cdc_unwrap(serde_json::json!({}));
+        apply_cdc_image_policy(
+            "mongodb-cdc",
+            &serde_json::json!({ "full_document": "required" }),
+            &mut ts,
+            "r",
+        )
+        .unwrap();
+        assert!(ts[0].config.get("on_missing_image").is_none());
+    }
+
+    #[test]
+    fn the_cdc_image_policy_ignores_other_sources_and_transforms() {
+        let mut ts = cdc_unwrap(serde_json::json!({}));
+        apply_cdc_image_policy("postgres-cdc", &serde_json::json!({}), &mut ts, "r").unwrap();
+        assert!(ts[0].config.get("on_missing_image").is_none());
+        let mut other = vec![TransformSpec {
+            kind: "flatten".into(),
+            config: serde_json::json!({}),
+        }];
+        apply_cdc_image_policy("mongodb-cdc", &serde_json::json!({}), &mut other, "r").unwrap();
+        assert_eq!(other[0].config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn expand_applies_the_cdc_image_policy_per_row() {
+        let yaml = |full_document: &str| {
+            format!(
+                r#"
+version: 1
+name: m
+pipeline:
+  source:
+    type: mongodb-cdc
+    config: {{ connection_uri: "mongodb://h/?replicaSet=rs0", database: d, full_document: {full_document} }}
+  transforms:
+    - type: cdc_unwrap
+  sink: {{ type: stdout, config: {{}} }}
+"#
+            )
+        };
+        let nodes = expand(&cfg(&yaml("update_lookup"))).expect("expands");
+        assert_eq!(nodes[0].transforms[0].config["on_missing_image"], "drop");
+        let err = expand(&cfg(&yaml("off"))).unwrap_err().to_string();
+        assert!(err.contains("full_document: off"), "{err}");
     }
 
     /// #679: a matrix row's `sla:` replaces the top-level one for that row —

@@ -363,6 +363,36 @@ pipeline:
     assert!(dlq_text.contains("alice@example.com") && dlq_text.contains("pii-eu"));
 }
 
+#[cfg(all(feature = "source-file", feature = "sink-file"))]
+#[test]
+fn the_shipped_policy_example_runs_with_its_masking_satisfying_the_rule() {
+    let dir = TempDir::new().unwrap();
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/csv_to_jsonl_with_policy.yaml");
+    fs::copy(&example, dir.path().join("pipeline.yaml")).unwrap();
+    write(
+        dir.path(),
+        "customers.csv",
+        "id,email,salary\n1,ada@example.com,120000\n2,bob@example.com,95000\n",
+    );
+    faucet()
+        .current_dir(dir.path())
+        .args(["run", "pipeline.yaml"])
+        .assert()
+        .success();
+    let out = fs::read_to_string(dir.path().join("out/customers.jsonl")).unwrap();
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "{out}");
+    for row in &rows {
+        let salary = row["salary"].as_str().unwrap();
+        assert!(!["120000", "95000"].contains(&salary), "{out}");
+        assert_eq!(salary.len(), 64, "a SHA-256 hex digest: {salary}");
+    }
+}
+
 #[test]
 fn schema_policy_and_a_malformed_policy_file_fail_closed() {
     faucet()

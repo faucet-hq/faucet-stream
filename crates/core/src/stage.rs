@@ -672,8 +672,8 @@ pub const CDC_UNCHANGED_TOAST_FIELD: &str = "__unchanged_toast__";
 /// Spec for [`TransformStage::CdcUnwrap`]. Normalizes a CDC change-event
 /// envelope (`{op, before, after, …}`) into a flat row plus a marker field,
 /// so a downstream upsert sink never needs to understand CDC. A 1→0|1 stage:
-/// DDL/truncate events (and non-delete events with no `after` image) are
-/// dropped.
+/// DDL/truncate events are dropped, and an event with no usable row image
+/// fails the run unless `on_missing_image: drop`.
 #[cfg(feature = "transform-cdc-unwrap")]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct CdcUnwrapSpec {
@@ -702,6 +702,35 @@ pub struct CdcUnwrapSpec {
     /// `op` values dropped entirely (1→0). Default `["ddl", "truncate"]`.
     #[serde(default = "cdc_default_drop_ops")]
     pub drop_ops: Vec<String>,
+    /// What to do with an event this stage cannot turn into a row: an insert or
+    /// update with no `after` object (mongodb-cdc with `full_document: off`, a
+    /// DynamoDB `KEYS_ONLY` / `OLD_IMAGE` stream), or a delete with neither a
+    /// `before` object nor a `key_field` object. Default `fail`, because
+    /// dropping it leaves the mirror silently out of date.
+    #[serde(default)]
+    pub on_missing_image: CdcMissingImage,
+}
+
+/// [`CdcUnwrapSpec::on_missing_image`] policy.
+#[cfg(feature = "transform-cdc-unwrap")]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcMissingImage {
+    /// Fail the run with a typed error naming the event.
+    #[default]
+    Fail,
+    /// Drop the event with a warning (the pre-1.x behaviour).
+    Drop,
 }
 
 #[cfg(feature = "transform-cdc-unwrap")]
@@ -744,6 +773,7 @@ impl Default for CdcUnwrapSpec {
             marker_field: cdc_default_marker_field(),
             delete_ops: cdc_default_delete_ops(),
             drop_ops: cdc_default_drop_ops(),
+            on_missing_image: CdcMissingImage::Fail,
         }
     }
 }
@@ -786,21 +816,28 @@ impl CompiledCdcUnwrap {
             }
         };
         let Some(Value::Object(mut map)) = row else {
-            if is_delete {
-                tracing::warn!(
-                    op,
-                    key_field = %s.key_field,
-                    before_field = %s.before_field,
-                    "cdc_unwrap: dropping delete event with no usable key (no `before` image and no key_field object)"
-                );
+            let what = if is_delete {
+                format!(
+                    "a delete event (op {op:?}) has no `{}` object and no `{}` object to take its key from",
+                    s.before_field, s.key_field
+                )
             } else {
-                tracing::warn!(
-                    op,
-                    after_field = %s.after_field,
-                    "cdc_unwrap: dropping non-delete event with no row image"
-                );
-            }
-            return Ok(vec![]);
+                format!(
+                    "a change event (op {op:?}) has no `{}` object, so the new row is unknown — \
+                     for mongodb-cdc set `full_document: update_lookup`, for a DynamoDB stream \
+                     use the NEW_IMAGE or NEW_AND_OLD_IMAGES view type",
+                    s.after_field
+                )
+            };
+            return match s.on_missing_image {
+                CdcMissingImage::Fail => Err(FaucetError::Transform(format!(
+                    "cdc_unwrap: {what} (set `on_missing_image: drop` to skip such events)"
+                ))),
+                CdcMissingImage::Drop => {
+                    tracing::warn!("cdc_unwrap: dropping an event: {what}");
+                    Ok(vec![])
+                }
+            };
         };
         // Drop the source's unchanged-TOAST marker (#670 L27). It is *envelope
         // metadata* — postgres-cdc stamps it to say which columns the WAL did
@@ -2131,12 +2168,41 @@ mod tests {
 
     #[cfg(feature = "transform-cdc-unwrap")]
     #[test]
-    fn cdc_unwrap_non_object_after_for_insert_is_dropped() {
+    fn cdc_unwrap_an_event_without_a_row_image_fails_by_default() {
         let stages = compile(&[cdc_unwrap_default()]);
+        let err = apply_stages(json!({"op": "u", "after": null}), &stages).unwrap_err();
+        assert!(
+            err.to_string().contains("full_document: update_lookup"),
+            "{err}"
+        );
+        let err = apply_stages(json!({"op": "insert"}), &stages).unwrap_err();
+        assert!(err.to_string().contains("on_missing_image"), "{err}");
+        let err = apply_stages(json!({"op": "d", "before": null}), &stages).unwrap_err();
+        assert!(err.to_string().contains("delete event"), "{err}");
+    }
+
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_drops_an_event_without_a_row_image_only_when_asked() {
+        let spec: CdcUnwrapSpec =
+            serde_json::from_value(json!({"on_missing_image": "drop"})).unwrap();
+        assert_eq!(spec.on_missing_image, CdcMissingImage::Drop);
+        let stages = compile(&[TransformStage::CdcUnwrap(spec)]);
         assert!(
             apply_stages(json!({"op": "insert", "after": null}), &stages)
                 .unwrap()
                 .is_empty()
+        );
+        assert!(
+            apply_stages(json!({"op": "d"}), &stages)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::from_value::<CdcUnwrapSpec>(json!({}))
+                .unwrap()
+                .on_missing_image,
+            CdcMissingImage::Fail
         );
     }
 

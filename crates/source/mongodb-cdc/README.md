@@ -110,7 +110,7 @@ Every change event is one JSON object — a flat CDC envelope:
 | `namespace` | object \| null | `{ "db": "…", "coll": "…" }`. `null` for cluster-scope events that carry no namespace (e.g. a cluster-level invalidate) |
 | `document_key` | object \| null | Document identity key (typically `{ "_id": … }`) |
 | `before` | object \| null | Pre-image of the document. Populated only when `full_document_before_change` is enabled and the collection has `changeStreamPreAndPostImages` turned on (MongoDB 6.0+). |
-| `after` | object \| null | Post-image of the document. Populated on inserts, replaces, and updates when `full_document` is `update_lookup`, `when_available`, or `required`. `null` on deletes. |
+| `after` | object \| null | Post-image of the document. Always populated on inserts and replaces. On updates it is populated only with `full_document: update_lookup`, or with `when_available` / `required` on a collection that has `changeStreamPreAndPostImages` enabled (MongoDB 6.0+); with the default `off` it is `null` on every update. `null` on deletes. |
 | `update_description` | object \| null | Present on `u` events: `{ "updated_fields": {…}, "removed_fields": ["…"], "truncated_arrays": [{…}] }`. `null` for all other op types. |
 | `resume_token` | object | Opaque server-assigned token. The pipeline persists this as the page bookmark and passes it to `resumeAfter` on the next run. |
 
@@ -325,7 +325,7 @@ state:
     connection_url: postgres://user:pass@localhost/warehouse
 ```
 
-> **Note:** `full_document: update_lookup` re-reads the document at lookup time, not change time (see [Caveats](#caveats)). For a strict mirror, prefer the change-event payload itself plus an idempotent sink, and pair with the `cdc_unwrap` transform + `write_mode: upsert` — see the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
+> **Note:** a mirror built with the `cdc_unwrap` transform + `write_mode: upsert` needs an `after` image on every update, so set `full_document: update_lookup` (or `required` on a collection with `changeStreamPreAndPostImages` enabled). `faucet validate` refuses the pairing with the default `full_document: off`, and `cdc_unwrap` fails the run on an update it cannot turn into a row rather than dropping it. `update_lookup` re-reads the document at lookup time, not change time (see [Caveats](#caveats)). See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
 
 ## Snapshot → CDC handoff
 

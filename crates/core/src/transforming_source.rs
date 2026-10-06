@@ -161,7 +161,10 @@ impl Source for TransformingSource {
                     yield StreamPage { records: vec![], bookmark: page.bookmark };
                     continue;
                 }
-                if batch_size == 0 {
+                // A bookmark-carrying page is the unit a commit token covers, so
+                // splitting it would write the earlier chunks without one and an
+                // exactly-once resume would replay them. Sinks re-chunk internally.
+                if batch_size == 0 || page.bookmark.is_some() {
                     yield StreamPage { records: out, bookmark: page.bookmark };
                     continue;
                 }
@@ -268,6 +271,29 @@ impl Source for TransformingSource {
         self.inner.record_table(record)
     }
 
+    fn is_shardable(&self) -> bool {
+        self.inner.is_shardable()
+    }
+
+    async fn enumerate_shards(
+        &self,
+        target: usize,
+    ) -> Result<Vec<crate::shard::ShardSpec>, FaucetError> {
+        self.inner.enumerate_shards(target).await
+    }
+
+    async fn apply_shard(&self, shard: &crate::shard::ShardSpec) -> Result<(), FaucetError> {
+        self.inner.apply_shard(shard).await
+    }
+
+    fn supports_discover(&self) -> bool {
+        self.inner.supports_discover()
+    }
+
+    async fn discover(&self) -> Result<Vec<crate::discover::DatasetDescriptor>, FaucetError> {
+        self.inner.discover().await
+    }
+
     fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
         self.inner.position_le(a, b)
     }
@@ -366,6 +392,123 @@ mod tests {
             TransformingSource::new(Box::new(RoutedSource), vec![], Labels::for_named("test"))
                 .unwrap();
         assert_forwards_multi_table_hooks(&wrapped);
+    }
+
+    #[derive(Default)]
+    struct ShardedSource {
+        applied: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Source for ShardedSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, serde_json::Value>,
+        ) -> Result<Vec<serde_json::Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn is_shardable(&self) -> bool {
+            true
+        }
+        async fn enumerate_shards(
+            &self,
+            target: usize,
+        ) -> Result<Vec<crate::shard::ShardSpec>, FaucetError> {
+            Ok((0..target)
+                .map(|i| crate::shard::ShardSpec::new(format!("s{i}"), serde_json::json!(i)))
+                .collect())
+        }
+        async fn apply_shard(&self, shard: &crate::shard::ShardSpec) -> Result<(), FaucetError> {
+            self.applied.lock().unwrap().push(shard.id.clone());
+            Ok(())
+        }
+        async fn range_digest(
+            &self,
+            _range: &crate::diff::KeyRange,
+            _key: &str,
+            _columns: &[String],
+        ) -> Result<Option<crate::diff::ServerDigest>, FaucetError> {
+            Err(FaucetError::Source(
+                "a raw-data digest must not be consulted".into(),
+            ))
+        }
+        fn supports_discover(&self) -> bool {
+            true
+        }
+        async fn discover(&self) -> Result<Vec<crate::discover::DatasetDescriptor>, FaucetError> {
+            Ok(vec![crate::discover::DatasetDescriptor::new(
+                "orders",
+                "table",
+                serde_json::json!({}),
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_and_discover_hooks_reach_the_inner_source() {
+        let inner = Arc::new(ShardedSource::default());
+        struct Shared(Arc<ShardedSource>);
+        #[async_trait]
+        impl Source for Shared {
+            async fn fetch_with_context(
+                &self,
+                ctx: &HashMap<String, serde_json::Value>,
+            ) -> Result<Vec<serde_json::Value>, FaucetError> {
+                self.0.fetch_with_context(ctx).await
+            }
+            fn is_shardable(&self) -> bool {
+                self.0.is_shardable()
+            }
+            async fn enumerate_shards(
+                &self,
+                target: usize,
+            ) -> Result<Vec<crate::shard::ShardSpec>, FaucetError> {
+                self.0.enumerate_shards(target).await
+            }
+            async fn apply_shard(
+                &self,
+                shard: &crate::shard::ShardSpec,
+            ) -> Result<(), FaucetError> {
+                self.0.apply_shard(shard).await
+            }
+            async fn range_digest(
+                &self,
+                range: &crate::diff::KeyRange,
+                key: &str,
+                columns: &[String],
+            ) -> Result<Option<crate::diff::ServerDigest>, FaucetError> {
+                self.0.range_digest(range, key, columns).await
+            }
+            fn supports_discover(&self) -> bool {
+                self.0.supports_discover()
+            }
+            async fn discover(
+                &self,
+            ) -> Result<Vec<crate::discover::DatasetDescriptor>, FaucetError> {
+                self.0.discover().await
+            }
+        }
+        let wrapped = TransformingSource::new(
+            Box::new(Shared(inner.clone())),
+            vec![],
+            Labels::for_named("t"),
+        )
+        .unwrap();
+        assert!(wrapped.is_shardable());
+        let shards = wrapped.enumerate_shards(3).await.unwrap();
+        assert_eq!(shards.len(), 3);
+        wrapped.apply_shard(&shards[1]).await.unwrap();
+        assert_eq!(*inner.applied.lock().unwrap(), vec!["s1".to_string()]);
+        assert!(wrapped.supports_discover());
+        assert_eq!(wrapped.discover().await.unwrap()[0].name, "orders");
+        let digest = wrapped
+            .range_digest(&crate::diff::KeyRange::ALL, "id", &[])
+            .await
+            .unwrap();
+        assert!(
+            digest.is_none(),
+            "transformed rows must be compared client-side, never by a raw-data digest"
+        );
     }
     use crate::stage::TransformStage;
     use crate::transform::{KeyCaseMode, RecordTransform};
@@ -854,7 +997,7 @@ mod tests {
 
     #[cfg(feature = "transform-explode")]
     #[tokio::test]
-    async fn stream_pages_rechunks_explosion_with_bookmark_on_last() {
+    async fn stream_pages_never_splits_a_bookmark_carrying_page() {
         let inner: Box<dyn Source> = Box::new(OnePageSource {
             records: explode_10x_records(100), // 100 → 1000 after explode
             bookmark: Some(json!("bm")),
@@ -867,18 +1010,33 @@ mod tests {
         while let Some(p) = stream.next().await {
             sub_pages.push(p.unwrap());
         }
-        assert_eq!(sub_pages.len(), 5, "1000 records / 200 batch = 5 sub-pages");
-        for (i, p) in sub_pages.iter().enumerate() {
-            assert_eq!(p.records.len(), 200, "sub-page {i} should be size 200");
-            if i < 4 {
-                assert!(
-                    p.bookmark.is_none(),
-                    "non-final sub-page {i} carries no bookmark"
-                );
-            } else {
-                assert_eq!(p.bookmark, Some(json!("bm")), "final sub-page has bookmark");
-            }
+        assert_eq!(
+            sub_pages.len(),
+            1,
+            "a bookmarked page stays one commit unit"
+        );
+        assert_eq!(sub_pages[0].records.len(), 1000);
+        assert_eq!(sub_pages[0].bookmark, Some(json!("bm")));
+    }
+
+    #[cfg(feature = "transform-explode")]
+    #[tokio::test]
+    async fn stream_pages_rechunks_a_grown_page_without_a_bookmark() {
+        let inner: Box<dyn Source> = Box::new(OnePageSource {
+            records: explode_10x_records(100),
+            bookmark: None,
+        });
+        let wrapped =
+            TransformingSource::new(inner, vec![explode_stage()], Labels::for_named("t")).unwrap();
+        let ctx = HashMap::new();
+        let mut stream = wrapped.stream_pages(&ctx, 200);
+        let mut sub_pages: Vec<StreamPage> = Vec::new();
+        while let Some(p) = stream.next().await {
+            sub_pages.push(p.unwrap());
         }
+        assert_eq!(sub_pages.len(), 5, "1000 records / 200 batch = 5 sub-pages");
+        assert!(sub_pages.iter().all(|p| p.records.len() == 200));
+        assert!(sub_pages.iter().all(|p| p.bookmark.is_none()));
     }
 
     #[cfg(feature = "transform-explode")]
