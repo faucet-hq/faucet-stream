@@ -39,6 +39,11 @@ pub struct PartitionChunk {
     pub open_ended: bool,
 }
 
+/// The `${partition.end}` an open-ended final chunk renders: the largest
+/// value, so its predicate (inclusive or half-open) admits every row above the
+/// planned bound.
+pub const UNBOUNDED_END: i64 = i64::MAX;
+
 /// Plan every chunk for `spec`.
 pub fn plan(spec: &PartitionSpec) -> CliResult<Vec<PartitionChunk>> {
     spec.validate()?;
@@ -65,9 +70,10 @@ pub fn plan(spec: &PartitionSpec) -> CliResult<Vec<PartitionChunk>> {
                 .enumerate()
                 .map(|(i, c)| {
                     let open = to_unbounded.unwrap_or(false) && c.is_last;
+                    let end = if open { UNBOUNDED_END } else { c.end };
                     let mut tokens = BTreeMap::new();
                     tokens.insert("start".into(), c.start.to_string());
-                    tokens.insert("end".into(), c.end.to_string());
+                    tokens.insert("end".into(), end.to_string());
                     tokens.insert("index".into(), i.to_string());
                     tokens.insert("id".into(), c.id.clone());
                     PartitionChunk {
@@ -244,6 +250,12 @@ mod tests {
         let chunks = plan(&int_spec(true)).unwrap();
         assert_eq!(chunks.iter().filter(|c| c.open_ended).count(), 1);
         assert!(chunks.last().unwrap().open_ended);
+        assert_eq!(
+            chunks.last().unwrap().tokens["end"],
+            i64::MAX.to_string(),
+            "the open tail renders no real upper bound"
+        );
+        assert_eq!(chunks[1].tokens["end"], "19", "inner chunks keep theirs");
         assert!(has_open_ended(&chunks));
         assert!(!has_open_ended(&plan(&int_spec(false)).unwrap()));
     }

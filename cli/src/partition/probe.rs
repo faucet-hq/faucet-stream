@@ -50,9 +50,21 @@ pub async fn resolve_bounds(spec: &PartitionSpec, auth: &AuthCatalog) -> CliResu
                         p.value_path
                     )));
                 }
+                // A probed bound is the largest existing value; a half-open
+                // range has to end one past it or that row is never read.
+                let to_value = match bounds {
+                    crate::chunking::Bounds::Inclusive => v,
+                    crate::chunking::Bounds::HalfOpen => v.checked_add(1).ok_or_else(|| {
+                        CliError::Config(format!(
+                            "partition: the discovered upper bound ({v}) is the largest \
+                             integer, so a half_open range cannot include it — use \
+                             `bounds: inclusive`"
+                        ))
+                    })?,
+                };
                 PartitionSpec::Integer {
                     from: *from,
-                    to: IntBound::Literal(v),
+                    to: IntBound::Literal(to_value),
                     chunk_size: *chunk_size,
                     bounds: *bounds,
                     // Default the open-ended tail ON for a probed bound: the
@@ -339,6 +351,57 @@ mod tests {
             PartitionSpec::Integer { to_unbounded, .. } => assert_eq!(to_unbounded, Some(false)),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_half_open_probe_ends_one_past_the_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("p.csv");
+        std::fs::write(&csv, "max_id\n5\n").unwrap();
+        let mut p = probe();
+        p.from_source.config = json!({ "path": csv.to_str().unwrap() });
+        let spec = |from: i64| PartitionSpec::Integer {
+            from,
+            to: IntBound::Discovered(p.clone()),
+            chunk_size: 10,
+            bounds: crate::chunking::Bounds::HalfOpen,
+            to_unbounded: Some(false),
+        };
+        let out = resolve_bounds(&spec(0), &AuthCatalog::default())
+            .await
+            .unwrap();
+        match &out {
+            PartitionSpec::Integer { to, .. } => assert_eq!(to, &IntBound::Literal(6)),
+            o => panic!("{o:?}"),
+        }
+        let chunks = crate::partition::plan::plan(&out).unwrap();
+        assert_eq!(chunks.last().unwrap().tokens["end"], "6", "id 5 is read");
+        // A single-row range (from == MAX) is one row, not empty.
+        let single = resolve_bounds(&spec(5), &AuthCatalog::default())
+            .await
+            .unwrap();
+        assert_eq!(crate::partition::plan::plan(&single).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_half_open_probe_at_the_integer_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("p.csv");
+        std::fs::write(&csv, format!("max_id\n{}\n", i64::MAX)).unwrap();
+        let mut p = probe();
+        p.from_source.config = json!({ "path": csv.to_str().unwrap() });
+        let spec = PartitionSpec::Integer {
+            from: 0,
+            to: IntBound::Discovered(p),
+            chunk_size: 10,
+            bounds: crate::chunking::Bounds::HalfOpen,
+            to_unbounded: None,
+        };
+        let err = resolve_bounds(&spec, &AuthCatalog::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bounds: inclusive"), "{err}");
     }
 
     #[tokio::test]

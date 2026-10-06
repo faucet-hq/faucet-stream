@@ -1351,7 +1351,7 @@ partition:
   to: 1000000              # or a probe: { from_source: {…}, value_path: "$.max_id" }
   chunk_size: 10000
   bounds: inclusive        # integer only — REQUIRED, no default
-  to_unbounded: false      # defaults ON when `to` is discovered
+  to_unbounded: false      # defaults ON when `to` is discovered; the last chunk's `end` is then the largest integer
 ```
 
 | Kind | Fields | Tokens |
