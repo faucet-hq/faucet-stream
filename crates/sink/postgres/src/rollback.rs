@@ -12,8 +12,8 @@ use crate::config::PostgresColumnMapping;
 use crate::sink::{PostgresSink, pg_bind_text, qualified_table_ref};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
-    JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, canonical_key,
-    key_json, plan_keys, plan_restore,
+    JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, key_json, plan_keys,
+    plan_restore,
 };
 use faucet_core::util::quote_ident;
 use serde_json::Value;
@@ -112,12 +112,14 @@ impl PostgresSink {
 
         let per = (MAX_PG_PARAMS / key.len().max(1)).max(1);
         for chunk in keys.chunks(per) {
-            // 1) Current rows for the chunk's keys, as JSON.
-            let (predicate, _) = sql.keys_in(key, chunk.len(), 0);
-            let predicate = cast_key_placeholders(&predicate, &key_udts, key.len());
-            let select =
-                format!("SELECT row_to_json(t)::text FROM {table_ref} AS t WHERE {predicate}");
-            let mut q = sqlx::query_scalar::<_, String>(&select);
+            // 1) Current rows for the chunk's keys, as JSON, attributed to each
+            // key by its position: re-deriving the key from the row's text
+            // misses a row whose stored form differs from the record's (an
+            // uppercase UUID, a padded number), and a missed row would be
+            // journaled as created by the run and deleted on rollback
+            // (#789 SQL-32).
+            let select = positional_key_select(&table_ref, key, &key_udts, chunk.len());
+            let mut q = sqlx::query_as::<_, (i32, String)>(&select);
             for kt in chunk {
                 for ((_, v), udt) in kt.0.iter().zip(key_udts.iter()) {
                     q = q.bind(pg_bind_text(Some(v), udt));
@@ -127,13 +129,11 @@ impl PostgresSink {
                 .fetch_all(&mut *conn)
                 .await
                 .map_err(|e| sink_err("read before-images", e))?;
-            let mut before: std::collections::HashMap<String, String> =
+            let mut before: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::with_capacity(rows.len());
-            for text in rows {
-                let row: Value =
-                    serde_json::from_str(&text).map_err(|e| sink_err("decode before-image", e))?;
-                if let Some(kt) = faucet_core::write_mode::record_key(&row, key) {
-                    before.insert(key_json(&canonical_key(&kt)), text);
+            for (idx, text) in rows {
+                if let Ok(idx) = usize::try_from(idx) {
+                    before.insert(idx, text);
                 }
             }
 
@@ -144,9 +144,9 @@ impl PostgresSink {
             );
             let insert = cast_journal_placeholders(&insert, chunk.len());
             let mut q = sqlx::query(&insert);
-            for kt in chunk {
+            for (idx, kt) in chunk.iter().enumerate() {
                 let kj = key_json(kt);
-                let img = before.get(&kj).cloned();
+                let img = before.get(&idx).cloned();
                 q = q
                     .bind(run_id)
                     .bind(&self.config.table_name)
@@ -613,6 +613,42 @@ fn cast_key_placeholders(predicate: &str, key_udts: &[String], key_len: usize) -
         }
     }
     out
+}
+
+/// `SELECT idx, row_to_json(t)` over a `VALUES (idx, key…)` list joined to
+/// the target, so each current row comes back tagged with the position of the
+/// key that matched it.
+fn positional_key_select(
+    table_ref: &str,
+    key: &[String],
+    key_udts: &[String],
+    rows: usize,
+) -> String {
+    let mut values = Vec::with_capacity(rows);
+    let mut p = 1;
+    for idx in 0..rows {
+        let mut cells = vec![idx.to_string()];
+        for udt in key_udts {
+            cells.push(format!("${p}::{udt}"));
+            p += 1;
+        }
+        values.push(format!("({})", cells.join(", ")));
+    }
+    let names: Vec<String> = std::iter::once("__faucet_idx".to_string())
+        .chain((0..key.len()).map(|i| format!("__faucet_k{i}")))
+        .collect();
+    let join: Vec<String> = key
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("t.{} = v.__faucet_k{i}", quote_ident(k)))
+        .collect();
+    format!(
+        "SELECT v.__faucet_idx, row_to_json(t)::text FROM (VALUES {}) AS v({}) \
+         JOIN {table_ref} AS t ON {}",
+        values.join(", "),
+        names.join(", "),
+        join.join(" AND ")
+    )
 }
 
 /// The journal insert binds `before_json` as text; cast it to `jsonb`.

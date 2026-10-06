@@ -1347,6 +1347,12 @@ impl faucet_core::Sink for MysqlSink {
     /// qualifier to thread. `DATA_TYPE` / `IS_NULLABLE` round-trip through
     /// `mysql_data_type_to_json_schema`.
     async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
+        // JSON-column mode stores each record whole; the physical columns are
+        // not the record's fields, so there is nothing to drift against
+        // (#789 SQL-20).
+        if !matches!(self.config.column_mapping, MysqlColumnMapping::AutoMap) {
+            return Ok(None);
+        }
         let columns = self.read_columns().await?;
         if columns.is_empty() {
             return Ok(None); // table does not exist yet

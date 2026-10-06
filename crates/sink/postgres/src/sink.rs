@@ -31,6 +31,8 @@ pub(crate) fn pg_bind_text(value: Option<&Value>, udt: &str) -> Option<String> {
         Some(v) => {
             if udt.eq_ignore_ascii_case("json") || udt.eq_ignore_ascii_case("jsonb") {
                 Some(v.to_string())
+            } else if let (true, Value::String(s)) = (udt.eq_ignore_ascii_case("bytea"), v) {
+                Some(bytea_text(s))
             } else {
                 match v {
                     Value::Bool(b) => Some(b.to_string()),
@@ -43,6 +45,33 @@ pub(crate) fn pg_bind_text(value: Option<&Value>, udt: &str) -> Option<String> {
                 }
             }
         }
+    }
+}
+
+/// The `bytea` input text for a string value (#789 SQL-02).
+///
+/// Every faucet source emits binary as base64 text, and `'SGVsbG8='::bytea`
+/// reads it as escape format — storing the eight ASCII bytes of the base64
+/// spelling. Valid base64 is decoded and rendered as the `\x…` hex input form;
+/// text already in hex form, or that is not base64, is passed through as
+/// before.
+fn bytea_text(s: &str) -> String {
+    use base64::Engine as _;
+    if s.starts_with("\\x") {
+        return s.to_string();
+    }
+    match base64::engine::general_purpose::STANDARD.decode(s) {
+        Ok(bytes) => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut out = String::with_capacity(2 + bytes.len() * 2);
+            out.push_str("\\x");
+            for b in bytes {
+                out.push(HEX[usize::from(b >> 4)] as char);
+                out.push(HEX[usize::from(b & 0x0f)] as char);
+            }
+            out
+        }
+        Err(_) => s.to_string(),
     }
 }
 
@@ -553,16 +582,61 @@ impl PostgresSink {
             return Ok(0);
         }
 
-        // Table columns (in declared order, with their udt) present in at least
-        // one record.
-        let insert_columns: Vec<(String, String)> = columns
-            .iter()
-            .filter(|(c, _)| used.contains(c.as_str()))
-            .cloned()
-            .collect();
-
-        let num_cols = insert_columns.len();
         let num_rows = matched_rows.len();
+        match conflict_key {
+            // An upsert writes each row's own columns only: binding NULL for a
+            // column a row omits would overwrite a stored value — an unchanged
+            // TOAST column a CDC event leaves out (#789 SQL-09). Rows are
+            // grouped by the set of columns they carry, one statement each.
+            Some(_) => {
+                let mut groups: Vec<(Vec<usize>, Vec<&Vec<(&String, &String, &Value)>>)> =
+                    Vec::new();
+                for row in &matched_rows {
+                    let present: Vec<usize> = columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (c, _))| row.iter().any(|(rc, _, _)| *rc == c))
+                        .map(|(i, _)| i)
+                        .collect();
+                    match groups.iter_mut().find(|(p, _)| *p == present) {
+                        Some((_, rows)) => rows.push(row),
+                        None => groups.push((present, vec![row])),
+                    }
+                }
+                for (present, rows) in groups {
+                    let insert_columns: Vec<(String, String)> =
+                        present.iter().map(|i| columns[*i].clone()).collect();
+                    self.insert_rows(conn, &table_ref, &insert_columns, &rows, conflict_key)
+                        .await?;
+                }
+            }
+            None => {
+                // Table columns (in declared order, with their udt) present in
+                // at least one record; a row missing one binds SQL NULL.
+                let insert_columns: Vec<(String, String)> = columns
+                    .iter()
+                    .filter(|(c, _)| used.contains(c.as_str()))
+                    .cloned()
+                    .collect();
+                let rows: Vec<&Vec<(&String, &String, &Value)>> = matched_rows.iter().collect();
+                self.insert_rows(conn, &table_ref, &insert_columns, &rows, None)
+                    .await?;
+            }
+        }
+        Ok(num_rows)
+    }
+
+    /// One multi-row `INSERT` (chunked under the bind-parameter cap) of `rows`
+    /// over `insert_columns`, with the upsert tail when `conflict_key` is set.
+    async fn insert_rows(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        table_ref: &str,
+        insert_columns: &[(String, String)],
+        rows: &[&Vec<(&String, &String, &Value)>],
+        conflict_key: Option<&[String]>,
+    ) -> Result<(), FaucetError> {
+        let num_cols = insert_columns.len();
         let col_names: Vec<String> = insert_columns.iter().map(|(c, _)| quote_ident(c)).collect();
 
         // PostgreSQL caps bind parameters per statement at 65535. A multi-row
@@ -572,7 +646,7 @@ impl PostgresSink {
         const MAX_PG_PARAMS: usize = 65535;
         let max_rows_per_insert = (MAX_PG_PARAMS / num_cols).max(1);
 
-        for sub in matched_rows.chunks(max_rows_per_insert) {
+        for sub in rows.chunks(max_rows_per_insert) {
             // Build multi-row VALUES clause with per-column casts so the column
             // type's input function parses the bound text:
             //   ($1::int4, $2::timestamptz), ($3::int4, $4::timestamptz), ...
@@ -608,9 +682,8 @@ impl PostgresSink {
             let mut q = sqlx::query(&query);
             for matched in sub {
                 // Bind values in the fixed column order, as text matching each
-                // column's type. A record missing a column that appeared in the
-                // first record binds SQL NULL.
-                for (col, udt) in &insert_columns {
+                // column's type. A record missing a column binds SQL NULL.
+                for (col, udt) in insert_columns {
                     let val = matched
                         .iter()
                         .find(|(c, _, _)| *c == col)
@@ -623,8 +696,7 @@ impl PostgresSink {
                 .await
                 .map_err(|e| FaucetError::Sink(format!("PostgreSQL insert failed: {e}")))?;
         }
-
-        Ok(num_rows)
+        Ok(())
     }
 
     /// Insert a batch of records using auto-mapped columns, on the given
@@ -1140,6 +1212,12 @@ impl faucet_core::Sink for PostgresSink {
     /// relation via `to_regclass`), additionally reading `a.attnotnull` so
     /// nullability round-trips through `pg_udt_to_json_schema`.
     async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
+        // JSON-column mode stores each record whole; the physical columns are
+        // not the record's fields, so there is nothing to drift against
+        // (#789 SQL-20).
+        if !matches!(self.config.column_mapping, PostgresColumnMapping::AutoMap) {
+            return Ok(None);
+        }
         let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
         let rows: Vec<(String, String, bool)> = sqlx::query(
             "SELECT a.attname::text AS column_name, t.typname::text AS udt_name, a.attnotnull \
