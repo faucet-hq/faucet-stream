@@ -24,22 +24,18 @@ fn scope_key(scope: &str) -> String {
     faucet_core::idempotency::scope_key(scope, SCOPE_COL_WIDTH)
 }
 
-use crate::coltype::{COLUMN_INFO_SQL, ColumnInfo, binary_flags, casts_for};
+use crate::coltype::{COLUMN_INFO_SQL, ColumnInfo};
 use crate::config::{MssqlColumnMapping, MssqlSinkConfig};
 use crate::encode::{
-    BoundParam, auto_row_params_typed, build_cleanup_delete_sql, build_cleanup_key_insert_sql,
-    build_cleanup_temp_create_sql, build_cleanup_temp_drop_sql, build_insert_sql_cast,
-    build_merge_cast, build_merge_delete_cast, group_by_present_columns, max_rows_per_insert,
-    resolve_insert_columns,
+    BoundParam, build_cleanup_delete_sql, build_cleanup_temp_create_sql,
+    build_cleanup_temp_drop_sql, max_rows_per_insert,
 };
 
-/// One chunk ready to bind: the column list, each column's `CAST` target, and
-/// the per-row parameters.
-pub(crate) struct Prepared {
-    pub(crate) cols: Vec<String>,
-    pub(crate) casts: Vec<Option<String>>,
-    pub(crate) rows: Vec<Vec<BoundParam>>,
-}
+pub(crate) use crate::statements::Prepared;
+use crate::statements::{
+    cleanup_key_typing, delete_statements, insert_statements, insertable, key_load_statements,
+    merge_statements, poison_check, prepare_rows, with_timeout, writable,
+};
 
 /// Microsoft SQL Server sink.
 pub struct MssqlSink {
@@ -277,26 +273,17 @@ impl MssqlSink {
         } else {
             self.config.table.clone()
         };
-        let infos = self.fetch_column_infos(&effective).await?;
-        if !infos.iter().any(|c| !c.is_identity) {
-            return Err(FaucetError::Sink(format!(
-                "MSSQL table '{}' has no writable columns or does not exist",
-                self.config.table
-            )));
-        }
+        let infos = writable(
+            self.fetch_column_infos(&effective).await?,
+            &self.config.table,
+        )?;
         *self.columns_cache.lock().expect("columns mutex") = Some(infos.clone());
         Ok(infos)
     }
 
     /// Writable (non-IDENTITY) column names, in table order.
     async fn insertable_columns(&self) -> Result<Vec<String>, FaucetError> {
-        Ok(self
-            .column_infos()
-            .await?
-            .into_iter()
-            .filter(|c| !c.is_identity)
-            .map(|c| c.name)
-            .collect())
+        Ok(insertable(&self.column_infos().await?))
     }
 
     /// Every column of `table` as `sys.columns` declares it, in column order;
@@ -340,14 +327,7 @@ impl MssqlSink {
 
     /// Fail every write once a desynced connection could not be replaced.
     fn check_poisoned(&self) -> Result<(), FaucetError> {
-        if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(FaucetError::Sink(
-                "MSSQL: an earlier statement timed out and its connection could not be \
-                 replaced; it may hold an open transaction, so no further write is safe"
-                    .into(),
-            ));
-        }
-        Ok(())
+        poison_check(self.poisoned.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// A statement timed out: the connection may still be running it inside an
@@ -378,50 +358,11 @@ impl MssqlSink {
     /// Returns `None` when there is nothing to insert (e.g. auto_columns with no
     /// matching keys).
     async fn prepare_chunk(&self, chunk: &[Value]) -> Result<Option<Prepared>, FaucetError> {
-        match &self.config.column_mapping {
-            MssqlColumnMapping::JsonColumn { column } => {
-                let cols = vec![column.clone()];
-                let rows: Vec<Vec<BoundParam>> = chunk
-                    .iter()
-                    .map(|r| {
-                        serde_json::to_string(r)
-                            .map(|s| vec![BoundParam::Str(s)])
-                            .map_err(|e| {
-                                FaucetError::Sink(format!(
-                                    "MSSQL json_column: failed to serialize record to JSON: {e}"
-                                ))
-                            })
-                    })
-                    .collect::<Result<_, _>>()?;
-                Ok(Some(Prepared {
-                    cols,
-                    casts: Vec::new(),
-                    rows,
-                }))
-            }
-            MssqlColumnMapping::AutoColumns { on_unknown_field } => {
-                let infos = self.column_infos().await?;
-                let insertable: Vec<String> = infos
-                    .iter()
-                    .filter(|c| !c.is_identity)
-                    .map(|c| c.name.clone())
-                    .collect();
-                let cols = resolve_insert_columns(&insertable, chunk, *on_unknown_field)?;
-                if cols.is_empty() {
-                    return Ok(None);
-                }
-                let binary = binary_flags(&infos, &cols);
-                let rows: Vec<Vec<BoundParam>> = chunk
-                    .iter()
-                    .map(|r| auto_row_params_typed(r, &cols, &binary))
-                    .collect();
-                Ok(Some(Prepared {
-                    casts: casts_for(&infos, &cols),
-                    cols,
-                    rows,
-                }))
-            }
-        }
+        let infos = match &self.config.column_mapping {
+            MssqlColumnMapping::AutoColumns { .. } => self.column_infos().await?,
+            MssqlColumnMapping::JsonColumn { .. } => Vec::new(),
+        };
+        prepare_rows(&self.config.column_mapping, &infos, chunk)
     }
 
     /// Insert rows within an **already-open** transaction — caller owns
@@ -449,15 +390,13 @@ impl MssqlSink {
             .map(|c| quote_ident_mssql(c))
             .collect::<Result<_, _>>()
             .map_err(|e| (e, false))?;
-        let per_insert = max_rows_per_insert(cols_quoted.len());
-        for sub in rows.chunks(per_insert) {
-            let sql = build_insert_sql_cast(
-                self.effective_table_quoted(),
-                &cols_quoted,
-                casts,
-                sub.len(),
-            );
-            let owned: Vec<&BoundParam> = sub.iter().flatten().collect();
+        for (sql, range) in insert_statements(
+            self.effective_table_quoted(),
+            &cols_quoted,
+            casts,
+            rows.len(),
+        ) {
+            let owned: Vec<&BoundParam> = rows[range].iter().flatten().collect();
             let refs: Vec<&dyn ToSql> = owned.iter().map(|p| p.as_tosql()).collect();
             let exec = async {
                 conn.execute(sql.as_str(), &refs)
@@ -465,22 +404,13 @@ impl MssqlSink {
                     .map(|_| ())
                     .map_err(|e| FaucetError::Sink(format!("MSSQL insert failed: {e}")))
             };
-            // On timeout the `exec` future is dropped mid-TDS, desyncing the
-            // connection — the caller must NOT issue ROLLBACK on it (mirrors
-            // `insert_chunk`).
-            let (result, timed_out) = match self.timeout() {
-                Some(t) => match tokio::time::timeout(t, exec).await {
-                    Ok(inner) => (inner, false),
-                    Err(_) => (
-                        Err(FaucetError::Sink("MSSQL insert timed out".into())),
-                        true,
-                    ),
-                },
-                None => (exec.await, false),
-            };
-            if let Err(e) = result {
-                return Err((e, timed_out));
-            }
+            // On timeout the connection is desynced; the caller must NOT issue
+            // ROLLBACK on it (mirrors `insert_chunk`).
+            let (result, timed_out) = with_timeout(self.timeout(), exec, || {
+                FaucetError::Sink("MSSQL insert timed out".into())
+            })
+            .await;
+            result.map_err(|e| (e, timed_out))?;
         }
         Ok(rows.len())
     }
@@ -537,14 +467,13 @@ impl MssqlSink {
             control(conn, "BEGIN TRAN").await?;
         }
 
-        for sub in rows.chunks(per_insert) {
-            let sql = build_insert_sql_cast(
-                self.effective_table_quoted(),
-                &cols_quoted,
-                casts,
-                sub.len(),
-            );
-            let owned: Vec<&BoundParam> = sub.iter().flatten().collect();
+        for (sql, range) in insert_statements(
+            self.effective_table_quoted(),
+            &cols_quoted,
+            casts,
+            rows.len(),
+        ) {
+            let owned: Vec<&BoundParam> = rows[range].iter().flatten().collect();
             let refs: Vec<&dyn ToSql> = owned.iter().map(|p| p.as_tosql()).collect();
 
             let exec = async {
@@ -566,17 +495,11 @@ impl MssqlSink {
             // pool helper's contract is "drop it"). Issuing ROLLBACK on it would
             // run on a corrupt stream. A *normal* error leaves the connection in
             // sync, so ROLLBACK is safe and releases the transaction promptly.
-            let (result, timed_out) = match self.timeout() {
-                Some(t) => match tokio::time::timeout(t, exec).await {
-                    Ok(inner) => (inner, false),
-                    Err(_) => (
-                        // Outcome unknown: the server may have committed.
-                        Err(FaucetError::Sink("MSSQL insert timed out".into()).into()),
-                        true,
-                    ),
-                },
-                None => (exec.await, false),
-            };
+            // Outcome unknown on timeout: the server may have committed.
+            let (result, timed_out) = with_timeout(self.timeout(), exec, || {
+                FaucetError::Sink("MSSQL insert timed out".into()).into()
+            })
+            .await;
             if let Err(e) = result {
                 if timed_out {
                     self.recover_desynced(conn).await;
@@ -613,14 +536,11 @@ impl MssqlSink {
                 .map(|r| r.total())
                 .map_err(|e| FaucetError::Sink(format!("MSSQL {what} failed: {e}")))
         };
-        match self.timeout() {
-            Some(t) => match tokio::time::timeout(t, exec).await {
-                Ok(Ok(n)) => Ok(n),
-                Ok(Err(e)) => Err((e, false)),
-                Err(_) => Err((FaucetError::Sink(format!("MSSQL {what} timed out")), true)),
-            },
-            None => exec.await.map_err(|e| (e, false)),
-        }
+        let (result, timed_out) = with_timeout(self.timeout(), exec, || {
+            FaucetError::Sink(format!("MSSQL {what} timed out"))
+        })
+        .await;
+        result.map_err(|e| (e, timed_out))
     }
 
     /// Run a single `MERGE`-upsert / `MERGE`-delete statement (see
@@ -655,43 +575,17 @@ impl MssqlSink {
             ));
         };
         let infos = self.column_infos().await.map_err(|e| (e, false))?;
-        let insertable: Vec<String> = infos
-            .iter()
-            .filter(|c| !c.is_identity)
-            .map(|c| c.name.clone())
-            .collect();
-        let cols = resolve_insert_columns(&insertable, upserts, *on_unknown_field)
-            .map_err(|e| (e, false))?;
-        if cols.is_empty() {
-            return Ok(0);
-        }
-        // One MERGE per set of carried columns, so an absent column is left
-        // untouched rather than set to NULL (SQL-10).
-        for (cols, rows) in group_by_present_columns(upserts, &cols) {
-            if cols.is_empty() {
-                continue;
-            }
-            let casts = casts_for(&infos, &cols);
-            let binary = binary_flags(&infos, &cols);
-            let per_insert = max_rows_per_insert(cols.len());
-            for sub in rows.chunks(per_insert) {
-                let sql = build_merge_cast(
-                    &self.table_quoted,
-                    &self.config.write.key,
-                    &cols,
-                    &casts,
-                    sub.len(),
-                )
-                .map_err(|e| (e, false))?;
-                // Bind every row's params concatenated row-major — matches the
-                // @PN numbering build_merge emits.
-                let owned: Vec<BoundParam> = sub
-                    .iter()
-                    .flat_map(|r| auto_row_params_typed(r, &cols, &binary))
-                    .collect();
-                let refs: Vec<&dyn ToSql> = owned.iter().map(|p| p.as_tosql()).collect();
-                self.exec_merge(conn, &sql, &refs).await?;
-            }
+        let statements = merge_statements(
+            &self.table_quoted,
+            &self.config.write.key,
+            &infos,
+            *on_unknown_field,
+            upserts,
+        )
+        .map_err(|e| (e, false))?;
+        for st in &statements {
+            let refs: Vec<&dyn ToSql> = st.params.iter().map(|p| p.as_tosql()).collect();
+            self.exec_merge(conn, &st.sql, &refs).await?;
         }
         Ok(upserts.len())
     }
@@ -707,25 +601,13 @@ impl MssqlSink {
         if deletes.is_empty() {
             return Ok(0);
         }
-        let key = &self.config.write.key;
         let infos = self.column_infos().await.map_err(|e| (e, false))?;
-        let casts = casts_for(&infos, key);
-        let binary = binary_flags(&infos, key);
-        let per = max_rows_per_insert(key.len());
-        for chunk in deletes.chunks(per) {
-            let sql = build_merge_delete_cast(&self.table_quoted, key, &casts, chunk.len())
+        let statements =
+            delete_statements(&self.table_quoted, &self.config.write.key, &infos, deletes)
                 .map_err(|e| (e, false))?;
-            // Bind each tuple's values in key order, row-major.
-            let owned: Vec<BoundParam> = chunk
-                .iter()
-                .flat_map(|kt| {
-                    kt.0.iter()
-                        .enumerate()
-                        .map(|(i, (_, v))| BoundParam::for_column(v, binary[i]))
-                })
-                .collect();
-            let refs: Vec<&dyn ToSql> = owned.iter().map(|p| p.as_tosql()).collect();
-            self.exec_merge(conn, &sql, &refs).await?;
+        for st in &statements {
+            let refs: Vec<&dyn ToSql> = st.params.iter().map(|p| p.as_tosql()).collect();
+            self.exec_merge(conn, &st.sql, &refs).await?;
         }
         Ok(deletes.len())
     }
@@ -784,28 +666,8 @@ impl MssqlSink {
         // `discover_column_types` takes its own connection from the pool, and
         // nesting the two would deadlock a `max_connections: 1` pool.
         let live_infos = self.discover_column_types().await?;
-        let live: std::collections::HashSet<String> =
-            live_infos.iter().map(|c| c.name.clone()).collect();
-        let key_casts = casts_for(&live_infos, key);
-        let key_binary = binary_flags(&live_infos, key);
-        if live.is_empty() {
-            return Err(FaucetError::Sink(format!(
-                "cleanup: MSSQL table '{}' has no columns or does not exist",
-                self.config.table
-            )));
-        }
-        // Fail with a clear message rather than letting SQL Server reject an
-        // unknown column mid-DELETE. The scope is written in *destination* terms,
-        // so a name that isn't a real column is a config error worth naming.
-        for col in scope.keys().chain(key.iter()) {
-            if !live.contains(col) {
-                return Err(FaucetError::Sink(format!(
-                    "cleanup: column '{col}' does not exist on {} — the completeness \
-                     claim and `key` are in destination column terms",
-                    self.config.table
-                )));
-            }
-        }
+        let (key_casts, key_binary) =
+            cleanup_key_typing(&live_infos, scope.keys(), key, &self.config.table)?;
 
         // Build every statement up front so an identifier-quoting failure can
         // never leave a transaction open on a pooled connection.
@@ -881,22 +743,11 @@ impl MssqlSink {
         // Load the written keys, chunked to stay inside MSSQL's 2100-parameter
         // and 1000-row-values ceilings. An empty set loads nothing and leaves the
         // `DELETE` below to remove the whole scope — the motivating case.
-        let per = max_rows_per_insert(key.len());
-        for chunk in seen.keys().chunks(per) {
-            let sql = build_cleanup_key_insert_sql(key, stmts.key_casts, chunk.len())
-                .map_err(|e| (e, false))?;
-            // Bind each tuple's values in key order, row-major — matching the @PN
-            // numbering `build_cleanup_key_insert_sql` emits.
-            let owned: Vec<BoundParam> = chunk
-                .iter()
-                .flat_map(|kt| {
-                    kt.0.iter()
-                        .enumerate()
-                        .map(|(i, (_, v))| BoundParam::for_column(v, stmts.key_binary[i]))
-                })
-                .collect();
-            let refs: Vec<&dyn ToSql> = owned.iter().map(|p| p.as_tosql()).collect();
-            self.exec_params(conn, &sql, &refs, "cleanup key load")
+        let loads = key_load_statements(key, stmts.key_casts, stmts.key_binary, seen.keys())
+            .map_err(|e| (e, false))?;
+        for st in &loads {
+            let refs: Vec<&dyn ToSql> = st.params.iter().map(|p| p.as_tosql()).collect();
+            self.exec_params(conn, &st.sql, &refs, "cleanup key load")
                 .await?;
         }
 

@@ -34,6 +34,7 @@ mod sink;
 mod staged;
 #[cfg(feature = "staging")]
 mod staged_exec;
+mod statements;
 
 pub use config::{MssqlColumnMapping, MssqlSinkConfig, OnUnknownField};
 pub use sink::MssqlSink;
