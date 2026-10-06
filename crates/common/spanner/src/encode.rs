@@ -229,7 +229,7 @@ mod tests {
         let st = |s: &str| Kind::StringValue(s.into());
         let canon = |s: &str, ty: &SpannerType| match canonical_kind(st(s), ty) {
             Kind::StringValue(v) => v,
-            other => panic!("{other:?}"),
+            other => format!("{other:?}"),
         };
         assert_eq!(canon("007", &SpannerType::Int64), "7");
         assert_eq!(canon("-42", &SpannerType::Int64), "-42");

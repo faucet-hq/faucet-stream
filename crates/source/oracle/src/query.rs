@@ -115,6 +115,18 @@ pub(crate) enum OwnedBind {
     TimestampTz(chrono::DateTime<chrono::FixedOffset>),
 }
 
+/// Each resolved bind paired with its owned value, typed by its name
+/// (`:bookmark` binds a timestamp-shaped bookmark as a timestamp, SQL-41).
+pub(crate) fn owned_binds(binds: Vec<(String, Value)>) -> Vec<(String, OwnedBind)> {
+    binds
+        .into_iter()
+        .map(|(n, v)| {
+            let bind = OwnedBind::for_name(&n, &v);
+            (n, bind)
+        })
+        .collect()
+}
+
 impl OwnedBind {
     pub fn from_value(v: &Value) -> Self {
         match v {
@@ -290,12 +302,10 @@ mod tests {
             OwnedBind::for_bookmark(&json!("2024-03-01T12:30:45.123456")),
             OwnedBind::Timestamp(t) if t.and_utc().timestamp_subsec_micros() == 123_456
         ));
-        let OwnedBind::TimestampTz(tz) =
-            OwnedBind::for_bookmark(&json!("2024-03-01T12:30:45.5+05:30"))
-        else {
-            panic!("offset kept");
-        };
-        assert_eq!(tz.offset().local_minus_utc(), 5 * 3600 + 1800);
+        assert!(matches!(
+            OwnedBind::for_bookmark(&json!("2024-03-01T12:30:45.5+05:30")),
+            OwnedBind::TimestampTz(tz) if tz.offset().local_minus_utc() == 5 * 3600 + 1800
+        ));
         assert!(matches!(
             OwnedBind::for_bookmark(&json!("2024-03-01T12:30:45Z")),
             OwnedBind::TimestampTz(_)
@@ -487,5 +497,15 @@ mod tests {
         assert_eq!(ds[0].estimated_rows, None);
         assert!(descriptors_from_catalog(vec![row("A\"", "T", "ID", "NUMBER", None)]).is_err());
         assert!(descriptors_from_catalog(Vec::new()).unwrap().is_empty());
+    }
+    #[test]
+    fn owned_binds_keep_names_and_type_each_value() {
+        let got = owned_binds(vec![
+            ("bookmark".into(), json!("2024-03-01T00:00:00")),
+            ("n".into(), json!(1)),
+        ]);
+        assert_eq!(got[0].0, "bookmark");
+        assert!(matches!(got[0].1, OwnedBind::Timestamp(_)));
+        assert_eq!(got[1].1, OwnedBind::Int(1));
     }
 }
