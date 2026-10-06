@@ -141,3 +141,57 @@ async fn exactly_once_round_trip_and_no_duplicates_on_resume() {
         Some(format_token(2))
     );
 }
+
+/// Two environments that share a pipeline/row scope on one cluster but use
+/// distinct `transactional_id_prefix`es never read each other's commit token
+/// (MSG-16). A prefixed sink still reads a pre-prefix (bare-scope) token until
+/// it writes its own.
+#[tokio::test]
+async fn a_transactional_id_prefix_isolates_commit_tokens() {
+    let (_container, brokers) = start_kafka().await;
+    let scope = "shared::row0";
+    let with_prefix = |prefix: Option<&str>| {
+        let mut cfg = eo_config(&brokers, "eo_isolated");
+        cfg.transactional_id_prefix = prefix.map(str::to_string);
+        cfg
+    };
+
+    let legacy = KafkaSink::new(with_prefix(None)).await.unwrap();
+    legacy
+        .write_batch_idempotent(&[json!({"id": 1})], scope, &format_token(3))
+        .await
+        .unwrap();
+    legacy.flush().await.unwrap();
+
+    let staging = KafkaSink::new(with_prefix(Some("staging"))).await.unwrap();
+    assert_eq!(
+        staging.last_committed_token(scope).await.unwrap(),
+        Some(format_token(3)),
+        "before its first write a prefixed sink falls back to the bare-scope token"
+    );
+    staging
+        .write_batch_idempotent(&[json!({"id": 2})], scope, &format_token(7))
+        .await
+        .unwrap();
+    staging.flush().await.unwrap();
+
+    let prod = KafkaSink::new(with_prefix(Some("prod"))).await.unwrap();
+    assert_eq!(
+        prod.last_committed_token(scope).await.unwrap(),
+        Some(format_token(3)),
+        "prod never sees staging's token, only the legacy one"
+    );
+    prod.write_batch_idempotent(&[json!({"id": 3})], scope, &format_token(1))
+        .await
+        .unwrap();
+    prod.flush().await.unwrap();
+    assert_eq!(
+        prod.last_committed_token(scope).await.unwrap(),
+        Some(format_token(1)),
+        "prod's own token wins over the legacy one"
+    );
+    assert_eq!(
+        staging.last_committed_token(scope).await.unwrap(),
+        Some(format_token(7))
+    );
+}

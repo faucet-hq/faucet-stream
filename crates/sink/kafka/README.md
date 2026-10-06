@@ -120,7 +120,7 @@ These fields apply only under `delivery: exactly_once` (ignored otherwise). See 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `exactly_once` | block | *(unset)* | Exactly-once knobs, grouped — see below. Only consulted under `delivery: exactly_once`. |
-| `exactly_once.transactional_id_prefix` | string | `"faucet"` | Namespace prefix for the producer's auto-derived `transactional.id` (`"{prefix}.{sanitized_scope}"`). Set it to isolate transactional ids across clusters/environments that share a pipeline-scope namespace. |
+| `exactly_once.transactional_id_prefix` | string | `"faucet"` | Namespace prefix for the producer's auto-derived `transactional.id` (`"{prefix}.{sanitized_scope}"`). Set it to isolate transactional ids across clusters/environments that share a pipeline-scope namespace; with an explicit prefix the commit token is also keyed `"{prefix}.{scope}"` on the side-topic, so environments never read each other's watermark (a pre-prefix bare-scope token is read until the first prefixed write). |
 | `exactly_once.commit_token_topic` | string | `"__faucet_commit_token"` | Compacted side-topic that holds one commit-token record per pipeline scope. Auto-created with `cleanup.policy=compact` if absent. |
 | `exactly_once.commit_token_topic_partitions` | int | `1` | Partition count used when auto-creating the commit-token topic. Must be ≥ 1. |
 | `exactly_once.commit_token_topic_replication` | int | `-1` | Replication factor used when auto-creating the commit-token topic. `-1` means "use the broker default". |
