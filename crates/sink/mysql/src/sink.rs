@@ -202,6 +202,22 @@ pub(crate) fn bind_value<'q>(
     }
 }
 
+/// Whether a MySQL `DATA_TYPE` stores raw bytes.
+fn is_binary_type(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
+    )
+}
+
+/// The bytes of a base64 string — how every faucet source emits binary — for a
+/// binary column (#789 SQL-02). `None` for text that is not base64, which is
+/// bound as text as before.
+fn binary_from_base64(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
 /// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
 ///
 /// `IF NOT EXISTS` rather than probe-then-create: two matrix rows writing the
@@ -266,6 +282,64 @@ fn mysql_keyword(t: SqlBaseType) -> &'static str {
         SqlBaseType::Text => "LONGTEXT",
         SqlBaseType::Json => "JSON",
     }
+}
+
+/// A column's definition as `INFORMATION_SCHEMA.COLUMNS` reports it.
+#[derive(Debug, Clone, Default)]
+struct MysqlColumnDef {
+    column_type: String,
+    charset: Option<String>,
+    collation: Option<String>,
+    default: Option<String>,
+    extra: String,
+    comment: String,
+}
+
+/// `ALTER TABLE … MODIFY COLUMN` that keeps `def` exactly and only drops NOT
+/// NULL. `None` for a generated column, whose definition is not reproduced.
+fn relax_column_sql(table: &str, col: &str, def: &MysqlColumnDef) -> Option<String> {
+    let extra = def.extra.to_ascii_lowercase();
+    if extra.contains("generated") && !extra.contains("default_generated") {
+        return None;
+    }
+    let quote = |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"));
+    let mut sql = format!(
+        "ALTER TABLE {table} MODIFY COLUMN {} {}",
+        quote_ident_mysql(col),
+        def.column_type
+    );
+    if let Some(cs) = &def.charset {
+        sql.push_str(&format!(" CHARACTER SET {cs}"));
+    }
+    if let Some(co) = &def.collation {
+        sql.push_str(&format!(" COLLATE {co}"));
+    }
+    sql.push_str(" NULL");
+    if let Some(d) = &def.default {
+        if extra.contains("default_generated") {
+            let upper = d.to_ascii_uppercase();
+            if upper.starts_with("CURRENT_TIMESTAMP") || upper.starts_with("NOW(") {
+                sql.push_str(&format!(" DEFAULT {d}"));
+            } else {
+                sql.push_str(&format!(" DEFAULT ({d})"));
+            }
+        } else {
+            sql.push_str(&format!(" DEFAULT {}", quote(d)));
+        }
+    }
+    if extra.contains("auto_increment") {
+        sql.push_str(" AUTO_INCREMENT");
+    }
+    if let Some(i) = extra.find("on update ") {
+        sql.push_str(&format!(
+            " ON UPDATE {}",
+            def.extra[i + "on update ".len()..].trim()
+        ));
+    }
+    if !def.comment.is_empty() {
+        sql.push_str(&format!(" COMMENT {}", quote(&def.comment)));
+    }
+    Some(sql)
 }
 
 /// `ALTER TABLE <table> ADD COLUMN `col` <kw>` — column addition.
@@ -648,17 +722,22 @@ impl MysqlSink {
             return Ok(0);
         }
 
-        // Get column names from the table.
+        // Column names and base types, in declared order.
         let effective_table = self.effective_table_name();
-        let columns: Vec<String> = sqlx::query(
-            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION"
+        let columns: Vec<(String, String)> = sqlx::query(
+            "SELECT COLUMN_NAME, CAST(DATA_TYPE AS CHAR) AS DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION"
         )
         .bind(&effective_table)
         .fetch_all(&mut *conn)
         .await
         .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
         .iter()
-        .map(|row| row.get::<String, _>("COLUMN_NAME"))
+        .map(|row| {
+            (
+                row.get::<String, _>("COLUMN_NAME"),
+                row.get::<String, _>("DATA_TYPE").to_ascii_lowercase(),
+            )
+        })
         .collect();
 
         if columns.is_empty() {
@@ -667,13 +746,10 @@ impl MysqlSink {
             )));
         }
 
-        // Pre-validate all records and collect matched column values. The
-        // INSERT column set is the UNION of table columns present in ANY record
-        // (in declared table order), not just the first record's keys —
-        // otherwise a field present only in a later record of the batch would be
-        // silently dropped (audit #146 H1). A row missing a unioned column binds
-        // SQL NULL.
-        let mut matched_rows: Vec<Vec<(&String, &Value)>> = Vec::with_capacity(records.len());
+        // Pre-validate all records and collect matched column values per
+        // record, in declared table order.
+        let mut matched_rows: Vec<Vec<(&String, &String, &Value)>> =
+            Vec::with_capacity(records.len());
         let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         for record in records {
@@ -681,9 +757,9 @@ impl MysqlSink {
                 .as_object()
                 .ok_or_else(|| FaucetError::Sink("AutoMap requires JSON object records".into()))?;
 
-            let matching: Vec<(&String, &Value)> = columns
+            let matching: Vec<(&String, &String, &Value)> = columns
                 .iter()
-                .filter_map(|col| obj.get(col).map(|v| (col, v)))
+                .filter_map(|(col, ty)| obj.get(col).map(|v| (col, ty, v)))
                 .collect();
 
             if matching.is_empty() {
@@ -695,7 +771,7 @@ impl MysqlSink {
                 continue;
             }
 
-            for (c, _) in &matching {
+            for (c, _, _) in &matching {
                 used.insert(c.as_str());
             }
             matched_rows.push(matching);
@@ -705,19 +781,67 @@ impl MysqlSink {
             return Ok(0);
         }
 
-        // Table columns (in declared order) that appear in at least one record.
-        let insert_columns: Vec<String> = columns
-            .iter()
-            .filter(|c| used.contains(c.as_str()))
-            .cloned()
-            .collect();
-
-        let num_cols = insert_columns.len();
         let num_rows = matched_rows.len();
+        match conflict_key {
+            // An upsert writes each row's own columns only: binding NULL for a
+            // column a row omits would overwrite the stored value (#789
+            // SQL-10). Rows are grouped by the set of columns they carry.
+            Some(_) => {
+                let mut groups: Vec<(Vec<usize>, Vec<&Vec<(&String, &String, &Value)>>)> =
+                    Vec::new();
+                for row in &matched_rows {
+                    let present: Vec<usize> = columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (c, _))| row.iter().any(|(rc, _, _)| *rc == c))
+                        .map(|(i, _)| i)
+                        .collect();
+                    match groups.iter_mut().find(|(p, _)| *p == present) {
+                        Some((_, rows)) => rows.push(row),
+                        None => groups.push((present, vec![row])),
+                    }
+                }
+                for (present, rows) in groups {
+                    let insert_columns: Vec<(String, String)> =
+                        present.iter().map(|i| columns[*i].clone()).collect();
+                    self.insert_rows(conn, &effective_table, &insert_columns, &rows, conflict_key)
+                        .await?;
+                }
+            }
+            None => {
+                // The UNION of table columns present in ANY record (in declared
+                // order), not just the first record's keys — otherwise a field
+                // present only in a later record would be silently dropped
+                // (audit #146 H1). A row missing a unioned column binds NULL.
+                let insert_columns: Vec<(String, String)> = columns
+                    .iter()
+                    .filter(|(c, _)| used.contains(c.as_str()))
+                    .cloned()
+                    .collect();
+                let rows: Vec<&Vec<(&String, &String, &Value)>> = matched_rows.iter().collect();
+                self.insert_rows(conn, &effective_table, &insert_columns, &rows, None)
+                    .await?;
+            }
+        }
+        Ok(num_rows)
+    }
+
+    /// One multi-row `INSERT` (chunked under the placeholder cap) of `rows`
+    /// over `insert_columns`, with the upsert tail when `conflict_key` is set.
+    async fn insert_rows(
+        &self,
+        conn: &mut MySqlConnection,
+        table: &str,
+        insert_columns: &[(String, String)],
+        rows: &[&Vec<(&String, &String, &Value)>],
+        conflict_key: Option<&[String]>,
+    ) -> Result<(), FaucetError> {
+        let num_cols = insert_columns.len();
         let col_names: Vec<String> = insert_columns
             .iter()
-            .map(|c| quote_ident_mysql(c))
+            .map(|(c, _)| quote_ident_mysql(c))
             .collect();
+        let names: Vec<String> = insert_columns.iter().map(|(c, _)| c.clone()).collect();
 
         // MySQL caps prepared-statement placeholders at 65535. A multi-row
         // INSERT binds `rows × num_cols`, so a wide table at a large batch_size
@@ -727,47 +851,42 @@ impl MysqlSink {
         const MAX_MYSQL_PARAMS: usize = 65535;
         let max_rows_per_insert = (MAX_MYSQL_PARAMS / num_cols).max(1);
 
-        for sub in matched_rows.chunks(max_rows_per_insert) {
+        for sub in rows.chunks(max_rows_per_insert) {
             // Build multi-row VALUES clause: (?, ?), (?, ?), ...
             let row_placeholder = format!("({})", vec!["?"; num_cols].join(", "));
             let value_tuples: Vec<&str> =
                 (0..sub.len()).map(|_| row_placeholder.as_str()).collect();
             let base_query = format!(
                 "INSERT INTO {} ({}) VALUES {}",
-                quote_ident_mysql(&effective_table),
+                quote_ident_mysql(table),
                 col_names.join(", "),
                 value_tuples.join(", ")
             );
             let query = match conflict_key {
-                Some(key) => format!("{base_query} {}", on_duplicate_clause(key, &insert_columns)),
+                Some(key) => format!("{base_query} {}", on_duplicate_clause(key, &names)),
                 None => base_query,
             };
 
             let mut q = sqlx::query(&query);
             for matched in sub {
-                for col in &insert_columns {
-                    let val = matched.iter().find(|(c, _)| *c == col).map(|(_, v)| *v);
+                for (col, data_type) in insert_columns {
+                    let val = matched
+                        .iter()
+                        .find(|(c, _, _)| *c == col)
+                        .map(|(_, _, v)| *v);
                     // Bind native MySQL types. Binding every value as a JSON string
                     // (the old behaviour) stored `"Bob"` with embedded quotes,
                     // turned `true` into the text "true", and bound the literal
                     // text "null" for absent columns instead of SQL NULL (#78/#4).
                     q = match val {
                         None | Some(Value::Null) => q.bind(None::<String>),
-                        Some(Value::Bool(b)) => q.bind(*b),
-                        Some(Value::Number(n)) => {
-                            if let Some(i) = n.as_i64() {
-                                q.bind(i)
-                            } else if let Some(f) = n.as_f64() {
-                                q.bind(f)
-                            } else {
-                                // u64 above i64::MAX — preserve exact text.
-                                q.bind(n.to_string())
+                        Some(Value::String(s)) if is_binary_type(data_type) => {
+                            match binary_from_base64(s) {
+                                Some(bytes) => q.bind(bytes),
+                                None => q.bind(s.clone()),
                             }
                         }
-                        Some(Value::String(s)) => q.bind(s.clone()),
-                        // Arrays/objects have no scalar SQL representation — store
-                        // their JSON text (suitable for TEXT / JSON columns).
-                        Some(v) => q.bind(v.to_string()),
+                        Some(v) => bind_value(q, v),
                     };
                 }
             }
@@ -776,8 +895,7 @@ impl MysqlSink {
                 .await
                 .map_err(|e| FaucetError::Sink(format!("MySQL insert failed: {e}")))?;
         }
-
-        Ok(num_rows)
+        Ok(())
     }
 
     /// Auto-map insert with plain append semantics (no `ON DUPLICATE KEY`
@@ -1418,22 +1536,42 @@ impl faucet_core::Sink for MysqlSink {
         }
 
         for col in &evolution.relax_nullability {
-            // Re-emit the column as its CURRENT type but explicitly nullable.
-            // MySQL's MODIFY COLUMN requires the full type spec, so map the
-            // column's existing DATA_TYPE back to a base type and re-emit it.
-            let existing_type = current
-                .iter()
-                .find(|(n, _, _)| n == col)
-                .map(|(_, dt, nullable)| {
-                    let fragment = mysql_data_type_to_json_schema(dt, *nullable);
-                    json_schema_base_type(&fragment).unwrap_or(SqlBaseType::Text)
-                })
-                .unwrap_or(SqlBaseType::Text);
-            let sql = format!(
-                "ALTER TABLE {table_ref} MODIFY COLUMN {} {} NULL",
-                quote_ident_mysql(col),
-                mysql_keyword(existing_type)
-            );
+            // MySQL's MODIFY COLUMN replaces the whole definition, so re-emit
+            // the column exactly as it is — type, charset, collation, default,
+            // AUTO_INCREMENT, ON UPDATE, comment — with only NOT NULL dropped
+            // (#789 SQL-33).
+            let row = sqlx::query(
+                "SELECT CAST(COLUMN_TYPE AS CHAR) AS COLUMN_TYPE, \
+                        CAST(CHARACTER_SET_NAME AS CHAR) AS CHARACTER_SET_NAME, \
+                        CAST(COLLATION_NAME AS CHAR) AS COLLATION_NAME, \
+                        CAST(COLUMN_DEFAULT AS CHAR) AS COLUMN_DEFAULT, \
+                        CAST(EXTRA AS CHAR) AS EXTRA, \
+                        CAST(COLUMN_COMMENT AS CHAR) AS COLUMN_COMMENT \
+                   FROM INFORMATION_SCHEMA.COLUMNS \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+            )
+            .bind(&self.config.table_name)
+            .bind(col)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                FaucetError::Sink(format!("MySQL read definition of {col} failed: {e}"))
+            })?;
+            let Some(row) = row else { continue };
+            let def = MysqlColumnDef {
+                column_type: row.get("COLUMN_TYPE"),
+                charset: row.get("CHARACTER_SET_NAME"),
+                collation: row.get("COLLATION_NAME"),
+                default: row.get("COLUMN_DEFAULT"),
+                extra: row.get::<Option<String>, _>("EXTRA").unwrap_or_default(),
+                comment: row
+                    .get::<Option<String>, _>("COLUMN_COMMENT")
+                    .unwrap_or_default(),
+            };
+            let Some(sql) = relax_column_sql(&table_ref, col, &def) else {
+                tracing::warn!(column = %col, "mysql: not relaxing NOT NULL on a generated column");
+                continue;
+            };
             sqlx::query(&sql)
                 .execute(&mut *conn)
                 .await
@@ -1656,6 +1794,83 @@ impl faucet_core::Sink for MysqlSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relax_column_sql_keeps_the_definition() {
+        let def = MysqlColumnDef {
+            column_type: "decimal(12,2)".into(),
+            charset: None,
+            collation: None,
+            default: Some("0.00".into()),
+            extra: String::new(),
+            comment: "it's".into(),
+        };
+        assert_eq!(
+            relax_column_sql("`t`", "amount", &def).as_deref(),
+            Some(
+                "ALTER TABLE `t` MODIFY COLUMN `amount` decimal(12,2) NULL DEFAULT '0.00' COMMENT 'it''s'"
+            )
+        );
+        let def = MysqlColumnDef {
+            column_type: "varchar(20)".into(),
+            charset: Some("utf8mb4".into()),
+            collation: Some("utf8mb4_bin".into()),
+            default: Some("uuid()".into()),
+            extra: "DEFAULT_GENERATED".into(),
+            comment: String::new(),
+        };
+        assert_eq!(
+            relax_column_sql("`t`", "c", &def).as_deref(),
+            Some(
+                "ALTER TABLE `t` MODIFY COLUMN `c` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT (uuid())"
+            )
+        );
+        let def = MysqlColumnDef {
+            column_type: "datetime(3)".into(),
+            default: Some("CURRENT_TIMESTAMP(3)".into()),
+            extra: "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3)".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            relax_column_sql("`t`", "d", &def).as_deref(),
+            Some(
+                "ALTER TABLE `t` MODIFY COLUMN `d` datetime(3) NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
+            )
+        );
+        let def = MysqlColumnDef {
+            column_type: "bigint".into(),
+            extra: "auto_increment".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            relax_column_sql("`t`", "id", &def).as_deref(),
+            Some("ALTER TABLE `t` MODIFY COLUMN `id` bigint NULL AUTO_INCREMENT")
+        );
+        let def = MysqlColumnDef {
+            column_type: "int".into(),
+            extra: "VIRTUAL GENERATED".into(),
+            ..Default::default()
+        };
+        assert_eq!(relax_column_sql("`t`", "g", &def), None);
+        let def = MysqlColumnDef {
+            column_type: "varchar(5)".into(),
+            default: Some("a\\b".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            relax_column_sql("`t`", "s", &def).as_deref(),
+            Some("ALTER TABLE `t` MODIFY COLUMN `s` varchar(5) NULL DEFAULT 'a\\\\b'")
+        );
+    }
+
+    #[test]
+    fn binary_columns_take_base64_as_bytes() {
+        assert!(is_binary_type("varbinary"));
+        assert!(is_binary_type("longblob"));
+        assert!(!is_binary_type("text"));
+        assert_eq!(binary_from_base64("SGVsbG8="), Some(b"Hello".to_vec()));
+        assert_eq!(binary_from_base64("not base64!"), None);
+    }
 
     // dataset_uri test is skipped: MysqlSink::new() requires a live pool
     // (connects to MySQL in new()), and no offline constructor exists.

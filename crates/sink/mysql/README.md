@@ -95,7 +95,7 @@ faucet run pipeline.yaml
 | Variant | YAML | Description |
 |---------|------|-------------|
 | `Json { column }` | `column_mapping: { json: { column: data } }` | Insert each record as a serialized JSON string in one column (defaults to `data`). Uses `INSERT INTO t (col) VALUES (?), (?), ...`. |
-| `AutoMap` | `column_mapping: auto_map` | Map top-level JSON keys directly to table columns discovered from `INFORMATION_SCHEMA.COLUMNS`. The INSERT column set is the **union** of record keys across the batch (a field present only in a later record is still written; a row missing a column binds SQL `NULL`). Extra keys with no matching column are silently ignored; records with no matching keys are skipped with a warning. |
+| `AutoMap` | `column_mapping: auto_map` | Map top-level JSON keys directly to table columns discovered from `INFORMATION_SCHEMA.COLUMNS`. The INSERT column set is the **union** of record keys across the batch (a field present only in a later record is still written; on an append a row missing a column binds SQL `NULL`, while an **upsert** writes each row's own columns only, so a column a row omits keeps its stored value). A base64 string bound to a `BINARY`/`VARBINARY`/`BLOB` column is stored as its decoded bytes — how every faucet source emits binary; other text is bound as is. Extra keys with no matching column are silently ignored; records with no matching keys are skipped with a warning. |
 
 ## Examples
 
@@ -280,13 +280,13 @@ See the [effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/co
 
 ## Schema evolution
 
-`MysqlSink` reports its live destination schema via `current_schema()` (read from `INFORMATION_SCHEMA.COLUMNS`, including `IS_NULLABLE`), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
+`MysqlSink` reports its live destination schema via `current_schema()` (read from `INFORMATION_SCHEMA.COLUMNS`, including `IS_NULLABLE`), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink in `auto_map` mode; in JSON-column mode the table's columns are not the record's fields, so the sink reports no schema and a `schema:` policy is inert.
 
 Under `on_drift: evolve`, `MysqlSink::evolve_schema()` applies additive DDL:
 
 - **New columns** → `ADD COLUMN`. MySQL has no `ADD COLUMN IF NOT EXISTS`, so the current column set is read first and an `ADD COLUMN` is emitted only for names not already present (idempotent by pre-check).
 - **Lossless widenings** (e.g. integer → number) → `MODIFY COLUMN` — gated on `allow_type_widening`; re-running the same `MODIFY` is a no-op.
-- **Nullability relaxations** → the column is re-emitted at its current mapped type with an explicit `NULL` (`MODIFY COLUMN`).
+- **Nullability relaxations** → `MODIFY COLUMN` re-emits the column's exact definition from `INFORMATION_SCHEMA.COLUMNS` — `COLUMN_TYPE` (so `DECIMAL(12,2)` stays `DECIMAL(12,2)`), character set and collation, default (an expression default stays an expression), `AUTO_INCREMENT`, `ON UPDATE` and comment — with `NOT NULL` replaced by `NULL`. A generated column is left as it is.
 
 Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
 
