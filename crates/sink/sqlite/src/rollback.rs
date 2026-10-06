@@ -199,6 +199,40 @@ impl SqliteSink {
         Ok(total)
     }
 
+    /// Journaled keys with a before-image whose row is gone. Only called when
+    /// a later run wrote the table: such a key was deleted by it, and restoring
+    /// the before-image would resurrect it.
+    async fn count_vanished(
+        &self,
+        tx: &mut Tx<'_>,
+        entries: &[JournalEntry],
+    ) -> Result<u64, FaucetError> {
+        let restorable = faucet_core::rollback::restorable(entries);
+        if restorable.is_empty() {
+            return Ok(0);
+        }
+        let key = &self.config.write.key;
+        let table_ref = quote_ident(&self.config.table_name);
+        let sql = journal_sql();
+        let per = (MAX_SQLITE_PARAMS / key.len().max(1)).max(1);
+        let mut present = 0u64;
+        for chunk in restorable.chunks(per) {
+            let (predicate, _) = sql.keys_in(key, chunk.len(), 0);
+            let count_sql = format!("SELECT count(*) FROM {table_ref} WHERE {predicate}");
+            let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
+            for e in chunk {
+                for (_, v) in &e.tuple(key).0 {
+                    q = bind_key_value_scalar(q, v);
+                }
+            }
+            present += q
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|e| sink_err("count vanished keys", e))? as u64;
+        }
+        Ok((restorable.len() as u64).saturating_sub(present))
+    }
+
     pub(crate) fn rollback_supported(&self) -> bool {
         matches!(self.config.column_mapping, SqliteColumnMapping::AutoMap)
     }
@@ -304,9 +338,12 @@ impl SqliteSink {
                 "no journal rows for this run (was `rollback.journal` enabled when it ran?)",
             ));
         }
-        let conflicts = self
+        let mut conflicts = self
             .count_conflicts(tx, &entries, run_id, &opts.run_id_column)
             .await?;
+        if opts.later_runs {
+            conflicts += self.count_vanished(tx, &entries).await?;
+        }
         if conflicts > 0 && !opts.force {
             return Ok(RollbackOutcome::blocked(conflicts));
         }

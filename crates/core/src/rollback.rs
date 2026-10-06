@@ -99,6 +99,11 @@ pub struct RollbackOptions {
     pub force: bool,
     /// Count what would change without changing anything.
     pub dry_run: bool,
+    /// A later run wrote this dataset after the one being undone. A journaled
+    /// key with a before-image whose row is now gone was then deleted by that
+    /// later run, so restoring it would resurrect it: it counts as a conflict.
+    #[serde(default)]
+    pub later_runs: bool,
 }
 
 /// What a sink did (or would do) for one dataset.
@@ -387,6 +392,13 @@ impl JournalEntry {
 /// Split journal entries into what a restore does: keys to **delete** (the
 /// run created them) and before-images to **write back** (the run changed or
 /// deleted them). Pure.
+/// Journaled keys whose undo would re-insert a before-image. When a later run
+/// wrote the dataset, each of these that no longer has a row is a conflict
+/// (see [`RollbackOptions::later_runs`]).
+pub fn restorable(entries: &[JournalEntry]) -> Vec<&JournalEntry> {
+    entries.iter().filter(|e| e.before.is_some()).collect()
+}
+
 pub fn plan_restore(entries: &[JournalEntry]) -> (Vec<&JournalEntry>, Vec<serde_json::Value>) {
     let mut deletes = Vec::new();
     let mut restores = Vec::new();
@@ -403,6 +415,29 @@ pub fn plan_restore(entries: &[JournalEntry]) -> (Vec<&JournalEntry>, Vec<serde_
 mod tests {
     use super::*;
     use crate::write_mode::WriteMode;
+
+    #[test]
+    fn restorable_keeps_only_keys_with_a_before_image() {
+        let entries = vec![
+            JournalEntry::decode(r#"{"id":"1"}"#, None).unwrap(),
+            JournalEntry::decode(r#"{"id":"2"}"#, Some(r#"{"id":2,"v":"a"}"#)).unwrap(),
+        ];
+        let kept = restorable(&entries);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].key["id"], "2");
+    }
+
+    #[test]
+    fn later_runs_defaults_off_when_absent_from_the_wire() {
+        let opts: RollbackOptions = serde_json::from_value(serde_json::json!({
+            "run_id_column": "_faucet_run_id",
+            "mode": "upsert",
+            "force": false,
+            "dry_run": false
+        }))
+        .unwrap();
+        assert!(!opts.later_runs);
+    }
 
     fn q(s: &str) -> String {
         format!("\"{s}\"")

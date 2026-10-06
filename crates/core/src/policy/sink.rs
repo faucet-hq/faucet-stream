@@ -707,6 +707,7 @@ mod tests {
                     mode: RollbackMode::Append,
                     force: false,
                     dry_run: true,
+                    later_runs: false,
                 },
             )
             .await

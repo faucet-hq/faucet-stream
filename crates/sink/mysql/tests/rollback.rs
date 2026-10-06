@@ -119,6 +119,7 @@ fn opts(mode: RollbackMode) -> RollbackOptions {
         mode,
         force: false,
         dry_run: false,
+        later_runs: false,
     }
 }
 
@@ -159,6 +160,31 @@ async fn append_rollback_deletes_only_the_runs_rows() {
         .await
         .unwrap();
     assert!(again.note.unwrap().contains("no rows"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_a_later_run_deleted_is_a_conflict_not_a_resurrection() {
+    let (_c, url) = start_mysql().await;
+    exec(
+        &url,
+        "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), _faucet_run_id VARCHAR(64))",
+    )
+    .await;
+    exec(&url, "INSERT INTO users VALUES (1, 'old-1', 'r0')").await;
+    let sink = MysqlSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[json!({"id": 1, "name": "new-1", RUN_COL: "r1"})])
+        .await
+        .unwrap();
+    exec(&url, "DELETE FROM users WHERE id = 1").await;
+    let mut later = opts(RollbackMode::Upsert);
+    later.later_runs = true;
+    let out = sink.rollback_run("r1", &later).await.unwrap();
+    assert_eq!((out.conflicts, out.applied), (1, false), "{out:?}");
+    assert_eq!(
+        scalar(&url, "SELECT count(*) FROM users").await,
+        0,
+        "blocked: nothing resurrected"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
