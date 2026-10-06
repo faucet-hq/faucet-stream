@@ -7,8 +7,9 @@ name: release-plz
 #   PR that bumps versions and prepends changelog entries for every crate with
 #   feat/fix/perf commits since its last per-crate tag. Review the PR like any
 #   other change; merging it triggers the publish job.
-# - `release-plz-release` (every push to main): after a release PR merges and
-#   the new commits are on `main`, publishes the bumped crates to crates.io
+# - `release-plz-release` (only when the pushed commit is a release commit,
+#   `chore: release …` / `chore(<crate>): release …` / `chore(release): …`):
+#   waits for approval in the protected `release` environment, then publishes the bumped crates to crates.io
 #   in dependency order, creates per-crate GitHub releases, and pushes
 #   per-crate `<crate>-v<X.Y.Z>` tags.
 #
@@ -35,6 +36,23 @@ permissions:
   contents: read
 
 jobs:
+  release-gate:
+    name: Detect a release commit
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.detect.outputs.release }}
+    steps:
+      - id: detect
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          subject="${MESSAGE%%$'\n'*}"
+          if [[ "$subject" =~ ^chore(\([^\)]*\))?:\ release || "$subject" =~ ^chore\(release\): ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
   release-plz-pr:
     name: Open / update release PR
     runs-on: ubuntu-latest
@@ -93,7 +111,10 @@ jobs:
 
   release-plz-release:
     name: Publish to crates.io
+    needs: release-gate
+    if: needs.release-gate.outputs.release == 'true'
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
       pull-requests: read

@@ -368,6 +368,7 @@ jobs:
       - plan
       - host
     runs-on: "ubuntu-22.04"
+    environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ needs.plan.outputs.val }}

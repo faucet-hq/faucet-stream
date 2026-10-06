@@ -171,6 +171,13 @@ The default release path is automated by [release-plz](https://release-plz.dev/)
    before connectors before `faucet-stream` and `faucet-cli`), waits for the
    sparse index to propagate between dependents, creates per-crate GitHub
    releases, and pushes the `<crate>-v<X.Y.Z>` tags.
+4. **Approve the deployment.** Publishing jobs run in the protected `release`
+   environment and wait for a required reviewer to approve them in the Actions
+   tab. That applies to the crates.io publish (only on a release commit:
+   `chore: release …`, `chore(<crate>): release …` or `chore(release): …`),
+   the manual fallback, and the Homebrew formula push of a `faucet-cli-v*`
+   release. The publishing secrets live in that environment, and release tags
+   (`*-v*`) can only be created by repository admins.
 
 **Commits that don't bump versions.** `docs`, `chore`, `refactor`, `test`, `ci`,
 and `build` commits are included in the changelog body for completeness but do
