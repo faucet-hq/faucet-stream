@@ -534,6 +534,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
     // external cancel of the root propagates to every level (#146 H16).
     let cancel = opts.cancel.clone().unwrap_or_default();
     let opts = Arc::new(opts);
+    let dlq_sinks: DlqSinkCache = Arc::default();
 
     // We execute level-by-level. Each level is "every node whose parent is
     // already done." Roots are level 0. For each level, we spawn one task per
@@ -893,7 +894,8 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                 .get(&meta)
                 .is_some_and(|gi| overwrite_groups[*gi].members > 1);
             let unit_cancel = level_cancel.clone();
-            let handle = joinset.spawn(async move {
+            let dlq_sinks = Arc::clone(&dlq_sinks);
+            let handle = joinset.spawn(DLQ_SINKS.scope(dlq_sinks, async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 run_unit(
                     &unit,
@@ -907,7 +909,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                     overwrite_grouped,
                 )
                 .await
-            });
+            }));
             task_meta.insert(handle.id(), meta);
         }
 
@@ -3158,16 +3160,36 @@ fn state_from_override(path: &Path) -> Arc<dyn StateStore> {
 /// Translate a [`crate::config::DlqSpec`] from the YAML/JSON config into a
 /// runtime [`DlqConfig`] ready to attach to a [`Pipeline`].
 pub async fn build_dlq_config(spec: &crate::config::DlqSpec) -> CliResult<DlqConfig> {
-    // DLQ sinks resolve against an empty catalog — shared `auth: { ref }` on a
-    // DLQ sink is out of scope (DLQ targets are typically local jsonl/stdout).
-    let sink = build_sink(
-        &spec.sink.kind,
-        spec.sink.config.clone(),
-        &AuthCatalog::new(),
-    )
-    .await?;
+    let config = crate::dlq_replay::plan::dlq_append_config(&spec.sink, "dlq")?;
+    // One DLQ sink per destination for the whole run (#789 CLI-03): rows and
+    // fan-out invocations dead-lettering into the same file append through one
+    // writer instead of each replacing the file with its own copy.
+    let cache = DLQ_SINKS.try_with(Arc::clone).ok();
+    let key = format!(
+        "{}\u{0}{}",
+        spec.sink.kind,
+        serde_json::to_string(&config).unwrap_or_default()
+    );
+    let mut cached = match &cache {
+        Some(c) => Some(c.lock().await),
+        None => None,
+    };
+    let sink: Arc<dyn Sink> = match cached.as_ref().and_then(|m| m.get(&key)) {
+        Some(sink) => Arc::clone(sink),
+        None => {
+            // DLQ sinks resolve against an empty catalog — shared `auth: { ref }`
+            // on a DLQ sink is out of scope (DLQ targets are typically local).
+            let sink: Arc<dyn Sink> =
+                Arc::from(build_sink(&spec.sink.kind, config, &AuthCatalog::new()).await?);
+            if let Some(map) = cached.as_mut() {
+                map.insert(key, Arc::clone(&sink));
+            }
+            sink
+        }
+    };
+    drop(cached);
     Ok(DlqConfig {
-        sink: Arc::from(sink),
+        sink,
         on_batch_error: match spec.on_batch_error {
             crate::config::OnBatchErrorSpec::Propagate => OnBatchError::Propagate,
             crate::config::OnBatchErrorSpec::DlqAll => OnBatchError::DlqAll,
@@ -3176,6 +3198,14 @@ pub async fn build_dlq_config(spec: &crate::config::DlqSpec) -> CliResult<DlqCon
         max_failures_total: spec.max_failures_total,
         include_original_payload: spec.include_original_payload,
     })
+}
+
+/// DLQ sinks shared by every invocation of one `run_expanded`, keyed by kind +
+/// config (#789 CLI-03).
+type DlqSinkCache = Arc<Mutex<HashMap<String, Arc<dyn Sink>>>>;
+
+tokio::task_local! {
+    static DLQ_SINKS: DlqSinkCache;
 }
 
 /// Classify a pipeline error into a notification event (#280). A circuit-breaker

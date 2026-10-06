@@ -1596,6 +1596,29 @@ fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
             )));
         }
     }
+    let data_paths: HashMap<&str, &str> = nodes
+        .iter()
+        .filter(|n| matches!(n.sink.kind.as_str(), "file" | "jsonl" | "csv"))
+        .filter_map(|n| Some((n.sink.config.get("path")?.as_str()?, n.id.as_str())))
+        .collect();
+    for n in nodes {
+        let Some(path) = n
+            .dlq
+            .as_ref()
+            .and_then(|d| d.sink.config.get("path"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if let Some(writer) = data_paths.get(path) {
+            return Err(CliError::Config(format!(
+                "row '{}': its DLQ writes '{path}', which row '{writer}' also writes as its \
+                 data sink — dead letters and data would overwrite each other; give the DLQ \
+                 its own path",
+                n.id
+            )));
+        }
+    }
     Ok(())
 }
 

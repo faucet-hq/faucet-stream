@@ -202,3 +202,75 @@ async fn a_child_that_depends_on_a_sibling_child_still_runs() {
     assert_eq!(deals, 2, "one deals invocation per account");
     assert_eq!(lines(&out.join("deals-2.jsonl")).len(), 2);
 }
+
+// ── CLI-03 ──────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "contract")]
+fn dlq_yaml(dir: &Path, input: &str, dlq_kind: &str, dlq_path: &str, rows: &str) -> String {
+    format!(
+        "version: 1\nname: dlq\npipeline:\n  source:\n    type: csv\n    config: {{ path: \
+         '{input}' }}\n  sink:\n    type: jsonl\n    config: {{ path: '{out}' }}\n  contract:\n    \
+         version: '1'\n    on_breach: quarantine\n    fields:\n      - name: status\n        type: \
+         string\n        enum: [ok]\n  dlq:\n    sink:\n      type: {dlq_kind}\n      config: {{ \
+         path: '{dlq_path}' }}\n{rows}",
+        out = dir.join("out-${now.unix}.jsonl").to_str().unwrap(),
+    )
+}
+
+#[cfg(feature = "contract")]
+#[tokio::test]
+async fn a_dlq_file_keeps_the_dead_letters_of_earlier_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write(dir.path(), "in.csv", "id,status\n1,ok\n2,bad\n");
+    let dlq = dir.path().join("dead.jsonl");
+    let yaml = dlq_yaml(dir.path(), &input, "jsonl", dlq.to_str().unwrap(), "");
+    for _ in 0..2 {
+        let summary = run(&yaml, opts("dlq")).await.unwrap();
+        assert!(!summary.had_failures(), "{summary:?}");
+    }
+    assert_eq!(lines(&dlq).len(), 2, "each run appends its dead letter");
+}
+
+#[cfg(all(feature = "contract", feature = "sink-file"))]
+#[tokio::test]
+async fn rows_sharing_a_file_dlq_append_through_one_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write(dir.path(), "in.csv", "id,status\n1,bad\n2,bad\n3,ok\n");
+    let dlq = dir.path().join("dead.jsonl");
+    let rows = format!(
+        "matrix:\n  - id: a\n    sink: {{ config: {{ path: '{a}' }} }}\n  - id: b\n    sink: {{ \
+         config: {{ path: '{b}' }} }}\n",
+        a = dir.path().join("a.jsonl").to_str().unwrap(),
+        b = dir.path().join("b.jsonl").to_str().unwrap(),
+    );
+    let yaml = dlq_yaml(dir.path(), &input, "file", dlq.to_str().unwrap(), &rows);
+    for _ in 0..2 {
+        let summary = run(&yaml, opts("dlq")).await.unwrap();
+        assert!(!summary.had_failures(), "{summary:?}");
+    }
+    assert_eq!(
+        lines(&dlq).len(),
+        8,
+        "two rows × two dead letters × two runs"
+    );
+}
+
+#[cfg(feature = "contract")]
+#[test]
+fn a_dlq_that_would_replace_its_file_is_refused() {
+    let yaml = dlq_yaml(Path::new("/tmp"), "in.csv", "jsonl", "dead.jsonl", "").replace(
+        "path: 'dead.jsonl' }",
+        "path: 'dead.jsonl', append: false }",
+    );
+    let e = expand_err(&yaml);
+    assert!(e.contains("append: false"), "{e}");
+}
+
+#[test]
+fn a_dlq_path_shared_with_a_data_sink_is_refused() {
+    let yaml = "version: 1\nname: x\npipeline:\n  source:\n    type: csv\n    config: { path: \
+                in.csv }\n  sink:\n    type: jsonl\n    config: { path: same.jsonl }\n  dlq:\n    \
+                sink:\n      type: jsonl\n      config: { path: same.jsonl }\n";
+    let e = expand_err(yaml);
+    assert!(e.contains("give the DLQ its own path"), "{e}");
+}

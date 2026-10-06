@@ -28,6 +28,16 @@ pipeline:
         path: ./dead-letters.jsonl
 ```
 
+**A DLQ always appends.** Once a record is dead-lettered the bookmark moves on,
+so the DLQ file holds its only copy. The file, `jsonl`, `csv`, S3, GCS, Azure
+Blob and SFTP sinks are therefore always opened in append mode when used as a
+DLQ — every run, row and fan-out invocation adds to the same file, and rows of
+one run that share a DLQ write through a single writer. A DLQ setting that
+would replace the file (`append: false`, `if_exists: replace`) or a single
+`.parquet` file (which cannot be appended to) is refused when the config
+loads, as is a DLQ path that is also a data sink's path. Clear handled dead
+letters with `faucet dlq discard`.
+
 ## The envelope
 
 Each dead-lettered record is wrapped in a fixed-shape envelope — the original
