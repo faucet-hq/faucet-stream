@@ -58,6 +58,7 @@ pub mod pipeline_state;
 pub mod pipeline_test;
 #[cfg(feature = "policy")]
 pub mod policy;
+pub mod preview_sample;
 pub mod profiling;
 #[cfg(feature = "cli-progress")]
 pub mod progress;

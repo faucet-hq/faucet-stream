@@ -11,7 +11,7 @@ use crate::error::{CliError, CliResult};
 use crate::expand::{NodeRole, expand};
 use crate::registry::build_source;
 use crate::transforms::compile_transforms;
-use faucet_core::stage::{apply_stages, compile_stage};
+use faucet_core::stage::compile_stage;
 
 #[cfg(feature = "sink-stdout")]
 use faucet_core::{Pipeline, Sink};
@@ -58,23 +58,25 @@ pub async fn run(args: PreviewArgs) -> CliResult<()> {
         None,
     )
     .await?;
-    let stages = compile_transforms(&first_root.transforms)?;
-    let records = source.fetch_all().await?;
-    let records: Vec<_> = if stages.is_empty() {
-        records
-    } else {
-        let compiled = stages
-            .iter()
-            .map(compile_stage)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut out = Vec::with_capacity(records.len());
-        for r in records {
-            out.extend(apply_stages(r, &compiled)?);
-        }
-        out
-    };
-
-    let limited: Vec<_> = records.into_iter().take(args.limit).collect();
+    let compiled = compile_transforms(&first_root.transforms)?
+        .iter()
+        .map(compile_stage)
+        .collect::<Result<Vec<_>, _>>()?;
+    let sample = crate::preview_sample::sample(
+        source.as_ref(),
+        &compiled,
+        args.limit,
+        crate::preview_sample::PREVIEW_TIMEOUT,
+    )
+    .await?;
+    if sample.timed_out {
+        tracing::warn!(
+            records = sample.records.len(),
+            "preview stopped after {}s before reaching --limit",
+            crate::preview_sample::PREVIEW_TIMEOUT.as_secs()
+        );
+    }
+    let limited = sample.records;
     let sink = StdoutSink::new(
         StdoutSinkConfig::new()
             .format(StdoutFormat::JsonLines)

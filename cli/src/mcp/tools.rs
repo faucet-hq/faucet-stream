@@ -655,7 +655,7 @@ async fn validate_config(ctx: &McpContext, args: &Value) -> Result<String, Strin
 }
 
 async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
-    use faucet_core::stage::{apply_stages, compile_stage};
+    use faucet_core::stage::compile_stage;
 
     let text = str_arg(args, "config")?;
     let limit = args
@@ -688,25 +688,28 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
     .map_err(|e| e.to_string())?;
     let stages =
         crate::transforms::compile_transforms(&first_root.transforms).map_err(|e| e.to_string())?;
-    let records = source.fetch_all().await.map_err(|e| e.to_string())?;
-    let records: Vec<Value> = if stages.is_empty() {
-        records
-    } else {
-        let compiled = stages
-            .iter()
-            .map(compile_stage)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::with_capacity(records.len());
-        for r in records {
-            out.extend(apply_stages(r, &compiled).map_err(|e| e.to_string())?);
-        }
-        out
-    };
-    let limited: Vec<Value> = records.into_iter().take(limit).collect();
-    Ok(pretty(
-        &json!({ "row": first_root.id, "count": limited.len(), "records": limited }),
-    ))
+    let compiled = stages
+        .iter()
+        .map(compile_stage)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let sample = crate::preview_sample::sample(
+        source.as_ref(),
+        &compiled,
+        limit,
+        crate::preview_sample::PREVIEW_TIMEOUT,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut doc = json!({
+        "row": first_root.id,
+        "count": sample.records.len(),
+        "records": sample.records,
+    });
+    if sample.timed_out {
+        doc["timed_out"] = Value::Bool(true);
+    }
+    Ok(pretty(&doc))
 }
 
 /// The optional `selection` argument (#741).

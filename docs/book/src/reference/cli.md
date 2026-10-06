@@ -246,7 +246,9 @@ See the [source discovery cookbook](../cookbook/discover.md).
 
 Runs the first root row's source and prints records (via the stdout sink).
 Children aren't previewed because they need parent records to resolve
-`${parent.path}` tokens.
+`${parent.path}` tokens. It reads pages only until `--limit` transformed
+records are collected, and stops after 30 seconds with what it has (a WARN says
+so), so previewing a large table or an endless stream never reads it all.
 
 ```bash
 faucet preview pipeline.yaml --limit 10

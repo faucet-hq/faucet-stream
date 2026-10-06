@@ -755,11 +755,14 @@ pub async fn preview_records(
                 "source",
             )?;
             let source = build_source(&k, c, auth, None).await?;
-            let records = source.fetch_all().await?;
-            out.push((
-                id.clone(),
-                records.into_iter().take(limit).collect::<Vec<_>>(),
-            ));
+            let sample = crate::preview_sample::sample(
+                source.as_ref(),
+                &[],
+                limit,
+                crate::preview_sample::PREVIEW_TIMEOUT,
+            )
+            .await?;
+            out.push((id.clone(), sample.records));
         }
     }
     if out.is_empty() {

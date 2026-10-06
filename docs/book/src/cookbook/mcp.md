@@ -115,6 +115,9 @@ A JSON-RPC 2.0 subset: `initialize`, `tools/list`, `tools/call`,
   `run_template` are absent from `tools/list` unless mutations are enabled.
 - **HTTP inherits serve auth.** Bearer/RBAC + audit apply to `/mcp` as to any
   route; mutations additionally require the `RunWrite` scope.
-- **`preview` is bounded** (≤100 rows) — never a full extract.
+- **`preview` is bounded** (≤100 rows) — never a full extract. It reads pages
+  only until the limit is reached and stops after 30 seconds, returning what it
+  has with `"timed_out": true`; `run_pipeline {dry_run: true}` previews the same
+  way.
 - **Secrets never leak** — tool output is run through the same redactor as the
   rest of the control plane.
