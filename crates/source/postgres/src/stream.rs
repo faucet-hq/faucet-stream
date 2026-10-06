@@ -10,7 +10,7 @@ use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Column, PgPool, Row};
+use sqlx::{Column, PgPool, Row, TypeInfo, ValueRef};
 use std::pin::Pin;
 use std::sync::Mutex;
 
@@ -49,6 +49,24 @@ impl PostgresSource {
         })
     }
 
+    /// `query` wrapped by [`text_cast_query`] for the columns the decoder
+    /// has no exact mapping for. A query the server cannot describe is
+    /// returned unchanged, so its own error surfaces when it runs.
+    async fn typed_query(&self, query: String) -> String {
+        use sqlx::Executor;
+        match (&self.pool).describe(&query).await {
+            Ok(described) => {
+                let columns: Vec<(String, String)> = described
+                    .columns()
+                    .iter()
+                    .map(|c| (c.name().to_string(), c.type_info().name().to_string()))
+                    .collect();
+                text_cast_query(&query, &columns).unwrap_or(query)
+            }
+            Err(_) => query,
+        }
+    }
+
     /// Apply the currently-set shard (if any) to a resolved query string.
     fn shard_wrap(&self, query: String) -> String {
         match &*self.applied_shard.lock().expect("shard mutex poisoned") {
@@ -58,41 +76,111 @@ impl PostgresSource {
     }
 }
 
+/// Postgres types the decoder maps exactly. Every other column is read through
+/// its text form (#789 SQL-12): arrays, enums, `interval`, `inet`, `money`,
+/// ranges, `timetz`, `xml`, `hstore` all decoded to `null` before. `NUMERIC`
+/// and `TIME` are read as text too, so `NaN` / `Infinity` and `24:00:00`
+/// survive.
+const NATIVE_TYPES: &[&str] = &[
+    "BOOL",
+    "INT2",
+    "INT4",
+    "INT8",
+    "FLOAT4",
+    "FLOAT8",
+    "TEXT",
+    "VARCHAR",
+    "BPCHAR",
+    "NAME",
+    "\"CHAR\"",
+    "CHAR",
+    "JSON",
+    "JSONB",
+    "TIMESTAMPTZ",
+    "TIMESTAMP",
+    "DATE",
+    "UUID",
+    "BYTEA",
+];
+
+/// Wrap `query` so every column outside [`NATIVE_TYPES`] is read as text,
+/// keeping column names and order. `None` when nothing needs a cast, or when
+/// duplicate column names make the columns unaddressable from the wrapper.
+fn text_cast_query(query: &str, columns: &[(String, String)]) -> Option<String> {
+    let needs_cast = |t: &str| !NATIVE_TYPES.iter().any(|n| n.eq_ignore_ascii_case(t));
+    if !columns.iter().any(|(_, t)| needs_cast(t)) {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !columns.iter().all(|(n, _)| seen.insert(n.as_str())) {
+        return None;
+    }
+    let select: Vec<String> = columns
+        .iter()
+        .map(|(n, t)| {
+            let q = quote_ident(n);
+            // `format('%s', …)` renders through the type's output function —
+            // the same text postgres-cdc emits (`::text` adds a netmask to
+            // `inet`, for one) — and the guard keeps NULL a NULL.
+            if needs_cast(t) {
+                format!("CASE WHEN q.{q} IS NULL THEN NULL ELSE format('%s', q.{q}) END AS {q}")
+            } else {
+                format!("q.{q}")
+            }
+        })
+        .collect();
+    Some(format!("SELECT {} FROM ({query}) AS q", select.join(", ")))
+}
+
+/// A float as JSON: a number when finite, else Postgres's own spelling.
+fn float_json(v: f64) -> Value {
+    serde_json::Number::from_f64(v)
+        .map(Value::Number)
+        .unwrap_or_else(|| {
+            Value::String(
+                if v.is_nan() {
+                    "NaN"
+                } else if v > 0.0 {
+                    "Infinity"
+                } else {
+                    "-Infinity"
+                }
+                .to_string(),
+            )
+        })
+}
+
 /// Convert a raw sqlx column value to a `serde_json::Value`.
 ///
-/// Uses `try_get_raw` to inspect the type info and convert accordingly.
-/// Falls back to `Value::Null` for unsupported or null columns.
-fn pg_value_to_json(row: &sqlx::postgres::PgRow, col_name: &str) -> Value {
+/// Tries the native decodes in turn; a non-NULL cell none of them can decode
+/// is an error rather than a silent `null`.
+fn pg_value_to_json(row: &sqlx::postgres::PgRow, col_name: &str) -> Result<Value, FaucetError> {
     // Try JSON/JSONB first — this is the most flexible
     if let Ok(v) = row.try_get::<Value, _>(col_name) {
-        return v;
+        return Ok(v);
     }
 
     // Try common scalar types
     if let Ok(v) = row.try_get::<String, _>(col_name) {
-        return Value::String(v);
+        return Ok(Value::String(v));
     }
     if let Ok(v) = row.try_get::<i64, _>(col_name) {
-        return Value::Number(v.into());
+        return Ok(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<i32, _>(col_name) {
-        return Value::Number(v.into());
+        return Ok(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<i16, _>(col_name) {
-        return Value::Number(v.into());
+        return Ok(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<f64, _>(col_name) {
-        return serde_json::Number::from_f64(v)
-            .map(Value::Number)
-            .unwrap_or(Value::Null);
+        return Ok(float_json(v));
     }
     if let Ok(v) = row.try_get::<f32, _>(col_name) {
-        return serde_json::Number::from_f64(v as f64)
-            .map(Value::Number)
-            .unwrap_or(Value::Null);
+        return Ok(float_json(f64::from(v)));
     }
     if let Ok(v) = row.try_get::<bool, _>(col_name) {
-        return Value::Bool(v);
+        return Ok(Value::Bool(v));
     }
 
     // Richer types that would otherwise silently decode to Null (#78/#43).
@@ -100,32 +188,44 @@ fn pg_value_to_json(row: &sqlx::postgres::PgRow, col_name: &str) -> Value {
     if let Ok(v) =
         row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(col_name)
     {
-        return Value::String(v.to_rfc3339());
+        return Ok(Value::String(v.to_rfc3339()));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDateTime, _>(col_name) {
-        return Value::String(v.to_string());
+        return Ok(Value::String(v.to_string()));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDate, _>(col_name) {
-        return Value::String(v.to_string());
+        return Ok(Value::String(v.to_string()));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveTime, _>(col_name) {
-        return Value::String(v.to_string());
+        return Ok(Value::String(v.to_string()));
     }
     // UUID → canonical hyphenated string.
     if let Ok(v) = row.try_get::<sqlx::types::Uuid, _>(col_name) {
-        return Value::String(v.to_string());
+        return Ok(Value::String(v.to_string()));
     }
     // NUMERIC / DECIMAL → string, preserving exact precision.
     if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
-        return Value::String(v.to_string());
+        return Ok(Value::String(v.to_string()));
     }
     // BYTEA → base64 (so binary survives the JSON round-trip).
     if let Ok(v) = row.try_get::<Vec<u8>, _>(col_name) {
         use base64::Engine as _;
-        return Value::String(base64::engine::general_purpose::STANDARD.encode(v));
+        return Ok(Value::String(
+            base64::engine::general_purpose::STANDARD.encode(v),
+        ));
     }
 
-    Value::Null
+    match row.try_get_raw(col_name) {
+        Ok(raw) if raw.is_null() => Ok(Value::Null),
+        Ok(raw) => Err(FaucetError::Source(format!(
+            "PostgreSQL column {col_name} has type {} which the source cannot decode; \
+             cast it to text in the query",
+            raw.type_info().name()
+        ))),
+        Err(e) => Err(FaucetError::Source(format!(
+            "PostgreSQL column {col_name} read failed: {e}"
+        ))),
+    }
 }
 
 /// Build the effective SQL query and ordered context-bind values for a given
@@ -280,14 +380,14 @@ fn descriptors_from_catalog(
 
 /// Convert a single `PgRow` into a JSON object whose keys are the row's
 /// column names.
-fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {
+fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Value, FaucetError> {
     let mut map = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name().to_string();
-        let value = pg_value_to_json(row, &name);
+        let value = pg_value_to_json(row, &name)?;
         map.insert(name, value);
     }
-    Value::Object(map)
+    Ok(Value::Object(map))
 }
 
 #[async_trait]
@@ -297,7 +397,7 @@ impl faucet_core::Source for PostgresSource {
         context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Value>, FaucetError> {
         let (query_str, bind_values) = resolve_query(&self.config, context);
-        let query_str = self.shard_wrap(query_str);
+        let query_str = self.typed_query(self.shard_wrap(query_str)).await;
         let query = bind_params(sqlx::query(&query_str), &self.config.params, &bind_values)?;
 
         let rows = query
@@ -305,7 +405,7 @@ impl faucet_core::Source for PostgresSource {
             .await
             .map_err(|e| FaucetError::Source(format!("PostgreSQL query failed: {e}")))?;
 
-        let records: Vec<Value> = rows.iter().map(row_to_json).collect();
+        let records: Vec<Value> = rows.iter().map(row_to_json).collect::<Result<_, _>>()?;
         tracing::info!(rows = records.len(), query = %self.config.query, "PostgreSQL source fetch complete");
         Ok(records)
     }
@@ -331,7 +431,7 @@ impl faucet_core::Source for PostgresSource {
 
         Box::pin(async_stream::try_stream! {
             let (query_str, bind_values) = resolve_query(&self.config, context);
-            let query_str = self.shard_wrap(query_str);
+            let query_str = self.typed_query(self.shard_wrap(query_str)).await;
             let query = bind_params(
                 sqlx::query(&query_str),
                 &self.config.params,
@@ -349,7 +449,7 @@ impl faucet_core::Source for PostgresSource {
                 .await
                 .map_err(|e| FaucetError::Source(format!("PostgreSQL query failed: {e}")))?
             {
-                buffer.push(row_to_json(&row));
+                buffer.push(row_to_json(&row)?);
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
@@ -575,6 +675,46 @@ fn key_discovery_error(e: sqlx::Error) -> FaucetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_cast_query_wraps_only_columns_without_a_native_decode() {
+        let cols = |c: &[(&str, &str)]| -> Vec<(String, String)> {
+            c.iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            text_cast_query("SELECT 1", &cols(&[("id", "INT4"), ("v", "jsonb")])),
+            None
+        );
+        assert_eq!(
+            text_cast_query(
+                "SELECT * FROM t",
+                &cols(&[("id", "INT4"), ("tags", "TEXT[]")])
+            )
+            .as_deref(),
+            Some(
+                "SELECT q.\"id\", CASE WHEN q.\"tags\" IS NULL THEN NULL \
+                 ELSE format('%s', q.\"tags\") END AS \"tags\" FROM (SELECT * FROM t) AS q"
+            )
+        );
+        assert_eq!(
+            text_cast_query("SELECT a, a", &cols(&[("a", "NUMERIC"), ("a", "NUMERIC")])),
+            None,
+            "duplicate names cannot be addressed from the wrapper"
+        );
+    }
+
+    #[test]
+    fn non_finite_floats_keep_their_postgres_spelling() {
+        assert_eq!(float_json(1.5), serde_json::json!(1.5));
+        assert_eq!(float_json(f64::NAN), serde_json::json!("NaN"));
+        assert_eq!(float_json(f64::INFINITY), serde_json::json!("Infinity"));
+        assert_eq!(
+            float_json(f64::NEG_INFINITY),
+            serde_json::json!("-Infinity")
+        );
+    }
     use faucet_core::shard::plan_pk_shards;
 
     #[test]
