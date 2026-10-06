@@ -141,7 +141,11 @@ incremental logic reads forward from it; requires a `state:` block);
 before they reach transforms or the sink. Values parse as JSON first (numbers,
 quoted strings), falling back to a bare string. Bookmark mode always runs as a
 single unit. The live `{name}::{row}` bookmark is untouched either way — every
-unit runs under `{name}::backfill::{unit}`.
+unit runs under `{name}::backfill::{range_hash}::{unit}`, where the range hash
+covers the row and the range. Two backfills of different ranges (or rows) never
+share a unit bookmark, and a fresh backfill always starts at `--from-bookmark`
+even if an earlier one of the same range left a bookmark behind; only
+`--resume` continues from it.
 
 ## Backfill over HTTP (`faucet serve`)
 

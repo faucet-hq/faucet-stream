@@ -2,7 +2,7 @@
 //! backfill range at `{name}::__backfill__::{range_hash}` in the pipeline's
 //! state store, recording each unit's terminal outcome so `--resume` re-runs
 //! only failed/pending units. Kept separate from every live bookmark key
-//! (`{name}::{row}`) and every unit's scoped key (`{name}::backfill::{unit}`).
+//! (`{name}::{row}`) and every unit's scoped key (`{name}::backfill::{range_hash}::{unit}`).
 
 use crate::backfill::plan::BackfillUnit;
 use crate::error::{CliError, CliResult};
@@ -85,15 +85,16 @@ pub fn marker_key(pipeline_name: &str, range_hash: &str) -> String {
 }
 
 /// State key a unit's pipeline invocation reads/advances — the executor's key
-/// for a root node whose id is `backfill::{unit}` (namespaced away from the
-/// live `{name}::{row}` key, so the forward sync's bookmark is never touched).
-pub fn unit_state_key(pipeline_name: &str, unit_id: &str) -> String {
-    crate::executor::build_state_key(pipeline_name, &unit_row_id(unit_id), None)
+/// for a root node whose id is `backfill::{range_hash}::{unit}`: namespaced away
+/// from the live `{name}::{row}` key, and per range (which includes the row), so
+/// one backfill never resumes another's bookmark.
+pub fn unit_state_key(pipeline_name: &str, range_hash: &str, unit_id: &str) -> String {
+    crate::executor::build_state_key(pipeline_name, &unit_row_id(range_hash, unit_id), None)
 }
 
 /// The synthesized row id for a unit's node.
-pub fn unit_row_id(unit_id: &str) -> String {
-    format!("backfill::{unit_id}")
+pub fn unit_row_id(range_hash: &str, unit_id: &str) -> String {
+    format!("backfill::{range_hash}::{unit_id}")
 }
 
 /// Split the plan into (to-run, already-done) against a loaded marker: done
@@ -142,8 +143,8 @@ mod tests {
         assert_eq!(marker, "orders::__backfill__::0123456789abcdef");
         faucet_core::state::validate_state_key(&marker).unwrap();
 
-        let unit = unit_state_key("orders", "20260601T000000Z");
-        assert_eq!(unit, "orders::backfill::20260601T000000Z");
+        let unit = unit_state_key("orders", "0123456789abcdef", "20260601T000000Z");
+        assert_eq!(unit, "orders::backfill::0123456789abcdef::20260601T000000Z");
         faucet_core::state::validate_state_key(&unit).unwrap();
 
         // The invariant that protects the live bookmark: no unit key ever

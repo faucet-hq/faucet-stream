@@ -8,7 +8,7 @@
 //! node with:
 //! - `${backfill.*}` tokens substituted in its source + sink configs,
 //! - the `${now.*}` clock set to the unit's window start,
-//! - a namespaced row id (`backfill::{unit}`) so its state key never touches
+//! - a namespaced row id (`backfill::{range_hash}::{unit}`) so its state key never touches
 //!   the forward-sync bookmark,
 //! - delivery forced to at-least-once (pair with `write_mode: upsert` for
 //!   idempotent replays).
@@ -167,10 +167,11 @@ fn select_root(nodes: Vec<ExpandedNode>, row: Option<&str>) -> CliResult<Expande
 fn build_unit_node(
     root: &ExpandedNode,
     unit: &BackfillUnit,
+    range_hash: &str,
     time_mode: bool,
 ) -> CliResult<ExpandedNode> {
     let mut n = root.clone();
-    n.id = unit_row_id(&unit.id);
+    n.id = unit_row_id(range_hash, &unit.id);
     if time_mode {
         substitute_unit_tokens(&mut n.source.config, unit)?;
         substitute_unit_tokens(&mut n.sink.config, unit)?;
@@ -445,7 +446,8 @@ pub async fn run_backfill(
         );
     }
     let descriptor = opts.range.descriptor(&root.id);
-    let marker_k = marker_key(&opts.pipeline_name, &range_hash(&descriptor));
+    let rhash = range_hash(&descriptor);
+    let marker_k = marker_key(&opts.pipeline_name, &rhash);
 
     // ── Marker (durable when a state store is configured) ────────────────────
     let store: Arc<dyn StateStore> = match cfg.pipeline.state.as_ref() {
@@ -458,7 +460,9 @@ pub async fn run_backfill(
             Arc::new(faucet_core::MemoryStateStore::new())
         }
     };
-    let marker = match store.get(&marker_k).await? {
+    let stored_marker = store.get(&marker_k).await?;
+    let fresh = stored_marker.is_none() || opts.restart;
+    let marker = match stored_marker {
         Some(v) if opts.restart => {
             let prior = BackfillState::from_value(v)?;
             tracing::warn!(
@@ -534,7 +538,7 @@ pub async fn run_backfill(
     // Done here (execute path only) so a `--restart --dry-run` never mutates
     // state. `units` still reflects the full plan (the marker was just reset).
     if opts.restart {
-        clear_scoped_unit_state(&store, &opts.pipeline_name, &units).await?;
+        clear_scoped_unit_state(&store, &opts.pipeline_name, &rhash, &units).await?;
     }
 
     // Persist the (possibly reset) marker up front so an early crash leaves a
@@ -564,9 +568,13 @@ pub async fn run_backfill(
         let cfg_range = opts.range.clone();
         let store = store.clone();
         let cancel = cancel.clone();
+        let rhash = rhash.clone();
         join.spawn(async move {
             let _permit = permit;
-            let result = run_one_unit(&root, &unit, &cfg_range, &opts, &store, cancel).await;
+            let result = run_one_unit(
+                &root, &unit, &cfg_range, &rhash, fresh, &opts, &store, cancel,
+            )
+            .await;
             (unit, result)
         });
     }
@@ -628,41 +636,58 @@ pub async fn run_backfill(
     })
 }
 
-/// Delete every planned unit's scoped state key (`{name}::backfill::{unit}`).
-/// Called on `--restart` so a re-backfill starts from scratch rather than
-/// silently resuming a surviving bookmark (audit #321 H3).
+/// Delete every planned unit's scoped state key
+/// (`{name}::backfill::{range_hash}::{unit}`). Called on `--restart` so a
+/// re-backfill starts from scratch rather than silently resuming a surviving
+/// bookmark (audit #321 H3).
 async fn clear_scoped_unit_state(
     store: &Arc<dyn StateStore>,
     pipeline_name: &str,
+    range_hash: &str,
     units: &[BackfillUnit],
 ) -> CliResult<()> {
     for unit in units {
         store
-            .delete(&unit_state_key(pipeline_name, &unit.id))
+            .delete(&unit_state_key(pipeline_name, range_hash, &unit.id))
             .await?;
     }
     Ok(())
 }
 
 /// Run one unit end-to-end through the executor.
+/// Seed a bookmark-mode unit's start: a fresh marker always starts at `from`,
+/// a resumed one keeps a further-along position it already holds.
+async fn seed_unit_bookmark(
+    store: &Arc<dyn StateStore>,
+    key: &str,
+    from: &Value,
+    fresh: bool,
+) -> CliResult<()> {
+    if fresh || store.get(key).await?.is_none() {
+        store.put(key, from).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_one_unit(
     root: &ExpandedNode,
     unit: &BackfillUnit,
     range: &BackfillRange,
+    range_hash: &str,
+    fresh: bool,
     opts: &BackfillOptions,
     store: &Arc<dyn StateStore>,
     cancel: CancellationToken,
 ) -> CliResult<()> {
     let time_mode = matches!(range, BackfillRange::Time { .. });
-    let mut node = build_unit_node(root, unit, time_mode)?;
+    let mut node = build_unit_node(root, unit, range_hash, time_mode)?;
 
     if let BackfillRange::Bookmark { from, to, field } = range {
-        // Seed the scoped bookmark once — a resumed unit keeps its own
+        // A fresh marker always starts at `from`; a resumed unit keeps its own
         // further-along position.
-        let key = unit_state_key(&opts.pipeline_name, &unit.id);
-        if store.get(&key).await?.is_none() {
-            store.put(&key, from).await?;
-        }
+        let key = unit_state_key(&opts.pipeline_name, range_hash, &unit.id);
+        seed_unit_bookmark(store, &key, from, fresh).await?;
         // Upper bound: wrap the pre-built source so records past the bound
         // are dropped before transforms/sink.
         if let (Some(to), Some(field)) = (to, field) {
@@ -955,8 +980,8 @@ matrix:
             start: crate::backfill::plan::parse_boundary("2026-06-01", tz).unwrap(),
             end: crate::backfill::plan::parse_boundary("2026-06-02", tz).unwrap(),
         };
-        let node = build_unit_node(&root, &unit, true).unwrap();
-        assert_eq!(node.id, "backfill::20260601T000000Z");
+        let node = build_unit_node(&root, &unit, "0123456789abcdef", true).unwrap();
+        assert_eq!(node.id, "backfill::0123456789abcdef::20260601T000000Z");
         assert_eq!(node.delivery, faucet_core::DeliveryMode::AtLeastOnce);
         let url = node.source.config["url"].as_str().unwrap();
         assert!(url.contains("since=2026-06-01T00:00:00+00:00"), "{url}");
@@ -969,7 +994,7 @@ matrix:
         // the run genuinely starts over. A surviving bookmark would otherwise
         // make run_one_unit skip its re-seed and resume mid-range.
         let store: Arc<dyn StateStore> = Arc::new(faucet_core::MemoryStateStore::new());
-        let key = unit_state_key("orders", "bookmark");
+        let key = unit_state_key("orders", "h", "bookmark");
         store.put(&key, &json!(500)).await.unwrap();
 
         let tz: chrono_tz::Tz = "UTC".parse().unwrap();
@@ -978,7 +1003,7 @@ matrix:
             start: crate::backfill::plan::parse_boundary("2026-06-01", tz).unwrap(),
             end: crate::backfill::plan::parse_boundary("2026-06-02", tz).unwrap(),
         };
-        clear_scoped_unit_state(&store, "orders", std::slice::from_ref(&unit))
+        clear_scoped_unit_state(&store, "orders", "h", std::slice::from_ref(&unit))
             .await
             .unwrap();
         assert_eq!(
@@ -986,6 +1011,46 @@ matrix:
             None,
             "restart must delete the surviving scoped bookmark"
         );
+    }
+
+    #[test]
+    fn units_of_different_ranges_never_share_a_bookmark() {
+        let a = BackfillRange::Bookmark {
+            from: json!(1),
+            to: None,
+            field: None,
+        };
+        let b = BackfillRange::Bookmark {
+            from: json!(900),
+            to: None,
+            field: None,
+        };
+        let key = |r: &BackfillRange, row: &str| {
+            unit_state_key("orders", &range_hash(&r.descriptor(row)), "bookmark")
+        };
+        assert_ne!(key(&a, "orders"), key(&b, "orders"));
+        assert_ne!(key(&a, "orders"), key(&a, "refunds"));
+        assert_eq!(key(&a, "orders"), key(&a, "orders"));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_marker_reseeds_the_start_and_a_resume_keeps_progress() {
+        let store: Arc<dyn StateStore> = Arc::new(faucet_core::MemoryStateStore::new());
+        let key = unit_state_key("orders", "h", "bookmark");
+        store.put(&key, &json!(500)).await.unwrap();
+        seed_unit_bookmark(&store, &key, &json!(1), false)
+            .await
+            .unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), Some(json!(500)));
+        seed_unit_bookmark(&store, &key, &json!(1), true)
+            .await
+            .unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), Some(json!(1)));
+        store.delete(&key).await.unwrap();
+        seed_unit_bookmark(&store, &key, &json!(7), false)
+            .await
+            .unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), Some(json!(7)));
     }
 
     #[test]

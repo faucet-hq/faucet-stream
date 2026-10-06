@@ -31,7 +31,7 @@ pub enum KeyKind {
     Replication,
     /// `{name}::__backfill__::{hash}` — a backfill's progress marker.
     BackfillMarker(String),
-    /// `{name}::backfill::{unit}` — one backfill unit's bookmark.
+    /// `{name}::backfill::{range_hash}::{unit}` — one backfill unit's bookmark.
     BackfillUnit(String),
 }
 
@@ -105,7 +105,7 @@ pub fn classify(pipeline: &str, key: &str) -> Option<ClassifiedKey> {
             return Some(pipeline_level(KeyKind::BackfillMarker(join(&segs[1..]))));
         }
         "backfill" if segs.len() > 1 => {
-            // A unit's own run markers hang off `{name}::backfill::{unit}`.
+            // A unit's own run markers hang off `{name}::backfill::{range_hash}::{unit}`.
             let (unit_end, kind) = match segs.last() {
                 Some(&STATUS_SUFFIX) if segs.len() > 2 => (segs.len() - 1, Some(KeyKind::Status)),
                 Some(&LEASE_SUFFIX) if segs.len() > 2 => (segs.len() - 1, Some(KeyKind::Lease)),
