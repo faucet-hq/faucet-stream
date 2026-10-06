@@ -56,6 +56,61 @@ impl MysqlSource {
     }
 
     /// Apply the currently-set shard (if any) to a resolved query string.
+    /// The binary-flagged result columns of `query` that are really text — a
+    /// `_bin` collation makes MySQL flag a VARCHAR/TEXT column BINARY, and
+    /// sqlx then hands its value over as bytes (#789 SQL-13). Found by
+    /// describing the query and probing the flagged columns' character sets
+    /// over zero rows; empty when the probe cannot run.
+    async fn text_columns(
+        &self,
+        query: &str,
+        bind_values: &[Value],
+    ) -> std::collections::HashSet<String> {
+        use sqlx::{Executor, TypeInfo};
+        let Ok(described) = (&self.pool).describe(query).await else {
+            return Default::default();
+        };
+        let flagged: Vec<String> = described
+            .columns()
+            .iter()
+            .filter(|c| BINARY_FLAGGED.contains(&c.type_info().name()))
+            .map(|c| c.name().to_string())
+            .collect();
+        if flagged.is_empty() {
+            return Default::default();
+        }
+        let all: Vec<String> = described
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        let Some(probe) = charset_probe_query(query, &all) else {
+            return Default::default();
+        };
+        let row = match bind_params(sqlx::query(&probe), bind_values)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::debug!(error = %e, "mysql: charset probe failed; binary-collation text stays base64");
+                return Default::default();
+            }
+        };
+        all.iter()
+            .enumerate()
+            .filter(|(i, name)| {
+                flagged.contains(name)
+                    && row
+                        .try_get::<Option<String>, _>(*i)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|cs| !cs.eq_ignore_ascii_case("binary"))
+            })
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
     fn shard_wrap(&self, query: String) -> String {
         match &*self.applied_shard.lock().expect("shard mutex poisoned") {
             Some(bounds) => bounds.wrap(&query, quote_ident_mysql),
@@ -68,7 +123,11 @@ impl MysqlSource {
 ///
 /// Attempts common types in order of likelihood. Falls back to `Value::Null`
 /// for unsupported or null columns.
-fn mysql_value_to_json(row: &sqlx::mysql::MySqlRow, col_name: &str) -> Value {
+fn mysql_value_to_json(
+    row: &sqlx::mysql::MySqlRow,
+    col_name: &str,
+    text_columns: &std::collections::HashSet<String>,
+) -> Value {
     // Try JSON first
     if let Ok(v) = row.try_get::<Value, _>(col_name) {
         return v;
@@ -143,8 +202,20 @@ fn mysql_value_to_json(row: &sqlx::mysql::MySqlRow, col_name: &str) -> Value {
     if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
         return Value::String(v.to_string());
     }
-    // BLOB / BINARY → base64.
+    // BLOB / BINARY → base64; a text column with a binary collation arrives
+    // as bytes too, but is text (#789 SQL-13).
     if let Ok(v) = row.try_get::<Vec<u8>, _>(col_name) {
+        if text_columns.contains(col_name) {
+            match String::from_utf8(v) {
+                Ok(s) => return Value::String(s),
+                Err(e) => {
+                    use base64::Engine as _;
+                    return Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(e.into_bytes()),
+                    );
+                }
+            }
+        }
         use base64::Engine as _;
         return Value::String(base64::engine::general_purpose::STANDARD.encode(v));
     }
@@ -282,14 +353,47 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
 
 /// Convert a single `MySqlRow` into a JSON object whose keys are the row's
 /// column names.
-fn row_to_json(row: &sqlx::mysql::MySqlRow) -> Value {
+fn row_to_json(
+    row: &sqlx::mysql::MySqlRow,
+    text_columns: &std::collections::HashSet<String>,
+) -> Value {
     let mut map = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name().to_string();
-        let value = mysql_value_to_json(row, &name);
+        let value = mysql_value_to_json(row, &name, text_columns);
         map.insert(name, value);
     }
     Value::Object(map)
+}
+
+/// sqlx type names of columns MySQL flags BINARY: real binary types, but also
+/// text with a `_bin` collation.
+const BINARY_FLAGGED: &[&str] = &[
+    "BINARY",
+    "VARBINARY",
+    "TINYBLOB",
+    "BLOB",
+    "MEDIUMBLOB",
+    "LONGBLOB",
+];
+
+/// A query reporting each named column's character set over zero rows of
+/// `query`: `CHARSET(MAX(col))` is `binary` only for a real binary column.
+/// `None` when the names are not unique (the derived table could not address
+/// them).
+fn charset_probe_query(query: &str, columns: &[String]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    if columns.is_empty() || !columns.iter().all(|c| seen.insert(c.as_str())) {
+        return None;
+    }
+    let probes: Vec<String> = columns
+        .iter()
+        .map(|c| format!("CAST(CHARSET(MAX(q.{0})) AS CHAR)", quote_ident_mysql(c)))
+        .collect();
+    Some(format!(
+        "SELECT {} FROM (SELECT * FROM ({query}) AS q0 LIMIT 0) AS q",
+        probes.join(", ")
+    ))
 }
 
 #[async_trait]
@@ -300,6 +404,7 @@ impl faucet_core::Source for MysqlSource {
     ) -> Result<Vec<Value>, FaucetError> {
         let (query_str, bind_values) = resolve_query(&self.config, context);
         let query_str = self.shard_wrap(query_str);
+        let text_columns = self.text_columns(&query_str, &bind_values).await;
         let query = bind_params(sqlx::query(&query_str), &bind_values);
 
         let rows = query
@@ -307,7 +412,7 @@ impl faucet_core::Source for MysqlSource {
             .await
             .map_err(|e| FaucetError::Source(format!("MySQL query failed: {e}")))?;
 
-        let records: Vec<Value> = rows.iter().map(row_to_json).collect();
+        let records: Vec<Value> = rows.iter().map(|r| row_to_json(r, &text_columns)).collect();
         tracing::info!(rows = records.len(), query = %self.config.query, "MySQL source fetch complete");
         Ok(records)
     }
@@ -334,6 +439,7 @@ impl faucet_core::Source for MysqlSource {
         Box::pin(async_stream::try_stream! {
             let (query_str, bind_values) = resolve_query(&self.config, context);
             let query_str = self.shard_wrap(query_str);
+            let text_columns = self.text_columns(&query_str, &bind_values).await;
             let query = bind_params(sqlx::query(&query_str), &bind_values);
 
             let mut rows = query.fetch(&self.pool);
@@ -347,7 +453,7 @@ impl faucet_core::Source for MysqlSource {
                 .await
                 .map_err(|e| FaucetError::Source(format!("MySQL query failed: {e}")))?
             {
-                buffer.push(row_to_json(&row));
+                buffer.push(row_to_json(&row, &text_columns));
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
@@ -578,6 +684,22 @@ fn key_discovery_error(e: sqlx::Error) -> FaucetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charset_probe_query_reads_every_column_over_zero_rows() {
+        assert_eq!(
+            charset_probe_query("SELECT a, b FROM t", &["a".into(), "b".into()]).as_deref(),
+            Some(
+                "SELECT CAST(CHARSET(MAX(q.`a`)) AS CHAR), CAST(CHARSET(MAX(q.`b`)) AS CHAR) \
+                 FROM (SELECT * FROM (SELECT a, b FROM t) AS q0 LIMIT 0) AS q"
+            )
+        );
+        assert_eq!(
+            charset_probe_query("SELECT a, a", &["a".into(), "a".into()]),
+            None
+        );
+        assert_eq!(charset_probe_query("SELECT 1", &[]), None);
+    }
 
     #[test]
     fn digest_query_leads_with_the_key_and_marks_nulls() {

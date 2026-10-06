@@ -15,7 +15,7 @@ Built on `sqlx` with a pooled, async connection and a true row cursor (`Query::f
 
 - **Streaming row cursor** — `Source::stream_pages` drives a sqlx cursor and yields one `StreamPage` per `batch_size` rows; the sink starts writing before the query finishes draining.
 - **Connection pooling** — a single `MySqlPool` is built once in `new()` and reused for every fetch; size it with `max_connections` (default `10`).
-- **Rich type decoding** — JSON, integers, floats, booleans, `DATETIME`/`TIMESTAMP`/`DATE`/`TIME`, `DECIMAL` (exact precision), and `BLOB`/`BINARY` (base64) all map to sensible JSON.
+- **Rich type decoding** — JSON, integers, floats, booleans, `DATETIME`/`TIMESTAMP`/`DATE`/`TIME`, `DECIMAL` (exact precision), and `BLOB`/`BINARY` (base64) all map to sensible JSON; text with a binary collation (`utf8mb4_bin`, the `BINARY` attribute) stays text.
 - **Parameterised per-record queries** — in a parent/child matrix run, `${parent.field}` tokens in the query are substituted as **safe bind parameters** (`?` placeholders), never string-interpolated. A token that is a whole quoted literal (`'${parent.name}'`) binds too; one embedded in a longer literal, a quoted identifier or a comment is refused when the config loads.
 - **TLS by default** — built with `tls-rustls`; encrypted connections need no extra dependency.
 - **Credential-safe** — the connection URL is masked in `Debug` output and stripped from the lineage dataset URI.
@@ -201,6 +201,14 @@ Columns are converted to JSON in order of likelihood; an unsupported or `NULL` c
 | `date`, `time` | string (ISO-8601) |
 | `decimal`, `numeric` | string (exact precision preserved) |
 | `blob`, `binary`, `varbinary` | string (base64) |
+| `char`/`varchar`/`text` with a `_bin` collation or the `BINARY` attribute | string (the text, not base64) |
+
+MySQL flags a text column with a binary collation the same way as a real binary
+column, so the source describes each query and, when any column carries that
+flag, reads the flagged columns' character sets with one zero-row probe
+(`CHARSET(MAX(col))` over the query `LIMIT 0`). A query with duplicate column
+names cannot be probed; there such text columns are still base64-encoded —
+alias the columns.
 | other / `NULL` | `null` |
 
 ## Capabilities
