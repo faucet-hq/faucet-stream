@@ -135,6 +135,8 @@ short-page rule.
 
 Page by the running **max** (or **min**) of a record field — the pattern accounting journal APIs use (`offset = max(JournalNumber)` of the last page). Stops on a short page.
 
+The cursor is taken from every record a page returns, including ones the incremental filter drops, so a page of only-old rows still moves it. Values compare like replication bookmarks: numbers and numeric strings by value (`"59"` follows `"9"`), timestamps chronologically, other strings as text. A **full** page that leaves the cursor where it was fails the run — more than a page of rows share that value, or the feed isn't ordered by the field — rather than stopping and silently skipping the rest.
+
 ```yaml
 pagination:
   type: RecordFieldCursor

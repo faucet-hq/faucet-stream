@@ -202,25 +202,14 @@ pub(crate) fn value_to_param_string(v: &Value) -> String {
     }
 }
 
-/// Keep the max (or min) of two cursor values: numbers compare numerically,
-/// strings lexicographically; a heterogeneous pair keeps the candidate.
+/// Keep the max (or min) of two cursor values, ordered like replication
+/// bookmarks ([`faucet_core::json_gt`]): numbers and decimal strings
+/// numerically (`"59"` > `"9"`), timestamps chronologically, other strings
+/// lexicographically.
 fn pick_cursor(agg: RecordCursorAgg, current: Value, candidate: Value) -> Value {
-    let candidate_wins = match (&current, &candidate) {
-        (Value::Number(a), Value::Number(b)) => {
-            let (a, b) = (
-                a.as_f64().unwrap_or(f64::NAN),
-                b.as_f64().unwrap_or(f64::NAN),
-            );
-            match agg {
-                RecordCursorAgg::Max => b > a,
-                RecordCursorAgg::Min => b < a,
-            }
-        }
-        (Value::String(a), Value::String(b)) => match agg {
-            RecordCursorAgg::Max => b > a,
-            RecordCursorAgg::Min => b < a,
-        },
-        _ => true,
+    let candidate_wins = match agg {
+        RecordCursorAgg::Max => faucet_core::json_gt(&candidate, &current),
+        RecordCursorAgg::Min => faucet_core::json_gt(&current, &candidate),
     };
     if candidate_wins { candidate } else { current }
 }
@@ -491,6 +480,14 @@ impl PaginationStyle {
                     .as_ref()
                     .map(value_to_param_string);
                 if cursor.is_some() && cursor == state.previous_token {
+                    if record_count >= *page_size {
+                        return Err(FaucetError::Source(format!(
+                            "rest: RecordFieldCursor did not advance past {cursor:?} on a full \
+                             page — more than a page of rows share that value, or the feed is \
+                             not ordered by the cursor field; stopping here would silently skip \
+                             the rest"
+                        )));
+                    }
                     tracing::warn!(
                         "pagination loop detected: RecordFieldCursor did not advance \
                          (cursor {cursor:?} repeated) — stopping"
@@ -830,7 +827,8 @@ mod new_style_tests {
                 .unwrap()
         );
 
-        // Non-advancing cursor trips the loop guard.
+        // A full page that leaves the cursor in place cannot be finished by
+        // keyset paging: it fails instead of silently dropping the rest.
         let mut state = PaginationState::default();
         let page = vec![json!({"JournalNumber": 9}), json!({"JournalNumber": 9})];
         style.update_record_cursor(&page, &mut state);
@@ -839,11 +837,34 @@ mod new_style_tests {
                 .advance(&json!({}), &HeaderMap::new(), &mut state, 2)
                 .unwrap()
         );
-        // Same max again → stop.
         style.update_record_cursor(&page, &mut state);
+        let err = style
+            .advance(&json!({}), &HeaderMap::new(), &mut state, 2)
+            .unwrap_err();
+        assert!(err.to_string().contains("did not advance"), "{err}");
+
+        // A short repeated page (with `stop_when_short: false`) is the feed's
+        // end, so the loop guard stops quietly.
+        let lenient = PaginationStyle::RecordFieldCursor {
+            field: "JournalNumber".into(),
+            into: RecordCursorTarget::Query,
+            param: "offset".into(),
+            agg: RecordCursorAgg::Max,
+            stop_when_short: false,
+            page_size: 2,
+        };
+        let mut state = PaginationState::default();
+        let short = vec![json!({"JournalNumber": 9})];
+        lenient.update_record_cursor(&short, &mut state);
         assert!(
-            !style
-                .advance(&json!({}), &HeaderMap::new(), &mut state, 2)
+            lenient
+                .advance(&json!({}), &HeaderMap::new(), &mut state, 1)
+                .unwrap()
+        );
+        lenient.update_record_cursor(&short, &mut state);
+        assert!(
+            !lenient
+                .advance(&json!({}), &HeaderMap::new(), &mut state, 1)
                 .unwrap()
         );
     }

@@ -1397,6 +1397,15 @@ impl RestStream {
                     let raw_records = self.extract_page(&body)?;
                     let raw_count = raw_records.len();
 
+                    // #554: derive this page's keyset cursor (max/min of the
+                    // configured field) from every record the page returned, before
+                    // the incremental filter drops old ones — a page of only-old
+                    // rows must still move the cursor. A no-op for every
+                    // non-RecordFieldCursor style.
+                    self.config
+                        .pagination
+                        .update_record_cursor(&raw_records, &mut state);
+
                     // #547: track the terminal cursor to persist as the bookmark.
                     if self.config.persist_cursor
                         && let Some(path) = self.config.pagination.cursor_path()
@@ -1448,12 +1457,6 @@ impl RestStream {
                         }
                     }
 
-                    // #554: derive this page's keyset cursor (max/min of the
-                    // configured field) so the next request can page by it. A
-                    // no-op for every non-RecordFieldCursor style.
-                    self.config
-                        .pagination
-                        .update_record_cursor(&records, &mut state);
 
                     // Advance pagination state to learn whether there is a next
                     // page BEFORE yielding the current one. This way the bookmark
