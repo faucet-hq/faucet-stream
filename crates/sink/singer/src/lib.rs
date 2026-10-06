@@ -28,6 +28,6 @@ pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};
 
-pub use config::{FlushOn, SingerSinkConfig};
+pub use config::{FlushOn, InheritEnv, SingerSinkConfig};
 pub use faucet_common_singer::{Redactor, SingerMessage, parse_line, secret_like_values};
 pub use sink::SingerSink;

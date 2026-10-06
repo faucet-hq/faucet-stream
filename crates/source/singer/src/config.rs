@@ -3,6 +3,7 @@
 //! No I/O or protocol logic lives here — just the serde/`JsonSchema` config
 //! surface, following the connector-crate convention.
 
+pub use faucet_common_singer::InheritEnv;
 use faucet_core::JsonSchema;
 use faucet_core::Value;
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,13 @@ pub struct SingerSourceConfig {
     /// [`MalformedPolicy::Skip`].
     #[serde(default)]
     pub on_malformed: MalformedPolicy,
+
+    /// Which of faucet's environment variables the tap receives: `true`
+    /// (default) the whole environment, `false` only `PATH`, `HOME`, `LANG`,
+    /// `LC_ALL` and `TMPDIR`, or a list of variable names passed on top of
+    /// that baseline. Set it to keep faucet's own credentials away from the tap.
+    #[serde(default)]
+    pub inherit_env: InheritEnv,
 }
 
 fn default_true() -> bool {
@@ -90,6 +98,7 @@ impl SingerSourceConfig {
             flush_on_state: true,
             idle_timeout_secs: None,
             on_malformed: MalformedPolicy::Skip,
+            inherit_env: InheritEnv::default(),
         }
     }
 

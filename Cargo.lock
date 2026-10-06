@@ -5201,6 +5201,7 @@ name = "faucet-common-singer"
 version = "1.0.0"
 dependencies = [
  "faucet-core",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "tempfile",

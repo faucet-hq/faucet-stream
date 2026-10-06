@@ -25,7 +25,7 @@ pub mod stream;
 // Re-export core types so users don't need a separate faucet-core dependency.
 pub use faucet_core::{FaucetError, Sink, Source};
 
-pub use config::{MalformedPolicy, SingerSourceConfig};
+pub use config::{InheritEnv, MalformedPolicy, SingerSourceConfig};
 pub use discover::{StreamSelection, catalog_stream_ids, discover, select_streams};
 pub use message::{SingerMessage, parse_line};
 pub use stream::SingerSource;

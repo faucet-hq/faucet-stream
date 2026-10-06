@@ -99,7 +99,8 @@ is the target's job, so faucet does not treat this sink as key-deduplicating
 | `target_command` | string | — (required) | Target executable on `PATH` or an absolute path |
 | `args` | string[] | `[]` | Extra args appended after faucet's `--config <file>` |
 | `target_config` | object | `{}` | The target's config — written to a private (0600) temp file passed as `--config` |
-| `env` | map | `{}` | Extra environment variables for the target |
+| `env` | map | `{}` | Extra environment variables for the target, set on top of `inherit_env` |
+| `inherit_env` | bool \| string[] | `true` | Which of faucet's environment variables the target sees — see [Environment](#environment--inherit_env) |
 | `stream` | string | row id / pipeline name (`faucet` for library callers) | Singer stream name |
 | `schema` | object | contract, else inferred | JSON Schema for the `SCHEMA` message |
 | `key_properties` | string[] | `key` under upsert | `SCHEMA` `key_properties` |
@@ -127,6 +128,20 @@ pipeline:
         destination_path: ./out
         do_timestamp_file: false
 ```
+
+## Environment — `inherit_env`
+
+The target runs as a child of faucet and, by default, sees faucet's whole
+environment plus `env`. That includes whatever credentials faucet itself holds
+there (cloud keys, vault tokens, a `faucet serve` server's secrets). To keep
+them away from the target:
+
+```yaml
+inherit_env: false                 # only PATH, HOME, LANG, LC_ALL, TMPDIR
+inherit_env: [TARGET_PASSWORD]     # that baseline plus the listed variables
+```
+
+`env` is applied on top either way.
 
 ## Library use
 
