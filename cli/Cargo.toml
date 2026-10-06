@@ -736,6 +736,10 @@ tokio-postgres = "0.7"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+# docs.rs builds every connector at once; without a jobs cap its builder
+# overruns the 6 GB sandbox (a 4-job build peaks at ~2.5-3.5 GB).
+targets = ["x86_64-unknown-linux-gnu"]
+cargo-args = ["--jobs", "4"]
 
 # API-stability (cargo-semver-checks) lint overrides — the same declared
 # contract `faucet-core` carries (see PRINCIPLES §3). Additive evolution of the
