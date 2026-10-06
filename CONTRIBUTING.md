@@ -124,6 +124,9 @@ are tracked in the roadmap epic (search the `epic` label).
 - Update the relevant crate `README.md`, the root README, and the docs site when
   you change config fields, defaults, or behavior.
 - Don't skip hooks (`--no-verify`) or CI; if a check fails, fix the root cause.
+- Workflows pin every action to a full commit SHA with the version in a trailing
+  comment (`uses: owner/action@<sha> # v1.2.3`); Dependabot proposes the
+  updates. Declare `permissions:` per job — the workflow default is read-only.
 
 ## Versioning & MSRV
 
