@@ -356,6 +356,59 @@ pub fn discard_keep_line(
 mod tests {
     use super::*;
 
+    fn dlq_spec(kind: &str, config: Value) -> ConnectorSpec {
+        ConnectorSpec {
+            kind: kind.into(),
+            config,
+            transforms: None,
+            inherit_transforms: true,
+            status: None,
+            tags: Vec::new(),
+            complete_for: None,
+            attributes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn dlq_append_config_forces_append_or_refuses() {
+        let ok = |kind: &str, cfg: Value| dlq_append_config(&dlq_spec(kind, cfg), "dlq").unwrap();
+        let err = |kind: &str, cfg: Value| {
+            dlq_append_config(&dlq_spec(kind, cfg), "row 'r' dlq")
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert_eq!(ok("jsonl", json!({"path": "d.jsonl"}))["append"], true);
+        assert_eq!(
+            ok("csv", json!({"path": "d.csv", "append": true}))["append"],
+            true
+        );
+        assert!(err("jsonl", json!({"path": "d", "append": false})).contains("append: false"));
+
+        let file = ok("file", json!({"path": "d.jsonl", "mode": "append"}));
+        assert_eq!(file["if_exists"], "append");
+        assert!(file.get("mode").is_none());
+        assert_eq!(ok("s3", json!({"bucket": "b"}))["if_exists"], "append");
+        assert_eq!(
+            ok("sftp", json!({"path": "p", "if_exists": "error"}))["if_exists"],
+            "error"
+        );
+        let e = err("gcs", json!({"bucket": "b", "if_exists": "replace"}));
+        assert!(
+            e.contains("row 'r' dlq") && e.contains("if_exists: replace"),
+            "{e}"
+        );
+
+        let fixed = json!({"destination": {"type": "local_path", "path": "d.parquet"}});
+        assert!(err("parquet", fixed).contains(".parquet"));
+        let rolling = json!({"destination": {"type": "local_path", "path": "d.parquet"},
+                             "max_rows_per_file": 10});
+        assert_eq!(ok("parquet", rolling.clone()), rolling);
+
+        assert_eq!(ok("stdout", json!({})), json!({}));
+        assert_eq!(ok("jsonl", json!("not-an-object")), json!("not-an-object"));
+    }
+
     fn env(reason: Option<&str>, ts_ms: Option<i64>) -> UnwrappedEnvelope {
         UnwrappedEnvelope {
             payload: json!({}),

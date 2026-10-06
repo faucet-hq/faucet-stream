@@ -6617,3 +6617,112 @@ matrix:
         assert_eq!(kind(FaucetError::Sink("x".into())), EventKind::RunFailure);
     }
 }
+
+#[cfg(test)]
+mod bind_and_dlq_tests {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::json;
+
+    #[cfg(feature = "source-sqlite")]
+    #[tokio::test]
+    async fn bind_context_source_supplies_its_binds_and_forwards_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let url = format!("sqlite://{}?mode=rwc", path.to_str().unwrap());
+        {
+            use sqlx::Connection;
+            let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            for stmt in [
+                "CREATE TABLE t (id INTEGER)",
+                "INSERT INTO t VALUES (1), (2)",
+            ] {
+                sqlx::query(stmt).execute(&mut conn).await.unwrap();
+            }
+        }
+        let inner = build_source(
+            "sqlite",
+            json!({"database_url": url, "query": "SELECT id FROM t WHERE id = {faucet_bind_0}"}),
+            &AuthCatalog::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let name = inner.connector_name();
+        let uri = inner.dataset_uri();
+        let key = inner.state_key();
+        let schema = inner.state_schema();
+        let exactly_once = inner.supports_exactly_once();
+        let replay = inner.replay_guarantee();
+        let src = BindContextSource {
+            inner,
+            ctx: HashMap::from([("faucet_bind_0".to_string(), json!(2))]),
+        };
+        let empty = HashMap::new();
+        assert_eq!(
+            src.fetch_with_context(&empty).await.unwrap(),
+            vec![json!({"id": 2})]
+        );
+        let (rows, _) = src.fetch_with_context_incremental(&empty).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let pages: Vec<_> = src.stream_pages(&empty, 10).collect().await;
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].as_ref().unwrap().records, vec![json!({"id": 2})]);
+
+        assert_eq!(src.connector_name(), name);
+        assert_eq!(src.dataset_uri(), uri);
+        assert_eq!(src.state_key(), key);
+        assert_eq!(src.state_schema(), schema);
+        src.set_run_clock(chrono::Utc::now());
+        src.set_roundtrip_recorder(Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "sqlite",
+            ),
+        ));
+        src.apply_start_bookmark(json!({})).await.unwrap();
+        assert_eq!(src.supports_exactly_once(), exactly_once);
+        assert_eq!(src.replay_guarantee(), replay);
+        let _ = src.lag().await;
+        assert_eq!(
+            src.migrate_state(schema, json!({"a": 1})).unwrap(),
+            json!({"a": 1})
+        );
+        #[cfg(feature = "arrow")]
+        {
+            let _ = src.supports_columnar();
+            let _ = src.stream_batches(&empty, 10).next().await;
+        }
+    }
+
+    #[cfg(feature = "sink-jsonl")]
+    #[tokio::test]
+    async fn dlq_sinks_are_shared_within_a_run_and_built_fresh_outside_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec: crate::config::DlqSpec = serde_json::from_value(json!({
+            "sink": {"type": "jsonl", "config": {"path": dir.path().join("d.jsonl")}}
+        }))
+        .unwrap();
+        let cache: DlqSinkCache = Arc::default();
+        let (a, b) = DLQ_SINKS
+            .scope(Arc::clone(&cache), async {
+                (
+                    build_dlq_config(&spec).await.unwrap(),
+                    build_dlq_config(&spec).await.unwrap(),
+                )
+            })
+            .await;
+        assert!(Arc::ptr_eq(&a.sink, &b.sink));
+        assert_eq!(cache.lock().await.len(), 1);
+        let outside = build_dlq_config(&spec).await.unwrap();
+        assert!(!Arc::ptr_eq(&a.sink, &outside.sink));
+
+        let bad: crate::config::DlqSpec = serde_json::from_value(json!({
+            "sink": {"type": "jsonl", "config": {"path": "x.jsonl", "append": false}}
+        }))
+        .unwrap();
+        assert!(build_dlq_config(&bad).await.is_err());
+    }
+}

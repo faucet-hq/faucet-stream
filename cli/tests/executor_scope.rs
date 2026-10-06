@@ -151,6 +151,20 @@ fn a_fanout_token_inside_a_longer_sql_string_is_refused() {
     assert!(e.contains("longer quoted string"), "{e}");
 }
 
+#[test]
+fn a_discovery_row_query_is_checked_like_any_sql_source() {
+    let yaml = "version: 1\nname: x\npipeline:\n  source:\n    type: csv\n    config: { path: \
+                p.csv }\n  sink:\n    type: jsonl\n    config: { path: o.jsonl }\nmatrix:\n  - \
+                id: p\n  - id: d\n    depends_on: [p]\n    fan_out:\n      source:\n        \
+                type: sqlite\n        config:\n          database_url: 'sqlite::memory:'\n          \
+                query: \"SELECT n FROM t WHERE n = 'x-${p.id}'\"\n      select: n\n      as: n\n";
+    let e = expand_err(yaml);
+    assert!(
+        e.contains("row 'd'") && e.contains("longer quoted string"),
+        "{e}"
+    );
+}
+
 #[tokio::test]
 async fn a_fanout_table_name_must_be_a_plain_identifier() {
     let dir = tempfile::tempdir().unwrap();
