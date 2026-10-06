@@ -21,7 +21,7 @@
 //! README.
 
 use crate::config::{CdcTls, MysqlCdcSourceConfig, StartPosition};
-use crate::convert::binlog_row_to_json;
+use crate::convert::{binlog_row_to_json_hinted, column_hints};
 use crate::state::{Bookmark, state_key};
 use async_trait::async_trait;
 use faucet_core::{FaucetError, Source, Stream, StreamPage};
@@ -272,6 +272,7 @@ impl MysqlCdcSource {
             // 1. Resolve start position for this fetch cycle.
             let pending = self.pending_bookmark.lock().await.take();
             let resolved = resolve_start(&self.config.start_position, pending.as_ref());
+            let anchor_start = pending.is_none() && matches!(resolved, ResolvedStart::Current { .. });
 
             // 2. Open a connection and build the binlog stream request.
             let mut conn = Conn::new(self.opts.clone())
@@ -291,6 +292,15 @@ impl MysqlCdcSource {
                 .map_err(|e| FaucetError::Source(format!("mysql-cdc: get_binlog_stream: {e}")))?;
             let mut stream = std::pin::pin!(binlog_stream);
 
+            // A start with no persisted bookmark persists where it opened
+            // right away; otherwise a cycle that sees no commit persists
+            // nothing and the next run opens at a later "current", losing
+            // the changes in between (#789 SQL-24).
+            if anchor_start && let ResolvedStart::FilePos { file, pos } = &resolved {
+                let bm = Bookmark::FilePos { file: file.clone(), pos: *pos };
+                yield StreamPage { records: Vec::new(), bookmark: Some(bm.to_value()?) };
+            }
+
             // 4. Per-event tracking state.
             let mut current_file = match &resolved {
                 ResolvedStart::FilePos { file, .. } => file.clone(),
@@ -298,6 +308,7 @@ impl MysqlCdcSource {
             };
             let mut buffer: Vec<Value> = Vec::new();
             let mut in_txn = false;
+            let mut payload_end: Option<u64> = None;
             let mut txid: u64 = 0;
             // Bookmark of the last successfully committed transaction.
             let mut last_commit_bookmark: Option<Bookmark> = None;
@@ -348,7 +359,18 @@ impl MysqlCdcSource {
                     Ok(Some(Ok(event))) => {
                         let header = event.header();
                         let ts_ms = u64::from(header.timestamp()) * 1_000;
-                        let log_pos = u64::from(header.log_pos());
+                        // Events decompressed from a Transaction_payload carry
+                        // log_pos 0; they sit at the payload's end position
+                        // (#789 SQL-28).
+                        let raw_pos = u64::from(header.log_pos());
+                        if header.event_type_raw()
+                            == mysql_async::binlog::EventType::TRANSACTION_PAYLOAD_EVENT as u8
+                        {
+                            payload_end = Some(raw_pos);
+                        } else if raw_pos != 0 {
+                            payload_end = None;
+                        }
+                        let log_pos = effective_log_pos(raw_pos, payload_end);
 
                         let event_data = event
                             .read_data()
@@ -468,6 +490,7 @@ impl MysqlCdcSource {
 
                                 let op = op_from_rows_event(&re);
                                 let lsn = json!({ "file": &current_file, "pos": log_pos });
+                                let hints = column_hints(tme);
 
                                 for row_result in re.rows(tme) {
                                     let (before_row, after_row) = row_result.map_err(|e| {
@@ -478,14 +501,14 @@ impl MysqlCdcSource {
 
                                     let before_json = if self.config.include_columns {
                                         match &before_row {
-                                            Some(r) => binlog_row_to_json(r)?,
+                                            Some(r) => binlog_row_to_json_hinted(r, &hints)?,
                                             None => Value::Null,
                                         }
                                     } else {
                                         Value::Null
                                     };
                                     let after_json = match &after_row {
-                                        Some(r) => binlog_row_to_json(r)?,
+                                        Some(r) => binlog_row_to_json_hinted(r, &hints)?,
                                         None => Value::Null,
                                     };
 
@@ -579,6 +602,17 @@ pub(crate) enum ResolvedStart {
     /// Start after a specific GTID set.  The string is parsed into `Sid`s
     /// for the `BinlogStreamRequest`.
     GtidSet { value: String },
+}
+
+/// The binlog position an event sits at: its own `log_pos`, or — for an
+/// event decompressed from a `Transaction_payload` (whose `log_pos` is `0`) —
+/// the enclosing payload's end position.
+fn effective_log_pos(raw: u64, payload_end: Option<u64>) -> u64 {
+    if raw == 0 {
+        payload_end.unwrap_or(0)
+    } else {
+        raw
+    }
 }
 
 /// Determine the effective start for this fetch cycle.
@@ -1238,6 +1272,14 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn events_inside_a_compressed_transaction_take_the_payload_end() {
+        assert_eq!(effective_log_pos(1234, None), 1234);
+        assert_eq!(effective_log_pos(1234, Some(99)), 1234);
+        assert_eq!(effective_log_pos(0, Some(99)), 99);
+        assert_eq!(effective_log_pos(0, None), 0);
+    }
     use crate::state::Bookmark;
     use serde_json::json;
 

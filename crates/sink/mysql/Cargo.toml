@@ -19,6 +19,7 @@ async-trait.workspace = true
 tracing.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "mysql", "json"] }
 tokio.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -9,7 +9,7 @@ use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{Column, Row, SqlitePool};
+use sqlx::{Column, Row, SqlitePool, TypeInfo, ValueRef};
 use std::pin::Pin;
 use std::sync::Mutex;
 
@@ -72,40 +72,43 @@ impl SqliteSource {
 
 /// Convert a SQLite row column value to a `serde_json::Value`.
 ///
-/// SQLite has dynamic typing — values are stored as INTEGER, REAL, TEXT,
-/// BLOB, or NULL. We try each type in order of specificity.
+/// SQLite has dynamic typing, so the value's own storage class (INTEGER,
+/// REAL, TEXT, BLOB or NULL) decides the JSON shape. A NULL cell must be
+/// checked first: sqlx decodes NULL as `""` when asked for a `String`.
 fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, col_name: &str) -> Value {
-    // Try JSON first (TEXT that parses as JSON)
-    if let Ok(v) = row.try_get::<Value, _>(col_name) {
-        return v;
+    let Ok(raw) = row.try_get_raw(col_name) else {
+        return Value::Null;
+    };
+    if raw.is_null() {
+        return Value::Null;
     }
-
-    if let Ok(v) = row.try_get::<String, _>(col_name) {
-        return Value::String(v);
-    }
-    if let Ok(v) = row.try_get::<i64, _>(col_name) {
-        return Value::Number(v.into());
-    }
-    if let Ok(v) = row.try_get::<i32, _>(col_name) {
-        return Value::Number(v.into());
-    }
-    if let Ok(v) = row.try_get::<f64, _>(col_name) {
-        return serde_json::Number::from_f64(v)
+    match raw.type_info().name() {
+        "INTEGER" => row
+            .try_get::<i64, _>(col_name)
+            .map(|v| Value::Number(v.into()))
+            .unwrap_or(Value::Null),
+        "REAL" => row
+            .try_get::<f64, _>(col_name)
+            .ok()
+            .and_then(serde_json::Number::from_f64)
             .map(Value::Number)
-            .unwrap_or(Value::Null);
+            .unwrap_or(Value::Null),
+        "BLOB" => row
+            .try_get::<Vec<u8>, _>(col_name)
+            .map(|v| {
+                use base64::Engine as _;
+                Value::String(base64::engine::general_purpose::STANDARD.encode(v))
+            })
+            .unwrap_or(Value::Null),
+        _ => {
+            if let Ok(v) = row.try_get::<Value, _>(col_name) {
+                return v;
+            }
+            row.try_get::<String, _>(col_name)
+                .map(Value::String)
+                .unwrap_or(Value::Null)
+        }
     }
-    if let Ok(v) = row.try_get::<bool, _>(col_name) {
-        return Value::Bool(v);
-    }
-    // BLOB → base64 so binary survives the JSON round-trip instead of decoding
-    // to Null (#78/#43). SQLite has no native datetime/uuid/decimal types —
-    // those are stored as TEXT/INTEGER/REAL and handled by the arms above.
-    if let Ok(v) = row.try_get::<Vec<u8>, _>(col_name) {
-        use base64::Engine as _;
-        return Value::String(base64::engine::general_purpose::STANDARD.encode(v));
-    }
-
-    Value::Null
 }
 
 /// Build the effective SQL query and ordered context-bind values for a given

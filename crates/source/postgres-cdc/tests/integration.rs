@@ -75,6 +75,7 @@ fn cfg(url: &str, slot: &str, publication: &str) -> PostgresCdcSourceConfig {
         proto_version: 1,
         idle_timeout: Duration::from_secs(5),
         max_messages: None,
+        max_cycle_duration: std::time::Duration::from_secs(300),
         max_staged_records: None,
         status_update_interval: Duration::from_secs(1),
         tcp_keepalive: Duration::from_secs(60),
@@ -559,4 +560,55 @@ async fn slot_lag_grows_while_unconsumed_and_shrinks_once_read() {
         caught_up.bytes < stuck_more.bytes,
         "reading the changes shrinks the lag: {caught_up:?} vs {stuck_more:?}"
     );
+}
+
+/// #789 SQL-08: under writes arriving faster than `idle_timeout`, a fetch
+/// cycle still ends once it has run for `max_cycle_duration`, so the next
+/// cycle can advance the slot. Before, the cycle never returned and the slot
+/// pinned WAL without bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cycle_under_steady_writes_ends_at_its_bound() {
+    let (_pg, url) = start_postgres().await;
+    ddl(
+        &url,
+        "CREATE TABLE public.ticks (id serial PRIMARY KEY, at timestamptz DEFAULT now()); \
+         CREATE PUBLICATION tick_pub FOR TABLE public.ticks;",
+    )
+    .await;
+    let mut config = cfg(&url, "tick_slot", "tick_pub");
+    config.idle_timeout = Duration::from_secs(30);
+    config.max_cycle_duration = Duration::from_secs(3);
+    let source = PostgresCdcSource::new(config).await.expect("source");
+    let _ = source.fetch_all_incremental().await.expect("warm-up");
+
+    let writer_url = url.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let writer = tokio::spawn(async move {
+        let (client, conn) = tokio_postgres::connect(&writer_url, NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            client
+                .batch_execute("INSERT INTO public.ticks DEFAULT VALUES")
+                .await
+                .expect("tick");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let (records, bookmark) =
+        tokio::time::timeout(Duration::from_secs(20), source.fetch_all_incremental())
+            .await
+            .expect("the cycle must end well before idle_timeout under steady writes")
+            .expect("fetch");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.await.expect("writer");
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(!records.is_empty());
+    assert!(bookmark.is_some());
 }

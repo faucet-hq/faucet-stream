@@ -15512,6 +15512,16 @@
                       "minimum": 0,
                       "default": null
                     },
+                    "max_cycle_duration": {
+                      "description": "Longest a fetch cycle runs before it ends at the next transaction\nboundary. Default: 300 s; `0` means no bound.\n\nThe slot's `confirmed_flush_lsn` advances only at the start of a cycle,\nfrom the bookmark the previous cycle persisted. Under steady writes\n`idle_timeout` never fires, so without this bound a cycle — and the WAL\nthe slot pins — would grow until the primary's disk filled. A\nlong-running runtime (`faucet schedule`, `faucet serve`, `faucet\nmirror`) starts the next cycle straight away.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 300
+                    },
                     "max_staged_records": {
                       "description": "Maximum number of change records buffered in memory for a *single*\nin-progress transaction before it is aborted.\n\nLogical replication requires a transaction to be buffered until its\nCOMMIT so it can be emitted atomically (partial transactions must\nnever leak downstream). A single bulk `UPDATE`/`DELETE`/`COPY` of\nmillions of rows therefore buffers every decoded row as a\n`serde_json::Value` in RAM, which can OOM the process. This bound is a\nsafety valve: when an in-progress transaction's staged record count\nexceeds it, the source aborts with a typed\n[`FaucetError::Source`] rather than\nbeing OOM-killed.\n\n`None` (the default) means unbounded — atomic delivery of arbitrarily\nlarge transactions at the cost of unbounded memory. Set a value sized\nto your available memory if you replicate tables subject to large\nbulk writes.",
                       "type": [
@@ -17545,7 +17555,7 @@
                       ]
                     },
                     "query": {
-                      "description": "SQL `SELECT` query to run. The output format is set to `JSONEachRow`\nvia the request settings, so **do not** append a `FORMAT` clause. Use\nthe literal `@bookmark` token to push the incremental cursor down into\nthe `WHERE` clause; use `{key}` tokens to inject parent-context values in\na matrix child.",
+                      "description": "SQL `SELECT` query to run. The output format is set via the request\nsettings (`JSONCompactEachRowWithNamesAndTypes`, decoded by column\ntype), so **do not** append a `FORMAT` clause. Use\nthe literal `@bookmark` token to push the incremental cursor down into\nthe `WHERE` clause; use `{key}` tokens to inject parent-context values in\na matrix child.",
                       "type": "string"
                     },
                     "batch_size": {
@@ -25060,7 +25070,7 @@
                       "default": true
                     },
                     "commit_rows": {
-                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\n`None` (the default) accumulates the **whole run** into one commit.\nSet it to bound how much is buffered, or to commit progressively on a\nlong run. `0` means the same as `None`.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
+                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\nWhen neither `commit_rows` nor `commit_bytes` is set, a group commits\nat 100,000 rows or ~256 MiB, whichever comes first, so a large load\nnever buffers the whole run in memory. `0` means no row limit. A\nfailed group commit keeps its uncommitted rows for the retry.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
                       "type": [
                         "integer",
                         "null",
@@ -25070,7 +25080,7 @@
                       "minimum": 0
                     },
                     "commit_bytes": {
-                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `None` (the default) removes the byte\nthreshold.",
+                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `0` means no byte limit; see\n[`commit_rows`](Self::commit_rows) for the default when both are unset.",
                       "type": [
                         "integer",
                         "null",

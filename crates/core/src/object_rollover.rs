@@ -404,6 +404,13 @@ pub struct PageAccumulator {
 }
 
 impl PageAccumulator {
+    /// Commit-group row ceiling [`bounded`](Self::bounded) applies when a sink
+    /// config sets neither threshold.
+    pub const DEFAULT_ROWS: usize = 100_000;
+    /// Commit-group estimated-bytes ceiling [`bounded`](Self::bounded) applies
+    /// when a sink config sets neither threshold (256 MiB).
+    pub const DEFAULT_BYTES: usize = 256 * 1024 * 1024;
+
     /// `max_rows`/`max_bytes` of `None` or `0` mean "no limit on this axis".
     /// With neither set, the whole run commits once at `flush`.
     pub fn new(max_rows: Option<usize>, max_bytes: Option<usize>) -> Self {
@@ -413,6 +420,30 @@ impl PageAccumulator {
             max_rows: max_rows.filter(|n| *n > 0),
             max_bytes: max_bytes.filter(|n| *n > 0),
         }
+    }
+
+    /// Like [`new`](Self::new), but a config that sets neither threshold gets
+    /// [`DEFAULT_ROWS`](Self::DEFAULT_ROWS) / [`DEFAULT_BYTES`](Self::DEFAULT_BYTES)
+    /// instead of buffering the whole run in memory. An explicit `0` on an
+    /// axis still means "no limit".
+    pub fn bounded(max_rows: Option<usize>, max_bytes: Option<usize>) -> Self {
+        if max_rows.is_none() && max_bytes.is_none() {
+            Self::new(Some(Self::DEFAULT_ROWS), Some(Self::DEFAULT_BYTES))
+        } else {
+            Self::new(max_rows, max_bytes)
+        }
+    }
+
+    /// Put rows whose commit failed back at the front of the open group, so a
+    /// retried `flush` commits them instead of finding nothing to do.
+    pub fn restore(&mut self, rows: Vec<Value>) {
+        if rows.is_empty() {
+            return;
+        }
+        self.bytes += rows.iter().map(estimate_size).sum::<usize>();
+        let mut restored = rows;
+        restored.append(&mut self.rows);
+        self.rows = restored;
     }
 
     /// Records held for the next commit.
@@ -557,6 +588,34 @@ mod page_accumulator_tests {
         acc.finish();
         assert!(acc.is_empty());
         assert_eq!(acc.bytes(), 0, "finish resets the size estimate too");
+    }
+
+    #[test]
+    fn restored_rows_commit_on_the_next_flush_before_newer_ones() {
+        let mut acc = PageAccumulator::new(Some(100), None);
+        acc.push_page(&page(3));
+        let group = acc.finish().expect("group");
+        acc.push_page(&[json!({ "id": 99 })]);
+        acc.restore(group);
+        assert_eq!(acc.len(), 4);
+        assert!(acc.bytes() > 0);
+        let again = acc.finish().expect("restored group");
+        assert_eq!(again[0], json!({ "id": 0 }));
+        assert_eq!(again[3], json!({ "id": 99 }));
+        acc.restore(Vec::new());
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn bounded_applies_finite_defaults_only_when_nothing_is_set() {
+        let mut acc = PageAccumulator::bounded(None, None);
+        assert_eq!(acc.max_rows, Some(PageAccumulator::DEFAULT_ROWS));
+        assert_eq!(acc.max_bytes, Some(PageAccumulator::DEFAULT_BYTES));
+        assert!(acc.push_page(&page(10)).is_none());
+        let unlimited = PageAccumulator::bounded(Some(0), None);
+        assert_eq!((unlimited.max_rows, unlimited.max_bytes), (None, None));
+        let rows_only = PageAccumulator::bounded(Some(5), None);
+        assert_eq!((rows_only.max_rows, rows_only.max_bytes), (Some(5), None));
     }
 
     #[test]

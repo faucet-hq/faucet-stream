@@ -84,6 +84,7 @@ fn cfg(url: &str) -> PostgresCdcSourceConfig {
         idle_timeout: Duration::from_secs(5),
         // Stop the drain cleanly once every seeded change has been streamed.
         max_messages: Some(TOTAL),
+        max_cycle_duration: std::time::Duration::from_secs(300),
         max_staged_records: None,
         status_update_interval: Duration::from_secs(1),
         tcp_keepalive: Duration::from_secs(60),

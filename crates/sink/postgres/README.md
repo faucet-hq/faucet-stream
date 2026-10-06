@@ -122,7 +122,9 @@ sink:
 
 ### AutoMap mode — map JSON keys to typed columns
 
-Discovers column names and types from the table schema and maps matching JSON keys. A field present only in some records is still written; rows missing a column bind SQL `NULL`.
+Discovers column names and types from the table schema and maps matching JSON keys. A field present only in some records is still written; on an append, rows missing a column bind SQL `NULL`. An **upsert** writes each row's own columns only, so a column a row omits keeps its stored value (a postgres-cdc event leaves an unchanged TOAST column out of `after`, and the mirror keeps it).
+
+A `bytea` column takes a **base64** string — how every faucet source emits binary — as its decoded bytes. A string already in Postgres's `\x…` hex form, or one that is not valid base64, is bound as before.
 
 ```sql
 CREATE TABLE events (
@@ -305,7 +307,7 @@ delivery: exactly_once
 
 ## Schema evolution
 
-`PostgresSink` reports its live destination schema via `current_schema()` (read from `pg_catalog`, including `attnotnull` so nullability round-trips), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
+`PostgresSink` reports its live destination schema via `current_schema()` (read from `pg_catalog`, including `attnotnull` so nullability round-trips), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink in `auto_map` mode. In JSONB-column mode the table's columns are not the record's fields, so the sink reports no schema and a `schema:` policy is inert.
 
 Under `on_drift: evolve`, `PostgresSink::evolve_schema()` applies additive DDL in one connection:
 
@@ -397,7 +399,7 @@ println!("transferred {} records", result.records_written);
 - A `sqlx::PgPool` is created once in `PostgresSink::new()` with the configured `max_connections` and reused for every batch.
 - `write_batch()` slices records into `batch_size` chunks (or forwards the whole slice when `batch_size = 0`) and inserts each chunk with a single multi-row `INSERT`.
 - **JSONB mode** inserts via `INSERT INTO table (col) SELECT * FROM unnest($1::jsonb[])` — one bound array, no per-row parameters.
-- **AutoMap mode** queries each column's name **and underlying type** (`udt_name`) from the catalog, scoped via `to_regclass` to exactly the relation the `INSERT` targets (the configured `schema`, else the `search_path`-resolved table). A multi-row `INSERT INTO ... VALUES ($1::int4, $2::timestamptz), ...` is built dynamically with a per-column cast; each value is bound as text so the destination column's input function parses it — numbers, booleans, timestamps, uuids, and `json`/`jsonb` columns all land in their native types. The column set is the **union** of record keys across the batch (in declared table order); a row missing a column binds SQL `NULL`.
+- **AutoMap mode** queries each column's name **and underlying type** (`udt_name`) from the catalog, scoped via `to_regclass` to exactly the relation the `INSERT` targets (the configured `schema`, else the `search_path`-resolved table). A multi-row `INSERT INTO ... VALUES ($1::int4, $2::timestamptz), ...` is built dynamically with a per-column cast; each value is bound as text so the destination column's input function parses it — numbers, booleans, timestamps, uuids, and `json`/`jsonb` columns all land in their native types. The column set is the **union** of record keys across the batch (in declared table order); on an append a row missing a column binds SQL `NULL`, while an upsert groups rows by the columns they carry and updates only those.
 - All identifiers (table + column names) are quoted with `quote_ident()` to prevent SQL injection.
 
 ## Lineage dataset URI

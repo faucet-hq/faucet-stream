@@ -143,7 +143,7 @@ fn validate_cleanup_columns(
 /// Shared by the delete-by-key and scoped-cleanup paths so the two never drift:
 /// a key bound as a JSON string (`"7"` instead of `7`) would silently match
 /// nothing and turn a delete into a no-op.
-fn bind_value<'q>(
+pub(crate) fn bind_value<'q>(
     q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
     v: &Value,
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
@@ -226,6 +226,85 @@ fn build_add_column_sql(table: &str, col: &str, t: SqlBaseType) -> String {
         quote_ident(col),
         sqlite_keyword(t)
     )
+}
+
+/// Rewrite the target's `CREATE TABLE` text (from `sqlite_master.sql`) so it
+/// creates `staging` instead: the overwrite staging table then carries the
+/// target's defaults, generated columns and constraints, which a
+/// `CREATE TABLE … AS SELECT` clone drops (#789 SQL-43). `None` when the text
+/// is not a recognisable `CREATE TABLE`.
+fn staging_definition(create_sql: &str, staging: &str, table: &str) -> Result<String, FaucetError> {
+    staging_ddl(create_sql, staging).ok_or_else(|| {
+        FaucetError::Sink(format!(
+            "sqlite overwrite: cannot derive a staging table from the definition of '{table}'"
+        ))
+    })
+}
+
+fn staging_ddl(create_sql: &str, staging: &str) -> Option<String> {
+    let lower = create_sql.to_ascii_lowercase();
+    let mut pos = lower.find("create")?;
+    pos += "create".len();
+    let rest = &lower[pos..];
+    let skip = rest.len() - rest.trim_start().len();
+    pos += skip;
+    if lower[pos..].starts_with("temp") {
+        return None;
+    }
+    if !lower[pos..].starts_with("table") {
+        return None;
+    }
+    pos += "table".len();
+    let rest = &lower[pos..];
+    pos += rest.len() - rest.trim_start().len();
+    if lower[pos..].starts_with("if not exists") {
+        pos += "if not exists".len();
+        let rest = &lower[pos..];
+        pos += rest.len() - rest.trim_start().len();
+    }
+    let bytes = create_sql.as_bytes();
+    let end = match *bytes.get(pos)? {
+        open @ (b'"' | b'`' | b'[') => {
+            let close = if open == b'[' { b']' } else { open };
+            let mut i = pos + 1;
+            loop {
+                match bytes.get(i)? {
+                    c if *c == close && close != b']' && bytes.get(i + 1) == Some(&close) => i += 2,
+                    c if *c == close => break i + 1,
+                    _ => i += 1,
+                }
+            }
+        }
+        _ => pos + create_sql[pos..].find(|c: char| c.is_whitespace() || c == '(')?,
+    };
+    Some(format!(
+        "{}{}{}",
+        &create_sql[..pos],
+        quote_ident_sqlite(staging),
+        &create_sql[end..]
+    ))
+}
+
+/// A table's non-generated (insertable) columns in order, read on the
+/// caller's connection so it works inside an open transaction.
+pub(crate) async fn insertable_columns(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+) -> Result<Vec<String>, FaucetError> {
+    sqlx::query_scalar("SELECT name FROM pragma_table_xinfo(?) WHERE hidden = 0 ORDER BY cid")
+        .bind(table)
+        .fetch_all(conn)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("sqlite: read columns of '{table}': {e}")))
+}
+
+/// Quote and comma-join column names.
+pub(crate) fn column_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| quote_ident_sqlite(n))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Map a SQLite column affinity string (`PRAGMA table_info.type`, e.g. `INTEGER`,
@@ -358,6 +437,23 @@ impl SqliteSink {
                 .await
                 .map_err(|e| FaucetError::Sink(format!("SQLite table probe failed: {e}")))?;
         Ok(exists.is_some())
+    }
+
+    /// Tables (other than the target and its own staging/previous copies) whose
+    /// foreign keys reference the target.
+    async fn referencing_tables(&self) -> Result<Vec<String>, FaucetError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT m.name FROM sqlite_master m, pragma_foreign_key_list(m.name) f \
+             WHERE m.type = 'table' AND f.\"table\" = ? COLLATE NOCASE AND m.name <> ? \
+             ORDER BY m.name",
+        )
+        .bind(&self.config.table_name)
+        .bind(&self.config.table_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: read foreign keys: {e}")))?;
+        let staging = self.staging_table();
+        Ok(rows.into_iter().filter(|t| *t != staging).collect())
     }
 
     /// Create a new SQLite sink. Establishes a connection pool.
@@ -998,9 +1094,11 @@ impl faucet_core::Sink for SqliteSink {
         self.config.write.is_overwrite()
     }
 
-    /// Create the staging table as an empty clone of the target's shape
-    /// (`CREATE TABLE staging AS SELECT * FROM target WHERE 0`), dropping any
-    /// leftover staging table from a previously-crashed run first.
+    /// Create the staging table from the target's own definition (so defaults,
+    /// generated columns and constraints carry over), dropping any leftover
+    /// staging table from a previously-crashed run first. A target that another
+    /// table references by foreign key is refused: the swap deletes and
+    /// re-inserts its rows, which would cascade into or break that table.
     ///
     /// A missing target with `create_table: true` (a first run) has no shape to
     /// clone: the first write creates staging from the page, and the commit
@@ -1009,7 +1107,6 @@ impl faucet_core::Sink for SqliteSink {
     /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         let staging = quote_ident(&self.staging_table());
-        let target = quote_ident(&self.config.table_name);
         sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
             .execute(&self.pool)
             .await
@@ -1017,23 +1114,42 @@ impl faucet_core::Sink for SqliteSink {
         if self.config.create_table && !self.table_exists(&self.config.table_name).await? {
             return Ok(());
         }
-        sqlx::query(&format!(
-            "CREATE TABLE {staging} AS SELECT * FROM {target} WHERE 0"
-        ))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
+        let referencing = self.referencing_tables().await?;
+        if !referencing.is_empty() {
+            return Err(FaucetError::Config(format!(
+                "sqlite overwrite: table '{}' is referenced by a foreign key from {}; replacing \
+                 its rows would cascade into or break those tables. Use write_mode: upsert, or \
+                 drop the foreign key",
+                self.config.table_name,
+                referencing.join(", ")
+            )));
+        }
+        let create_sql: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(&self.config.table_name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("sqlite overwrite: read target definition: {e}"))
+                })?;
+        let create_sql = create_sql.ok_or_else(|| {
             FaucetError::Sink(format!(
-                "sqlite overwrite: create staging from '{}' (does the table exist?): {e}",
+                "sqlite overwrite: create staging from '{}': the table does not exist",
                 self.config.table_name
             ))
         })?;
+        let ddl = staging_definition(&create_sql, &self.staging_table(), &self.config.table_name)?;
+        sqlx::query(&ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: create staging: {e}")))?;
         Ok(())
     }
 
     /// Atomically replace the destination with the staged rows in one
-    /// transaction: `DELETE FROM target; INSERT INTO target SELECT * FROM
-    /// staging; DROP TABLE staging`. SQLite DDL is transactional, so a failure
+    /// transaction: `DELETE FROM target; INSERT INTO target (cols) SELECT cols
+    /// FROM staging; DROP TABLE staging`, over the target's non-generated
+    /// columns. SQLite DDL is transactional, so a failure
     /// anywhere rolls the whole swap back and the prior rows survive.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
         let staging = quote_ident(&self.staging_table());
@@ -1064,9 +1180,10 @@ impl faucet_core::Sink for SqliteSink {
         if self.config.write.keeps_previous() {
             self.keep_previous_copy(&mut tx).await?;
         }
+        let cols = column_list(&insertable_columns(&mut tx, &self.config.table_name).await?);
         for stmt in [
             format!("DELETE FROM {target}"),
-            format!("INSERT INTO {target} SELECT * FROM {staging}"),
+            format!("INSERT INTO {target} ({cols}) SELECT {cols} FROM {staging}"),
             format!("DROP TABLE {staging}"),
         ] {
             sqlx::query(&stmt)
@@ -1114,6 +1231,12 @@ impl faucet_core::Sink for SqliteSink {
     /// connection acquired from the pool (a standalone read — not inside an open
     /// transaction).
     async fn current_schema(&self) -> Result<Option<serde_json::Value>, FaucetError> {
+        // JSON-column mode stores each record whole; the physical columns are
+        // not the record's fields, so there is nothing to drift against
+        // (#789 SQL-20).
+        if !matches!(self.config.column_mapping, SqliteColumnMapping::AutoMap) {
+            return Ok(None);
+        }
         let rows = sqlx::query(&format!(
             "PRAGMA table_info({})",
             quote_ident(&self.config.table_name)
@@ -1385,6 +1508,47 @@ impl faucet_core::Sink for SqliteSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_ddl_renames_only_the_table_of_any_quoting_style() {
+        let cases = [
+            (
+                "CREATE TABLE users (id INTEGER, note TEXT DEFAULT 'users')",
+                "CREATE TABLE `users__faucet_ovw` (id INTEGER, note TEXT DEFAULT 'users')",
+            ),
+            (
+                "CREATE TABLE \"my \"\"t\"\"\"(a)",
+                "CREATE TABLE `users__faucet_ovw`(a)",
+            ),
+            (
+                "create table `t` (a)",
+                "create table `users__faucet_ovw` (a)",
+            ),
+            ("CREATE TABLE [t](a)", "CREATE TABLE `users__faucet_ovw`(a)"),
+            (
+                "CREATE TABLE IF NOT EXISTS t (a)",
+                "CREATE TABLE IF NOT EXISTS `users__faucet_ovw` (a)",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                staging_ddl(input, "users__faucet_ovw").as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+        assert_eq!(staging_ddl("CREATE TEMP TABLE t (a)", "s"), None);
+        assert_eq!(staging_ddl("CREATE VIEW v AS SELECT 1", "s"), None);
+        assert_eq!(staging_ddl("SELECT 1", "s"), None);
+        assert_eq!(staging_ddl("CREATE TABLE \"unterminated", "s"), None);
+        assert_eq!(staging_ddl("CREATE TABLE", "s"), None);
+        assert!(
+            staging_definition("CREATE VIEW v AS SELECT 1", "s", "v")
+                .unwrap_err()
+                .to_string()
+                .contains("'v'")
+        );
+    }
     use crate::config::SqliteSinkConfig;
     use faucet_core::Sink as _;
 

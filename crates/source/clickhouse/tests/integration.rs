@@ -219,3 +219,94 @@ async fn incremental_pushdown_and_resume() {
         "incremental replication must expose a bookmark state key"
     );
 }
+
+/// #789 SQL-05: a 64-bit integer cursor orders numerically — `100` follows
+/// `99` — whatever the server's `output_format_json_quote_64bit_integers`
+/// default, because the source quotes them and decodes by column type.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_uint64_cursor_orders_numerically_across_runs() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE seq (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    http_exec(
+        &base,
+        "INSERT INTO seq VALUES (9, -1), (99, -2), (100, -3), (101, 9223372036854775807)",
+    )
+    .await;
+
+    let source = ClickHouseSource::new(
+        ClickHouseSourceConfig::new(&base, "SELECT id, v FROM seq ORDER BY id")
+            .incremental("id", json!(9)),
+    )
+    .expect("source");
+    let (rows, bookmark) = source.fetch_all_incremental().await.expect("run 1");
+    let ids: Vec<u64> = rows.iter().map(|r| r["id"].as_u64().unwrap()).collect();
+    assert_eq!(ids, vec![99, 100, 101]);
+    assert_eq!(bookmark, Some(json!(101)));
+    assert_eq!(rows[2]["v"], json!(9_223_372_036_854_775_807i64));
+
+    source
+        .apply_start_bookmark(bookmark.unwrap())
+        .await
+        .expect("bookmark");
+    http_exec(&base, "INSERT INTO seq VALUES (200, 0)").await;
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let pages: Vec<_> = source
+        .stream_pages(&ctx, 1000)
+        .map(|p| p.expect("page"))
+        .collect()
+        .await;
+    let streamed: Vec<u64> = pages
+        .iter()
+        .flat_map(|p| p.records.iter())
+        .map(|r| r["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        streamed,
+        vec![200],
+        "the run after 101 reads 200, not nothing"
+    );
+}
+
+/// #789 SQL-15: decimals and 128/256-bit integers arrive as exact strings.
+#[tokio::test(flavor = "multi_thread")]
+async fn decimals_and_wide_integers_stay_exact() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE money (id UInt8, amount Decimal(38, 10), big Int128, huge UInt256) \
+         ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    http_exec(
+        &base,
+        "INSERT INTO money VALUES (1, '1234567890123456789012345678.0123456789', \
+         '-170141183460469231731687303715884105728', \
+         '115792089237316195423570985008687907853269984665640564039457584007913129639935')",
+    )
+    .await;
+    let source = ClickHouseSource::new(ClickHouseSourceConfig::new(
+        &base,
+        "SELECT id, amount, big, huge FROM money",
+    ))
+    .expect("source");
+    let rows = source.fetch_all().await.expect("fetch");
+    assert_eq!(rows[0]["id"], json!(1));
+    assert_eq!(
+        rows[0]["amount"],
+        json!("1234567890123456789012345678.0123456789")
+    );
+    assert_eq!(
+        rows[0]["big"],
+        json!("-170141183460469231731687303715884105728")
+    );
+    assert_eq!(
+        rows[0]["huge"],
+        json!("115792089237316195423570985008687907853269984665640564039457584007913129639935")
+    );
+}

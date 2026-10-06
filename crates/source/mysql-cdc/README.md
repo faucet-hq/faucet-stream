@@ -137,6 +137,20 @@ Every change event is one JSON object:
 | `lsn` | object | Binlog coordinates of the commit event: `{ "file": "mysql-bin.000003", "pos": 4567 }`. Used as the persisted bookmark. |
 | `txid` | number | Monotonically increasing per-session transaction counter (resets to 0 on each `faucet run`). Useful for grouping rows from the same transaction. |
 
+### Column values
+
+`before` / `after` values render the same way the [`mysql`](https://crates.io/crates/faucet-source-mysql) query source renders a snapshot, so a snapshot → CDC mirror never rewrites a row just because its type changed shape:
+
+| Column type | JSON |
+|---|---|
+| `TIMESTAMP` | RFC 3339 UTC string |
+| `DATETIME` / `DATE` / `TIME` | `YYYY-MM-DD HH:MM:SS[.fff]` / `YYYY-MM-DD` / `HH:MM:SS[.fff]` strings |
+| `YEAR` | number |
+| `FLOAT` | the single-precision value's shortest decimal form |
+| `ENUM` / `SET` | the label / the comma-joined labels (needs `binlog_row_metadata=FULL`, already required) |
+
+Binlog transaction compression (`binlog_transaction_compression=ON`) is supported; each row's `lsn.pos` is the end of its compressed transaction, so a resume never re-reads a transaction it already delivered.
+
 ### `op` mapping
 
 | Binlog event | `op` value |
@@ -195,7 +209,7 @@ Both lists must use fully-qualified names (e.g. `appdb.users`); an unqualified e
 | `{ type: file_pos, file: "mysql-bin.000003", pos: 4567 }` | Resume from an explicit file/position. |
 | `{ type: gtid_set, value: "uuid:1-1000" }` | Start after an executed GTID set. Requires `gtid_mode=ON` on the server. |
 
-A persisted bookmark always wins over `start_position` — the latter only applies on a fresh run.
+A persisted bookmark always wins over `start_position` — the latter only applies on a fresh run. A fresh `current` start persists the position it resolved before any change arrives, so a restart before the first commit resumes there instead of re-resolving `current` and skipping whatever was written in between.
 
 ### TLS modes
 

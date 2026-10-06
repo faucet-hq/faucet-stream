@@ -13,7 +13,7 @@ Built on [`sqlx`](https://crates.io/crates/sqlx) with a reusable connection pool
 
 - **Streaming row cursor** — `stream_pages` drives a `sqlx` cursor and yields `batch_size`-sized pages; peak client memory is `O(batch_size)`, independent of total row count.
 - **Connection pooling** — a `PgPoolOptions` pool sized by `max_connections` is built once in `new()` and reused for every fetch.
-- **Type-aware row decoding** — integers, floats, booleans, `text`, `json`/`jsonb`, `timestamp(tz)`, `date`/`time`, `uuid`, `numeric`/`decimal`, and `bytea` are each converted to the right JSON shape (full numeric precision preserved as strings; binary base64-encoded).
+- **Type-aware row decoding** — integers, floats, booleans, `text`, `json`/`jsonb`, `timestamp(tz)`, `date`/`time`, `uuid`, `numeric`/`decimal`, and `bytea` are each converted to the right JSON shape (full numeric precision preserved as strings; binary base64-encoded); every other type arrives as its text output, never as a silent `null`.
 - **Positional bind parameters** — `params` from config are bound as native scalar types (`$1`, `$2`, …), so a numeric or boolean bind compares correctly against a typed column instead of being coerced to `jsonb`.
 - **Matrix-context binding** — `${parent.path}` tokens in the query are rewritten to additional positional bind markers and filled per parent record, so the same query template runs once per row produced by a parent in a [matrix](https://faucet-hq.github.io/faucet-stream/reference/config.html) pipeline.
 - **Credential redaction** — the connection URL is masked in `Debug` output and stripped from the emitted lineage dataset URI.
@@ -178,15 +178,23 @@ Columns are converted to JSON values by probing the row's value with each candid
 | `int8` / `bigint` | number (i64) |
 | `int4` / `integer` | number (i32) |
 | `int2` / `smallint` | number (i16) |
-| `float8` / `double precision` | number (f64) |
-| `float4` / `real` | number (f32) |
+| `float8` / `double precision` | number (f64); `NaN` / `Infinity` / `-Infinity` as those strings |
+| `float4` / `real` | number (f32); non-finite values as strings |
 | `bool` / `boolean` | boolean |
 | `timestamptz` | string (RFC 3339) |
-| `timestamp`, `date`, `time` | string (ISO-8601) |
+| `timestamp`, `date` | string (ISO-8601) |
+| `time` | string, the server's own text (`24:00:00` stays `24:00:00`) |
 | `uuid` | string (canonical hyphenated) |
-| `numeric`, `decimal` | string (exact precision preserved) |
+| `numeric`, `decimal` | string, exact (`NaN` / `Infinity` too) |
 | `bytea` | string (base64) |
-| other / `NULL` | `null` |
+| any other type — arrays, enums, `interval`, `inet`/`cidr`, `money`, ranges, `timetz`, `xml`, `hstore`, … | string, the type's own text output (the same text postgres-cdc emits) |
+| `NULL` | `null` |
+
+Types without an exact native decode are read through their text output: the
+source describes the query first and wraps it, casting only those columns. A
+query with duplicate column names cannot be wrapped; there, a non-NULL value of
+such a type fails the run with an error naming the column instead of turning
+into `null` — alias the columns or cast the value in SQL.
 
 ## Matrix-context binding
 
@@ -296,7 +304,7 @@ This crate has no optional features of its own. Enable it in the CLI or umbrella
 | `FaucetError::Config: batch_size must be …` | `batch_size` exceeds `MAX_BATCH_SIZE` (1,000,000). Lower it, or use `0` for a single un-chunked page. |
 | Run uses too much memory on a huge table | Lower `batch_size` so each page is smaller, and ensure the sink flushes per page. Avoid `batch_size: 0` for very large result sets — it materializes everything in one page. |
 | A `numeric`/`timestamp`/`uuid` arrives as a string | Intentional — these are encoded as strings to preserve exact precision / format. Cast downstream (e.g. a `cast` transform) if you need a JSON number. |
-| A column comes back as `null` unexpectedly | The column's Postgres type isn't in the supported-type table above and falls through to `null`. Cast it in SQL (e.g. `SELECT my_col::text`) so it decodes as a string. |
+| A run fails with "has type … which the source cannot decode" | The query has duplicate column names, so a type without a native decode could not be read as text. Alias the duplicate columns (or cast the value to `text` in SQL). |
 | Connection-pool exhaustion under high matrix fan-out | Many matrix children share the pool. Raise `max_connections`, or lower the pipeline's `execution.max_concurrent`. |
 | Credentials appear in logs | The DSN is masked in `Debug` and stripped from the lineage URI, but never run a connector config holding a resolved secret with `FAUCET_LOG=debug` — third-party `sqlx` logging is outside faucet's redaction boundary. |
 

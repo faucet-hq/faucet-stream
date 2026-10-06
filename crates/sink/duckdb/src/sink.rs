@@ -72,9 +72,67 @@ fn split_table(table: &str) -> (Option<&str>, &str) {
 pub struct DuckdbSink {
     config: DuckdbSinkConfig,
     conn: Arc<Mutex<Connection>>,
+    /// The process-wide database instance this sink's connection belongs to,
+    /// kept alive for as long as the sink is.
+    _instance: Option<SharedInstance>,
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+}
+
+/// One DuckDB database instance per file in this process (#789 SQL-07).
+///
+/// Every `Connection::open` creates a separate instance, and DuckDB's file
+/// lock never conflicts inside one process, so two sinks on one file used to
+/// write through two instances; whichever closed last checkpointed its own
+/// view and the other's committed data disappeared. Sinks on the same file now
+/// take `try_clone()`d connections of one shared instance.
+static INSTANCES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Weak<Mutex<Connection>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// The identity of a database file, stable whether or not it exists yet.
+fn instance_key(path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    let parent = p
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    match (std::fs::canonicalize(parent), p.file_name()) {
+        (Ok(dir), Some(name)) => dir.join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// A connection to `path`, sharing the process's instance for that file.
+type SharedInstance = Arc<Mutex<Connection>>;
+
+fn connect(path: &str) -> Result<(Connection, Option<SharedInstance>), FaucetError> {
+    if path == ":memory:" {
+        return Ok((open(path)?, None));
+    }
+    let key = instance_key(path);
+    let mut instances = INSTANCES
+        .lock()
+        .map_err(|_| FaucetError::Sink("duckdb instance registry poisoned".into()))?;
+    let instance = match instances.get(&key).and_then(std::sync::Weak::upgrade) {
+        Some(existing) => existing,
+        None => {
+            let fresh = Arc::new(Mutex::new(open(path)?));
+            instances.insert(key, Arc::downgrade(&fresh));
+            fresh
+        }
+    };
+    instances.retain(|_, w| w.strong_count() > 0);
+    let conn = instance
+        .lock()
+        .map_err(|_| FaucetError::Sink("duckdb instance mutex poisoned".into()))?
+        .try_clone()
+        .map_err(|e| FaucetError::Sink(format!("DuckDB connect failed ({path}): {e}")))?;
+    Ok((conn, Some(instance)))
 }
 
 fn open(path: &str) -> Result<Connection, FaucetError> {
@@ -356,12 +414,13 @@ impl DuckdbSink {
     pub async fn new(config: DuckdbSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         let path = config.resolved_path().to_string();
-        let conn = tokio::task::spawn_blocking(move || open(&path))
+        let (conn, instance) = tokio::task::spawn_blocking(move || connect(&path))
             .await
             .map_err(|e| FaucetError::Sink(format!("duckdb open task panicked: {e}")))??;
         Ok(Self {
             config,
             conn: Arc::new(Mutex::new(conn)),
+            _instance: instance,
             table_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }

@@ -235,3 +235,103 @@ async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
         vec![(1, "a2".into()), (2, "b".into()), (3, "c".into())]
     );
 }
+
+/// #789 SQL-09: an upsert row that omits a column leaves the stored value
+/// alone, even when another row in the same page carries that column — the
+/// canonical postgres-cdc mirror omits an unchanged TOAST column.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_rows_without_a_column_keep_its_stored_value() {
+    let (_container, url) = start_postgres().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    sqlx::query("CREATE TABLE kv (id INT PRIMARY KEY, name TEXT, body TEXT)")
+        .execute(&pool)
+        .await
+        .expect("create");
+    sqlx::query("INSERT INTO kv VALUES (1, 'a', 'big-1'), (2, 'b', 'big-2')")
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+    let sink = PostgresSink::new(upsert_sink_config(&url))
+        .await
+        .expect("sink");
+    sink.write_batch(&[
+        json!({"id": 1, "body": "big-1-changed"}),
+        json!({"id": 2, "name": "b2"}),
+        json!({"id": 3, "name": "c", "body": "big-3"}),
+    ])
+    .await
+    .expect("upsert");
+
+    let rows: Vec<(i32, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT id, name, body FROM kv ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("read");
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some("a".into()), Some("big-1-changed".into())),
+            (2, Some("b2".into()), Some("big-2".into())),
+            (3, Some("c".into()), Some("big-3".into())),
+        ]
+    );
+    pool.close().await;
+}
+
+/// #789 SQL-02: a base64 string (how every faucet source emits binary) lands
+/// in a `bytea` column as its bytes, through both INSERT and COPY; hex input
+/// and non-base64 text are passed through unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn base64_strings_land_in_bytea_as_their_bytes() {
+    let (_container, url) = start_postgres().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    sqlx::query("CREATE TABLE bin (id INT PRIMARY KEY, b BYTEA)")
+        .execute(&pool)
+        .await
+        .expect("create");
+
+    let records = [
+        json!({"id": 1, "b": "SGVsbG8="}),
+        json!({"id": 2, "b": "\\x00ff"}),
+        json!({"id": 3, "b": "not base64!"}),
+        json!({"id": 4, "b": ""}),
+    ];
+    let insert = PostgresSink::new(
+        PostgresSinkConfig::new(&url, "bin").column_mapping(PostgresColumnMapping::AutoMap),
+    )
+    .await
+    .expect("sink");
+    insert.write_batch(&records[..2]).await.expect("insert");
+    let mut copy_cfg =
+        PostgresSinkConfig::new(&url, "bin").column_mapping(PostgresColumnMapping::AutoMap);
+    copy_cfg.write_method = faucet_sink_postgres::PostgresWriteMethod::Copy;
+    let copy = PostgresSink::new(copy_cfg).await.expect("copy sink");
+    copy.write_batch(&records[2..]).await.expect("copy");
+
+    let rows: Vec<(i32, Vec<u8>)> = sqlx::query_as("SELECT id, b FROM bin ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("read");
+    assert_eq!(rows[0].1, b"Hello".to_vec());
+    assert_eq!(rows[1].1, vec![0x00, 0xff]);
+    assert_eq!(rows[2].1, b"not base64!".to_vec());
+    assert_eq!(rows[3].1, Vec::<u8>::new());
+    pool.close().await;
+}
+
+/// #789 SQL-20: in JSON-column mode the physical columns are not the
+/// record's fields, so no drift baseline is reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn json_column_mode_reports_no_drift_baseline() {
+    let (_container, url) = start_postgres().await;
+    create_kv_table(&url).await;
+    let json_sink = PostgresSink::new(PostgresSinkConfig::new(&url, "kv"))
+        .await
+        .expect("sink");
+    assert!(json_sink.current_schema().await.unwrap().is_none());
+    let auto = PostgresSink::new(upsert_sink_config(&url))
+        .await
+        .expect("sink");
+    assert!(auto.current_schema().await.unwrap().is_some());
+}

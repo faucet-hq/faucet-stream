@@ -297,3 +297,84 @@ async fn first_overwrite_that_writes_nothing_creates_no_table() {
     sink.commit_overwrite().await.unwrap();
     assert!(!table_exists(&url, "users").await);
 }
+
+/// #789 SQL-43: staging is built from the target's own definition, so a
+/// `NOT NULL DEFAULT` column the records do not carry keeps its default and a
+/// generated column is computed — a `CREATE TABLE … AS SELECT` clone dropped
+/// both, and the swap then failed or nulled the column.
+#[tokio::test]
+async fn overwrite_keeps_defaults_and_generated_columns() {
+    let (_dir, url) = fresh_db(
+        "CREATE TABLE \"users\" (id INTEGER PRIMARY KEY, name TEXT, \
+         status TEXT NOT NULL DEFAULT 'new', note TEXT DEFAULT 'n/a', \
+         name_len INT GENERATED ALWAYS AS (length(name)) VIRTUAL)",
+    )
+    .await;
+    seed(
+        &url,
+        "INSERT INTO users (id, name, status) VALUES (1, 'old', 'done')",
+    )
+    .await;
+    let sink = SqliteSink::new(overwrite_config(&url, SqliteColumnMapping::AutoMap))
+        .await
+        .unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[json!({"id": 2, "name": "abcd"})])
+        .await
+        .unwrap();
+    sink.commit_overwrite().await.unwrap();
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT id, status, note, name_len FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<i64, _>("id"), 2);
+    assert_eq!(row.get::<String, _>("status"), "new");
+    assert_eq!(row.get::<String, _>("note"), "n/a");
+    assert_eq!(row.get::<i64, _>("name_len"), 4);
+    pool.close().await;
+}
+
+/// #789 SQL-43: a target another table references by foreign key is refused —
+/// the swap's delete-and-refill would cascade into (or break) that table.
+#[tokio::test]
+async fn overwrite_refuses_a_target_referenced_by_a_foreign_key() {
+    let (_dir, url) = fresh_db("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").await;
+    seed(
+        &url,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, \
+         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE)",
+    )
+    .await;
+    seed(&url, "INSERT INTO users VALUES (1, 'a')").await;
+    seed(&url, "INSERT INTO orders VALUES (10, 1)").await;
+
+    let sink = SqliteSink::new(overwrite_config(&url, SqliteColumnMapping::AutoMap))
+        .await
+        .unwrap();
+    let err = sink.begin_overwrite().await.unwrap_err().to_string();
+    assert!(err.contains("orders"), "{err}");
+    assert_eq!(names(&url, "users").await, vec!["a"]);
+}
+
+/// #789 SQL-20: in JSON-column mode the physical columns are not the record's
+/// fields, so the sink reports no drift baseline instead of one that strips
+/// every field.
+#[tokio::test]
+async fn json_column_mode_reports_no_drift_baseline() {
+    let (_dir, url) =
+        fresh_db("CREATE TABLE users (id INTEGER PRIMARY KEY, data TEXT NOT NULL)").await;
+    let mut cfg = overwrite_config(&url, SqliteColumnMapping::default());
+    cfg.write = WriteSpec::default();
+    let sink = SqliteSink::new(cfg).await.unwrap();
+    assert!(sink.current_schema().await.unwrap().is_none());
+    let auto = SqliteSink::new(overwrite_config(&url, SqliteColumnMapping::AutoMap))
+        .await
+        .unwrap();
+    assert!(auto.current_schema().await.unwrap().is_some());
+}

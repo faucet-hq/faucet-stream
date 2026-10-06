@@ -454,3 +454,47 @@ async fn capability_readback_and_token_rewind() {
         .unwrap_err();
     assert!(err.to_string().contains(RUN_COL), "{err}");
 }
+
+/// #789 SQL-32: a pre-existing row whose stored key text differs from the
+/// record's (an uppercase UUID into a `uuid` column) is restored, not deleted
+/// as if the run had created it.
+#[tokio::test]
+async fn rollback_restores_a_row_whose_key_text_differs_from_the_record() {
+    let (_c, url) = start_postgres().await;
+    exec(
+        &url,
+        "CREATE TABLE users (id UUID PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    exec(
+        &url,
+        "INSERT INTO users VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'old', 'r0')",
+    )
+    .await;
+    let sink = PostgresSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[json!({
+        "id": "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+        "name": "new",
+        RUN_COL: "r1"
+    })])
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar(
+            &url,
+            "SELECT count(*) FROM _faucet_run_journal WHERE before_json IS NULL"
+        )
+        .await,
+        0,
+        "the existing row's image is journaled"
+    );
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert_eq!((out.deleted, out.restored), (0, 1), "{out:?}");
+    assert_eq!(
+        scalar(&url, "SELECT count(*) FROM users WHERE name = 'old'").await,
+        1
+    );
+}

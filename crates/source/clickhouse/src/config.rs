@@ -42,8 +42,9 @@ pub struct ClickHouseSourceConfig {
     /// Connection settings (`url` or `host`, `database`, credentials).
     #[serde(flatten)]
     pub connection: ClickHouseConnection,
-    /// SQL `SELECT` query to run. The output format is set to `JSONEachRow`
-    /// via the request settings, so **do not** append a `FORMAT` clause. Use
+    /// SQL `SELECT` query to run. The output format is set via the request
+    /// settings (`JSONCompactEachRowWithNamesAndTypes`, decoded by column
+    /// type), so **do not** append a `FORMAT` clause. Use
     /// the literal `@bookmark` token to push the incremental cursor down into
     /// the `WHERE` clause; use `{key}` tokens to inject parent-context values in
     /// a matrix child.
