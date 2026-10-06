@@ -74,7 +74,7 @@ pub struct DuckdbSink {
     conn: Arc<Mutex<Connection>>,
     /// The process-wide database instance this sink's connection belongs to,
     /// kept alive for as long as the sink is.
-    _instance: Option<Arc<Mutex<Connection>>>,
+    _instance: Option<SharedInstance>,
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
@@ -108,7 +108,9 @@ fn instance_key(path: &str) -> std::path::PathBuf {
 }
 
 /// A connection to `path`, sharing the process's instance for that file.
-fn connect(path: &str) -> Result<(Connection, Option<Arc<Mutex<Connection>>>), FaucetError> {
+type SharedInstance = Arc<Mutex<Connection>>;
+
+fn connect(path: &str) -> Result<(Connection, Option<SharedInstance>), FaucetError> {
     if path == ":memory:" {
         return Ok((open(path)?, None));
     }

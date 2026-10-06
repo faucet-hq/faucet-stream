@@ -447,8 +447,7 @@ impl SqliteSink {
         // have gained columns since (schema evolution), and a generated column
         // cannot be inserted into.
         let kept = self.columns_of(tx, &self.previous_table()).await?;
-        let insertable =
-            crate::sink::insertable_columns(&mut **tx, &self.config.table_name).await?;
+        let insertable = crate::sink::insertable_columns(tx, &self.config.table_name).await?;
         let cols = crate::sink::column_list(
             &kept
                 .into_iter()

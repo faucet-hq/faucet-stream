@@ -601,13 +601,11 @@ async fn a_cycle_under_steady_writes_ends_at_its_bound() {
     });
 
     let started = std::time::Instant::now();
-    let (records, bookmark) = tokio::time::timeout(
-        Duration::from_secs(20),
-        source.fetch_all_incremental(),
-    )
-    .await
-    .expect("the cycle must end well before idle_timeout under steady writes")
-    .expect("fetch");
+    let (records, bookmark) =
+        tokio::time::timeout(Duration::from_secs(20), source.fetch_all_incremental())
+            .await
+            .expect("the cycle must end well before idle_timeout under steady writes")
+            .expect("fetch");
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.await.expect("writer");
     assert!(started.elapsed() < Duration::from_secs(15));

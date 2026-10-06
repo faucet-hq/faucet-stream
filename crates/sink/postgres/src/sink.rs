@@ -584,13 +584,9 @@ impl PostgresSink {
 
         let num_rows = matched_rows.len();
         match conflict_key {
-            // An upsert writes each row's own columns only: binding NULL for a
-            // column a row omits would overwrite a stored value — an unchanged
-            // TOAST column a CDC event leaves out (#789 SQL-09). Rows are
-            // grouped by the set of columns they carry, one statement each.
+            // Grouped by present columns so an absent column is never overwritten with NULL.
             Some(_) => {
-                let mut groups: Vec<(Vec<usize>, Vec<&Vec<(&String, &String, &Value)>>)> =
-                    Vec::new();
+                let mut groups: Vec<(Vec<usize>, Vec<_>)> = Vec::new();
                 for row in &matched_rows {
                     let present: Vec<usize> = columns
                         .iter()

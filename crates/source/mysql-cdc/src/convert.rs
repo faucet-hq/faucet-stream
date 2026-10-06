@@ -212,7 +212,7 @@ pub fn column_hints(tme: &mysql_async::binlog::events::TableMapEvent<'_>) -> Vec
 fn fraction(micros: u32) -> String {
     if micros == 0 {
         String::new()
-    } else if micros % 1000 == 0 {
+    } else if micros.is_multiple_of(1000) {
         format!(".{:03}", micros / 1000)
     } else {
         format!(".{micros:06}")
