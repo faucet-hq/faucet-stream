@@ -6,7 +6,8 @@
 //! other integration tests.
 //!
 //! Check 3 (bookmark round-trip) does not apply: the SQS source drains the
-//! queue with no resumable bookmark (`bookmark: None` on every page).
+//! queue with no resumable bookmark (every page carries an informational
+//! `{queue, consumed}` bookmark only so the pipeline flushes before deleting).
 
 use faucet_conformance::{assert_config_schema_valid_value, assert_errors_not_panics};
 use faucet_source_sqs::{SqsCredentials, SqsSource, SqsSourceConfig};
@@ -233,5 +234,81 @@ async fn messages_survive_a_downstream_failure_after_the_page_is_yielded() {
         4,
         "no message may be deleted before the page it belongs to is written \
          downstream — every one must still be redeliverable"
+    );
+}
+
+/// Create a queue with a short visibility timeout.
+async fn create_queue_with_visibility(
+    client: &aws_sdk_sqs::Client,
+    name: &str,
+    secs: &str,
+) -> String {
+    use aws_sdk_sqs::types::QueueAttributeName;
+    for _ in 0..120 {
+        match client
+            .create_queue()
+            .queue_name(name)
+            .attributes(QueueAttributeName::VisibilityTimeout, secs)
+            .send()
+            .await
+        {
+            Ok(out) => return out.queue_url().expect("queue url").to_string(),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+        }
+    }
+    panic!("localstack sqs never became ready");
+}
+
+/// Drain the queue, collecting every record.
+async fn drain(source: &SqsSource) -> Vec<serde_json::Value> {
+    use faucet_core::Source as _;
+    use futures::StreamExt;
+    let ctx = std::collections::HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 4);
+    let mut out = Vec::new();
+    while let Some(page) = pages.next().await {
+        let page = page.expect("page");
+        assert!(
+            page.bookmark.is_some(),
+            "every page carries a bookmark (MSG-07)"
+        );
+        out.extend(page.records);
+    }
+    out
+}
+
+/// MSG-09: a page still being assembled when the queue's visibility timeout
+/// runs out must not receive its own messages again — the source keeps
+/// renewing the visibility of everything it holds. Two messages, a page of
+/// four, a 3 s visibility timeout and an 8 s idle window: without renewal the
+/// two come back and fill the page with duplicates.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_messages_are_not_redelivered_while_a_page_is_assembled() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+
+    let config = |queue_url: &str, renew: u32| {
+        let mut cfg = SqsSourceConfig::new(queue_url);
+        cfg.region = Some("us-east-1".into());
+        cfg.endpoint_url = Some(endpoint.clone());
+        cfg.credentials = test_credentials();
+        cfg.wait_time_seconds = 1;
+        cfg.idle_timeout_secs = Some(8);
+        cfg.batch_size = 4;
+        cfg.visibility_extension_secs = renew;
+        cfg
+    };
+
+    let renewed = create_queue_with_visibility(&client, "lease-renewed", "3").await;
+    seed(&client, &renewed, 2).await;
+    let source = SqsSource::new(config(&renewed, 6)).await.expect("source");
+    assert_eq!(drain(&source).await.len(), 2, "no redelivery while renewed");
+
+    let unrenewed = create_queue_with_visibility(&client, "lease-unrenewed", "3").await;
+    seed(&client, &unrenewed, 2).await;
+    let source = SqsSource::new(config(&unrenewed, 0)).await.expect("source");
+    assert!(
+        drain(&source).await.len() > 2,
+        "without renewal the held messages come back (proves the test can fail)"
     );
 }

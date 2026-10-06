@@ -150,7 +150,7 @@ async-stream = { workspace = true }
 # `macros` is required by `tokio::select!` in the streaming loop's cooperative
 # cancellation (#146 H16); without it a connector built in feature isolation
 # (no dependent pulling tokio/macros in via unification) fails to compile.
-tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "macros"] }
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "macros", "rt"] }
 # `CancellationToken` for cooperative run cancellation (flush-on-cancel, #146 H16).
 tokio-util = { workspace = true }
 dotenvy = "0.15"
@@ -198,7 +198,7 @@ parquet = { version = "58", optional = true, features = ["async"] }
 
 [dev-dependencies]
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 futures.workspace = true
 tempfile = "3"
 metrics-util.workspace = true
