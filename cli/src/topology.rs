@@ -43,6 +43,12 @@ pub struct TopologyRunOptions {
     pub limit: Option<usize>,
     /// Clock backing `${now.*}` in node configs. `None` = process start.
     pub clock: Option<DateTime<FixedOffset>>,
+    /// Run budget (#703): applied to every real sink node, and its
+    /// `allowed_sinks` to every sink node's template and kind (#789 CLI-16).
+    pub budget: Option<faucet_core::BudgetSpec>,
+    /// Run id, so a caller (serve) can attribute the run to its own id. A
+    /// fresh UUIDv7 when `None`.
+    pub run_id: Option<String>,
 }
 
 impl TopologyRunOptions {
@@ -60,10 +66,12 @@ impl TopologyRunOptions {
 
 /// Top-level blocks that topology mode parses but does **not** act on.
 ///
-/// Empty — every top-level block is now applied to a node graph: the per-page
-/// governance passes and `resilience:` per sink node (#456 C3), and `sla:` /
-/// `notifications:` / `lineage:` / `catalog:` per sink node in
-/// `post_run_observability` (#459).
+/// Only `usage:` — a pricing table for reports a node graph does not produce.
+/// Every block that carries a guarantee is either applied to the graph (the
+/// governance passes and `resilience:` per sink node, #456 C3; `sla:` /
+/// `notifications:` / `lineage:` / `catalog:` per sink node, #459; `budget:`,
+/// `metadata_columns:` and `reconcile:` per sink node, #789 CLI-16) or refused by
+/// [`validate_topology_spec`] (`verify:`, `rollback:`).
 ///
 /// The mechanism is kept deliberately. A declared-but-inert block is the worst
 /// kind of silence — the operator believes a guarantee is in force when nothing
@@ -71,8 +79,14 @@ impl TopologyRunOptions {
 /// mode, list it here and `faucet validate` will say so out loud rather than
 /// printing a clean bill of health.
 pub fn inert_blocks(cfg: &PipelineConfig) -> Vec<(&'static str, &'static str)> {
-    let _ = cfg;
-    Vec::new()
+    let mut inert = Vec::new();
+    if cfg.usage.is_some() {
+        inert.push((
+            "usage",
+            "a node graph records no usage or cost estimate for its runs",
+        ));
+    }
+    inert
 }
 
 /// Config-level graph validation: the checks that need only the `nodes:` /
@@ -96,6 +110,7 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
     if cfg.delivery == faucet_core::DeliveryMode::ExactlyOnce {
         validate_exactly_once(cfg)?;
     }
+    refuse_graph_blocks(cfg)?;
     let spec = &cfg.pipeline;
     let mut known: Vec<String> = spec.nodes.keys().cloned().collect();
     known.sort_unstable();
@@ -110,6 +125,101 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+/// Refuse the blocks a node graph cannot honour, and check the ones it applies
+/// (#789 CLI-16). A block that parses but does nothing is worse than an error:
+/// the operator believes a guarantee is in force when nothing enforces it.
+///
+/// - `verify:` compares a destination with *its* source through one transform
+///   chain. A graph sink is fed through tees, merges and joins, so it has no
+///   single source to compare against.
+/// - `rollback:` journals per matrix row and undoes a run through that row's
+///   run marker; a node graph has no rows to journal or locate a run under.
+fn refuse_graph_blocks(cfg: &PipelineConfig) -> CliResult<()> {
+    if cfg.verify.is_some() {
+        return Err(CliError::Config(
+            "`verify:` is not supported in topology mode (`pipeline.nodes`): a node graph's \
+             sink is fed through tees, merges and joins rather than one source and one \
+             transform chain, so there is no source to compare its rows against. Verify a \
+             matrix config instead"
+                .into(),
+        ));
+    }
+    if cfg.rollback.as_ref().is_some_and(|r| r.enabled) {
+        return Err(CliError::Config(
+            "`rollback:` is not supported in topology mode (`pipeline.nodes`): runs are \
+             journaled and undone per matrix row, and a node graph has none. Remove the \
+             block or set `rollback.enabled: false`"
+                .into(),
+        ));
+    }
+    if let Some(spec) = &cfg.reconcile {
+        spec.validate()?;
+    }
+    if let Some(budget) = &cfg.budget {
+        budget.validate().map_err(CliError::Config)?;
+    }
+    if cfg.delivery == faucet_core::DeliveryMode::ExactlyOnce
+        && let Some((id, _, _)) = sink_nodes(cfg)?
+            .into_iter()
+            .find(|(_, _, c)| c.get("write_mode").and_then(Value::as_str) == Some("overwrite"))
+    {
+        return Err(CliError::Config(format!(
+            "sink node '{id}': `write_mode: overwrite` is incompatible with `delivery: \
+             exactly_once` — an overwrite swaps the whole destination at the end of the run, \
+             so there is no per-page watermark to commit"
+        )));
+    }
+    Ok(())
+}
+
+/// `allowed_sinks` of a run budget, checked against every sink node's template
+/// name and connector kind before anything runs — the graph analogue of the
+/// matrix executor's `check_budget_sinks`.
+fn check_budget_sinks(
+    cfg: &PipelineConfig,
+    budget: Option<&faucet_core::BudgetSpec>,
+) -> CliResult<()> {
+    let Some(budget) = budget.filter(|b| !b.allowed_sinks.is_empty()) else {
+        return Ok(());
+    };
+    for (id, node) in &cfg.pipeline.nodes {
+        let NodeSpec::Sink { template, .. } = node else {
+            continue;
+        };
+        let template = template.as_deref().unwrap_or("default");
+        let kind = resolved_node_kind(cfg, node).unwrap_or_default();
+        if !budget.sink_allowed(template, &kind) {
+            return Err(CliError::BudgetSinkNotAllowed {
+                row: id.clone(),
+                sink: format!("{template} ({kind})"),
+                allowed: budget.allowed_sinks.join(", "),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Per-sink-node run-budget state, so the run can turn a duration verdict into
+/// that node's failure. The timers stop when this is dropped.
+#[derive(Default)]
+pub struct TopologyBudgets {
+    states: HashMap<String, std::sync::Arc<faucet_core::BudgetState>>,
+    timers: Vec<faucet_core::BudgetTimer>,
+}
+
+impl TopologyBudgets {
+    /// `(sink node id, error)` for every node whose budget ran out.
+    fn verdicts(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .states
+            .iter()
+            .filter_map(|(id, s)| s.verdict().map(|v| (id.clone(), v.error().to_string())))
+            .collect();
+        out.sort();
+        out
+    }
 }
 
 /// The connector kind a source/sink node resolves to, without building anything.
@@ -416,7 +526,7 @@ pub async fn build_topology_meta(
     opts: &TopologyRunOptions,
 ) -> CliResult<(Topology, NodeIdentities)> {
     let mut ids = NodeIdentities::new();
-    let topo = build_topology_inner(cfg, auth, opts, Some(&mut ids), None).await?;
+    let topo = build_topology_inner(cfg, auth, opts, Some(&mut ids), None, None).await?;
     Ok((topo, ids))
 }
 
@@ -429,8 +539,49 @@ pub async fn build_topology_full(
 ) -> CliResult<(Topology, NodeIdentities, TopologyProfilers)> {
     let mut ids = NodeIdentities::new();
     let mut profilers = TopologyProfilers::new();
-    let topo = build_topology_inner(cfg, auth, opts, Some(&mut ids), Some(&mut profilers)).await?;
+    let topo =
+        build_topology_inner(cfg, auth, opts, Some(&mut ids), Some(&mut profilers), None).await?;
     Ok((topo, ids, profilers))
+}
+
+/// Everything a run needs from building the graph: the topology, each node's
+/// identity, each sink node's profiler and run-budget state.
+pub struct BuiltTopology {
+    /// The graph, ready to run.
+    pub topology: Topology,
+    /// Source/sink node identities.
+    pub identities: NodeIdentities,
+    /// Per-sink-node column profilers.
+    pub profilers: TopologyProfilers,
+    /// Per-sink-node run-budget state.
+    pub budgets: TopologyBudgets,
+}
+
+/// [`build_topology_full`] that also applies the run budget to every real sink
+/// node (#789 CLI-16).
+pub async fn build_topology_run(
+    cfg: &PipelineConfig,
+    auth: &AuthCatalog,
+    opts: &TopologyRunOptions,
+) -> CliResult<BuiltTopology> {
+    let mut identities = NodeIdentities::new();
+    let mut profilers = TopologyProfilers::new();
+    let mut budgets = TopologyBudgets::default();
+    let topology = build_topology_inner(
+        cfg,
+        auth,
+        opts,
+        Some(&mut identities),
+        Some(&mut profilers),
+        Some(&mut budgets),
+    )
+    .await?;
+    Ok(BuiltTopology {
+        topology,
+        identities,
+        profilers,
+        budgets,
+    })
 }
 
 /// Build a [`faucet_core::Topology`], honouring the run options.
@@ -449,7 +600,7 @@ pub async fn build_topology_with(
     auth: &AuthCatalog,
     opts: &TopologyRunOptions,
 ) -> CliResult<Topology> {
-    build_topology_inner(cfg, auth, opts, None, None).await
+    build_topology_inner(cfg, auth, opts, None, None, None).await
 }
 
 async fn build_topology_inner(
@@ -458,9 +609,19 @@ async fn build_topology_inner(
     opts: &TopologyRunOptions,
     mut identities: Option<&mut NodeIdentities>,
     mut profilers: Option<&mut TopologyProfilers>,
+    mut budgets: Option<&mut TopologyBudgets>,
 ) -> CliResult<Topology> {
     // Cheap graph checks first, so a wiring typo never costs a connector build.
     validate_topology_spec(cfg)?;
+    let budget = opts.budget.as_ref().filter(|b| !b.is_empty());
+    check_budget_sinks(cfg, budget)?;
+    let metadata = match &cfg.metadata_columns {
+        Some(spec) => faucet_core::CompiledMetadata::compile(spec)
+            .map_err(|e| CliError::Config(format!("metadata_columns: {e}")))?,
+        None => None,
+    };
+    let reaching = reaching_sources(cfg);
+    let run_id = opts.run_id.clone().unwrap_or_default();
 
     let clock = opts.clock();
     let spec = &cfg.pipeline;
@@ -538,8 +699,39 @@ async fn build_topology_inner(
                     }
                     sink
                 };
+                // Run budget (#703): innermost, around the real destination, so
+                // the ceilings count what the sink accepts. A crossing page is
+                // refused whole and cancels the run's token, which stops every
+                // node; a duration ceiling records a verdict the run turns into
+                // this node's failure (#789 CLI-16).
+                let sink = match (budget, budgets.as_mut()) {
+                    (Some(spec), Some(states)) if !opts.dry_run => {
+                        let (wrapped, state, timer) = faucet_core::BudgetSink::wrap(
+                            sink,
+                            spec.clone(),
+                            opts.cancel.clone().unwrap_or_default(),
+                        );
+                        states.states.insert((*id).clone(), state);
+                        states.timers.push(timer);
+                        Box::new(wrapped) as Box<_>
+                    }
+                    _ => sink,
+                };
                 let sink = match opts.limit {
                     Some(n) => Box::new(crate::executor::LimitedSink::wrap(sink, n)) as Box<_>,
+                    None => sink,
+                };
+                // `_faucet_*` metadata columns (#510), stamped closest to the
+                // real write, as the matrix executor does (#789 CLI-16).
+                let sink = match &metadata {
+                    Some(meta) => Box::new(faucet_core::MetadataSink::new(
+                        sink,
+                        meta.clone(),
+                        faucet_core::MetadataContext {
+                            run_id: run_id.clone(),
+                            source: source_label(cfg, reaching.get(*id)),
+                        },
+                    )) as Box<_>,
                     None => sink,
                 };
                 // Column profiling (#708): a real run's sink node profiles what
@@ -807,6 +999,10 @@ pub async fn preview_to_string(
 /// Build and run the topology, returning a [`RunSummary`] shaped like a matrix
 /// run (one invocation per sink node, plus one per node failure under
 /// `on_error: continue`).
+///
+/// A failed run still reports per sink node — notifications, SLA, lineage and
+/// the run markers see the failure — before its error is returned. A sink that a
+/// failed node feeds is reported failed, not successful (#789 CLI-18).
 pub async fn run_topology(
     cfg: &PipelineConfig,
     auth: &AuthCatalog,
@@ -819,17 +1015,34 @@ pub async fn run_topology(
         );
     }
 
-    let (topo, identities, profilers) = build_topology_full(cfg, auth, &run).await?;
-
     let pipeline_name = cfg.name.clone().unwrap_or_else(|| "unnamed".to_string());
-    let run_id = uuid::Uuid::now_v7().to_string();
+    let run_id = run
+        .run_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    // One token for the whole graph: the caller's cancel reaches it, and a run
+    // budget cancels it when a ceiling is crossed so every node stops.
+    let token = run.cancel.clone().unwrap_or_default().child_token();
+    let build_opts = TopologyRunOptions {
+        cancel: Some(token.clone()),
+        run_id: Some(run_id.clone()),
+        ..run.clone()
+    };
+    let BuiltTopology {
+        topology: topo,
+        identities,
+        profilers,
+        budgets,
+    } = build_topology_run(cfg, auth, &build_opts).await?;
 
     let on_error = match cfg.execution.as_ref().map(|e| e.on_error) {
         Some(crate::config::OnError::Stop) => TopologyOnError::Propagate,
         _ => TopologyOnError::Continue,
     };
 
-    let mut opts = TopologyOptions::new(pipeline_name.clone()).with_on_error(on_error);
+    let mut opts = TopologyOptions::new(pipeline_name.clone())
+        .with_on_error(on_error)
+        .with_cancel(token);
     opts.run_id = run_id.clone();
 
     if let Some(state) = &cfg.pipeline.state {
@@ -848,9 +1061,6 @@ pub async fn run_topology(
     }
     if let Some(dlq) = &cfg.pipeline.dlq {
         opts = opts.with_dlq(crate::executor::build_dlq_config(dlq).await?);
-    }
-    if let Some(c) = run.cancel.clone() {
-        opts = opts.with_cancel(c);
     }
 
     // Lineage START, one per sink node — a topology's analogue of an invocation.
@@ -884,11 +1094,7 @@ pub async fn run_topology(
         }
     }
 
-    // `run_reported` rather than `run_with`: the post-run pass below emits one
-    // notification and evaluates one SLA per **sink node**, which needs to know
-    // which node failed (#459).
     let state_store = opts.state_store.clone();
-    let cancelled = run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
     let governance = build_governance(cfg)?;
     // Run lease + run-outcome marker per sink node (#732 / #735), like a
     // matrix invocation's.
@@ -913,25 +1119,39 @@ pub async fn run_topology(
         }
     }
     let started = std::time::Instant::now();
-    let reported = match topo.run_reported(opts, governance).await {
-        Ok(r) => r,
-        Err(e) => {
-            let kind = crate::pipeline_state::markers::kind_label(&format!("{e:?}"));
-            let record = !run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
-            for (_, base, m) in markers {
-                m.finish(
-                    base,
-                    run_id.clone(),
-                    Err((kind.clone(), e.to_string())),
-                    started.elapsed().as_millis() as u64,
-                    record,
-                    Default::default(),
-                )
-                .await;
+    // `run_attributed`: the post-run pass below reports per **sink node**, which
+    // needs to know which node failed — and needs that on a failed run too, where
+    // `run_reported` would hand back only the error (#459, #789 CLI-18).
+    let (mut reported, run_error) = topo.run_attributed(opts, governance).await;
+    let cancelled = run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
+
+    // Post-run verdicts that fail a sink node after it wrote: a run budget's
+    // duration ceiling, and a completeness reconciliation shortfall (#789
+    // CLI-16). Folded into the node's report so every pass below sees them.
+    let mut verdicts = budgets.verdicts();
+    drop(budgets);
+    if let Some(spec) = &cfg.reconcile
+        && run_error.is_none()
+        && !run.is_preview()
+        && !cancelled
+    {
+        for node in reported.nodes.iter().filter(|n| n.kind == "sink") {
+            if node.error.is_some() || verdicts.iter().any(|(id, _)| *id == node.node_id) {
+                continue;
             }
-            return Err(e.into());
+            if let Err(e) = crate::reconcile::run(spec, auth, node.records as u64).await {
+                verdicts.push((node.node_id.clone(), e.to_string()));
+            }
         }
-    };
+    }
+    for (id, message) in &verdicts {
+        if let Some(node) = reported.nodes.iter_mut().find(|n| &n.node_id == id)
+            && node.error.is_none()
+        {
+            node.error = Some(message.clone());
+            node.error_kind = Some(faucet_core::topology::NodeErrorKind::Other);
+        }
+    }
 
     // Per-sink-node observability. A sink node is a topology's analogue of a
     // matrix invocation — it owns a state key, a bookmark, and a record count —
@@ -972,19 +1192,27 @@ pub async fn run_topology(
     for (node_id, message) in &profile_failures {
         failures.push((node_id.as_str(), message.as_str(), None));
     }
-    let record = !run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
     let elapsed = started.elapsed().as_millis() as u64;
     for (id, base, m) in markers {
-        let outcome = node_outcome(&id, &reported, &failures);
+        let outcome = match &run_error {
+            Some(e) if failures.is_empty() => Err((
+                crate::pipeline_state::markers::kind_label(&format!("{e:?}")),
+                e.to_string(),
+            )),
+            _ => node_outcome(&id, &reported, &failures),
+        };
         m.finish(
             base,
             run_id.clone(),
             outcome,
             elapsed,
-            record,
+            !cancelled,
             Default::default(),
         )
         .await;
+    }
+    if let Some(e) = run_error {
+        return Err(e.into());
     }
     Ok(build_summary(&reported.result.per_sink, &failures))
 }
@@ -1147,6 +1375,23 @@ fn lineage_ctx(
         column_lineage: None,
         source_code: None,
     })
+}
+
+/// The connector kind(s) feeding a sink node, for its `_faucet_source` metadata
+/// column: the one kind, or every distinct kind joined with `+` when a merge or
+/// join feeds it.
+fn source_label(cfg: &PipelineConfig, reaching: Option<&Vec<String>>) -> String {
+    let mut kinds: Vec<String> = reaching
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| cfg.pipeline.nodes.get(id))
+                .filter_map(|n| resolved_node_kind(cfg, n))
+                .collect()
+        })
+        .unwrap_or_default();
+    kinds.sort();
+    kinds.dedup();
+    kinds.join("+")
 }
 
 /// For each **sink** node, the source nodes that reach it, in deterministic order.
@@ -1899,5 +2144,111 @@ pipeline:
     - { from: t2, to: w }
 "#);
         assert_eq!(reaching_sources(&c)["w"], vec!["s".to_string()]);
+    }
+
+    #[test]
+    fn exactly_once_refuses_an_overwrite_sink_node() {
+        let c = cfg(r#"version: 1
+name: p
+delivery: exactly_once
+pipeline:
+  state: { type: file, config: { path: /tmp/st } }
+  sources:
+    a: { type: postgres-cdc, config: {} }
+  sinks:
+    o: { type: sqlite, config: { path: /tmp/o.db, write_mode: overwrite } }
+  nodes:
+    s: { kind: source, ref: a }
+    w: { kind: sink, ref: o }
+  edges:
+    - { from: s, to: w }
+"#);
+        let err = validate_topology_spec(&c).unwrap_err().to_string();
+        assert!(err.contains("sink node 'w'"), "{err}");
+        assert!(err.contains("write_mode: overwrite"), "{err}");
+    }
+
+    #[test]
+    fn usage_is_the_only_inert_block() {
+        let mut c = cfg(LINEAR);
+        c.usage = Some(serde_json::from_value(serde_json::json!({})).unwrap());
+        let inert = inert_blocks(&c);
+        assert_eq!(inert.len(), 1);
+        assert_eq!(inert[0].0, "usage");
+    }
+
+    #[test]
+    fn source_label_names_every_reaching_kind() {
+        let c = cfg(r#"version: 1
+name: p
+pipeline:
+  sources:
+    a: { type: csv, config: { path: /tmp/a.csv } }
+    b: { type: jsonl, config: { path: /tmp/b.jsonl } }
+  sinks:
+    o: { type: jsonl, config: { path: /tmp/o.jsonl } }
+  nodes:
+    sa: { kind: source, ref: a }
+    sb: { kind: source, ref: b }
+    sc: { kind: source, ref: a }
+    m: { kind: merge }
+    w: { kind: sink, ref: o }
+  edges:
+    - { from: sa, to: m }
+    - { from: sb, to: m }
+    - { from: sc, to: m }
+    - { from: m, to: w }
+"#);
+        let reaching = reaching_sources(&c);
+        assert_eq!(source_label(&c, reaching.get("w")), "csv+jsonl");
+        assert_eq!(source_label(&c, None), "");
+    }
+
+    #[test]
+    fn a_budget_without_allowed_sinks_checks_nothing() {
+        let c = cfg(LINEAR);
+        let open = faucet_core::BudgetSpec {
+            max_records: Some(1),
+            ..Default::default()
+        };
+        check_budget_sinks(&c, Some(&open)).unwrap();
+        check_budget_sinks(&c, None).unwrap();
+        let by_kind = faucet_core::BudgetSpec {
+            allowed_sinks: vec!["jsonl".into()],
+            ..Default::default()
+        };
+        check_budget_sinks(&c, Some(&by_kind)).unwrap();
+    }
+
+    struct NullSink;
+    #[async_trait::async_trait]
+    impl faucet_core::Sink for NullSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+            Ok(records.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spent_duration_budget_is_a_verdict_on_its_node() {
+        let cancel = CancellationToken::new();
+        let (_sink, state, timer) = faucet_core::BudgetSink::wrap(
+            Box::new(NullSink),
+            faucet_core::BudgetSpec {
+                max_duration_secs: Some(1),
+                ..Default::default()
+            },
+            cancel.clone(),
+        );
+        let mut budgets = TopologyBudgets::default();
+        budgets.states.insert("w".into(), state);
+        budgets.timers.push(timer);
+        assert!(budgets.verdicts().is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
+            .await
+            .expect("the duration ceiling cancels the run");
+        let verdicts = budgets.verdicts();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].0, "w");
+        assert!(verdicts[0].1.contains("max_duration_secs"), "{verdicts:?}");
     }
 }

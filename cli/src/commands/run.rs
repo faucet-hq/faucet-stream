@@ -280,6 +280,18 @@ pub(crate) async fn execute(
                 dry_run: args.dry_run,
                 limit: args.limit,
                 clock: Some(resolve_run_clock(args.clock.as_deref())?),
+                budget: crate::budget::effective_budget(
+                    cfg.budget.as_ref(),
+                    crate::budget::BudgetFlags {
+                        max_records: args.max_records,
+                        max_bytes: args.max_bytes,
+                        max_duration_secs: args.max_duration_secs,
+                        allowed_sinks: args.allowed_sinks.clone(),
+                    }
+                    .into_spec(),
+                )
+                .map_err(CliError::Config)?,
+                run_id: None,
             },
         )
         .await?;
