@@ -218,6 +218,24 @@ pub struct LoadedSubmission {
 }
 
 impl LoadedSubmission {
+    /// Whether the submission is a topology config (`pipeline.nodes`). Such a
+    /// submission carries no expanded rows: it runs as a node graph.
+    pub fn is_topology(&self) -> bool {
+        crate::topology::is_topology(&self.cfg)
+    }
+
+    /// Refuse a topology config on a path that works on matrix rows (#789
+    /// CLI-17), instead of acting on an empty row set as if it had none.
+    pub fn require_matrix(&self) -> Result<(), ServeError> {
+        if self.is_topology() {
+            return Err(ServeError::Unprocessable {
+                message: crate::error::CliError::TopologyNotSupported.to_string(),
+                details: None,
+            });
+        }
+        Ok(())
+    }
+
     /// The shared auth-provider catalog for this run: the config's own
     /// `auth:` block, plus — for a tenant run — the tenant's connections with
     /// their refresh tokens persisted back to the vault.
@@ -461,6 +479,30 @@ pub async fn load_submission_scoped(
         message: e.to_string(),
         details: None,
     })?;
+
+    // A topology config runs as a node graph, not as matrix rows (#789 CLI-17):
+    // validate the graph here and carry no rows. A tenant run is refused — its
+    // state is namespaced per matrix row, which a graph's sink nodes are not.
+    if crate::topology::is_topology(&cfg) {
+        if tenant.is_some() {
+            return Err(ServeError::Unprocessable {
+                message: "a tenant run cannot use a topology config (`pipeline.nodes`): \
+                          tenant state is namespaced per matrix row, and a node graph has \
+                          none"
+                    .into(),
+                details: None,
+            });
+        }
+        crate::topology::validate_topology_spec(&cfg).map_err(|e| ServeError::Unprocessable {
+            message: e.to_string(),
+            details: None,
+        })?;
+        return Ok(LoadedSubmission {
+            cfg,
+            nodes: Vec::new(),
+            tenant,
+        });
+    }
 
     // 6. Expand the matrix.
     let nodes = expand(&cfg).map_err(|e| ServeError::Unprocessable {
