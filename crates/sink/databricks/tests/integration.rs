@@ -166,12 +166,14 @@ async fn upsert_merges_with_delete_marker_and_dedup() {
     let w = wh.writes();
     assert_eq!(w.len(), 1);
     assert!(
-        w[0].contains("FROM VALUES ('1', 'b', 'u'), ('2', NULL, 'd') AS v(c0, c1, c2)"),
+        w[0].contains(
+            "FROM VALUES ('1', 'b', 'u', '1'), ('2', NULL, 'd', '0') AS v(c0, c1, c2, c3)"
+        ),
         "{}",
         w[0]
     );
     assert!(w[0].contains("WHEN MATCHED AND s.`__faucet_op` = 'd' THEN DELETE"));
-    assert!(w[0].contains("WHEN MATCHED THEN UPDATE SET t.`name` = s.`name`"));
+    assert!(w[0].contains("WHEN MATCHED THEN UPDATE SET t.`name` = CASE WHEN s.`__faucet_has_0` = '1' THEN s.`name` ELSE t.`name` END"));
 }
 
 #[tokio::test]
@@ -611,7 +613,7 @@ async fn staged_exactly_once_and_upsert_read_the_staged_file() {
         merge.starts_with("MERGE INTO `sales`.`orders` AS t USING (SELECT CAST(`id` AS bigint)")
     );
     assert!(merge.contains(
-        "`__faucet_op` AS `__faucet_op` FROM read_files('/Volumes/main/sales/stage/_faucet/orders/"
+        "`__faucet_has_0` AS `__faucet_has_0` FROM read_files('/Volumes/main/sales/stage/_faucet/orders/"
     ));
 }
 

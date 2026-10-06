@@ -411,8 +411,14 @@ impl DatabricksSink {
         ops.extend(vec![Some("d".to_owned()); plan.deletes.len()]);
         let merge_cols = m.columns.clone();
         m.push_column(TableColumn::new(OP_COL, "string"), ops);
-        let target = self.target();
         let key = &self.config.write.key;
+        for (i, cells) in sql::presence_flags(&plan.upserts, plan.deletes.len(), &merge_cols, key)
+            .into_iter()
+            .enumerate()
+        {
+            m.push_column(TableColumn::new(sql::presence_col(i), "string"), cells);
+        }
+        let target = self.target();
         if self.use_staging(m.estimated_bytes()) {
             return self
                 .staged(&m, eo, |loc, name| {
