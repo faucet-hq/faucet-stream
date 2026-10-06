@@ -366,6 +366,8 @@ pub struct Stmts {
     pub cancel_pending: String,
     /// Request cancellation of an in-flight run owned by another instance.
     pub request_cancel: String,
+    pub cancel_pending_shards: String,
+    pub cancel_requeued_shards: String,
     /// List run IDs owned by this instance that have a pending cancellation request.
     pub pending_cancellations: String,
     /// Upsert this instance's membership heartbeat into `faucet_serve_instances`.
@@ -795,6 +797,15 @@ impl Stmts {
             request_cancel: "UPDATE faucet_serve_runs \
                 SET cancel_requested = $1 WHERE run_id = $2 AND status IN ('running','sharded')"
                 .into(),
+            cancel_pending_shards: "UPDATE faucet_serve_shards \
+                SET status = 'cancelled', finished_at = $1 \
+                WHERE run_id = $2 AND status = 'pending'"
+                .into(),
+            cancel_requeued_shards: "UPDATE faucet_serve_shards \
+                SET status = 'cancelled', finished_at = $1 \
+                WHERE status = 'pending' AND run_id IN \
+                (SELECT run_id FROM faucet_serve_runs WHERE cancel_requested IS NOT NULL)"
+                .into(),
             pending_cancellations: "SELECT run_id FROM faucet_serve_runs \
                 WHERE status = 'running' AND owner = $1 AND cancel_requested IS NOT NULL"
                 .into(),
@@ -823,7 +834,7 @@ impl Stmts {
                 .into(),
             claim_shards_select: "SELECT s.run_id, s.shard_id, s.descriptor, r.body \
                 FROM faucet_serve_shards s JOIN faucet_serve_runs r ON r.run_id = s.run_id \
-                WHERE s.status = 'pending' \
+                WHERE s.status = 'pending' AND r.cancel_requested IS NULL \
                 ORDER BY CAST(COALESCE(s.size_estimate, '0') AS BIGINT) DESC, s.run_id, s.shard_id \
                 LIMIT $1"
                 .into(),
@@ -1183,6 +1194,15 @@ impl Stmts {
             request_cancel: "UPDATE faucet_serve_runs \
                 SET cancel_requested = ? WHERE run_id = ? AND status IN ('running','sharded')"
                 .into(),
+            cancel_pending_shards: "UPDATE faucet_serve_shards \
+                SET status = 'cancelled', finished_at = ? \
+                WHERE run_id = ? AND status = 'pending'"
+                .into(),
+            cancel_requeued_shards: "UPDATE faucet_serve_shards \
+                SET status = 'cancelled', finished_at = ? \
+                WHERE status = 'pending' AND run_id IN \
+                (SELECT run_id FROM faucet_serve_runs WHERE cancel_requested IS NOT NULL)"
+                .into(),
             pending_cancellations: "SELECT run_id FROM faucet_serve_runs \
                 WHERE status = 'running' AND owner = ? AND cancel_requested IS NOT NULL"
                 .into(),
@@ -1211,7 +1231,7 @@ impl Stmts {
                 .into(),
             claim_shards_select: "SELECT s.run_id, s.shard_id, s.descriptor, r.body \
                 FROM faucet_serve_shards s JOIN faucet_serve_runs r ON r.run_id = s.run_id \
-                WHERE s.status = 'pending' \
+                WHERE s.status = 'pending' AND r.cancel_requested IS NULL \
                 ORDER BY CAST(COALESCE(s.size_estimate, '0') AS INTEGER) DESC, s.run_id, s.shard_id \
                 LIMIT ?"
                 .into(),
@@ -2421,8 +2441,15 @@ macro_rules! impl_sql_history {
             ) -> Result<(), $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
+                let now = sql::fmt_ts(chrono::Utc::now());
                 sqlx::query(&self.stmts.request_cancel)
-                    .bind(sql::fmt_ts(chrono::Utc::now()))
+                    .bind(&now)
+                    .bind(run_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                sqlx::query(&self.stmts.cancel_pending_shards)
+                    .bind(&now)
                     .bind(run_id)
                     .execute(&self.pool)
                     .await
@@ -2668,6 +2695,13 @@ macro_rules! impl_sql_history {
                         }
                     }
                 }
+                if report.requeued > 0 {
+                    sqlx::query(&self.stmts.cancel_requeued_shards)
+                        .bind(&now_s)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(backend)?;
+                }
                 Ok(report)
             }
 
@@ -2675,11 +2709,11 @@ macro_rules! impl_sql_history {
                 &self,
                 run_id: &str,
                 shard_id: &str,
-                success: bool,
+                outcome: $crate::serve::history::ShardOutcome,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let status = if success { "completed" } else { "failed" };
+                let status = outcome.as_str();
                 let now_s = sql::fmt_ts(chrono::Utc::now());
                 let n = sqlx::query(&self.stmts.finalize_shard)
                     .bind(status)
@@ -2717,6 +2751,7 @@ macro_rules! impl_sql_history {
                         "completed" => p.completed += n,
                         "failed" => p.failed += n,
                         "running" => p.running += n,
+                        "cancelled" => p.cancelled += n,
                         _ => p.pending += n,
                     }
                 }
@@ -2763,7 +2798,7 @@ macro_rules! impl_sql_history {
                     if !progress.all_terminal() {
                         continue;
                     }
-                    let success = progress.failed == 0;
+                    let (status, error) = progress.parent_outcome();
                     // Read-modify-write the body so the surfaced record stays
                     // consistent (status, finished_at, error) with the column.
                     let Some(body_row) = sqlx::query(&self.stmts.select_body)
@@ -2782,17 +2817,10 @@ macro_rules! impl_sql_history {
                         continue;
                     }
                     let now = chrono::Utc::now();
-                    rec.status = if success {
-                        RunStatus::Completed
-                    } else {
-                        RunStatus::Failed
-                    };
+                    rec.status = status;
                     rec.finished_at = Some(now);
-                    if !success {
-                        rec.error = Some(format!(
-                            "{}/{} shard(s) failed",
-                            progress.failed, progress.total
-                        ));
+                    if error.is_some() {
+                        rec.error = error;
                     }
                     let new_body = sql::encode_body(&rec)?;
                     let n = sqlx::query(&self.stmts.finalize_sharded_parent)
@@ -2808,7 +2836,7 @@ macro_rules! impl_sql_history {
                         finalized += 1;
                         $crate::serve::metrics::record_run_finished(
                             rec.status,
-                            if success { "ok" } else { "error" },
+                            rec.status.finished_reason(),
                         );
                         tracing::info!(
                             run_id,

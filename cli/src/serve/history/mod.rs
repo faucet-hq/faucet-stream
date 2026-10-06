@@ -60,6 +60,14 @@ impl RunStatus {
             Self::Cancelled => "cancelled",
         }
     }
+    /// The `reason` label `faucet_serve_runs_total` records for a terminal status.
+    pub fn finished_reason(self) -> &'static str {
+        match self {
+            Self::Completed => "ok",
+            Self::Cancelled => "cancelled",
+            _ => "error",
+        }
+    }
     /// Parse a lowercase status name (inverse of [`as_str`](Self::as_str)).
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.trim() {
@@ -409,13 +417,47 @@ pub struct ShardProgress {
     pub failed: usize,
     pub running: usize,
     pub pending: usize,
+    pub cancelled: usize,
 }
 
 impl ShardProgress {
     /// True when every shard has reached a terminal state (and at least one
     /// exists) — i.e. the parent run can be finalized.
     pub fn all_terminal(&self) -> bool {
-        self.total > 0 && self.completed + self.failed == self.total
+        self.total > 0 && self.completed + self.failed + self.cancelled == self.total
+    }
+
+    /// The parent run's terminal status and error once every shard is terminal:
+    /// any cancelled shard means the run was cancelled, else any failure fails it.
+    pub fn parent_outcome(&self) -> (RunStatus, Option<String>) {
+        if self.cancelled > 0 {
+            (RunStatus::Cancelled, None)
+        } else if self.failed > 0 {
+            (
+                RunStatus::Failed,
+                Some(format!("{}/{} shard(s) failed", self.failed, self.total)),
+            )
+        } else {
+            (RunStatus::Completed, None)
+        }
+    }
+}
+
+/// How one shard ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl ShardOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShardOutcome::Completed => "completed",
+            ShardOutcome::Failed => "failed",
+            ShardOutcome::Cancelled => "cancelled",
+        }
     }
 }
 
@@ -676,16 +718,16 @@ pub trait RunHistory: Send + Sync {
         Ok(ReclaimReport::default())
     }
 
-    /// Owner-fenced terminal write for one shard (`running` → `completed`/`failed`),
+    /// Owner-fenced terminal write for one shard (`running` → `completed`/`failed`/`cancelled`),
     /// only if this instance still owns it. Returns `true` if the write landed.
     /// Default: `false`.
     async fn finalize_shard(
         &self,
         run_id: &str,
         shard_id: &str,
-        success: bool,
+        outcome: ShardOutcome,
     ) -> Result<bool, HistoryError> {
-        let _ = (run_id, shard_id, success);
+        let _ = (run_id, shard_id, outcome);
         Ok(false)
     }
 
@@ -1700,6 +1742,7 @@ mod tests {
             failed: 0,
             running: 1,
             pending: 1,
+            cancelled: 0,
         };
         assert!(!p.all_terminal());
         // All terminal (mix of completed + failed sums to total).
@@ -1709,8 +1752,30 @@ mod tests {
             failed: 1,
             running: 0,
             pending: 0,
+            cancelled: 0,
         };
         assert!(p.all_terminal());
+        assert_eq!(
+            p.parent_outcome(),
+            (RunStatus::Failed, Some("1/3 shard(s) failed".into()))
+        );
+        p.cancelled = 1;
+        p.failed = 0;
+        assert!(p.all_terminal());
+        assert_eq!(p.parent_outcome(), (RunStatus::Cancelled, None));
+        p.cancelled = 0;
+        p.completed = 3;
+        assert_eq!(p.parent_outcome(), (RunStatus::Completed, None));
+    }
+
+    #[test]
+    fn shard_outcomes_and_finished_reasons_are_stable_labels() {
+        assert_eq!(ShardOutcome::Completed.as_str(), "completed");
+        assert_eq!(ShardOutcome::Failed.as_str(), "failed");
+        assert_eq!(ShardOutcome::Cancelled.as_str(), "cancelled");
+        assert_eq!(RunStatus::Completed.finished_reason(), "ok");
+        assert_eq!(RunStatus::Cancelled.finished_reason(), "cancelled");
+        assert_eq!(RunStatus::Failed.finished_reason(), "error");
     }
 
     #[tokio::test]
@@ -1720,7 +1785,11 @@ mod tests {
         assert_eq!(h.insert_shards("r", &[]).await.unwrap(), 0);
         assert!(h.claim_shards(8).await.unwrap().is_empty());
         assert_eq!(h.renew_shard_leases().await.unwrap(), 0);
-        assert!(!h.finalize_shard("r", "0", true).await.unwrap());
+        assert!(
+            !h.finalize_shard("r", "0", ShardOutcome::Completed)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             h.shard_progress("r").await.unwrap(),
             ShardProgress::default()

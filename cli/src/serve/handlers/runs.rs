@@ -167,6 +167,9 @@ pub async fn cancel_run(
             .request_cancel(&id)
             .await
             .map_err(|e| ServeError::Internal(e.to_string()))?;
+        if rec.status == crate::serve::history::RunStatus::Sharded {
+            crate::serve::runner::maybe_finalize_parent(&state, &id).await;
+        }
         crate::serve::audit::write(&state, &actor, "run.cancel", Some(id.clone()), None, "ok")
             .await;
         return Ok(StatusCode::ACCEPTED);

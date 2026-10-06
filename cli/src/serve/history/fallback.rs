@@ -223,9 +223,9 @@ impl RunHistory for FallbackHistory {
         &self,
         run_id: &str,
         shard_id: &str,
-        success: bool,
+        outcome: super::ShardOutcome,
     ) -> Result<bool, HistoryError> {
-        via!(self, p => p.finalize_shard(run_id, shard_id, success), f => f.finalize_shard(run_id, shard_id, success))
+        via!(self, p => p.finalize_shard(run_id, shard_id, outcome), f => f.finalize_shard(run_id, shard_id, outcome))
     }
     async fn shard_progress(
         &self,
@@ -771,7 +771,11 @@ mod tests {
             fb.reclaim_shards(3).await.unwrap(),
             ReclaimReport::default()
         );
-        assert!(!fb.finalize_shard("r", "0", true).await.unwrap());
+        assert!(
+            !fb.finalize_shard("r", "0", super::super::ShardOutcome::Completed)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             fb.shard_progress("r").await.unwrap(),
             ShardProgress::default()

@@ -8,7 +8,7 @@ use crate::executor::{ExecuteOptions, RunSummary, run_expanded};
 use crate::registry::build_source;
 use crate::serve::error::ServeError;
 use crate::serve::history::{Claim, InvocationRecord, RunRecord, RunStatus};
-use crate::serve::history::{ClaimedShard, ShardInsert};
+use crate::serve::history::{ClaimedShard, ShardInsert, ShardOutcome};
 use crate::serve::load::{BodyOrigin, ConfigFormat, LoadedSubmission, load_submission_scoped};
 use crate::serve::rbac::AuthContext;
 use crate::serve::state::ServerState;
@@ -542,7 +542,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             tracing::error!(run_id, shard_id, "claimed shard's run has no stored config");
             let _ = state
                 .history()
-                .finalize_shard(&run_id, &shard_id, false)
+                .finalize_shard(&run_id, &shard_id, ShardOutcome::Failed)
                 .await;
             maybe_finalize_parent(&state, &run_id).await;
             return;
@@ -568,7 +568,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
                 );
                 let _ = state
                     .history()
-                    .finalize_shard(&run_id, &shard_id, false)
+                    .finalize_shard(&run_id, &shard_id, ShardOutcome::Failed)
                     .await;
                 maybe_finalize_parent(&state, &run_id).await;
                 return;
@@ -606,7 +606,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             run_id: run_id.clone(),
             shard_id: shard_id.clone(),
         };
-        let success = execute_shard(
+        let outcome = execute_shard(
             &state,
             loaded,
             &run_id,
@@ -622,7 +622,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 
         match state
             .history()
-            .finalize_shard(&run_id, &shard_id, success)
+            .finalize_shard(&run_id, &shard_id, outcome)
             .await
         {
             Ok(true) => {}
@@ -638,8 +638,8 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 }
 
 /// Run one shard's pipeline (single node, source narrowed via `opts.shard`).
-/// Returns `true` on clean completion. Does not touch the parent run record —
-/// the caller finalizes the shard and the parent.
+/// Does not touch the parent run record — the caller finalizes the shard and
+/// the parent.
 #[allow(clippy::too_many_arguments)]
 async fn execute_shard(
     state: &ServerState,
@@ -652,12 +652,12 @@ async fn execute_shard(
     clock_flag: Option<String>,
     concurrency: Option<usize>,
     submitted_at: DateTime<Utc>,
-) -> bool {
+) -> ShardOutcome {
     let auth = match loaded.auth_catalog() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard auth catalog: {e}");
-            return false;
+            return ShardOutcome::Failed;
         }
     };
     let LoadedSubmission { cfg, nodes, tenant } = loaded;
@@ -673,7 +673,7 @@ async fn execute_shard(
                 "shard clock: {}",
                 e.api_error().error.message
             );
-            return false;
+            return ShardOutcome::Failed;
         }
     };
     let resilience = match &cfg.resilience {
@@ -681,7 +681,7 @@ async fn execute_shard(
             Ok(p) => Some(p),
             Err(e) => {
                 tracing::error!(run_id, shard_id, "shard resilience: {e}");
-                return false;
+                return ShardOutcome::Failed;
             }
         },
         None => None,
@@ -691,7 +691,7 @@ async fn execute_shard(
         Ok(l) => l,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard lineage: {e}");
-            return false;
+            return ShardOutcome::Failed;
         }
     };
 
@@ -702,7 +702,7 @@ async fn execute_shard(
         Ok(u) => u,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard usage: {e}");
-            return false;
+            return ShardOutcome::Failed;
         }
     };
     let opts = ExecuteOptions {
@@ -795,14 +795,18 @@ async fn execute_shard(
             }
         }
     };
-    matches!(terminal, Terminal::Completed { .. })
+    match terminal {
+        Terminal::Completed { .. } => ShardOutcome::Completed,
+        Terminal::Cancelled => ShardOutcome::Cancelled,
+        _ => ShardOutcome::Failed,
+    }
 }
 
 /// Finalize a `Sharded` parent run once all its shards are terminal. The last
 /// shard to finish always observes `all_terminal` (its own `finalize_shard`
 /// committed first), so the run never lingers `Sharded`. A benign double-finalize
 /// (two shards finishing simultaneously) writes the same terminal status twice.
-async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
+pub(crate) async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
     let progress = match state.history().shard_progress(run_id).await {
         Ok(p) => p,
         Err(e) => {
@@ -813,14 +817,7 @@ async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
     if !progress.all_terminal() {
         return;
     }
-    let success = progress.failed == 0;
-    let status = if success {
-        RunStatus::Completed
-    } else {
-        RunStatus::Failed
-    };
-    let error =
-        (!success).then(|| format!("{}/{} shard(s) failed", progress.failed, progress.total));
+    let (status, error) = progress.parent_outcome();
     // Status-fenced finalize: transitions the parent only while it is still
     // `Sharded`, and does NOT re-stamp owner/lease on the terminal record, so a
     // near-simultaneous double-finalize from two instances has a single winner
@@ -831,7 +828,7 @@ async fn maybe_finalize_parent(state: &ServerState, run_id: &str) {
         .await
     {
         Ok(true) => {
-            metrics::record_run_finished(status, if success { "ok" } else { "error" });
+            metrics::record_run_finished(status, status.finished_reason());
             tracing::info!(
                 run_id,
                 shards = progress.total,
@@ -2715,7 +2712,11 @@ mod tests {
             for i in 0..3 {
                 state
                     .history()
-                    .finalize_shard("r", &i.to_string(), true)
+                    .finalize_shard(
+                        "r",
+                        &i.to_string(),
+                        crate::serve::history::ShardOutcome::Completed,
+                    )
                     .await
                     .unwrap();
             }
@@ -2733,12 +2734,12 @@ mod tests {
             seed_sharded_with_shards(&state, "r", 2).await;
             state
                 .history()
-                .finalize_shard("r", "0", true)
+                .finalize_shard("r", "0", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             state
                 .history()
-                .finalize_shard("r", "1", false)
+                .finalize_shard("r", "1", crate::serve::history::ShardOutcome::Failed)
                 .await
                 .unwrap();
             maybe_finalize_parent(&state, "r").await;
@@ -2756,7 +2757,7 @@ mod tests {
             // Only one shard finalized → run stays Sharded.
             state
                 .history()
-                .finalize_shard("r", "0", true)
+                .finalize_shard("r", "0", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             maybe_finalize_parent(&state, "r").await;
@@ -2836,7 +2837,11 @@ mod tests {
                 Utc::now(),
             )
             .await;
-            assert!(ok, "csv→jsonl shard should complete");
+            assert_eq!(
+                ok,
+                ShardOutcome::Completed,
+                "csv→jsonl shard should complete"
+            );
             let written = std::fs::read_to_string(&output).unwrap();
             assert_eq!(written.lines().count(), 2, "both rows written");
             assert!(written.contains("alice") && written.contains("bob"));
@@ -2976,7 +2981,11 @@ mod tests {
                 Utc::now(),
             )
             .await;
-            assert!(!ok, "malformed resilience → shard fails fast");
+            assert_eq!(
+                ok,
+                ShardOutcome::Failed,
+                "malformed resilience → shard fails fast"
+            );
         }
 
         #[tokio::test]
@@ -3029,10 +3038,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let state = sqlite_state(dir.path()).await;
             seed_run(&state, "r", RunStatus::Sharded).await;
-            // request_cancel is fire-and-forget; verify it took effect by reading
-            // back via pending_shard_cancellations after a shard is claimed below.
-            state.history().request_cancel("r").await.unwrap();
-            // Insert + claim a shard so this instance owns a running shard under r.
+            // Insert + claim a shard so this instance owns a running shard under r,
+            // then flag the parent (a cancel-requested parent's shards are never
+            // claimed, so the claim has to come first).
             use crate::serve::history::ShardInsert;
             state
                 .history()
@@ -3048,6 +3056,7 @@ mod tests {
                 .unwrap();
             let claimed = state.history().claim_shards(1).await.unwrap();
             assert_eq!(claimed.len(), 1, "shard claimed (running, owned)");
+            state.history().request_cancel("r").await.unwrap();
 
             let flagged = state.history().pending_shard_cancellations().await.unwrap();
             assert_eq!(
@@ -3073,12 +3082,12 @@ mod tests {
             // Runs A (flagged) and C (NOT flagged) each get one shard; claim both
             // so they are running+owned here.
             seed_run(&state, "A", RunStatus::Sharded).await;
-            state.history().request_cancel("A").await.unwrap();
             state.history().insert_shards("A", &one("0")).await.unwrap();
             seed_run(&state, "C", RunStatus::Sharded).await;
             state.history().insert_shards("C", &one("0")).await.unwrap();
             let claimed = state.history().claim_shards(8).await.unwrap();
             assert_eq!(claimed.len(), 2, "A and C shards claimed (running)");
+            state.history().request_cancel("A").await.unwrap();
 
             // Run B: flagged, but its shard stays PENDING (inserted after the
             // claim, never claimed) → must be excluded (the join requires a
@@ -3105,7 +3114,11 @@ mod tests {
             for i in 0..3 {
                 state
                     .history()
-                    .finalize_shard("r", &i.to_string(), true)
+                    .finalize_shard(
+                        "r",
+                        &i.to_string(),
+                        crate::serve::history::ShardOutcome::Completed,
+                    )
                     .await
                     .unwrap();
             }
@@ -3140,17 +3153,17 @@ mod tests {
             seed_sharded_with_shards(&state, "r", 3).await;
             state
                 .history()
-                .finalize_shard("r", "0", true)
+                .finalize_shard("r", "0", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             state
                 .history()
-                .finalize_shard("r", "1", false)
+                .finalize_shard("r", "1", crate::serve::history::ShardOutcome::Failed)
                 .await
                 .unwrap();
             state
                 .history()
-                .finalize_shard("r", "2", true)
+                .finalize_shard("r", "2", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             let n = state
@@ -3173,7 +3186,7 @@ mod tests {
             // Only one shard terminal → the parent stays sharded.
             state
                 .history()
-                .finalize_shard("r", "0", true)
+                .finalize_shard("r", "0", crate::serve::history::ShardOutcome::Completed)
                 .await
                 .unwrap();
             let n = state
