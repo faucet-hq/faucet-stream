@@ -34,6 +34,63 @@ async fn drain(source: &DynamoDbSource) -> (Vec<Value>, Vec<Option<Value>>) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn doctor_flags_a_stream_without_a_new_image() {
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, StreamSpecification,
+        StreamViewType,
+    };
+    let Some((_c, endpoint, client)) = start().await else {
+        return;
+    };
+    client
+        .create_table()
+        .table_name("keys_only")
+        .billing_mode(BillingMode::PayPerRequest)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .stream_specification(
+            StreamSpecification::builder()
+                .stream_enabled(true)
+                .stream_view_type(StreamViewType::KeysOnly)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("create table");
+    let mut cfg = config(&endpoint, "keys_only");
+    cfg.mode = ReadMode::Streams;
+    cfg.idle_termination_secs = Some(1);
+    let source = DynamoDbSource::new(cfg).await.unwrap();
+    let report = source
+        .check(&faucet_core::CheckContext::default())
+        .await
+        .unwrap();
+    let probe = report
+        .probes
+        .iter()
+        .find(|p| p.name == "stream_view_type")
+        .expect("a stream_view_type probe");
+    assert!(
+        format!("{:?}", probe.status).contains("KEYS_ONLY"),
+        "{report:?}"
+    );
+    assert_eq!(report.failed_count(), 1, "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn parallel_scan_returns_every_item_once_and_resumes() {
     let Some((_c, endpoint, client)) = start().await else {
         return;

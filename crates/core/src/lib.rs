@@ -190,7 +190,7 @@ pub use rollback::{
 };
 pub use shard::ShardSpec;
 #[cfg(feature = "transform-cdc-unwrap")]
-pub use stage::CdcUnwrapSpec;
+pub use stage::{CdcMissingImage, CdcUnwrapSpec};
 #[cfg(feature = "transform-unpivot")]
 pub use stage::{CompiledUnpivot, UnpivotSpec};
 #[cfg(feature = "transform-explode")]

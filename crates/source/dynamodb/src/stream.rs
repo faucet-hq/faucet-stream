@@ -663,6 +663,22 @@ impl faucet_core::Source for DynamoDbSource {
                 report
                     .probes
                     .push(Probe::pass("describe_table", start.elapsed()));
+                if self.config.mode == ReadMode::Streams {
+                    let view = desc
+                        .stream_specification()
+                        .and_then(|s| s.stream_view_type());
+                    if let Some(problem) = stream_view_problem(view) {
+                        report.probes.push(Probe::fail(
+                            "stream_view_type",
+                            start.elapsed(),
+                            problem,
+                        ));
+                    } else if view.is_some() {
+                        report
+                            .probes
+                            .push(Probe::pass("stream_view_type", start.elapsed()));
+                    }
+                }
                 self.config
                     .stream_arn
                     .clone()
@@ -699,6 +715,20 @@ impl faucet_core::Source for DynamoDbSource {
     }
 }
 
+/// Why a stream view type cannot feed a mirror: `KEYS_ONLY` and `OLD_IMAGE`
+/// records carry no new image, so `cdc_unwrap` has no row to upsert.
+fn stream_view_problem(view: Option<&aws_sdk_dynamodb::types::StreamViewType>) -> Option<String> {
+    use aws_sdk_dynamodb::types::StreamViewType as V;
+    match view {
+        Some(V::NewImage | V::NewAndOldImages) | None => None,
+        Some(other) => Some(format!(
+            "stream view type {} carries no new image, so inserts and updates cannot be \
+             mirrored — set the table's stream to NEW_IMAGE or NEW_AND_OLD_IMAGES",
+            other.as_str()
+        )),
+    }
+}
+
 /// The table a DynamoDB Streams envelope belongs to. Scan / query items are
 /// user data, so a `table` attribute there is never read as routing.
 fn stream_record_table(mode: crate::config::ReadMode, record: &Value) -> Option<String> {
@@ -723,6 +753,21 @@ mod tests {
         assert_eq!(
             stream_record_table(ReadMode::Streams, &serde_json::json!({})),
             None
+        );
+    }
+
+    #[test]
+    fn only_views_with_a_new_image_can_feed_a_mirror() {
+        use aws_sdk_dynamodb::types::StreamViewType as V;
+        assert!(stream_view_problem(None).is_none());
+        assert!(stream_view_problem(Some(&V::NewImage)).is_none());
+        assert!(stream_view_problem(Some(&V::NewAndOldImages)).is_none());
+        let keys = stream_view_problem(Some(&V::KeysOnly)).unwrap();
+        assert!(keys.contains("KEYS_ONLY") && keys.contains("NEW_AND_OLD_IMAGES"));
+        assert!(
+            stream_view_problem(Some(&V::OldImage))
+                .unwrap()
+                .contains("OLD_IMAGE")
         );
     }
     use super::*;
