@@ -119,6 +119,8 @@ ENV FAUCET_SERVE_LISTEN=0.0.0.0:8080 \
 EXPOSE 8080
 
 ENTRYPOINT ["faucet"]
-# Default: the HTTP control plane. Override for one-shot runs, e.g.
+# Default: the HTTP control plane, which refuses to start without auth — pass
+#   -e FAUCET_SERVE_AUTH_TOKEN=... (or --auth-config / the role tokens).
+# Override for one-shot runs, e.g.
 #   docker run --rm -v $PWD:/w -w /w faucet:full run pipeline.yaml
-CMD ["serve", "--no-auth"]
+CMD ["serve"]

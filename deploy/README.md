@@ -22,12 +22,19 @@ running image is missing a connector you declared).
 ```bash
 # Complete image — all connectors + the serve control plane
 docker build -t faucet:full .
-docker run --rm -p 8080:8080 faucet:full serve --no-auth
+# The image's default command is `serve`, which refuses to start without auth.
+docker run --rm -p 8080:8080 -e FAUCET_SERVE_AUTH_TOKEN="$(openssl rand -hex 32)" faucet:full
 curl -s localhost:8080/healthz && echo OK
 
 # Run a pipeline one-shot
 docker run --rm -v "$PWD":/w -w /w faucet:full run pipeline.yaml
 ```
+
+`serve --no-auth` turns authentication off: anyone who can reach the port can
+submit and run pipelines with the container's credentials and network access.
+Use it only for a local demo bound to loopback
+(`docker run -p 127.0.0.1:8080:8080 faucet:full serve --no-auth`), never on a
+published port.
 
 ### Lean, named images (recommended for k8s — "profile B")
 
