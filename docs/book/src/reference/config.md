@@ -211,11 +211,17 @@ everywhere.)
 **Reserved id:** `now` is a reserved matrix row id — a matrix row cannot be
 named `now`.
 
-**SQL caveat:** `${now.*}` substitutes as plain text into config values — the
-same semantics as `${row_id.path}` tokens. For SQL sources that interpolate
-`${now.*}` into a query string, prefer the connector's bind-parameter path
-(`substitute_context_bind_params`) over raw text substitution to avoid
-injection risk.
+**SQL queries:** in the query of a SQL source (postgres, mysql, sqlite,
+duckdb, redshift, mssql, clickhouse, spanner, snowflake, bigquery, oracle;
+`sql` for databricks), a `${row_id.path}` token is **bound as a query
+parameter**, never spliced into the SQL text, because its value comes from
+another system. A token may stand alone (`WHERE id = ${p.id}`) or be a whole
+quoted literal (`WHERE name = '${p.name}'`); a token embedded in a longer
+literal (`'x-${p.id}'`), inside a quoted identifier or inside a comment cannot
+be bound and is refused when the config loads. A token that fills a `table`,
+`table_name`, `table_id`, `collection`, `index`, `schema` or `dataset` field
+must resolve to a plain identifier (letters, digits, `_`, `.`, `-`, `$`).
+`${now.*}` is the run clock, not upstream data, and still substitutes as text.
 
 ### `${tenant.*}` — tenant values
 

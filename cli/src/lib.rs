@@ -77,6 +77,7 @@ pub mod select;
 pub mod serve;
 pub mod signals;
 pub mod sla;
+pub mod sql_bind;
 pub mod state;
 pub mod status;
 #[cfg(feature = "templates")]

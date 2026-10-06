@@ -65,7 +65,7 @@ faucet run pipeline.yaml
 |-------|------|---------|-------------|
 | `project_id` | string | — *(required)* | GCP project ID the query is billed to and run against. |
 | `auth` | `BigQueryCredentials` | — *(required)* | Authentication — see [Authentication](#authentication). |
-| `query` | string | — *(required)* | SQL to execute. May contain positional `?` markers (bound from `params` + matrix context) and `${field.path}` placeholders resolved against the parent-record context at runtime. |
+| `query` | string | — *(required)* | SQL to execute. May contain positional `?` markers (bound from `params` + matrix context) and, in a matrix child, `${parent.field}` tokens that are bound as query parameters (never spliced into the SQL). |
 | `use_legacy_sql` | bool | `false` | Use BigQuery's legacy SQL dialect. Leave `false` (Standard SQL) unless the query uses legacy `[project:dataset.table]` references. |
 | `location` | string | *(unset)* | Location override for non-`US` jobs (`"EU"`, `"asia-east1"`, …). When unset, BigQuery uses the queried tables' default location. |
 | `max_results_per_page` | int | `1000` | Rows per `jobs.getQueryResults` page. Smaller = more HTTP round-trips, less memory; larger = fewer requests, more memory. |

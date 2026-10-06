@@ -735,6 +735,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     attributes: Default::default(),
                 }
             };
+            crate::sql_bind::check_source_query(
+                &src.kind,
+                &src.config,
+                |id| id_set.contains(id),
+                &format!("row '{row_id}'"),
+            )?;
             out.push(ExpandedNode {
                 id: ids[i].clone(),
                 row_index: i,
@@ -782,6 +788,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
 
         let merged_source = registry.resolve("source", row_id, row.source.as_ref())?;
         let merged_sink = registry.resolve("sink", row_id, row.sink.as_ref())?;
+        crate::sql_bind::check_source_query(
+            &merged_source.kind,
+            &merged_source.config,
+            |id| id_set.contains(id),
+            &format!("row '{row_id}'"),
+        )?;
         // The sink template name this row resolved (or the legacy `default`),
         // used to scope masking `applies_to` per destination.
         let sink_ref = row

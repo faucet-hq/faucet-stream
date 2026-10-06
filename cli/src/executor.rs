@@ -1621,7 +1621,9 @@ async fn run_discovery(
         resolve_now_inplace(&mut cfg, opts.clock)?;
         // Chained discovery (#531): resolve the upstream tuple `${dim}` tokens in
         // the source config (e.g. `/crm/v3/properties/${types.name}`).
+        let mut binds = HashMap::new();
         if let Some(pc) = product_ctx {
+            binds = crate::sql_bind::bind_source_query(&source_kind, &mut cfg, pc)?;
             resolve_inplace(&mut cfg, pc)?;
         }
         let source = build_source(
@@ -1632,7 +1634,7 @@ async fn run_discovery(
         )
         .await?;
         source.set_run_clock(opts.clock.to_utc());
-        let records = source.fetch_all().await?;
+        let records = source.fetch_with_context(&binds).await?;
         let values = crate::discovery_matrix::project_dedup(&records, select);
         let n = values.len();
         if collect {
@@ -2169,9 +2171,16 @@ async fn run_one_invocation(
             fanout_ctx.insert(k.clone(), v.clone());
         }
     }
+    let mut sql_binds: HashMap<String, Value> = HashMap::new();
     if !fanout_ctx.is_empty() {
+        sql_binds =
+            crate::sql_bind::bind_source_query(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
+        let (source_before, sink_before) = (source_cfg.clone(), sink_cfg.clone());
         resolve_inplace(&mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut sink_cfg, &fanout_ctx)?;
+        let is_fanout = |id: &str| fanout_ctx.contains_key(id);
+        crate::sql_bind::check_identifier_fields(&source_before, &source_cfg, is_fanout, "source")?;
+        crate::sql_bind::check_identifier_fields(&sink_before, &sink_cfg, is_fanout, "sink")?;
         if let Some(scope) = cleanup_scope.as_mut() {
             resolve_inplace(scope, &fanout_ctx)?;
         }
@@ -2226,6 +2235,14 @@ async fn run_one_invocation(
             .await
             .map_err(|e| CliError::Internal(format!("applying shard {:?}: {e}", shard.id)))?;
     }
+    let source: Box<dyn Source> = if sql_binds.is_empty() {
+        source
+    } else {
+        Box::new(BindContextSource {
+            inner: source,
+            ctx: sql_binds,
+        })
+    };
     let raw_sink: Box<dyn Sink> = if opts.dry_run {
         Box::new(CountingSink::new())
     } else {
@@ -3406,6 +3423,96 @@ impl Source for StateKeyOverride {
         >,
     > {
         self.inner.stream_native(ctx, format, batch_size)
+    }
+}
+
+/// Hands a SQL source the bind values of its fan-out tokens (#789 SQL-01).
+/// [`crate::sql_bind`] rewrites `${parent.path}` in the query into
+/// `{faucet_bind_N}` placeholders; the pipeline fetches with an empty context,
+/// so this wrapper supplies the context that the connector turns into native
+/// bind markers.
+struct BindContextSource {
+    inner: Box<dyn Source>,
+    ctx: HashMap<String, Value>,
+}
+
+#[async_trait]
+impl Source for BindContextSource {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        self.inner.fetch_with_context(&self.ctx).await
+    }
+    async fn fetch_with_context_incremental(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
+        self.inner.fetch_with_context_incremental(&self.ctx).await
+    }
+    fn stream_pages<'a>(
+        &'a self,
+        _ctx: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn faucet_core::Stream<Item = Result<faucet_core::StreamPage, FaucetError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.inner.stream_pages(&self.ctx, batch_size)
+    }
+    fn connector_name(&self) -> &'static str {
+        self.inner.connector_name()
+    }
+    fn dataset_uri(&self) -> String {
+        self.inner.dataset_uri()
+    }
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        self.inner.set_run_clock(now);
+    }
+    fn state_key(&self) -> Option<String> {
+        self.inner.state_key()
+    }
+    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        self.inner.apply_start_bookmark(bookmark).await
+    }
+    fn supports_exactly_once(&self) -> bool {
+        self.inner.supports_exactly_once()
+    }
+    fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
+        self.inner.replay_guarantee()
+    }
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.inner.supports_columnar()
+    }
+    #[cfg(feature = "arrow")]
+    fn stream_batches<'a>(
+        &'a self,
+        _ctx: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn faucet_core::Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.inner.stream_batches(&self.ctx, batch_size)
     }
 }
 
