@@ -448,6 +448,7 @@ async fn plan_run(
     )
     .await?;
     runner::policy_gate(state, actor, &loaded).await?;
+    loaded.require_matrix()?;
     let auth = loaded
         .auth_catalog()
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;

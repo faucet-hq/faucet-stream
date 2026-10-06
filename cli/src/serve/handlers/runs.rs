@@ -410,6 +410,7 @@ pub async fn rollback_run(
         origin,
     )
     .await?;
+    loaded.require_matrix()?;
     let auth = crate::auth_catalog::build_auth_catalog(loaded.cfg.auth.as_ref())
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
     let pipeline_name = loaded

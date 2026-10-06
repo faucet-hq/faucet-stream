@@ -323,6 +323,9 @@ impl<'a> Registry<'a> {
 /// Expand `cfg` into a topologically valid list of nodes. Roots come first,
 /// then children in BFS order.
 pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
+    if crate::topology::is_topology(cfg) {
+        return Err(CliError::TopologyNotSupported);
+    }
     // Fail-fast at config load: validate the execution-level adaptive
     // batch-size controller here (the shared `validate`/`run`/`preview`/
     // `doctor`/`schedule` gate) so `faucet validate` rejects a bad block

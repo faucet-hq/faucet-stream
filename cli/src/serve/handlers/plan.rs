@@ -64,6 +64,7 @@ pub async fn plan(
         state.caller_origin(),
     )
     .await?;
+    loaded.require_matrix()?;
     let auth = build_auth_catalog(loaded.cfg.auth.as_ref()).map_err(cli_to_serve)?;
     let node = select_root(&loaded.nodes, req.row.as_deref()).map_err(cli_to_serve)?;
     let sample = req.sample.map(|records| {

@@ -69,13 +69,68 @@ impl Reload {
     }
 }
 
+/// What a tick runs: the expanded matrix rows, or — for a topology config
+/// (`pipeline.nodes`) — its node graph, which has no rows (#789 CLI-17).
+#[derive(Clone)]
+struct Rows {
+    nodes: Vec<ExpandedNode>,
+    topology: Option<std::sync::Arc<PipelineConfig>>,
+}
+
+impl Rows {
+    /// Validate the config once and plan what each tick runs.
+    fn plan(cfg: &PipelineConfig) -> CliResult<Self> {
+        if crate::topology::is_topology(cfg) {
+            crate::topology::validate_topology_spec(cfg)?;
+            return Ok(Self {
+                nodes: Vec::new(),
+                topology: Some(std::sync::Arc::new(cfg.clone())),
+            });
+        }
+        Ok(expand(cfg)?.into())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+impl From<Vec<ExpandedNode>> for Rows {
+    fn from(nodes: Vec<ExpandedNode>) -> Self {
+        Self {
+            nodes,
+            topology: None,
+        }
+    }
+}
+
+/// Run one tick: the matrix rows through the executor, or the node graph
+/// through the topology runner with the same cancel, clock and budget.
+async fn run_rows(rows: Rows, opts: ExecuteOptions) -> CliResult<RunSummary> {
+    match rows.topology {
+        Some(cfg) => {
+            let run = crate::topology::TopologyRunOptions {
+                cancel: opts.cancel.clone(),
+                dry_run: false,
+                limit: None,
+                clock: Some(opts.clock),
+                budget: opts.budget.clone(),
+                run_id: opts.run_id.clone(),
+            };
+            crate::topology::run_topology(&cfg, &opts.auth, run).await
+        }
+        None => run_expanded(rows.nodes, opts).await,
+    }
+}
+
 /// The config-derived fields a hot reload (SIGHUP) swaps. Auth catalog, lineage
 /// emitter, notifier, and catalog handle are deliberately NOT reloaded — they
 /// hold pooled connections / cached tokens reused across ticks (reloading them
 /// would churn connections and could leak auth-catalog tokens).
 struct ReloadedBundle {
     compiled: CompiledSchedule,
-    nodes: Vec<ExpandedNode>,
+    nodes: Rows,
     execution: Option<crate::config::ExecutionSpec>,
     resilience: Option<faucet_core::ResiliencePolicy>,
     sla: Option<crate::sla::SlaSpec>,
@@ -99,7 +154,7 @@ async fn reload_bundle(path: &std::path::Path, profile: Option<&str>) -> CliResu
     let compiled = CompiledSchedule::compile(spec)?;
     let cron = spec.cron.clone();
     let timezone = spec.timezone.clone();
-    let nodes = expand(&cfg)?;
+    let nodes = Rows::plan(&cfg)?;
     let resilience = match &cfg.resilience {
         Some(spec) => Some(spec.to_policy()?),
         None => None,
@@ -175,7 +230,7 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
         Some(spec) => Some(crate::catalog::connect_from_spec(spec).await?),
         None => None,
     };
-    let nodes = expand(&cfg)?; // validate once; cloned per tick
+    let nodes = Rows::plan(&cfg)?; // validate once; cloned per tick
     let execution = cfg.execution.clone();
     let resilience = match &cfg.resilience {
         Some(spec) => Some(spec.to_policy()?),
@@ -306,7 +361,7 @@ fn run_span(run_ordinal: u64, scheduled_for: DateTime<Utc>, tick: DateTime<Utc>)
 /// Spawn one pipeline run, wrapping it in the optional run timeout and the
 /// per-run span.
 fn spawn_run(
-    nodes: Vec<ExpandedNode>,
+    nodes: Rows,
     opts: ExecuteOptions,
     timeout: Option<Duration>,
     span: tracing::Span,
@@ -314,14 +369,14 @@ fn spawn_run(
     tokio::spawn(
         async move {
             match timeout {
-                Some(d) => match tokio::time::timeout(d, run_expanded(nodes, opts)).await {
+                Some(d) => match tokio::time::timeout(d, run_rows(nodes, opts)).await {
                     Ok(r) => r,
                     Err(_) => Err(CliError::Internal(format!(
                         "scheduled run exceeded run_timeout_secs ({}s) and was aborted",
                         d.as_secs()
                     ))),
                 },
-                None => run_expanded(nodes, opts).await,
+                None => run_rows(nodes, opts).await,
             }
         }
         .instrument(span),
@@ -383,7 +438,7 @@ fn classify(
 /// `--once`: run exactly one pipeline run now and map its result to an exit.
 #[allow(clippy::too_many_arguments)]
 async fn run_once(
-    nodes: &[ExpandedNode],
+    nodes: &Rows,
     auth: &AuthCatalog,
     execution: &Option<crate::config::ExecutionSpec>,
     compiled: &CompiledSchedule,
@@ -424,7 +479,7 @@ async fn run_once(
         catalog,
     );
     let span = run_span(1, now, now);
-    let fut = run_expanded(nodes.to_vec(), opts).instrument(span);
+    let fut = run_rows(nodes.clone(), opts).instrument(span);
     let summary = match compiled.run_timeout {
         Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
             CliError::Internal(format!(
@@ -446,7 +501,7 @@ async fn run_once(
         catalog.as_ref(),
         pipeline_name,
         crate::catalog::snapshot::on_error_str(execution),
-        nodes,
+        &nodes.nodes,
         true,
         chrono::Utc::now(),
     )
@@ -458,7 +513,7 @@ async fn run_once(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     mut compiled: CompiledSchedule,
-    mut nodes: Vec<ExpandedNode>,
+    mut nodes: Rows,
     auth: AuthCatalog,
     mut execution: Option<crate::config::ExecutionSpec>,
     pipeline_name: String,
@@ -1084,7 +1139,7 @@ mod tests {
         // A zero-ish timeout (1ns) virtually guarantees the timeout branch fires
         // even though the pipeline is fast — the timeout races the spawn.
         let handle = spawn_run(
-            nodes,
+            nodes.into(),
             opts,
             Some(Duration::from_nanos(1)),
             run_span(1, Utc::now(), Utc::now()),
