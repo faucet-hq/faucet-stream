@@ -78,6 +78,12 @@ start_at: now               # now (only objects seen after startup) | beginning 
 
 **`${trigger.*}` tokens injected into the run config:**
 
+Tokens are substituted inside each string value of the parsed config, with the
+raw value: `bucket: "${trigger.bucket}"`, `prefix: in/${trigger.object_key}`
+and `bucket: ${trigger.bucket}` all yield a plain string, and a value holding
+`:`, quotes or newlines stays inside its scalar. A whole-value token is always a
+string (`size: ${trigger.size}` gives `"42"`). Mapping keys are not substituted.
+
 *`mode: per_object` — one token set per object:*
 
 | Token | Value |

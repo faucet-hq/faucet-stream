@@ -113,48 +113,73 @@ impl TriggerEvent {
     }
 }
 
-/// Substitute every `${trigger.<token>}` in `text`. Substituted values are
-/// YAML-escaped (wrapped + quotes doubled) so a value containing `:`/quotes can
-/// land in a scalar position without breaking the document. An unknown token is
-/// an error (never silently passed through). Returns the substituted text.
+/// Substitute every `${trigger.<token>}` in a config document. The document is
+/// parsed and each string scalar is substituted on its own with the raw value,
+/// so a token inside a quoted or longer scalar stays a single string with no
+/// quotes added, and a value holding `:`, quotes or newlines cannot change the
+/// document's shape. An unknown token is an error (never silently passed
+/// through). Returns the re-rendered document.
 pub fn substitute(
     text: &str,
     event: &TriggerEvent,
     name: &str,
     fired_at: &str,
 ) -> Result<String, String> {
-    substitute_with(text, event, name, fired_at, yaml_escape)
+    if !text.contains("${trigger.") {
+        return Ok(text.to_string());
+    }
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(text)
+        .map_err(|e| format!("pipeline config is not valid YAML: {e}"))?;
+    substitute_value(&mut doc, event, name, fired_at)?;
+    serde_yaml::to_string(&doc).map_err(|e| format!("re-rendering pipeline config: {e}"))
 }
 
-/// [`substitute`] without YAML quoting — for a value that is not spliced
-/// into a document (a template param).
+fn substitute_value(
+    v: &mut serde_yaml::Value,
+    event: &TriggerEvent,
+    name: &str,
+    fired_at: &str,
+) -> Result<(), String> {
+    match v {
+        serde_yaml::Value::String(s) if s.contains("${trigger.") => {
+            *s = substitute_plain(s, event, name, fired_at)?;
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                substitute_value(item, event, name, fired_at)?;
+            }
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for (_, item) in map.iter_mut() {
+                substitute_value(item, event, name, fired_at)?;
+            }
+        }
+        serde_yaml::Value::Tagged(tagged) => {
+            substitute_value(&mut tagged.value, event, name, fired_at)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Substitute every `${trigger.<token>}` in one string with the raw value.
 pub fn substitute_plain(
     text: &str,
     event: &TriggerEvent,
     name: &str,
     fired_at: &str,
 ) -> Result<String, String> {
-    substitute_with(text, event, name, fired_at, str::to_string)
-}
-
-fn substitute_with(
-    text: &str,
-    event: &TriggerEvent,
-    name: &str,
-    fired_at: &str,
-    escape: fn(&str) -> String,
-) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${trigger.") {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 2..]; // skip "${"
+        let after = &rest[start + 2..];
         let Some(end) = after.find('}') else {
             return Err("unterminated `${trigger.…}` token".into());
         };
-        let token = &after[8..end]; // after "trigger."
+        let token = &after[8..end];
         match event.lookup(token, name, fired_at) {
-            Some(v) => out.push_str(&escape(&v)),
+            Some(v) => out.push_str(&v),
             None => {
                 return Err(format!(
                     "unknown `${{trigger.{token}}}` token for {} trigger '{name}'",
@@ -166,18 +191,6 @@ fn substitute_with(
     }
     out.push_str(rest);
     Ok(out)
-}
-
-/// Quote a value for safe scalar substitution into YAML.
-fn yaml_escape(v: &str) -> String {
-    format!(
-        "\"{}\"",
-        v.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
-    )
 }
 
 /// Deterministic idempotency key for the event (see spec §9).
@@ -261,8 +274,8 @@ mod tests {
             "since=2026-09-26T02:00:00Z"
         );
         assert_eq!(
-            substitute("t: ${trigger.tick}", &e, "n", "f").unwrap(),
-            "t: \"2026-09-26T02:00:00Z\""
+            parsed(&substitute("t: ${trigger.tick}", &e, "n", "f").unwrap())["t"],
+            "2026-09-26T02:00:00Z"
         );
         assert!(substitute_plain("${trigger.depth}", &e, "n", "f").is_err());
         assert_eq!(idempotency_key("n", &e), "trig:n:2026-09-26T02:00:00Z");
@@ -281,17 +294,35 @@ mod tests {
         }
     }
 
+    fn parsed(text: &str) -> serde_json::Value {
+        serde_yaml::from_str(text).unwrap()
+    }
+
     #[test]
-    fn substitutes_object_key_with_yaml_escaping() {
+    fn substitutes_object_key_into_bare_quoted_and_embedded_scalars() {
         let out = substitute(
-            "key: ${trigger.object_key}",
+            "key: ${trigger.object_key}\nquoted: \"${trigger.object_key}\"\nprefix: in/${trigger.object_key}\nsize: ${trigger.size}\nlist: ['${trigger.bucket}']\n",
             &obj(),
             "t",
             "2026-06-12T10:00:01Z",
         )
         .unwrap();
-        // The ':' in the key must be quoted so YAML stays valid.
-        assert_eq!(out, "key: \"incoming/2026/data:set.json\"");
+        let v = parsed(&out);
+        assert_eq!(v["key"], "incoming/2026/data:set.json");
+        assert_eq!(v["quoted"], "incoming/2026/data:set.json");
+        assert_eq!(v["prefix"], "in/incoming/2026/data:set.json");
+        assert_eq!(v["size"], "42", "a whole-scalar token stays a string");
+        assert_eq!(v["list"][0], "b");
+    }
+
+    #[test]
+    fn a_document_without_tokens_passes_through_unchanged() {
+        let text = "# keep me\nname: x\n";
+        assert_eq!(substitute(text, &obj(), "t", "now").unwrap(), text);
+        let tagged = substitute("x: !Keep ${trigger.bucket}\n", &obj(), "t", "now").unwrap();
+        assert_eq!(tagged.trim(), "x: !Keep b");
+        assert!(substitute("a: [${trigger.bucket}", &obj(), "t", "now").is_err());
+        assert!(substitute("a: ${trigger.bucket", &obj(), "t", "now").is_err());
     }
 
     #[test]
@@ -314,13 +345,17 @@ mod tests {
             idem: "k1".into(),
         };
         let out = substitute(
-            "t: ${trigger.header.X-Tenant} m: ${trigger.query.mode}",
+            "t: ${trigger.header.X-Tenant}\nm: \"${trigger.query.mode}\"",
             &e,
             "h",
             "now",
         )
         .unwrap();
-        assert_eq!(out, "t: \"acme\" m: \"full\"");
+        let v = parsed(&out);
+        assert_eq!(
+            (v["t"].as_str(), v["m"].as_str()),
+            (Some("acme"), Some("full"))
+        );
     }
 
     #[test]
@@ -344,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn substitutes_multiline_value_escapes_newline() {
+    fn substitutes_a_multiline_value_as_one_scalar() {
         let mut headers = BTreeMap::new();
         let mut query = BTreeMap::new();
         headers.insert("x-h".into(), "v".into());
@@ -356,9 +391,9 @@ mod tests {
             query,
             idem: "k".into(),
         };
-        let out = substitute("b: ${trigger.body}", &e, "h", "now").unwrap();
-        // Must contain literal backslash-n, not a raw newline.
-        assert_eq!(out, r#"b: "line1\nline2""#);
-        assert!(!out.contains('\n'), "raw newline must not appear in output");
+        let out = substitute("b: ${trigger.body}\nc: 1\n", &e, "h", "now").unwrap();
+        let v = parsed(&out);
+        assert_eq!(v["b"], "line1\nline2");
+        assert_eq!(v["c"], 1, "the value cannot add or move keys");
     }
 }

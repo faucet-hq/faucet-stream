@@ -204,6 +204,147 @@ async fn webhook_trigger_enqueues_exactly_one_run() {
     );
 }
 
+fn webhook_event(query: &[(&str, &str)]) -> faucet_cli::serve::triggers::context::TriggerEvent {
+    faucet_cli::serve::triggers::context::TriggerEvent::Webhook {
+        method: "POST".into(),
+        body: "{\"dataset\":\"orders\"}".into(),
+        headers: Default::default(),
+        query: query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        idem: "cookbook-1".into(),
+    }
+}
+
+/// SERVE-09: the cookbook's trigger configs — tokens inside quoted scalars and
+/// embedded in longer strings — substitute to the raw value.
+#[tokio::test]
+async fn cookbook_trigger_configs_substitute_into_quoted_and_embedded_scalars() {
+    use faucet_cli::serve::triggers::context::TriggerEvent;
+    use faucet_cli::serve::triggers::enqueue::resolve_config_text;
+    use faucet_cli::serve::triggers::spec::PipelineRef;
+
+    let dir = tempfile::tempdir().unwrap();
+    let s3_load = dir.path().join("s3_load.yaml");
+    std::fs::write(
+        &s3_load,
+        r#"version: 1
+name: s3-load
+pipeline:
+  source:
+    type: s3
+    config:
+      bucket: "${trigger.bucket}"
+      prefix: "${trigger.object_key}"   # exact key → single-object read
+      region: us-east-1
+      file_format: json_lines
+  sink:
+    type: postgres
+    config:
+      connection_url: "${env:PG_URL}"
+      table_name: events_raw
+      column_mapping: { type: jsonb, column: payload }
+"#,
+    )
+    .unwrap();
+    let object = TriggerEvent::Object {
+        bucket: "my-bucket".into(),
+        key: "incoming/2026/10/06/data:part-1.jsonl".into(),
+        size: 10,
+        last_modified: "2026-10-06T00:00:00Z".into(),
+    };
+    let text = resolve_config_text(
+        &PipelineRef::Path(s3_load.display().to_string()),
+        &object,
+        "load-dropped-files",
+        "2026-10-06T00:00:01Z",
+    )
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_yaml::from_str(&text).unwrap();
+    assert_eq!(v["pipeline"]["source"]["config"]["bucket"], "my-bucket");
+    assert_eq!(
+        v["pipeline"]["source"]["config"]["prefix"],
+        "incoming/2026/10/06/data:part-1.jsonl"
+    );
+    assert_eq!(
+        v["pipeline"]["sink"]["config"]["connection_url"], "${env:PG_URL}",
+        "other directives are left for the loader"
+    );
+
+    let sync = dir.path().join("sync.yaml");
+    std::fs::write(
+        &sync,
+        r#"# pipeline that uses the request body as a REST source filter
+pipeline:
+  source:
+    type: rest
+    config:
+      url: "https://api.example.com/orders?dataset=${trigger.query.dataset}"
+      auth: { type: bearer, config: { token: "${env:API_TOKEN}" } }
+  sink:
+    type: file
+    config:
+      path: "./out/${trigger.fired_at}.jsonl"
+"#,
+    )
+    .unwrap();
+    let text = resolve_config_text(
+        &PipelineRef::Path(sync.display().to_string()),
+        &webhook_event(&[("dataset", "orders")]),
+        "sync-hook",
+        "2026-10-06T00:00:01Z",
+    )
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_yaml::from_str(&text).unwrap();
+    assert_eq!(
+        v["pipeline"]["source"]["config"]["url"],
+        "https://api.example.com/orders?dataset=orders"
+    );
+    assert_eq!(
+        v["pipeline"]["sink"]["config"]["path"],
+        "./out/2026-10-06T00:00:01Z.jsonl"
+    );
+}
+
+/// SERVE-09 end to end: a webhook fire whose pipeline uses quoted and embedded
+/// `${trigger.*}` tokens runs and writes where the tokens say.
+#[tokio::test]
+async fn a_webhook_fire_with_quoted_and_embedded_tokens_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.csv"), "a,b\n1,2\n").unwrap();
+    let pipeline = dir.path().join("sync.yaml");
+    std::fs::write(
+        &pipeline,
+        "version: 1\nname: sync\npipeline:\n  source:\n    type: csv\n    config:\n      path: \"${trigger.query.dir}/in.csv\"\n  sink:\n    type: jsonl\n    config:\n      path: ${trigger.query.dir}/out-${trigger.query.dataset}.jsonl\n",
+    )
+    .unwrap();
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: sync-hook\n    type: webhook\n    config: {}\n",
+        pipeline.display()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let event = webhook_event(&[("dir", dir.path().to_str().unwrap()), ("dataset", "orders")]);
+    let now = chrono::Utc::now().to_rfc3339();
+    let outcome =
+        faucet_cli::serve::triggers::enqueue::fire(&state, &compiled.triggers[0], event, &now)
+            .await;
+    assert!(
+        matches!(
+            outcome,
+            faucet_cli::serve::triggers::enqueue::FireOutcome::Enqueued(_)
+        ),
+        "expected Enqueued, got {outcome:?}"
+    );
+    wait_for_runs(&state, 1).await;
+    let written = std::fs::read_to_string(dir.path().join("out-orders.jsonl")).unwrap();
+    assert_eq!(written.lines().count(), 1, "{written}");
+}
+
 #[cfg(feature = "triggers-object-store")]
 #[tokio::test]
 async fn object_arrival_enqueues_one_run_per_object_and_dedupes() {
