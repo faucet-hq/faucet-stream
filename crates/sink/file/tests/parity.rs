@@ -94,7 +94,7 @@ async fn an_explicit_parquet_schema_types_and_fixes_the_columns() {
     assert!(!b.schema().field(0).is_nullable());
     let (rows, _) = read_parquet(&out);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["amount"], json!(12.5));
+    assert_eq!(rows[0]["amount"], json!("12.50"));
     assert_eq!(rows[1]["label"], Value::Null);
 
     let e = pages(

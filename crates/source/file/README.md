@@ -131,6 +131,11 @@ types arrive typed: `decimal` as `Decimal128`, `date` as `Date32`, and
 timestamps as `Timestamp`. `format: auto` stays on the row path, because it
 cannot promise that every file decodes to Arrow.
 
+When Arrow data becomes JSON rows (a row-path sink, or a transform or
+governance pass), decimals arrive as exact strings (`"12.50"`) so no digits are
+lost, and non-finite floats as `"NaN"`, `"Infinity"` or `"-Infinity"` instead
+of `null`.
+
 ## Incremental mode
 
 ```yaml
