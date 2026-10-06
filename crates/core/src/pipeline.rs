@@ -7386,6 +7386,36 @@ mod cleanup_tests {
     }
 
     #[tokio::test]
+    async fn tracker_counts_a_page_whose_whole_batch_failed() {
+        let sink = CleanupSink::failing();
+        let p = policy(100);
+        let tracker = CleanupTracker::new(&sink, &p);
+        let page = vec![json!({"id": 1}), json!({"id": 2})];
+        assert!(tracker.write_batch_partial(&page).await.is_err());
+        assert_eq!(tracker.tracked(), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_rows_of_a_page_routed_to_the_dlq_by_dlq_all() {
+        use crate::dlq::{DlqConfig, OnBatchError};
+        let sink = CleanupSink::failing();
+        let dlq_sink: Arc<dyn Sink> = Arc::new(CleanupSink::new());
+        let dlq = DlqConfig {
+            on_batch_error: OnBatchError::DlqAll,
+            ..DlqConfig::new(dlq_sink)
+        };
+        let source = src(vec![json!({"id": 1}), json!({"id": 2})]);
+        Pipeline::new(&source, &sink)
+            .with_dlq(dlq)
+            .allow_dlq_all_duplicates(true)
+            .with_cleanup(policy(100))
+            .run()
+            .await
+            .expect("the failed page is routed to the DLQ and the run succeeds");
+        assert_eq!(sink.calls(), vec![vec!["1".to_string(), "2".to_string()]]);
+    }
+
+    #[tokio::test]
     async fn tracker_refuses_to_delete_after_an_overflow() {
         let sink = CleanupSink::new();
         let p = policy(1);

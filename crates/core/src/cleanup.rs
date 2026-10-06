@@ -296,11 +296,12 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
         &self,
         records: &[Value],
     ) -> Result<Vec<crate::traits::RowOutcome>, FaucetError> {
-        let out = self.inner.write_batch_partial(records).await?;
-        // Count every row handed to the sink, including the ones that failed and
-        // will be routed to the DLQ — see the type docs.
+        let out = self.inner.write_batch_partial(records).await;
+        // Count every row handed to the sink, including the ones that failed —
+        // per row or as a whole batch under `on_batch_error: dlq_all` — and will
+        // be routed to the DLQ. See the type docs.
         self.record(records);
-        Ok(out)
+        out
     }
 
     async fn write_batch_idempotent(
