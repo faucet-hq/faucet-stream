@@ -49,9 +49,7 @@ async fn single_file_mode_writes_to_the_exact_fixed_path() {
         ])
         .await
         .unwrap();
-        // In single-file mode `flush()` keeps the writer open (it does not write
-        // the footer); the file is finalized when the sink is dropped at end of
-        // run. Drop the sink (end of scope) before reading it back.
+        // In single-file mode `flush()` publishes the complete file.
         sink.flush().await.unwrap();
     }
 
@@ -321,4 +319,26 @@ async fn lazy_writer_opens_on_first_batch_inferring_schema_from_records() {
         schema.field_with_name("name").unwrap().data_type(),
         &arrow::datatypes::DataType::Utf8
     );
+}
+
+/// #789 FILE-01: a flush publishes a readable file while the run is still
+/// going, later pages are appended to it, and unflushed rows never land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_file_flush_publishes_and_drop_discards() {
+    let tmp = TempDir::new().unwrap();
+    let target = tmp.path().join("pub.parquet");
+    let cfg = ParquetSinkConfig::local(target.to_string_lossy().to_string());
+    {
+        let sink = ParquetSink::new(cfg).await.unwrap();
+        sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+        sink.flush().await.unwrap();
+        assert_eq!(rows_in(&read_file(&target).await), 1);
+        sink.write_batch(&[json!({"id": 2}), json!({"id": 3})])
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+        assert_eq!(rows_in(&read_file(&target).await), 3);
+        sink.write_batch(&[json!({"id": 4})]).await.unwrap();
+    }
+    assert_eq!(rows_in(&read_file(&target).await), 3);
 }

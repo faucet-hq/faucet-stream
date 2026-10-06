@@ -24,7 +24,7 @@ Built on the `parquet` + `arrow` crates wired through `object_store`, so local a
 - **Row & byte rollover** — split large outputs across multiple `<uuid>.parquet` files by row count (`max_rows_per_file`) or byte budget (`max_bytes_per_file`).
 - **Streaming writer** — one reused `object_store` client, bounded buffering, configurable `row_group_size` for read-back performance.
 - **Drops unknown fields (within a file)** — a field absent from the *current file's* locked schema (one that appeared after the file's first batch) is dropped, with a `tracing::warn!` once per field per file. A Parquet file cannot change its schema mid-stream, so this loss is unavoidable within a file — but the schema is re-inferred per file, so the field is captured in the next file on rollover.
-- **Flush-safe** — files become valid only when the footer is written. In **rollover / directory / S3 mode** each `flush()` (called automatically by the pipeline on success, error-unwind, and cooperative cancellation) closes the current file and writes its footer. In **single-file mode** one writer stays open for the whole run — per-page `flush()` only flushes buffered row groups (no footer) so the file is never truncated mid-stream — and the footer is written once when the sink is dropped at end of run.
+- **Flush-safe** — files become valid only when the footer is written. In **rollover / directory / S3 mode** each `flush()` (called automatically by the pipeline on success, error-unwind, and cooperative cancellation) closes the current file and writes its footer. In **single-file mode** each `flush()` publishes the whole file (footer, fsync, atomic rename) and the next page continues it, so the file on disk always matches the stored bookmark; nothing is finalised when the sink is dropped.
 - **Arrow columnar fast path** (`arrow` feature, RFC 0002) — accepts Arrow `RecordBatch`es natively (`write_batch_columnar`), so a `parquet → parquet` pipeline writes them straight through the same writer/rollover path with no `serde_json::Value` round-trip. Opt-in; off by default and used only when the source is also columnar.
 
 ## Installation
@@ -115,13 +115,17 @@ destination:
   path: /var/lib/exports/events.parquet
 ```
 
-In single-file mode the sink keeps one writer open for the entire run and
-accumulates **every** page into that one file. The pipeline flushes after each
-bookmark-carrying page, but those intermediate flushes only push buffered row
-groups to the open file (they do **not** write the footer); the footer is
-written once when the sink is dropped at the end of the run. This is what makes
-single-file output correct for multi-bookmark sources (e.g. CDC streams), which
-emit many bookmark-carrying pages over a run.
+In single-file mode every `flush()` publishes a complete file at the path:
+the footer is written, the file is fsynced and renamed into place, so the
+bookmark the pipeline stores after a flush never names rows that are not on
+disk, and a reader sees either the previous complete file or the new one. The
+next page reopens the file and copies its rows into a new writer before
+appending (a Parquet file cannot be extended in place), so every page of the
+run ends up in the one file; the cost is a rewrite per bookmark-carrying page,
+so a high-frequency CDC source is better served by a directory destination.
+Rows written after the last `flush()` are discarded when the sink is dropped —
+nothing is finalised on drop, so a failed or killed run never publishes rows
+its bookmark does not cover.
 
 ### S3 (or any S3-compatible service)
 
