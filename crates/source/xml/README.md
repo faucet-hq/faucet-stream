@@ -248,7 +248,7 @@ The optional `soap:` block is **sugar over the XML-over-HTTP request/response pa
 2. **injects the version-correct headers**, regardless of the `auth` variant (so real bearer / basic auth stays free):
    - **1.1** → `SOAPAction: "<action>"` header **and** `Content-Type: text/xml; charset=utf-8`;
    - **1.2** → `Content-Type: application/soap+xml; charset=utf-8; action="<action>"` and **no** `SOAPAction` header;
-3. **resolves `records_element_path` relative to `Envelope.Body`** when `path_relative_to_body` (default) — you write `GetUsersResponse.Users.User`;
+3. **resolves `records_element_path` relative to `Envelope.Body`** when `path_relative_to_body` (default) — you write `GetUsersResponse.Users.User`. `Envelope`, `Body` and every path segment match whatever namespace prefix the server uses (`soap:Envelope`, `ns1:GetUsersResponse`; an exact key wins). A success response with no `Envelope`/`Body`, or whose body lacks the path's first element (the operation's response wrapper), fails the run instead of returning zero records; an absent inner element is an empty result;
 4. **surfaces a SOAP `<Fault>`** as `FaucetError::Source` when `fault_as_error` (default); set it `false` to emit zero records (logged once) instead.
 
 | Field | Type | Default | Description |

@@ -281,3 +281,58 @@ async fn raw_body_path_is_unchanged_when_soap_absent() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["Name"], "Ivy");
 }
+
+/// The normal case for a real SOAP server: `soap:`-prefixed `Envelope`/`Body`
+/// and a prefixed response wrapper. The default body-relative path must still
+/// find the records (#789 API-08).
+#[tokio::test]
+async fn a_prefixed_envelope_resolves_the_body_relative_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ws"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+             <soap:Body><ns1:GetUsersResponse xmlns:ns1=\"urn:example\"><ns1:Users>\
+             <ns1:User><Name>Alice</Name></ns1:User><ns1:User><Name>Bob</Name></ns1:User>\
+             </ns1:Users></ns1:GetUsersResponse></soap:Body></soap:Envelope>",
+        ))
+        .mount(&server)
+        .await;
+
+    let config = XmlStreamConfig::new(server.uri(), "/ws")
+        .method(Method::POST)
+        .records_element_path("GetUsersResponse.Users.User")
+        .with_soap(SoapConfig {
+            body_inner: Some("<GetUsers xmlns=\"urn:example\"/>".into()),
+            ..Default::default()
+        });
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["Name"], "Alice");
+}
+
+/// A success response whose body lacks the configured response element is a
+/// configuration mismatch, not an empty result.
+#[tokio::test]
+async fn a_missing_response_element_fails_instead_of_returning_zero_rows() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ws"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+             <soap:Body><OtherResponse/></soap:Body></soap:Envelope>",
+        ))
+        .mount(&server)
+        .await;
+
+    let config = XmlStreamConfig::new(server.uri(), "/ws")
+        .method(Method::POST)
+        .records_element_path("GetUsersResponse.Users.User")
+        .with_soap(SoapConfig {
+            body_inner: Some("<GetUsers xmlns=\"urn:example\"/>".into()),
+            ..Default::default()
+        });
+    let err = XmlStream::new(config).fetch_all().await.unwrap_err();
+    assert!(matches!(err, FaucetError::Source(_)), "{err}");
+    assert!(err.to_string().contains("GetUsersResponse"), "{err}");
+}

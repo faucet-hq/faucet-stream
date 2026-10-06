@@ -258,9 +258,14 @@ impl XmlStream {
             return Ok(Vec::new());
         }
 
-        let records = match self.effective_records_path() {
-            Some(path) => convert::extract_at_path(&doc, &path),
-            None => vec![doc],
+        let records = match (&self.config.soap, &self.config.records_element_path) {
+            (Some(soap), Some(path)) => {
+                convert::extract_soap_records(&doc, path, soap.path_relative_to_body)?
+            }
+            _ => match self.effective_records_path() {
+                Some(path) => convert::extract_at_path(&doc, &path),
+                None => vec![doc],
+            },
         };
         Ok(records)
     }

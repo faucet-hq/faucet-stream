@@ -441,6 +441,60 @@ pub fn extract_at_path(value: &Value, path: &str) -> Vec<Value> {
     }
 }
 
+/// [`extract_at_path`] where each segment matches its element exactly or, when
+/// no key matches exactly, by local name — so `Envelope.Body.GetUsersResponse`
+/// finds `soap:Envelope.soap:Body.ns1:GetUsersResponse` (#789 API-08).
+pub fn extract_at_path_by_local(value: &Value, path: &str) -> Vec<Value> {
+    let mut current = value;
+    for seg in path.split('.') {
+        current = match child_exact_or_local(current, seg) {
+            Some(v) => v,
+            None => return vec![],
+        };
+    }
+    match current {
+        Value::Array(arr) => arr.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+fn child_exact_or_local<'a>(value: &'a Value, seg: &str) -> Option<&'a Value> {
+    let map = value.as_object()?;
+    map.get(seg)
+        .or_else(|| find_child_by_local(value, local_name(seg)))
+}
+
+/// Extract the records of a SOAP response. With `relative_to_body` the path is
+/// resolved under the envelope's `Body`, found by local name whatever its
+/// namespace prefix. A response with no `Envelope`/`Body`, or whose body lacks
+/// the path's first element (the operation's response wrapper, always present
+/// on a successful reply), is an error rather than zero records; a deeper
+/// element that is absent is an empty result.
+pub fn extract_soap_records(
+    doc: &Value,
+    path: &str,
+    relative_to_body: bool,
+) -> Result<Vec<Value>, faucet_core::FaucetError> {
+    if !relative_to_body {
+        return Ok(extract_at_path_by_local(doc, path));
+    }
+    let body = find_child_by_local(doc, "Envelope")
+        .and_then(|env| find_child_by_local(env, "Body"))
+        .ok_or_else(|| {
+            faucet_core::FaucetError::Source(
+                "xml: the SOAP response has no Envelope/Body element".into(),
+            )
+        })?;
+    let first = path.split('.').next().unwrap_or(path);
+    if child_exact_or_local(body, first).is_none() {
+        return Err(faucet_core::FaucetError::Source(format!(
+            "xml: the SOAP body has no `{first}` element (records_element_path `{path}`); \
+             check the response element name"
+        )));
+    }
+    Ok(extract_at_path_by_local(body, path))
+}
+
 /// The local name of an element key — the part after the last `:`, so a
 /// namespace-prefixed element like `soap:Body` matches on `Body`.
 fn local_name(key: &str) -> &str {
@@ -874,6 +928,37 @@ mod tests {
         assert!(
             matches!(&err, FaucetError::Transform(m) if m.contains("XML parse error")),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn soap_records_resolve_through_prefixes_and_fail_without_the_wrapper() {
+        let doc = json!({"soap:Envelope": {"soap:Body": {"ns1:Resp": {"ns1:Item": [{"id": 1}, {"id": 2}]}}}});
+        assert_eq!(
+            extract_soap_records(&doc, "Resp.Item", true).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            extract_soap_records(&doc, "Resp.Missing", true).unwrap(),
+            Vec::<Value>::new(),
+            "an absent inner element is an empty result"
+        );
+        let err = extract_soap_records(&doc, "Other.Item", true).unwrap_err();
+        assert!(err.to_string().contains("`Other`"), "{err}");
+        let err = extract_soap_records(&json!({"root": {}}), "Resp", true).unwrap_err();
+        assert!(err.to_string().contains("Envelope/Body"), "{err}");
+        assert_eq!(
+            extract_soap_records(&doc, "Envelope.Body.Resp.Item", false)
+                .unwrap()
+                .len(),
+            2,
+            "an absolute path also matches prefixed segments"
+        );
+        let exact = json!({"a": {"x:b": 1, "b": 2}});
+        assert_eq!(
+            extract_at_path_by_local(&exact, "a.b"),
+            vec![json!(2)],
+            "exact key wins"
         );
     }
 
