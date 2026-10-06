@@ -362,9 +362,15 @@ page unit, and `batch_size` could only ever *split* an oversized page — it
 could never merge two undersized ones, so a small source page meant one
 expensive warehouse operation per small page. Each `INSERT … SELECT` is a full warehouse query, so the per-query overhead — not the data — dominated a small-page run. For true bulk volume, configure `bulk_load:` to stage and `COPY` instead.
 
-- `commit_rows` — records per commit. `None` (the default) accumulates the
-  **whole run** into one commit.
+- `commit_rows` — records per commit. `0` removes the row limit.
 - `commit_bytes` — estimated-bytes counterpart, bounding how much is buffered.
+  `0` removes the byte limit.
+
+With neither set, a group commits at **100,000 rows or ~256 MiB**, whichever
+comes first, so a large load never holds the whole run in memory. A group
+whose commit fails keeps its uncommitted rows, so a retried `flush` (for
+example under a `resilience:` policy) commits them rather than reporting
+success with nothing written.
 
 `batch_size` still bounds an individual request inside a commit group, so a
 very large group is split into reasonably-sized requests.
@@ -372,7 +378,10 @@ very large group is split into reasonably-sized requests.
 **Only the append path accumulates.** `delivery: exactly_once` and the DLQ
 path commit per page, because a commit token must land atomically with its own
 page, and a DLQ must report which rows of *this* page failed — neither is
-expressible once pages are merged.
+expressible once pages are merged. With a `dlq:` block, earlier buffered pages are
+committed first and a failed write sends exactly the rows of that page that did
+not land to the DLQ; rows from chunks that committed before the failure are not
+repeated.
 
 ## Batch atomicity
 

@@ -84,16 +84,41 @@ impl SnowflakeSink {
     /// very large group is split into requests near Snowflake's documented
     /// sweet spot — but the *group* is what accumulation controls, and a small
     /// source page no longer forces its own query.
-    async fn commit_group(&self, rows: &[Value]) -> Result<(), FaucetError> {
+    /// On failure, also returns how many leading rows did land.
+    async fn commit_group(&self, rows: &[Value]) -> Result<(), (usize, FaucetError)> {
         let chunk = if self.config.batch_size == 0 {
             rows.len().max(1)
         } else {
             self.config.batch_size
         };
+        let mut done = 0;
         for slice in rows.chunks(chunk) {
-            let (sql, payload) = self.build_insert(slice)?;
+            let (sql, payload) = self.build_insert(slice).map_err(|e| (done, e))?;
             let bindings = json!({ "1": { "type": "TEXT", "value": payload } });
-            self.execute_sql(&sql, Some(bindings)).await?;
+            self.execute_sql(&sql, Some(bindings))
+                .await
+                .map_err(|e| (done, e))?;
+            done += slice.len();
+        }
+        Ok(())
+    }
+
+    /// Commit a group the accumulator handed out; on failure put back the
+    /// uncommitted rows of earlier pages (`rows[..keep_end]`), so a retried
+    /// write or `flush` commits them instead of dropping them (SQL-04).
+    async fn commit_or_restore(
+        &self,
+        rows: Vec<Value>,
+        keep_end: usize,
+    ) -> Result<(), FaucetError> {
+        if let Err((done, e)) = self.commit_group(&rows).await {
+            if done < keep_end {
+                let mut rows = rows;
+                rows.truncate(keep_end);
+                rows.drain(..done);
+                self.pending.lock().await.restore(rows);
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -146,7 +171,7 @@ impl SnowflakeSink {
         }
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
-            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::new(
+            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
                 config.commit_bytes,
             )),
@@ -581,9 +606,42 @@ impl faucet_core::Sink for SnowflakeSink {
             open.finish()
         };
         if let Some(rows) = group {
-            self.commit_group(&rows).await?;
+            let len = rows.len();
+            self.commit_or_restore(rows, len).await?;
         }
         Ok(())
+    }
+
+    /// The DLQ path commits per page (SQL-21): earlier buffered rows are
+    /// committed first, then this page alone, so a failed commit names exactly
+    /// the rows of *this* page that did not land.
+    async fn write_batch_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.flush().await?;
+        self.ensure_table_ready(records).await?;
+        match self.commit_group(records).await {
+            Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
+            Err((0, e)) => Err(e),
+            Err((done, e)) => {
+                let message = e.to_string();
+                Ok((0..records.len())
+                    .map(|i| {
+                        if i < done {
+                            Ok(())
+                        } else {
+                            Err(FaucetError::Sink(format!(
+                                "snowflake: write failed: {message}"
+                            )))
+                        }
+                    })
+                    .collect())
+            }
+        }
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -600,7 +658,8 @@ impl faucet_core::Sink for SnowflakeSink {
             pending.push_page(records)
         };
         if let Some(rows) = group {
-            self.commit_group(&rows).await?;
+            let keep_end = rows.len() - records.len();
+            self.commit_or_restore(rows, keep_end).await?;
         }
         let total = records.len();
 
