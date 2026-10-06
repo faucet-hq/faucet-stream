@@ -250,6 +250,31 @@ pub struct XmlStreamConfig {
     /// request). Requires the crate's `mtls` feature.
     #[serde(default)]
     pub tls: Option<TlsClientConfig>,
+    /// Per-request timeout in seconds. Covers one HTTP request (a stalled peer
+    /// fails the request, so retries and resilience can act), not the whole
+    /// run. `null` disables it. Defaults to `30`.
+    #[serde(
+        with = "faucet_core::config::duration_secs_option",
+        default = "default_request_timeout"
+    )]
+    #[schemars(with = "Option<u64>")]
+    pub timeout: Option<std::time::Duration>,
+    /// Timeout for establishing a connection, in seconds. `null` disables it.
+    /// Defaults to `10`.
+    #[serde(
+        with = "faucet_core::config::duration_secs_option",
+        default = "default_connect_timeout"
+    )]
+    #[schemars(with = "Option<u64>")]
+    pub connect_timeout: Option<std::time::Duration>,
+}
+
+fn default_request_timeout() -> Option<std::time::Duration> {
+    Some(std::time::Duration::from_secs(30))
+}
+
+fn default_connect_timeout() -> Option<std::time::Duration> {
+    Some(std::time::Duration::from_secs(10))
 }
 
 fn default_batch_size() -> usize {
@@ -274,6 +299,8 @@ impl XmlStreamConfig {
             decode: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             tls: None,
+            timeout: default_request_timeout(),
+            connect_timeout: default_connect_timeout(),
         }
     }
 
@@ -287,6 +314,18 @@ impl XmlStreamConfig {
     /// time; otherwise [`XmlStream::try_new`](crate::XmlStream::try_new) errors).
     pub fn tls(mut self, tls: TlsClientConfig) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Set the per-request timeout (`None` disables it).
+    pub fn timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the connect timeout (`None` disables it).
+    pub fn connect_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 

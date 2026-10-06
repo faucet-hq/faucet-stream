@@ -93,6 +93,8 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. The event-driven parser buffers matched subtrees and yields whenever the buffer reaches this size. **`0` = no batching**: the document is drained end-to-end and the entire result set is emitted in a single page. Validated against `MAX_BATCH_SIZE` (1,000,000). |
+| `timeout` | int / null | `30` | Per-request timeout in seconds — a stalled peer fails the request (so retries and resilience act) instead of hanging the run. `null` disables it. |
+| `connect_timeout` | int / null | `10` | Timeout for establishing a connection, in seconds. `null` disables it. |
 
 > `headers` exists on the Rust config struct for programmatic use but is `#[serde(skip)]` — it is **not** settable from YAML/JSON. Use `Custom` auth (or `query_params`) to attach request headers from config.
 

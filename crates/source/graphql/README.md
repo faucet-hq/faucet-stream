@@ -83,6 +83,8 @@ faucet run pipeline.yaml
 | `records_path` | string | *(unset)* | JSONPath plucking the record array out of the response (e.g. `$.data.users.edges[*].node`). When unset, the whole `data` object is emitted as one record. |
 | `auth` | `GraphqlAuth` \| `{ ref }` | `none` | Authentication — inline `{ type, config }` or a shared-provider reference. See [Authentication](#authentication). |
 | `retry_on_response` | array of matchers | `[]` | Responses to treat as throttling and retry, including a `200` whose body reports it. See [Throttling in a 200 body](#throttling-in-a-200-body). |
+| `timeout` | int / null | `30` | Per-request timeout in seconds — a stalled peer fails the request (so retries and resilience act) instead of hanging the run. `null` disables it. |
+| `connect_timeout` | int / null | `10` | Timeout for establishing a connection, in seconds. `null` disables it. |
 
 ### Pagination
 

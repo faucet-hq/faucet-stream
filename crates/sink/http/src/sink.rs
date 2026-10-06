@@ -56,9 +56,18 @@ async fn retry_delay(err: &FaucetError, attempt: u32) {
 impl HttpSink {
     /// Create a new HTTP sink from the given configuration.
     pub fn new(config: HttpSinkConfig) -> Self {
+        let mut builder = reqwest::Client::builder();
+        if let Some(t) = config.timeout {
+            builder = builder.timeout(t);
+        }
+        if let Some(t) = config.connect_timeout {
+            builder = builder.connect_timeout(t);
+        }
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: builder
+                .build()
+                .expect("an HTTP client with only timeouts set always builds"),
             auth_provider: None,
         }
     }

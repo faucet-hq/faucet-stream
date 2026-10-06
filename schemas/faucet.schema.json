@@ -14985,6 +14985,28 @@
                       "items": {
                         "$ref": "#/$defs/source_graphql__RetryMatcher"
                       }
+                    },
+                    "timeout": {
+                      "description": "Per-request timeout in seconds. Covers one HTTP request (a stalled peer\nfails the request, so retries and resilience can act), not the whole\nrun. `null` disables it. Defaults to `30`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "connect_timeout": {
+                      "description": "Timeout for establishing a connection, in seconds. `null` disables it.\nDefaults to `10`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
                     }
                   },
                   "title": "GraphqlStreamConfig",
@@ -15129,6 +15151,28 @@
                         }
                       ],
                       "default": null
+                    },
+                    "timeout": {
+                      "description": "Per-request timeout in seconds. Covers one HTTP request (a stalled peer\nfails the request, so retries and resilience can act), not the whole\nrun. `null` disables it. Defaults to `30`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "connect_timeout": {
+                      "description": "Timeout for establishing a connection, in seconds. `null` disables it.\nDefaults to `10`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
                     }
                   }
                 },
@@ -24071,6 +24115,28 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "timeout": {
+                      "description": "Per-request timeout in seconds. Covers one HTTP request (a stalled peer\nfails the request, so retries and resilience can act), not the whole\nrun. `null` disables it. Defaults to `30`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "connect_timeout": {
+                      "description": "Timeout for establishing a connection, in seconds. `null` disables it.\nDefaults to `10`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
                     }
                   }
                 },

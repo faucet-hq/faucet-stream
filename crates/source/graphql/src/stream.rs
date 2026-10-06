@@ -143,6 +143,12 @@ impl GraphqlStream {
     /// for non-TLS configs exactly as before.
     pub fn try_new(config: GraphqlStreamConfig) -> Result<Self, FaucetError> {
         let mut builder = Client::builder();
+        if let Some(t) = config.timeout {
+            builder = builder.timeout(t);
+        }
+        if let Some(t) = config.connect_timeout {
+            builder = builder.connect_timeout(t);
+        }
         if let Some(tls) = &config.tls {
             tls.validate()?;
             builder = apply_client_tls(builder, tls)?;
