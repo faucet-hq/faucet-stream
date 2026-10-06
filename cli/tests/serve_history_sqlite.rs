@@ -1000,6 +1000,41 @@ mod templates {
         );
     }
 
+    async fn assert_prune_keeps_live_versions(s: &dyn RunHistory) {
+        for _ in 0..3 {
+            s.template_register(&draft("orders", None)).await.unwrap();
+        }
+        s.template_launch("orders", 1, None).await.unwrap();
+        s.template_launch("orders", 2, None).await.unwrap();
+        s.template_set_tag("orders", "prod", 3).await.unwrap();
+        for _ in 0..22 {
+            s.template_register(&draft("orders", None)).await.unwrap();
+        }
+        let versions = s.template_versions("orders").await.unwrap();
+        assert_eq!(versions.len(), 23, "20 newest + the three live ones");
+        for live in [1, 2, 3] {
+            assert!(versions.contains(&live), "version {live} must survive");
+        }
+        assert!(!versions.contains(&4) && !versions.contains(&5));
+        let st = s.template_state("orders").await.unwrap();
+        assert_eq!((st.stable, st.previous), (Some(2), Some(1)));
+        assert_eq!(st.tags.get("prod"), Some(&3));
+        assert!(
+            s.template_get("orders", Some(2)).await.unwrap().is_some(),
+            "the launched version still resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_never_removes_the_launched_previous_or_channel_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir, "tpl-prune.db").await;
+        assert_prune_keeps_live_versions(&s).await;
+        let memory =
+            faucet_cli::serve::history::memory::MemoryHistory::new(Duration::from_secs(60));
+        assert_prune_keeps_live_versions(&memory).await;
+    }
+
     #[tokio::test]
     async fn deleting_a_version_cascades_to_channels_and_launch_entries() {
         let dir = tempfile::tempdir().unwrap();

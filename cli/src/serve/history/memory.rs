@@ -907,29 +907,31 @@ impl RunHistory for MemoryHistory {
         &self,
         draft: &templates::TemplateDraft,
     ) -> Result<templates::TemplateRecord, HistoryError> {
-        let mut store = self
-            .templates
-            .lock()
-            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
-        let id = draft.id.to_string();
-        let versions = store.entry(id.clone()).or_default();
-        let next = versions.keys().copied().max().unwrap_or(0) + 1;
-        let record = templates::TemplateRecord {
-            id,
-            version: next,
-            kind: draft.kind,
-            name: draft.name.clone(),
-            description: draft.description.clone(),
-            body: draft.body.clone(),
-            format: draft.format,
-            params: draft.params.clone(),
-            created_at: Utc::now(),
-            created_by: draft.created_by.clone(),
+        let (record, all) = {
+            let mut store = self
+                .templates
+                .lock()
+                .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+            let id = draft.id.to_string();
+            let versions = store.entry(id.clone()).or_default();
+            let next = versions.keys().copied().max().unwrap_or(0) + 1;
+            let record = templates::TemplateRecord {
+                id,
+                version: next,
+                kind: draft.kind,
+                name: draft.name.clone(),
+                description: draft.description.clone(),
+                body: draft.body.clone(),
+                format: draft.format,
+                params: draft.params.clone(),
+                created_at: Utc::now(),
+                created_by: draft.created_by.clone(),
+            };
+            versions.insert(next, record.clone());
+            let all: Vec<u32> = versions.keys().copied().collect();
+            (record, all)
         };
-        versions.insert(next, record.clone());
-        for stale in templates::versions_to_prune(versions.keys().copied().collect()) {
-            versions.remove(&stale);
-        }
+        self.prune_template_versions(&record.id, all).await?;
         Ok(record)
     }
 

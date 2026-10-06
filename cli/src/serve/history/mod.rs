@@ -1305,6 +1305,27 @@ pub trait RunHistory: Send + Sync {
         ))
     }
 
+    /// Delete the versions of `id` past [`templates::VERSION_RETAIN`], keeping the
+    /// launched version, the rollback target and every channel target, through
+    /// the same cascade as [`template_delete`](Self::template_delete).
+    async fn prune_template_versions(
+        &self,
+        id: &str,
+        versions: Vec<u32>,
+    ) -> Result<(), HistoryError> {
+        if versions.len() <= templates::VERSION_RETAIN {
+            return Ok(());
+        }
+        let protected = templates::protected_versions(
+            &self.template_launches(id).await?,
+            &self.template_tags(id).await?,
+        );
+        for stale in templates::versions_to_prune(versions, &protected) {
+            self.template_delete(id, Some(stale)).await?;
+        }
+        Ok(())
+    }
+
     /// True when the backend is in fallback mode (drives `/readyz`). Always false
     /// for memory.
     fn degraded(&self) -> bool;

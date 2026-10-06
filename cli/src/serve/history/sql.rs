@@ -3876,13 +3876,7 @@ macro_rules! impl_sql_history {
                             // Bound the version history so a template
                             // re-registered on every deploy can't grow forever.
                             let keep = self.template_versions(&id).await?;
-                            for stale in templates::versions_to_prune(keep) {
-                                let _ = sqlx::query(&self.stmts.template_delete_version)
-                                    .bind(&id)
-                                    .bind(stale.to_string())
-                                    .execute(&self.pool)
-                                    .await;
-                            }
+                            self.prune_template_versions(&id, keep).await?;
                             return Ok(record);
                         }
                         Err(e) if attempt < sql::CLAIM_ATTEMPTS => {
