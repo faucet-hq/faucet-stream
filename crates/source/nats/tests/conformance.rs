@@ -109,4 +109,96 @@ mod docker {
         assert!(peak <= 250, "peak page {peak} exceeds batch_size");
         assert!(peak < N, "buffered everything into one page");
     }
+
+    async fn start_jetstream() -> (testcontainers::ContainerAsync<Nats>, String) {
+        use testcontainers::ImageExt;
+        use testcontainers_modules::nats::NatsServerCmd;
+        let cmd = NatsServerCmd::default().with_jetstream();
+        let container = Nats::default()
+            .with_cmd(&cmd)
+            .start()
+            .await
+            .expect("nats jetstream container start");
+        let host = container.get_host().await.expect("nats host");
+        let port = container.get_host_port_ipv4(4222).await.expect("nats port");
+        (container, format!("nats://{host}:{port}"))
+    }
+
+    async fn drain(source: &NatsSource) -> Vec<serde_json::Value> {
+        let ctx = std::collections::HashMap::new();
+        let mut pages = source.stream_pages(&ctx, 4);
+        let mut out = Vec::new();
+        while let Some(page) = pages.next().await {
+            let page = page.expect("page");
+            assert!(
+                page.bookmark.is_some(),
+                "every JetStream page carries a bookmark (MSG-07)"
+            );
+            out.extend(page.records);
+        }
+        out
+    }
+
+    /// MSG-07 / MSG-09: JetStream pages carry a bookmark (so the pipeline
+    /// flushes before the page is acked), and messages held while a page is
+    /// assembled get in-progress acks, so a page that outlives the consumer's
+    /// `ack_wait` is not redelivered into the same run. Without them it is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_jetstream_messages_are_not_redelivered_while_a_page_is_assembled() {
+        use async_nats::jetstream::consumer::pull::Config as PullConfig;
+        let (_container, server) = start_jetstream().await;
+        let client = async_nats::connect(&server).await.expect("connect");
+        let js = async_nats::jetstream::new(client);
+        let stream = js
+            .create_stream(async_nats::jetstream::stream::Config {
+                name: "ORDERS".into(),
+                subjects: vec!["orders.>".into()],
+                ..Default::default()
+            })
+            .await
+            .expect("stream");
+        for name in ["renewed", "unrenewed"] {
+            stream
+                .create_consumer(PullConfig {
+                    durable_name: Some(name.into()),
+                    ack_wait: std::time::Duration::from_secs(3),
+                    ..Default::default()
+                })
+                .await
+                .expect("consumer");
+        }
+        for i in 0..2 {
+            js.publish("orders.new", format!(r#"{{"i":{i}}}"#).into())
+                .await
+                .expect("publish")
+                .await
+                .expect("ack");
+        }
+
+        let config = |consumer: &str, progress: u64| {
+            let mut cfg = NatsSourceConfig::new("orders.>");
+            cfg.connection.servers = vec![server.clone()];
+            cfg.jetstream_stream = Some("ORDERS".into());
+            cfg.jetstream_consumer = Some(consumer.into());
+            cfg.idle_timeout_secs = Some(8);
+            cfg.batch_size = 4;
+            cfg.progress_interval_secs = progress;
+            cfg
+        };
+
+        let renewed = NatsSource::new(config("renewed", 1)).await.unwrap();
+        assert_eq!(
+            drain(&renewed).await.len(),
+            2,
+            "no redelivery while renewed"
+        );
+        let again = NatsSource::new(config("renewed", 1)).await.unwrap();
+        assert!(drain(&again).await.is_empty(), "the page was acked");
+
+        let unrenewed = NatsSource::new(config("unrenewed", 0)).await.unwrap();
+        assert!(
+            drain(&unrenewed).await.len() > 2,
+            "without in-progress acks the held messages come back (proves the test can fail)"
+        );
+    }
 }
