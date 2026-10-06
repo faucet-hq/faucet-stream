@@ -48,6 +48,7 @@ use futures_core::Stream;
 use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::Instrument as _;
 
 /// Default page size used when a caller does not specify one.
 ///
@@ -1689,7 +1690,11 @@ where
                             connector = %sink_name,
                             dlq_connector = %dlq_sink_name,
                         );
-                        let _enter = span.enter();
+                        // Instrument the branch future rather than holding an
+                        // `Entered` guard across its awaits: a guard left on a
+                        // worker's span stack after the task migrates leaks this
+                        // span into whatever runs there next.
+                        async {
 
                         // Reslice the page into sub-batches driven by the
                         // adaptive controller (or write the whole page in one
@@ -2102,6 +2107,10 @@ where
                         if let Some(e) = drift_abort {
                             return Err(e);
                         }
+                        Ok::<(), FaucetError>(())
+                        }
+                        .instrument(span)
+                        .await?;
                     } else if exactly_once {
                         // ── Exactly-once path ──────────────────────────────────
                         // A token is issued only for bookmark-carrying pages, so
@@ -8003,6 +8012,116 @@ mod cleanup_tests {
                 .any(|e| e.starts_with("write:")),
             "Value path must run: {events:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dlq_span_tests {
+    use super::*;
+    use crate::dlq::DlqConfig;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    thread_local! {
+        static ENTERED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[derive(Default)]
+    struct StackSubscriber {
+        next: AtomicU64,
+        names: Mutex<std::collections::HashMap<u64, &'static str>>,
+    }
+
+    impl StackSubscriber {
+        fn entered_names(&self) -> Vec<&'static str> {
+            let names = self.names.lock().unwrap();
+            ENTERED.with(|s| s.borrow().iter().filter_map(|id| names.get(id).copied()).collect())
+        }
+    }
+
+    impl Subscriber for StackSubscriber {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            self.names
+                .lock()
+                .unwrap()
+                .insert(id, attrs.metadata().name());
+            Id::from_u64(id)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, _: &Event<'_>) {}
+        fn enter(&self, id: &Id) {
+            ENTERED.with(|s| s.borrow_mut().push(id.into_u64()));
+        }
+        fn exit(&self, id: &Id) {
+            ENTERED.with(|s| {
+                let mut s = s.borrow_mut();
+                if let Some(pos) = s.iter().rposition(|x| *x == id.into_u64()) {
+                    s.remove(pos);
+                }
+            });
+        }
+    }
+
+    struct OneRow;
+
+    #[async_trait]
+    impl Source for OneRow {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![json!({"id": 1})])
+        }
+    }
+
+    struct GatedSink(Arc<tokio::sync::Notify>);
+
+    #[async_trait]
+    impl Sink for GatedSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.0.notified().await;
+            Ok(records.len())
+        }
+    }
+
+    struct NullSink;
+
+    #[async_trait]
+    impl Sink for NullSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_suspended_dlq_write_leaves_no_span_entered_on_the_polling_thread() {
+        let subscriber = Arc::new(StackSubscriber::default());
+        let _default = tracing::subscriber::set_default(subscriber.clone());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let sink = GatedSink(gate.clone());
+        let dlq_sink: Arc<dyn Sink> = Arc::new(NullSink);
+        let source = OneRow;
+        let pipeline = Pipeline::new(&source, &sink).with_dlq(DlqConfig::new(dlq_sink));
+        let mut run = Box::pin(pipeline.run());
+        assert!(futures::poll!(&mut run).is_pending());
+        assert!(
+            !subscriber.entered_names().contains(&"faucet.dlq.route"),
+            "the DLQ span stayed entered after the run yielded: {:?}",
+            subscriber.entered_names()
+        );
+        gate.notify_one();
+        let result = run.await.unwrap();
+        assert_eq!(result.records_written, 1);
+        assert!(subscriber.entered_names().is_empty());
     }
 }
 

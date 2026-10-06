@@ -643,4 +643,30 @@ mod tests {
         // No buffer is created for events that never had a serve_run_id span.
         assert!(hub.reader("nonexistent").is_none());
     }
+
+    #[test]
+    fn a_root_run_span_created_inside_another_runs_span_keeps_its_own_log() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let hub = LogHub::new();
+        let subscriber = tracing_subscriber::registry().with(RunLogLayer::new(hub.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let x = tracing::info_span!("faucet.serve.run", serve_run_id = "run-x");
+            let _x = x.enter();
+            let stale = tracing::info_span!("faucet.dlq.route");
+            let _stale = stale.enter();
+            let y = tracing::info_span!(parent: None, "faucet.serve.run", serve_run_id = "run-y");
+            let _y = y.enter();
+            tracing::info!("from run y");
+        });
+        let (y_lines, _rx, _ended) = hub.reader("run-y").expect("run-y has a buffer");
+        assert!(y_lines.iter().any(|l| l.line.contains("from run y")));
+        let x_lines = hub
+            .reader("run-x")
+            .map(|(lines, _, _)| lines)
+            .unwrap_or_default();
+        assert!(
+            x_lines.iter().all(|l| !l.line.contains("from run y")),
+            "run y's line leaked into run x's log"
+        );
+    }
 }
