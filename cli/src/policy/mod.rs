@@ -173,7 +173,11 @@ pub fn evaluate_node(
     input_schema: Option<&Value>,
 ) -> RowPolicyReport {
     let (inputs, column_source) = input_columns(node, input_schema);
-    let (columns, known, opaque) = labelled_columns(policy, node, &inputs);
+    let (columns, known, opaque) = if column_source == ColumnSource::Contract {
+        labelled_outputs(policy, node, &inputs)
+    } else {
+        labelled_columns(policy, node, &inputs)
+    };
     let facts = SinkFacts {
         id: node.sink_ref.clone(),
         kind: node.sink.kind.clone(),
@@ -193,8 +197,9 @@ pub fn evaluate_node(
     }
 }
 
-/// The row's input columns: the supplied schema's properties, else the
-/// contract's fields, else nothing.
+/// The row's known columns: the supplied schema's properties (the row's
+/// input), else the contract's fields (its **output** — a contract is enforced
+/// after the transforms), else nothing.
 fn input_columns(node: &ExpandedNode, schema: Option<&Value>) -> (Vec<String>, ColumnSource) {
     if let Some(props) = schema
         .and_then(|s| s.get("properties"))
@@ -226,6 +231,197 @@ fn labelled_columns(
     label_columns(policy, inputs, Some(&ops), &|column| {
         masked_action(node, column)
     })
+}
+
+/// Label a row's contract fields. They are the transforms' **outputs**, so
+/// each is traced back through the chain to the input it came from, and a
+/// renamed column (`ssn` → `tax_id`) keeps the labels of its input name.
+fn labelled_outputs(
+    policy: &CompiledPolicy,
+    node: &ExpandedNode,
+    outputs: &[String],
+) -> (Vec<ColumnFacts>, usize, bool) {
+    let masking_present = masking_present(node);
+    let ops = crate::lineage_glue::column_ops(&node.transforms, masking_present);
+    label_outputs(policy, outputs, Some(&ops), &|column| {
+        masked_action(node, column)
+    })
+}
+
+/// Where an output column came from, walking `ops` backwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Origin {
+    /// This input column (possibly under another name).
+    Input(String),
+    /// A literal the chain set; no input feeds it.
+    Literal,
+    /// An opaque step hides it.
+    Unknown,
+}
+
+fn origin_of(output: &str, ops: &[faucet_lineage::ColumnOp]) -> Origin {
+    use faucet_lineage::ColumnOp;
+    let mut name = output.to_string();
+    for op in ops.iter().rev() {
+        match op {
+            ColumnOp::Opaque => return Origin::Unknown,
+            ColumnOp::Set(keys) if keys.contains(&name) => return Origin::Literal,
+            ColumnOp::Rename(pairs) => {
+                if let Some((old, _)) = pairs.iter().find(|(_, new)| *new == name) {
+                    name = old.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    Origin::Input(name)
+}
+
+/// The pure step behind [`labelled_outputs`]: `ops` is the chain (`None` =
+/// unknown); an output whose origin is hidden is labelled by its own name and
+/// marked conservative.
+fn label_outputs(
+    policy: &CompiledPolicy,
+    outputs: &[String],
+    ops: Option<&[faucet_lineage::ColumnOp]>,
+    masked: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<ColumnFacts>, usize, bool) {
+    let mut out = Vec::new();
+    let mut opaque = ops.is_none();
+    for output in outputs {
+        let origin = match ops {
+            Some(ops) => origin_of(output, ops),
+            None => Origin::Unknown,
+        };
+        let mut labels = policy.labels_for_name(output);
+        let mut via = "name";
+        let mut conservative = false;
+        match &origin {
+            Origin::Input(input) if input != output => {
+                let inherited = policy.labels_for_name(input);
+                if !inherited.is_empty() {
+                    via = "lineage";
+                }
+                labels.extend(inherited);
+            }
+            Origin::Unknown => {
+                opaque = true;
+                conservative = true;
+                via = "conservative";
+            }
+            Origin::Input(_) | Origin::Literal => {}
+        }
+        if labels.is_empty() {
+            continue;
+        }
+        out.push(ColumnFacts {
+            name: output.clone(),
+            labels,
+            masked: masked(output),
+            conservative,
+            via: Some(via.to_string()),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    (out, outputs.len(), opaque)
+}
+
+/// Label a topology's contract fields. The path from a source to a sink is
+/// not one chain, so an output inherits the labels of every name any transform
+/// node renames into it (transitively) — conservatively — and a graph with
+/// transform nodes is reported opaque.
+fn label_graph_outputs(
+    policy: &CompiledPolicy,
+    outputs: &[String],
+    renames: &[(String, String)],
+    has_transforms: bool,
+    masked: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<ColumnFacts>, usize, bool) {
+    let mut out = Vec::new();
+    for output in outputs {
+        let mut labels = policy.labels_for_name(output);
+        let mut seen = BTreeSet::from([output.clone()]);
+        let mut frontier = vec![output.clone()];
+        let mut inherited = false;
+        while let Some(name) = frontier.pop() {
+            for (old, _) in renames.iter().filter(|(_, new)| *new == name) {
+                if seen.insert(old.clone()) {
+                    let from = policy.labels_for_name(old);
+                    inherited |= !from.is_empty();
+                    labels.extend(from);
+                    frontier.push(old.clone());
+                }
+            }
+        }
+        if labels.is_empty() {
+            continue;
+        }
+        let via = if inherited {
+            "lineage"
+        } else if has_transforms {
+            "conservative"
+        } else {
+            "name"
+        };
+        out.push(ColumnFacts {
+            name: output.clone(),
+            labels,
+            masked: masked(output),
+            conservative: has_transforms,
+            via: Some(via.to_string()),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    (out, outputs.len(), has_transforms)
+}
+
+/// The policy the runtime backstop ([`faucet_core::PolicySink`]) enforces for
+/// `node`. It classifies records by their **output** names, so every column the
+/// row's transforms rename also carries the labels of the name it came from.
+pub fn runtime_spec(spec: &PolicySpec, node: &ExpandedNode) -> PolicySpec {
+    let Ok(compiled) = CompiledPolicy::compile(spec) else {
+        return spec.clone();
+    };
+    let ops = crate::lineage_glue::column_ops(&node.transforms, masking_present(node));
+    let mut out = spec.clone();
+    out.classifications.extend(rename_aliases(&compiled, &ops));
+    out
+}
+
+/// One extra classification per (renamed column, inherited label).
+fn rename_aliases(
+    policy: &CompiledPolicy,
+    ops: &[faucet_lineage::ColumnOp],
+) -> Vec<faucet_core::policy::Classification> {
+    let mut aliases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (k, op) in ops.iter().enumerate() {
+        let faucet_lineage::ColumnOp::Rename(pairs) = op else {
+            continue;
+        };
+        for (old, new) in pairs {
+            let mut labels = policy.labels_for_name(old);
+            if let Origin::Input(input) = origin_of(new, &ops[..=k]) {
+                labels.extend(policy.labels_for_name(&input));
+            }
+            if !labels.is_empty() {
+                aliases.entry(new.clone()).or_default().extend(labels);
+            }
+        }
+    }
+    aliases
+        .into_iter()
+        .flat_map(|(field, labels)| {
+            labels
+                .into_iter()
+                .map(move |label| faucet_core::policy::Classification {
+                    label,
+                    description: None,
+                    fields: vec![field.clone()],
+                    field_pattern: None,
+                    value_detector: None,
+                })
+        })
+        .collect()
 }
 
 /// The pure labelling step: `ops` is the column-lineage chain (`None` when the
@@ -354,6 +550,21 @@ pub fn evaluate_topology(spec: &PolicySpec, cfg: &PipelineConfig) -> CliResult<P
     };
     #[cfg(not(feature = "contract"))]
     let (inputs, column_source): (Vec<String>, ColumnSource) = (Vec::new(), ColumnSource::None);
+    let graph_renames: Vec<(String, String)> = cfg
+        .pipeline
+        .nodes
+        .values()
+        .filter_map(|n| match n {
+            NodeSpec::Transform { transforms, .. } => Some(transforms),
+            _ => None,
+        })
+        .flat_map(|t| crate::lineage_glue::column_ops(t, false))
+        .filter_map(|op| match op {
+            faucet_lineage::ColumnOp::Rename(pairs) => Some(pairs),
+            _ => None,
+        })
+        .flatten()
+        .collect();
     let mut ids: Vec<&String> = cfg.pipeline.nodes.keys().collect();
     ids.sort();
     let mut rows = Vec::new();
@@ -385,13 +596,17 @@ pub fn evaluate_topology(spec: &PolicySpec, cfg: &PipelineConfig) -> CliResult<P
             let _ = &sink_ids;
             None
         };
-        let ops: Vec<faucet_lineage::ColumnOp> = Vec::new();
-        let (columns, known, opaque) = label_columns(
-            &compiled,
-            &inputs,
-            if has_transforms { None } else { Some(&ops) },
-            &masked,
-        );
+        let (columns, known, opaque) = if column_source == ColumnSource::Contract {
+            label_graph_outputs(&compiled, &inputs, &graph_renames, has_transforms, &masked)
+        } else {
+            let ops: Vec<faucet_lineage::ColumnOp> = Vec::new();
+            label_columns(
+                &compiled,
+                &inputs,
+                if has_transforms { None } else { Some(&ops) },
+                &masked,
+            )
+        };
         let facts = SinkFacts {
             id: id.clone(),
             kind: sink_kind.clone(),
@@ -605,14 +820,17 @@ pipeline:
 
     #[test]
     fn labels_follow_renames_and_masking_satisfies() {
+        // A contract describes the transformed output, so it lists the
+        // renamed column.
         let cfg = mk_cfg(
-            "  contract:\n    version: \"1\"\n    fields:\n      - { name: email, type: string }\n  transforms:\n    - type: rename_field\n      config: { fields: { email: contact } }\n",
+            "  contract:\n    version: \"1\"\n    fields:\n      - { name: contact, type: string }\n  transforms:\n    - type: rename_field\n      config: { fields: { email: contact } }\n",
         );
         let nodes = expand(&cfg).unwrap();
         let report = evaluate_nodes(&policy(), &nodes, &HashMap::new()).unwrap();
         let row = &report.rows[0];
         assert_eq!(row.columns[0].name, "contact");
         assert_eq!(row.columns[0].via.as_deref(), Some("lineage"));
+        assert!(row.columns[0].labels.contains("pii"));
         assert_eq!(report.violations, 1);
 
         let masked = mk_cfg(
@@ -809,6 +1027,114 @@ pipeline:
             probes[0].status,
             faucet_core::ProbeStatus::Fail { .. }
         ));
+    }
+
+    #[test]
+    fn a_renamed_pii_column_keeps_its_label_against_a_deny_rule() {
+        let deny: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "fields": ["ssn"]}],
+            "rules": [{"name": "no-pii-in-files", "when": {"label": "pii"}, "deny": true}]
+        }))
+        .unwrap();
+        let cfg = mk_cfg(
+            "  contract:\n    version: \"1\"\n    fields:\n      - { name: id, type: integer }\n      - { name: tax_id, type: string }\n  transforms:\n    - type: rename_field\n      config: { fields: { ssn: tax_id } }\n",
+        );
+        let nodes = expand(&cfg).unwrap();
+        let report = evaluate_nodes(&deny, &nodes, &HashMap::new()).unwrap();
+        assert_eq!(report.violations, 1, "{report:?}");
+        assert_eq!(report.rows[0].violations[0].column, "tax_id");
+        assert!(!report.rows[0].opaque);
+
+        // The runtime backstop classifies records by their output names, so it
+        // gets the alias too.
+        let runtime = CompiledPolicy::compile(&runtime_spec(&deny, &nodes[0])).unwrap();
+        assert!(runtime.labels_for_name("tax_id").contains("pii"));
+        assert!(runtime.labels_for_name("id").is_empty());
+    }
+
+    #[test]
+    fn origins_follow_renames_backwards_and_stop_at_literals_and_opaque_steps() {
+        use faucet_lineage::ColumnOp;
+        let ops = vec![
+            ColumnOp::Rename(vec![("a".into(), "b".into())]),
+            ColumnOp::Identity,
+            ColumnOp::Rename(vec![("b".into(), "c".into())]),
+            ColumnOp::Set(vec!["lit".into()]),
+        ];
+        assert_eq!(origin_of("c", &ops), Origin::Input("a".into()));
+        assert_eq!(origin_of("z", &ops), Origin::Input("z".into()));
+        assert_eq!(origin_of("lit", &ops), Origin::Literal);
+        let opaque = vec![ColumnOp::Opaque, ColumnOp::Identity];
+        assert_eq!(origin_of("c", &opaque), Origin::Unknown);
+
+        let policy = CompiledPolicy::compile(
+            &serde_json::from_value(json!({
+                "classifications": [{"label": "pii", "fields": ["a"]}, {"label": "x", "fields": ["lit"]}],
+                "rules": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        let outputs = vec!["c".to_string(), "lit".to_string(), "plain".to_string()];
+        let (cols, known, opaque) = label_outputs(&policy, &outputs, Some(&ops), &none);
+        assert_eq!((known, opaque), (3, false));
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "c");
+        assert_eq!(cols[0].via.as_deref(), Some("lineage"));
+        assert_eq!(cols[1].via.as_deref(), Some("name"));
+        let (cols, _, opaque) = label_outputs(&policy, &outputs, None, &none);
+        assert!(opaque);
+        assert_eq!(cols.len(), 1, "an unknown chain keeps only name labels");
+        assert!(cols[0].conservative);
+
+        let aliases = rename_aliases(&policy, &ops);
+        let fields: Vec<&str> = aliases.iter().map(|c| c.fields[0].as_str()).collect();
+        assert_eq!(
+            fields,
+            ["b", "c"],
+            "every renamed name inherits `a`'s label"
+        );
+    }
+
+    #[test]
+    fn a_topology_renamed_column_inherits_labels_conservatively() {
+        let deny: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "fields": ["ssn"]}],
+            "rules": [{"name": "no-pii", "when": {"label": "pii"}, "deny": true}]
+        }))
+        .unwrap();
+        let cfg = PipelineConfig::from_text(
+            r#"version: 1
+name: p
+pipeline:
+  contract:
+    version: "1"
+    fields:
+      - { name: tax_id, type: string }
+  sources:
+    a: { type: csv, config: { path: /tmp/a.csv } }
+  sinks:
+    o: { type: jsonl, config: { path: /tmp/o.jsonl } }
+  nodes:
+    s: { kind: source, ref: a }
+    t: { kind: transform, transforms: [{ type: rename_field, config: { fields: { ssn: mid } } }] }
+    u: { kind: transform, transforms: [{ type: rename_field, config: { fields: { mid: tax_id } } }] }
+    w: { kind: sink, ref: o }
+  edges:
+    - { from: s, to: t }
+    - { from: t, to: u }
+    - { from: u, to: w }
+"#,
+            Path::new("p.yaml"),
+        )
+        .unwrap();
+        let report = evaluate_topology(&deny, &cfg).unwrap();
+        assert_eq!(report.violations, 1, "{report:?}");
+        let col = &report.rows[0].columns[0];
+        assert_eq!(col.name, "tax_id");
+        assert!(col.conservative);
+        assert_eq!(col.via.as_deref(), Some("lineage"));
     }
 
     #[test]

@@ -143,6 +143,7 @@ fn compliant_attributes_or_masking_satisfy_the_rule() {
 fn labels_follow_a_rename_and_an_opaque_chain_is_conservative() {
     let dir = TempDir::new().unwrap();
     let pol = write(dir.path(), "policy.yaml", POLICY);
+    // The contract describes the transformed output, so it names `contact`.
     let renamed = write(
         dir.path(),
         "renamed.yaml",
@@ -150,7 +151,8 @@ fn labels_follow_a_rename_and_an_opaque_chain_is_conservative() {
             dir.path(),
             "",
             "  transforms:\n    - type: rename_field\n      config: { fields: { email: contact } }\n",
-        ),
+        )
+        .replace("{ name: email, type: string }", "{ name: contact, type: string }"),
     );
     let out = faucet()
         .args(["policy", "--json"])
@@ -288,6 +290,44 @@ pipeline:
         .assert()
         .failure()
         .stderr(contains("Policy `pii-masked` violated"));
+}
+
+#[test]
+fn runtime_backstop_follows_a_rename_of_a_labelled_column() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("in.csv"), "id,ssn\n1,123-45-6789\n").unwrap();
+    let cfg = write(
+        dir.path(),
+        "renamed.yaml",
+        &format!(
+            r#"version: 1
+name: rtrename
+policy:
+  classifications:
+    - {{ label: pii, fields: [ssn] }}
+  rules:
+    - name: no-pii-in-files
+      when: {{ label: pii }}
+      deny: true
+pipeline:
+  source: {{ type: csv, config: {{ path: "{in}" }} }}
+  transforms:
+    - type: rename_field
+      config: {{ fields: {{ ssn: tax_id }} }}
+  sink: {{ type: jsonl, config: {{ path: "{out}" }} }}
+"#,
+            r#in = dir.path().join("in.csv").display(),
+            out = dir.path().join("out.jsonl").display(),
+        ),
+    );
+    faucet()
+        .args(["run"])
+        .arg(&cfg)
+        .assert()
+        .failure()
+        .stderr(contains("Policy `no-pii-in-files` violated"));
+    let written = fs::read_to_string(dir.path().join("out.jsonl")).unwrap_or_default();
+    assert!(!written.contains("123-45-6789"), "{written}");
 }
 
 #[test]

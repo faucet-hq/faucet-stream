@@ -2538,8 +2538,9 @@ async fn run_one_invocation(
                     node.id
                 )));
             }
-            let compiled = faucet_core::CompiledPolicy::compile(spec)
-                .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+            let compiled =
+                faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
+                    .map_err(|e| CliError::Config(format!("policy: {e}")))?;
             let policy_sink = faucet_core::PolicySink::new(
                 sink,
                 Arc::new(compiled),
