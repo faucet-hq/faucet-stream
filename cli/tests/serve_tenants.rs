@@ -973,6 +973,86 @@ async fn a_schedule_trigger_fans_a_template_out_to_every_tenant() {
     }
 }
 
+/// SERVE-10: one tenant whose fire fails deterministically (a missing label
+/// its `${tenant.labels.*}` routing needs) must not stop the schedule for the
+/// other tenants — the schedule advances tick after tick.
+#[cfg(all(feature = "triggers", feature = "schedule"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_tenant_does_not_stop_a_scheduled_fan_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}]})))
+        .mount(&data)
+        .await;
+    let out = dir.path().join("out");
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&out).unwrap();
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(
+        &triggers,
+        "version: 1\ntriggers:\n  - name: every-second\n    type: schedule\n    cron: \"* * * * * *\"\n    template: { id: tenant-sync }\n    tenants: all\n",
+    )
+    .unwrap();
+    let api = spawn_with(dir.path(), None, "http://127.0.0.1:9", Some(triggers)).await;
+    for (t, labels) in [
+        ("acme", json!({"region": "eu"})),
+        ("broken", json!({})),
+        ("globex", json!({"region": "us"})),
+    ] {
+        let (code, _) = api
+            .post(
+                "admin-tok",
+                "/v1/tenants",
+                json!({"id": t, "labels": labels}),
+            )
+            .await;
+        assert_eq!(code, 201);
+        let (code, _) = api
+            .post(
+                "op-tok",
+                &format!("/v1/tenants/{t}/connections"),
+                json!({"name": "api", "provider": {"type": "static", "config": {"token": "t"}}}),
+            )
+            .await;
+        assert_eq!(code, 201);
+    }
+    let body = template(&data.uri(), &out, &state_dir).replace(
+        "out-${tenant.id}.jsonl",
+        "out-${tenant.id}-${tenant.labels.region}.jsonl",
+    );
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": body, "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    for t in ["acme", "globex"] {
+        let mut ticks = std::collections::BTreeSet::new();
+        for _ in 0..400 {
+            let (_, page) = api.get("admin-tok", &format!("/v1/runs?tenant={t}")).await;
+            for r in page["runs"].as_array().unwrap() {
+                if r["labels"]["faucet.trigger.name"] == "every-second" {
+                    ticks.insert(r["labels"]["faucet.trigger.tick"].to_string());
+                }
+            }
+            if ticks.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            ticks.len() >= 2,
+            "the schedule stalled for {t} behind the failing tenant: {ticks:?}"
+        );
+    }
+    let (_, page) = api.get("admin-tok", "/v1/runs?tenant=broken").await;
+    assert!(page["runs"].as_array().unwrap().is_empty());
+}
+
 /// `max_concurrent_runs` refuses a submission over the limit with 429.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tenant_over_its_concurrency_limit_is_refused_with_429() {

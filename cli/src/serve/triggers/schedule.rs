@@ -87,7 +87,7 @@ impl Watcher for ScheduleWatcher {
             FireOutcome::Dropped(reason) => {
                 Err(format!("tick {tick} dropped ({reason}); retrying"))
             }
-            FireOutcome::Error(e) => Err(format!("tick {tick}: {e}")),
+            FireOutcome::Error(e) | FireOutcome::Failed(e) => Err(format!("tick {tick}: {e}")),
             FireOutcome::Enqueued(_) | FireOutcome::Coalesced => unreachable!("committed above"),
         }
     }

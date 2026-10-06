@@ -24,6 +24,10 @@ pub fn describe() {
         "faucet_serve_trigger_errors_total",
         "Watcher poll/serve/fire errors"
     );
+    describe_counter!(
+        "faucet_serve_trigger_tenant_failures_total",
+        "Tenant fan-out fires refused for one tenant while the others ran"
+    );
     describe_gauge!(
         "faucet_serve_triggers_active",
         "Number of active triggers (including webhook routes, which spawn no watcher task)"
@@ -75,6 +79,14 @@ pub fn coalesced(trigger: &str) {
 }
 pub fn dropped(trigger: &str, reason: &'static str) {
     counter!("faucet_serve_trigger_runs_dropped_total", "trigger" => trigger.to_string(), "reason" => reason).increment(1);
+}
+pub fn tenant_failed(trigger: &str, tenant: &str) {
+    counter!(
+        "faucet_serve_trigger_tenant_failures_total",
+        "trigger" => trigger.to_string(),
+        "tenant" => tenant.to_string()
+    )
+    .increment(1);
 }
 pub fn error(trigger: &str, kind: &'static str) {
     counter!("faucet_serve_trigger_errors_total", "trigger" => trigger.to_string(), "type" => kind)
