@@ -350,10 +350,12 @@ fn is_secret_kv_key(key: &str) -> bool {
 
 /// Best-effort check that a string looks like a `host[:port]` authority — used
 /// to identify the userinfo→host `@` delimiter when redacting credentials.
-/// Accepts letters, digits, `.`, `-`, `:`, `_`, and bracketed IPv6 forms.
+/// Accepts letters, digits, `.`, `-`, `:`, `_`, bracketed IPv6 forms, and `,`
+/// for a multi-host seed list (`h1:27017,h2:27017`).
 fn is_host_shaped(s: &str) -> bool {
     s.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'_' | b'[' | b']' | b'%')
+        b.is_ascii_alphanumeric()
+            || matches!(b, b'.' | b'-' | b':' | b'_' | b'[' | b']' | b'%' | b',')
     })
 }
 
@@ -808,6 +810,18 @@ mod tests {
         assert_eq!(
             redact_uri_credentials("mongodb://u:p@h/db?x=1"),
             "mongodb://h/db?x=1"
+        );
+    }
+
+    #[test]
+    fn redact_strips_userinfo_before_a_multi_host_seed_list() {
+        assert_eq!(
+            redact_uri_credentials("mongodb://u:pw@h1:27017,h2:27017/?replicaSet=rs0"),
+            "mongodb://h1:27017,h2:27017/?replicaSet=rs0"
+        );
+        assert_eq!(
+            redact_uri_credentials("postgres://app:p@ss,w0rd@db1:5432,db2:5432/app"),
+            "postgres://db1:5432,db2:5432/app"
         );
     }
 
