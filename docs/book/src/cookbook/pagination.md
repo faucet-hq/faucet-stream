@@ -1,8 +1,11 @@
 # Pagination styles (REST source)
 
 The REST source walks multi-page responses automatically. Set `pagination.type`
-to one of the styles below. `max_pages` is a hard cap across all of them, and
-every style has a loop/termination guard so a misbehaving API can't loop forever.
+to one of the styles below. Every style has a loop/termination guard so a
+misbehaving API can't loop forever. `max_pages` is an optional cap across all of
+them (unset by default); a pass the cap cuts short persists no record-derived or
+window bookmark, because that would skip the pages it never read — only a
+`persist_cursor` bookmark, which names the next unread page, is kept.
 
 | Style | Stops when |
 |-------|-----------|

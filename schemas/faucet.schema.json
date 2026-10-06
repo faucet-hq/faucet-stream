@@ -14495,7 +14495,7 @@
                       "default": null
                     },
                     "max_pages": {
-                      "description": "Hard cap on pages fetched per run, across every pagination style — the\nbackstop against a feed that never signals completion. `None` removes\nthe cap.",
+                      "description": "Optional cap on pages fetched per pass, across every pagination style.\nUnset by default: each pagination style already stops on its own end\nsignal and loop guards. When the cap cuts a pass short, only a persisted\ncursor bookmark (`persist_cursor`) is kept — a record-derived or window\nbookmark would skip the unread pages, so none is written.",
                       "type": [
                         "integer",
                         "null",
@@ -14503,7 +14503,7 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 100
+                      "default": null
                     },
                     "request_delay": {
                       "description": "Fixed delay between page requests, in seconds — a politeness knob for\nAPIs that rate-limit by request frequency. Applied *in addition* to any\n`Retry-After` honoured by the retry path.",
@@ -14622,7 +14622,7 @@
                       "default": null
                     },
                     "schema_sample_size": {
-                      "description": "Maximum number of records to sample when inferring the schema via\n[`crate::stream::RestStream::infer_schema`].  `0` means sample all\navailable records (up to `max_pages`).  Defaults to `100`.",
+                      "description": "Maximum number of records to sample when inferring the schema via\n[`crate::stream::RestStream::infer_schema`].  `0` means sample all\navailable records (up to `max_pages`, when set).  Defaults to `100`.",
                       "type": [
                         "integer",
                         "string"
