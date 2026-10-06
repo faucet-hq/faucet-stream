@@ -200,6 +200,22 @@ async fn an_empty_batch_uploads_nothing() {
 async fn overwrite_truncates_once_then_appends() {
     let server = MockServer::start().await;
     mount(&server).await;
+    // The target exists with a designed schema; the truncating load must carry
+    // it, or BigQuery replaces it with the Parquet file's own (SQL-35).
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tableReference": {
+                "projectId": PROJECT_ID, "datasetId": DATASET_ID, "tableId": TABLE_ID
+            },
+            "schema": { "fields": [
+                { "name": "id", "type": "STRING", "mode": "REQUIRED", "description": "the key" }
+            ] }
+        })))
+        .mount(&server)
+        .await;
     let mut cfg = config(&server);
     cfg.write.write_mode = faucet_core::WriteMode::Overwrite;
     let sink = build_sink(&server, cfg).await;
@@ -224,6 +240,11 @@ async fn overwrite_truncates_once_then_appends() {
         dispositions,
         vec!["TRUNCATE", "APPEND", "APPEND"],
         "only the first batch of an overwrite run may truncate"
+    );
+    let first = String::from_utf8_lossy(&upload_bodies(&server).await[0]).to_string();
+    assert!(
+        first.contains("\"mode\":\"REQUIRED\"") && first.contains("the key"),
+        "the truncating load keeps the table's schema: {first}"
     );
 }
 

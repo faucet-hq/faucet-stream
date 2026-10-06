@@ -800,6 +800,27 @@ async fn direct_overwrite_streams_one_load_across_pages() {
         body.contains("\"id\":1") && body.contains("\"id\":2"),
         "both pages in one atomic load, got: {body}"
     );
+
+    // SQL-35: the truncating load carries the existing table's own schema
+    // (INTEGER / REQUIRED), not one inferred from the first page, and does not
+    // drop unknown fields.
+    let initiate = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| {
+            r.method.as_str() == "POST"
+                && r.url.path().contains("/upload/bigquery")
+                && r.url.query().is_some_and(|q| q.contains("resumable"))
+        })
+        .expect("session initiate");
+    let job = String::from_utf8_lossy(&initiate.body).to_string();
+    assert!(
+        job.contains("\"mode\":\"REQUIRED\"") && job.contains("\"type\":\"INTEGER\""),
+        "{job}"
+    );
+    assert!(job.contains("\"ignoreUnknownValues\":false"), "{job}");
 }
 
 /// A direct overwrite flushed mid-stream must not truncate the target a second

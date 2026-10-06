@@ -173,11 +173,75 @@ async fn load_native_ndjson_streams_session_with_explicit_string_schema() {
     assert!(body.contains("\"name\":\"Amount\",\"type\":\"STRING\""));
 }
 
+/// `tables.get` on the target: `Some(fields)` → the table exists with that
+/// schema; `None` → 404, the table does not exist yet.
+async fn mount_target(server: &MockServer, fields: Option<serde_json::Value>) {
+    let response = match fields {
+        Some(fields) => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tableReference": {
+                "projectId": PROJECT_ID, "datasetId": DATASET_ID, "tableId": TABLE_ID
+            },
+            "schema": { "fields": fields }
+        })),
+        None => ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": {"code": 404, "message": "Not found: Table",
+                      "errors": [{"reason": "notFound", "message": "Not found: Table"}]}
+        })),
+    };
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}"
+        )))
+        .respond_with(response)
+        .mount(server)
+        .await;
+}
+
+/// SQL-35: an overwrite into an existing table loads with that table's own
+/// schema, so the refresh keeps its types, modes and descriptions; unknown
+/// fields fail the load instead of being dropped.
+#[tokio::test]
+async fn load_native_overwrite_keeps_an_existing_tables_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_resumable(&server, "/session/native-keep", "job-native-keep").await;
+    mount_target(
+        &server,
+        Some(serde_json::json!([
+            {"name": "Id", "type": "INTEGER", "mode": "REQUIRED", "description": "key"}
+        ])),
+    )
+    .await;
+    let mut config = native_config(&server);
+    config.write.write_mode = WriteMode::Overwrite;
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.load_native(
+        NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec())
+            .with_records(Some(1)),
+        "p::row",
+        NativeLoadContext {
+            write_mode: WriteMode::Overwrite,
+            first_batch: true,
+        },
+    )
+    .await
+    .expect("feed");
+    sink.flush().await.expect("flush");
+    let body = upload_bodies(&server).await.join("\n");
+    assert!(body.contains("\"WRITE_TRUNCATE\""), "{body}");
+    assert!(
+        body.contains("\"type\":\"INTEGER\"") && body.contains("\"description\":\"key\""),
+        "the table's own schema, not an all-STRING one: {body}"
+    );
+    assert!(body.contains("\"ignoreUnknownValues\":false"), "{body}");
+}
+
 #[tokio::test]
 async fn load_native_overwrite_first_batch_truncates_once_per_object() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
     mount_resumable(&server, "/session/native-2", "job-native-2").await;
+    mount_target(&server, None).await;
     let mut config = native_config(&server);
     config.write.write_mode = WriteMode::Overwrite;
     let (sink, _sa) = build_sink(&server, config).await;
@@ -212,6 +276,11 @@ async fn load_native_overwrite_first_batch_truncates_once_per_object() {
     // Exactly one initiate (one session/load job for the object), truncating.
     assert_eq!(bodies.len(), 1, "one load job per object: {bodies:?}");
     assert!(bodies[0].contains("\"WRITE_TRUNCATE\""), "{}", bodies[0]);
+    assert!(
+        bodies[0].contains("\"name\":\"Id\",\"type\":\"STRING\""),
+        "a missing table falls back to the inferred schema: {}",
+        bodies[0]
+    );
 }
 
 #[tokio::test]

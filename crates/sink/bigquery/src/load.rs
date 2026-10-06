@@ -135,6 +135,7 @@ pub async fn write_columnar_media(
     token: &str,
     table_id: &str,
     write_disposition: &str,
+    schema: Option<serde_json::Value>,
     batch: &RecordBatch,
 ) -> Result<usize, FaucetError> {
     if batch.num_rows() == 0 {
@@ -146,7 +147,7 @@ pub async fn write_columnar_media(
         .await
         .map_err(|e| FaucetError::Sink(format!("parquet encode task panicked: {e}")))??;
 
-    let job_json = serde_json::json!({
+    let mut job_json = serde_json::json!({
         "configuration": {
             "load": {
                 "sourceFormat": "PARQUET",
@@ -159,8 +160,12 @@ pub async fn write_columnar_media(
                 },
             }
         }
-    })
-    .to_string();
+    });
+    if let Some(schema) = schema {
+        // A truncating load keeps the existing table's schema (SQL-35).
+        job_json["configuration"]["load"]["schema"] = schema;
+    }
+    let job_json = job_json.to_string();
 
     // Reuse the sink's multipart framing rather than hand-rolling a second
     // copy — the same "one escaper, one convention" rule #654 M14 was about.

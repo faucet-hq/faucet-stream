@@ -497,6 +497,12 @@ is atomic on its own — the target keeps its prior rows until the load succeeds
 A *grouped* fan-out (several matrix rows writing one physical table) and a
 scoped overwrite still stage, since neither can be expressed as one truncate.
 
+A truncating load replaces the table's schema with the load's, so the load runs
+with the **existing table's own schema** (types, modes, descriptions, policy
+tags) unless the config sets `schema:`; only a missing table is typed from the
+first page. Fields the schema does not have fail the load rather than being
+dropped (`ignoreUnknownValues` is off for a truncating load).
+
 With `media_load: false` the page is loaded into a `LIKE` temp table via the
 query API, then swapped with a
 `BEGIN TRANSACTION; TRUNCATE; INSERT … SELECT; COMMIT` that preserves the

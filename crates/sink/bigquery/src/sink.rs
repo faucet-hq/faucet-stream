@@ -259,7 +259,9 @@ fn build_load_job_json_full(
         },
         "sourceFormat": source_format,
         "writeDisposition": write_disposition,
-        "ignoreUnknownValues": true,
+        // A truncating load must not silently drop fields the schema lacks
+        // (SQL-35): they would be gone from the refreshed table.
+        "ignoreUnknownValues": write_disposition != "WRITE_TRUNCATE",
     });
     match schema {
         // Explicit schema wins; autodetect must be off or BigQuery ignores the schema.
@@ -282,6 +284,18 @@ fn build_load_job_json_full(
         });
     }
     job
+}
+
+/// A table's own schema as a load-job `schema`, or `None` when it has no fields.
+fn existing_load_schema(
+    schema: &gcp_bigquery_client::model::table_schema::TableSchema,
+) -> Result<Option<Value>, FaucetError> {
+    if schema.fields.as_ref().is_none_or(Vec::is_empty) {
+        return Ok(None);
+    }
+    serde_json::to_value(schema)
+        .map(Some)
+        .map_err(|e| FaucetError::Sink(format!("BigQuery: serialize table schema: {e}")))
 }
 
 /// Build an all-`STRING` BigQuery load schema (`{fields:[{name,type:STRING,mode:NULLABLE}]}`)
@@ -794,6 +808,37 @@ impl BigQuerySink {
             .unwrap_or_default())
     }
 
+    /// The schema a `WRITE_TRUNCATE` load into `table_id` runs with when the
+    /// config names none. A truncating load replaces the table's schema with the
+    /// load's, so an existing table is loaded with its **own** schema — types,
+    /// modes, descriptions and policy tags survive the refresh (SQL-35). Only a
+    /// missing or schemaless table falls back to `infer` (the first page).
+    async fn truncate_schema(
+        &self,
+        table_id: &str,
+        infer: impl FnOnce() -> Option<Value>,
+    ) -> Result<Option<Value>, FaucetError> {
+        let existing = retry_control_plane("tables.get (truncate schema)", || {
+            self.client.table().get(
+                &self.config.project_id,
+                &self.config.dataset_id,
+                table_id,
+                None,
+            )
+        })
+        .await;
+        match existing {
+            Ok(table) => match existing_load_schema(&table.schema)? {
+                Some(schema) => Ok(Some(schema)),
+                None => Ok(infer()),
+            },
+            Err(e) if is_table_not_found(&e) => Ok(infer()),
+            Err(e) => Err(FaucetError::Sink(format!(
+                "BigQuery tables.get (truncate schema) failed: {e}"
+            ))),
+        }
+    }
+
     /// Fetch (once) and cache the target table's schema as
     /// [`idempotent::FieldSpec`]s, returning an owned clone. Used by the
     /// exactly-once / upsert write paths, which require a table with a defined
@@ -1247,22 +1292,21 @@ impl BigQuerySink {
         };
         let write_disposition = session_disposition(write_disposition, reopening);
         if need_open {
-            let schema = self
+            let schema = match self
                 .config
                 .schema
                 .as_ref()
                 .and_then(json_schema_to_load_schema)
-                .or_else(|| {
-                    // WRITE_TRUNCATE with autodetect keeps an *existing* table's
-                    // schema (BigQuery ignores autodetect on an existing target),
-                    // so a renamed/changed column would leave the old schema in
-                    // place. An explicit schema forces the replace overwrite means.
-                    (write_disposition == "WRITE_TRUNCATE")
-                        .then(|| {
-                            json_schema_to_load_schema(&faucet_core::schema::infer_schema(records))
-                        })
-                        .flatten()
-                });
+            {
+                Some(explicit) => Some(explicit),
+                None if write_disposition == "WRITE_TRUNCATE" => {
+                    self.truncate_schema(table_id, || {
+                        json_schema_to_load_schema(&faucet_core::schema::infer_schema(records))
+                    })
+                    .await?
+                }
+                None => None,
+            };
             let sess = self
                 .initiate_session(table_id, write_disposition, schema)
                 .await?;
@@ -2163,11 +2207,17 @@ impl faucet_core::Sink for BigQuerySink {
                     }
                     // The explicit all-STRING schema (from the first chunk) opens the
                     // session; later chunks pass `None` (session already open).
-                    let schema = if first {
+                    let schema = if !first {
+                        None
+                    } else if write_disposition == "WRITE_TRUNCATE" {
+                        self.truncate_schema(&table, || {
+                            native_batch_columns(&chunk, faucet_core::NativeFormat::NdJson, b',')
+                                .and_then(all_string_schema)
+                        })
+                        .await?
+                    } else {
                         native_batch_columns(&chunk, faucet_core::NativeFormat::NdJson, b',')
                             .and_then(all_string_schema)
-                    } else {
-                        None
                     };
                     rows += chunk.iter().filter(|&&b| b == b'\n').count();
                     self.feed_session_bytes(&table, write_disposition, schema, &chunk)
@@ -2186,8 +2236,15 @@ impl faucet_core::Sink for BigQuerySink {
                     .records
                     .map(|r| r as usize)
                     .unwrap_or_else(|| raw.iter().filter(|&&b| b == b'\n').count());
-                let schema = native_batch_columns(&raw, faucet_core::NativeFormat::NdJson, b',')
-                    .and_then(all_string_schema);
+                let inferred = || {
+                    native_batch_columns(&raw, faucet_core::NativeFormat::NdJson, b',')
+                        .and_then(all_string_schema)
+                };
+                let schema = if write_disposition == "WRITE_TRUNCATE" {
+                    self.truncate_schema(&table, inferred).await?
+                } else {
+                    inferred()
+                };
                 self.feed_session_bytes(&table, write_disposition, schema, &raw)
                     .await?;
                 Ok(rows)
@@ -2200,9 +2257,15 @@ impl faucet_core::Sink for BigQuerySink {
                 }
                 let rows = batch.records.unwrap_or(0) as usize;
                 let skip_rows = if csv.has_header { Some(1) } else { None };
-                let schema =
+                let inferred = || {
                     native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter)
-                        .and_then(all_string_schema);
+                        .and_then(all_string_schema)
+                };
+                let schema = if write_disposition == "WRITE_TRUNCATE" {
+                    self.truncate_schema(&table, inferred).await?
+                } else {
+                    inferred()
+                };
                 let autodetect_fallback = schema.is_none();
                 let media = gzip(&raw)?;
                 let job_json = build_load_job_json_full(
@@ -2631,6 +2694,11 @@ impl faucet_core::Sink for BigQuerySink {
         }
         let token = self.access_token().await?;
         self.roundtrips.record("load");
+        let schema = if disposition == "WRITE_TRUNCATE" {
+            self.truncate_schema(&self.config.table_id, || None).await?
+        } else {
+            None
+        };
         crate::load::write_columnar_media(
             &self.client,
             &self.config,
@@ -2638,6 +2706,7 @@ impl faucet_core::Sink for BigQuerySink {
             &token,
             &self.config.table_id,
             disposition,
+            schema,
             batch,
         )
         .await
@@ -2649,9 +2718,9 @@ mod tests {
     use super::{
         BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema, appends_via_media_load,
         build_load_job_json, build_load_job_json_fmt, build_load_job_json_full,
-        build_multipart_related, deletes_to_payload, dml_affected_rows, gzip, is_direct_overwrite,
-        json_schema_to_load_schema, media_boundary, multipart_boundary, native_batch_columns,
-        records_to_ndjson, scope_to_payload,
+        build_multipart_related, deletes_to_payload, dml_affected_rows, existing_load_schema, gzip,
+        is_direct_overwrite, json_schema_to_load_schema, media_boundary, multipart_boundary,
+        native_batch_columns, records_to_ndjson, scope_to_payload,
     };
     use faucet_core::{FaucetError, KeyTuple};
     use serde_json::json;
@@ -2822,7 +2891,31 @@ mod tests {
         assert_eq!(load["writeDisposition"], "WRITE_TRUNCATE");
         assert_eq!(load["skipLeadingRows"], 1);
         assert_eq!(load["autodetect"], true);
-        assert_eq!(load["ignoreUnknownValues"], true);
+        assert_eq!(
+            load["ignoreUnknownValues"], false,
+            "a truncating load must not drop unknown fields (SQL-35)"
+        );
+        let append =
+            build_load_job_json_fmt("p", "d", "t", "WRITE_APPEND", None, "CSV", None, true);
+        assert_eq!(append["configuration"]["load"]["ignoreUnknownValues"], true);
+    }
+
+    #[test]
+    fn an_existing_table_schema_becomes_the_load_schema() {
+        let empty = gcp_bigquery_client::model::table_schema::TableSchema::new(vec![]);
+        assert_eq!(existing_load_schema(&empty).unwrap(), None);
+        let none = gcp_bigquery_client::model::table_schema::TableSchema { fields: None };
+        assert_eq!(existing_load_schema(&none).unwrap(), None);
+        let mut amount =
+            gcp_bigquery_client::model::table_field_schema::TableFieldSchema::numeric("amount");
+        amount.description = Some("money".into());
+        amount.mode = Some("REQUIRED".into());
+        let schema = gcp_bigquery_client::model::table_schema::TableSchema::new(vec![amount]);
+        let load = existing_load_schema(&schema).unwrap().unwrap();
+        assert_eq!(load["fields"][0]["name"], "amount");
+        assert_eq!(load["fields"][0]["type"], "NUMERIC");
+        assert_eq!(load["fields"][0]["mode"], "REQUIRED");
+        assert_eq!(load["fields"][0]["description"], "money");
     }
 
     #[test]
