@@ -194,6 +194,59 @@ async fn incremental_resumes_without_duplicates() {
     assert_eq!(bookmark2, Some(Value::from("2024-04-01")));
 }
 
+/// SQL-40: a legacy `DATETIME` cursor renders as milliseconds, so the bookmark
+/// converts back to `DATETIME` and the second run succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_datetime_cursor_resumes_on_the_next_run() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+
+    exec(
+        &pool,
+        "CREATE TABLE dbo.legacy (id INT, updated_at DATETIME)",
+    )
+    .await;
+    exec(
+        &pool,
+        "INSERT INTO dbo.legacy VALUES (1, '2024-03-01T12:30:45.003'), \
+         (2, '2024-03-01T12:30:45.007')",
+    )
+    .await;
+    let mut scfg = MssqlSourceConfig::new(
+        cfg.connection_url.clone().unwrap(),
+        "SELECT id, updated_at FROM dbo.legacy WHERE updated_at > @bookmark ORDER BY updated_at",
+    );
+    scfg.connection.tls = cfg.tls.clone();
+    scfg.replication = MssqlReplication::Incremental {
+        column: "updated_at".into(),
+        initial_value: Value::from("2000-01-01T00:00:00.000"),
+    };
+    let source = MssqlSource::new(scfg).await.expect("source");
+
+    let (rows, bookmark) = source.fetch_all_incremental().await.expect("run 1");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0]["updated_at"],
+        Value::from("2024-03-01T12:30:45.003")
+    );
+    assert_eq!(bookmark, Some(Value::from("2024-03-01T12:30:45.007")));
+
+    source
+        .apply_start_bookmark(bookmark.unwrap())
+        .await
+        .unwrap();
+    exec(
+        &pool,
+        "INSERT INTO dbo.legacy VALUES (3, '2024-03-01T12:30:46.000')",
+    )
+    .await;
+    let (rows2, _) = source.fetch_all_incremental().await.expect("run 2");
+    let ids: Vec<i64> = rows2.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![3]);
+}
+
 // ── PK-range sharding (Mode B, #262) ────────────────────────────────────────
 
 /// The core Mode B correctness guarantee: enumerating a source into N shards and

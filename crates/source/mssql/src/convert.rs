@@ -75,7 +75,11 @@ fn decode_temporal(row: &Row, idx: usize, data: &ColumnData<'_>) -> Result<Value
             .try_get::<NaiveTime, _>(idx)
             .map_err(conv)?
             .map(|t| json!(t.to_string())),
-        ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => row
+        ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) => row
+            .try_get::<NaiveDateTime, _>(idx)
+            .map_err(conv)?
+            .map(|dt| json!(format_legacy_datetime(dt))),
+        ColumnData::DateTime2(_) => row
             .try_get::<NaiveDateTime, _>(idx)
             .map_err(conv)?
             .map(|dt| json!(dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string())),
@@ -86,6 +90,19 @@ fn decode_temporal(row: &Row, idx: usize, data: &ColumnData<'_>) -> Result<Value
         _ => unreachable!("decode_temporal called on a non-temporal column"),
     };
     Ok(value.unwrap_or(Value::Null))
+}
+
+/// Render a `DATETIME` / `SMALLDATETIME` value with millisecond precision, as
+/// SQL Server itself displays it.
+///
+/// `DATETIME` stores 1/300-second ticks, which decode to nine-digit fractions
+/// such as `.003333333`; SQL Server refuses to convert that string back to
+/// `DATETIME`, so a bookmark rendered with `%.f` failed every run after the
+/// first (SQL-40). The fraction is rounded to the nearest millisecond — never
+/// past `.997`, the last tick of a second.
+pub(crate) fn format_legacy_datetime(dt: NaiveDateTime) -> String {
+    let ms = ((dt.and_utc().timestamp_subsec_nanos() + 500_000) / 1_000_000).min(999);
+    format!("{}.{ms:03}", dt.format("%Y-%m-%dT%H:%M:%S"))
 }
 
 /// Format an MSSQL DECIMAL/NUMERIC value as a precision-preserving string
@@ -118,6 +135,33 @@ pub(crate) fn numeric_to_string(n: Numeric) -> String {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    #[test]
+    fn legacy_datetime_renders_milliseconds_sql_server_can_parse() {
+        let at = |nanos: u32| {
+            NaiveDate::from_ymd_opt(2024, 3, 1)
+                .unwrap()
+                .and_hms_nano_opt(12, 30, 45, nanos)
+                .unwrap()
+        };
+        assert_eq!(
+            format_legacy_datetime(at(3_333_333)),
+            "2024-03-01T12:30:45.003"
+        );
+        assert_eq!(
+            format_legacy_datetime(at(6_666_667)),
+            "2024-03-01T12:30:45.007"
+        );
+        assert_eq!(
+            format_legacy_datetime(at(996_666_667)),
+            "2024-03-01T12:30:45.997"
+        );
+        assert_eq!(format_legacy_datetime(at(0)), "2024-03-01T12:30:45.000");
+        assert_eq!(
+            format_legacy_datetime(at(999_999_999)),
+            "2024-03-01T12:30:45.999"
+        );
+    }
 
     #[test]
     fn numeric_formats_with_scale() {

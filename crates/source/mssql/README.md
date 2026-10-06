@@ -248,7 +248,8 @@ Discovery reads catalog metadata only — it never scans table data.
 | CHAR / VARCHAR / NCHAR / NVARCHAR / TEXT / NTEXT / XML | string |
 | DATE | `YYYY-MM-DD` |
 | TIME | ISO time |
-| DATETIME / DATETIME2 / SMALLDATETIME | ISO 8601 (no offset) |
+| DATETIME / SMALLDATETIME | ISO 8601, milliseconds (`2024-03-01T12:30:45.007`, as SQL Server displays it), so the value round-trips as a `@bookmark` |
+| DATETIME2 | ISO 8601 (no offset), full fractional precision |
 | DATETIMEOFFSET | RFC 3339 (offset preserved) |
 | UNIQUEIDENTIFIER | hyphenated string |
 | BINARY / VARBINARY / IMAGE | base64 string |
