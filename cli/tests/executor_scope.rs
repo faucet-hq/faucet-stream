@@ -174,3 +174,31 @@ async fn a_fanout_table_name_must_be_a_plain_identifier() {
         .expect("the child must fail");
     assert!(err.contains("not a plain identifier"), "{err}");
 }
+
+// ── CLI-06 ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_child_that_depends_on_a_sibling_child_still_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts = write(dir.path(), "accounts.csv", "id\n1\n2\n");
+    let out = dir.path().join("out");
+    let yaml = format!(
+        "version: 1\nname: deps\npipeline:\n  source:\n    type: csv\n    config: {{ path: \
+         '{accounts}' }}\n  sink:\n    type: jsonl\n    config: {{ path: '{out}/x.jsonl' }}\n\
+         matrix:\n  - id: accounts\n    sink: {{ config: {{ path: '{out}/accounts.jsonl' }} }}\n  \
+         - id: contacts\n    parent: accounts\n    parent_key: id\n    sink: {{ config: {{ path: \
+         '{out}/contacts-${{accounts.id}}.jsonl' }} }}\n  - id: deals\n    parent: accounts\n    \
+         parent_key: id\n    depends_on: [contacts]\n    sink: {{ config: {{ path: \
+         '{out}/deals-${{accounts.id}}.jsonl' }} }}\n",
+        out = out.to_str().unwrap(),
+    );
+    let summary = run(&yaml, opts("deps")).await.unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    let deals = summary
+        .invocations
+        .iter()
+        .filter(|i| i.row_id == "deals")
+        .count();
+    assert_eq!(deals, 2, "one deals invocation per account");
+    assert_eq!(lines(&out.join("deals-2.jsonl")).len(), 2);
+}

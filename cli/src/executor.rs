@@ -521,6 +521,12 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
 
     let mut outcomes: Vec<InvocationOutcome> = Vec::new();
     let mut skipped_subtrees: HashSet<String> = HashSet::new();
+    // Children each parent still has to schedule; its captured records are
+    // released when this reaches zero (#789 CLI-06).
+    let mut pending_children: HashMap<String, usize> = children_of
+        .iter()
+        .map(|(p, c)| (p.clone(), c.len()))
+        .collect();
 
     // Root cooperative-cancel token: the caller's (serve wires run-cancel /
     // timeout / shutdown) or a fresh one. Each level derives a child token so
@@ -604,25 +610,29 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         // Build the work units for this level. Each unit is one invocation —
         // a root runs once; a child runs once per parent record.
         let mut units: Vec<Unit> = Vec::new();
-        // Move only the captured records of the parents whose children run this
-        // level out of the shared map. This both narrows the snapshot and frees
-        // each parent's buffer the moment its children consume it: all of a
-        // parent's children become ready in the same level, so its records are
-        // needed exactly once. Units hold their own `Arc<Value>` clones, so
-        // removing the map entry here only drops the map's hold (#160).
+        // Snapshot the captured records of the parents whose children run this
+        // level. A parent's children need not all become ready in the same
+        // level — a child that `depends_on` a sibling child runs a level later
+        // (#789 CLI-06) — so a parent's buffer is released only once its last
+        // child has been scheduled. Units hold their own `Arc<Value>` clones,
+        // so releasing the map entry only drops the map's hold (#160).
         let level_records: HashMap<String, Vec<Arc<Value>>> = {
-            let consumed_parents: HashSet<&str> = ready
-                .iter()
-                .filter_map(|id| match &nodes_by_id[id].role {
-                    NodeRole::Child { parent_id, .. } => Some(parent_id.as_str()),
-                    _ => None,
-                })
-                .collect();
             let mut cap = captured.lock().await;
-            consumed_parents
-                .iter()
-                .filter_map(|p| cap.remove(*p).map(|v| (p.to_string(), v)))
-                .collect()
+            let mut snapshot = HashMap::new();
+            for id in &ready {
+                let NodeRole::Child { parent_id, .. } = &nodes_by_id[id].role else {
+                    continue;
+                };
+                if let Some(records) = cap.get(parent_id) {
+                    snapshot.insert(parent_id.clone(), records.clone());
+                }
+                let left = pending_children.entry(parent_id.clone()).or_insert(1);
+                *left = left.saturating_sub(1);
+                if *left == 0 {
+                    cap.remove(parent_id);
+                }
+            }
+            snapshot
         };
         for id in &ready {
             let node = &nodes_by_id[id];
