@@ -137,12 +137,16 @@ impl KafkaSource {
     /// exactly where the consumer is positioned for that reset policy. Those
     /// watermark lookups are a broker round-trip, so each empty partition's
     /// floor is resolved once and cached.
-    async fn resolve_assigned_offsets(&self) -> Vec<PartitionOffset> {
+    ///
+    /// Returns `(positions, floors)`: concrete consumer positions, and the
+    /// watermark floors of partitions without one, which rank below the prior
+    /// bookmark in [`Bookmark::merged_with_floors`].
+    async fn resolve_assigned_offsets(&self) -> (Vec<PartitionOffset>, Vec<PartitionOffset>) {
         let assigned = match self.consumer.assignment() {
             Ok(tpl) => tpl,
             Err(e) => {
                 tracing::warn!(error = %e, "kafka source: assignment() failed; bookmark falls back to consumed/carry-forward offsets");
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
         };
         let positions: HashMap<(String, i32), rdkafka::Offset> = self
@@ -157,6 +161,7 @@ impl KafkaSource {
             .unwrap_or_default();
 
         let mut out: Vec<PartitionOffset> = Vec::new();
+        let mut floors: Vec<PartitionOffset> = Vec::new();
         let mut need_watermark: Vec<(String, i32)> = Vec::new();
         {
             let cache = self.assigned_floor.lock().ok();
@@ -172,7 +177,7 @@ impl KafkaSource {
                     // No concrete position → use a cached watermark floor, or
                     // schedule a lookup for it.
                     _ => match cache.as_ref().and_then(|c| c.get(&key)) {
-                        Some(&floor) => out.push(PartitionOffset {
+                        Some(&floor) => floors.push(PartitionOffset {
                             topic: key.0,
                             partition: key.1,
                             offset: floor,
@@ -211,7 +216,7 @@ impl KafkaSource {
             if let Ok(mut cache) = self.assigned_floor.lock() {
                 for (topic, partition, floor) in resolved {
                     cache.insert((topic.clone(), partition), floor);
-                    out.push(PartitionOffset {
+                    floors.push(PartitionOffset {
                         topic,
                         partition,
                         offset: floor,
@@ -219,7 +224,7 @@ impl KafkaSource {
                 }
             }
         }
-        out
+        (out, floors)
     }
 
     /// The start bookmark applied via [`apply_start_bookmark`], retained for
@@ -248,8 +253,13 @@ impl KafkaSource {
         &self,
         consumed: &HashMap<(String, i32), i64>,
     ) -> Result<Option<Value>, FaucetError> {
-        let assigned = self.resolve_assigned_offsets().await;
-        let merged = Bookmark::merged(self.start_bookmark().as_ref(), &assigned, consumed);
+        let (positions, floors) = self.resolve_assigned_offsets().await;
+        let merged = Bookmark::merged_with_floors(
+            self.start_bookmark().as_ref(),
+            &floors,
+            &positions,
+            consumed,
+        );
         if merged.partition_offsets.is_empty() {
             Ok(None)
         } else {
@@ -462,6 +472,34 @@ fn build_sr_client(
     cfg.map(SchemaRegistryClient::new).transpose()
 }
 
+/// Whether a consumer error event is one librdkafka recovers from on its own
+/// (a broker roll, a coordinator move, a timed-out request, a poll interval
+/// overrun that the next poll rejoins from). Those are logged and the poll
+/// loop continues; anything else, including every fatal error, fails the run.
+pub(crate) fn is_transient_consume_error(e: &rdkafka::error::KafkaError) -> bool {
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode as C};
+    match e {
+        KafkaError::PartitionEOF(_) => true,
+        KafkaError::MessageConsumption(code) => matches!(
+            code,
+            C::BrokerTransportFailure
+                | C::Resolve
+                | C::AllBrokersDown
+                | C::OperationTimedOut
+                | C::PollExceeded
+                | C::RequestTimedOut
+                | C::BrokerNotAvailable
+                | C::LeaderNotAvailable
+                | C::NotLeaderForPartition
+                | C::NetworkException
+                | C::CoordinatorLoadInProgress
+                | C::CoordinatorNotAvailable
+                | C::NotCoordinator
+        ),
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl Source for KafkaSource {
     async fn fetch_with_context(
@@ -511,6 +549,11 @@ impl Source for KafkaSource {
                                         (msg.topic().to_string(), msg.partition()),
                                         msg.offset() + 1,
                                     );
+                                    self.context.note_delivered(
+                                        msg.topic(),
+                                        msg.partition(),
+                                        msg.offset() + 1,
+                                    );
                                     records.push(record);
                                     last_message_at = Instant::now();
                                     if records.len() >= max_messages {
@@ -524,6 +567,9 @@ impl Source for KafkaSource {
                                     OnDecodeError::Fail => return Err(e),
                                 },
                             }
+                        }
+                        Ok(Err(e)) if is_transient_consume_error(&e) => {
+                            tracing::warn!(error = %e, "kafka source: transient consumer error, continuing");
                         }
                         Ok(Err(e)) => {
                             return Err(FaucetError::Source(format!("kafka recv: {e}")));
@@ -644,6 +690,11 @@ impl Source for KafkaSource {
                                             (msg.topic().to_string(), msg.partition()),
                                             msg.offset() + 1,
                                         );
+                                        self.context.note_delivered(
+                                            msg.topic(),
+                                            msg.partition(),
+                                            msg.offset() + 1,
+                                        );
                                         buffer.push(record);
                                         last_message_at = Instant::now();
                                         total += 1;
@@ -658,6 +709,9 @@ impl Source for KafkaSource {
                                         OnDecodeError::Fail => fatal = Some(e),
                                     },
                                 }
+                            }
+                            Ok(Err(e)) if is_transient_consume_error(&e) => {
+                                tracing::warn!(error = %e, "kafka source: transient consumer error, continuing");
                             }
                             Ok(Err(e)) => {
                                 fatal = Some(FaucetError::Source(format!("kafka recv: {e}")));
@@ -1176,5 +1230,30 @@ mod tests {
             };
             assert!(build_sr_client(&format, None).is_err());
         }
+    }
+
+    #[test]
+    fn transient_consumer_errors_do_not_fail_the_run() {
+        use rdkafka::error::{KafkaError, RDKafkaErrorCode as C};
+        for code in [
+            C::BrokerTransportFailure,
+            C::AllBrokersDown,
+            C::PollExceeded,
+            C::NotCoordinator,
+            C::RequestTimedOut,
+        ] {
+            assert!(
+                is_transient_consume_error(&KafkaError::MessageConsumption(code)),
+                "{code:?}"
+            );
+        }
+        assert!(is_transient_consume_error(&KafkaError::PartitionEOF(0)));
+        assert!(!is_transient_consume_error(
+            &KafkaError::MessageConsumptionFatal(C::BrokerTransportFailure)
+        ));
+        assert!(!is_transient_consume_error(
+            &KafkaError::MessageConsumption(C::TopicAuthorizationFailed)
+        ));
+        assert!(!is_transient_consume_error(&KafkaError::Canceled));
     }
 }

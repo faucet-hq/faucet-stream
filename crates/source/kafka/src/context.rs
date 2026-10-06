@@ -34,8 +34,8 @@ const COMMITTED_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// and the same error slot.
 #[derive(Clone, Default)]
 pub(crate) struct BookmarkContext {
-    /// Bookmark to apply on the next `Rebalance::Assign`. Taken (not peeked)
-    /// when the assign fires, so subsequent rebalances do not re-seek.
+    /// Bookmark to apply on the first `Rebalance::Assign`. Taken (not peeked)
+    /// when the assign fires; later assigns use [`Self::delivered`].
     pub(crate) pending_bookmark: Arc<Mutex<Option<Bookmark>>>,
     /// A retained copy of the start bookmark (never taken). Read at
     /// bookmark-build time so previously-known partitions that are assigned
@@ -53,9 +53,41 @@ pub(crate) struct BookmarkContext {
     /// durably advanced a partition past our bookmark). Set by
     /// [`KafkaSource::apply_shard`](crate::stream::KafkaSource).
     pub(crate) member_mode: Arc<AtomicBool>,
+    /// The next offset after every message delivered this run, by partition.
+    /// Outside member mode nothing is committed to the group, so a later
+    /// Assign (a rebalance after the first) re-seeks from the start bookmark
+    /// plus these, instead of falling back to `auto.offset.reset`.
+    pub(crate) delivered: Arc<Mutex<HashMap<(String, i32), i64>>>,
+}
+
+/// Where a re-assigned partition resumes outside member mode: the start
+/// bookmark, advanced by what this run already delivered. `None` when neither
+/// knows any partition.
+pub(crate) fn resume_bookmark(
+    start: Option<&Bookmark>,
+    delivered: &HashMap<(String, i32), i64>,
+) -> Option<Bookmark> {
+    let merged = Bookmark::merged(start, &[], delivered);
+    (!merged.partition_offsets.is_empty()).then_some(merged)
 }
 
 impl BookmarkContext {
+    /// Record the next offset after a delivered message.
+    pub(crate) fn note_delivered(&self, topic: &str, partition: i32, next_offset: i64) {
+        if let Ok(mut map) = self.delivered.lock() {
+            map.insert((topic.to_string(), partition), next_offset);
+        }
+    }
+
+    fn reassign_bookmark(&self) -> Option<Bookmark> {
+        if self.member_mode.load(Ordering::Acquire) {
+            return None;
+        }
+        let start = self.start_offsets.lock().ok().and_then(|g| g.clone());
+        let delivered = self.delivered.lock().ok()?.clone();
+        resume_bookmark(start.as_ref(), &delivered)
+    }
+
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -98,9 +130,11 @@ impl ConsumerContext for BookmarkContext {
                 self.pre_rebalance(base_consumer, &rebalance);
                 drop(rebalance);
 
-                // `take()` consumes the bookmark on the first Assign so that
-                // subsequent cooperative rebalances do not re-apply stale
-                // offsets.
+                // The first Assign takes the start bookmark. A later one
+                // (outside member mode, where nothing is committed to the
+                // group) resumes from the start bookmark advanced by what this
+                // run delivered — otherwise a re-assigned partition restarts
+                // at `auto.offset.reset` and skips the gap.
                 let bookmark = match self.pending_bookmark.lock() {
                     Ok(mut guard) => guard.take(),
                     Err(poisoned) => {
@@ -109,7 +143,8 @@ impl ConsumerContext for BookmarkContext {
                         )));
                         None
                     }
-                };
+                }
+                .or_else(|| self.reassign_bookmark());
 
                 if let Some(bookmark) = bookmark {
                     let lookup: HashMap<(&str, i32), i64> = bookmark
@@ -309,5 +344,45 @@ mod tests {
             FaucetError::State(msg) => assert_eq!(msg, "first"),
             other => panic!("expected State, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_later_assign_resumes_from_the_start_bookmark_advanced_by_deliveries() {
+        let ctx = BookmarkContext::new();
+        assert!(ctx.reassign_bookmark().is_none(), "nothing known yet");
+        *ctx.start_offsets.lock().unwrap() = Some(Bookmark {
+            partition_offsets: vec![
+                PartitionOffset {
+                    topic: "t".into(),
+                    partition: 0,
+                    offset: 10,
+                },
+                PartitionOffset {
+                    topic: "t".into(),
+                    partition: 1,
+                    offset: 20,
+                },
+            ],
+        });
+        ctx.note_delivered("t", 1, 27);
+        ctx.note_delivered("t", 2, 3);
+        let b = ctx.reassign_bookmark().unwrap();
+        let got: Vec<(&str, i32, i64)> = b
+            .partition_offsets
+            .iter()
+            .map(|p| (p.topic.as_str(), p.partition, p.offset))
+            .collect();
+        assert_eq!(got, vec![("t", 0, 10), ("t", 1, 27), ("t", 2, 3)]);
+
+        ctx.member_mode.store(true, Ordering::Release);
+        assert!(
+            ctx.reassign_bookmark().is_none(),
+            "member mode defers to the group's committed offsets"
+        );
+    }
+
+    #[test]
+    fn resume_bookmark_is_none_when_nothing_is_known() {
+        assert!(resume_bookmark(None, &HashMap::new()).is_none());
     }
 }
