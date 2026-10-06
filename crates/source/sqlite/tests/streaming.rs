@@ -324,3 +324,49 @@ async fn discover_enumerates_tables_with_schemas() {
         serde_json::json!(["boolean", "null"])
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn null_cells_of_every_storage_class_decode_as_null() {
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let url = sqlite_url(tmp.path());
+    let pool = sqlx::SqlitePool::connect(&url).await.expect("seed pool");
+    sqlx::query(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL, d BLOB, e BOOLEAN)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create");
+    sqlx::query("INSERT INTO t VALUES (1, NULL, NULL, NULL, NULL, NULL)")
+        .execute(&pool)
+        .await
+        .expect("insert nulls");
+    sqlx::query("INSERT INTO t VALUES (2, 'x', 7, 1.5, X'0102', 1)")
+        .execute(&pool)
+        .await
+        .expect("insert values");
+    sqlx::query("INSERT INTO t VALUES (3, '{\"k\":1}', 0, 2.0, X'', 0)")
+        .execute(&pool)
+        .await
+        .expect("insert json");
+    pool.close().await;
+
+    let source = SqliteSource::new(SqliteSourceConfig::new(
+        &url,
+        "SELECT id, a, b, c, d, e FROM t ORDER BY id",
+    ))
+    .await
+    .expect("source");
+    let rows = source.fetch_all().await.expect("fetch");
+    assert_eq!(
+        rows[0],
+        serde_json::json!({"id": 1, "a": null, "b": null, "c": null, "d": null, "e": null})
+    );
+    assert_eq!(
+        rows[1],
+        serde_json::json!({"id": 2, "a": "x", "b": 7, "c": 1.5, "d": "AQI=", "e": 1})
+    );
+    assert_eq!(
+        rows[2],
+        serde_json::json!({"id": 3, "a": {"k": 1}, "b": 0, "c": 2.0, "d": "", "e": 0})
+    );
+}
