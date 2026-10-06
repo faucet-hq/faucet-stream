@@ -13877,7 +13877,7 @@
       "description": "Format of the staged file that `COPY` reads.",
       "oneOf": [
         {
-          "description": "Newline-delimited JSON objects, loaded with `FORMAT AS JSON 'auto'`.\nMaps by column **name** (order-independent) and handles NULLs and typed\ncolumns cleanly — the default.",
+          "description": "Newline-delimited JSON objects, loaded with `FORMAT AS JSON 'auto ignorecase'` (keys match columns ignoring case).\nMaps by column **name** (order-independent) and handles NULLs and typed\ncolumns cleanly — the default.",
           "type": "string",
           "const": "jsonl"
         },
@@ -17205,6 +17205,11 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "on_gap": {
+                      "$ref": "#/$defs/source_mssql-cdc__OnGap",
+                      "default": "fail",
+                      "description": "What to do when the bookmark predates the retained change history\n(downtime longer than the CDC cleanup retention): `fail` (default) or\n`skip`."
                     }
                   },
                   "title": "MssqlCdcSourceConfig",
@@ -19117,6 +19122,11 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "result_disposition": {
+                      "$ref": "#/$defs/source_databricks__ResultDisposition",
+                      "default": "external_links",
+                      "description": "How the row path fetches results: `external_links` (default) downloads\neach chunk from a presigned URL, so results of any size stream;\n`inline` keeps them in the API response, which Databricks caps at\n25 MiB. Use `inline` only when the client cannot reach the workspace's\ncloud storage."
                     }
                   }
                 },
@@ -20187,7 +20197,7 @@
                     },
                     "idle_timeout": {
                       "default": 30,
-                      "description": "End the fetch cycle after this long without a captured change. Default\n30s. A long-running runtime re-invokes the source to keep tailing.",
+                      "description": "End the fetch cycle after this long without a captured change, counted\nonly once mining has reached the current SCN. Default 30s. A\nlong-running runtime re-invokes the source to keep tailing.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -31097,6 +31107,36 @@
           "items": {
             "type": "string"
           }
+        }
+      ]
+    },
+    "source_databricks__ResultDisposition": {
+      "description": "How the row path receives a statement's result (ignored under\n`arrow_native`, which always uses external links).",
+      "oneOf": [
+        {
+          "const": "external_links",
+          "description": "Chunks are downloaded from presigned cloud-storage URLs (no size cap;\nthe client must be able to reach the workspace's storage). Default.",
+          "type": "string"
+        },
+        {
+          "const": "inline",
+          "description": "Chunks are returned inside the API response. Databricks fails a\nstatement whose result exceeds 25 MiB in this mode.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_mssql-cdc__OnGap": {
+      "description": "What to do when a run resumes behind the capture instance's retained\nminimum LSN — the CDC cleanup job purged changes before they were read.",
+      "oneOf": [
+        {
+          "const": "fail",
+          "description": "Fail the run with a typed error. Default: the purged changes are lost,\nand a destination that silently missed them is corrupt.",
+          "type": "string"
+        },
+        {
+          "const": "skip",
+          "description": "Log a warning and resume from the earliest retained change, accepting\nthe loss (e.g. after re-snapshotting the destination).",
+          "type": "string"
         }
       ]
     }

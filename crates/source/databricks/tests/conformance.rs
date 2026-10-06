@@ -56,6 +56,7 @@ async fn conformance_bounded_memory() {
         poll_interval_secs: 1,
         batch_size: batch,
         arrow_native: false,
+        result_disposition: Default::default(),
         replication: DatabricksReplication::Full,
         state_key: None,
     };
