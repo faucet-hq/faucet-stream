@@ -111,6 +111,7 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
         validate_exactly_once(cfg)?;
     }
     refuse_graph_blocks(cfg)?;
+    refuse_destructive_sources(cfg)?;
     let spec = &cfg.pipeline;
     let mut known: Vec<String> = spec.nodes.keys().cloned().collect();
     known.sort_unstable();
@@ -122,6 +123,45 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
                     known: known.clone(),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse queue sources that ack messages as they are read: a graph polls its
+/// sources ahead of its sinks, so a failed or cancelled sink would lose
+/// messages that were already acked (#789 MSG-14). `Topology::validate`
+/// refuses the built source too; this catches it at config-load time.
+fn refuse_destructive_sources(cfg: &PipelineConfig) -> CliResult<()> {
+    let mut ids: Vec<&String> = cfg.pipeline.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let NodeSpec::Source {
+            template,
+            kind,
+            config,
+        } = &cfg.pipeline.nodes[id]
+        else {
+            continue;
+        };
+        let Ok((kind, config)) = resolve_connector(
+            &cfg.pipeline.sources,
+            &cfg.pipeline.source,
+            template.as_deref(),
+            kind.as_deref(),
+            config.as_ref(),
+            id,
+            "source",
+        ) else {
+            continue;
+        };
+        if crate::registry::source_kind_consumes_destructively(&kind, &config) {
+            return Err(CliError::Config(format!(
+                "topology source node '{id}' (`{kind}`) acknowledges messages as it is read, and \
+                 a graph polls its sources ahead of its sinks, so a failed or cancelled sink \
+                 would lose messages that were already acked; run this source in a linear \
+                 pipeline instead"
+            )));
         }
     }
     Ok(())
@@ -2168,6 +2208,40 @@ pipeline:
         let err = validate_topology_spec(&c).unwrap_err().to_string();
         assert!(err.contains("sink node 'w'"), "{err}");
         assert!(err.contains("write_mode: overwrite"), "{err}");
+    }
+
+    #[test]
+    fn a_queue_source_that_acks_on_read_is_refused_in_a_graph() {
+        let yaml = |source: &str| {
+            format!(
+                r#"version: 1
+name: p
+pipeline:
+  sources:
+    a: {source}
+  sinks:
+    o: {{ type: stdout, config: {{}} }}
+  nodes:
+    s: {{ kind: source, ref: a }}
+    w: {{ kind: sink, ref: o }}
+  edges:
+    - {{ from: s, to: w }}
+"#
+            )
+        };
+        for source in [
+            r#"{ type: sqs, config: { queue_url: "https://q" } }"#,
+            r#"{ type: rabbitmq, config: { queue: q } }"#,
+            r#"{ type: nats, config: { subject: s, jetstream_stream: S, jetstream_consumer: c } }"#,
+        ] {
+            let err = validate_topology_spec(&cfg(&yaml(source)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("source node 's'"), "{err}");
+            assert!(err.contains("acknowledges messages"), "{err}");
+        }
+        validate_topology_spec(&cfg(&yaml(r#"{ type: nats, config: { subject: s } }"#)))
+            .expect("core NATS acks nothing");
     }
 
     #[test]

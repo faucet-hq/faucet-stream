@@ -575,6 +575,9 @@ impl Source for SamplingSource {
     fn supports_exactly_once(&self) -> bool {
         self.inner.supports_exactly_once()
     }
+    fn consumes_destructively(&self) -> bool {
+        self.inner.consumes_destructively()
+    }
     fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
         self.inner.replay_guarantee()
     }

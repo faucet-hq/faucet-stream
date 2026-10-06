@@ -312,6 +312,10 @@ impl Source for NatsSource {
         serde_json::to_value(faucet_core::schema_for!(NatsSourceConfig)).unwrap_or(Value::Null)
     }
 
+    fn consumes_destructively(&self) -> bool {
+        self.config.is_jetstream()
+    }
+
     fn connector_name(&self) -> &'static str {
         "nats"
     }

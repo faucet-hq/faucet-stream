@@ -360,6 +360,10 @@ impl Source for RabbitMqSource {
         serde_json::to_value(faucet_core::schema_for!(RabbitMqSourceConfig)).unwrap_or(Value::Null)
     }
 
+    fn consumes_destructively(&self) -> bool {
+        true
+    }
+
     fn connector_name(&self) -> &'static str {
         "rabbitmq"
     }

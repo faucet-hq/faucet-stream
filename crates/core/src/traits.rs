@@ -283,6 +283,18 @@ pub trait Source: Send + Sync {
         false
     }
 
+    /// Whether reading from this source **removes data from its backend** —
+    /// a queue source that acks, deletes or settles messages as the pipeline
+    /// moves past each page (SQS, Pub/Sub, JetStream, RabbitMQ). Such a source
+    /// relies on the linear pipeline writing and flushing a page before it is
+    /// polled again; anything that reads without durably writing (a preview, a
+    /// dry run, a `--limit` run, a plan sample) or that polls ahead of its
+    /// sinks (a topology graph) would lose those messages for good, so callers
+    /// refuse it. Default `false`.
+    fn consumes_destructively(&self) -> bool {
+        false
+    }
+
     /// The typed replay capability this source advertises — see
     /// [`ReplayGuarantee`](crate::ReplayGuarantee).
     ///

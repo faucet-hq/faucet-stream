@@ -247,6 +247,9 @@ impl Source for TransformingSource {
     fn supports_exactly_once(&self) -> bool {
         self.inner.supports_exactly_once()
     }
+    fn consumes_destructively(&self) -> bool {
+        self.inner.consumes_destructively()
+    }
 
     fn replay_guarantee(&self) -> crate::idempotency::ReplayGuarantee {
         self.inner.replay_guarantee()

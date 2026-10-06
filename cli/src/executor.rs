@@ -2264,6 +2264,14 @@ async fn run_one_invocation(
     };
     // The run clock bounds "now"-relative reads (REST window slicing, #769).
     source.set_run_clock(opts.clock.to_utc());
+    if (opts.dry_run || opts.limit.is_some()) && source.consumes_destructively() {
+        return Err(CliError::Config(
+            crate::preview_sample::destructive_read_refusal(
+                &node.source.kind,
+                if opts.dry_run { "--dry-run" } else { "--limit" },
+            ),
+        ));
+    }
 
     // Catalog identity (#279): read the dataset URIs off the *raw* connectors,
     // before any wrapper is layered on.
@@ -3430,6 +3438,9 @@ impl Source for StateKeyOverride {
     fn supports_exactly_once(&self) -> bool {
         self.inner.supports_exactly_once()
     }
+    fn consumes_destructively(&self) -> bool {
+        self.inner.consumes_destructively()
+    }
     fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
         self.inner.replay_guarantee()
     }
@@ -3556,6 +3567,9 @@ impl Source for BindContextSource {
     }
     fn supports_exactly_once(&self) -> bool {
         self.inner.supports_exactly_once()
+    }
+    fn consumes_destructively(&self) -> bool {
+        self.inner.consumes_destructively()
     }
     fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
         self.inner.replay_guarantee()

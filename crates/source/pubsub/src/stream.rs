@@ -299,6 +299,10 @@ impl faucet_core::Source for PubsubSource {
         Ok(())
     }
 
+    fn consumes_destructively(&self) -> bool {
+        true
+    }
+
     fn connector_name(&self) -> &'static str {
         "pubsub"
     }

@@ -323,6 +323,10 @@ impl faucet_core::Source for SqsSource {
             .expect("schema serialization")
     }
 
+    fn consumes_destructively(&self) -> bool {
+        true
+    }
+
     fn connector_name(&self) -> &'static str {
         "sqs"
     }

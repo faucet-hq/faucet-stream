@@ -530,9 +530,19 @@ impl Topology {
             let i = in_deg.get(n.id.as_str()).copied().unwrap_or(0);
             let o = out_deg.get(n.id.as_str()).copied().unwrap_or(0);
             match &n.kind {
-                NodeKind::Source(_) => {
+                NodeKind::Source(source) => {
                     has_source = true;
                     arity(&n.id, "source", i == 0, o == 1, "0 in, exactly 1 out")?;
+                    if source.consumes_destructively() {
+                        return Err(cfg(format!(
+                            "source '{}' ({}) acknowledges messages as it is read past each \
+                             page, and a graph polls its sources ahead of its sinks, so a \
+                             failed or cancelled sink would lose messages that were already \
+                             acked; run this source in a linear pipeline instead",
+                            n.id,
+                            source.connector_name()
+                        )));
+                    }
                 }
                 NodeKind::Transform(_) => {
                     arity(&n.id, "transform", i == 1, o == 1, "exactly 1 in, 1 out")?;
@@ -2497,6 +2507,35 @@ mod tests {
     }
 
     // ── Validation ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_a_source_that_consumes_destructively() {
+        struct Queue;
+        #[async_trait]
+        impl Source for Queue {
+            async fn fetch_with_context(
+                &self,
+                _: &std::collections::HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(Vec::new())
+            }
+            fn consumes_destructively(&self) -> bool {
+                true
+            }
+            fn connector_name(&self) -> &'static str {
+                "queue"
+            }
+        }
+        let (sink, _) = CollectSink::new();
+        let err = Topology::builder()
+            .source("q", Box::new(Queue))
+            .sink("out", Box::new(sink))
+            .edge("q", "out")
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("source 'q' (queue)"), "{err}");
+    }
 
     #[test]
     fn validate_rejects_empty() {
