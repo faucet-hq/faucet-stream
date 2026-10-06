@@ -39,6 +39,20 @@ pub enum StartPosition {
     Earliest,
 }
 
+/// What to do when a run resumes behind the capture instance's retained
+/// minimum LSN — the CDC cleanup job purged changes before they were read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnGap {
+    /// Fail the run with a typed error. Default: the purged changes are lost,
+    /// and a destination that silently missed them is corrupt.
+    #[default]
+    Fail,
+    /// Log a warning and resume from the earliest retained change, accepting
+    /// the loss (e.g. after re-snapshotting the destination).
+    Skip,
+}
+
 /// Configuration for the Microsoft SQL Server CDC source.
 ///
 /// The source polls native SQL Server change data capture: `sys.fn_cdc_get_max_lsn()`
@@ -98,6 +112,11 @@ pub struct MssqlCdcSourceConfig {
     /// derived from the database (or host) and the sorted capture-instance list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_key: Option<String>,
+    /// What to do when the bookmark predates the retained change history
+    /// (downtime longer than the CDC cleanup retention): `fail` (default) or
+    /// `skip`.
+    #[serde(default)]
+    pub on_gap: OnGap,
 }
 
 impl MssqlCdcSourceConfig {
@@ -278,6 +297,7 @@ impl fmt::Debug for MssqlCdcSourceConfig {
             .field("max_connections", &self.max_connections)
             .field("statement_timeout_secs", &self.statement_timeout_secs)
             .field("state_key", &self.state_key)
+            .field("on_gap", &self.on_gap)
             .finish()
     }
 }

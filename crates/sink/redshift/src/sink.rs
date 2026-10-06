@@ -47,18 +47,22 @@ impl RedshiftSink {
     /// Load one accumulated group, still re-chunked to `batch_size` so a
     /// single staged object / `INSERT` statement stays a reasonable size
     /// (#617).
-    async fn commit_group(&self, rows: &[Value]) -> Result<(), FaucetError> {
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            vec![rows]
+    /// On failure, also returns how many leading rows did land.
+    async fn commit_group(&self, rows: &[Value]) -> Result<(), (usize, FaucetError)> {
+        let chunk_len = if self.config.batch_size == 0 {
+            rows.len().max(1)
         } else {
-            rows.chunks(self.config.batch_size).collect()
+            self.config.batch_size
         };
         let mut total = 0;
-        for chunk in chunks {
+        let mut done = 0;
+        for chunk in rows.chunks(chunk_len) {
             total += match self.config.write_strategy {
-                RedshiftWriteStrategy::Copy => self.copy_chunk(chunk).await?,
-                RedshiftWriteStrategy::Insert => self.insert_chunk(chunk).await?,
-            };
+                RedshiftWriteStrategy::Copy => self.copy_chunk(chunk).await,
+                RedshiftWriteStrategy::Insert => self.insert_chunk(chunk).await,
+            }
+            .map_err(|e| (done, e))?;
+            done += chunk.len();
         }
         tracing::info!(
             table = %self.config.table_name,
@@ -66,6 +70,26 @@ impl RedshiftSink {
             strategy = self.config.write_strategy.as_str(),
             "Redshift write complete"
         );
+        Ok(())
+    }
+
+    /// Commit a group the accumulator handed out; on failure put back the
+    /// uncommitted rows of earlier pages (`rows[..keep_end]`), so a retried
+    /// write or `flush` commits them instead of dropping them (SQL-04).
+    async fn commit_or_restore(
+        &self,
+        rows: Vec<Value>,
+        keep_end: usize,
+    ) -> Result<(), FaucetError> {
+        if let Err((done, e)) = self.commit_group(&rows).await {
+            if done < keep_end {
+                let mut rows = rows;
+                rows.truncate(keep_end);
+                rows.drain(..done);
+                self.pending.lock().await.restore(rows);
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -135,7 +159,7 @@ impl RedshiftSink {
         };
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
-            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::new(
+            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
                 config.commit_bytes,
             )),
@@ -271,11 +295,14 @@ impl RedshiftSink {
             .cloned()
             .collect();
         if present.is_empty() {
-            tracing::warn!(
-                table = %self.config.table_name,
-                "redshift: no record keys match table columns; skipping insert"
-            );
-            return Ok(0);
+            // Reporting the chunk as written would advance the bookmark past
+            // rows that never landed (SQL-19).
+            return Err(FaucetError::Sink(format!(
+                "redshift: no field of the {} record(s) matches a column of {} (columns: {})",
+                records.len(),
+                self.table_ref(),
+                table_columns.join(", ")
+            )));
         }
 
         // Drop records that share *no* column with the table. `present` is the
@@ -312,7 +339,7 @@ impl RedshiftSink {
                     FaucetError::Sink("redshift: insert requires JSON object records".into())
                 })?;
                 for col in &present {
-                    q = bind_json(q, obj.get(col), col)?;
+                    q = bind_json(q, crate::copy::field(obj, col), col)?;
                 }
             }
             q.execute(&self.pool)
@@ -408,9 +435,42 @@ impl faucet_core::Sink for RedshiftSink {
             open.finish()
         };
         if let Some(rows) = group {
-            self.commit_group(&rows).await?;
+            let len = rows.len();
+            self.commit_or_restore(rows, len).await?;
         }
         Ok(())
+    }
+
+    /// The DLQ path commits per page (SQL-21): earlier buffered rows are
+    /// committed first, then this page alone, so a failed commit names exactly
+    /// the rows of *this* page that did not land.
+    async fn write_batch_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.flush().await?;
+        self.ensure_table_ready(records).await?;
+        match self.commit_group(records).await {
+            Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
+            Err((0, e)) => Err(e),
+            Err((done, e)) => {
+                let message = e.to_string();
+                Ok((0..records.len())
+                    .map(|i| {
+                        if i < done {
+                            Ok(())
+                        } else {
+                            Err(FaucetError::Sink(format!(
+                                "redshift: write failed: {message}"
+                            )))
+                        }
+                    })
+                    .collect())
+            }
+        }
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -426,7 +486,8 @@ impl faucet_core::Sink for RedshiftSink {
             pending.push_page(records)
         };
         if let Some(rows) = group {
-            self.commit_group(&rows).await?;
+            let keep_end = rows.len() - records.len();
+            self.commit_or_restore(rows, keep_end).await?;
         }
         Ok(records.len())
     }

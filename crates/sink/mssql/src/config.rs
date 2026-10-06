@@ -197,6 +197,14 @@ impl MssqlSinkConfig {
         if self.table.trim().is_empty() {
             return Err(FaucetError::Config("MSSQL sink requires a `table`".into()));
         }
+        if self.staging.is_some() && self.write.write_mode != faucet_core::WriteMode::Append {
+            return Err(FaucetError::Config(format!(
+                "MSSQL sink: `staging:` loads each page with `COPY INTO` straight into the \
+                 target table, so it supports only `write_mode: append` (got `{}`) — remove \
+                 `staging:` for overwrite, upsert or delete",
+                self.write.write_mode.as_str()
+            )));
+        }
         Ok(())
     }
 }
@@ -313,6 +321,20 @@ mod tests {
     fn validate_rejects_empty_table() {
         let cfg = MssqlSinkConfig::new("mssql://sa:pw@h/db", "  ");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn staging_is_refused_for_every_mode_but_append() {
+        let mut cfg = MssqlSinkConfig::new("mssql://sa:pw@h/db", "dbo.t");
+        cfg.staging =
+            Some(serde_json::from_value(json!({"location": "az://c/p", "format": "csv"})).unwrap());
+        assert!(cfg.validate().is_ok());
+        for mode in ["overwrite", "upsert", "delete"] {
+            cfg.write = serde_json::from_value(json!({"write_mode": mode, "key": ["id"]})).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("only `write_mode: append`"), "{mode}: {err}");
+            assert!(err.contains(mode), "{err}");
+        }
     }
 
     #[test]

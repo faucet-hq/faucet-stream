@@ -13,7 +13,7 @@ use faucet_core::idempotency::{
 use faucet_core::{FaucetError, PlannedColumn, SqlBaseType};
 use serde_json::{Value, json};
 
-use crate::config::OnUnknownField;
+use crate::config::{OnUnknownField, OracleColumnMapping};
 
 /// ORA-00942: table or view does not exist.
 pub(crate) const ORA_TABLE_MISSING: i32 = 942;
@@ -360,12 +360,16 @@ pub(crate) fn ignoring(ddl: &str, codes: &[i32]) -> String {
     )
 }
 
-/// Oracle type for a planned column. Doubles are IEEE `BINARY_DOUBLE` (a
+/// Oracle type for a planned column. A column whose first-page values are all
+/// whole numbers is an unconstrained `NUMBER`: `NUMBER(19)` has scale 0, so a
+/// later `99.95` was silently rounded to `100` (SQL-16); only a key column, which
+/// must stay integral, is `NUMBER(38)`. Doubles are IEEE `BINARY_DOUBLE` (a
 /// `NUMBER` cannot hold 1e300 or 1e-300); key text is bounded (`CLOB` cannot be
 /// indexed); other text is `CLOB` so no value is ever truncated.
 pub(crate) fn column_type(t: SqlBaseType, is_key: bool) -> &'static str {
     match t {
-        SqlBaseType::Integer => "NUMBER(19)",
+        SqlBaseType::Integer if is_key => "NUMBER(38)",
+        SqlBaseType::Integer => "NUMBER",
         SqlBaseType::Double => "BINARY_DOUBLE",
         SqlBaseType::Boolean => "NUMBER(1)",
         SqlBaseType::Text | SqlBaseType::Json if is_key => "VARCHAR2(1000 CHAR)",
@@ -603,9 +607,250 @@ pub(crate) fn case_records(records: &[Value], upper: bool) -> std::borrow::Cow<'
     )
 }
 
+/// The column a record key addresses: the exact name, else — for a key that
+/// matches nothing exactly — the column its upper-case form names, when that
+/// column is all upper case. Unquoted Oracle DDL (`CREATE TABLE T (ID …)`)
+/// stores names upper-cased, and lower-case keys from most sources would
+/// otherwise match nothing under `identifier_case: preserve` (SQL-17).
+pub(crate) fn column_for<'a>(key: &str, columns: &'a [String]) -> Option<&'a str> {
+    if let Some(c) = columns.iter().find(|c| c.as_str() == key) {
+        return Some(c);
+    }
+    let upper = key.to_uppercase();
+    columns
+        .iter()
+        .find(|c| c.as_str() == upper && c.as_str() == c.to_uppercase())
+        .map(String::as_str)
+}
+
+/// Rename every record key that addresses a column only through
+/// [`column_for`]'s upper-case fallback. A record already carrying the column's
+/// exact name keeps its own value for it.
+pub(crate) fn fold_to_columns<'a>(
+    records: &'a [Value],
+    columns: &[String],
+) -> std::borrow::Cow<'a, [Value]> {
+    let needs = |o: &serde_json::Map<String, Value>| {
+        o.keys()
+            .any(|k| column_for(k, columns).is_some_and(|c| c != k && !o.contains_key(c)))
+    };
+    if !records.iter().any(|r| r.as_object().is_some_and(needs)) {
+        return std::borrow::Cow::Borrowed(records);
+    }
+    std::borrow::Cow::Owned(
+        records
+            .iter()
+            .map(|r| match r {
+                Value::Object(o) => Value::Object(
+                    o.iter()
+                        .map(|(k, v)| match column_for(k, columns) {
+                            Some(c) if c != k && !o.contains_key(c) => (c.to_string(), v.clone()),
+                            _ => (k.clone(), v.clone()),
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// Upsert records grouped by which of `columns` each carries (a key present
+/// with `null` counts), in first-seen order. Each group is merged on its own
+/// columns, so a column a record omits keeps its stored value instead of being
+/// overwritten with NULL (#789 SQL-10).
+pub(crate) fn group_by_present_columns(records: &[Value], columns: &[String]) -> Vec<Vec<Value>> {
+    let mut groups: Vec<(Vec<bool>, Vec<Value>)> = Vec::new();
+    for record in records {
+        let present: Vec<bool> = columns
+            .iter()
+            .map(|c| record.as_object().is_some_and(|o| o.contains_key(c)))
+            .collect();
+        match groups.iter_mut().find(|(p, _)| *p == present) {
+            Some((_, rows)) => rows.push(record.clone()),
+            None => groups.push((present, vec![record.clone()])),
+        }
+    }
+    groups.into_iter().map(|(_, rows)| rows).collect()
+}
+
+/// A prepared chunk: the columns written, their bind kinds, and each row's
+/// encoded values (or its encoding failure), by chunk index.
+pub(crate) type PreparedRows = (
+    Vec<String>,
+    Vec<BindKind>,
+    Vec<(usize, Result<Vec<Option<String>>, String>)>,
+);
+
+/// Insertable column names, in table order.
+pub(crate) fn insertable_names(info: &[ColumnInfo]) -> Vec<String> {
+    info.iter()
+        .filter(|c| c.insertable)
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// Whether `on_unknown_field: drop` lets a record with no matching key be
+/// skipped rather than refused.
+pub(crate) fn drops_unknown(mapping: &OracleColumnMapping) -> bool {
+    matches!(
+        mapping,
+        OracleColumnMapping::AutoColumns {
+            on_unknown_field: OnUnknownField::Drop
+        }
+    )
+}
+
+/// The columns, bind kinds and encoded rows for one chunk. `info` is only read
+/// in `auto_columns` mode, where record keys are first folded onto the
+/// table's columns (SQL-17).
+pub(crate) fn prepare_rows(
+    mapping: &OracleColumnMapping,
+    info: &[ColumnInfo],
+    chunk: &[Value],
+) -> Result<PreparedRows, FaucetError> {
+    match mapping {
+        OracleColumnMapping::JsonColumn { column } => Ok((
+            vec![column.clone()],
+            vec![BindKind::Clob],
+            chunk
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, Ok(vec![Some(r.to_string())])))
+                .collect(),
+        )),
+        OracleColumnMapping::AutoColumns { on_unknown_field } => {
+            let names = insertable_names(info);
+            let chunk = fold_to_columns(chunk, &names);
+            let cols = resolve_insert_columns(&names, &chunk, *on_unknown_field)?;
+            let kinds: Vec<BindKind> = cols
+                .iter()
+                .map(|c| {
+                    info.iter()
+                        .find(|i| &i.name == c)
+                        .map(BindKind::for_column)
+                        .unwrap_or(BindKind::Text)
+                })
+                .collect();
+            let rows = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, encode_row(r, &cols, &kinds)))
+                .collect();
+            Ok((cols, kinds, rows))
+        }
+    }
+}
+
+/// The page with record keys (and the write `key`) mapped onto the table's
+/// `names` through the unquoted-identifier fallback (SQL-17). JSON-column mode
+/// and an empty page pass through.
+pub(crate) fn fold_page(
+    mapping: &OracleColumnMapping,
+    names: &[String],
+    records: &[Value],
+    spec: &faucet_core::WriteSpec,
+) -> (Vec<Value>, faucet_core::WriteSpec) {
+    let mut spec = spec.clone();
+    if !matches!(mapping, OracleColumnMapping::AutoColumns { .. }) || records.is_empty() {
+        return (records.to_vec(), spec);
+    }
+    spec.key = fold_names(&spec.key, names);
+    (fold_to_columns(records, names).into_owned(), spec)
+}
+
+/// The upsert groups of a plan: each chunk's records folded onto the table's
+/// columns, then grouped by the columns they carry (SQL-10).
+pub(crate) fn upsert_groups(chunks: &[&[Value]], insertable: &[String]) -> Vec<Vec<Value>> {
+    chunks
+        .iter()
+        .flat_map(|chunk| group_by_present_columns(&fold_to_columns(chunk, insertable), insertable))
+        .collect()
+}
+
+/// `key` mapped through [`column_for`]; a name that matches no column is kept.
+pub(crate) fn fold_names(names: &[String], columns: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|n| column_for(n, columns).unwrap_or(n).to_string())
+        .collect()
+}
+
+/// The table to write when `table` itself does not exist: its upper-case form,
+/// when that exists — a table created with unquoted DDL (SQL-17). Otherwise
+/// `table` (created as written).
+pub(crate) fn pick_table(table: &str, exact_exists: bool, upper_exists: bool) -> String {
+    let upper = table.to_uppercase();
+    if !exact_exists && upper != table && upper_exists {
+        upper
+    } else {
+        table.to_string()
+    }
+}
+
+/// The error for a non-empty chunk whose keys match no column of `table`.
+pub(crate) fn no_columns_error(table: &str, records: &[Value]) -> FaucetError {
+    let mut keys: Vec<&str> = records
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.keys().map(String::as_str))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.truncate(10);
+    FaucetError::Sink(format!(
+        "oracle: none of the record keys {keys:?} match a column of {table} — nothing would be \
+         written. Check `table` and the column names (Oracle names are case-sensitive once \
+         quoted; `identifier_case: upper` matches tables created with unquoted DDL), or set \
+         `on_unknown_field: drop` to skip such records"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lower_case_keys_reach_unquoted_upper_case_columns() {
+        let cols = vec!["ID".to_string(), "NAME".to_string(), "mixed".to_string()];
+        assert_eq!(column_for("ID", &cols), Some("ID"));
+        assert_eq!(column_for("id", &cols), Some("ID"));
+        assert_eq!(column_for("Name", &cols), Some("NAME"));
+        assert_eq!(column_for("mixed", &cols), Some("mixed"));
+        assert_eq!(column_for("MIXED", &cols), None);
+        assert_eq!(column_for("other", &cols), None);
+
+        let recs = vec![json!({"id": 1, "name": "a"}), json!({"ID": 2, "id": 9})];
+        let folded = fold_to_columns(&recs, &cols);
+        assert_eq!(folded[0], json!({"ID": 1, "NAME": "a"}));
+        assert_eq!(folded[1], json!({"ID": 2, "id": 9}));
+        let exact = vec![json!({"ID": 1})];
+        assert!(matches!(
+            fold_to_columns(&exact, &cols),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            fold_names(&["id".to_string(), "zzz".to_string()], &cols),
+            vec!["ID".to_string(), "zzz".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unquoted_table_is_found_by_its_upper_case_name() {
+        assert_eq!(pick_table("events", false, true), "EVENTS");
+        assert_eq!(pick_table("app.events", false, true), "APP.EVENTS");
+        assert_eq!(pick_table("events", true, true), "events");
+        assert_eq!(pick_table("events", false, false), "events");
+        assert_eq!(pick_table("EVENTS", false, true), "EVENTS");
+    }
+
+    #[test]
+    fn the_zero_column_error_names_the_keys_and_the_fix() {
+        let err =
+            no_columns_error("\"T\"", &[json!({"b": 1, "a": 2}), json!({"a": 3})]).to_string();
+        assert!(err.contains("[\"a\", \"b\"]"), "{err}");
+        assert!(err.contains("identifier_case: upper"), "{err}");
+    }
 
     fn col(name: &str, ty: &str, precision: Option<i64>, scale: Option<i64>) -> ColumnInfo {
         ColumnInfo {
@@ -795,11 +1040,13 @@ mod tests {
         .unwrap();
         let sql = create_table_sql("\"T\"", &planned, &["SKU".to_string()]).unwrap();
         assert!(sql.contains("\"SKU\" VARCHAR2(1000 CHAR)"), "{sql}");
-        assert!(sql.contains("\"QTY\" NUMBER(19)"), "{sql}");
+        assert!(sql.contains("\"QTY\" NUMBER,"), "{sql}");
         assert!(sql.contains("\"OK\" NUMBER(1)"), "{sql}");
         assert!(sql.contains("\"P\" BINARY_DOUBLE"), "{sql}");
         assert!(sql.contains("\"DOC\" CLOB"), "{sql}");
         assert!(sql.ends_with("PRIMARY KEY (\"SKU\"))"), "{sql}");
+        let int_keyed = create_table_sql("\"T\"", &planned, &["QTY".to_string()]).unwrap();
+        assert!(int_keyed.contains("\"QTY\" NUMBER(38)"), "{int_keyed}");
         let unkeyed = create_table_sql("\"T\"", &planned, &[]).unwrap();
         assert!(!unkeyed.contains("PRIMARY KEY"));
         assert_eq!(
@@ -919,5 +1166,94 @@ mod tests {
         assert_eq!(case_records(&recs, true)[0], json!({"ID": 1}));
         assert_eq!(case_records(&recs, true)[1], json!(5));
         assert_eq!(case_records(&recs, false)[0], json!({"id": 1}));
+    }
+    #[test]
+    fn upsert_records_group_by_the_columns_they_carry() {
+        let cols: Vec<String> = ["ID", "A", "B"].iter().map(|s| s.to_string()).collect();
+        let records = vec![
+            json!({"ID": 1, "A": 1, "B": 1}),
+            json!({"ID": 2, "A": null}),
+            json!({"ID": 3, "A": 3, "B": 3}),
+        ];
+        let groups = group_by_present_columns(&records, &cols);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec![records[0].clone(), records[2].clone()]);
+        assert_eq!(groups[1], vec![records[1].clone()]);
+    }
+    fn oinfo(name: &str, insertable: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: "VARCHAR2".into(),
+            precision: None,
+            scale: None,
+            nullable: true,
+            insertable,
+        }
+    }
+
+    #[test]
+    fn prepare_rows_folds_keys_and_encodes_per_mode() {
+        let info = vec![oinfo("ID", true), oinfo("NAME", true), oinfo("V", false)];
+        let auto = OracleColumnMapping::AutoColumns {
+            on_unknown_field: OnUnknownField::Drop,
+        };
+        let (cols, kinds, rows) =
+            prepare_rows(&auto, &info, &[json!({"id": "1", "name": "a", "zz": 1})]).unwrap();
+        assert_eq!(cols, vec!["ID", "NAME"]);
+        assert_eq!(kinds, vec![BindKind::Text, BindKind::Text]);
+        assert_eq!(rows[0].1.as_ref().unwrap()[1].as_deref(), Some("a"));
+        let json_mode = OracleColumnMapping::JsonColumn {
+            column: "DOC".into(),
+        };
+        let (cols, kinds, rows) = prepare_rows(&json_mode, &[], &[json!({"a": 1})]).unwrap();
+        assert_eq!(
+            (cols, kinds),
+            (vec!["DOC".to_string()], vec![BindKind::Clob])
+        );
+        assert_eq!(
+            rows[0].1.as_ref().unwrap()[0].as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        assert!(drops_unknown(&auto));
+        assert!(!drops_unknown(&json_mode));
+        assert_eq!(insertable_names(&info), vec!["ID", "NAME"]);
+    }
+
+    #[test]
+    fn fold_page_maps_keys_only_in_auto_mode() {
+        let names = vec!["ID".to_string(), "NAME".to_string()];
+        let spec = faucet_core::WriteSpec {
+            write_mode: faucet_core::WriteMode::Upsert,
+            key: vec!["id".into()],
+            delete_marker: None,
+            rollback: None,
+        };
+        let auto = OracleColumnMapping::AutoColumns {
+            on_unknown_field: OnUnknownField::Error,
+        };
+        let (records, folded) = fold_page(&auto, &names, &[json!({"id": 1})], &spec);
+        assert_eq!(records, vec![json!({"ID": 1})]);
+        assert_eq!(folded.key, vec!["ID"]);
+        let (records, same) = fold_page(&auto, &names, &[], &spec);
+        assert!(records.is_empty() && same.key == spec.key);
+        let json_mode = OracleColumnMapping::JsonColumn {
+            column: "DOC".into(),
+        };
+        let (records, same) = fold_page(&json_mode, &names, &[json!({"id": 1})], &spec);
+        assert_eq!(
+            (records[0].clone(), same.key),
+            (json!({"id": 1}), spec.key.clone())
+        );
+    }
+
+    #[test]
+    fn upsert_groups_fold_then_group_each_chunk() {
+        let insertable = vec!["ID".to_string(), "A".to_string()];
+        let first = [json!({"id": 1, "a": 1}), json!({"id": 2})];
+        let second = [json!({"ID": 3, "A": 3})];
+        let groups = upsert_groups(&[&first[..], &second[..]], &insertable);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0], vec![json!({"ID": 1, "A": 1})]);
+        assert_eq!(groups[1], vec![json!({"ID": 2})]);
     }
 }

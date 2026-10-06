@@ -566,13 +566,7 @@ impl MssqlCdcSource {
                         }
                         PollPlan::Query { from, to, gap } => {
                             if gap {
-                                tracing::warn!(
-                                    connector = "mssql-cdc",
-                                    capture_instance = %ci,
-                                    "resume point predates the retained minimum LSN; the CDC \
-                                     cleanup job purged changes before they were read — resuming \
-                                     from the earliest retained change (a data gap is possible)"
-                                );
+                                crate::change::check_gap(self.config.on_gap, ci, &from.to_hex())?;
                             }
 
                             let sql = changes_sql(ci);

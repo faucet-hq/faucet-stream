@@ -6,6 +6,7 @@ use faucet_core::FaucetError;
 use serde_json::Value;
 use tiberius::ToSql;
 
+use crate::coltype::placeholder;
 use crate::config::OnUnknownField;
 
 /// An owned bind parameter, so the `&dyn ToSql` slice handed to `tiberius`
@@ -15,7 +16,11 @@ pub(crate) enum BoundParam {
     F64(f64),
     Bool(bool),
     Str(String),
-    Null(Option<i32>),
+    /// A NULL bound as `nvarchar`, which converts to every non-binary type
+    /// (an `int` NULL does not: SQL-38).
+    Null(Option<String>),
+    /// A NULL for a `binary` / `varbinary` / `image` column.
+    NullBinary(Option<Vec<u8>>),
 }
 
 impl BoundParam {
@@ -39,6 +44,14 @@ impl BoundParam {
         }
     }
 
+    /// [`from_value`](Self::from_value), with a NULL typed for a binary column.
+    pub(crate) fn for_column(v: &Value, binary: bool) -> Self {
+        match v {
+            Value::Null if binary => BoundParam::NullBinary(None),
+            other => Self::from_value(other),
+        }
+    }
+
     pub(crate) fn as_tosql(&self) -> &dyn ToSql {
         match self {
             BoundParam::I64(v) => v,
@@ -46,6 +59,7 @@ impl BoundParam {
             BoundParam::Bool(v) => v,
             BoundParam::Str(v) => v,
             BoundParam::Null(v) => v,
+            BoundParam::NullBinary(v) => v,
         }
     }
 }
@@ -73,25 +87,34 @@ pub(crate) fn max_rows_per_insert(num_cols: usize) -> usize {
     by_params.min(MAX_VALUES_ROWS)
 }
 
+/// One `VALUES` row group of `width` placeholders starting at `@P{start}`, each
+/// wrapped in its column's `CAST` target when `casts` names one. `casts` is
+/// either empty (no casts) or one entry per column.
+fn row_group(start: usize, width: usize, casts: &[Option<String>]) -> String {
+    let phs: Vec<String> = (0..width)
+        .map(|i| placeholder(start + i, casts.get(i).and_then(|c| c.as_deref())))
+        .collect();
+    format!("({})", phs.join(", "))
+}
+
 /// Build a multi-row `INSERT` with `@P`-numbered placeholders:
 /// `INSERT INTO <table> (c1, c2) VALUES (@P1, @P2), (@P3, @P4), …`.
 ///
 /// `table_quoted` and the `cols_quoted` entries must already be quoted via
 /// `quote_ident_mssql`.
-pub(crate) fn build_insert_sql(
+///
+/// Each placeholder is cast to its column's type when `casts` names one, so a
+/// column mixing NULLs, numbers and strings across rows has one type (SQL-39).
+pub(crate) fn build_insert_sql_cast(
     table_quoted: &str,
     cols_quoted: &[String],
+    casts: &[Option<String>],
     num_rows: usize,
 ) -> String {
     let num_cols = cols_quoted.len();
-    let mut tuples = Vec::with_capacity(num_rows);
-    for row in 0..num_rows {
-        let start = row * num_cols + 1;
-        let placeholders: Vec<String> = (start..start + num_cols)
-            .map(|i| format!("@P{i}"))
-            .collect();
-        tuples.push(format!("({})", placeholders.join(", ")));
-    }
+    let tuples: Vec<String> = (0..num_rows)
+        .map(|row| row_group(row * num_cols + 1, num_cols, casts))
+        .collect();
     format!(
         "INSERT INTO {} ({}) VALUES {}",
         table_quoted,
@@ -164,15 +187,19 @@ pub(crate) fn resolve_insert_columns(
 ///
 /// Emits `n_rows` `VALUES` groups of `cols.len()` `@PN` params each, numbered
 /// row-major so the binding order matches `n_rows` calls of
-/// [`auto_row_params(record, cols)`](auto_row_params) concatenated in record
+/// [`auto_row_params_typed(record, cols, …)`](auto_row_params_typed) concatenated in record
 /// order. Joins on every `key` column, `UPDATE`s the non-key columns, and
 /// `INSERT`s all columns. When every column is a key there is nothing to
 /// update, so the `WHEN MATCHED` clause is omitted entirely. T-SQL requires a
 /// terminating `;` on `MERGE`, so one is always appended.
-pub(crate) fn build_merge(
+///
+/// Each placeholder is cast to its column's type (SQL-38, SQL-39); `casts` is
+/// empty or one entry per `cols` entry.
+pub(crate) fn build_merge_cast(
     table: &str,
     key: &[String],
     cols: &[String],
+    casts: &[Option<String>],
     n_rows: usize,
 ) -> Result<String, FaucetError> {
     let q = |s: &str| quote_ident_mssql(s);
@@ -180,20 +207,8 @@ pub(crate) fn build_merge(
     let quoted_keys: Vec<String> = key.iter().map(|k| q(k)).collect::<Result<_, _>>()?;
     let col_list = quoted_cols.join(", ");
 
-    let mut ph = 1usize;
     let groups: Vec<String> = (0..n_rows)
-        .map(|_| {
-            let g = cols
-                .iter()
-                .map(|_| {
-                    let p = format!("@P{ph}");
-                    ph += 1;
-                    p
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({g})")
-        })
+        .map(|row| row_group(row * cols.len() + 1, cols.len(), casts))
         .collect();
 
     let on = quoted_keys
@@ -239,9 +254,12 @@ pub(crate) fn build_merge(
 /// expressed as a `MERGE` whose source is the `VALUES` list of key tuples.
 /// Params are numbered row-major over the key columns, matching how the caller
 /// binds each [`KeyTuple`](faucet_core::KeyTuple)'s values in `key` order.
-pub(crate) fn build_merge_delete(
+///
+/// Each key placeholder is cast to its column's type when `casts` names one.
+pub(crate) fn build_merge_delete_cast(
     table: &str,
     key: &[String],
+    casts: &[Option<String>],
     n_rows: usize,
 ) -> Result<String, FaucetError> {
     let quoted_keys: Vec<String> = key
@@ -250,20 +268,8 @@ pub(crate) fn build_merge_delete(
         .collect::<Result<_, _>>()?;
     let key_list = quoted_keys.join(", ");
 
-    let mut ph = 1usize;
     let groups: Vec<String> = (0..n_rows)
-        .map(|_| {
-            let g = key
-                .iter()
-                .map(|_| {
-                    let p = format!("@P{ph}");
-                    ph += 1;
-                    p
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({g})")
-        })
+        .map(|row| row_group(row * key.len() + 1, key.len(), casts))
         .collect();
 
     let on = quoted_keys
@@ -348,13 +354,19 @@ pub(crate) fn build_cleanup_temp_create_sql(
 /// and 1000-row-values ceilings.
 pub(crate) fn build_cleanup_key_insert_sql(
     key: &[String],
+    casts: &[Option<String>],
     n_rows: usize,
 ) -> Result<String, FaucetError> {
     let quoted_keys: Vec<String> = key
         .iter()
         .map(|k| quote_ident_mssql(k))
         .collect::<Result<_, _>>()?;
-    Ok(build_insert_sql(CLEANUP_TEMP_TABLE, &quoted_keys, n_rows))
+    Ok(build_insert_sql_cast(
+        CLEANUP_TEMP_TABLE,
+        &quoted_keys,
+        casts,
+        n_rows,
+    ))
 }
 
 /// Build the scoped-cleanup `DELETE`: every row matching `scope` whose key is
@@ -412,14 +424,47 @@ pub(crate) fn build_cleanup_delete_sql(
     ))
 }
 
-/// Bind one record's values in `columns` order (SQL NULL for missing keys).
-pub(crate) fn auto_row_params(record: &Value, columns: &[String]) -> Vec<BoundParam> {
+/// Bind one record's values in `columns` order (SQL NULL for missing keys),
+/// with NULLs typed `varbinary` for the columns flagged in `binary`.
+/// Upsert rows grouped by the subset of `columns` each carries (a key present
+/// with `null` counts as carried), in first-seen order. An upsert writes each
+/// row's own columns only, so a column a row omits keeps its stored value
+/// instead of being overwritten with NULL (#789 SQL-10).
+pub(crate) fn group_by_present_columns<'a>(
+    records: &'a [Value],
+    columns: &[String],
+) -> Vec<(Vec<String>, Vec<&'a Value>)> {
+    let mut groups: Vec<(Vec<String>, Vec<&'a Value>)> = Vec::new();
+    for record in records {
+        let present: Vec<String> = columns
+            .iter()
+            .filter(|c| {
+                record
+                    .as_object()
+                    .is_some_and(|o| o.contains_key(c.as_str()))
+            })
+            .cloned()
+            .collect();
+        match groups.iter_mut().find(|(p, _)| *p == present) {
+            Some((_, rows)) => rows.push(record),
+            None => groups.push((present, vec![record])),
+        }
+    }
+    groups
+}
+
+pub(crate) fn auto_row_params_typed(
+    record: &Value,
+    columns: &[String],
+    binary: &[bool],
+) -> Vec<BoundParam> {
     let obj = record.as_object();
     columns
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             let v = obj.and_then(|o| o.get(c)).unwrap_or(&Value::Null);
-            BoundParam::from_value(v)
+            BoundParam::for_column(v, binary.get(i).copied().unwrap_or(false))
         })
         .collect()
 }
@@ -428,6 +473,40 @@ pub(crate) fn auto_row_params(record: &Value, columns: &[String]) -> Vec<BoundPa
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn upsert_rows_group_by_the_columns_they_carry() {
+        let cols: Vec<String> = ["id", "a", "b"].iter().map(|s| s.to_string()).collect();
+        let records = vec![
+            json!({"id": 1, "a": 1, "b": 1}),
+            json!({"id": 2, "a": null}),
+            json!({"id": 3, "a": 3, "b": 3}),
+            json!(7),
+        ];
+        let groups = group_by_present_columns(&records, &cols);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].0, cols);
+        assert_eq!(groups[0].1, vec![&records[0], &records[2]]);
+        assert_eq!(groups[1].0, vec!["id".to_string(), "a".to_string()]);
+        assert!(groups[2].0.is_empty(), "a non-object carries nothing");
+    }
+
+    fn build_merge_cast_t(
+        table: &str,
+        key: &[String],
+        cols: &[String],
+        n_rows: usize,
+    ) -> Result<String, FaucetError> {
+        build_merge_cast(table, key, cols, &[], n_rows)
+    }
+
+    fn build_merge_delete_cast_t(
+        table: &str,
+        key: &[String],
+        n_rows: usize,
+    ) -> Result<String, FaucetError> {
+        build_merge_delete_cast(table, key, &[], n_rows)
+    }
 
     #[test]
     fn param_split_respects_both_mssql_limits() {
@@ -455,7 +534,7 @@ mod tests {
 
     #[test]
     fn insert_sql_numbers_placeholders_across_rows() {
-        let sql = build_insert_sql("[dbo].[events]", &["[a]".into(), "[b]".into()], 2);
+        let sql = build_insert_sql_cast("[dbo].[events]", &["[a]".into(), "[b]".into()], &[], 2);
         assert_eq!(
             sql,
             "INSERT INTO [dbo].[events] ([a], [b]) VALUES (@P1, @P2), (@P3, @P4)"
@@ -501,7 +580,7 @@ mod tests {
     #[test]
     fn auto_row_params_binds_null_for_missing_keys() {
         let columns = vec!["id".to_string(), "name".to_string()];
-        let params = auto_row_params(&json!({"id": 7}), &columns);
+        let params = auto_row_params_typed(&json!({"id": 7}), &columns, &[]);
         assert_eq!(params.len(), 2);
         assert!(matches!(params[0], BoundParam::I64(7)));
         assert!(matches!(params[1], BoundParam::Null(None)));
@@ -538,7 +617,7 @@ mod tests {
 
     #[test]
     fn mssql_merge_statement_shape() {
-        let sql = build_merge(
+        let sql = build_merge_cast_t(
             "[dbo].[t]",
             &["id".to_string()],
             &["id".to_string(), "name".to_string()],
@@ -571,7 +650,7 @@ mod tests {
     fn mssql_merge_all_keys_has_no_update_clause() {
         // When every column is a key, there is nothing to UPDATE — emit no WHEN
         // MATCHED clause.
-        let sql = build_merge("[t]", &["id".to_string()], &["id".to_string()], 2).unwrap();
+        let sql = build_merge_cast_t("[t]", &["id".to_string()], &["id".to_string()], 2).unwrap();
         assert!(!sql.contains("WHEN MATCHED"), "{sql}");
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"), "{sql}");
         assert!(sql.contains("(@P1), (@P2)"), "two single-col rows: {sql}");
@@ -581,7 +660,7 @@ mod tests {
     fn mssql_merge_numbers_params_row_major() {
         // Two rows of two columns → @P1..@P4 in row-major order, matching how
         // `auto_row_params` is concatenated per row.
-        let sql = build_merge(
+        let sql = build_merge_cast_t(
             "[t]",
             &["id".to_string()],
             &["id".to_string(), "name".to_string()],
@@ -596,7 +675,7 @@ mod tests {
 
     #[test]
     fn mssql_merge_composite_key_joins_on_all_key_cols() {
-        let sql = build_merge(
+        let sql = build_merge_cast_t(
             "[t]",
             &["a".to_string(), "b".to_string()],
             &["a".to_string(), "b".to_string(), "v".to_string()],
@@ -616,7 +695,7 @@ mod tests {
 
     #[test]
     fn mssql_merge_delete_statement_shape() {
-        let sql = build_merge_delete("[dbo].[t]", &["id".to_string()], 2).unwrap();
+        let sql = build_merge_delete_cast_t("[dbo].[t]", &["id".to_string()], 2).unwrap();
         assert!(sql.contains("MERGE [dbo].[t] AS tgt"), "{sql}");
         assert!(
             sql.contains("USING (VALUES (@P1), (@P2)) AS src ([id])"),
@@ -629,7 +708,7 @@ mod tests {
 
     #[test]
     fn mssql_merge_delete_composite_key() {
-        let sql = build_merge_delete("[t]", &["a".to_string(), "b".to_string()], 1).unwrap();
+        let sql = build_merge_delete_cast_t("[t]", &["a".to_string(), "b".to_string()], 1).unwrap();
         assert!(
             sql.contains("USING (VALUES (@P1, @P2)) AS src ([a], [b])"),
             "{sql}"
@@ -686,8 +765,64 @@ mod tests {
     }
 
     #[test]
+    fn casts_give_every_row_of_a_column_one_type() {
+        let casts = vec![Some("datetime2(7)".to_string()), None];
+        let sql = build_insert_sql_cast("[t]", &["[a]".into(), "[b]".into()], &casts, 2);
+        assert_eq!(
+            sql,
+            "INSERT INTO [t] ([a], [b]) VALUES (CAST(@P1 AS datetime2(7)), @P2), \
+             (CAST(@P3 AS datetime2(7)), @P4)"
+        );
+        let merge = build_merge_cast(
+            "[t]",
+            &["id".to_string()],
+            &["id".to_string(), "note".to_string()],
+            &[Some("int".into()), Some("nvarchar(max)".into())],
+            2,
+        )
+        .unwrap();
+        assert!(
+            merge.contains(
+                "(CAST(@P1 AS int), CAST(@P2 AS nvarchar(max))), \
+                 (CAST(@P3 AS int), CAST(@P4 AS nvarchar(max)))"
+            ),
+            "{merge}"
+        );
+        let delete =
+            build_merge_delete_cast("[t]", &["id".to_string()], &[Some("bigint".into())], 2)
+                .unwrap();
+        assert!(
+            delete.contains("(CAST(@P1 AS bigint)), (CAST(@P2 AS bigint))"),
+            "{delete}"
+        );
+        let keys =
+            build_cleanup_key_insert_sql(&["id".to_string()], &[Some("int".into())], 1).unwrap();
+        assert!(keys.ends_with("VALUES (CAST(@P1 AS int))"), "{keys}");
+    }
+
+    #[test]
+    fn nulls_bind_as_text_or_binary_never_int() {
+        let rows = auto_row_params_typed(
+            &json!({"a": null, "b": "x"}),
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &[false, false, true],
+        );
+        assert!(matches!(rows[0], BoundParam::Null(None)));
+        assert!(matches!(rows[1], BoundParam::Str(_)));
+        assert!(matches!(rows[2], BoundParam::NullBinary(None)));
+        for p in &rows {
+            let _ = p.as_tosql();
+        }
+        assert!(matches!(
+            BoundParam::for_column(&json!(1), true),
+            BoundParam::I64(1)
+        ));
+    }
+
+    #[test]
     fn cleanup_key_insert_numbers_params_row_major() {
-        let sql = build_cleanup_key_insert_sql(&["a".to_string(), "b".to_string()], 2).unwrap();
+        let sql =
+            build_cleanup_key_insert_sql(&["a".to_string(), "b".to_string()], &[], 2).unwrap();
         assert_eq!(
             sql,
             "INSERT INTO #faucet_cleanup_keys ([a], [b]) VALUES (@P1, @P2), (@P3, @P4)"

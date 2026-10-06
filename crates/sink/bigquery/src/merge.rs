@@ -16,13 +16,17 @@ fn key_field<'a>(columns: &'a [FieldSpec], name: &str) -> Option<&'a FieldSpec> 
     columns.iter().find(|f| f.name == name)
 }
 
-/// `SELECT <typed expr> AS `col`, … FROM UNNEST(JSON_QUERY_ARRAY(<payload_param>)) AS r`.
-///
-/// Each column is extracted with the same typed `column_expr` the exactly-once
-/// `INSERT … SELECT` uses, then aliased to its name so the MERGE `ON`/`SET`/
-/// `INSERT` clauses can reference `S.`col``.
-pub(crate) fn build_source_select(columns: &[FieldSpec], payload_param: &str) -> String {
-    let exprs = columns
+/// The alias of the presence flag for the `i`-th column of the MERGE source.
+fn presence_alias(i: usize) -> String {
+    format!("`__faucet_has_{i}`")
+}
+
+/// The MERGE source: the typed columns plus, for every non-key column, whether
+/// the record carries that key at all. `JSON_QUERY` returns SQL `NULL` only for
+/// a missing key (an explicit JSON `null` comes back as the text `null`), so
+/// the flag tells "absent" from "set to null".
+fn build_merge_source(columns: &[FieldSpec], key: &[String], payload_param: &str) -> String {
+    let mut exprs: Vec<String> = columns
         .iter()
         .map(|f| {
             let path = format!("${}", json_path_segment(&f.name));
@@ -32,12 +36,28 @@ pub(crate) fn build_source_select(columns: &[FieldSpec], payload_param: &str) ->
                 quote_ident(&f.name)
             )
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("SELECT {exprs} FROM UNNEST(JSON_QUERY_ARRAY({payload_param})) AS r")
+        .collect();
+    for (i, f) in columns.iter().enumerate() {
+        if key.iter().any(|k| k == &f.name) {
+            continue;
+        }
+        let path = format!("${}", json_path_segment(&f.name));
+        exprs.push(format!(
+            "JSON_QUERY(r, '{path}') IS NOT NULL AS {}",
+            presence_alias(i)
+        ));
+    }
+    format!(
+        "SELECT {} FROM UNNEST(JSON_QUERY_ARRAY({payload_param})) AS r",
+        exprs.join(", ")
+    )
 }
 
 /// The in-place upsert `MERGE` over the `@payload` page.
+///
+/// A matched row keeps its current value for every column the record does not
+/// carry: assigning every table column nulled enrichment columns, columns a
+/// transform dropped, and anything a partial (CDC) image left out (SQL-11).
 pub(crate) fn build_merge_upsert(
     columns: &[FieldSpec],
     key: &[String],
@@ -45,7 +65,7 @@ pub(crate) fn build_merge_upsert(
     dataset: &str,
     table: &str,
 ) -> String {
-    let src = build_source_select(columns, "@payload");
+    let src = build_merge_source(columns, key, "@payload");
     let on = key
         .iter()
         .map(|k| format!("T.{q} = S.{q}", q = quote_ident(k)))
@@ -63,8 +83,15 @@ pub(crate) fn build_merge_upsert(
         .join(", ");
     let non_key_sets = columns
         .iter()
-        .filter(|f| !key.iter().any(|k| k == &f.name))
-        .map(|f| format!("{q} = S.{q}", q = quote_ident(&f.name)))
+        .enumerate()
+        .filter(|(_, f)| !key.iter().any(|k| k == &f.name))
+        .map(|(i, f)| {
+            format!(
+                "{q} = IF(S.{p}, S.{q}, T.{q})",
+                q = quote_ident(&f.name),
+                p = presence_alias(i)
+            )
+        })
         .collect::<Vec<_>>();
     let matched = if non_key_sets.is_empty() {
         String::new()
@@ -310,11 +337,11 @@ mod tests {
     }
 
     #[test]
-    fn source_select_aliases_each_typed_column() {
-        let sql = build_source_select(&id_name_cols(), "@payload");
+    fn merge_source_types_each_column_and_flags_non_key_presence() {
+        let sql = build_merge_source(&id_name_cols(), &["id".into()], "@payload");
         assert_eq!(
             sql,
-            "SELECT CAST(JSON_VALUE(r, '$.id') AS INT64) AS `id`, JSON_VALUE(r, '$.name') AS `name` FROM UNNEST(JSON_QUERY_ARRAY(@payload)) AS r"
+            "SELECT CAST(JSON_VALUE(r, '$.id') AS INT64) AS `id`, JSON_VALUE(r, '$.name') AS `name`, JSON_QUERY(r, '$.name') IS NOT NULL AS `__faucet_has_1` FROM UNNEST(JSON_QUERY_ARRAY(@payload)) AS r"
         );
     }
 
@@ -323,7 +350,7 @@ mod tests {
         let sql = build_merge_upsert(&id_name_cols(), &["id".into()], "p", "d", "t");
         assert_eq!(
             sql,
-            "MERGE INTO `p.d.t` T USING (SELECT CAST(JSON_VALUE(r, '$.id') AS INT64) AS `id`, JSON_VALUE(r, '$.name') AS `name` FROM UNNEST(JSON_QUERY_ARRAY(@payload)) AS r) S ON T.`id` = S.`id` WHEN MATCHED THEN UPDATE SET `name` = S.`name` WHEN NOT MATCHED THEN INSERT (`id`, `name`) VALUES (S.`id`, S.`name`)"
+            "MERGE INTO `p.d.t` T USING (SELECT CAST(JSON_VALUE(r, '$.id') AS INT64) AS `id`, JSON_VALUE(r, '$.name') AS `name`, JSON_QUERY(r, '$.name') IS NOT NULL AS `__faucet_has_1` FROM UNNEST(JSON_QUERY_ARRAY(@payload)) AS r) S ON T.`id` = S.`id` WHEN MATCHED THEN UPDATE SET `name` = IF(S.`__faucet_has_1`, S.`name`, T.`name`) WHEN NOT MATCHED THEN INSERT (`id`, `name`) VALUES (S.`id`, S.`name`)"
         );
     }
 
@@ -340,7 +367,9 @@ mod tests {
             "got: {sql}"
         );
         assert!(
-            sql.contains("WHEN MATCHED THEN UPDATE SET `name` = S.`name`"),
+            sql.contains(
+                "WHEN MATCHED THEN UPDATE SET `name` = IF(S.`__faucet_has_2`, S.`name`, T.`name`)"
+            ),
             "got: {sql}"
         );
         assert!(
@@ -360,6 +389,10 @@ mod tests {
             "t",
         );
         assert!(!sql.contains("WHEN MATCHED"), "got: {sql}");
+        assert!(
+            !sql.contains("__faucet_has"),
+            "keys need no presence flag: {sql}"
+        );
         assert!(
             sql.contains("ON T.`id` = S.`id` WHEN NOT MATCHED THEN INSERT (`id`) VALUES (S.`id`)"),
             "got: {sql}"

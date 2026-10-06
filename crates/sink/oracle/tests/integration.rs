@@ -370,3 +370,119 @@ async fn oracle_sink_end_to_end() {
         .unwrap();
     assert_eq!(report.failed_count(), 0, "{report:?}");
 }
+
+/// SQL-16: an integral first page creates an unconstrained `NUMBER`, so a later
+/// fraction is stored exactly. SQL-17: lower-case keys and a lower-case `table`
+/// reach a table created with unquoted DDL, and a page whose keys match no
+/// column fails instead of reporting rows written.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_sink_keeps_fractions_and_finds_unquoted_tables() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+
+    let sink = OracleSink::new(OracleSinkConfig::new(conn.clone(), "PRICES"))
+        .await
+        .expect("sink");
+    sink.write_batch(&[json!({"ID": 1, "AMOUNT": 10})])
+        .await
+        .expect("integral page");
+    sink.write_batch(&[json!({"ID": 2, "AMOUNT": 99.95})])
+        .await
+        .expect("fractional page");
+    let amounts =
+        common::query_strings(&conn, "SELECT TO_CHAR(AMOUNT) FROM PRICES ORDER BY ID").await;
+    assert_eq!(amounts, vec![Some("10".into()), Some("99.95".into())]);
+
+    common::exec(
+        &conn,
+        &["CREATE TABLE ORDERS (ID NUMBER PRIMARY KEY, NAME VARCHAR2(20))"],
+    )
+    .await;
+    let lower = OracleSink::new(OracleSinkConfig::new(conn.clone(), "orders"))
+        .await
+        .expect("sink");
+    assert_eq!(
+        lower
+            .write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2})])
+            .await
+            .expect("lower-case keys"),
+        2
+    );
+    assert_eq!(count(&conn, "ORDERS").await, 2);
+    let shadow = common::query_strings(
+        &conn,
+        "SELECT TO_CHAR(COUNT(*)) FROM USER_TABLES WHERE TABLE_NAME = 'orders'",
+    )
+    .await;
+    assert_eq!(shadow, vec![Some("0".into())], "no lower-case shadow table");
+
+    let mut upsert = OracleSinkConfig::new(conn.clone(), "orders");
+    upsert.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["id".into()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let upsert = OracleSink::new(upsert).await.expect("upsert sink");
+    upsert
+        .write_batch(&[json!({"id": 2, "name": "b"})])
+        .await
+        .expect("keyed lower-case write");
+    let names = common::query_strings(&conn, "SELECT NAME FROM ORDERS ORDER BY ID").await;
+    assert_eq!(names, vec![Some("a".into()), Some("b".into())]);
+
+    let err = lower
+        .write_batch(&[json!({"nothing": 1})])
+        .await
+        .expect_err("no matching column");
+    assert!(err.to_string().contains("match a column"), "{err}");
+    assert_eq!(count(&conn, "ORDERS").await, 2);
+}
+
+/// SQL-10: an upsert leaves a column a record does not carry untouched (the
+/// partial images oracle-cdc emits under PK-only supplemental logging); an
+/// explicit `null` still clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_upsert_keeps_columns_a_record_does_not_carry() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE PARTIAL (ID NUMBER PRIMARY KEY, A VARCHAR2(20), B VARCHAR2(20))",
+            "INSERT INTO PARTIAL VALUES (1, 'a1', 'b1')",
+            "INSERT INTO PARTIAL VALUES (2, 'a2', 'b2')",
+        ],
+    )
+    .await;
+    let mut cfg = OracleSinkConfig::new(conn.clone(), "PARTIAL");
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["ID".into()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = OracleSink::new(cfg).await.expect("upsert sink");
+    sink.write_batch(&[
+        json!({"ID": 1, "A": "a1-new"}),
+        json!({"ID": 2, "A": "a2-new", "B": null}),
+        json!({"ID": 3, "B": "b3"}),
+    ])
+    .await
+    .expect("upsert");
+    let rows = common::query_strings(
+        &conn,
+        "SELECT TO_CHAR(ID) || ':' || NVL(A, '-') || ':' || NVL(B, '-') FROM PARTIAL ORDER BY ID",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            Some("1:a1-new:b1".into()),
+            Some("2:a2-new:-".into()),
+            Some("3:-:b3".into()),
+        ]
+    );
+}

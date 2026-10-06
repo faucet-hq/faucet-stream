@@ -98,6 +98,30 @@ async fn oracle_query_source_end_to_end() {
     assert_eq!(rows, vec![json!({"ID": 3, "UPDATED_AT": 30})]);
     assert_eq!(bm, Some(json!(30)));
 
+    // SQL-41: the documented push-down on a DATE / TIMESTAMP cursor binds the
+    // ISO bookmark (with its `T`) as a timestamp, not NLS-formatted text.
+    for (column, initial) in [
+        ("D", "1970-01-01T00:00:00"),
+        ("TS", "1970-01-01T00:00:00"),
+        ("TSZ", "1970-01-01T00:00:00+00:00"),
+    ] {
+        let mut temporal = OracleSourceConfig::new(
+            conn.clone(),
+            format!("SELECT ID, {column} FROM T_TYPES WHERE {column} > :bookmark"),
+        );
+        temporal.replication = OracleReplication::Incremental {
+            column: column.into(),
+            initial_value: json!(initial),
+        };
+        let source = OracleSource::new(temporal).await.expect("source");
+        let (rows, bm) = source.fetch_all_incremental().await.expect(column);
+        assert_eq!(rows.len(), 1, "{column}: {rows:?}");
+        let bm = bm.expect("bookmark");
+        source.apply_start_bookmark(bm).await.unwrap();
+        let (again, _) = source.fetch_all_incremental().await.expect(column);
+        assert!(again.is_empty(), "{column} resumes past its bookmark");
+    }
+
     // PK-range sharding covers every row exactly once.
     let mut sharded = OracleSourceConfig::new(conn.clone(), "SELECT ID FROM T_TYPES");
     sharded.shard = Some(ShardConfig { key: "ID".into() });

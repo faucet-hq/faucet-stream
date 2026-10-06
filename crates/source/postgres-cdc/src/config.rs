@@ -11,6 +11,10 @@ fn default_true() -> bool {
 fn default_proto_version() -> u32 {
     1
 }
+fn default_max_cycle_duration() -> Duration {
+    Duration::from_secs(300)
+}
+
 fn default_idle_timeout() -> Duration {
     Duration::from_secs(30)
 }
@@ -115,6 +119,22 @@ pub struct PostgresCdcSourceConfig {
     #[serde(default)]
     pub max_messages: Option<usize>,
 
+    /// Longest a fetch cycle runs before it ends at the next transaction
+    /// boundary. Default: 300 s; `0` means no bound.
+    ///
+    /// The slot's `confirmed_flush_lsn` advances only at the start of a cycle,
+    /// from the bookmark the previous cycle persisted. Under steady writes
+    /// `idle_timeout` never fires, so without this bound a cycle — and the WAL
+    /// the slot pins — would grow until the primary's disk filled. A
+    /// long-running runtime (`faucet schedule`, `faucet serve`, `faucet
+    /// mirror`) starts the next cycle straight away.
+    #[serde(
+        default = "default_max_cycle_duration",
+        with = "faucet_core::config::duration_secs"
+    )]
+    #[schemars(with = "u64")]
+    pub max_cycle_duration: Duration,
+
     /// Maximum number of change records buffered in memory for a *single*
     /// in-progress transaction before it is aborted.
     ///
@@ -217,6 +237,7 @@ impl std::fmt::Debug for PostgresCdcSourceConfig {
             .field("proto_version", &self.proto_version)
             .field("idle_timeout", &self.idle_timeout)
             .field("max_messages", &self.max_messages)
+            .field("max_cycle_duration", &self.max_cycle_duration)
             .field("max_staged_records", &self.max_staged_records)
             .field("status_update_interval", &self.status_update_interval)
             .field("tcp_keepalive", &self.tcp_keepalive)
@@ -315,6 +336,7 @@ mod tests {
             proto_version: 1,
             idle_timeout: std::time::Duration::from_secs(30),
             max_messages: None,
+            max_cycle_duration: default_max_cycle_duration(),
             max_staged_records: None,
             status_update_interval: std::time::Duration::from_secs(10),
             tcp_keepalive: std::time::Duration::from_secs(60),

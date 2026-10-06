@@ -5,6 +5,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// How the row path receives a statement's result (ignored under
+/// `arrow_native`, which always uses external links).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultDisposition {
+    /// Chunks are downloaded from presigned cloud-storage URLs (no size cap;
+    /// the client must be able to reach the workspace's storage). Default.
+    #[default]
+    ExternalLinks,
+    /// Chunks are returned inside the API response. Databricks fails a
+    /// statement whose result exceeds 25 MiB in this mode.
+    Inline,
+}
+
 /// How the source replicates rows across runs.
 ///
 /// Serializes as `{ type: full }` or
@@ -171,6 +185,13 @@ pub struct DatabricksSourceConfig {
     /// `INLINE` + `JSON_ARRAY` row path, unchanged). RFC 0002 / #375.
     #[serde(default)]
     pub arrow_native: bool,
+    /// How the row path fetches results: `external_links` (default) downloads
+    /// each chunk from a presigned URL, so results of any size stream;
+    /// `inline` keeps them in the API response, which Databricks caps at
+    /// 25 MiB. Use `inline` only when the client cannot reach the workspace's
+    /// cloud storage.
+    #[serde(default)]
+    pub result_disposition: ResultDisposition,
     /// Replication mode. Defaults to [`DatabricksReplication::Full`].
     #[serde(default)]
     pub replication: DatabricksReplication,
@@ -244,6 +265,7 @@ mod tests {
             poll_interval_secs: default_poll_interval(),
             batch_size: DEFAULT_BATCH_SIZE,
             arrow_native: false,
+            result_disposition: ResultDisposition::default(),
             replication: DatabricksReplication::Full,
             state_key: None,
         }

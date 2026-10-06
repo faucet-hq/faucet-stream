@@ -132,7 +132,12 @@ need the crate's `staging` feature.
   `WHEN NOT MATCHED AND op = 'u' THEN INSERT`. Rows are deduplicated per page
   (last write wins) before the `MERGE`, so it never sees two source rows for one
   key. Rows missing a key fail the batch, or go to the DLQ per row via
-  `write_batch_partial`.
+  `write_batch_partial`. Each row carries a flag per non-key column saying whether its
+  record had that column: a matched row updates only the columns its record
+  carried, and an inserted row takes the column's `DEFAULT` (else `NULL`) for
+  one it did not, so an upsert never overwrites a stored value with `NULL`. The
+  exactly-once append path likewise fills a column the page lacks with its
+  `DEFAULT`.
 - **overwrite** — `begin` drops any leftover `<table>__faucet_ovw` and creates
   it `LIKE` the target; every page lands in it; `commit` runs one
   `INSERT OVERWRITE TABLE t SELECT * FROM <staging>` (a single Delta commit —

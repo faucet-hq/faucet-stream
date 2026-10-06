@@ -82,11 +82,11 @@ bookmark compared against a `TIMESTAMP` column needs an explicit cast in the
 query — `updated_at > TIMESTAMP(@bookmark)` — and likewise `DATE(@bookmark)`
 for `DATE` columns. Integer bookmarks bind as `INT64` and compare directly.
 
-**Cursor column type:** the cursor `column` must be `INT64`, `TIMESTAMP`, or
-`DATE`. `NUMERIC` is **rejected** — it decodes to a string to preserve
-precision, so the bookmark comparison would order it lexicographically (`"9" >
-"10"`) and skip or re-read rows. The source fails fast with a clear error rather
-than advancing an incorrect bookmark.
+**Cursor column type:** `INT64`, `TIMESTAMP`, `DATE` and `NUMERIC` all work.
+Cursors are compared by value, not as text: `TIMESTAMP` values as instants
+(Spanner trims trailing fractional zeros, so `…:00Z` sorts after `…:00.5Z` as
+text) and `NUMERIC` strings as exact decimals (`"9" < "10"`). Bind a `NUMERIC`
+cursor with `amount > CAST(@bookmark AS NUMERIC)`.
 
 ## Stale reads
 

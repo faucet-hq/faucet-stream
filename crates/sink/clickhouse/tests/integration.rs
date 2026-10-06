@@ -228,3 +228,154 @@ async fn small_pages_merge_into_one_insert() {
     .await;
     assert_eq!(parts, 1, "ten pages must produce ONE part, not ten");
 }
+
+fn rows(from: i64, n: i64) -> Vec<Value> {
+    (from..from + n)
+        .map(|i| json!({ "id": i, "name": "x" }))
+        .collect()
+}
+
+/// #789 SQL-04: a `flush` whose group commit fails keeps the group, so the
+/// retry the resilience policy makes commits it instead of returning `Ok` on
+/// an empty accumulator.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_flush_keeps_its_group_for_the_retry() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    let mut cfg = ClickHouseSinkConfig::new(&base, "late")
+        .with_batch_size(0)
+        .with_create_table(false);
+    cfg.commit_rows = Some(1_000);
+    let sink = ClickHouseSink::new(cfg).expect("sink");
+
+    sink.write_batch(&rows(0, 10)).await.expect("buffered");
+    sink.write_batch(&rows(10, 10)).await.expect("buffered");
+    assert!(sink.flush().await.is_err(), "the table does not exist yet");
+
+    http_exec(
+        &base,
+        "CREATE TABLE late (id Int64, name String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    sink.flush()
+        .await
+        .expect("the retry commits the kept group");
+    assert_eq!(count_of(&base, "SELECT count() AS n FROM late").await, 20);
+}
+
+/// #789 SQL-04: when the group a `write_batch` call fills fails to commit, the
+/// rows of earlier pages stay buffered; the current page is the caller's to
+/// retry or route, so it is not kept twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_group_in_write_batch_keeps_only_the_earlier_pages() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    let mut cfg = ClickHouseSinkConfig::new(&base, "grouped")
+        .with_batch_size(0)
+        .with_create_table(false);
+    cfg.commit_rows = Some(15);
+    let sink = ClickHouseSink::new(cfg).expect("sink");
+
+    sink.write_batch(&rows(0, 10)).await.expect("buffered");
+    assert!(sink.write_batch(&rows(10, 10)).await.is_err());
+
+    http_exec(
+        &base,
+        "CREATE TABLE grouped (id Int64, name String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    sink.write_batch(&rows(10, 10))
+        .await
+        .expect("the caller's retry of the failed page");
+    sink.flush().await.expect("flush");
+    assert_eq!(
+        count_of(&base, "SELECT count() AS n FROM grouped").await,
+        20
+    );
+    assert_eq!(
+        count_of(&base, "SELECT count(DISTINCT id) AS n FROM grouped").await,
+        20,
+        "no row is written twice"
+    );
+}
+
+/// #789 SQL-21: with a DLQ the sink commits per page — earlier buffered rows
+/// first — and reports exactly the rows of the page that did not land.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_dlq_path_reports_the_rows_of_the_page_that_did_not_land() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE typed (id Int64, n UInt8) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let sink = ClickHouseSink::new(
+        ClickHouseSinkConfig::new(&base, "typed")
+            .with_batch_size(2)
+            .with_create_table(false),
+    )
+    .expect("sink");
+
+    sink.write_batch(&[json!({ "id": 100, "n": 1 })])
+        .await
+        .expect("buffered");
+    let page = vec![
+        json!({ "id": 1, "n": 1 }),
+        json!({ "id": 2, "n": 2 }),
+        json!({ "id": 3, "n": "not a number" }),
+        json!({ "id": 4, "n": 4 }),
+    ];
+    let outcomes = sink.write_batch_partial(&page).await.expect("partial");
+    let landed: Vec<bool> = outcomes.iter().map(|o| o.is_ok()).collect();
+    assert_eq!(landed, vec![true, true, false, false]);
+    assert_eq!(
+        count_of(&base, "SELECT count() AS n FROM typed").await,
+        3,
+        "the buffered row and the first chunk landed"
+    );
+
+    let bad_first = vec![json!({ "id": 5, "n": "x" }), json!({ "id": 6, "n": 6 })];
+    assert!(
+        sink.write_batch_partial(&bad_first).await.is_err(),
+        "nothing landed, so the whole page is the router's to route"
+    );
+    assert!(
+        sink.write_batch_partial(&[])
+            .await
+            .expect("empty")
+            .is_empty()
+    );
+}
+
+/// A group whose earlier pages landed before the failing chunk has nothing to
+/// restore; a fully successful per-page write reports every row as written.
+#[tokio::test(flavor = "multi_thread")]
+async fn landed_rows_are_not_restored_and_a_clean_page_reports_all_rows() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE landed (id Int64, name String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let mut cfg = ClickHouseSinkConfig::new(&base, "landed")
+        .with_batch_size(10)
+        .with_create_table(false);
+    cfg.commit_rows = Some(15);
+    let sink = ClickHouseSink::new(cfg).expect("sink");
+
+    sink.write_batch(&rows(0, 10)).await.expect("buffered");
+    let mut bad = rows(10, 10);
+    bad[3] = json!({ "id": "not a number", "name": "x" });
+    assert!(sink.write_batch(&bad).await.is_err());
+    sink.flush().await.expect("nothing left to commit");
+    assert_eq!(count_of(&base, "SELECT count() AS n FROM landed").await, 10);
+
+    let outcomes = sink
+        .write_batch_partial(&rows(20, 5))
+        .await
+        .expect("all rows land");
+    assert!(outcomes.iter().all(Result::is_ok));
+    assert_eq!(count_of(&base, "SELECT count() AS n FROM landed").await, 15);
+}

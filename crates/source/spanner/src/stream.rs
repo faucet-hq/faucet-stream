@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use faucet_common_spanner::decode::{column_is_numeric, row_to_json};
+use faucet_common_spanner::decode::row_to_json;
 use faucet_common_spanner::quote_ident_spanner;
 use faucet_common_spanner::types::{parse_spanner_type, spanner_type_to_json_schema};
 use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
@@ -317,24 +317,7 @@ impl Source for SpannerSource {
                 .await
                 .map_err(|e| FaucetError::Source(format!("spanner: row stream failed: {e}")))?
             {
-                let first_page = fields.is_none();
                 let fields = fields.get_or_insert_with(|| iter.columns_metadata().clone());
-                // Fail loud on a NUMERIC incremental cursor rather than advancing
-                // a lexicographically-ordered bookmark and silently skipping or
-                // re-reading rows (#466 L3). Checked once, when the metadata
-                // first arrives.
-                if first_page
-                    && let Some(ctx) = incr.as_ref()
-                    && column_is_numeric(fields, &ctx.column)
-                {
-                    Err(FaucetError::Config(format!(
-                        "spanner: incremental cursor column `{}` is NUMERIC, which decodes to a \
-                         string and orders lexicographically (\"9\" > \"10\"), producing an \
-                         incorrect bookmark that skips or re-reads rows. Use an INT64 or \
-                         TIMESTAMP/DATE cursor column instead.",
-                        ctx.column
-                    )))?;
-                }
                 let record = row_to_json(&row, fields)
                     .map_err(|e| FaucetError::Source(format!("spanner: row decode failed: {e}")))?;
                 buffer.push(record);
@@ -582,6 +565,59 @@ mod tests {
             "params bind in deterministic (sorted) order"
         );
         assert!(incr.is_none());
+    }
+
+    #[test]
+    fn timestamp_cursors_compare_as_instants_across_fraction_widths() {
+        // Spanner trims trailing fractional zeros, so `…:00Z` and `…:00.5Z`
+        // differ in width and `'.' < 'Z'` reverses their text order (SQL-30).
+        let ctx = IncrementalCtx {
+            column: "ts".into(),
+            start: json!("2024-01-01T00:00:00Z"),
+        };
+        let page = vec![
+            json!({"ts": "2024-01-01T00:00:00.5Z"}),
+            json!({"ts": "2024-01-01T00:00:00Z"}),
+            json!({"ts": "2024-01-01T00:00:01Z"}),
+        ];
+        let mut max = None;
+        let kept = apply_incremental(page, Some(&ctx), &mut max);
+        assert_eq!(
+            kept,
+            vec![
+                json!({"ts": "2024-01-01T00:00:00.5Z"}),
+                json!({"ts": "2024-01-01T00:00:01Z"})
+            ]
+        );
+        assert_eq!(max, Some(json!("2024-01-01T00:00:01Z")));
+
+        let mut max = Some(json!("2024-01-01T00:00:00.25Z"));
+        apply_incremental(
+            vec![json!({"ts": "2024-01-01T00:00:00.5Z"})],
+            Some(&ctx),
+            &mut max,
+        );
+        assert_eq!(max, Some(json!("2024-01-01T00:00:00.5Z")));
+    }
+
+    #[test]
+    fn numeric_cursors_compare_as_decimals() {
+        let ctx = IncrementalCtx {
+            column: "n".into(),
+            start: json!("9.5"),
+        };
+        let mut max = None;
+        let kept = apply_incremental(
+            vec![
+                json!({"n": "10"}),
+                json!({"n": "9"}),
+                json!({"n": "100.25"}),
+            ],
+            Some(&ctx),
+            &mut max,
+        );
+        assert_eq!(kept, vec![json!({"n": "10"}), json!({"n": "100.25"})]);
+        assert_eq!(max, Some(json!("100.25")));
     }
 
     #[test]

@@ -169,3 +169,184 @@ async fn json_column_with_create_table() {
     assert_eq!(parsed["a"], json!(1));
     assert_eq!(parsed["nested"]["x"], json!(true));
 }
+
+fn auto_cfg(cfg: &MssqlConnectionConfig, table: &str) -> MssqlSinkConfig {
+    let mut s = sink_cfg(cfg, table);
+    s.column_mapping = MssqlColumnMapping::AutoColumns {
+        on_unknown_field: faucet_sink_mssql::OnUnknownField::Warn,
+    };
+    s
+}
+
+/// SQL-38 / SQL-39: a NULL (or a missing key) binds into date/time,
+/// uniqueidentifier and varbinary columns, and one chunk may mix NULLs,
+/// strings and numbers in a text column — on append and on upsert.
+#[tokio::test(flavor = "multi_thread")]
+async fn nulls_and_mixed_values_bind_with_each_columns_type() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+
+    exec(
+        &pool,
+        "CREATE TABLE dbo.typed (id INT NOT NULL PRIMARY KEY, note NVARCHAR(50) NULL, \
+         deleted_at DATETIME2 NULL, ref UNIQUEIDENTIFIER NULL, blob VARBINARY(16) NULL, \
+         day DATE NULL)",
+    )
+    .await;
+    let rows: Vec<Value> = vec![
+        json!({"id": 1, "note": "a", "deleted_at": null, "ref": null, "blob": null, "day": "2024-01-02"}),
+        json!({"id": 2, "note": null, "deleted_at": "2024-01-02T03:04:05", "day": null}),
+        json!({"id": 3, "note": 7, "ref": "6F9619FF-8B86-D011-B42D-00C04FC964FF"}),
+    ];
+    let sink = MssqlSink::new(auto_cfg(&cfg, "dbo.typed"))
+        .await
+        .expect("sink");
+    assert_eq!(sink.write_batch(&rows).await.expect("append"), 3);
+    assert_eq!(count(&pool, "dbo.typed").await, 3);
+
+    let mut up = auto_cfg(&cfg, "dbo.typed");
+    up.write = serde_json::from_value(json!({"write_mode": "upsert", "key": ["id"]})).unwrap();
+    let upsert = MssqlSink::new(up).await.expect("upsert sink");
+    let changed: Vec<Value> = vec![
+        json!({"id": 1, "note": null, "deleted_at": "2024-02-03T00:00:00"}),
+        json!({"id": 4, "note": "x", "deleted_at": null, "ref": null}),
+        json!({"id": 2, "note": 9}),
+    ];
+    upsert.write_batch(&changed).await.expect("upsert");
+    assert_eq!(count(&pool, "dbo.typed").await, 4);
+
+    let mut conn = pool.get().await.expect("checkout");
+    let r = conn
+        .query("SELECT note FROM dbo.typed WHERE id = 2", &[])
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(r[0].get::<&str, _>("note"), Some("9"));
+}
+
+/// SQL-37: a write that times out (here: blocked by another session's lock)
+/// must not leave its transaction open on a pooled connection that a later
+/// page then "commits" into.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_write_leaves_no_transaction_for_the_next_page() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(&pool, "CREATE TABLE dbo.locked (id INT NOT NULL)").await;
+
+    let mut s = auto_cfg(&cfg, "dbo.locked");
+    s.statement_timeout_secs = 1;
+    s.max_connections = 1;
+    let sink = MssqlSink::new(s).await.expect("sink");
+
+    // Another session holds an exclusive table lock, so the insert waits.
+    let mut blocker = pool.get().await.expect("blocker");
+    blocker
+        .simple_query("BEGIN TRAN; SELECT * FROM dbo.locked WITH (TABLOCKX, HOLDLOCK)")
+        .await
+        .expect("lock")
+        .into_results()
+        .await
+        .expect("lock");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("blocked write times out");
+    assert!(err.to_string().contains("timed out"), "{err}");
+    blocker
+        .simple_query("ROLLBACK TRAN")
+        .await
+        .expect("release")
+        .into_results()
+        .await
+        .expect("release");
+    drop(blocker);
+
+    // The next page runs on the (only) pooled connection and must really commit.
+    assert_eq!(
+        sink.write_batch(&[json!({"id": 2})]).await.expect("write"),
+        1
+    );
+    drop(sink);
+
+    let mut conn = pool.get().await.expect("checkout");
+    conn.simple_query("SET LOCK_TIMEOUT 5000")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    let rows = conn
+        .query("SELECT id FROM dbo.locked ORDER BY id", &[])
+        .await
+        .expect("read after the sink is gone")
+        .into_first_result()
+        .await
+        .expect("read");
+    let ids: Vec<i32> = rows.iter().filter_map(|r| r.get::<i32, _>("id")).collect();
+    assert_eq!(ids, vec![2], "the page after the timeout must be committed");
+}
+
+/// SQL-10: an upsert leaves a column a record does not carry untouched; an
+/// explicit `null` still clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_keeps_columns_a_record_does_not_carry() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.partial (id INT NOT NULL PRIMARY KEY, a NVARCHAR(20) NULL, \
+         b NVARCHAR(20) NULL)",
+    )
+    .await;
+    exec(
+        &pool,
+        "INSERT INTO dbo.partial VALUES (1, N'a1', N'b1'), (2, N'a2', N'b2')",
+    )
+    .await;
+
+    let mut up = auto_cfg(&cfg, "dbo.partial");
+    up.write = serde_json::from_value(json!({"write_mode": "upsert", "key": ["id"]})).unwrap();
+    let sink = MssqlSink::new(up).await.expect("upsert sink");
+    sink.write_batch(&[
+        json!({"id": 1, "a": "a1-new"}),
+        json!({"id": 2, "a": "a2-new", "b": null}),
+        json!({"id": 3, "b": "b3"}),
+    ])
+    .await
+    .expect("upsert");
+
+    let mut conn = pool.get().await.expect("checkout");
+    let rows = conn
+        .query("SELECT id, a, b FROM dbo.partial ORDER BY id", &[])
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    let got: Vec<(i32, Option<String>, Option<String>)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<i32, _>("id").unwrap(),
+                r.get::<&str, _>("a").map(str::to_string),
+                r.get::<&str, _>("b").map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, Some("a1-new".into()), Some("b1".into())),
+            (2, Some("a2-new".into()), None),
+            (3, None, Some("b3".into())),
+        ]
+    );
+}

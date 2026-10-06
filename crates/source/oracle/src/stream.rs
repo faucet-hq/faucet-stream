@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::config::{OracleReplication, OracleSourceConfig};
 use crate::query::{
     CatalogRow, OwnedBind, PlannedQuery, apply_incremental, default_state_key,
-    descriptors_from_catalog, plan_query, resolve_binds,
+    descriptors_from_catalog, owned_binds, plan_query, resolve_binds,
 };
 
 /// Oracle Database query source.
@@ -41,6 +41,8 @@ fn as_tosql(b: &OwnedBind) -> &dyn ToSql {
         OwnedBind::Int(i) => i,
         OwnedBind::Float(f) => f,
         OwnedBind::Text(s) => s,
+        OwnedBind::Timestamp(t) => t,
+        OwnedBind::TimestampTz(t) => t,
     }
 }
 
@@ -68,10 +70,7 @@ fn run_query(job: QueryJob, mut emit: impl FnMut(Vec<Value>) -> bool) -> Result<
         .map_err(|e| ora_err(Side::Source, "prepare", &e))?;
     let names: Vec<String> = stmt.bind_names().iter().map(|s| s.to_string()).collect();
     let binds = resolve_binds(&names, &job.params, job.bookmark.as_ref())?;
-    let owned: Vec<(String, OwnedBind)> = binds
-        .into_iter()
-        .map(|(n, v)| (n, OwnedBind::from_value(&v)))
-        .collect();
+    let owned = owned_binds(binds);
     let named: Vec<(&str, &dyn ToSql)> = owned
         .iter()
         .map(|(n, b)| (n.as_str(), as_tosql(b)))
@@ -363,10 +362,7 @@ impl Source for OracleSource {
             let mut stmt = conn.statement(&sql).build().map_err(|e| stmt_err(&e))?;
             let names: Vec<String> = stmt.bind_names().iter().map(|s| s.to_string()).collect();
             let binds = resolve_binds(&names, &planned.params, planned.bookmark.as_ref())?;
-            let owned: Vec<(String, OwnedBind)> = binds
-                .into_iter()
-                .map(|(n, v)| (n, OwnedBind::from_value(&v)))
-                .collect();
+            let owned = owned_binds(binds);
             let named: Vec<(&str, &dyn ToSql)> = owned
                 .iter()
                 .map(|(n, b)| (n.as_str(), as_tosql(b)))
@@ -412,6 +408,8 @@ mod tests {
             OwnedBind::Int(1),
             OwnedBind::Float(1.5),
             OwnedBind::Text("x".into()),
+            OwnedBind::Timestamp(chrono::DateTime::UNIX_EPOCH.naive_utc()),
+            OwnedBind::TimestampTz(chrono::DateTime::UNIX_EPOCH.fixed_offset()),
         ] {
             let _ = as_tosql(&b);
         }

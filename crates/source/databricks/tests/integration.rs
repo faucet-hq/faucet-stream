@@ -27,6 +27,7 @@ fn base_config(uri: &str, sql: &str) -> DatabricksSourceConfig {
         poll_interval_secs: 1,
         batch_size: 1000,
         arrow_native: false,
+        result_disposition: Default::default(),
         replication: DatabricksReplication::Full,
         state_key: None,
     }
@@ -132,6 +133,135 @@ async fn multi_chunk_pagination() {
     let rows = src.fetch_with_context(&HashMap::new()).await.unwrap();
     let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![1, 2, 3, 4]); // both chunks, in order
+}
+
+/// SQL-45: the default row path asks for `EXTERNAL_LINKS` + `JSON_ARRAY` (no
+/// 25 MiB INLINE cap) and reads each presigned chunk without the workspace
+/// token, following the links across chunks; incremental bookmarks still
+/// advance over every chunk.
+#[tokio::test]
+async fn external_link_chunks_stream_without_the_workspace_token() {
+    let server = MockServer::start().await;
+    let link = |n: u32| format!("{}/presigned/chunk{n}?sig=abc", server.uri());
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "disposition": "EXTERNAL_LINKS", "format": "JSON_ARRAY"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "s9",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": manifest(&[("id", "INT"), ("name", "STRING")]),
+            "result": { "external_links": [{
+                "chunk_index": 0,
+                "external_link": link(0),
+                "next_chunk_index": 1,
+                "next_chunk_internal_link": "/api/2.0/sql/statements/s9/result/chunks/1"
+            }] }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/s9/result/chunks/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "external_links": [
+                { "chunk_index": 1, "external_link": link(1) },
+                { "chunk_index": 2 }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/presigned/chunk0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([["1", "a"], ["2", null]])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/presigned/chunk1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([["3", "c"]])))
+        .mount(&server)
+        .await;
+
+    let mut cfg = base_config(
+        &server.uri(),
+        "SELECT id, name FROM t WHERE id > ${bookmark}",
+    );
+    cfg.replication = DatabricksReplication::Incremental {
+        column: "id".into(),
+        initial_value: json!(0),
+    };
+    let src = DatabricksSource::new(cfg)
+        .unwrap()
+        .with_endpoint_base(server.uri());
+    let rows = src.fetch_with_context(&HashMap::new()).await.unwrap();
+    let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert_eq!(rows[1]["name"], Value::Null);
+
+    for req in server.received_requests().await.unwrap() {
+        let presigned = req.url.path().starts_with("/presigned/");
+        assert_eq!(
+            req.headers.contains_key("authorization"),
+            !presigned,
+            "{} must {}carry the workspace token",
+            req.url,
+            if presigned { "not " } else { "" }
+        );
+    }
+}
+
+/// A failing presigned download is an error, not a silently short result.
+#[tokio::test]
+async fn a_failed_external_link_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "s10",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": manifest(&[("id", "INT")]),
+            "result": { "external_links": [{
+                "external_link": format!("{}/presigned/gone", server.uri())
+            }] }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/presigned/gone"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("expired"))
+        .mount(&server)
+        .await;
+
+    let src = source(&server.uri(), "SELECT id FROM t").await;
+    let err = src.fetch_with_context(&HashMap::new()).await.unwrap_err();
+    assert!(err.to_string().contains("external link HTTP 403"), "{err}");
+}
+
+/// A presigned chunk that is not a JSON array of rows is an error.
+#[tokio::test]
+async fn an_unparseable_external_chunk_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "s11",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": manifest(&[("id", "INT")]),
+            "result": { "external_links": [{
+                "external_link": format!("{}/presigned/bad", server.uri())
+            }] }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/presigned/bad"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&server)
+        .await;
+
+    let src = source(&server.uri(), "SELECT id FROM t").await;
+    let err = src.fetch_with_context(&HashMap::new()).await.unwrap_err();
+    assert!(err.to_string().contains("external-link chunk"), "{err}");
 }
 
 #[tokio::test]

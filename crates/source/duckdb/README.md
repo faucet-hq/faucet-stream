@@ -38,10 +38,19 @@ pipeline:
 
 Scalar DuckDB types map exactly to JSON (integers → number, `DOUBLE`/`FLOAT` →
 number, `BOOLEAN` → bool, `VARCHAR` → string). `BLOB` is base64-encoded so
-binary survives the JSON round-trip. Temporal (`TIMESTAMP`/`DATE`/`TIME`),
-`DECIMAL`, and nested (`LIST`/`STRUCT`/`MAP`) values are best-effort: temporal
-types surface their raw integer representation and the rest fall back to a
-stable string. A future Arrow-native columnar fast path is tracked separately.
+binary survives the JSON round-trip. `DECIMAL` is emitted as its exact decimal
+string (DuckDB types a bare literal such as `2.5` as `DECIMAL`, so it arrives as
+`"2.5"`; `CAST` to `DOUBLE` for a JSON number). Temporal
+(`TIMESTAMP`/`DATE`/`TIME`) and nested (`LIST`/`STRUCT`/`MAP`) values are
+best-effort: temporal types surface their raw integer representation and the
+rest fall back to a stable string. A future Arrow-native columnar fast path is
+tracked separately.
+
+A value the DuckDB driver cannot decode — a `DECIMAL` wider than 28
+significant digits or a nanosecond `TIME` — fails the run with an error naming
+the column (`CAST` it to `VARCHAR` in the query), and a reader that stops early
+for any other reason fails the run too, rather than ending the stream as if the
+result were complete.
 
 ## Conformance
 

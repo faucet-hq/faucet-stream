@@ -84,16 +84,41 @@ impl SnowflakeSink {
     /// very large group is split into requests near Snowflake's documented
     /// sweet spot — but the *group* is what accumulation controls, and a small
     /// source page no longer forces its own query.
-    async fn commit_group(&self, rows: &[Value]) -> Result<(), FaucetError> {
+    /// On failure, also returns how many leading rows did land.
+    async fn commit_group(&self, rows: &[Value]) -> Result<(), (usize, FaucetError)> {
         let chunk = if self.config.batch_size == 0 {
             rows.len().max(1)
         } else {
             self.config.batch_size
         };
+        let mut done = 0;
         for slice in rows.chunks(chunk) {
-            let (sql, payload) = self.build_insert(slice)?;
+            let (sql, payload) = self.build_insert(slice).map_err(|e| (done, e))?;
             let bindings = json!({ "1": { "type": "TEXT", "value": payload } });
-            self.execute_sql(&sql, Some(bindings)).await?;
+            self.execute_sql(&sql, Some(bindings))
+                .await
+                .map_err(|e| (done, e))?;
+            done += slice.len();
+        }
+        Ok(())
+    }
+
+    /// Commit a group the accumulator handed out; on failure put back the
+    /// uncommitted rows of earlier pages (`rows[..keep_end]`), so a retried
+    /// write or `flush` commits them instead of dropping them (SQL-04).
+    async fn commit_or_restore(
+        &self,
+        rows: Vec<Value>,
+        keep_end: usize,
+    ) -> Result<(), FaucetError> {
+        if let Err((done, e)) = self.commit_group(&rows).await {
+            if done < keep_end {
+                let mut rows = rows;
+                rows.truncate(keep_end);
+                rows.drain(..done);
+                self.pending.lock().await.restore(rows);
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -146,7 +171,7 @@ impl SnowflakeSink {
         }
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
-            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::new(
+            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
                 config.commit_bytes,
             )),
@@ -439,6 +464,20 @@ impl SnowflakeSink {
     /// `OBJECT` / `ARRAY`) is stringified by the `::string` cast rather than
     /// stored as structured JSON; this sink maps records to scalar columns.
     fn build_insert(&self, records: &[Value]) -> Result<(String, String), FaucetError> {
+        let payload = Value::Array(records.to_vec()).to_string();
+        Ok((self.insert_from(records, "?")?, payload))
+    }
+
+    /// The page INSERT with its JSON payload inlined as an escaped string
+    /// literal, for the multi-statement exactly-once request where the SQL API
+    /// accepts no bindings (SQL-44).
+    fn build_insert_inline(&self, records: &[Value]) -> Result<String, FaucetError> {
+        let payload = Value::Array(records.to_vec()).to_string();
+        self.insert_from(records, &idempotent::sql_string_literal(&payload))
+    }
+
+    /// `INSERT … SELECT … FROM TABLE(FLATTEN(input => PARSE_JSON(<input>)))`.
+    fn insert_from(&self, records: &[Value], input: &str) -> Result<String, FaucetError> {
         let columns = Self::column_union(records)?;
 
         // `quote_ident` produces a `"`-escaped quoted identifier, which is also
@@ -454,16 +493,14 @@ impl SnowflakeSink {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let payload = Value::Array(records.to_vec()).to_string();
-        let sql = format!(
-            "INSERT INTO {}.{}.{} ({}) SELECT {} FROM TABLE(FLATTEN(input => PARSE_JSON(?)))",
+        Ok(format!(
+            "INSERT INTO {}.{}.{} ({}) SELECT {} FROM TABLE(FLATTEN(input => PARSE_JSON({input})))",
             quote_ident(&self.config.database),
             quote_ident(&self.config.schema),
             quote_ident(&self.config.table),
             col_list,
             projection,
-        );
-        Ok((sql, payload))
+        ))
     }
 }
 
@@ -569,9 +606,42 @@ impl faucet_core::Sink for SnowflakeSink {
             open.finish()
         };
         if let Some(rows) = group {
-            self.commit_group(&rows).await?;
+            let len = rows.len();
+            self.commit_or_restore(rows, len).await?;
         }
         Ok(())
+    }
+
+    /// The DLQ path commits per page (SQL-21): earlier buffered rows are
+    /// committed first, then this page alone, so a failed commit names exactly
+    /// the rows of *this* page that did not land.
+    async fn write_batch_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.flush().await?;
+        self.ensure_table_ready(records).await?;
+        match self.commit_group(records).await {
+            Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
+            Err((0, e)) => Err(e),
+            Err((done, e)) => {
+                let message = e.to_string();
+                Ok((0..records.len())
+                    .map(|i| {
+                        if i < done {
+                            Ok(())
+                        } else {
+                            Err(FaucetError::Sink(format!(
+                                "snowflake: write failed: {message}"
+                            )))
+                        }
+                    })
+                    .collect())
+            }
+        }
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -588,7 +658,8 @@ impl faucet_core::Sink for SnowflakeSink {
             pending.push_page(records)
         };
         if let Some(rows) = group {
-            self.commit_group(&rows).await?;
+            let keep_end = rows.len() - records.len();
+            self.commit_or_restore(rows, keep_end).await?;
         }
         let total = records.len();
 
@@ -627,33 +698,31 @@ impl faucet_core::Sink for SnowflakeSink {
         token: &str,
     ) -> Result<usize, FaucetError> {
         self.ensure_commit_table().await?;
+        if !records.is_empty() {
+            self.ensure_table_ready(records).await?;
+        }
 
-        let (sql, bindings, count) = if records.is_empty() {
-            let sql =
-                idempotent::build_commit_only_statement(&self.config.database, &self.config.schema);
-            let bindings = json!({
-                "1": { "type": "TEXT", "value": scope },
-                "2": { "type": "TEXT", "value": token },
-            });
-            (sql, bindings, idempotent::COMMIT_ONLY_STATEMENT_COUNT)
-        } else {
-            let (insert_sql, payload) = self.build_insert(records)?;
-            let sql = idempotent::build_transaction_statement(
-                &insert_sql,
+        let (sql, count) = if records.is_empty() {
+            let sql = idempotent::build_commit_only_statement_inline(
                 &self.config.database,
                 &self.config.schema,
+                scope,
+                token,
             );
-            let bindings = json!({
-                "1": { "type": "TEXT", "value": payload },
-                "2": { "type": "TEXT", "value": scope },
-                "3": { "type": "TEXT", "value": token },
-            });
-            (sql, bindings, idempotent::TRANSACTION_STATEMENT_COUNT)
+            (sql, idempotent::COMMIT_ONLY_STATEMENT_COUNT)
+        } else {
+            let sql = idempotent::build_transaction_statement_inline(
+                &self.build_insert_inline(records)?,
+                &self.config.database,
+                &self.config.schema,
+                scope,
+                token,
+            );
+            (sql, idempotent::TRANSACTION_STATEMENT_COUNT)
         };
 
         let parameters = json!({ "MULTI_STATEMENT_COUNT": count.to_string() });
-        self.execute_statement(&sql, Some(bindings), Some(parameters))
-            .await?;
+        self.execute_statement(&sql, None, Some(parameters)).await?;
 
         tracing::info!(
             table = %format!(

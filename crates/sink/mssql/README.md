@@ -75,7 +75,7 @@ faucet run pipeline.yaml
 | `max_connections` | int | `5` | Maximum pooled connections (`bb8`). |
 | `transaction_per_batch` | bool | `true` | Wrap each batch's `INSERT`s in `BEGIN TRAN` / `COMMIT TRAN`. Upsert/delete are always transaction-wrapped regardless. |
 | `isolate_row_failures` | bool | `true` | On a batch failure, roll back and replay row-by-row so good rows land and only the bad row is DLQ-routed. `false` fails the whole batch on the first bad row (fewer round-trips). |
-| `statement_timeout_secs` | int (seconds) | `300` | Per-statement server-side timeout. `0` disables. |
+| `statement_timeout_secs` | int (seconds) | `300` | Per-statement timeout. `0` disables. A statement that times out may still be running in an open transaction, so its connection is replaced with a fresh one (closing the old one makes the server roll it back) instead of returning to the pool; if no new connection can be made, every later write fails rather than committing into that transaction. |
 | `create_table` | bool | `false` | **`json_column` mode only** — create the table if absent as `(id BIGINT IDENTITY PRIMARY KEY, <column> NVARCHAR(MAX))`. Rejected with `auto_columns` (schema inference for MSSQL types is unsafe). |
 
 ### Write mode
@@ -119,6 +119,8 @@ column_mapping:
   type: json_column
   column: payload
 ```
+
+**Typed binding.** In `auto_columns` mode each bound value is cast to its column's declared type (read from `sys.columns`), so a NULL or a missing key binds into `DATETIME2`, `DATE`, `UNIQUEIDENTIFIER`, `XML` or `VARBINARY` columns, and one chunk may mix NULLs, numbers and strings in a text column. Text columns are cast to `NVARCHAR(MAX)` rather than their declared length, so an over-long value still fails the insert instead of being truncated.
 
 > `IDENTITY` columns are server-generated — do **not** put identity values in your records unless you've run `SET IDENTITY_INSERT <table> ON` yourself. `auto_columns` + `create_table` is rejected at construction: create the table yourself first so its types are correct.
 
@@ -222,7 +224,9 @@ sink:
 ```
 
 Build with the crate's `staging` feature (CLI: `--features sink-mssql-staging`,
-in `full`). **Azure only** (`az://…`), **CSV only**. `COPY INTO` maps CSV columns
+in `full`). **Azure only** (`az://…`), **CSV only**, and **`write_mode: append`
+only**: `COPY INTO` loads straight into the target table, so `overwrite`, `upsert`
+and `delete` are refused at load time (`faucet validate` reports it). `COPY INTO` maps CSV columns
 by **position**, so the target table's column order must match the staged CSV —
 align the table (or stage a matching column subset). The load SQL/URL generation
 is unit-tested; the server-side `COPY INTO` requires a live SQL Server/Synapse +
@@ -232,7 +236,7 @@ Azure storage and is not exercised in CI (same as the other staged-load sinks).
 
 In addition to the default append, the sink can **upsert** (insert-or-update by key) or **delete** by key. Both require `column_mapping: auto_columns` — the key columns must be real table columns, not buried inside a JSON column (using `json_column` with `upsert`/`delete` is rejected at construction). The key columns should have a `UNIQUE` / `PRIMARY KEY` constraint.
 
-- **`upsert`** — each record is merged via a single T-SQL [`MERGE`](https://learn.microsoft.com/sql/t-sql/statements/merge-transact-sql): matching rows (by `key`) have their non-key columns updated; non-matching rows are inserted. When every column is a key column there's nothing to update, so the `WHEN MATCHED` clause is omitted. Within a batch, records sharing a key are deduplicated **last-write-wins** before the `MERGE` runs (MERGE rejects a source targeting the same key twice).
+- **`upsert`** — each record is merged via a single T-SQL [`MERGE`](https://learn.microsoft.com/sql/t-sql/statements/merge-transact-sql): matching rows (by `key`) have their non-key columns updated; non-matching rows are inserted. When every column is a key column there's nothing to update, so the `WHEN MATCHED` clause is omitted. A record updates only the columns it carries: rows are grouped by their set of keys, one `MERGE` per group, so a column a record omits keeps its stored value (an explicit `null` still clears it). Within a batch, records sharing a key are deduplicated **last-write-wins** before the `MERGE` runs (MERGE rejects a source targeting the same key twice).
 - **`delete`** — every record's `key` is collected and deleted via `MERGE … WHEN MATCHED THEN DELETE` (T-SQL has no row-constructor `IN ((a,b), …)`), so single- and multi-column keys share one code path.
 - **`delete_marker`** (upsert mode only) — rows whose `field` equals one of `values` are routed to a delete instead of an upsert; the marker field is stripped from the upserted record. This lets a CDC stream carrying an operation flag drive inserts, updates, and deletes from one pipeline.
 
@@ -281,13 +285,13 @@ See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 ## Schema evolution
 
-`MssqlSink` reports its live destination schema via `current_schema()` (read from `sys.columns`, including nullability), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
+`MssqlSink` reports its live destination schema via `current_schema()` (read from `sys.columns`, including nullability), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink in `auto_columns` mode. In `json_column` mode the table's columns are not the record's fields, so the sink reports no schema and a `schema:` policy is inert.
 
 Under `on_drift: evolve`, `MssqlSink::evolve_schema()` applies additive DDL:
 
 - **New columns** → `ALTER TABLE … ADD`, guarded with `IF NOT EXISTS (SELECT 1 FROM sys.columns …)` (idempotent).
 - **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN` to the wider type — gated on `allow_type_widening`.
-- **Nullability relaxations** → `ALTER COLUMN … NULL`. MSSQL's `ALTER COLUMN` requires the full type spec, so the column is re-emitted at its widened base type keyword (e.g. `INT` → `BIGINT`). This is a minor, always-lossless type canonicalization — the column ends up nullable at the same or a wider type.
+- **Nullability relaxations** → `ALTER COLUMN … NULL`. MSSQL's `ALTER COLUMN` requires the full type spec, so the column's exact declared type is re-stated from `sys.columns` — length, precision, scale and collation (`DECIMAL(38,10)`, `DATETIME2(3)`, `VARCHAR(20) COLLATE …`) — and only its nullability changes. A column whose type cannot be re-stated (CLR types) fails the evolution instead of being rewritten.
 
 After an evolution the cached AutoColumns set is dropped so the next write re-discovers any newly-added column. Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
 

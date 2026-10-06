@@ -173,11 +173,75 @@ async fn load_native_ndjson_streams_session_with_explicit_string_schema() {
     assert!(body.contains("\"name\":\"Amount\",\"type\":\"STRING\""));
 }
 
+/// `tables.get` on the target: `Some(fields)` → the table exists with that
+/// schema; `None` → 404, the table does not exist yet.
+async fn mount_target(server: &MockServer, fields: Option<serde_json::Value>) {
+    let response = match fields {
+        Some(fields) => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tableReference": {
+                "projectId": PROJECT_ID, "datasetId": DATASET_ID, "tableId": TABLE_ID
+            },
+            "schema": { "fields": fields }
+        })),
+        None => ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": {"code": 404, "message": "Not found: Table",
+                      "errors": [{"reason": "notFound", "message": "Not found: Table"}]}
+        })),
+    };
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}"
+        )))
+        .respond_with(response)
+        .mount(server)
+        .await;
+}
+
+/// SQL-35: an overwrite into an existing table loads with that table's own
+/// schema, so the refresh keeps its types, modes and descriptions; unknown
+/// fields fail the load instead of being dropped.
+#[tokio::test]
+async fn load_native_overwrite_keeps_an_existing_tables_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_resumable(&server, "/session/native-keep", "job-native-keep").await;
+    mount_target(
+        &server,
+        Some(serde_json::json!([
+            {"name": "Id", "type": "INTEGER", "mode": "REQUIRED", "description": "key"}
+        ])),
+    )
+    .await;
+    let mut config = native_config(&server);
+    config.write.write_mode = WriteMode::Overwrite;
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.load_native(
+        NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec())
+            .with_records(Some(1)),
+        "p::row",
+        NativeLoadContext {
+            write_mode: WriteMode::Overwrite,
+            first_batch: true,
+        },
+    )
+    .await
+    .expect("feed");
+    sink.flush().await.expect("flush");
+    let body = upload_bodies(&server).await.join("\n");
+    assert!(body.contains("\"WRITE_TRUNCATE\""), "{body}");
+    assert!(
+        body.contains("\"type\":\"INTEGER\"") && body.contains("\"description\":\"key\""),
+        "the table's own schema, not an all-STRING one: {body}"
+    );
+    assert!(body.contains("\"ignoreUnknownValues\":false"), "{body}");
+}
+
 #[tokio::test]
 async fn load_native_overwrite_first_batch_truncates_once_per_object() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
     mount_resumable(&server, "/session/native-2", "job-native-2").await;
+    mount_target(&server, None).await;
     let mut config = native_config(&server);
     config.write.write_mode = WriteMode::Overwrite;
     let (sink, _sa) = build_sink(&server, config).await;
@@ -212,6 +276,11 @@ async fn load_native_overwrite_first_batch_truncates_once_per_object() {
     // Exactly one initiate (one session/load job for the object), truncating.
     assert_eq!(bodies.len(), 1, "one load job per object: {bodies:?}");
     assert!(bodies[0].contains("\"WRITE_TRUNCATE\""), "{}", bodies[0]);
+    assert!(
+        bodies[0].contains("\"name\":\"Id\",\"type\":\"STRING\""),
+        "a missing table falls back to the inferred schema: {}",
+        bodies[0]
+    );
 }
 
 #[tokio::test]
@@ -378,4 +447,208 @@ async fn load_native_rejects_an_unsupported_format() {
         .await
         .expect_err("parquet is not a load_native format here");
     assert!(err.to_string().contains("unsupported format"), "{err}");
+}
+
+/// SQL-36: once a mid-run flush committed the native append load, later
+/// NDJSON batches — whole buffers and streams split mid-line — stream through
+/// `insertAll` rather than opening one load job per page.
+#[tokio::test]
+async fn load_native_appends_after_a_flush_stream_rows() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_resumable(&server, "/session/native-4", "job-native-4").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}/insertAll"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    let ctx = || NativeLoadContext {
+        write_mode: WriteMode::Append,
+        first_batch: true,
+    };
+
+    let first = NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec());
+    sink.load_native(first, "p::row", ctx())
+        .await
+        .expect("page 1");
+    sink.flush().await.expect("flush 1");
+
+    let second = NativeBatch::bytes(
+        NativeFormat::NdJson,
+        b"{\"Id\":\"2\"}\n\n{\"Id\":\"3\"}\n".to_vec(),
+    );
+    let n = sink
+        .load_native(second, "p::row", ctx())
+        .await
+        .expect("page 2");
+    assert_eq!(n, 2);
+
+    let chunks: Vec<Result<Vec<u8>, faucet_core::FaucetError>> = vec![
+        Ok(b"{\"Id\":\"4\"}\n{\"I".to_vec()),
+        Ok(b"d\":\"5\"}\n{\"Id\":\"6\"}".to_vec()),
+        Ok(b"\n".to_vec()),
+    ];
+    let third = NativeBatch {
+        format: NativeFormat::NdJson,
+        payload: NativePayload::Stream(Box::pin(futures::stream::iter(chunks))),
+        csv: faucet_core::CsvDialect::default(),
+        records: None,
+        bookmark: None,
+    };
+    let n = sink
+        .load_native(third, "p::row", ctx())
+        .await
+        .expect("page 3");
+    assert_eq!(n, 3);
+    sink.flush().await.expect("flush 2");
+
+    assert_eq!(
+        upload_bodies(&server).await.len(),
+        1,
+        "one load job for the run"
+    );
+    let inserts: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/insertAll"))
+        .map(|r| gunzip(&r.body))
+        .collect();
+    let all = inserts.join("\n");
+    for id in ["2", "3", "4", "5", "6"] {
+        assert!(
+            all.contains(&format!("\"Id\":\"{id}\"")),
+            "{id} missing: {all}"
+        );
+    }
+}
+
+/// A malformed NDJSON line on the streamed path is an error, not a silent drop.
+#[tokio::test]
+async fn load_native_streamed_rows_reject_malformed_ndjson() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_resumable(&server, "/session/native-5", "job-native-5").await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    let ctx = NativeLoadContext {
+        write_mode: WriteMode::Append,
+        first_batch: true,
+    };
+    let first = NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec());
+    sink.load_native(first, "p::row", ctx)
+        .await
+        .expect("page 1");
+    sink.flush().await.expect("flush");
+    let bad = NativeBatch::bytes(NativeFormat::NdJson, b"{not json}\n".to_vec());
+    let err = sink
+        .load_native(bad, "p::row", ctx)
+        .await
+        .expect_err("malformed line");
+    assert!(err.to_string().contains("invalid NDJSON"), "{err}");
+}
+
+fn gunzip(bytes: &[u8]) -> String {
+    use std::io::Read;
+    let mut d = flate2::read::GzDecoder::new(bytes);
+    let mut s = String::new();
+    d.read_to_string(&mut s).expect("gunzip");
+    s
+}
+
+/// A job-JSON body from a multipart load POST (the part before the media).
+async fn multipart_job_bodies(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| {
+            r.url
+                .query()
+                .is_some_and(|q| q.contains("uploadType=multipart"))
+        })
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .collect()
+}
+
+/// SQL-35: a truncating native CSV load into a missing table infers its
+/// all-STRING schema from the header.
+#[tokio::test]
+async fn load_native_csv_overwrite_infers_a_missing_tables_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
+        .and(query_param("uploadType", "multipart"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-csv"},
+            "status": {"state": "DONE"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-csv")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-csv"},
+            "status": {"state": "DONE"}
+        })))
+        .mount(&server)
+        .await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    let mut batch =
+        NativeBatch::bytes(NativeFormat::Csv, b"Col1,Col2\n1,2\n".to_vec()).with_records(Some(1));
+    batch.csv.has_header = true;
+    let ctx = NativeLoadContext {
+        write_mode: WriteMode::Overwrite,
+        first_batch: true,
+    };
+    sink.load_native(batch, "p::row", ctx)
+        .await
+        .expect("csv load");
+    let body = multipart_job_bodies(&server).await.join("\n");
+    assert!(body.contains("WRITE_TRUNCATE"), "{body:.600}");
+    assert!(body.contains("\"name\":\"Col1\""), "{body:.600}");
+}
+
+/// SQL-35: a streamed truncating NDJSON load into a missing table infers its
+/// schema from the first chunk.
+#[tokio::test]
+async fn load_native_streamed_overwrite_infers_a_missing_tables_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
+    mount_resumable(&server, "/session/native-6", "job-native-6").await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    let chunks: Vec<Result<Vec<u8>, faucet_core::FaucetError>> = vec![
+        Ok(b"{\"Id\":\"1\"}\n".to_vec()),
+        Ok(b"{\"Id\":\"2\"}\n".to_vec()),
+    ];
+    let batch = NativeBatch {
+        format: NativeFormat::NdJson,
+        payload: NativePayload::Stream(Box::pin(futures::stream::iter(chunks))),
+        csv: faucet_core::CsvDialect::default(),
+        records: None,
+        bookmark: None,
+    };
+    let ctx = NativeLoadContext {
+        write_mode: WriteMode::Overwrite,
+        first_batch: true,
+    };
+    assert_eq!(
+        sink.load_native(batch, "p::row", ctx).await.expect("load"),
+        2
+    );
+    let body = upload_bodies(&server).await.join("\n");
+    assert!(body.contains("WRITE_TRUNCATE"), "{body:.400}");
+    assert!(
+        body.contains("\"name\":\"Id\",\"type\":\"STRING\""),
+        "{body:.400}"
+    );
 }

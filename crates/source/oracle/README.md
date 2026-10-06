@@ -52,7 +52,7 @@ source:
 
 ### Incremental replication
 
-Rows whose `column` exceeds the stored bookmark (or `initial_value` on the first run) are emitted; the new maximum is persisted with the final page, after everything before it was written. Put `:bookmark` in the `WHERE` clause to filter server-side — without it the source still filters client-side but re-reads the whole result set (a warning is logged).
+Rows whose `column` exceeds the stored bookmark (or `initial_value` on the first run) are emitted; the new maximum is persisted with the final page, after everything before it was written. Put `:bookmark` in the `WHERE` clause to filter server-side — without it the source still filters client-side but re-reads the whole result set (a warning is logged). A bookmark from a `DATE` / `TIMESTAMP` / `TIMESTAMP WITH TIME ZONE` column (`YYYY-MM-DDTHH:MI:SS[.f][offset]`, the form this source emits) is bound as a timestamp, so the comparison does not depend on the session's `NLS_DATE_FORMAT`; any other bookmark binds as its JSON type.
 
 ### Sharding
 

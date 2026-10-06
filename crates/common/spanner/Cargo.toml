@@ -11,6 +11,7 @@ keywords = ["spanner", "gcp", "etl", "pipeline", "faucet"]
 categories.workspace = true
 
 [dependencies]
+chrono.workspace = true
 faucet-core.workspace = true
 gcloud-spanner.workspace = true
 gcloud-googleapis.workspace = true

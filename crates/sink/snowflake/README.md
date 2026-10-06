@@ -203,10 +203,10 @@ Snowflake's SQL REST API may answer a submitted `INSERT` with **HTTP 202 Accepte
 
 `SnowflakeSink` implements `Sink::supports_idempotent_writes` (returns `true`) and the two companion hooks:
 
-- `write_batch_idempotent(records, scope, token)` — writes the page's records and MERGEs the `token` into a `_faucet_commit_token("scope" STRING PRIMARY KEY, "token" STRING, "updated_at" TIMESTAMP_NTZ)` watermark table in the target database/schema, all inside **one multi-statement transaction** (`BEGIN; INSERT; MERGE; COMMIT;` with `MULTI_STATEMENT_COUNT` set on the request), so both either commit together or neither does. The watermark table is created (`CREATE TABLE IF NOT EXISTS`) as its own request once per sink instance — Snowflake DDL auto-commits, so it can never ride inside the transaction.
+- `write_batch_idempotent(records, scope, token)` — writes the page's records and MERGEs the `token` into a `_faucet_commit_token("scope" STRING PRIMARY KEY, "token" STRING, "updated_at" TIMESTAMP_NTZ)` watermark table in the target database/schema, all inside **one multi-statement transaction** (`BEGIN; INSERT; MERGE; COMMIT;` with `MULTI_STATEMENT_COUNT` set on the request), so both either commit together or neither does. The watermark table is created (`CREATE TABLE IF NOT EXISTS`) as its own request once per sink instance — Snowflake DDL auto-commits, so it can never ride inside the transaction. The SQL API accepts no bind variables in a multi-statement request, so the page's JSON, the scope and the token are inlined as escaped string literals (quotes and backslashes doubled). With `create_table: true` the target table is created before the first page, as on the append path.
 - `last_committed_token(scope)` — reads the current watermark so the pipeline skips already-committed pages on resume.
 
-**The whole page is one atomic unit on this path** — `batch_size` re-chunking does not apply to `write_batch_idempotent` (core issues exactly one token per page; splitting the page across transactions would break the rows-plus-token atomicity). Size the *source's* `batch_size` down if a page's JSON payload grows too large for a single SQL REST API request. An empty page still advances the watermark via a commit-only `BEGIN; MERGE; COMMIT;` transaction.
+**The whole page is one atomic unit on this path** — `batch_size` re-chunking does not apply to `write_batch_idempotent` (core issues exactly one token per page; splitting the page across transactions would break the rows-plus-token atomicity). The page's JSON travels inside the statement text, so size the *source's* `batch_size` down if a page grows too large for a single SQL REST API request. An empty page still advances the watermark via a commit-only `BEGIN; MERGE; COMMIT;` transaction.
 
 To use effectively-once delivery, set `delivery: exactly_once` and pair this sink with a CDC source (`postgres-cdc`, `mysql-cdc`, `mongodb-cdc`) plus a `state:` block. A DLQ is not permitted in effectively-once mode. All four requirements are validated at config-load time (`faucet validate`) before any run starts.
 
@@ -362,9 +362,15 @@ page unit, and `batch_size` could only ever *split* an oversized page — it
 could never merge two undersized ones, so a small source page meant one
 expensive warehouse operation per small page. Each `INSERT … SELECT` is a full warehouse query, so the per-query overhead — not the data — dominated a small-page run. For true bulk volume, configure `bulk_load:` to stage and `COPY` instead.
 
-- `commit_rows` — records per commit. `None` (the default) accumulates the
-  **whole run** into one commit.
+- `commit_rows` — records per commit. `0` removes the row limit.
 - `commit_bytes` — estimated-bytes counterpart, bounding how much is buffered.
+  `0` removes the byte limit.
+
+With neither set, a group commits at **100,000 rows or ~256 MiB**, whichever
+comes first, so a large load never holds the whole run in memory. A group
+whose commit fails keeps its uncommitted rows, so a retried `flush` (for
+example under a `resilience:` policy) commits them rather than reporting
+success with nothing written.
 
 `batch_size` still bounds an individual request inside a commit group, so a
 very large group is split into reasonably-sized requests.
@@ -372,7 +378,10 @@ very large group is split into reasonably-sized requests.
 **Only the append path accumulates.** `delivery: exactly_once` and the DLQ
 path commit per page, because a commit token must land atomically with its own
 page, and a DLQ must report which rows of *this* page failed — neither is
-expressible once pages are merged.
+expressible once pages are merged. With a `dlq:` block, earlier buffered pages are
+committed first and a failed write sends exactly the rows of that page that did
+not land to the DLQ; rows from chunks that committed before the failure are not
+repeated.
 
 ## Batch atomicity
 

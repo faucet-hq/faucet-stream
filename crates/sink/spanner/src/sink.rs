@@ -11,7 +11,7 @@
 use crate::config::SpannerSinkConfig;
 use async_trait::async_trait;
 use faucet_common_spanner::decode::SpannerJson;
-use faucet_common_spanner::encode::{EncodedKind, encode_to_kind};
+use faucet_common_spanner::encode::{EncodedKind, canonical_kind, encode_to_kind};
 use faucet_common_spanner::quote_ident_spanner;
 use faucet_common_spanner::types::{SpannerType, parse_spanner_type, spanner_type_to_json_schema};
 use faucet_core::FaucetError;
@@ -288,6 +288,18 @@ fn kind_fingerprint(kind: &Kind) -> String {
         other => ('x', format!("{other:?}")),
     };
     format!("{tag}{}:{body}", body.len())
+}
+
+/// A PK-ordered key tuple in Spanner's own rendering of each column type, so a
+/// written key and the live key it produced fingerprint alike (SQL-31).
+fn canonical_tuple(vals: Vec<Kind>, meta: &TableMeta) -> Vec<Kind> {
+    vals.into_iter()
+        .zip(&meta.pk)
+        .map(|(kind, col)| match meta.type_of(col) {
+            Some(ty) => canonical_kind(kind, ty),
+            None => kind,
+        })
+        .collect()
 }
 
 /// Fingerprint of a whole PK-ordered key tuple.
@@ -778,7 +790,7 @@ impl SpannerSink {
         for key_tuple in seen.keys() {
             let vals = encode_key_in_pk_order(key_tuple, &meta)
                 .map_err(|e| FaucetError::Sink(format!("spanner cleanup: {e}")))?;
-            seen_fingerprints.insert(tuple_fingerprint(&vals));
+            seen_fingerprints.insert(tuple_fingerprint(&canonical_tuple(vals, &meta)));
         }
 
         let plan = Arc::new(CleanupPlan {
@@ -874,7 +886,7 @@ async fn run_cleanup_txn(
                         .map_err(|e| format!("key column `{pk_col}`: {e}"))?,
                 );
             }
-            live.push(vals);
+            live.push(canonical_tuple(vals, &plan.meta));
         }
     }
 
@@ -1685,6 +1697,33 @@ mod tests {
             .map(|v| tuple_fingerprint(v))
             .collect();
         assert_eq!(stale_key_rows(live, &seen), vec![k("2")]);
+    }
+
+    #[test]
+    fn written_keys_match_their_canonical_live_form() {
+        let meta = TableMeta {
+            columns: vec![
+                ("id".into(), SpannerType::Int64, false),
+                ("at".into(), SpannerType::Timestamp, false),
+                ("amt".into(), SpannerType::Numeric, false),
+            ],
+            pk: vec!["id".into(), "at".into(), "amt".into(), "gone".into()],
+        };
+        let s = |v: &str| Kind::StringValue(v.into());
+        let written = canonical_tuple(
+            vec![s("007"), s("2024-01-01T00:00:00+00:00"), s("1.50"), s("x")],
+            &meta,
+        );
+        let live = canonical_tuple(
+            vec![s("7"), s("2024-01-01T00:00:00Z"), s("1.5"), s("x")],
+            &meta,
+        );
+        assert_eq!(tuple_fingerprint(&written), tuple_fingerprint(&live));
+        let seen: HashSet<String> = [tuple_fingerprint(&written)].into_iter().collect();
+        assert!(
+            stale_key_rows(vec![live], &seen).is_empty(),
+            "nothing the run wrote is stale"
+        );
     }
 
     #[test]

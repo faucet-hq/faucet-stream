@@ -108,15 +108,37 @@ fn insert_params(
 impl ClickHouseSink {
     /// Insert one accumulated group, still re-chunked to `batch_size` so a
     /// single HTTP request stays a reasonable size (#617).
-    async fn commit_group(&self, rows: &[Value]) -> Result<(), FaucetError> {
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            vec![rows]
+    async fn commit_group(&self, rows: &[Value]) -> Result<(), (usize, FaucetError)> {
+        let chunk_len = if self.config.batch_size == 0 {
+            rows.len().max(1)
         } else {
-            rows.chunks(self.config.batch_size).collect()
+            self.config.batch_size
         };
-        for chunk in chunks {
-            self.send_insert(chunk).await?;
+        let mut done = 0;
+        for chunk in rows.chunks(chunk_len) {
+            self.send_insert(chunk).await.map_err(|e| (done, e))?;
+            done += chunk.len();
             tracing::debug!(records = chunk.len(), "ClickHouse insert chunk written");
+        }
+        Ok(())
+    }
+
+    /// Commit a group the accumulator handed out; on failure put back the
+    /// uncommitted rows of earlier pages (`rows[..keep_end]`), so a retried
+    /// write or `flush` commits them instead of dropping them.
+    async fn commit_or_restore(
+        &self,
+        rows: Vec<Value>,
+        keep_end: usize,
+    ) -> Result<(), FaucetError> {
+        if let Err((done, e)) = self.commit_group(&rows).await {
+            if done < keep_end {
+                let mut rows = rows;
+                rows.truncate(keep_end);
+                rows.drain(..done);
+                self.pending.lock().await.restore(rows);
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -172,7 +194,7 @@ impl ClickHouseSink {
         let client = build_client(&config.connection)?;
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
-            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::new(
+            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
                 config.commit_bytes,
             )),
@@ -275,9 +297,46 @@ impl Sink for ClickHouseSink {
             open.finish()
         };
         if let Some(rows) = group {
-            self.commit_group(&rows).await?;
+            let len = rows.len();
+            self.commit_or_restore(rows, len).await?;
         }
         Ok(())
+    }
+
+    /// The DLQ path commits per page (#789 SQL-21): earlier buffered rows are
+    /// committed first, then this page alone, so a failed commit can name
+    /// exactly the rows of *this* page that did not land.
+    async fn write_batch_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.flush().await?;
+        self.ensure_table_ready(records).await?;
+        if self.config.staging.is_some() {
+            self.write_batch(records).await?;
+            return Ok(records.iter().map(|_| Ok(())).collect());
+        }
+        match self.commit_group(records).await {
+            Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
+            Err((0, e)) => Err(e),
+            Err((done, e)) => {
+                let message = e.to_string();
+                Ok((0..records.len())
+                    .map(|i| {
+                        if i < done {
+                            Ok(())
+                        } else {
+                            Err(FaucetError::Sink(format!(
+                                "clickhouse: insert failed: {message}"
+                            )))
+                        }
+                    })
+                    .collect())
+            }
+        }
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -309,7 +368,8 @@ impl Sink for ClickHouseSink {
             pending.push_page(records)
         };
         if let Some(rows) = group {
-            self.commit_group(&rows).await?;
+            let keep_end = rows.len() - records.len();
+            self.commit_or_restore(rows, keep_end).await?;
         }
         Ok(records.len())
     }

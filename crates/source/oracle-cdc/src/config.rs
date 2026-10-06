@@ -74,8 +74,9 @@ pub struct OracleCdcSourceConfig {
     )]
     #[schemars(with = "u64")]
     pub poll_interval: Duration,
-    /// End the fetch cycle after this long without a captured change. Default
-    /// 30s. A long-running runtime re-invokes the source to keep tailing.
+    /// End the fetch cycle after this long without a captured change, counted
+    /// only once mining has reached the current SCN. Default 30s. A
+    /// long-running runtime re-invokes the source to keep tailing.
     #[serde(
         default = "default_idle_timeout",
         with = "faucet_core::config::duration_secs"

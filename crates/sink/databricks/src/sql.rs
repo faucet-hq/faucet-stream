@@ -33,6 +33,8 @@ pub struct TableColumn {
     pub full_type: String,
     /// Whether the column accepts NULL.
     pub nullable: bool,
+    /// The column's `DEFAULT` expression (`column_default`), if any.
+    pub default: Option<String>,
 }
 
 impl TableColumn {
@@ -41,6 +43,7 @@ impl TableColumn {
             name: name.into(),
             full_type: full_type.into(),
             nullable: true,
+            default: None,
         }
     }
 
@@ -229,7 +232,7 @@ pub fn describe_sql(catalog: Option<&str>) -> String {
         None => "information_schema.columns".to_owned(),
     };
     format!(
-        "SELECT column_name, full_data_type, is_nullable FROM {src} \
+        "SELECT column_name, full_data_type, is_nullable, column_default FROM {src} \
          WHERE lower(table_schema) = lower(:faucet_schema) AND lower(table_name) = lower(:faucet_table) \
          ORDER BY ordinal_position"
     )
@@ -243,10 +246,12 @@ pub fn columns_from_rows(rows: Vec<Vec<Option<String>>>) -> Vec<TableColumn> {
             let name = it.next().flatten()?;
             let full_type = it.next().flatten().unwrap_or_else(|| "string".into());
             let nullable = !matches!(it.next().flatten().as_deref(), Some("NO"));
+            let default = it.next().flatten().filter(|d| !d.trim().is_empty());
             Some(TableColumn {
                 name,
                 full_type,
                 nullable,
+                default,
             })
         })
         .collect()
@@ -498,8 +503,11 @@ pub fn replace_where_sql(
                     quote_ident(&tc.name)
                 )
             } else {
+                // A column the page does not carry takes its DEFAULT, not NULL
+                // (SQL-10).
                 format!(
-                    "CAST(NULL AS {}) AS {}",
+                    "CAST({} AS {}) AS {}",
+                    tc.default.as_deref().unwrap_or("NULL"),
                     tc.full_type,
                     quote_ident(&tc.name)
                 )
@@ -524,21 +532,46 @@ pub fn delete_eo_sql(table: &TableRef, scope: &str, seq: u64) -> String {
     )
 }
 
+/// The presence-flag column the sink adds for non-key merge column `i`.
+pub fn presence_col(i: usize) -> String {
+    format!("__faucet_has_{i}")
+}
+
 /// One `MERGE` applying upserts and deletes. `cols` are the merge columns
-/// (key included); the relation's last column is [`OP_COL`].
+/// (key included); the relation then carries [`OP_COL`] and, for each non-key
+/// column in order, a [`presence_col`] flag (`'1'` when the record carried the
+/// column). A matched row updates only the columns its record carried, and an
+/// inserted row takes a column's DEFAULT when its record did not carry it, so
+/// an upsert never overwrites a stored value with NULL (SQL-10).
 pub fn merge_sql(
     table: &TableRef,
     cols: &[TableColumn],
     key: &[String],
     rel: Relation<'_>,
 ) -> String {
+    let is_key = |name: &str| key.iter().any(|k| k.eq_ignore_ascii_case(name));
     let mut proj = projection(cols, rel);
     proj.push(format!(
         "{} AS {}",
         rel.col(cols.len(), OP_COL),
         quote_ident(OP_COL)
     ));
-    let is_key = |name: &str| key.iter().any(|k| k.eq_ignore_ascii_case(name));
+    let mut flag: Vec<Option<String>> = Vec::with_capacity(cols.len());
+    let mut next = cols.len() + 1;
+    for c in cols {
+        if is_key(&c.name) {
+            flag.push(None);
+            continue;
+        }
+        let name = presence_col(flag.iter().flatten().count());
+        proj.push(format!(
+            "{} AS {}",
+            rel.col(next, &name),
+            quote_ident(&name)
+        ));
+        next += 1;
+        flag.push(Some(format!("s.{} = '1'", quote_ident(&name))));
+    }
     let on = key
         .iter()
         .map(|k| format!("t.{0} = s.{0}", quote_ident(k)))
@@ -546,8 +579,27 @@ pub fn merge_sql(
         .join(" AND ");
     let set: Vec<String> = cols
         .iter()
-        .filter(|c| !is_key(&c.name))
-        .map(|c| format!("t.{0} = s.{0}", quote_ident(&c.name)))
+        .zip(&flag)
+        .filter_map(|(c, f)| {
+            f.as_ref().map(|f| {
+                format!(
+                    "t.{0} = CASE WHEN {f} THEN s.{0} ELSE t.{0} END",
+                    quote_ident(&c.name)
+                )
+            })
+        })
+        .collect();
+    let vals: Vec<String> = cols
+        .iter()
+        .zip(&flag)
+        .map(|(c, f)| match f {
+            None => format!("s.{}", quote_ident(&c.name)),
+            Some(f) => format!(
+                "CASE WHEN {f} THEN s.{} ELSE {} END",
+                quote_ident(&c.name),
+                c.default.as_deref().unwrap_or("NULL")
+            ),
+        })
         .collect();
     let op = quote_ident(OP_COL);
     let update = if set.is_empty() {
@@ -561,14 +613,37 @@ pub fn merge_sql(
          WHEN NOT MATCHED AND s.{op} = 'u' THEN INSERT ({names}) VALUES ({vals})",
         t = table.sql(),
         proj = proj.join(", "),
-        from = rel.from(cols.len() + 1),
+        from = rel.from(next),
         names = col_list(cols),
-        vals = cols
-            .iter()
-            .map(|c| format!("s.{}", quote_ident(&c.name)))
-            .collect::<Vec<_>>()
-            .join(", "),
+        vals = vals.join(", "),
     )
+}
+
+/// The presence flags for the non-key `cols` of each upsert record (`'1'` when
+/// the record carries the column, matched like [`build_matrix`] ignoring case),
+/// then `'0'` for each delete row. One `Vec` per flag column.
+pub fn presence_flags(
+    upserts: &[Value],
+    deletes: usize,
+    cols: &[TableColumn],
+    key: &[String],
+) -> Vec<Vec<Option<String>>> {
+    cols.iter()
+        .filter(|c| !key.iter().any(|k| k.eq_ignore_ascii_case(&c.name)))
+        .map(|c| {
+            let mut cells: Vec<Option<String>> = upserts
+                .iter()
+                .map(|r| {
+                    let has = r
+                        .as_object()
+                        .is_some_and(|o| o.keys().any(|k| k.eq_ignore_ascii_case(&c.name)));
+                    Some(if has { "1" } else { "0" }.to_owned())
+                })
+                .collect();
+            cells.extend(std::iter::repeat_n(Some("0".to_owned()), deletes));
+            cells
+        })
+        .collect()
 }
 
 /// `COPY INTO` one staged file. `COPY INTO` remembers every file it loaded
@@ -873,7 +948,18 @@ mod tests {
         assert!(describe_sql(Some("main")).contains("FROM `main`.information_schema.columns"));
         assert!(describe_sql(None).contains("FROM information_schema.columns"));
         let got = columns_from_rows(vec![
-            vec![Some("id".into()), Some("bigint".into()), Some("NO".into())],
+            vec![
+                Some("id".into()),
+                Some("bigint".into()),
+                Some("NO".into()),
+                Some("0".into()),
+            ],
+            vec![
+                Some("e".into()),
+                Some("int".into()),
+                Some("YES".into()),
+                Some(" ".into()),
+            ],
             vec![Some("n".into()), None, Some("YES".into())],
             vec![None],
         ]);
@@ -883,8 +969,10 @@ mod tests {
                 TableColumn {
                     name: "id".into(),
                     full_type: "bigint".into(),
-                    nullable: false
+                    nullable: false,
+                    default: Some("0".into()),
                 },
+                TableColumn::new("e", "int"),
                 TableColumn::new("n", "string"),
             ]
         );
@@ -897,6 +985,7 @@ mod tests {
                 name: "id".into(),
                 full_type: "INT".into(),
                 nullable: false,
+                default: None,
             },
             TableColumn::new("amt", "decimal(10,2)"),
             TableColumn::new("f", "float"),
@@ -1002,19 +1091,27 @@ mod tests {
 
     #[test]
     fn merge_applies_updates_deletes_inserts() {
-        let c = &cols()[..2];
+        let mut c = cols()[..2].to_vec();
+        c[1].default = Some("'n/a'".into());
         let rows = vec![
-            vec![Some("1".into()), Some("a".into()), Some("u".into())],
-            vec![Some("2".into()), None, Some("d".into())],
+            vec![
+                Some("1".into()),
+                Some("a".into()),
+                Some("u".into()),
+                Some("1".into()),
+            ],
+            vec![Some("2".into()), None, Some("d".into()), Some("0".into())],
         ];
-        let sql = merge_sql(&t(), c, &["id".into()], Relation::Values(&rows));
+        let sql = merge_sql(&t(), &c, &["id".into()], Relation::Values(&rows));
         assert_eq!(
             sql,
             "MERGE INTO `main`.`sales`.`orders` AS t USING (SELECT CAST(v.c0 AS bigint) AS `id`, v.c1 AS `name`, \
-             v.c2 AS `__faucet_op` FROM VALUES ('1', 'a', 'u'), ('2', NULL, 'd') AS v(c0, c1, c2)) AS s \
+             v.c2 AS `__faucet_op`, v.c3 AS `__faucet_has_0` FROM VALUES ('1', 'a', 'u', '1'), ('2', NULL, 'd', '0') \
+             AS v(c0, c1, c2, c3)) AS s \
              ON t.`id` = s.`id` WHEN MATCHED AND s.`__faucet_op` = 'd' THEN DELETE \
-             WHEN MATCHED THEN UPDATE SET t.`name` = s.`name` \
-             WHEN NOT MATCHED AND s.`__faucet_op` = 'u' THEN INSERT (`id`, `name`) VALUES (s.`id`, s.`name`)"
+             WHEN MATCHED THEN UPDATE SET t.`name` = CASE WHEN s.`__faucet_has_0` = '1' THEN s.`name` ELSE t.`name` END \
+             WHEN NOT MATCHED AND s.`__faucet_op` = 'u' THEN INSERT (`id`, `name`) \
+             VALUES (s.`id`, CASE WHEN s.`__faucet_has_0` = '1' THEN s.`name` ELSE 'n/a' END)"
         );
         let key_only = merge_sql(
             &t(),
@@ -1026,6 +1123,41 @@ mod tests {
         assert!(key_only.contains(
             "`__faucet_op` AS `__faucet_op` FROM read_files('s3://b/k', format => 'parquet')"
         ));
+    }
+
+    #[test]
+    fn presence_flags_mark_carried_non_key_columns() {
+        let c = cols();
+        let flags = presence_flags(
+            &[
+                json!({"ID": 1, "Name": "a"}),
+                json!({"id": 2, "tags": null}),
+            ],
+            1,
+            &c,
+            &["id".into()],
+        );
+        assert_eq!(
+            flags,
+            vec![
+                vec![Some("1".into()), Some("0".into()), Some("0".into())],
+                vec![Some("0".into()), Some("1".into()), Some("0".into())],
+            ]
+        );
+        assert_eq!(presence_col(3), "__faucet_has_3");
+    }
+
+    #[test]
+    fn replace_where_fills_an_absent_column_with_its_default() {
+        let mut table = cols();
+        table[2].default = Some("array('x')".into());
+        let page = vec![TableColumn::new("id", "bigint")];
+        let rows = vec![vec![Some("1".into())]];
+        let sql = replace_where_sql(&t(), &table, &page, Relation::Values(&rows), "s", 1);
+        assert!(
+            sql.contains("CAST(array('x') AS array<string>) AS `tags`"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -1131,6 +1263,7 @@ mod tests {
                 name: "qty".into(),
                 full_type: "int".into(),
                 nullable: false,
+                default: None,
             },
             TableColumn::new("price", "float"),
             TableColumn::new("amt", "double"),
@@ -1138,6 +1271,7 @@ mod tests {
                 name: "note".into(),
                 full_type: "string".into(),
                 nullable: false,
+                default: None,
             },
         ];
         let evo = SchemaEvolution {

@@ -27,7 +27,7 @@ Append-only: Redshift has no `ON CONFLICT`, and `COPY` cannot upsert, so
 | `table_name` | yes | Target table. |
 | `schema` | no | Namespace qualifying the table. |
 | `write_strategy` | no | `copy` (default) or `insert`. |
-| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto'`) or `csv` (`FORMAT AS CSV`). |
+| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto ignorecase'`) or `csv` (`FORMAT AS CSV`). |
 | `copy.staging_bucket` | copy only | S3 bucket for staged files. |
 | `copy.staging_prefix` | no | Key prefix for staged objects. |
 | `copy.iam_role` | copy only | IAM role ARN Redshift assumes to read the staged file. |
@@ -88,9 +88,15 @@ page unit, and `batch_size` could only ever *split* an oversized page — it
 could never merge two undersized ones, so a small source page meant one
 expensive warehouse operation per small page. `COPY` wants millions of rows per load; one `COPY` per 1000-row page produced many small commits, small unsorted blocks, and VACUUM pressure.
 
-- `commit_rows` — records per commit. `None` (the default) accumulates the
-  **whole run** into one commit.
+- `commit_rows` — records per commit. `0` removes the row limit.
 - `commit_bytes` — estimated-bytes counterpart, bounding how much is buffered.
+  `0` removes the byte limit.
+
+With neither set, a group commits at **100,000 rows or ~256 MiB**, whichever
+comes first, so a large load never holds the whole run in memory. A group
+whose commit fails keeps its uncommitted rows, so a retried `flush` (for
+example under a `resilience:` policy) commits them rather than reporting
+success with nothing written.
 
 `batch_size` still bounds an individual request inside a commit group, so a
 very large group is split into reasonably-sized requests.
@@ -98,7 +104,10 @@ very large group is split into reasonably-sized requests.
 **Only the append path accumulates.** `delivery: exactly_once` and the DLQ
 path commit per page, because a commit token must land atomically with its own
 page, and a DLQ must report which rows of *this* page failed — neither is
-expressible once pages are merged.
+expressible once pages are merged. With a `dlq:` block, earlier buffered pages are
+committed first and a failed write sends exactly the rows of that page that did
+not land to the DLQ; rows from chunks that committed before the failure are not
+repeated.
 
 ## Batch atomicity
 

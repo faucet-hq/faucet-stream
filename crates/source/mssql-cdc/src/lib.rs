@@ -19,7 +19,7 @@ mod lsn;
 mod state;
 mod stream;
 
-pub use config::{MssqlCdcSourceConfig, StartPosition};
+pub use config::{MssqlCdcSourceConfig, OnGap, StartPosition};
 pub use lsn::Lsn;
 pub use state::Bookmarks;
 pub use stream::MssqlCdcSource;

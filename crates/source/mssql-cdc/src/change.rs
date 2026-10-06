@@ -128,6 +128,34 @@ pub fn plan_poll(
     }
 }
 
+/// Apply the `on_gap` policy to a poll plan that had to jump past purged
+/// changes (SQL-26). `Fail` refuses the run; `Skip` warns and goes on.
+pub fn check_gap(
+    on_gap: crate::config::OnGap,
+    capture_instance: &str,
+    resume_from: &str,
+) -> Result<(), faucet_core::FaucetError> {
+    match on_gap {
+        crate::config::OnGap::Fail => Err(faucet_core::FaucetError::Source(format!(
+            "mssql-cdc: capture instance '{capture_instance}' resumes before its retained \
+             minimum LSN — the CDC cleanup job purged changes that were never read, so they \
+             are lost. Re-snapshot the destination, then set `on_gap: skip` to resume from \
+             the earliest retained change ({resume_from})"
+        ))),
+        crate::config::OnGap::Skip => {
+            tracing::warn!(
+                connector = "mssql-cdc",
+                capture_instance,
+                resume_from,
+                "resume point predates the retained minimum LSN; the CDC cleanup job purged \
+                 changes before they were read — resuming from the earliest retained change \
+                 (on_gap: skip)"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Split a decoded change row's columns into the business columns (the table's
 /// own columns) and drop every CDC metadata / helper column (`__$*` and the
 /// `__faucet_lsn` alias). Pure.
@@ -298,6 +326,34 @@ mod tests {
     }
 
     // ── envelope shaping ──────────────────────────────────────────────────────
+
+    #[test]
+    fn a_purged_gap_fails_by_default_and_skips_only_when_asked() {
+        let err = check_gap(crate::config::OnGap::default(), "dbo_orders", "0x01")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dbo_orders"), "{err}");
+        assert!(err.contains("on_gap: skip"), "{err}");
+        assert!(check_gap(crate::config::OnGap::Skip, "dbo_orders", "0x01").is_ok());
+    }
+
+    #[test]
+    fn on_gap_deserializes_and_defaults_to_fail() {
+        let cfg: crate::config::MssqlCdcSourceConfig = serde_json::from_value(json!({
+            "connection_url": "mssql://sa:pw@h/db",
+            "capture_instances": ["dbo_t"],
+        }))
+        .unwrap();
+        assert_eq!(cfg.on_gap, crate::config::OnGap::Fail);
+        let skip: crate::config::MssqlCdcSourceConfig = serde_json::from_value(json!({
+            "connection_url": "mssql://sa:pw@h/db",
+            "capture_instances": ["dbo_t"],
+            "on_gap": "skip",
+        }))
+        .unwrap();
+        assert_eq!(skip.on_gap, crate::config::OnGap::Skip);
+        assert!(format!("{skip:?}").contains("on_gap"));
+    }
 
     #[test]
     fn business_columns_strips_metadata() {

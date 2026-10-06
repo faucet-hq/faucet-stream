@@ -150,7 +150,7 @@ scope: { type: collection, database: appdb, collection: orders }
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `operation_types` | string[] | `[]` (all) | Server-side `$match` allowlist on `operationType`. Empty = every operation. Example: `["insert", "update", "delete"]`. |
+| `operation_types` | string[] | `[]` (all) | Server-side `$match` allowlist on `operationType`. Empty = every operation. Example: `["insert", "update", "delete"]`. `invalidate` always passes the server-side `$match` (the stream ends at one and its token is the only way to resume past it); unless listed it is not emitted as a record, but its bookmark is still persisted. |
 | `aggregation_pipeline` | object[] | `[]` | Extra aggregation stages appended **after** the internal `operation_types` `$match`. Use for server-side field projection, redaction, or further filtering of the change-event documents. |
 
 ### Document images
@@ -282,7 +282,7 @@ The connector is fully resumable. After each emitted page the pipeline writes th
 **`start_from` precedence (only consulted when no persisted bookmark exists, except as noted):**
 
 - `resume_token` and `timestamp` variants **always** override a persisted bookmark — they force an explicit start position regardless of what the state store holds.
-- `now` and `earliest` variants **yield** to a persisted bookmark: if one exists the connector resumes from it; if none exists, the variant chooses the initial position.
+- `now` and `earliest` variants **yield** to a persisted bookmark: if one exists the connector resumes from it; if none exists, the variant chooses the initial position. A fresh `now` start persists the position it opened at before any change arrives, so a quiet first cycle followed by writes between runs loses nothing: the next run resumes from that position.
 
 State keys (one per scope) so that two pipelines on different scopes never collide:
 
@@ -335,7 +335,7 @@ There is no replication slot to pin — the **oplog window** is the retention ri
 
 ## `invalidate` events
 
-An `invalidate` event (emitted when a watched collection or database is dropped while the stream is open) is delivered as a `ddl` record and then **terminates the stream**. The connector closes the stream and returns; a fresh `faucet run` is needed to start a new change stream. Persisted bookmarks from before the invalidate are no longer resumable by MongoDB — use `start_from: { type: now }` or `{ type: earliest }` on the next run.
+An `invalidate` event (emitted when a watched collection or database is dropped or renamed while the stream is open) is delivered as a `ddl` record — or, when `operation_types` does not list `invalidate`, only recorded in the bookmark — and **ends the fetch cycle**. Its token is persisted with `invalidate: true`, and the next run resumes past it with `startAfter`, so a re-created collection is captured from there. A stream the server closes without an event also ends the cycle with a warning instead of polling a dead cursor.
 
 ## Config loading
 
@@ -411,7 +411,7 @@ This crate has no optional features of its own. From the umbrella / CLI it is ga
 | Resume fails after restart with a "resume point may no longer be in the oplog" error | The persisted `resumeToken` rolled off the oplog while the pipeline was down. Increase the oplog size, or restart with `start_from: { type: now }` (accepting the gap). |
 | `before` is always `null` despite `full_document_before_change` set | Pre-images need MongoDB 6.0+ **and** `changeStreamPreAndPostImages: { enabled: true }` on the collection: `db.runCommand({ collMod: "mycoll", changeStreamPreAndPostImages: { enabled: true } })`. With `required` and pre-images off, the stream errors; with `when_available` you get `before: null`. |
 | `after` reflects a newer state than the change | You're using `full_document: update_lookup`, which re-reads the document at lookup time. If the doc was further modified or deleted in between, `after` shows the later state (or is absent). Don't rely on it for a strict point-in-time image. |
-| Pipeline exits cleanly but the source dropped a collection | An `invalidate` (collection/db dropped) arrives as a `ddl` event and **terminates the stream**. Re-run `faucet run`; the prior bookmark is no longer resumable, so set `start_from`. |
+| Pipeline exits cleanly but the source dropped a collection | An `invalidate` (collection/db dropped or renamed) ends the fetch cycle. The next run resumes past it with `startAfter` and captures the re-created collection. |
 | Authorization errors opening the stream | The user needs `find` + `changeStream` on the namespace (cluster scope needs read across all databases). Check `authSource` in the URI matches where the user is defined. |
 | No events appear even though documents are changing | Check `operation_types` isn't filtering them out, and that `scope` targets the right database/collection. A too-short `idle_timeout` ends the cycle before events arrive on a quiet collection — that's expected; the next run resumes. |
 | `in-memory change buffer exceeded max_staged_records` | A high-throughput stream buffered more events than the configured `max_staged_records` cap before a page flushed — most likely with `batch_size: 0` (single-page drain). Raise `max_staged_records` to fit your available memory, or set a non-zero `batch_size` so pages flush more often. |

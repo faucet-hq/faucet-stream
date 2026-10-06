@@ -16,7 +16,10 @@ the Delta Lake connectors ([`faucet-source-delta`](https://crates.io/crates/fauc
 ## Highlights
 
 - **Async statement lifecycle** — submit → poll until terminal → stream result
-  chunks (INLINE + `JSON_ARRAY`), following `next_chunk_internal_link`.
+  chunks (`EXTERNAL_LINKS` + `JSON_ARRAY`: each chunk is downloaded from its
+  presigned URL without the workspace token), following the chunk links, so
+  results of any size stream — `INLINE` results are capped at 25 MiB by
+  Databricks.
 - **Type-aware decode** from the response `manifest` column schema (every
   `JSON_ARRAY` cell is a string; decoded per `type_name` to typed JSON, with
   `DECIMAL`/large `LONG` preserved losslessly as strings).
@@ -50,6 +53,7 @@ the Delta Lake connectors ([`faucet-source-delta`](https://crates.io/crates/fauc
 | `wait_timeout_secs` | int | `50` | server wait before async (`0` or `5`–`50`) |
 | `poll_interval_secs` | int | `1` | client poll cadence while running |
 | `batch_size` | int | `1000` | rows per emitted page; `0` is the "no batching" sentinel — the whole result set is emitted in a single page |
+| `result_disposition` | `external_links` \| `inline` | `external_links` | how the row path receives results. `external_links` downloads each chunk from a presigned cloud-storage URL (no size cap; the client must reach the workspace's storage); `inline` keeps results in the API response, which Databricks fails above 25 MiB. Ignored under `arrow_native`. |
 | `arrow_native` | bool | `false` | fetch as `EXTERNAL_LINKS` + `ARROW_STREAM` and decode Arrow IPC; enables the columnar fast path. Requires the `arrow` feature and `replication: full`. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode). |
 | `replication` | `{ type: full \| incremental, column, initial_value }` | `full` | incremental cursor |
 | `state_key` | string? | derived | explicit bookmark key |
@@ -79,13 +83,13 @@ IPC stream rather than a `JSON_ARRAY`. This has two effects:
   `Value`-shaped transform is configured, records move end-to-end as Arrow
   `RecordBatch`es with no `serde_json::Value` materialization; and
 - a faster **row path** — even into a JSON sink, decoding Arrow batches skips
-  the per-cell string→JSON decode the default `INLINE` + `JSON_ARRAY` path pays.
+  the per-cell string→JSON decode the default `JSON_ARRAY` path pays.
 
 `arrow_native: true` requires the `arrow` feature and only works with
 `replication: full` — config validation rejects `arrow_native` combined with
 incremental replication, because the columnar path does not run the per-row
 client-side incremental filter. The default (`arrow_native: false`) keeps the
-unchanged `INLINE` + `JSON_ARRAY` row path.
+`JSON_ARRAY` row path.
 
 ```yaml
 # databricks(arrow) → parquet — runs Arrow end-to-end
@@ -111,7 +115,6 @@ or `cargo install faucet-cli --features "source-databricks,arrow"` (CLI).
 ## Out of scope (v1)
 
 `discover()` via `INFORMATION_SCHEMA`, Unity Catalog Volumes, and a Databricks
-SQL sink (use the Delta sink). (The `EXTERNAL_LINKS` large-result disposition is
-available via `arrow_native` — see above.)
+SQL sink (use the Delta sink).
 
 License: MIT OR Apache-2.0.

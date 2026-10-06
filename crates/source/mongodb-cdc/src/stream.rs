@@ -183,12 +183,23 @@ pub(crate) fn full_document_before_type(
     }
 }
 
+/// Whether `invalidate` events are delivered as records. The server-side
+/// `$match` always lets them through, because the stream ends at one and its
+/// token is the only way to resume past it (#789 SQL-27).
+pub(crate) fn reports_invalidate(config: &MongoCdcSourceConfig) -> bool {
+    config.operation_types.is_empty() || config.operation_types.iter().any(|t| t == "invalidate")
+}
+
 /// Build the server-side pipeline: operation-type `$match` + user stages.
 pub(crate) fn build_pipeline(config: &MongoCdcSourceConfig) -> Result<Vec<Document>, FaucetError> {
     let mut pipeline: Vec<Document> = Vec::new();
     if !config.operation_types.is_empty() {
+        let mut types = config.operation_types.clone();
+        if !reports_invalidate(config) {
+            types.push("invalidate".to_string());
+        }
         pipeline.push(bson::doc! {
-            "$match": { "operationType": { "$in": config.operation_types.clone() } }
+            "$match": { "operationType": { "$in": types } }
         });
     }
     for (i, stage) in config.aggregation_pipeline.iter().enumerate() {
@@ -483,8 +494,15 @@ impl MongoCdcSource {
             use futures::StreamExt;
 
             let pending = self.pending_bookmark.lock().await.take();
-            let start = resolve_start(&self.config.start_from, pending.as_ref())?;
+            let mut start = resolve_start(&self.config.start_from, pending.as_ref())?;
+            let mut anchor = None;
+            if start == StartPosition::Now {
+                let token = self.capture_now_token().await?;
+                anchor = Some(Bookmark::from_token(&token)?.to_value()?);
+                start = StartPosition::ResumeAfter(token);
+            }
             let pipeline = build_pipeline(&self.config)?;
+            let report_invalidate = reports_invalidate(&self.config);
 
             // Open the change stream scoped to collection, database, or cluster.
             // Each arm resolves to a ChangeStream<ChangeStreamEvent<Document>>.
@@ -562,6 +580,9 @@ impl MongoCdcSource {
                 }
             };
             let mut change_stream = std::pin::pin!(change_stream);
+            if anchor.is_some() {
+                yield StreamPage { records: Vec::new(), bookmark: anchor };
+            }
 
             let chunk = if per_batch { batch_size } else { usize::MAX };
             let mut buffer: Vec<Value> = Vec::new();
@@ -577,6 +598,19 @@ impl MongoCdcSource {
             // page yields, so a dropped in-flight buffer is simply re-fetched
             // (the resume token has not advanced).
             loop {
+                if !change_stream.is_alive() {
+                    tracing::warn!(
+                        connector = "mongodb-cdc",
+                        "the server closed the change stream; ending the fetch cycle"
+                    );
+                    if !buffer.is_empty() {
+                        yield StreamPage {
+                            records: std::mem::take(&mut buffer),
+                            bookmark: last_bookmark.take(),
+                        };
+                    }
+                    break;
+                }
                 match tokio::time::timeout(idle_timeout, change_stream.next()).await {
                     Ok(Some(Ok(event))) => {
                         if let Some(ts) = &event.cluster_time {
@@ -592,8 +626,10 @@ impl MongoCdcSource {
                         // high-throughput stream would grow it without bound.
                         // Abort with a typed error before staging one more record
                         // past the cap rather than risk an OOM-kill.
-                        check_staging_cap(buffer.len(), max_staged)?;
-                        buffer.push(to_envelope(&event, &bookmark)?);
+                        if report_invalidate || !is_invalidate {
+                            check_staging_cap(buffer.len(), max_staged)?;
+                            buffer.push(to_envelope(&event, &bookmark)?);
+                        }
                         // The persisted bookmark records whether it is an
                         // invalidate token, so resume uses `start_after` not
                         // `resume_after` (#321 M3). The envelope above keeps the
@@ -932,6 +968,37 @@ mod tests {
         let p = build_pipeline(&c).unwrap();
         assert_eq!(p.len(), 1);
         assert!(p[0].contains_key("$match"));
+    }
+
+    #[test]
+    fn the_operation_match_always_lets_invalidate_through() {
+        let cfg = |types: Value| -> MongoCdcSourceConfig {
+            serde_json::from_value(json!({
+                "connection_uri": "mongodb://h/?replicaSet=rs0",
+                "scope": { "type": "cluster" },
+                "operation_types": types
+            }))
+            .unwrap()
+        };
+        let types = |c: &MongoCdcSourceConfig| {
+            build_pipeline(c).unwrap()[0]
+                .get_document("$match")
+                .unwrap()
+                .get_document("operationType")
+                .unwrap()
+                .get_array("$in")
+                .unwrap()
+                .iter()
+                .map(|b| b.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let filtered = cfg(json!(["insert"]));
+        assert_eq!(types(&filtered), ["insert", "invalidate"]);
+        assert!(!reports_invalidate(&filtered));
+        let listed = cfg(json!(["invalidate", "insert"]));
+        assert_eq!(types(&listed), ["invalidate", "insert"]);
+        assert!(reports_invalidate(&listed));
+        assert!(reports_invalidate(&cfg(json!([]))));
     }
 
     #[test]

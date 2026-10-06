@@ -349,6 +349,7 @@ impl PostgresCdcSource {
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         let max_messages = self.config.max_messages.unwrap_or(usize::MAX);
         let idle_timeout = self.config.idle_timeout;
+        let max_cycle = self.config.max_cycle_duration;
         let per_transaction = batch_size != 0;
 
         Box::pin(async_stream::try_stream! {
@@ -444,6 +445,7 @@ impl PostgresCdcSource {
             let mut agg_records: Vec<Value> = Vec::new();
             let mut total_records: usize = 0;
             let mut last_message_at = Instant::now();
+            let cycle_started = Instant::now();
 
             loop {
                 let idle_deadline = last_message_at + idle_timeout;
@@ -543,6 +545,13 @@ impl PostgresCdcSource {
                     if total_records >= max_messages {
                         stop = true;
                     }
+                }
+                // End the cycle at a transaction boundary once it has run for
+                // max_cycle_duration, so the next cycle advances the slot from
+                // the bookmark this one persisted (#789 SQL-08).
+                if cycle_ended(max_cycle, cycle_started.elapsed(), state.in_txn) {
+                    tracing::debug!("postgres-cdc: max_cycle_duration reached, stopping");
+                    stop = true;
                 }
 
                 if stop {
@@ -849,6 +858,12 @@ fn schema_table(record: &Value) -> Option<String> {
     Some(format!("{schema}.{table}"))
 }
 
+/// Whether a fetch cycle that has run for `elapsed` should end now: only
+/// outside a transaction, and never when the bound is `0`.
+fn cycle_ended(max_cycle: Duration, elapsed: Duration, in_txn: bool) -> bool {
+    !max_cycle.is_zero() && !in_txn && elapsed >= max_cycle
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -887,6 +902,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_cycle_ends_at_its_bound_only_outside_a_transaction() {
+        let five = Duration::from_secs(5);
+        assert!(!cycle_ended(five, Duration::from_secs(4), false));
+        assert!(cycle_ended(five, Duration::from_secs(5), false));
+        assert!(!cycle_ended(five, Duration::from_secs(9), true));
+        assert!(!cycle_ended(
+            Duration::ZERO,
+            Duration::from_secs(999),
+            false
+        ));
+    }
     use crate::pgoutput::messages::{ColumnDesc, ReplicaIdentity};
     use crate::replication::ReplicationEvent;
     use pgwire_replication::Lsn;

@@ -800,6 +800,27 @@ async fn direct_overwrite_streams_one_load_across_pages() {
         body.contains("\"id\":1") && body.contains("\"id\":2"),
         "both pages in one atomic load, got: {body}"
     );
+
+    // SQL-35: the truncating load carries the existing table's own schema
+    // (INTEGER / REQUIRED), not one inferred from the first page, and does not
+    // drop unknown fields.
+    let initiate = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| {
+            r.method.as_str() == "POST"
+                && r.url.path().contains("/upload/bigquery")
+                && r.url.query().is_some_and(|q| q.contains("resumable"))
+        })
+        .expect("session initiate");
+    let job = String::from_utf8_lossy(&initiate.body).to_string();
+    assert!(
+        job.contains("\"mode\":\"REQUIRED\"") && job.contains("\"type\":\"INTEGER\""),
+        "{job}"
+    );
+    assert!(job.contains("\"ignoreUnknownValues\":false"), "{job}");
 }
 
 /// A direct overwrite flushed mid-stream must not truncate the target a second
@@ -880,6 +901,66 @@ async fn append_media_load_streams_one_load_on_flush() {
         body.contains("\"id\":1") && body.contains("\"id\":2"),
         "got: {body}"
     );
+}
+
+/// SQL-36: a mid-run flush (a bookmark-carrying page) finalizes the append load
+/// once; later pages stream through `insertAll` instead of opening a load job
+/// per page, so a continuously bookmarking source never exhausts the daily
+/// load-job quota.
+#[tokio::test]
+async fn append_media_load_streams_rows_after_a_mid_run_flush() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_resumable(&server, "/resumable/app-2", "load-app-2").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}/insertAll"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let mut config = BigQuerySinkConfig::new(
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ApplicationDefault,
+    );
+    config.media_load = true;
+    config.upload_base_url = Some(server.uri());
+    let config = with_sa_auth(config, &server);
+    let (sink, _sa) = build_sink(&server, config).await;
+
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("page 1");
+    sink.flush().await.expect("flush 1");
+    sink.write_batch(&[json!({"id": 2, "name": "b"})])
+        .await
+        .expect("page 2");
+    sink.flush().await.expect("flush 2");
+    sink.write_batch(&[json!({"id": 3, "name": "c"})])
+        .await
+        .expect("page 3");
+    sink.flush().await.expect("flush 3");
+
+    let reqs = server.received_requests().await.expect("recording");
+    let initiates = reqs
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().starts_with("/upload/"))
+        .count();
+    assert_eq!(initiates, 1, "one load job for the whole run");
+    let inserts: Vec<String> = reqs
+        .iter()
+        .filter(|r| r.url.path().ends_with("/insertAll"))
+        .map(|r| gunzip(&r.body))
+        .collect();
+    assert_eq!(inserts.len(), 2, "pages after the flush stream rows");
+    assert!(inserts[0].contains("\"id\":2") && inserts[1].contains("\"id\":3"));
+    let puts = session_puts(&server, "/resumable/app-2").await;
+    assert_eq!(puts.len(), 1);
+    assert!(gunzip(&puts[0]).contains("\"id\":1"));
 }
 
 /// An empty overwrite source opens no session and finalizes cleanly — no upload
@@ -1798,4 +1879,90 @@ async fn staging_probe_reports_present_and_absent() {
         .await;
     let (sink, _sa) = build_sink(&server, config_overwrite()).await;
     assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(false));
+}
+
+/// The resumable-upload initiate body (the load-job JSON) of the first upload.
+async fn initiate_body(server: &MockServer) -> serde_json::Value {
+    let req = server
+        .received_requests()
+        .await
+        .expect("recording")
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST" && r.url.path().starts_with("/upload/"))
+        .expect("an upload was initiated");
+    serde_json::from_slice(&req.body).expect("initiate body is the job JSON")
+}
+
+/// SQL-35: an explicit `schema` still wins over the existing table's schema on
+/// a truncating load.
+#[tokio::test]
+async fn truncating_load_uses_an_explicit_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_resumable(&server, "/resumable/explicit", "load-explicit").await;
+    let mut config = direct_media_config(&server);
+    config.schema = Some(json!({
+        "type": "object",
+        "properties": {"id": {"type": "integer"}, "extra": {"type": "string"}}
+    }));
+    let (sink, _sa) = build_sink(&server, config).await;
+
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1, "extra": "x"})])
+        .await
+        .expect("page");
+    let body = initiate_body(&server).await;
+    let text = body.to_string();
+    assert!(text.contains("\"extra\""), "{text}");
+    assert!(
+        !text.contains("REQUIRED"),
+        "explicit schema, not the table's: {text}"
+    );
+}
+
+/// SQL-35: a failure reading the target's schema for a truncating load is an
+/// error, never a silent fallback to an inferred schema.
+#[tokio::test]
+async fn truncating_load_surfaces_a_schema_read_failure() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    let table_path = format!("/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}");
+    Mock::given(method("GET"))
+        .and(path(table_path.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tableReference": {"projectId": PROJECT_ID, "datasetId": DATASET_ID, "tableId": TABLE_ID},
+            "schema": {"fields": [{"name": "id", "type": "INTEGER"}]}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(table_path))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": {"code": 500, "message": "backend error", "errors": []}
+        })))
+        .mount(&server)
+        .await;
+    mount_resumable(&server, "/resumable/err", "load-err").await;
+    let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
+
+    sink.begin_overwrite().await.expect("begin");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("schema read fails");
+    assert!(err.to_string().contains("truncate schema"), "{err}");
+}
+
+/// `BigQuerySink::new` builds its client from service-account key JSON without
+/// a network round trip, and the sink it returns writes like `from_parts`.
+#[tokio::test]
+async fn new_builds_a_sink_from_service_account_key_json() {
+    let server = MockServer::start().await;
+    let mut config = config_overwrite();
+    config.write.write_mode = WriteMode::Append;
+    let config = with_sa_auth(config, &server);
+    let sink = BigQuerySink::new(config).await.expect("sink");
+    assert_eq!(sink.connector_name(), "bigquery");
 }

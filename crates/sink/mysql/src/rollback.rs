@@ -10,8 +10,8 @@ use crate::config::MysqlColumnMapping;
 use crate::sink::{MysqlSink, bind_value, quote_ident_mysql, scope_key};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
-    JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, canonical_key,
-    key_json, plan_keys, plan_restore,
+    JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, key_json, plan_keys,
+    plan_restore,
 };
 use serde_json::Value;
 use sqlx::{MySqlConnection, Row};
@@ -114,9 +114,12 @@ impl MysqlSink {
 
         let per = (MAX_MYSQL_PARAMS / (key.len().max(1) * 4)).max(1);
         for chunk in keys.chunks(per) {
-            let (predicate, _) = sql.keys_in(key, chunk.len(), 0);
-            let select =
-                format!("SELECT {row_expr} AS row_json FROM {table_ref} WHERE {predicate}");
+            // Attribute each current row to its key by position: re-deriving
+            // the key from the row's text misses a row whose stored form
+            // differs from the record's (a case-variant key under a `_ci`
+            // collation), and a missed row would be journaled as created by
+            // the run and deleted on rollback (#789 SQL-32).
+            let select = positional_key_select(&table_ref, key, &row_expr, chunk.len());
             let mut q = sqlx::query(&select);
             for kt in chunk {
                 for (_, v) in &kt.0 {
@@ -127,21 +130,20 @@ impl MysqlSink {
                 .fetch_all(&mut *conn)
                 .await
                 .map_err(|e| sink_err("read before-images", e))?;
-            let mut before: std::collections::HashMap<String, String> =
+            let mut before: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::with_capacity(rows.len());
             for r in rows {
+                let idx: i64 = r.get("__faucet_idx");
                 let text: String = r.get("row_json");
-                let row: Value =
-                    serde_json::from_str(&text).map_err(|e| sink_err("decode before-image", e))?;
-                if let Some(kt) = faucet_core::write_mode::record_key(&row, key) {
-                    before.insert(key_json(&canonical_key(&kt)), text);
+                if let Ok(idx) = usize::try_from(idx) {
+                    before.insert(idx, text);
                 }
             }
             let insert = sql.insert(chunk.len());
             let mut q = sqlx::query(&insert);
-            for kt in chunk {
+            for (idx, kt) in chunk.iter().enumerate() {
                 let kj = key_json(kt);
-                let img = before.get(&kj).cloned();
+                let img = before.get(&idx).cloned();
                 q = q
                     .bind(run_id)
                     .bind(&self.config.table_name)
@@ -533,6 +535,31 @@ impl MysqlSink {
             }),
         ))
     }
+}
+
+/// `SELECT idx, <row json>` over a `UNION ALL` list of `(idx, key…)` joined
+/// to the target, so each current row comes back tagged with the position of
+/// the key that matched it.
+fn positional_key_select(table_ref: &str, key: &[String], row_expr: &str, rows: usize) -> String {
+    let keys: Vec<String> = (0..rows)
+        .map(|idx| {
+            let cells: Vec<String> = std::iter::once(format!("{idx} AS __faucet_idx"))
+                .chain((0..key.len()).map(|i| format!("? AS __faucet_k{i}")))
+                .collect();
+            format!("SELECT {}", cells.join(", "))
+        })
+        .collect();
+    let join: Vec<String> = key
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("t.{} = v.__faucet_k{i}", quote_ident_mysql(k)))
+        .collect();
+    format!(
+        "SELECT v.__faucet_idx, {row_expr} AS row_json FROM ({}) AS v \
+         JOIN {table_ref} AS t ON {}",
+        keys.join(" UNION ALL "),
+        join.join(" AND ")
+    )
 }
 
 #[cfg(test)]

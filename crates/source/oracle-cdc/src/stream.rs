@@ -331,7 +331,7 @@ impl Shared {
                     meta = self.load_meta(&conn)?;
                 }
             }
-            if captured {
+            if keeps_cycle_alive(captured, to, current) {
                 last_activity = Instant::now();
             }
             if last_activity.elapsed() >= self.config.idle_timeout {
@@ -670,8 +670,25 @@ fn schema_table(record: &Value) -> Option<String> {
     Some(format!("{schema}.{table}"))
 }
 
+/// Whether a window resets the idle clock: it captured a commit, or mining has
+/// not yet reached the current SCN. Each cycle restarts at `restart_scn` — pinned
+/// by the oldest open transaction anywhere in the database — and re-mines redo
+/// it already emitted; counting that catch-up as idle broke the cycle before it
+/// reached new redo, every cycle, so capture never progressed (SQL-29).
+fn keeps_cycle_alive(captured: bool, to: u64, current: u64) -> bool {
+    captured || to < current
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn catching_up_is_never_idle() {
+        assert!(keeps_cycle_alive(false, 100, 200), "re-mining old redo");
+        assert!(keeps_cycle_alive(true, 200, 200), "captured a commit");
+        assert!(!keeps_cycle_alive(false, 200, 200), "caught up and quiet");
+        assert!(!keeps_cycle_alive(false, 250, 200));
+    }
 
     #[test]
     fn routes_by_owner_table() {

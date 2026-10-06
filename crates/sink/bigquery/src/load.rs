@@ -127,7 +127,6 @@ pub async fn write_columnar(
 /// resumable machinery here is built around a gzip encoder that must not touch
 /// Parquet bytes. Batch size is what bounds the body; a very large batch is
 /// what `bulk_load` staging remains for.
-#[allow(clippy::too_many_arguments)]
 pub async fn write_columnar_media(
     client: &Client,
     config: &BigQuerySinkConfig,
@@ -135,6 +134,33 @@ pub async fn write_columnar_media(
     token: &str,
     table_id: &str,
     write_disposition: &str,
+    batch: &RecordBatch,
+) -> Result<usize, FaucetError> {
+    write_columnar_media_with_schema(
+        client,
+        config,
+        upload_base,
+        token,
+        table_id,
+        write_disposition,
+        None,
+        batch,
+    )
+    .await
+}
+
+/// [`write_columnar_media`] with an explicit load-job `schema`. A truncating
+/// load passes the existing table's schema, so the refresh keeps its types,
+/// modes and descriptions instead of taking the Parquet file's (SQL-35).
+#[allow(clippy::too_many_arguments)]
+pub async fn write_columnar_media_with_schema(
+    client: &Client,
+    config: &BigQuerySinkConfig,
+    upload_base: &str,
+    token: &str,
+    table_id: &str,
+    write_disposition: &str,
+    schema: Option<serde_json::Value>,
     batch: &RecordBatch,
 ) -> Result<usize, FaucetError> {
     if batch.num_rows() == 0 {
@@ -146,7 +172,7 @@ pub async fn write_columnar_media(
         .await
         .map_err(|e| FaucetError::Sink(format!("parquet encode task panicked: {e}")))??;
 
-    let job_json = serde_json::json!({
+    let mut job_json = serde_json::json!({
         "configuration": {
             "load": {
                 "sourceFormat": "PARQUET",
@@ -159,8 +185,12 @@ pub async fn write_columnar_media(
                 },
             }
         }
-    })
-    .to_string();
+    });
+    if let Some(schema) = schema {
+        // A truncating load keeps the existing table's schema (SQL-35).
+        job_json["configuration"]["load"]["schema"] = schema;
+    }
+    let job_json = job_json.to_string();
 
     // Reuse the sink's multipart framing rather than hand-rolling a second
     // copy — the same "one escaper, one convention" rule #654 M14 was about.

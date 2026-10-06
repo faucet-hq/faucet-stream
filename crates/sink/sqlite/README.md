@@ -265,7 +265,7 @@ See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 ## Schema evolution
 
-`SqliteSink` reports its live destination schema via `current_schema()` (read from `PRAGMA table_info`, including the `notnull` flag), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
+`SqliteSink` reports its live destination schema via `current_schema()` (read from `PRAGMA table_info`, including the `notnull` flag), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink in `auto_map` mode. In JSON-column mode the table's columns are not the record's fields, so the sink reports no schema and a `schema:` policy is inert.
 
 Under `on_drift: evolve`, `SqliteSink::evolve_schema()` is **add-column only**, owing to SQLite's limited `ALTER TABLE` and dynamic typing:
 
@@ -426,9 +426,13 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 ## Overwrite (`write_mode: overwrite`)
 
 Full-refresh: each run atomically **replaces** the whole table. Writes are
-staged into a `SELECT … WHERE 0` clone (`{table}__faucet_ovw`) and swapped in
-one transaction (`DELETE` + `INSERT … SELECT` + `DROP`) only after the run
-succeeds, so a mid-run failure leaves the previous rows intact. No `key` is
+staged into `{table}__faucet_ovw`, created from the target's own `CREATE TABLE`
+definition (so defaults, generated columns and constraints carry over), and
+swapped in one transaction (`DELETE` + `INSERT … SELECT` over the target's
+non-generated columns + `DROP`) only after the run succeeds, so a mid-run
+failure leaves the previous rows intact. A target that another table references
+by foreign key is refused: the delete-and-refill swap would cascade into or
+break that table (use `write_mode: upsert` there). No `key` is
 needed; a missing target is created by the first run
 (staged from the first page, then renamed into place at commit — a failed first
 run leaves no table) when `create_table: true`. Works in both `auto_map` and JSON

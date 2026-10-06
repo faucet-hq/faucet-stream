@@ -6,8 +6,8 @@ ClickHouse query **source** for the
 Talks to ClickHouse over its
 [HTTP interface](https://clickhouse.com/docs/en/interfaces/http) using
 [`reqwest`](https://crates.io/crates/reqwest): runs a SQL `SELECT`, requests the
-`JSONEachRow` output format, and streams the response body straight into
-`StreamPage`s. Response bytes are line-buffered and decoded incrementally, so
+`JSONCompactEachRowWithNamesAndTypes` output format, and streams the response
+body straight into `StreamPage`s. Response bytes are line-buffered and decoded incrementally, so
 memory stays bounded (`batch_size` records per page) regardless of how large the
 result set is.
 
@@ -30,7 +30,24 @@ source:
 ```
 
 Do **not** append a `FORMAT` clause to `query` — the source sets the output
-format to `JSONEachRow` via the request settings.
+format via the request settings.
+
+### Exact numbers
+
+The source asks the server to quote every 64-bit-and-wider integer and every
+decimal (`output_format_json_quote_64bit_integers=1`,
+`output_format_json_quote_decimals=1`) and decodes each cell by its column
+type, so nothing is rounded through a float and the result does not depend on
+the server's defaults:
+
+| ClickHouse type | JSON |
+|---|---|
+| `Int8` … `Int64`, `UInt8` … `UInt64` (incl. `Nullable`/`LowCardinality`) | exact number |
+| `Int128`, `Int256`, `UInt128`, `UInt256`, `Decimal(P, S)` | exact decimal string |
+| everything else | as ClickHouse renders it |
+
+An integer incremental cursor therefore orders numerically, and a decimal or
+wide-integer cursor (a string) is compared by value, not as text.
 
 ### Authentication
 

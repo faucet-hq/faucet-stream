@@ -26,6 +26,7 @@ tokio.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 faucet-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 testcontainers = "0.27"

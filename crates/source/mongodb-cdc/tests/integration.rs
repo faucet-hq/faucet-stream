@@ -627,3 +627,70 @@ async fn a_pipeline_resumes_from_a_released_schema_zero_bookmark() {
     assert_eq!(stored.schema, 1);
     assert_eq!(stored.data["invalidate"], json!(false));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quiet_first_cycle_anchors_and_a_filtered_drop_ends_the_stream() {
+    let (_container, uri) = start_repl_set().await;
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let coll = client.database(DB).collection::<Document>(COLL);
+    coll.insert_one(doc! { "_id": 0 }).await.expect("seed");
+
+    let mut cfg = config(&uri);
+    cfg.idle_timeout = Duration::from_secs(2);
+    cfg.operation_types = vec!["insert".into(), "update".into(), "delete".into()];
+
+    let quiet = MongoCdcSource::new(cfg.clone()).await.expect("source");
+    let (records, anchor) = drain(&quiet).await;
+    assert!(records.is_empty());
+    let anchor = anchor.expect("a quiet first cycle persists where it opened");
+
+    coll.insert_one(doc! { "_id": 1 })
+        .await
+        .expect("between runs");
+
+    let next = MongoCdcSource::new(cfg.clone()).await.expect("source");
+    next.apply_start_bookmark(anchor).await.expect("bookmark");
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let drop_uri = uri.clone();
+    let dropper = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let client = Client::with_uri_str(&drop_uri).await.expect("client");
+        client
+            .database(DB)
+            .collection::<Document>(COLL)
+            .drop()
+            .await
+            .expect("drop");
+    });
+    let mut pages = next.stream_pages(&ctx, 0);
+    let mut records = Vec::new();
+    let mut last = None;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(page) = pages.next().await {
+            let page = page.expect("page");
+            records.extend(page.records);
+            if page.bookmark.is_some() {
+                last = page.bookmark;
+            }
+        }
+    })
+    .await
+    .expect("a dropped collection ends the cycle instead of spinning");
+    dropper.await.expect("dropper");
+
+    let ids: Vec<&Value> = records.iter().map(|r| &r["document_key"]["_id"]).collect();
+    assert_eq!(
+        ids,
+        [&json!(1)],
+        "the write between runs is captured: {records:?}"
+    );
+    assert!(records.iter().all(|r| r["op"] != "invalidate"));
+    let last = last.expect("the invalidate token is persisted");
+    assert_eq!(last["invalidate"], json!(true));
+
+    let after = MongoCdcSource::new(cfg).await.expect("source");
+    after.apply_start_bookmark(last).await.expect("bookmark");
+    tokio::time::timeout(Duration::from_secs(30), drain(&after))
+        .await
+        .expect("resuming past the invalidate finishes");
+}

@@ -23,7 +23,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{DatabricksReplication, DatabricksSourceConfig, shared_auth};
+use crate::config::{
+    DatabricksReplication, DatabricksSourceConfig, ResultDisposition, shared_auth,
+};
 use crate::convert::{ColumnInfo, row_to_json};
 
 /// Databricks SQL query source.
@@ -46,16 +48,14 @@ struct ResultChunk {
     data_array: Option<Vec<Vec<Value>>>,
     #[serde(default)]
     next_chunk_internal_link: Option<String>,
-    /// Present under `EXTERNAL_LINKS` disposition (ARROW_STREAM): each entry
-    /// carries a presigned URL to an Arrow IPC chunk plus its own
-    /// next-chunk link. Only consumed by the `arrow` columnar path.
-    #[cfg(feature = "arrow")]
+    /// Present under `EXTERNAL_LINKS` disposition: each entry carries a
+    /// presigned URL to a chunk (a JSON array of rows, or an Arrow IPC stream
+    /// under `arrow_native`) plus its own next-chunk link.
     #[serde(default)]
     external_links: Option<Vec<ExternalLink>>,
 }
 
 /// One `result.external_links[]` entry (EXTERNAL_LINKS disposition).
-#[cfg(feature = "arrow")]
 #[derive(Debug, Deserialize)]
 struct ExternalLink {
     #[serde(default)]
@@ -66,7 +66,6 @@ struct ExternalLink {
 
 /// The internal link to the next result chunk, checked at both the result
 /// level and (for EXTERNAL_LINKS) the first external-link level.
-#[cfg(feature = "arrow")]
 fn next_chunk_link(chunk: &ResultChunk) -> Option<String> {
     chunk.next_chunk_internal_link.clone().or_else(|| {
         chunk
@@ -220,10 +219,15 @@ impl DatabricksSource {
         // ARROW_STREAM is only valid with EXTERNAL_LINKS disposition; JSON_ARRAY
         // stays INLINE. `arrow_native` is validated to require the `arrow`
         // feature at config load, so requesting Arrow here is always decodable.
+        // INLINE results are capped at 25 MiB server-side, so the row path
+        // reads presigned JSON chunks by default (SQL-45).
         let (disposition, format) = if self.config.arrow_native {
             ("EXTERNAL_LINKS", "ARROW_STREAM")
         } else {
-            ("INLINE", "JSON_ARRAY")
+            match self.config.result_disposition {
+                ResultDisposition::ExternalLinks => ("EXTERNAL_LINKS", "JSON_ARRAY"),
+                ResultDisposition::Inline => ("INLINE", "JSON_ARRAY"),
+            }
         };
         let mut body = json!({
             "statement": sql,
@@ -271,16 +275,7 @@ impl DatabricksSource {
         &self,
         url: &str,
     ) -> Result<Vec<arrow::array::RecordBatch>, FaucetError> {
-        let resp = self.client.get(url).send().await.map_err(|e| {
-            FaucetError::Source(format!("databricks: external-link request failed: {e}"))
-        })?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(FaucetError::Source(format!(
-                "databricks: external link HTTP {status}: {body}"
-            )));
-        }
+        let resp = self.get_external(url).await?;
         let data = resp.bytes().await.map_err(|e| {
             FaucetError::Source(format!(
                 "databricks: reading external-link body failed: {e}"
@@ -291,6 +286,46 @@ impl DatabricksSource {
             .map_err(|e| {
                 FaucetError::Source(format!("databricks: arrow decode task panicked: {e}"))
             })?
+    }
+}
+
+impl DatabricksSource {
+    /// GET a presigned external link. It is signed for the storage service, so
+    /// it is fetched **without** an `Authorization` header (adding one breaks
+    /// the signature).
+    async fn get_external(&self, url: &str) -> Result<reqwest::Response, FaucetError> {
+        let resp = self.client.get(url).send().await.map_err(|e| {
+            FaucetError::Source(format!("databricks: external-link request failed: {e}"))
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(FaucetError::Source(format!(
+                "databricks: external link HTTP {status}: {body}"
+            )));
+        }
+        Ok(resp)
+    }
+
+    /// Fetch a presigned `JSON_ARRAY` chunk: a JSON array of row arrays.
+    async fn fetch_json_link(&self, url: &str) -> Result<Vec<Vec<Value>>, FaucetError> {
+        self.get_external(url).await?.json().await.map_err(|e| {
+            FaucetError::Source(format!(
+                "databricks: could not parse an external-link chunk: {e}"
+            ))
+        })
+    }
+
+    /// Every row of one result chunk: its inline `data_array` plus the rows of
+    /// each presigned external link.
+    async fn chunk_rows(&self, chunk: &mut ResultChunk) -> Result<Vec<Vec<Value>>, FaucetError> {
+        let mut rows = chunk.data_array.take().unwrap_or_default();
+        for link in chunk.external_links.iter().flatten() {
+            if let Some(url) = link.external_link.as_deref() {
+                rows.extend(self.fetch_json_link(url).await?);
+            }
+        }
+        Ok(rows)
     }
 }
 
@@ -492,8 +527,9 @@ impl Source for DatabricksSource {
 
             // Walk chunks: the initial `result`, then follow next_chunk_internal_link.
             let mut chunk = resp.result;
-            while let Some(c) = chunk {
-                if let Some(data) = c.data_array {
+            while let Some(mut c) = chunk {
+                let data = self.chunk_rows(&mut c).await?;
+                {
                     for row in &data {
                         let obj = row_to_json(row, &columns);
                         // Track the running max BEFORE the client-side filter so
@@ -516,7 +552,7 @@ impl Source for DatabricksSource {
                         }
                     }
                 }
-                chunk = match c.next_chunk_internal_link {
+                chunk = match next_chunk_link(&c) {
                     Some(link) => Some(self.fetch_chunk(&link).await?),
                     None => None,
                 };
@@ -633,6 +669,7 @@ mod tests {
             poll_interval_secs: 1,
             batch_size: 1000,
             arrow_native: false,
+            result_disposition: ResultDisposition::default(),
             replication: DatabricksReplication::Incremental {
                 column: "ts".into(),
                 initial_value: json!("2026-01-01"),
@@ -652,9 +689,15 @@ mod tests {
         let body = s.build_body(&HashMap::new(), incr.as_ref());
         assert_eq!(body["warehouse_id"], json!("wh1"));
         assert_eq!(body["catalog"], json!("main"));
-        assert_eq!(body["disposition"], json!("INLINE"));
+        // SQL-45: the row path no longer requests INLINE (capped at 25 MiB).
+        assert_eq!(body["disposition"], json!("EXTERNAL_LINKS"));
         assert_eq!(body["format"], json!("JSON_ARRAY"));
         assert_eq!(body["wait_timeout"], json!("50s"));
+        let mut inline = cfg();
+        inline.result_disposition = ResultDisposition::Inline;
+        let inline_body = source(inline).build_body(&HashMap::new(), incr.as_ref());
+        assert_eq!(inline_body["disposition"], json!("INLINE"));
+        assert_eq!(inline_body["format"], json!("JSON_ARRAY"));
         // ${bookmark} rewritten to the named param marker.
         assert!(
             body["statement"]
