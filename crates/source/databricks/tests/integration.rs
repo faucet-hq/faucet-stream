@@ -164,7 +164,10 @@ async fn external_link_chunks_stream_without_the_workspace_token() {
     Mock::given(method("GET"))
         .and(path("/api/2.0/sql/statements/s9/result/chunks/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "external_links": [{ "chunk_index": 1, "external_link": link(1) }]
+            "external_links": [
+                { "chunk_index": 1, "external_link": link(1) },
+                { "chunk_index": 2 }
+            ]
         })))
         .mount(&server)
         .await;

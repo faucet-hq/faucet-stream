@@ -1880,3 +1880,77 @@ async fn staging_probe_reports_present_and_absent() {
     let (sink, _sa) = build_sink(&server, config_overwrite()).await;
     assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(false));
 }
+
+/// The resumable-upload initiate body (the load-job JSON) of the first upload.
+async fn initiate_body(server: &MockServer) -> serde_json::Value {
+    let req = server
+        .received_requests()
+        .await
+        .expect("recording")
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST" && r.url.path().starts_with("/upload/"))
+        .expect("an upload was initiated");
+    serde_json::from_slice(&req.body).expect("initiate body is the job JSON")
+}
+
+/// SQL-35: an explicit `schema` still wins over the existing table's schema on
+/// a truncating load.
+#[tokio::test]
+async fn truncating_load_uses_an_explicit_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_resumable(&server, "/resumable/explicit", "load-explicit").await;
+    let mut config = direct_media_config(&server);
+    config.schema = Some(json!({
+        "type": "object",
+        "properties": {"id": {"type": "integer"}, "extra": {"type": "string"}}
+    }));
+    let (sink, _sa) = build_sink(&server, config).await;
+
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1, "extra": "x"})])
+        .await
+        .expect("page");
+    let body = initiate_body(&server).await;
+    let text = body.to_string();
+    assert!(text.contains("\"extra\""), "{text}");
+    assert!(
+        !text.contains("REQUIRED"),
+        "explicit schema, not the table's: {text}"
+    );
+}
+
+/// SQL-35: a failure reading the target's schema for a truncating load is an
+/// error, never a silent fallback to an inferred schema.
+#[tokio::test]
+async fn truncating_load_surfaces_a_schema_read_failure() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    let table_path = format!("/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}");
+    Mock::given(method("GET"))
+        .and(path(table_path.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tableReference": {"projectId": PROJECT_ID, "datasetId": DATASET_ID, "tableId": TABLE_ID},
+            "schema": {"fields": [{"name": "id", "type": "INTEGER"}]}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(table_path))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": {"code": 500, "message": "backend error", "errors": []}
+        })))
+        .mount(&server)
+        .await;
+    mount_resumable(&server, "/resumable/err", "load-err").await;
+    let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
+
+    sink.begin_overwrite().await.expect("begin");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("schema read fails");
+    assert!(err.to_string().contains("truncate schema"), "{err}");
+}

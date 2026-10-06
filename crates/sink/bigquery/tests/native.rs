@@ -489,6 +489,7 @@ async fn load_native_appends_after_a_flush_stream_rows() {
     let chunks: Vec<Result<Vec<u8>, faucet_core::FaucetError>> = vec![
         Ok(b"{\"Id\":\"4\"}\n{\"I".to_vec()),
         Ok(b"d\":\"5\"}\n{\"Id\":\"6\"}".to_vec()),
+        Ok(b"\n".to_vec()),
     ];
     let third = NativeBatch {
         format: NativeFormat::NdJson,
@@ -556,4 +557,98 @@ fn gunzip(bytes: &[u8]) -> String {
     let mut s = String::new();
     d.read_to_string(&mut s).expect("gunzip");
     s
+}
+
+/// A job-JSON body from a multipart load POST (the part before the media).
+async fn multipart_job_bodies(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| {
+            r.url
+                .query()
+                .is_some_and(|q| q.contains("uploadType=multipart"))
+        })
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .collect()
+}
+
+/// SQL-35: a truncating native CSV load into a missing table infers its
+/// all-STRING schema from the header.
+#[tokio::test]
+async fn load_native_csv_overwrite_infers_a_missing_tables_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
+        .and(query_param("uploadType", "multipart"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-csv"},
+            "status": {"state": "DONE"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-csv")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-csv"},
+            "status": {"state": "DONE"}
+        })))
+        .mount(&server)
+        .await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    let mut batch =
+        NativeBatch::bytes(NativeFormat::Csv, b"Col1,Col2\n1,2\n".to_vec()).with_records(Some(1));
+    batch.csv.has_header = true;
+    let ctx = NativeLoadContext {
+        write_mode: WriteMode::Overwrite,
+        first_batch: true,
+    };
+    sink.load_native(batch, "p::row", ctx)
+        .await
+        .expect("csv load");
+    let body = multipart_job_bodies(&server).await.join("\n");
+    assert!(body.contains("WRITE_TRUNCATE"), "{body:.600}");
+    assert!(body.contains("\"name\":\"Col1\""), "{body:.600}");
+}
+
+/// SQL-35: a streamed truncating NDJSON load into a missing table infers its
+/// schema from the first chunk.
+#[tokio::test]
+async fn load_native_streamed_overwrite_infers_a_missing_tables_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
+    mount_resumable(&server, "/session/native-6", "job-native-6").await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    let chunks: Vec<Result<Vec<u8>, faucet_core::FaucetError>> = vec![
+        Ok(b"{\"Id\":\"1\"}\n".to_vec()),
+        Ok(b"{\"Id\":\"2\"}\n".to_vec()),
+    ];
+    let batch = NativeBatch {
+        format: NativeFormat::NdJson,
+        payload: NativePayload::Stream(Box::pin(futures::stream::iter(chunks))),
+        csv: faucet_core::CsvDialect::default(),
+        records: None,
+        bookmark: None,
+    };
+    let ctx = NativeLoadContext {
+        write_mode: WriteMode::Overwrite,
+        first_batch: true,
+    };
+    assert_eq!(
+        sink.load_native(batch, "p::row", ctx).await.expect("load"),
+        2
+    );
+    let body = upload_bodies(&server).await.join("\n");
+    assert!(body.contains("WRITE_TRUNCATE"), "{body:.400}");
+    assert!(
+        body.contains("\"name\":\"Id\",\"type\":\"STRING\""),
+        "{body:.400}"
+    );
 }

@@ -855,10 +855,7 @@ impl BigQuerySink {
         })
         .await;
         match existing {
-            Ok(table) => match existing_load_schema(&table.schema)? {
-                Some(schema) => Ok(Some(schema)),
-                None => Ok(infer()),
-            },
+            Ok(table) => Ok(existing_load_schema(&table.schema)?.or_else(infer)),
             Err(e) if is_table_not_found(&e) => Ok(infer()),
             Err(e) => Err(FaucetError::Sink(format!(
                 "BigQuery tables.get (truncate schema) failed: {e}"
