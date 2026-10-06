@@ -564,3 +564,45 @@ async fn rewind_commit_token_sets_and_clears_the_watermark() {
     sink.rewind_commit_token("s", None).await.unwrap();
     assert_eq!(sink.last_committed_token("s").await.unwrap(), None);
 }
+
+/// #789 SQL-32: pre-existing rows whose stored key differs from the record's
+/// text form — `1` for the key `true`, `2.0` for the key `2` — are restored by
+/// rollback, not deleted as if the run had created them.
+#[tokio::test]
+async fn rollback_restores_rows_whose_stored_key_differs_from_the_record() {
+    for (create, seed, record, expect) in [
+        (
+            "CREATE TABLE users (id BOOLEAN PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+            "INSERT INTO users VALUES (1, 'old', 'r0')",
+            json!({"id": true, "name": "new", RUN_COL: "r1"}),
+            "bool",
+        ),
+        (
+            "CREATE TABLE users (id REAL PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+            "INSERT INTO users VALUES (2.0, 'old', 'r0')",
+            json!({"id": 2, "name": "new", RUN_COL: "r1"}),
+            "real",
+        ),
+    ] {
+        let (_dir, url) = fresh_db(create).await;
+        exec(&url, seed).await;
+        let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
+        sink.write_batch(&[record]).await.unwrap();
+        let out = sink
+            .rollback_run("r1", &opts(RollbackMode::Upsert))
+            .await
+            .unwrap();
+        assert_eq!((out.deleted, out.restored), (0, 1), "{expect}: {out:?}");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let name: String = sqlx::query_scalar("SELECT name FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "old", "{expect}");
+        pool.close().await;
+    }
+}

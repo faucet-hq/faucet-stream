@@ -143,7 +143,7 @@ fn validate_cleanup_columns(
 /// Shared by the delete-by-key and scoped-cleanup paths so the two never drift:
 /// a key bound as a JSON string (`"7"` instead of `7`) would silently match
 /// nothing and turn a delete into a no-op.
-fn bind_value<'q>(
+pub(crate) fn bind_value<'q>(
     q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
     v: &Value,
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {

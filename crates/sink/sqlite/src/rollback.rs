@@ -8,7 +8,7 @@ use crate::sink::{BEGIN_WRITE, SqliteSink};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, canonical_key,
-    key_json, plan_keys, plan_restore,
+    key_json, plan_restore,
 };
 use faucet_core::util::quote_ident;
 use serde_json::Value;
@@ -87,7 +87,7 @@ impl SqliteSink {
         run_id: &str,
     ) -> Result<(), FaucetError> {
         let key = &self.config.write.key;
-        let keys = plan_keys(plan, key);
+        let keys = typed_plan_keys(plan, key);
         if keys.is_empty() {
             return Ok(());
         }
@@ -99,32 +99,36 @@ impl SqliteSink {
 
         let per = (MAX_SQLITE_PARAMS / (key.len().max(1) * 4)).max(1);
         for chunk in keys.chunks(per) {
-            let (predicate, _) = sql.keys_in(key, chunk.len(), 0);
-            let select = format!("SELECT {row_expr} FROM {table_ref} WHERE {predicate}");
-            let mut q = sqlx::query_scalar::<_, String>(&select);
-            for kt in chunk {
-                for (_, v) in &kt.0 {
-                    q = bind_key_value(q, v);
+            // Attribute each current row to its key by position, binding the
+            // key's typed values as the upsert does: re-deriving the key from
+            // the row's text misses a row stored as `1` for the key `true`,
+            // or as `2.0` for `2`, and a missed row would be journaled as
+            // created by the run and deleted on rollback (#789 SQL-32).
+            let select = positional_key_select(&table_ref, key, &row_expr, chunk.len());
+            let mut q = sqlx::query(&select);
+            for (_, typed) in chunk {
+                for (_, v) in &typed.0 {
+                    q = crate::sink::bind_value(q, v);
                 }
             }
             let rows = q
                 .fetch_all(&mut **tx)
                 .await
                 .map_err(|e| sink_err("read before-images", e))?;
-            let mut before: std::collections::HashMap<String, String> =
+            let mut before: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::with_capacity(rows.len());
-            for text in rows {
-                let row: Value =
-                    serde_json::from_str(&text).map_err(|e| sink_err("decode before-image", e))?;
-                if let Some(kt) = faucet_core::write_mode::record_key(&row, key) {
-                    before.insert(key_json(&canonical_key(&kt)), text);
+            for r in rows {
+                let idx: i64 = r.get(0);
+                let text: String = r.get(1);
+                if let Ok(idx) = usize::try_from(idx) {
+                    before.insert(idx, text);
                 }
             }
             let insert = sql.insert(chunk.len());
             let mut q = sqlx::query(&insert);
-            for kt in chunk {
+            for (idx, (kt, _)) in chunk.iter().enumerate() {
                 let kj = key_json(kt);
-                let img = before.get(&kj).cloned();
+                let img = before.get(&idx).cloned();
                 q = q
                     .bind(run_id)
                     .bind(&self.config.table_name)
@@ -551,19 +555,6 @@ impl SqliteSink {
     }
 }
 
-/// Bind a canonical (text) key value; SQLite's column affinity converts the
-/// text back to the column's storage class for the comparison.
-fn bind_key_value<'q>(
-    q: sqlx::query::QueryScalar<'q, sqlx::Sqlite, String, sqlx::sqlite::SqliteArguments<'q>>,
-    v: &Value,
-) -> sqlx::query::QueryScalar<'q, sqlx::Sqlite, String, sqlx::sqlite::SqliteArguments<'q>> {
-    match v {
-        Value::Null => q.bind(None::<String>),
-        Value::String(s) => q.bind(s.clone()),
-        other => q.bind(other.to_string()),
-    }
-}
-
 fn bind_key_value_scalar<'q>(
     q: sqlx::query::QueryScalar<'q, sqlx::Sqlite, i64, sqlx::sqlite::SqliteArguments<'q>>,
     v: &Value,
@@ -573,6 +564,52 @@ fn bind_key_value_scalar<'q>(
         Value::String(s) => q.bind(s.clone()),
         other => q.bind(other.to_string()),
     }
+}
+
+/// The plan's distinct keys as `(canonical, typed)` pairs: the canonical
+/// tuple names the journal row, the typed one is bound to find the current row
+/// exactly as the upsert matched it.
+fn typed_plan_keys(
+    plan: &faucet_core::WritePlan,
+    key: &[String],
+) -> Vec<(
+    faucet_core::write_mode::KeyTuple,
+    faucet_core::write_mode::KeyTuple,
+)> {
+    let mut seen = std::collections::HashSet::new();
+    let upserts = plan
+        .upserts
+        .iter()
+        .filter_map(|r| faucet_core::write_mode::record_key(r, key));
+    upserts
+        .chain(plan.deletes.iter().cloned())
+        .filter_map(|typed| {
+            let canonical = canonical_key(&typed);
+            seen.insert(key_json(&canonical))
+                .then_some((canonical, typed))
+        })
+        .collect()
+}
+
+/// `SELECT idx, <row json>` over a `VALUES (idx, key…)` CTE joined to the
+/// target, so each current row comes back tagged with its key's position.
+fn positional_key_select(table_ref: &str, key: &[String], row_expr: &str, rows: usize) -> String {
+    let marks = vec!["?"; key.len()].join(", ");
+    let values: Vec<String> = (0..rows).map(|idx| format!("({idx}, {marks})")).collect();
+    let names: Vec<String> = std::iter::once("__faucet_idx".to_string())
+        .chain((0..key.len()).map(|i| format!("__faucet_k{i}")))
+        .collect();
+    let join: Vec<String> = key
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("{table_ref}.{} = v.__faucet_k{i}", quote_ident(k)))
+        .collect();
+    format!(
+        "WITH v({}) AS (VALUES {}) SELECT v.__faucet_idx, {row_expr} FROM v JOIN {table_ref} ON {}",
+        names.join(", "),
+        values.join(", "),
+        join.join(" AND ")
+    )
 }
 
 #[cfg(test)]
