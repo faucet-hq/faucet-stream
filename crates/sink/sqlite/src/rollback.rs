@@ -439,15 +439,18 @@ impl SqliteSink {
                 ..Default::default()
             });
         }
-        // Column list from the kept copy: the target may have gained columns
-        // since (schema evolution), and a bare `SELECT *` would misalign.
-        let cols = self
-            .columns_of(tx, &self.previous_table())
-            .await?
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Columns the kept copy has and the target can take: the target may
+        // have gained columns since (schema evolution), and a generated column
+        // cannot be inserted into.
+        let kept = self.columns_of(tx, &self.previous_table()).await?;
+        let insertable =
+            crate::sink::insertable_columns(&mut **tx, &self.config.table_name).await?;
+        let cols = crate::sink::column_list(
+            &kept
+                .into_iter()
+                .filter(|c| insertable.contains(c))
+                .collect::<Vec<_>>(),
+        );
         for stmt in [
             format!("DELETE FROM {target}"),
             format!("INSERT INTO {target} ({cols}) SELECT {cols} FROM {prev}"),
