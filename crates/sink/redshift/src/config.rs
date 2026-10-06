@@ -34,7 +34,7 @@ impl RedshiftWriteStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RedshiftCopyFormat {
-    /// Newline-delimited JSON objects, loaded with `FORMAT AS JSON 'auto'`.
+    /// Newline-delimited JSON objects, loaded with `FORMAT AS JSON 'auto ignorecase'` (keys match columns ignoring case).
     /// Maps by column **name** (order-independent) and handles NULLs and typed
     /// columns cleanly — the default.
     #[default]

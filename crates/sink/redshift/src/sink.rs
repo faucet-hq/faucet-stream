@@ -271,11 +271,14 @@ impl RedshiftSink {
             .cloned()
             .collect();
         if present.is_empty() {
-            tracing::warn!(
-                table = %self.config.table_name,
-                "redshift: no record keys match table columns; skipping insert"
-            );
-            return Ok(0);
+            // Reporting the chunk as written would advance the bookmark past
+            // rows that never landed (SQL-19).
+            return Err(FaucetError::Sink(format!(
+                "redshift: no field of the {} record(s) matches a column of {} (columns: {})",
+                records.len(),
+                self.table_ref(),
+                table_columns.join(", ")
+            )));
         }
 
         // Drop records that share *no* column with the table. `present` is the
@@ -312,7 +315,7 @@ impl RedshiftSink {
                     FaucetError::Sink("redshift: insert requires JSON object records".into())
                 })?;
                 for col in &present {
-                    q = bind_json(q, obj.get(col), col)?;
+                    q = bind_json(q, crate::copy::field(obj, col), col)?;
                 }
             }
             q.execute(&self.pool)

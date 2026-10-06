@@ -67,7 +67,7 @@ pub(crate) fn s3_uri(bucket: &str, key: &str) -> String {
 
 /// Build the Redshift `COPY` statement.
 ///
-/// For JSONL the column list is omitted (`FORMAT AS JSON 'auto'` maps by key
+/// For JSONL the column list is omitted (`FORMAT AS JSON 'auto ignorecase'` maps by key
 /// name); for CSV the destination column order is passed explicitly. `s3_path`,
 /// `iam_role`, and `region` are emitted as escaped string literals.
 pub(crate) fn copy_statement(
@@ -92,7 +92,9 @@ pub(crate) fn copy_statement(
     };
 
     let format_clause = match format {
-        RedshiftCopyFormat::Jsonl => "FORMAT AS JSON 'auto'".to_string(),
+        // Redshift folds column names to lower case; `ignorecase` matches
+        // `userId` to `userid` instead of loading NULL (SQL-18).
+        RedshiftCopyFormat::Jsonl => "FORMAT AS JSON 'auto ignorecase'".to_string(),
         RedshiftCopyFormat::Csv => "FORMAT AS CSV".to_string(),
     };
 
@@ -131,6 +133,22 @@ pub(crate) fn insert_statement(table_ref: &str, columns: &[String], num_rows: us
     )
 }
 
+/// The value of `record`'s field for destination column `column`: the exact key
+/// when present, else a key equal to it ignoring case. Redshift folds unquoted
+/// (and, by default, quoted) identifiers to lower case, so a `userId` field
+/// feeds the `userid` column (SQL-19).
+pub(crate) fn field<'a>(
+    obj: &'a serde_json::Map<String, Value>,
+    column: &str,
+) -> Option<&'a Value> {
+    obj.get(column).or_else(|| {
+        let folded = column.to_lowercase();
+        obj.iter()
+            .find(|(k, _)| k.to_lowercase() == folded)
+            .map(|(_, v)| v)
+    })
+}
+
 /// The set of destination columns present in at least one record, preserving
 /// the destination's declared order.
 pub(crate) fn columns_present<'a>(
@@ -142,7 +160,7 @@ pub(crate) fn columns_present<'a>(
         .filter(|col| {
             records
                 .iter()
-                .any(|r| r.as_object().is_some_and(|o| o.contains_key(col.as_str())))
+                .any(|r| r.as_object().is_some_and(|o| field(o, col).is_some()))
         })
         .collect()
 }
@@ -154,11 +172,11 @@ pub(crate) fn columns_present<'a>(
 pub(crate) fn shares_a_column(record: &Value, present: &[String]) -> bool {
     record
         .as_object()
-        .is_some_and(|o| present.iter().any(|c| o.contains_key(c.as_str())))
+        .is_some_and(|o| present.iter().any(|c| field(o, c).is_some()))
 }
 
 /// Serialize records as newline-delimited JSON (JSONL) bytes for `FORMAT AS
-/// JSON 'auto'`.
+/// JSON 'auto ignorecase'`.
 pub(crate) fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
     let mut buf = Vec::new();
     for record in records {
@@ -199,7 +217,7 @@ pub(crate) fn serialize_csv(records: &[Value], columns: &[String]) -> Result<Vec
         let obj = record.as_object().ok_or_else(|| {
             FaucetError::Sink("redshift: CSV requires JSON object records".into())
         })?;
-        let cells: Vec<String> = columns.iter().map(|c| csv_cell(obj.get(c))).collect();
+        let cells: Vec<String> = columns.iter().map(|c| csv_cell(field(obj, c))).collect();
         buf.push_str(&cells.join(","));
         buf.push('\n');
     }
@@ -210,6 +228,25 @@ pub(crate) fn serialize_csv(records: &[Value], columns: &[String]) -> Result<Vec
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fields_match_columns_ignoring_case() {
+        let rec = json!({"userId": 1, "user_name": "a", "Exact": 1, "exact": 2});
+        let obj = rec.as_object().unwrap();
+        assert_eq!(field(obj, "userid"), Some(&json!(1)));
+        assert_eq!(field(obj, "USER_NAME"), Some(&json!("a")));
+        assert_eq!(field(obj, "exact"), Some(&json!(2)), "an exact key wins");
+        assert_eq!(field(obj, "missing"), None);
+
+        let cols = vec!["userid".to_string(), "user_name".to_string()];
+        let records = vec![json!({"userId": 7, "User_Name": "x,y"})];
+        assert_eq!(columns_present(&records, &cols).len(), 2);
+        assert!(shares_a_column(&records[0], &cols));
+        assert_eq!(
+            String::from_utf8(serialize_csv(&records, &cols).unwrap()).unwrap(),
+            "7,\"x,y\"\n"
+        );
+    }
 
     #[test]
     fn table_ref_qualified_and_bare() {
@@ -247,7 +284,7 @@ mod tests {
         assert_eq!(
             sql,
             "COPY \"public\".\"events\" FROM 's3://bucket/staging/abc.jsonl' \
-             IAM_ROLE 'arn:aws:iam::123:role/redshift' FORMAT AS JSON 'auto'"
+             IAM_ROLE 'arn:aws:iam::123:role/redshift' FORMAT AS JSON 'auto ignorecase'"
         );
     }
 

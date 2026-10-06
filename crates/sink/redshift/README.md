@@ -27,7 +27,7 @@ Append-only: Redshift has no `ON CONFLICT`, and `COPY` cannot upsert, so
 | `table_name` | yes | Target table. |
 | `schema` | no | Namespace qualifying the table. |
 | `write_strategy` | no | `copy` (default) or `insert`. |
-| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto'`) or `csv` (`FORMAT AS CSV`). |
+| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto ignorecase'`) or `csv` (`FORMAT AS CSV`). |
 | `copy.staging_bucket` | copy only | S3 bucket for staged files. |
 | `copy.staging_prefix` | no | Key prefix for staged objects. |
 | `copy.iam_role` | copy only | IAM role ARN Redshift assumes to read the staged file. |

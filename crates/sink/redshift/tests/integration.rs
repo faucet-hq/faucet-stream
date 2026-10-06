@@ -239,10 +239,10 @@ async fn batch_size_zero_writes_single_statement() {
     pool.close().await;
 }
 
-/// A record whose keys match no destination column is a no-op (the sink logs a
-/// warning and skips the insert rather than emitting invalid SQL).
+/// A chunk whose keys match no destination column fails the commit rather than
+/// reporting rows that never landed (SQL-19; this used to be a silent no-op).
 #[tokio::test(flavor = "multi_thread")]
-async fn insert_with_no_matching_columns_is_a_noop() {
+async fn insert_with_no_matching_columns_errors() {
     let _guard = serial().lock().await;
     let (_container, port) = start_postgres().await;
     let pool = seed_pool(port).await;
@@ -254,16 +254,44 @@ async fn insert_with_no_matching_columns_is_a_noop() {
     let sink = RedshiftSink::new(insert_config(port, "events", 1000))
         .await
         .expect("sink builds");
-    // No key overlaps the `id` column.
-    let written = sink
-        .write_batch(&[json!({"unknown": 1})])
+    sink.write_batch(&[json!({"unknown": 1})])
         .await
-        .expect("write");
-    // The sink reports what it accepted; the row is dropped at commit time
-    // because no key matches a real column.
-    assert_eq!(written, 1);
-    sink.flush().await.expect("flush");
+        .expect("buffered");
+    let err = sink.flush().await.expect_err("no matching column");
+    assert!(err.to_string().contains("matches a column"), "{err}");
     assert_eq!(row_count(&pool, "events").await, 0);
+    pool.close().await;
+}
+
+/// Redshift folds identifiers to lower case, so camelCase fields must land in
+/// their lower-cased columns instead of being skipped or loaded as NULL (SQL-19).
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_matches_fields_to_columns_ignoring_case() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (userid BIGINT, displayname TEXT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+    let sink = RedshiftSink::new(insert_config(port, "events", 1000))
+        .await
+        .expect("sink builds");
+    sink.write_batch(&[
+        json!({"userId": 1, "displayName": "Ann"}),
+        json!({"USERID": 2, "displayname": "Bo"}),
+    ])
+    .await
+    .expect("write");
+    sink.flush().await.expect("flush");
+
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT userid, displayname FROM events ORDER BY userid")
+            .fetch_all(&pool)
+            .await
+            .expect("read back");
+    assert_eq!(rows, vec![(1, "Ann".to_string()), (2, "Bo".to_string())]);
     pool.close().await;
 }
 
