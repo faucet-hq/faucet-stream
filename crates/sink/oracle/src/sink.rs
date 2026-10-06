@@ -21,9 +21,9 @@ use crate::plan::{
     BindKind, COLUMNS_SQL, ColumnInfo, ORA_NAME_IN_USE, TABLE_EXISTS_SQL, add_column_sql,
     case_records, clone_table_sql, column_from_row, create_json_table_sql, create_table_sql,
     delete_sql, dictionary_binds, drop_table_sql, encode_row, fold_names, fold_to_columns,
-    ignoring, insert_sql, merge_sql, no_columns_error, pick_table, relax_null_sql, rename_sql,
-    resolve_insert_columns, schema_from_columns, swap_sql, token_merge_sql, token_select_sql,
-    token_table, token_table_ddl, widen_column_sql,
+    group_by_present_columns, ignoring, insert_sql, merge_sql, no_columns_error, pick_table,
+    relax_null_sql, rename_sql, resolve_insert_columns, schema_from_columns, swap_sql,
+    token_merge_sql, token_select_sql, token_table, token_table_ddl, widen_column_sql,
 };
 
 /// Oracle Database sink.
@@ -356,8 +356,23 @@ impl Inner {
     fn apply_plan(&self, conn: &Connection, plan: &WritePlan) -> Result<usize, FaucetError> {
         let names: Vec<String> = self.columns(conn)?.into_iter().map(|c| c.name).collect();
         let key = &fold_names(&self.config.write.key, &names);
+        let insertable: Vec<String> = self
+            .columns(conn)?
+            .into_iter()
+            .filter(|c| c.insertable)
+            .map(|c| c.name)
+            .collect();
         let mut affected = 0;
-        for chunk in self.chunks(&plan.upserts) {
+        // One MERGE per set of carried columns, so an absent column is left
+        // untouched rather than set to NULL (SQL-10).
+        let groups: Vec<Vec<Value>> = self
+            .chunks(&plan.upserts)
+            .into_iter()
+            .flat_map(|chunk| {
+                group_by_present_columns(&fold_to_columns(chunk, &insertable), &insertable)
+            })
+            .collect();
+        for chunk in &groups {
             let (cols, kinds, rows) = self.prepare(conn, chunk)?;
             if cols.is_empty() {
                 if !self.drops_unknown() {

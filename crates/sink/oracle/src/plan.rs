@@ -655,6 +655,25 @@ pub(crate) fn fold_to_columns<'a>(
     )
 }
 
+/// Upsert records grouped by which of `columns` each carries (a key present
+/// with `null` counts), in first-seen order. Each group is merged on its own
+/// columns, so a column a record omits keeps its stored value instead of being
+/// overwritten with NULL (#789 SQL-10).
+pub(crate) fn group_by_present_columns(records: &[Value], columns: &[String]) -> Vec<Vec<Value>> {
+    let mut groups: Vec<(Vec<bool>, Vec<Value>)> = Vec::new();
+    for record in records {
+        let present: Vec<bool> = columns
+            .iter()
+            .map(|c| record.as_object().is_some_and(|o| o.contains_key(c)))
+            .collect();
+        match groups.iter_mut().find(|(p, _)| *p == present) {
+            Some((_, rows)) => rows.push(record.clone()),
+            None => groups.push((present, vec![record.clone()])),
+        }
+    }
+    groups.into_iter().map(|(_, rows)| rows).collect()
+}
+
 /// `key` mapped through [`column_for`]; a name that matches no column is kept.
 pub(crate) fn fold_names(names: &[String], columns: &[String]) -> Vec<String> {
     names
@@ -1053,5 +1072,18 @@ mod tests {
         assert_eq!(case_records(&recs, true)[0], json!({"ID": 1}));
         assert_eq!(case_records(&recs, true)[1], json!(5));
         assert_eq!(case_records(&recs, false)[0], json!({"id": 1}));
+    }
+    #[test]
+    fn upsert_records_group_by_the_columns_they_carry() {
+        let cols: Vec<String> = ["ID", "A", "B"].iter().map(|s| s.to_string()).collect();
+        let records = vec![
+            json!({"ID": 1, "A": 1, "B": 1}),
+            json!({"ID": 2, "A": null}),
+            json!({"ID": 3, "A": 3, "B": 3}),
+        ];
+        let groups = group_by_present_columns(&records, &cols);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec![records[0].clone(), records[2].clone()]);
+        assert_eq!(groups[1], vec![records[1].clone()]);
     }
 }

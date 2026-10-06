@@ -32,7 +32,7 @@ Connection fields are documented in [`faucet-common-oracle`](https://crates.io/c
 | `statement_timeout_secs` | `300` | Per-round-trip call timeout (`0` disables). |
 | `create_table` | `true` | Create a missing table (see below). |
 | `write_mode` | `append` | `append` / `upsert` / `delete` / `overwrite`. |
-| `key` | — | Key columns for `upsert` / `delete`. |
+| `key` | — | Key columns for `upsert` / `delete`. An upsert updates only the columns a record carries, so a column it omits (an oracle-cdc partial image) keeps its stored value; an explicit `null` clears it. |
 | `delete_marker` | — | `{ field, values }`: `upsert` rows matching it become deletes. |
 
 ```yaml

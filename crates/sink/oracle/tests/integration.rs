@@ -439,3 +439,50 @@ async fn oracle_sink_keeps_fractions_and_finds_unquoted_tables() {
     assert!(err.to_string().contains("match a column"), "{err}");
     assert_eq!(count(&conn, "ORDERS").await, 2);
 }
+
+/// SQL-10: an upsert leaves a column a record does not carry untouched (the
+/// partial images oracle-cdc emits under PK-only supplemental logging); an
+/// explicit `null` still clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_upsert_keeps_columns_a_record_does_not_carry() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE PARTIAL (ID NUMBER PRIMARY KEY, A VARCHAR2(20), B VARCHAR2(20))",
+            "INSERT INTO PARTIAL VALUES (1, 'a1', 'b1')",
+            "INSERT INTO PARTIAL VALUES (2, 'a2', 'b2')",
+        ],
+    )
+    .await;
+    let mut cfg = OracleSinkConfig::new(conn.clone(), "PARTIAL");
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["ID".into()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = OracleSink::new(cfg).await.expect("upsert sink");
+    sink.write_batch(&[
+        json!({"ID": 1, "A": "a1-new"}),
+        json!({"ID": 2, "A": "a2-new", "B": null}),
+        json!({"ID": 3, "B": "b3"}),
+    ])
+    .await
+    .expect("upsert");
+    let rows = common::query_strings(
+        &conn,
+        "SELECT TO_CHAR(ID) || ':' || NVL(A, '-') || ':' || NVL(B, '-') FROM PARTIAL ORDER BY ID",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            Some("1:a1-new:b1".into()),
+            Some("2:a2-new:-".into()),
+            Some("3:-:b3".into()),
+        ]
+    );
+}
