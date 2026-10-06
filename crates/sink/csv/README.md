@@ -72,7 +72,7 @@ Every row of the query result is written to `./out/users.csv` with a header row,
 |-------|------|---------|-------------|
 | `path` | string | *(required)* | Path to the output file. Missing parent directories are created automatically (`mkdir -p`). |
 | `delimiter` | byte (int) | `44` (`,`) | Single-byte field delimiter. Common values: `44` comma, `9` tab, `59` semicolon, `124` pipe. |
-| `write_headers` | bool | `true` | Write a header row of column names on the first open. Skipped automatically on append-mode re-opens. |
+| `write_headers` | bool | `true` | Write a header row of column names on the first open. With `append: true` it is written only when the file is missing or empty; a non-empty file's existing header fixes the columns and their order (extra record fields follow `on_unknown_field`). |
 | `append` | bool | `false` | Append to an existing file instead of truncating it on open. When `false`, the file is truncated on the first open. |
 | `batch_size` | int | `1000` | Records per upstream `StreamPage`. **No behavioural impact at this sink** — present only for config parity. See [Streaming & batching](#streaming--batching). |
 | `on_unknown_field` | `warn` \| `error` | `warn` | What to do when a record carries a field that is **not** in the frozen column set (the header is fixed from the first batch and cannot be extended). `warn` — emit a one-shot warning naming the dropped field(s) and keep writing (the value is dropped). `error` — abort the write with `FaucetError::Sink` the first time any such field appears. See [Column order & missing fields](#column-order--missing-fields). |

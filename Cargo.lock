@@ -5481,6 +5481,7 @@ dependencies = [
  "csv",
  "faucet-conformance",
  "faucet-core",
+ "flate2",
  "schemars 1.2.1",
  "serde",
  "serde_json",
