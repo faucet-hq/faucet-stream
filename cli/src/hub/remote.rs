@@ -540,22 +540,29 @@ pub async fn fetch_cached(
 /// Move a downloaded snapshot into place. A complete snapshot another
 /// process installed meanwhile is never replaced — it may be in use.
 fn install_snapshot(tmp: &Path, snapshot: &Path) -> CliResult<()> {
-    if is_complete(snapshot) {
-        let _ = std::fs::remove_dir_all(tmp);
-        return Ok(());
-    }
-    let _ = std::fs::remove_dir_all(snapshot);
-    match std::fs::rename(tmp, snapshot) {
-        Ok(()) => Ok(()),
-        Err(_) if is_complete(snapshot) => {
-            let _ = std::fs::remove_dir_all(tmp);
-            Ok(())
+    if !is_complete(snapshot) {
+        let _ = std::fs::remove_dir_all(snapshot);
+        if let Err(e) = std::fs::rename(tmp, snapshot)
+            && !is_complete(snapshot)
+        {
+            return Err(net_err(
+                &format!("installing snapshot {}", snapshot.display()),
+                e,
+            ));
         }
-        Err(e) => Err(net_err(
-            &format!("installing snapshot {}", snapshot.display()),
-            e,
-        )),
     }
+    let _ = std::fs::remove_dir_all(tmp);
+    Ok(())
+}
+
+/// Whether a directory entry was modified within [`TMP_GRACE`] (or its age
+/// cannot be read — then it is left alone).
+fn is_recent(e: &std::fs::DirEntry) -> bool {
+    e.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_none_or(|age| age < TMP_GRACE)
 }
 
 /// How long another process's download directory is left alone.
@@ -571,19 +578,13 @@ fn prune_old(key_dir: &Path, keep: &str, previous: Option<&str>) {
     for e in rd.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if name == keep || name == CURRENT_FILE || name == "files" || Some(&*name) == previous {
+        let spared = name == keep
+            || name == CURRENT_FILE
+            || name == "files"
+            || Some(&*name) == previous
+            || (name.starts_with(".tmp-") && is_recent(&e));
+        if spared {
             continue;
-        }
-        if name.starts_with(".tmp-") {
-            let recent = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_none_or(|age| age < TMP_GRACE);
-            if recent {
-                continue;
-            }
         }
         if e.path().is_dir() {
             let _ = std::fs::remove_dir_all(e.path());
@@ -835,6 +836,10 @@ mod tests {
         std::fs::write(tmp.join(".complete"), b"").unwrap();
         install_snapshot(&tmp, &fresh).unwrap();
         assert!(is_complete(&fresh));
+        let err = install_snapshot(&root.path().join(".tmp-missing"), &root.path().join("ghi"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("installing snapshot"), "{err}");
 
         for d in ["files/x", "old", "prev", ".tmp-live-2"] {
             std::fs::create_dir_all(root.path().join(d)).unwrap();

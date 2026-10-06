@@ -443,6 +443,63 @@ async fn upsert_run_is_undone_and_the_bookmark_rewound() {
 }
 
 #[tokio::test]
+async fn undoing_the_newest_run_rewinds_its_bookmark_and_watermark() {
+    use faucet_core::StateStore;
+    let d = fresh().await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "upsert",
+        "rollback: {}",
+    ));
+    let summary = run(&cfg).await;
+    let run_id = summary.invocations[0].run_id.clone().unwrap();
+    let marker = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap()
+        .remove(0);
+    // Model a run that started from a stored bookmark under exactly-once.
+    let store = faucet_core::FileStateStore::new(&d.state);
+    let key = faucet_cli::rollback::state::marker_key(&marker.state_key, &run_id);
+    let mut stored = store.get(&key).await.unwrap().unwrap();
+    stored["bookmark_before"] = serde_json::json!({"id": 2});
+    stored["delivery"] = serde_json::json!("exactly_once");
+    stored["token_before"] = serde_json::json!("00000000000000000001");
+    store.put(&key, &stored).await.unwrap();
+
+    let report = faucet_cli::rollback::rollback(
+        &cfg,
+        RollbackInputs {
+            run_id,
+            row: None,
+            dry_run: false,
+            force: false,
+            pipeline_name: "mirror".into(),
+            auth: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.bookmark_rewound && report.token_rewound,
+        "{report:?}"
+    );
+    assert_eq!(
+        store.get(&marker.state_key).await.unwrap(),
+        Some(serde_json::json!({"id": 2}))
+    );
+    assert_eq!(
+        count(
+            &d.dst,
+            "SELECT count(*) FROM _faucet_commit_token WHERE token = '00000000000000000001'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
 async fn rollback_is_blocked_by_a_later_run_unless_forced() {
     let d = fresh().await;
     let cfg = load(&config_yaml(

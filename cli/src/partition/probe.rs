@@ -370,10 +370,16 @@ mod tests {
         let out = resolve_bounds(&spec(0), &AuthCatalog::default())
             .await
             .unwrap();
-        match &out {
-            PartitionSpec::Integer { to, .. } => assert_eq!(to, &IntBound::Literal(6)),
-            o => panic!("{o:?}"),
-        }
+        assert!(
+            matches!(
+                &out,
+                PartitionSpec::Integer {
+                    to: IntBound::Literal(6),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
         let chunks = crate::partition::plan::plan(&out).unwrap();
         assert_eq!(chunks.last().unwrap().tokens["end"], "6", "id 5 is read");
         // A single-row range (from == MAX) is one row, not empty.

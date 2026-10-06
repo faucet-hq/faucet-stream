@@ -1050,6 +1050,14 @@ pipeline:
         let runtime = CompiledPolicy::compile(&runtime_spec(&deny, &nodes[0])).unwrap();
         assert!(runtime.labels_for_name("tax_id").contains("pii"));
         assert!(runtime.labels_for_name("id").is_empty());
+        // An uncompilable policy is handed back unchanged (the caller's own
+        // compile reports it).
+        let bad: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "field_pattern": "("}],
+            "rules": []
+        }))
+        .unwrap();
+        assert_eq!(runtime_spec(&bad, &nodes[0]), bad);
     }
 
     #[test]
@@ -1135,6 +1143,29 @@ pipeline:
         assert_eq!(col.name, "tax_id");
         assert!(col.conservative);
         assert_eq!(col.via.as_deref(), Some("lineage"));
+
+        // Without a contract nothing is known statically.
+        let no_contract = PipelineConfig::from_text(
+            r#"version: 1
+name: p
+pipeline:
+  sources:
+    a: { type: csv, config: { path: /tmp/a.csv } }
+  sinks:
+    o: { type: jsonl, config: { path: /tmp/o.jsonl } }
+  nodes:
+    s: { kind: source, ref: a }
+    w: { kind: sink, ref: o }
+  edges:
+    - { from: s, to: w }
+"#,
+            Path::new("p.yaml"),
+        )
+        .unwrap();
+        let report = evaluate_topology(&deny, &no_contract).unwrap();
+        assert_eq!(report.rows[0].column_source, ColumnSource::None);
+        assert!(report.rows[0].columns.is_empty());
+        assert_eq!(report.violations, 0);
     }
 
     #[test]
