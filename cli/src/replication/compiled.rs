@@ -89,14 +89,8 @@ fn compile_tables(
                 .into(),
         ));
     }
-    if cdc.kind == "mongodb-cdc"
-        && cdc.config.pointer("/scope/type").and_then(|v| v.as_str()) == Some("collection")
-    {
-        return Err(CliError::Config(
-            "a multi-table mongodb-cdc mirror watches a database (scope.type: database), \
-             not one collection"
-                .into(),
-        ));
+    if cdc.kind == "mongodb-cdc" {
+        mongodb_scope_matches_snapshot(&cdc.config, &snapshot.source)?;
     }
     if tables.include.is_empty() {
         return Err(CliError::Config(
@@ -222,6 +216,36 @@ impl CompiledReplication {
             tables,
         })
     }
+}
+
+/// A multi-table mongodb-cdc mirror must watch exactly the database the
+/// snapshot discovers: its change records name tables by bare collection only
+/// at `scope.type: database`, and only then do they match the snapshot's table
+/// set. Any other scope routes every change to no table while the positions
+/// still advance, so the changes would be lost.
+fn mongodb_scope_matches_snapshot(
+    cdc: &serde_json::Value,
+    snapshot: &ConnectorSpec,
+) -> CliResult<()> {
+    let scope = cdc.pointer("/scope/type").and_then(|v| v.as_str());
+    if scope != Some("database") {
+        return Err(CliError::Config(format!(
+            "a multi-table mongodb-cdc mirror watches one database: set \
+             pipeline.source.config.scope to {{ type: database, database: <name> }} (got {})",
+            scope.map_or("the default cluster scope".to_string(), |s| format!("scope.type: {s}"))
+        )));
+    }
+    let watched = cdc.pointer("/scope/database").and_then(|v| v.as_str());
+    let snapshotted = snapshot.config.get("database").and_then(|v| v.as_str());
+    if snapshot.kind == "mongodb" && watched != snapshotted {
+        return Err(CliError::Config(format!(
+            "the mongodb-cdc scope watches database '{}' but mirror.snapshot.source reads \
+             '{}'; both must name the same database",
+            watched.unwrap_or(""),
+            snapshotted.unwrap_or("")
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -520,7 +544,31 @@ mirror:
             "{ type: mongodb-cdc, config: { connection_uri: \"mongodb://m\", scope: { type: collection, database: d, collection: c } } }",
         );
         let e = compile_err(&mongo);
-        assert!(e.contains("watches a database"), "{e}");
+        assert!(e.contains("watches one database"), "{e}");
+    }
+
+    #[test]
+    fn a_mongodb_cdc_mirror_needs_the_snapshot_database_scope() {
+        let mongo = |scope: &str, db: &str| {
+            TABLES
+                .replace(
+                    "{ type: postgres-cdc, config: { connection_url: \"postgres://x\", slot_name: s, publication_name: p } }",
+                    &format!("{{ type: mongodb-cdc, config: {{ connection_uri: \"mongodb://m\"{scope} }} }}"),
+                )
+                .replace(
+                    "{ type: postgres, config: { connection_url: \"postgres://x\", query: \"SELECT 1\" } }",
+                    &format!("{{ type: mongodb, config: {{ connection_uri: \"mongodb://m\", database: {db}, collection: c }} }}"),
+                )
+        };
+        let e = compile_err(&mongo("", "shop"));
+        assert!(e.contains("the default cluster scope"), "{e}");
+        let e = compile_err(&mongo(", scope: { type: cluster }", "shop"));
+        assert!(e.contains("scope.type: cluster"), "{e}");
+        let e = compile_err(&mongo(", scope: { type: database, database: crm }", "shop"));
+        assert!(e.contains("'crm'") && e.contains("'shop'"), "{e}");
+        let ok = cfg(&mongo(", scope: { type: database, database: shop }", "shop"));
+        let r = CompiledReplication::compile(ok.replication.as_ref().unwrap(), &ok).unwrap();
+        assert_eq!(r.tables.expect("tables mode").cdc_kind, "mongodb-cdc");
     }
 
     #[test]
