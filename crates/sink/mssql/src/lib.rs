@@ -26,6 +26,7 @@
 //! # }
 //! ```
 
+mod coltype;
 mod config;
 mod encode;
 mod sink;

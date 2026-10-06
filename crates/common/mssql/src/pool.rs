@@ -96,6 +96,27 @@ pub async fn build_pool(
     Ok(pool)
 }
 
+/// Swap the client inside a pooled connection for a freshly connected one.
+///
+/// A statement abandoned on timeout can leave its connection mid-request with a
+/// transaction open, and the pool would hand that connection to the next
+/// caller (`bb8-tiberius` never reports a connection broken). Replacing the
+/// client drops — and so closes — the stale one, which makes the server roll
+/// its transaction back, and leaves a clean connection in the pool slot.
+pub async fn replace_connection(
+    cfg: &MssqlConnectionConfig,
+    conn: &mut MssqlPooledConnection<'_>,
+) -> Result<(), FaucetError> {
+    use bb8::ManageConnection;
+    let fresh = ConnectionManager::new(build_config(cfg)?)
+        .connect()
+        .await
+        .map_err(|e| FaucetError::Sink(format!("MSSQL reconnect failed: {e}")))?;
+    let stale = std::mem::replace(&mut **conn, fresh);
+    drop(stale);
+    Ok(())
+}
+
 /// Run a query future under `timeout`. On elapse, returns the error produced by
 /// `make_timeout_err` (so the source maps to [`FaucetError::Source`] and the
 /// sink to [`FaucetError::Sink`]); the caller drops the connection rather than
