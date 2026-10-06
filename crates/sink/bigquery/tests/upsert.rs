@@ -191,7 +191,9 @@ async fn write_batch_upsert_posts_merge() {
     );
     assert!(q.contains("ON T.`id` = S.`id`"), "got: {q}");
     assert!(
-        q.contains("WHEN MATCHED THEN UPDATE SET `name` = S.`name`"),
+        q.contains(
+            "WHEN MATCHED THEN UPDATE SET `name` = IF(S.`__faucet_has_1`, S.`name`, T.`name`)"
+        ),
         "got: {q}"
     );
     assert_eq!(tx["parameterMode"], "NAMED");
