@@ -469,3 +469,47 @@ async fn lag_counts_unread_change_transactions() {
     assert_eq!(behind.events, Some(2), "{behind:?}");
     assert!(behind.seconds.unwrap() >= 0.0);
 }
+
+/// SQL-26: a bookmark older than the retained minimum LSN fails the run by
+/// default instead of skipping the purged changes with a warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a SQL Server (mssql) container: the ~2 GB image is too heavy/slow \
+            to come up reliably on the shared CI runner. Run explicitly with \
+            `cargo test -p faucet-source-mssql-cdc -- --ignored`."]
+async fn a_bookmark_behind_the_retained_history_fails_unless_skipped() {
+    let _serial = SERIAL.lock().await;
+    let Some((_c, port)) = start_mssql_cdc().await else {
+        return;
+    };
+    let (pool, conn) = setup(port, "cdc_gap").await;
+    exec(
+        &pool,
+        "INSERT INTO dbo.users (id, name) VALUES (1, N'alice')",
+    )
+    .await;
+    wait_for_changes(&pool, 1).await;
+
+    let purged = json!({ CI: "00000000000000000001" });
+    let source = MssqlCdcSource::new(build_config(&conn))
+        .await
+        .expect("source new");
+    source.apply_start_bookmark(purged.clone()).await.unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 0);
+    let mut failure = None;
+    while let Some(page) = pages.next().await {
+        if let Err(e) = page {
+            failure = Some(e.to_string());
+            break;
+        }
+    }
+    let failure = failure.expect("the gap must fail the run");
+    assert!(failure.contains("on_gap: skip"), "{failure}");
+
+    let mut skip = build_config(&conn);
+    skip.on_gap = faucet_source_mssql_cdc::OnGap::Skip;
+    let source = MssqlCdcSource::new(skip).await.expect("source new");
+    source.apply_start_bookmark(purged).await.unwrap();
+    let (records, _) = drain(&source).await;
+    assert!(!records.is_empty(), "skip resumes from the earliest change");
+}
