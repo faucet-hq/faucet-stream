@@ -16,14 +16,14 @@ use faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX;
 use faucet_core::{FaucetError, RowOutcome, Sink, WriteMode, WritePlan};
 use serde_json::Value;
 
-use crate::config::{IdentifierCase, OnUnknownField, OracleColumnMapping, OracleSinkConfig};
+use crate::config::{IdentifierCase, OracleColumnMapping, OracleSinkConfig};
 use crate::plan::{
-    BindKind, COLUMNS_SQL, ColumnInfo, ORA_NAME_IN_USE, TABLE_EXISTS_SQL, add_column_sql,
-    case_records, clone_table_sql, column_from_row, create_json_table_sql, create_table_sql,
-    delete_sql, dictionary_binds, drop_table_sql, encode_row, fold_names, fold_to_columns,
-    group_by_present_columns, ignoring, insert_sql, merge_sql, no_columns_error, pick_table,
-    relax_null_sql, rename_sql, resolve_insert_columns, schema_from_columns, swap_sql,
-    token_merge_sql, token_select_sql, token_table, token_table_ddl, widen_column_sql,
+    BindKind, COLUMNS_SQL, ColumnInfo, ORA_NAME_IN_USE, PreparedRows, TABLE_EXISTS_SQL,
+    add_column_sql, case_records, clone_table_sql, column_from_row, create_json_table_sql,
+    create_table_sql, delete_sql, dictionary_binds, drop_table_sql, drops_unknown, fold_names,
+    fold_page, ignoring, insert_sql, insertable_names, merge_sql, no_columns_error, pick_table,
+    prepare_rows, relax_null_sql, rename_sql, schema_from_columns, swap_sql, token_merge_sql,
+    token_select_sql, token_table, token_table_ddl, upsert_groups, widen_column_sql,
 };
 
 /// Oracle Database sink.
@@ -236,69 +236,12 @@ impl Inner {
 
     /// Resolve the column list, bind kinds and encoded rows for a chunk.
     /// Per-row encoding failures are returned alongside, by chunk index.
-    #[allow(clippy::type_complexity)]
-    fn prepare(
-        &self,
-        conn: &Connection,
-        chunk: &[Value],
-    ) -> Result<
-        (
-            Vec<String>,
-            Vec<BindKind>,
-            Vec<(usize, Result<Vec<Option<String>>, String>)>,
-        ),
-        FaucetError,
-    > {
-        let (cols, kinds) = match &self.config.column_mapping {
-            OracleColumnMapping::JsonColumn { column } => {
-                (vec![column.clone()], vec![BindKind::Clob])
-            }
-            OracleColumnMapping::AutoColumns { on_unknown_field } => {
-                let info = self.columns(conn)?;
-                let insertable: Vec<String> = info
-                    .iter()
-                    .filter(|c| c.insertable)
-                    .map(|c| c.name.clone())
-                    .collect();
-                let cols = resolve_insert_columns(
-                    &insertable,
-                    &fold_to_columns(chunk, &insertable),
-                    *on_unknown_field,
-                )?;
-                let kinds = cols
-                    .iter()
-                    .map(|c| {
-                        info.iter()
-                            .find(|i| &i.name == c)
-                            .map(BindKind::for_column)
-                            .unwrap_or(BindKind::Text)
-                    })
-                    .collect();
-                (cols, kinds)
-            }
-        };
-        let names: Vec<String> = match &self.config.column_mapping {
-            OracleColumnMapping::AutoColumns { .. } => self
-                .columns(conn)?
-                .into_iter()
-                .filter(|c| c.insertable)
-                .map(|c| c.name)
-                .collect(),
+    fn prepare(&self, conn: &Connection, chunk: &[Value]) -> Result<PreparedRows, FaucetError> {
+        let info = match &self.config.column_mapping {
+            OracleColumnMapping::AutoColumns { .. } => self.columns(conn)?,
             OracleColumnMapping::JsonColumn { .. } => Vec::new(),
         };
-        let chunk = fold_to_columns(chunk, &names);
-        let rows = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let encoded = match &self.config.column_mapping {
-                    OracleColumnMapping::JsonColumn { .. } => Ok(vec![Some(r.to_string())]),
-                    OracleColumnMapping::AutoColumns { .. } => encode_row(r, &cols, &kinds),
-                };
-                (i, encoded)
-            })
-            .collect();
-        Ok((cols, kinds, rows))
+        prepare_rows(&self.config.column_mapping, &info, chunk)
     }
 
     fn chunks<'a>(&self, records: &'a [Value]) -> Vec<&'a [Value]> {
@@ -354,24 +297,13 @@ impl Inner {
 
     /// Apply a planned upsert/delete batch (no commit).
     fn apply_plan(&self, conn: &Connection, plan: &WritePlan) -> Result<usize, FaucetError> {
-        let names: Vec<String> = self.columns(conn)?.into_iter().map(|c| c.name).collect();
+        let info = self.columns(conn)?;
+        let names: Vec<String> = info.iter().map(|c| c.name.clone()).collect();
         let key = &fold_names(&self.config.write.key, &names);
-        let insertable: Vec<String> = self
-            .columns(conn)?
-            .into_iter()
-            .filter(|c| c.insertable)
-            .map(|c| c.name)
-            .collect();
         let mut affected = 0;
         // One MERGE per set of carried columns, so an absent column is left
         // untouched rather than set to NULL (SQL-10).
-        let groups: Vec<Vec<Value>> = self
-            .chunks(&plan.upserts)
-            .into_iter()
-            .flat_map(|chunk| {
-                group_by_present_columns(&fold_to_columns(chunk, &insertable), &insertable)
-            })
-            .collect();
+        let groups = upsert_groups(&self.chunks(&plan.upserts), &insertable_names(&info));
         for chunk in &groups {
             let (cols, kinds, rows) = self.prepare(conn, chunk)?;
             if cols.is_empty() {
@@ -429,15 +361,8 @@ impl Inner {
         Ok(affected)
     }
 
-    /// Whether `on_unknown_field: drop` lets a record with no matching key be
-    /// skipped rather than refused.
     fn drops_unknown(&self) -> bool {
-        matches!(
-            self.config.column_mapping,
-            OracleColumnMapping::AutoColumns {
-                on_unknown_field: OnUnknownField::Drop
-            }
-        )
+        drops_unknown(&self.config.column_mapping)
     }
 
     /// The page with record keys (and the write `key`) mapped onto the table's
@@ -447,17 +372,18 @@ impl Inner {
         conn: &Connection,
         records: &[Value],
     ) -> Result<(Vec<Value>, faucet_core::WriteSpec), FaucetError> {
-        let mut spec = self.config.write.clone();
-        if !matches!(
-            self.config.column_mapping,
-            OracleColumnMapping::AutoColumns { .. }
-        ) || records.is_empty()
-        {
-            return Ok((records.to_vec(), spec));
-        }
-        let names: Vec<String> = self.columns(conn)?.into_iter().map(|c| c.name).collect();
-        spec.key = fold_names(&spec.key, &names);
-        Ok((fold_to_columns(records, &names).into_owned(), spec))
+        let names: Vec<String> = match (&self.config.column_mapping, records.is_empty()) {
+            (OracleColumnMapping::AutoColumns { .. }, false) => {
+                self.columns(conn)?.into_iter().map(|c| c.name).collect()
+            }
+            _ => Vec::new(),
+        };
+        Ok(fold_page(
+            &self.config.column_mapping,
+            &names,
+            records,
+            &self.config.write,
+        ))
     }
 
     fn plan(
