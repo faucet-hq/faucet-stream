@@ -6650,6 +6650,7 @@ version = "1.0.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "chrono",
  "faucet-common-oracle",
  "faucet-conformance",
  "faucet-core",

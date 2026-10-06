@@ -41,6 +41,8 @@ fn as_tosql(b: &OwnedBind) -> &dyn ToSql {
         OwnedBind::Int(i) => i,
         OwnedBind::Float(f) => f,
         OwnedBind::Text(s) => s,
+        OwnedBind::Timestamp(t) => t,
+        OwnedBind::TimestampTz(t) => t,
     }
 }
 
@@ -70,7 +72,10 @@ fn run_query(job: QueryJob, mut emit: impl FnMut(Vec<Value>) -> bool) -> Result<
     let binds = resolve_binds(&names, &job.params, job.bookmark.as_ref())?;
     let owned: Vec<(String, OwnedBind)> = binds
         .into_iter()
-        .map(|(n, v)| (n, OwnedBind::from_value(&v)))
+        .map(|(n, v)| {
+            let bind = OwnedBind::for_name(&n, &v);
+            (n, bind)
+        })
         .collect();
     let named: Vec<(&str, &dyn ToSql)> = owned
         .iter()
@@ -365,7 +370,10 @@ impl Source for OracleSource {
             let binds = resolve_binds(&names, &planned.params, planned.bookmark.as_ref())?;
             let owned: Vec<(String, OwnedBind)> = binds
                 .into_iter()
-                .map(|(n, v)| (n, OwnedBind::from_value(&v)))
+                .map(|(n, v)| {
+                    let bind = OwnedBind::for_name(&n, &v);
+                    (n, bind)
+                })
                 .collect();
             let named: Vec<(&str, &dyn ToSql)> = owned
                 .iter()

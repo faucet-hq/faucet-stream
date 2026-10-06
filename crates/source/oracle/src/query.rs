@@ -111,6 +111,8 @@ pub(crate) enum OwnedBind {
     Int(i64),
     Float(f64),
     Text(String),
+    Timestamp(chrono::NaiveDateTime),
+    TimestampTz(chrono::DateTime<chrono::FixedOffset>),
 }
 
 impl OwnedBind {
@@ -126,6 +128,36 @@ impl OwnedBind {
             Value::String(s) => OwnedBind::Text(s.clone()),
             other => OwnedBind::Text(other.to_string()),
         }
+    }
+
+    /// The bind for placeholder `name`: [`for_bookmark`](Self::for_bookmark) for
+    /// `:bookmark`, else [`from_value`](Self::from_value).
+    pub fn for_name(name: &str, v: &Value) -> Self {
+        if name.eq_ignore_ascii_case("BOOKMARK") {
+            Self::for_bookmark(v)
+        } else {
+            Self::from_value(v)
+        }
+    }
+
+    /// The `:bookmark` bind. A cursor value in the form this source emits for
+    /// `DATE` / `TIMESTAMP` / `TIMESTAMP WITH TIME ZONE` columns
+    /// (`YYYY-MM-DDTHH:MI:SS[.f][offset]`) binds as a timestamp: as text, the
+    /// session's `NLS_DATE_FORMAT` conversion rejects the `T` with ORA-01861
+    /// (SQL-41). An offset is kept, so the comparison is between instants.
+    pub fn for_bookmark(v: &Value) -> Self {
+        if let Value::String(s) = v
+            && s.len() >= 19
+            && s.as_bytes()[10] == b'T'
+        {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                return OwnedBind::TimestampTz(dt);
+            }
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+                return OwnedBind::Timestamp(dt);
+            }
+        }
+        Self::from_value(v)
     }
 }
 
@@ -239,6 +271,53 @@ fn table_descriptor(cols: &[CatalogRow]) -> Result<DatasetDescriptor, FaucetErro
 mod tests {
     use super::*;
     use faucet_common_oracle::OracleConnectionConfig;
+
+    #[test]
+    fn temporal_bookmarks_bind_as_timestamps() {
+        let naive = chrono::NaiveDate::from_ymd_opt(2024, 3, 1)
+            .unwrap()
+            .and_hms_opt(12, 30, 45)
+            .unwrap();
+        assert_eq!(
+            OwnedBind::for_bookmark(&json!("2024-03-01T12:30:45")),
+            OwnedBind::Timestamp(naive)
+        );
+        assert_eq!(
+            OwnedBind::for_bookmark(&json!("1970-01-01T00:00:00")),
+            OwnedBind::Timestamp(chrono::DateTime::UNIX_EPOCH.naive_utc())
+        );
+        assert!(matches!(
+            OwnedBind::for_bookmark(&json!("2024-03-01T12:30:45.123456")),
+            OwnedBind::Timestamp(t) if t.and_utc().timestamp_subsec_micros() == 123_456
+        ));
+        let OwnedBind::TimestampTz(tz) =
+            OwnedBind::for_bookmark(&json!("2024-03-01T12:30:45.5+05:30"))
+        else {
+            panic!("offset kept");
+        };
+        assert_eq!(tz.offset().local_minus_utc(), 5 * 3600 + 1800);
+        assert!(matches!(
+            OwnedBind::for_bookmark(&json!("2024-03-01T12:30:45Z")),
+            OwnedBind::TimestampTz(_)
+        ));
+        assert_eq!(
+            OwnedBind::for_bookmark(&json!("2024-03-01")),
+            OwnedBind::Text("2024-03-01".into())
+        );
+        assert_eq!(
+            OwnedBind::for_bookmark(&json!("2024-03-01Tnope-not-a-time")),
+            OwnedBind::Text("2024-03-01Tnope-not-a-time".into())
+        );
+        assert_eq!(OwnedBind::for_bookmark(&json!(7)), OwnedBind::Int(7));
+        assert!(matches!(
+            OwnedBind::for_name("BOOKMARK", &json!("2024-03-01T00:00:00")),
+            OwnedBind::Timestamp(_)
+        ));
+        assert_eq!(
+            OwnedBind::for_name("1", &json!("2024-03-01T00:00:00")),
+            OwnedBind::Text("2024-03-01T00:00:00".into())
+        );
+    }
 
     fn cfg(query: &str) -> OracleSourceConfig {
         OracleSourceConfig::new(
