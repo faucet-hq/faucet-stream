@@ -220,7 +220,8 @@ async fn discover(shared: &Shared) -> CliResult<BTreeMap<String, Resolution>> {
             tracing::warn!(table = %name, "mirror.per_table names a table discovery did not report");
         }
     }
-    let (kept, collisions) = tables::refuse_collisions(plans);
+    let incumbents = shared.state.lock().await.incumbents();
+    let (kept, collisions) = tables::refuse_collisions(plans, &incumbents);
     for (name, reason) in collisions {
         out.insert(name, Resolution::Refused(reason));
     }
