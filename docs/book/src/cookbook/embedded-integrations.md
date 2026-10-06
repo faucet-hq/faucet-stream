@@ -246,7 +246,15 @@ principals:
 usage (lists are filtered), template reads and the schema catalog. Another
 tenant's run or route is a `404` — existence does not leak — and every global
 administrative route (tenant CRUD, template admin, audit, reload, fan-out) is a
-`403`. Its plain `POST /v1/runs` runs for Acme.
+`403`. It runs **registered templates only** —
+`POST /v1/tenants/acme/templates/{id}/runs` — and a config of its own
+(`POST /v1/runs`, `POST /v1/tenants/acme/runs`, `POST /v1/changes`) is a `403`:
+a submitted config resolves `${env:}` / `${file:}` / secret references and
+builds connectors on the server, which only the server's operator may do. Your
+admin registers the pipelines; each customer's backend triggers them.
+
+Idempotency keys are scoped to the tenant, so `nightly-2026-10-01` sent for two
+tenants starts two runs, and a key never reveals another tenant's run.
 
 ## Deleting a tenant
 

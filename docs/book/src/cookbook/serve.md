@@ -71,7 +71,8 @@ each a `{ name, token, role }` where role is `viewer` (read-only), `operator`
 the audit log).
 
 ```yaml
-# auth.yaml — tokens can use ${env:…}/${secret:…} interpolation
+# auth.yaml — tokens resolve ${env:…} / ${file:…} / ${secret:…} and
+# secret-manager references (${vault:…}, …) when the server starts
 principals:
   - { name: alice, token: "${env:ALICE_TOKEN}", role: admin }
   - { name: ci,    token: "${env:CI_TOKEN}",    role: operator }
@@ -83,7 +84,15 @@ faucet serve --auth-config auth.yaml --history postgres://…/faucet
 ```
 
 A viewer's `POST /v1/runs` returns `403`; its `GET /v1/runs` returns `200`.
-`--auth-config` is mutually exclusive with `--auth-token` / `--no-auth`.
+`--auth-config` is mutually exclusive with `--auth-token` / `--no-auth`. A
+reference that does not resolve refuses the start, and a token still holding
+`${` is refused — never accepted literally. No config the server loads can read
+those variables or files, nor `FAUCET_VAULT_KEY` and the server's own token
+variables.
+
+A config submitted over HTTP or MCP may not use the `singer` source or sink —
+they run a program on the host — unless the server is started with
+`--allow-subprocess-connectors`. Registered templates may.
 
 **Every mutating action** (`run.submit` / `run.cancel` / `run.delete`) **and every
 denied attempt** is written to a tamper-evident audit log — principal, role,
