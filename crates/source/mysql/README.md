@@ -16,7 +16,7 @@ Built on `sqlx` with a pooled, async connection and a true row cursor (`Query::f
 - **Streaming row cursor** — `Source::stream_pages` drives a sqlx cursor and yields one `StreamPage` per `batch_size` rows; the sink starts writing before the query finishes draining.
 - **Connection pooling** — a single `MySqlPool` is built once in `new()` and reused for every fetch; size it with `max_connections` (default `10`).
 - **Rich type decoding** — JSON, integers, floats, booleans, `DATETIME`/`TIMESTAMP`/`DATE`/`TIME`, `DECIMAL` (exact precision), and `BLOB`/`BINARY` (base64) all map to sensible JSON.
-- **Parameterised per-record queries** — in a parent/child matrix run, `${parent.field}` tokens in the query are substituted as **safe bind parameters** (`?` placeholders), never string-interpolated.
+- **Parameterised per-record queries** — in a parent/child matrix run, `${parent.field}` tokens in the query are substituted as **safe bind parameters** (`?` placeholders), never string-interpolated. A token that is a whole quoted literal (`'${parent.name}'`) binds too; one embedded in a longer literal, a quoted identifier or a comment is refused when the config loads.
 - **TLS by default** — built with `tls-rustls`; encrypted connections need no extra dependency.
 - **Credential-safe** — the connection URL is masked in `Debug` output and stripped from the lineage dataset URI.
 - **`batch_size: 0` sentinel** — drain the whole result set into a single page for small lookup tables or load-job-style sinks.

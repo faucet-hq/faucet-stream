@@ -242,3 +242,58 @@ async fn dry_run_reports_plan_without_writing() {
     assert!(out.units.iter().all(|u| u.outcome == "pending"));
     assert_eq!(dst_row_count(&dst).await, 0, "nothing executed");
 }
+
+/// #789 CLI-07: two bookmark-mode backfills of different ranges keep separate
+/// unit bookmarks, each seeded with its own `--from-bookmark`.
+#[tokio::test(flavor = "multi_thread")]
+async fn bookmark_backfills_of_different_ranges_never_share_a_unit_bookmark() {
+    use faucet_core::StateStore;
+    let dir = tempfile::tempdir().unwrap();
+    let (src, dst) = seed(dir.path()).await;
+    let state_dir = dir.path().join("state");
+    let yaml = format!(
+        r#"
+version: 1
+name: bf
+pipeline:
+  source:
+    type: sqlite
+    config:
+      database_url: "sqlite://{src}"
+      query: "SELECT id, day, amount FROM events"
+  sink:
+    type: sqlite
+    config:
+      database_url: "sqlite://{dst}?mode=rwc"
+      table_name: events_out
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [id]
+  state:
+    type: file
+    config: {{ path: "{state}" }}
+"#,
+        state = state_dir.display(),
+    );
+    let cfg = faucet_cli::config::parse_with_extension(&yaml, "yaml").expect("config parses");
+    let range = |from: i64| BackfillRange::Bookmark {
+        from: json!(from),
+        to: None,
+        field: None,
+    };
+    let first = run_backfill(&cfg, opts(range(1))).await.expect("first");
+    let second = run_backfill(&cfg, opts(range(500))).await.expect("second");
+    assert_eq!((first.failed, second.failed), (0, 0));
+
+    let store = faucet_core::FileStateStore::new(&state_dir);
+    let unit = |out: &faucet_cli::backfill::BackfillOutcome| {
+        faucet_cli::backfill::state::unit_state_key(
+            "bf",
+            &faucet_cli::backfill::plan::range_hash(&out.descriptor),
+            "bookmark",
+        )
+    };
+    assert_ne!(unit(&first), unit(&second));
+    assert_eq!(store.get(&unit(&first)).await.unwrap(), Some(json!(1)));
+    assert_eq!(store.get(&unit(&second)).await.unwrap(), Some(json!(500)));
+}

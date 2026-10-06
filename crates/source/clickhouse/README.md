@@ -60,8 +60,9 @@ is omitted the cursor is applied client-side only, so the server returns the
 whole result set on every run (correctness is preserved, but it is a full
 re-scan — a warning is logged).
 
-You can inject parent-context values in a matrix child via `{key}` tokens; they
-are substituted as injection-safe SQL literals.
+In a matrix child, reference parent-record values with `${parent.field}`
+tokens; they are substituted as injection-safe SQL literals. Library callers
+pass the same values as `{key}` tokens through `fetch_with_context`.
 
 ## Dataset discovery / sharding
 

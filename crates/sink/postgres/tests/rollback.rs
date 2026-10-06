@@ -105,6 +105,7 @@ fn opts(mode: RollbackMode) -> RollbackOptions {
         mode,
         force: false,
         dry_run: false,
+        later_runs: false,
     }
 }
 
@@ -265,6 +266,21 @@ async fn upsert_rollback_is_blocked_by_a_later_run_unless_forced() {
         rows(&url).await,
         vec![(1, "old-1".into(), Some("r0".into()))]
     );
+}
+
+#[tokio::test]
+async fn a_key_a_later_run_deleted_is_a_conflict_not_a_resurrection() {
+    let (_c, url) = start_postgres().await;
+    exec(&url, CREATE_USERS).await;
+    exec(&url, "INSERT INTO users VALUES (1, 'old-1', 'r0')").await;
+    let sink = PostgresSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[user(1, "new-1", "r1")]).await.unwrap();
+    exec(&url, "DELETE FROM users WHERE id = 1").await;
+    let mut later = opts(RollbackMode::Upsert);
+    later.later_runs = true;
+    let out = sink.rollback_run("r1", &later).await.unwrap();
+    assert_eq!((out.conflicts, out.applied), (1, false), "{out:?}");
+    assert!(rows(&url).await.is_empty(), "blocked: nothing resurrected");
 }
 
 #[tokio::test]

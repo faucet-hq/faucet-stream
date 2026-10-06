@@ -181,6 +181,16 @@ pub enum CliError {
     )]
     MatrixAndNodesBothPresent,
 
+    /// A command that works on matrix rows was handed a topology config
+    /// (#789 CLI-17). Expanding it would have built one synthetic row from the
+    /// `default` templates and run a different pipeline than the graph.
+    #[error(
+        "this command cannot use a topology config (`pipeline.nodes`): it works on matrix \
+         rows, and a node graph has none. Run topology configs with `faucet run`, \
+         `faucet schedule` or `faucet serve`"
+    )]
+    TopologyNotSupported,
+
     /// A topology edge references a node id that doesn't exist in `nodes:`.
     #[error("topology edge references unknown node '{name}' (known nodes: {})", known.join(", "))]
     EdgeEndpointMissing { name: String, known: Vec<String> },

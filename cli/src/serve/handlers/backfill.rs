@@ -176,6 +176,7 @@ pub async fn submit_backfill(
         state.caller_origin(),
     )
     .await?;
+    loaded.require_matrix()?;
     let unscoped: Vec<&str> = loaded
         .nodes
         .iter()

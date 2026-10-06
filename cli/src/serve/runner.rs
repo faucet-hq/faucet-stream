@@ -743,7 +743,7 @@ async fn execute_shard(
     };
 
     let server_shutdown = state.shutdown_token();
-    let span = tracing::info_span!("faucet.serve.shard", serve_run_id = %run_id, shard = %shard_id);
+    let span = tracing::info_span!(parent: None, "faucet.serve.shard", serve_run_id = %run_id, shard = %shard_id);
     let audit_state = state.clone();
     let audit_run_id = run_id.to_string();
     let work = async move {
@@ -1209,8 +1209,12 @@ pub(crate) async fn policy_gate(
 ) -> Result<(), ServeError> {
     #[cfg(feature = "policy")]
     if let Some(spec) = loaded.cfg.policy.as_ref() {
-        let report = crate::policy::evaluate_nodes(spec, &loaded.nodes, &Default::default())
-            .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+        let report = if loaded.is_topology() {
+            crate::policy::evaluate_topology(spec, &loaded.cfg)
+        } else {
+            crate::policy::evaluate_nodes(spec, &loaded.nodes, &Default::default())
+        }
+        .map_err(|e| ServeError::BadConfig(e.to_string()))?;
         if report.violated() {
             let merged = serde_json::to_value(&loaded.cfg).unwrap_or(serde_json::Value::Null);
             let fp = idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
@@ -1257,6 +1261,7 @@ pub(crate) async fn run_doctor_first(
     loaded: &LoadedSubmission,
 ) -> Result<serde_json::Value, ServeError> {
     use faucet_core::check::CheckContext;
+    loaded.require_matrix()?;
     let auth = loaded
         .auth_catalog()
         .map_err(|e| ServeError::Unprocessable {
@@ -1781,7 +1786,7 @@ async fn execute_run(
         budget,
     };
 
-    let span = tracing::info_span!("faucet.serve.run", serve_run_id = %run_id);
+    let span = tracing::info_span!(parent: None, "faucet.serve.run", serve_run_id = %run_id);
     let audit_state = state.clone();
     let audit_run_id = run_id.clone();
     // The resolved+expanded config snapshot (#374) a successful run leaves in
@@ -1800,11 +1805,30 @@ async fn execute_run(
         crate::catalog::snapshot::on_error_str(&cfg.execution).to_string(),
         nodes.clone(),
     );
+    // A topology config runs as its node graph (#789 CLI-17), with the same
+    // cancel token, clock, budget and run id a matrix run gets.
+    let topology = crate::topology::is_topology(&cfg).then(|| {
+        (
+            cfg.clone(),
+            opts.auth.clone(),
+            crate::topology::TopologyRunOptions {
+                cancel: opts.cancel.clone(),
+                dry_run: false,
+                limit: None,
+                clock: Some(opts.clock),
+                budget: opts.budget.clone(),
+                run_id: opts.run_id.clone(),
+            },
+        )
+    });
     let work = async move {
         // Emitted inside the run span so it is captured by the SSE log layer
         // (and gives every `/logs` reader at least one line to anchor on).
         tracing::info!("pipeline run starting");
-        let result = run_expanded(nodes, opts).await;
+        let result = match &topology {
+            Some((cfg, auth, run)) => crate::topology::run_topology(cfg, auth, run.clone()).await,
+            None => run_expanded(nodes, opts).await,
+        };
         audit_runtime_policy_denials(&audit_state, &audit_run_id, &result).await;
         #[cfg(feature = "catalog")]
         {

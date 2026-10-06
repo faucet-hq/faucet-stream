@@ -98,7 +98,12 @@ pub fn render_report(r: &RollbackReport) -> String {
         o_mode(r)
     );
     let verb = if r.dry_run { "would " } else { "" };
+    if !r.later_runs.is_empty() {
+        out.push_str(&format!("  later runs: {}\n", r.later_runs.join(", ")));
+    }
+    let refused_for_later_runs = r.blocked && !r.later_runs.is_empty();
     match r.mode {
+        _ if refused_for_later_runs => {}
         faucet_core::rollback::RollbackMode::Append => {
             out.push_str(&format!(
                 "  {verb}delete {} row(s) the run appended\n",
@@ -196,7 +201,28 @@ mod tests {
             outcome,
             bookmark_rewound: true,
             token_rewound: false,
+            later_runs: vec![],
         }
+    }
+
+    #[test]
+    fn a_refusal_for_later_runs_names_them_and_counts_nothing() {
+        let mut r = report(
+            RollbackMode::Append,
+            RollbackOutcome {
+                applied: false,
+                note: Some("roll those back first".into()),
+                ..Default::default()
+            },
+            false,
+        );
+        r.blocked = true;
+        r.later_runs = vec!["r2".into(), "r3".into()];
+        let text = render_report(&r);
+        assert!(text.contains("rollback BLOCKED"), "{text}");
+        assert!(text.contains("later runs: r2, r3"), "{text}");
+        assert!(!text.contains("delete 0 row"), "{text}");
+        assert!(text.contains("roll those back first"), "{text}");
     }
 
     #[test]

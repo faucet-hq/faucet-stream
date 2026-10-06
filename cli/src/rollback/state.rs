@@ -79,6 +79,15 @@ impl RunIndex {
     pub fn remove(&mut self, run_id: &str) {
         self.runs.retain(|r| r != run_id);
     }
+
+    /// The retained runs newer than `run_id`, oldest first (empty when it is
+    /// the newest or not retained).
+    pub fn later(&self, run_id: &str) -> Vec<String> {
+        match self.runs.iter().position(|r| r == run_id) {
+            Some(i) => self.runs[i + 1..].to_vec(),
+            None => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +98,16 @@ mod tests {
     fn keys_nest_under_the_state_key() {
         assert_eq!(index_key("p::r"), "p::r::__rollback__");
         assert_eq!(marker_key("p::r", "abc"), "p::r::__rollback__::abc");
+    }
+
+    #[test]
+    fn later_lists_the_newer_runs() {
+        let idx = RunIndex {
+            runs: vec!["a".into(), "b".into(), "c".into()],
+        };
+        assert_eq!(idx.later("a"), vec!["b".to_string(), "c".to_string()]);
+        assert!(idx.later("c").is_empty());
+        assert!(idx.later("zzz").is_empty());
     }
 
     #[test]

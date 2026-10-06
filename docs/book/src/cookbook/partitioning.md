@@ -139,8 +139,14 @@ same way:
 
 **`to_unbounded` defaults on when the bound is discovered.** A probed maximum is
 stale the instant it returns, so the final chunk drops its upper bound and reads
-whatever arrived since. Set it explicitly to `false` for a range you know is
-closed.
+whatever arrived since: its `${partition.end}` renders as the largest integer
+(`9223372036854775807`), so `id <= ${partition.end}` and `id <
+${partition.end}` both admit every later row. Set it explicitly to `false` for a
+range you know is closed.
+
+With `bounds: half_open` a probed maximum is planned as `to = MAX + 1`, so the
+row holding the maximum is read (and a range whose `from` equals the maximum is
+one row, not empty).
 
 A probe that returns no rows, `null`, or a non-numeric value is an **error**, not
 a zero — `MAX(id)` over an empty table returns `NULL`, and treating that as 0

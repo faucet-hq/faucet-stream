@@ -343,7 +343,7 @@ fn read_file_trimmed(path_str: &str) -> CliResult<String> {
 
 /// Walk a dotted path through a JSON value. Returns `None` if any segment
 /// is missing or addresses through a non-object/array node.
-fn resolve_dotted(root: &Value, path: &str) -> Option<Value> {
+pub(crate) fn resolve_dotted(root: &Value, path: &str) -> Option<Value> {
     if path.is_empty() {
         return Some(root.clone());
     }

@@ -35,6 +35,20 @@ three forms:
 The key must resolve to a single value; it is not a JSONPath. It is resolved on
 the raw records, before transforms run, so no `flatten` is needed.
 
+### How cursor values compare
+
+Values are compared by what they hold, not as raw text:
+
+- Numbers compare numerically, integers exactly beyond 2^53.
+- Decimal strings (`"99"`, `"1234.50"`, as DECIMAL columns often arrive)
+  compare as exact decimals, so `"100"` is newer than `"99"`. A number and a
+  decimal string compare numerically too.
+- Timestamp strings compare as instants: RFC 3339 values with different
+  offsets or fraction widths are converted to UTC first; values without an
+  offset compare as local date-times against each other.
+- Any other string compares lexicographically, so a date-only cursor
+  (`2024-06-01`) orders correctly as long as it is fixed width.
+
 ### Pushing the bookmark into a nested request body
 
 A `replication_bind` with `into: body` writes the bookmark into the JSON request

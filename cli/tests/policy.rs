@@ -143,6 +143,7 @@ fn compliant_attributes_or_masking_satisfy_the_rule() {
 fn labels_follow_a_rename_and_an_opaque_chain_is_conservative() {
     let dir = TempDir::new().unwrap();
     let pol = write(dir.path(), "policy.yaml", POLICY);
+    // The contract describes the transformed output, so it names `contact`.
     let renamed = write(
         dir.path(),
         "renamed.yaml",
@@ -150,7 +151,8 @@ fn labels_follow_a_rename_and_an_opaque_chain_is_conservative() {
             dir.path(),
             "",
             "  transforms:\n    - type: rename_field\n      config: { fields: { email: contact } }\n",
-        ),
+        )
+        .replace("{ name: email, type: string }", "{ name: contact, type: string }"),
     );
     let out = faucet()
         .args(["policy", "--json"])
@@ -291,6 +293,44 @@ pipeline:
 }
 
 #[test]
+fn runtime_backstop_follows_a_rename_of_a_labelled_column() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("in.csv"), "id,ssn\n1,123-45-6789\n").unwrap();
+    let cfg = write(
+        dir.path(),
+        "renamed.yaml",
+        &format!(
+            r#"version: 1
+name: rtrename
+policy:
+  classifications:
+    - {{ label: pii, fields: [ssn] }}
+  rules:
+    - name: no-pii-in-files
+      when: {{ label: pii }}
+      deny: true
+pipeline:
+  source: {{ type: csv, config: {{ path: "{in}" }} }}
+  transforms:
+    - type: rename_field
+      config: {{ fields: {{ ssn: tax_id }} }}
+  sink: {{ type: jsonl, config: {{ path: "{out}" }} }}
+"#,
+            r#in = dir.path().join("in.csv").display(),
+            out = dir.path().join("out.jsonl").display(),
+        ),
+    );
+    faucet()
+        .args(["run"])
+        .arg(&cfg)
+        .assert()
+        .failure()
+        .stderr(contains("Policy `no-pii-in-files` violated"));
+    let written = fs::read_to_string(dir.path().join("out.jsonl")).unwrap_or_default();
+    assert!(!written.contains("123-45-6789"), "{written}");
+}
+
+#[test]
 fn runtime_backstop_fails_on_a_detected_value_and_quarantines_with_a_dlq() {
     let dir = TempDir::new().unwrap();
     // No contract → nothing is known statically; the row `mail` (not a
@@ -361,6 +401,36 @@ pipeline:
     let dlq_text = fs::read_to_string(&dlq).unwrap();
     assert_eq!(dlq_text.lines().count(), 1, "{dlq_text}");
     assert!(dlq_text.contains("alice@example.com") && dlq_text.contains("pii-eu"));
+}
+
+#[cfg(all(feature = "source-file", feature = "sink-file"))]
+#[test]
+fn the_shipped_policy_example_runs_with_its_masking_satisfying_the_rule() {
+    let dir = TempDir::new().unwrap();
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/csv_to_jsonl_with_policy.yaml");
+    fs::copy(&example, dir.path().join("pipeline.yaml")).unwrap();
+    write(
+        dir.path(),
+        "customers.csv",
+        "id,email,salary\n1,ada@example.com,120000\n2,bob@example.com,95000\n",
+    );
+    faucet()
+        .current_dir(dir.path())
+        .args(["run", "pipeline.yaml"])
+        .assert()
+        .success();
+    let out = fs::read_to_string(dir.path().join("out/customers.jsonl")).unwrap();
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "{out}");
+    for row in &rows {
+        let salary = row["salary"].as_str().unwrap();
+        assert!(!["120000", "95000"].contains(&salary), "{out}");
+        assert_eq!(salary.len(), 64, "a SHA-256 hex digest: {salary}");
+    }
 }
 
 #[test]

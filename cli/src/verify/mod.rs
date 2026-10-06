@@ -100,7 +100,9 @@ pub async fn verify(
 ) -> CliResult<VerifyOutcome> {
     spec.validate()?;
     let nodes = expand(cfg)?;
+    let all = nodes.clone();
     let node = crate::dlq_replay::plan::select_replay_node(nodes, inputs.row.as_deref())?;
+    crate::destination::check_owns_destination(&node, &all)?;
     verify_node(&node, spec, &inputs).await
 }
 

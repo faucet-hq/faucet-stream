@@ -100,6 +100,14 @@ destination after every successful root invocation (`after_run`). A mismatch
 fails the run — the same posture as `reconcile:` — unless
 `fail_on_difference: false`, in which case it is logged, counted, and the run
 stays green. `repair: true` heals the drift inside the run before deciding.
+
+A post-run check is refused (at `faucet validate`) where it cannot be
+meaningful: on a `write_mode: overwrite` row, whose new data is swapped in
+after the run, and on a row whose destination other rows also write — a
+partition chunk, or several matrix rows on one table — since its source covers
+only part of the destination and every other row's data would count as a
+difference (and `allow_delete` would remove it). `faucet verify` refuses such
+a shared-destination row too.
 The command's flags (`--repair`, `--allow-delete`, `--max-differences`)
 override the block for that invocation; without a block, `faucet verify` uses
 the defaults above.

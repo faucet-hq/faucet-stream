@@ -190,7 +190,7 @@ Columns are converted to JSON values by probing the row's value with each candid
 
 ## Matrix-context binding
 
-In a parent/child [matrix](https://faucet-hq.github.io/faucet-stream/reference/config.html) pipeline, the query may reference fields from each parent record with `${parent_id.dotted.path}` tokens. At runtime these are rewritten to additional positional bind markers (appended after the static `params`) and filled per parent record, so a single query template fans out into one parameterized execution per parent row — never string-interpolated, so it is SQL-injection safe.
+In a parent/child [matrix](https://faucet-hq.github.io/faucet-stream/reference/config.html) pipeline, the query may reference fields from each parent record with `${parent_id.dotted.path}` tokens. At runtime these are rewritten to additional positional bind markers (appended after the static `params`) and filled per parent record, so a single query template fans out into one parameterized execution per parent row — never string-interpolated, so it is SQL-injection safe. A token may also be a whole quoted literal (`'${parent.name}'` binds the same way); a token embedded in a longer literal (`'x-${parent.id}'`), inside a quoted identifier or inside a comment cannot be bound and is refused when the config loads.
 
 ```yaml
 matrix:

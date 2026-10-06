@@ -23,6 +23,7 @@ pub mod compose;
 pub mod config;
 pub mod conformance;
 pub mod connector_export;
+pub mod destination;
 pub mod discovery_matrix;
 pub mod dlq_replay;
 pub mod dynamic_fanout;
@@ -77,6 +78,7 @@ pub mod select;
 pub mod serve;
 pub mod signals;
 pub mod sla;
+pub mod sql_bind;
 pub mod state;
 pub mod status;
 #[cfg(feature = "templates")]
@@ -376,6 +378,23 @@ pub async fn run_from_yaml_str_selected(
         Some(spec) => Some(catalog::connect_from_spec(spec).await?),
         None => None,
     };
+    // A topology config runs as its node graph (#789 CLI-17); expanding it
+    // would run a synthetic default-template row instead.
+    if topology::is_topology(&cfg) {
+        if selection.is_some() {
+            return Err(CliError::Config(select::TOPOLOGY_REFUSAL.into()));
+        }
+        return topology::run_topology(
+            &cfg,
+            &auth,
+            topology::TopologyRunOptions {
+                budget: crate::budget::effective_budget(cfg.budget.as_ref(), None)
+                    .map_err(CliError::Config)?,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
     let nodes = expand::expand(&cfg)?;
     let nodes = match selection {
         Some(sel) => sel.apply(&cfg, nodes)?,

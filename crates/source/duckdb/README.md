@@ -13,7 +13,7 @@ small channel rather than buffering the whole result set.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `database` | string | — | Path to the `.duckdb` file, or `:memory:`. A `duckdb://` / `duckdb:` prefix is accepted and stripped. |
-| `query` | string | — | SQL query to execute. Supports `{placeholder}` tokens bound as parameters (safe against injection). |
+| `query` | string | — | SQL query to execute. In a parent/child matrix run, `${parent.field}` tokens are bound as parameters (safe against injection); library callers pass `{key}` placeholders through `fetch_with_context`. |
 | `read_only` | bool | `false` | Open read-only. DuckDB allows many read-only connections to one file but only a single read-write connection. |
 | `batch_size` | integer | `1000` | Rows per emitted page. `0` = emit the entire result set as one page. Validated at config load: an empty `database` / `query`, or a `batch_size` above `MAX_BATCH_SIZE` (1,000,000), is rejected with `FaucetError::Config`. |
 

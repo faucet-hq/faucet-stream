@@ -203,16 +203,134 @@ pub fn values_to_record_batch_inferred(records: &[Value]) -> Result<RecordBatch,
 /// null-valued column is emitted as `"key": null` rather than omitted — without
 /// this a `SELECT *`-style identity would silently delete every explicit-null
 /// field (audit #321 H6). An empty batch returns an empty `Vec`.
+///
+/// Decimals are emitted as exact strings (`"12345678901234567890.12"`) rather
+/// than JSON numbers, which `serde_json` would round through `f64`; non-finite
+/// floats become `"NaN"` / `"Infinity"` / `"-Infinity"` instead of `null`.
 pub fn record_batch_to_values(batch: &RecordBatch) -> Result<Vec<Value>, FaucetError> {
     let mut buf = Vec::new();
     {
         let mut writer = arrow_json::writer::WriterBuilder::new()
             .with_explicit_nulls(true)
+            .with_encoder_factory(Arc::new(ExactEncoderFactory))
             .build::<_, arrow_json::writer::JsonArray>(&mut buf);
         writer.write(batch).map_err(|e| te("json write", e))?;
         writer.finish().map_err(|e| te("json finish", e))?;
     }
     serde_json::from_slice(&buf).map_err(|e| te("json parse", e))
+}
+
+#[derive(Debug)]
+struct ExactEncoderFactory;
+
+struct StringEncoder<F: FnMut(usize) -> String>(F);
+
+impl<F: FnMut(usize) -> String> arrow_json::writer::Encoder for StringEncoder<F> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let text = (self.0)(idx);
+        serde_json::to_writer(&mut *out, &text).expect("writing to a Vec cannot fail");
+    }
+}
+
+struct JsonTextEncoder<F: FnMut(usize) -> String>(F);
+
+impl<F: FnMut(usize) -> String> arrow_json::writer::Encoder for JsonTextEncoder<F> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        out.extend_from_slice((self.0)(idx).as_bytes());
+    }
+}
+
+fn non_finite_json(nan: bool, positive: bool) -> String {
+    let text = if nan {
+        "NaN"
+    } else if positive {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    format!("\"{text}\"")
+}
+
+fn f64_json(v: f64) -> String {
+    if v.is_finite() {
+        Value::from(v).to_string()
+    } else {
+        non_finite_json(v.is_nan(), v.is_sign_positive())
+    }
+}
+
+fn f32_json(v: f32) -> String {
+    if v.is_finite() {
+        serde_json::to_string(&v).expect("a finite f32 always serializes")
+    } else {
+        non_finite_json(v.is_nan(), v.is_sign_positive())
+    }
+}
+
+fn nullable<'a>(
+    encoder: impl arrow_json::writer::Encoder + 'a,
+    array: &'a dyn arrow::array::Array,
+) -> arrow_json::writer::NullableEncoder<'a> {
+    arrow_json::writer::NullableEncoder::new(Box::new(encoder), array.nulls().cloned())
+}
+
+impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
+    fn make_default_encoder<'a>(
+        &self,
+        _field: &'a arrow::datatypes::FieldRef,
+        array: &'a dyn arrow::array::Array,
+        _options: &'a arrow_json::writer::EncoderOptions,
+    ) -> Result<Option<arrow_json::writer::NullableEncoder<'a>>, arrow::error::ArrowError> {
+        use arrow::array::AsArray;
+        use arrow::datatypes::{
+            DataType, Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, Float16Type,
+            Float32Type, Float64Type,
+        };
+        let enc = match array.data_type() {
+            DataType::Decimal32(..) => {
+                let a = array.as_primitive::<Decimal32Type>();
+                nullable(StringEncoder(move |i| a.value_as_string(i)), array)
+            }
+            DataType::Decimal64(..) => {
+                let a = array.as_primitive::<Decimal64Type>();
+                nullable(StringEncoder(move |i| a.value_as_string(i)), array)
+            }
+            DataType::Decimal128(..) => {
+                let a = array.as_primitive::<Decimal128Type>();
+                nullable(StringEncoder(move |i| a.value_as_string(i)), array)
+            }
+            DataType::Decimal256(..) => {
+                let a = array.as_primitive::<Decimal256Type>();
+                nullable(StringEncoder(move |i| a.value_as_string(i)), array)
+            }
+            DataType::Float64 => {
+                let a = array.as_primitive::<Float64Type>();
+                if a.values().iter().all(|v| v.is_finite()) {
+                    return Ok(None);
+                }
+                nullable(JsonTextEncoder(move |i| f64_json(a.value(i))), array)
+            }
+            DataType::Float32 => {
+                let a = array.as_primitive::<Float32Type>();
+                if a.values().iter().all(|v| v.is_finite()) {
+                    return Ok(None);
+                }
+                nullable(JsonTextEncoder(move |i| f32_json(a.value(i))), array)
+            }
+            DataType::Float16 => {
+                let a = array.as_primitive::<Float16Type>();
+                if a.values().iter().all(|v| v.is_finite()) {
+                    return Ok(None);
+                }
+                nullable(
+                    JsonTextEncoder(move |i| f32_json(f32::from(a.value(i)))),
+                    array,
+                )
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(enc))
+    }
 }
 
 /// Compare two schemas for field-level equality (name + data-type + nullability).
@@ -247,6 +365,126 @@ mod tests {
         let batch = values_to_record_batch(&[], schema).unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert!(record_batch_to_values(&batch).unwrap().is_empty());
+    }
+
+    fn decimal_batch() -> RecordBatch {
+        use arrow::array::Decimal128Array;
+        use arrow::datatypes::{DataType, Field};
+        let amounts = Decimal128Array::from(vec![
+            Some(12_345_678_901_234_567_890_123_456_789_012_345_678_i128),
+            None,
+            Some(-1),
+        ])
+        .with_precision_and_scale(38, 2)
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 2),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(amounts)]).unwrap()
+    }
+
+    #[test]
+    fn decimals_survive_as_exact_strings_and_round_trip() {
+        let batch = decimal_batch();
+        let values = record_batch_to_values(&batch).unwrap();
+        assert_eq!(
+            values[0]["amount"],
+            json!("123456789012345678901234567890123456.78")
+        );
+        assert_eq!(values[1]["amount"], json!(null));
+        assert_eq!(values[2]["amount"], json!("-0.01"));
+        let back = values_to_record_batch(&values, batch.schema()).unwrap();
+        assert_eq!(back, batch);
+    }
+
+    #[test]
+    fn nested_decimals_are_exact_too() {
+        use arrow::array::{Decimal128Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field};
+        let item = Arc::new(Field::new("item", DataType::Decimal128(38, 0), true));
+        let values = Decimal128Array::from(vec![99_999_999_999_999_999_999_999_i128])
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        let list = ListArray::new(
+            item.clone(),
+            OffsetBuffer::from_lengths([1]),
+            Arc::new(values),
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ids",
+            DataType::List(item),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(list)]).unwrap();
+        let rows = record_batch_to_values(&batch).unwrap();
+        assert_eq!(rows[0]["ids"], json!(["99999999999999999999999"]));
+    }
+
+    #[test]
+    fn non_finite_floats_become_strings_not_nulls() {
+        use arrow::array::{Float32Array, Float64Array};
+        use arrow::datatypes::{DataType, Field};
+        let halves = arrow::compute::cast(
+            &Float32Array::from(vec![Some(f32::INFINITY), Some(0.5), None, Some(f32::NAN)]),
+            &DataType::Float16,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Float64, true),
+            Field::new("f", DataType::Float32, true),
+            Field::new("h", DataType::Float16, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(1.5),
+                    None,
+                ])),
+                Arc::new(Float32Array::from(vec![
+                    Some(f32::NEG_INFINITY),
+                    Some(0.1),
+                    Some(f32::NAN),
+                    Some(2.0),
+                ])),
+                halves,
+            ],
+        )
+        .unwrap();
+        let rows = record_batch_to_values(&batch).unwrap();
+        assert_eq!(rows[0]["d"], json!("NaN"));
+        assert_eq!(rows[1]["d"], json!("Infinity"));
+        assert_eq!(rows[2]["d"], json!(1.5));
+        assert_eq!(rows[3]["d"], json!(null));
+        assert_eq!(rows[0]["f"], json!("-Infinity"));
+        assert_eq!(rows[1]["f"].to_string(), "0.1");
+        assert_eq!(rows[2]["f"], json!("NaN"));
+        assert_eq!(rows[0]["h"], json!("Infinity"));
+        assert_eq!(rows[1]["h"], json!(0.5));
+        assert_eq!(rows[2]["h"], json!(null));
+        assert_eq!(rows[3]["h"], json!("NaN"));
+
+        let back = values_to_record_batch(&rows, schema).unwrap();
+        let d = back
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(d.value(0).is_nan());
+        assert_eq!(d.value(1), f64::INFINITY);
+        assert_eq!(d.value(2), 1.5);
+    }
+
+    #[test]
+    fn all_finite_floats_keep_the_default_encoding() {
+        let batch = values_to_record_batch_inferred(&[json!({"x": 0.25})]).unwrap();
+        assert_eq!(record_batch_to_values(&batch).unwrap()[0]["x"], json!(0.25));
     }
 
     #[test]

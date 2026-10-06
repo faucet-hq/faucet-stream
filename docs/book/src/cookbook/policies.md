@@ -112,7 +112,10 @@ Per row the report says **what the static pass knows**:
   backstop is the enforcement.
 - **Labels follow the transform chain** through the same column-lineage ops
   OpenLineage emission uses, so `rename_field: { email: contact }` yields a
-  labelled `contact` (`via: lineage`). An **opaque** transform (`flatten`,
+  labelled `contact` (`via: lineage`). A contract describes the row's
+  **output** (it is enforced after the transforms), so it lists `contact`;
+  each contract field is traced back through the chain to the input it came
+  from and keeps that input's labels. An **opaque** transform (`flatten`,
   `explode`, `keys_case`, `sql`, `wasm`, custom) carries every labelled input
   **conservatively**: a rename cannot hide a label, and the report flags the
   row as opaque.
@@ -124,7 +127,8 @@ Per row the report says **what the static pass knows**:
 
 Topology graphs (`pipeline.nodes`) are evaluated per sink node from the
 pipeline-level contract; any transform node in the graph makes the labels
-conservative.
+conservative, and a contract field inherits the labels of every name any
+transform node renames into it.
 
 ## The runtime backstop
 
@@ -135,7 +139,9 @@ its detector): every record's scalar leaves are classified by name and by
 value detector and the same rules are evaluated against the sink's
 attributes. A label on a container (`fields: [phones]`) covers every leaf
 beneath it (`phones.0`, `phones.1`), and a leaf the masking pass rewrote by
-name counts as masked with that action, exactly as in the static pass.
+name counts as masked with that action, exactly as in the static pass. The
+sink sees records after the transforms, so a column a row's transforms
+renamed (`ssn` → `tax_id`) carries the labels of its original name there too.
 
 - `on_runtime: fail` — the page is refused before it is written;
   `faucet run` fails with `Policy `pii-eu` violated on column `mail`` and

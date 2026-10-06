@@ -112,6 +112,14 @@ emit only some of them.
 
 `merge` forwards pages from all inputs in arrival order.
 
+A merge can also join the branches of one source back together — a `tee` fans the
+source out, each branch transforms its copy, and the `merge` combines them. Then
+the merge forwards a source position (the bookmark the sink persists) only once
+**every** branch has delivered it, so a sink never records a position while
+another branch's copy of that page is still on its way. A merge that mixes such
+branches with an unrelated source forwards no positions at all, and the next run
+replays rather than skips.
+
 ## Joins
 
 A `join` node hash-joins two upstreams. The **build** (right) side is buffered
@@ -147,6 +155,11 @@ The build side is fully materialized before probing begins, so pair a large
 dimension table with a fast local source (SQLite / Parquet) rather than a slow
 remote API, and keep `max_build_records` as a guardrail.
 
+The two sides must come from different upstream nodes. A graph that feeds both
+sides from one `tee` is refused when it is built: the join reads its whole build
+side before the probe side, so the shared tee would block on the full probe
+channel and the run would never end.
+
 ## State and errors
 
 Each terminal sink owns a bookmark under `{name}::{node_id}`. On restart the
@@ -169,15 +182,34 @@ routinely, make the sinks idempotent (`write_mode: upsert` with a `key`) or turn
 on [exactly-once delivery](#exactly-once-delivery), which replaces both rules
 above with a real ordering.
 
+A sink node with `write_mode: overwrite` stages its rows before the first write
+and swaps them in — and only then persists its position — once **every** node of
+the graph has succeeded and the run was not cancelled. If any node fails, or the
+run is cancelled, every overwrite sink discards its staging and its destination
+is left exactly as it was.
+
+A sink whose input stopped because an upstream node failed is reported as
+**failed** — in the run summary, its notification, its SLA history, its lineage
+event and its run marker — not as a successful run of the records it happened to
+receive. That holds under `execution.on_error: stop` too: the run still reports
+per sink node before it returns the error.
+
 ## Exactly-once delivery
 
 `delivery: exactly_once` works in topology mode. Each sink node keeps its own
-commit watermark, so a restart resumes from the **lowest** committed sequence
-across the sinks — the one that is furthest behind — and every sink that is
-already ahead of that point skips the pages it has committed. Unlike the
-at-least-once rules above this is a genuine total order (the sequence is a
-monotonic counter the pipeline assigns, not an opaque bookmark), so no sink is
-ever resumed past its own progress and no sink re-writes a page it already has.
+commit watermark. On restart, each sink's committed position is read from its
+state — or from the position embedded in its own commit token, when the sink
+committed a page the state store never recorded. The source resumes from the
+position furthest behind, and every sink ahead of it skips the replayed pages it
+has already committed:
+
+- by **position**, when the source can order its positions (the CDC sources), so
+  the replay does not need to repeat the original page boundaries;
+- otherwise by its **commit sequence**, with every sink started at the
+  furthest-behind sink's sequence so the sequences keep counting the same pages.
+
+No sink is resumed past its own progress, and no sink re-writes a page it already
+has.
 
 Five requirements are checked at config-load time, so `faucet validate` catches
 a violation before anything runs:
@@ -248,8 +280,31 @@ where it makes sense:
 | `lineage:` | one OpenLineage job per sink node, named `{pipeline}.{node_id}`. Its **inputs are every source that reaches that sink**, so a merge emits a job with several inputs. Column lineage is emitted only for a single-input sink — with several inputs the per-column derivation is not knowable from the graph alone, and it is left out rather than guessed |
 | `catalog:` | one dataset per source and per sink, plus one edge per (source, sink) pair that the graph actually connects; a merge sink's per-edge volume is the contributing source's own record count |
 
+| `budget:` (and `faucet run --max-*` / `--allowed-sink`) | per sink node: each real sink is wrapped in the budget, a page that would cross a ceiling is refused whole and stops the run, a duration ceiling fails the node, and `allowed_sinks` is checked against every sink node's template name and kind before anything runs |
+| `metadata_columns:` | per sink node: the `_faucet_*` columns are stamped on every row a sink writes; `_faucet_source` names the kind of every source that reaches the sink (`csv+jsonl` for a merge of the two) |
+| `reconcile:` | per sink node: each sink's written count is compared with the probe's authoritative count, and a shortfall fails that node |
+
 A sink whose branch produced no records still reports — an empty branch is a
 result, not a missing one.
+
+Two blocks are **refused** in topology mode, with an error from `faucet validate`:
+`verify:` (a graph sink is fed through tees, merges and joins rather than one
+source and one transform chain, so there is no source to compare it with) and
+`rollback:` (runs are journaled and undone per matrix row). `usage:` is accepted
+but not applied — a graph run records no usage or cost estimate — and `faucet
+validate` says so.
+
+## Runtimes
+
+`faucet run`, `faucet schedule` and `faucet serve` run a topology config as its
+node graph, with the same cancellation, clock, budget and run id a matrix run
+gets. A server refuses a topology config for a **tenant** run, because tenant
+state is namespaced per matrix row.
+
+Commands that work on matrix rows — `doctor`, `plan` (and `POST /v1/plan`),
+`backfill`, `verify`, `rollback`, `mirror`, change requests and serve's
+`doctor_first` — refuse a topology config with an explicit error, rather than
+acting on a synthetic row built from the `default` templates.
 
 ## Runnable examples
 

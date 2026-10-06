@@ -1006,7 +1006,7 @@ as a pipeline but prints a deprecation notice — add `kind: pipeline`. See the
 | `--version <n\|channel>` | *(deprecate)* Retire (or revive) only this version. It still runs when pinned, with a warning; `newest` skips it and `launch` refuses it. |
 | `--param <NAME=VALUE>` | *(run)* Supply a declared param. Repeatable. |
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
-| `--limit <n>` | *(run)* Stop after writing this many records. |
+| `--limit <n>` | *(run)* Stop after writing this many records. On a `write_mode: overwrite` row the sample is staged and then discarded — the destination is left unchanged. |
 | `--select` / `--only` / `--skip` / `--tag` / `--status` / `--include-parents` | *(run / rows)* Run — or, with `rows`, preview — only some of the template's rows: a source template's streams, a pipeline's matrix rows. The same selection model as `faucet run`; for a source template only the selected streams are composed, so a stream the sink cannot run does not block the others. A topology template refuses any selection. See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-streams). |
 | `--no-state` | *(rows)* Skip each row's `faucet status` view (last success / failure, bookmark age, lag, health). |
 | `--suite <path>` | *(test)* Positional: the suite file (YAML or JSON). `faucet schema template-test` prints its schema. |

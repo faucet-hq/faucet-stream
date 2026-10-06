@@ -15,7 +15,7 @@ SQLite is an in-process, file-based engine — there is no server, no network wi
 - **`batch_size: 0` "no batching" sentinel** — drain the entire cursor into one page for small lookup tables or for sinks that prefer one large request to many small ones.
 - **Dynamic-type aware decoding** — SQLite's storage classes (INTEGER, REAL, TEXT, BLOB, NULL) are probed in order of specificity; TEXT that parses as JSON is returned as a native JSON value, BLOBs are base64-encoded so binary survives the round-trip.
 - **Connection pooling** — a `sqlx::SqlitePool` is built once in `new()` and reused for every query; pool size is configurable.
-- **Safe parameter binding** — `{field}` placeholders in the query are bound from the matrix / parent-record context as positional `?` parameters, so values are never string-interpolated into SQL (no injection).
+- **Safe parameter binding** — in a parent/child matrix run, `${parent.field}` tokens in the query are bound as positional `?` parameters, so values are never string-interpolated into SQL (no injection). Library callers pass the same values as `{key}` placeholders through `fetch_with_context`.
 - **File or in-memory** — point at `sqlite:data.db`, an absolute path, or `sqlite::memory:`.
 
 ## Installation
@@ -123,7 +123,7 @@ source:
 
 ### Per-parent query in a matrix fan-out
 
-A child matrix row can substitute values from each parent record into the query with `{field}` placeholders. Each value is bound as a positional parameter, so injection is impossible.
+A child matrix row can reference values from each parent record in the query with `${parent.field}` tokens. Each value is bound as a positional parameter, so injection is impossible. A token may be a whole quoted literal (`'${tenants.name}'`); a token embedded in a longer literal, a quoted identifier or a comment is refused when the config loads.
 
 ```yaml
 matrix:
@@ -136,7 +136,7 @@ matrix:
       type: sqlite
       config:
         database_url: sqlite:tenants.db
-        query: SELECT * FROM records WHERE tenant_id = {tenants.id}
+        query: SELECT * FROM records WHERE tenant_id = ${tenants.id}
 ```
 
 ## Streaming & batching

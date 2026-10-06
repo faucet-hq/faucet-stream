@@ -1256,6 +1256,7 @@ mod tests {
             mode: crate::rollback::RollbackMode::Append,
             force: false,
             dry_run: false,
+            later_runs: false,
         };
         let err = sink.rollback_run("r1", &opts).await.unwrap_err();
         assert!(

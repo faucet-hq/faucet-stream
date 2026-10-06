@@ -217,6 +217,41 @@ impl MysqlSink {
         Ok(total)
     }
 
+    /// Journaled keys with a before-image whose row is gone. Only called when
+    /// a later run wrote the table: such a key was deleted by it, and restoring
+    /// the before-image would resurrect it.
+    async fn count_vanished(
+        &self,
+        conn: &mut MySqlConnection,
+        entries: &[JournalEntry],
+    ) -> Result<u64, FaucetError> {
+        let restorable = faucet_core::rollback::restorable(entries);
+        if restorable.is_empty() {
+            return Ok(0);
+        }
+        let key = &self.config.write.key;
+        let table_ref = quote_ident_mysql(&self.config.table_name);
+        let sql = journal_sql();
+        let per = (MAX_MYSQL_PARAMS / key.len().max(1)).max(1);
+        let mut present = 0u64;
+        for chunk in restorable.chunks(per) {
+            let (predicate, _) = sql.keys_in(key, chunk.len(), 0);
+            let count_sql = format!("SELECT count(*) AS n FROM {table_ref} WHERE {predicate}");
+            let mut q = sqlx::query(&count_sql);
+            for e in chunk {
+                for (_, v) in &e.tuple(key).0 {
+                    q = bind_value(q, v);
+                }
+            }
+            let row = q
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| sink_err("count vanished keys", e))?;
+            present += row.get::<i64, _>("n") as u64;
+        }
+        Ok((restorable.len() as u64).saturating_sub(present))
+    }
+
     pub(crate) fn rollback_supported(&self) -> bool {
         matches!(self.config.column_mapping, MysqlColumnMapping::AutoMap)
     }
@@ -327,9 +362,12 @@ impl MysqlSink {
                 "no journal rows for this run (was `rollback.journal` enabled when it ran?)",
             ));
         }
-        let conflicts = self
+        let mut conflicts = self
             .count_conflicts(&mut *conn, &entries, run_id, &opts.run_id_column)
             .await?;
+        if opts.later_runs {
+            conflicts += self.count_vanished(&mut *conn, &entries).await?;
+        }
         if conflicts > 0 && !opts.force {
             return Ok(RollbackOutcome::blocked(conflicts));
         }

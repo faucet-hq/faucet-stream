@@ -118,11 +118,11 @@ pub struct BigQuerySinkConfig {
     /// is the only safe swap across the independent writer sink instances.
     ///
     /// Absent/`false` ⇒ a **solo** overwrite (the common one-table-per-run case)
-    /// loads directly into the target — `WRITE_TRUNCATE` on the first page,
-    /// `WRITE_APPEND` on the rest — with no staging table, no swap, and no
-    /// second data-write. A BigQuery load job with `WRITE_TRUNCATE` is atomic on
-    /// its own (the target's prior data survives a failed load), so a
-    /// single-load refresh is fully atomic without staging.
+    /// loads directly into the target: every page feeds one `WRITE_TRUNCATE`
+    /// resumable load that the pipeline finalizes once, at the end of a
+    /// successful run, with no staging table, no swap, and no second data-write.
+    /// A BigQuery load job with `WRITE_TRUNCATE` is atomic on its own, so a
+    /// failed or cancelled run leaves the target's prior data intact.
     ///
     /// Only consulted on the `media_load` overwrite path (and only when `scope`
     /// is `None`); the `jobs.query` overwrite path always stages. Not a

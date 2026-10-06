@@ -299,7 +299,12 @@ A remote hub is any GitHub repository laid out like `hub/`:
 URL. The CLI resolves the ref to a commit with one API request, downloads the
 catalog into `~/.cache/faucet/hub/<repo>/<ref>/<commit>/` the first time
 (`%LOCALAPPDATA%\faucet\hub\` on Windows; `FAUCET_HUB_CACHE` or
-`XDG_CACHE_HOME` override the location), and reuses the snapshot until the ref moves. Offline, the last snapshot is used
+`XDG_CACHE_HOME` override the location), and reuses the snapshot until the ref moves. The
+snapshot includes the catalog's `index.json`, so an unpinned template resolves
+to its launched (`stable`) version — not whatever body was merged last — and
+`@N` / `@stable` / `@newest` pins work against a remote hub. When the ref moves,
+the snapshot it replaced is kept until the next move, so a run that started a
+moment earlier keeps reading it. Offline, the last snapshot is used
 with a warning (`FAUCET_HUB_OFFLINE=1` skips the network altogether); it never
 falls back to an empty catalog. `GITHUB_TOKEN` (or `FAUCET_GITHUB_TOKEN`) is
 sent when set — needed for a private catalog, and it lifts the anonymous API

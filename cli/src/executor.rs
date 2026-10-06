@@ -462,6 +462,9 @@ pub fn run_expanded_boxed(
 
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
+    if !opts.dry_run {
+        check_overwrite_plan(&nodes, &opts)?;
+    }
     let on_error = opts
         .execution
         .as_ref()
@@ -521,6 +524,12 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
 
     let mut outcomes: Vec<InvocationOutcome> = Vec::new();
     let mut skipped_subtrees: HashSet<String> = HashSet::new();
+    // Children each parent still has to schedule; its captured records are
+    // released when this reaches zero (#789 CLI-06).
+    let mut pending_children: HashMap<String, usize> = children_of
+        .iter()
+        .map(|(p, c)| (p.clone(), c.len()))
+        .collect();
 
     // Root cooperative-cancel token: the caller's (serve wires run-cancel /
     // timeout / shutdown) or a fresh one. Each level derives a child token so
@@ -528,6 +537,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
     // external cancel of the root propagates to every level (#146 H16).
     let cancel = opts.cancel.clone().unwrap_or_default();
     let opts = Arc::new(opts);
+    let dlq_sinks: DlqSinkCache = Arc::default();
 
     // We execute level-by-level. Each level is "every node whose parent is
     // already done." Roots are level 0. For each level, we spawn one task per
@@ -604,25 +614,29 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         // Build the work units for this level. Each unit is one invocation —
         // a root runs once; a child runs once per parent record.
         let mut units: Vec<Unit> = Vec::new();
-        // Move only the captured records of the parents whose children run this
-        // level out of the shared map. This both narrows the snapshot and frees
-        // each parent's buffer the moment its children consume it: all of a
-        // parent's children become ready in the same level, so its records are
-        // needed exactly once. Units hold their own `Arc<Value>` clones, so
-        // removing the map entry here only drops the map's hold (#160).
+        // Snapshot the captured records of the parents whose children run this
+        // level. A parent's children need not all become ready in the same
+        // level — a child that `depends_on` a sibling child runs a level later
+        // (#789 CLI-06) — so a parent's buffer is released only once its last
+        // child has been scheduled. Units hold their own `Arc<Value>` clones,
+        // so releasing the map entry only drops the map's hold (#160).
         let level_records: HashMap<String, Vec<Arc<Value>>> = {
-            let consumed_parents: HashSet<&str> = ready
-                .iter()
-                .filter_map(|id| match &nodes_by_id[id].role {
-                    NodeRole::Child { parent_id, .. } => Some(parent_id.as_str()),
-                    _ => None,
-                })
-                .collect();
             let mut cap = captured.lock().await;
-            consumed_parents
-                .iter()
-                .filter_map(|p| cap.remove(*p).map(|v| (p.to_string(), v)))
-                .collect()
+            let mut snapshot = HashMap::new();
+            for id in &ready {
+                let NodeRole::Child { parent_id, .. } = &nodes_by_id[id].role else {
+                    continue;
+                };
+                if let Some(records) = cap.get(parent_id) {
+                    snapshot.insert(parent_id.clone(), records.clone());
+                }
+                let left = pending_children.entry(parent_id.clone()).or_insert(1);
+                *left = left.saturating_sub(1);
+                if *left == 0 {
+                    cap.remove(parent_id);
+                }
+            }
+            snapshot
         };
         for id in &ready {
             let node = &nodes_by_id[id];
@@ -883,7 +897,8 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                 .get(&meta)
                 .is_some_and(|gi| overwrite_groups[*gi].members > 1);
             let unit_cancel = level_cancel.clone();
-            let handle = joinset.spawn(async move {
+            let dlq_sinks = Arc::clone(&dlq_sinks);
+            let handle = joinset.spawn(DLQ_SINKS.scope(dlq_sinks, async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 run_unit(
                     &unit,
@@ -897,7 +912,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                     overwrite_grouped,
                 )
                 .await
-            });
+            }));
             task_meta.insert(handle.id(), meta);
         }
 
@@ -998,7 +1013,18 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         // together, atomically.
         let level_cancelled = level_cancel.is_cancelled() || cancel.is_cancelled();
         for (gi, group) in overwrite_groups.iter().enumerate() {
-            let must_abort = level_cancelled || failed_overwrite_groups.contains(&gi);
+            // `--limit` writes a sample: committing it would replace the whole
+            // destination with N rows (#789 CLI-05), so the staged sample is
+            // always discarded.
+            if opts.limit.is_some() {
+                tracing::warn!(
+                    dest = %group.dest,
+                    "--limit on a `write_mode: overwrite` row: the staged sample is discarded \
+                     and the destination is left unchanged"
+                );
+            }
+            let must_abort =
+                level_cancelled || failed_overwrite_groups.contains(&gi) || opts.limit.is_some();
             let mut cfg = group.cfg.clone();
             mark_overwrite_staging(&group.kind, &mut cfg, group.members > 1);
             let sink = build_sink(&group.kind, cfg, &opts.auth).await?;
@@ -1099,6 +1125,24 @@ async fn resolve_product_dims(
         )));
     }
     Ok(Some(resolved))
+}
+
+/// Refuse a run whose overwrite swaps would replace a destination with only
+/// part of its data (#789): a source-sharded run (each shard would commit its
+/// own swap — CLI-02), or rows sharing one destination that run in different
+/// levels (each level commits its own swap — CLI-04).
+fn check_overwrite_plan(nodes: &[ExpandedNode], opts: &ExecuteOptions) -> CliResult<()> {
+    if opts.shard.is_some()
+        && let Some(node) = nodes.iter().find(|n| crate::destination::is_overwrite(n))
+    {
+        return Err(CliError::Config(format!(
+            "row '{}': a source-sharded run cannot write `write_mode: overwrite` — each shard \
+             would swap in only its own slice of the data. Remove `shard:` or use \
+             `write_mode: upsert`",
+            node.id
+        )));
+    }
+    crate::destination::check_overwrite_levels(nodes)
 }
 
 /// A group of overwrite fan-out invocations sharing one physical destination
@@ -1621,7 +1665,9 @@ async fn run_discovery(
         resolve_now_inplace(&mut cfg, opts.clock)?;
         // Chained discovery (#531): resolve the upstream tuple `${dim}` tokens in
         // the source config (e.g. `/crm/v3/properties/${types.name}`).
+        let mut binds = HashMap::new();
         if let Some(pc) = product_ctx {
+            binds = crate::sql_bind::bind_source_query(&source_kind, &mut cfg, pc)?;
             resolve_inplace(&mut cfg, pc)?;
         }
         let source = build_source(
@@ -1632,7 +1678,7 @@ async fn run_discovery(
         )
         .await?;
         source.set_run_clock(opts.clock.to_utc());
-        let records = source.fetch_all().await?;
+        let records = source.fetch_with_context(&binds).await?;
         let values = crate::discovery_matrix::project_dedup(&records, select);
         let n = values.len();
         if collect {
@@ -2169,9 +2215,16 @@ async fn run_one_invocation(
             fanout_ctx.insert(k.clone(), v.clone());
         }
     }
+    let mut sql_binds: HashMap<String, Value> = HashMap::new();
     if !fanout_ctx.is_empty() {
+        sql_binds =
+            crate::sql_bind::bind_source_query(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
+        let (source_before, sink_before) = (source_cfg.clone(), sink_cfg.clone());
         resolve_inplace(&mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut sink_cfg, &fanout_ctx)?;
+        let is_fanout = |id: &str| fanout_ctx.contains_key(id);
+        crate::sql_bind::check_identifier_fields(&source_before, &source_cfg, is_fanout, "source")?;
+        crate::sql_bind::check_identifier_fields(&sink_before, &sink_cfg, is_fanout, "sink")?;
         if let Some(scope) = cleanup_scope.as_mut() {
             resolve_inplace(scope, &fanout_ctx)?;
         }
@@ -2226,6 +2279,14 @@ async fn run_one_invocation(
             .await
             .map_err(|e| CliError::Internal(format!("applying shard {:?}: {e}", shard.id)))?;
     }
+    let source: Box<dyn Source> = if sql_binds.is_empty() {
+        source
+    } else {
+        Box::new(BindContextSource {
+            inner: source,
+            ctx: sql_binds,
+        })
+    };
     let raw_sink: Box<dyn Sink> = if opts.dry_run {
         Box::new(CountingSink::new())
     } else {
@@ -2477,8 +2538,9 @@ async fn run_one_invocation(
                     node.id
                 )));
             }
-            let compiled = faucet_core::CompiledPolicy::compile(spec)
-                .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+            let compiled =
+                faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
+                    .map_err(|e| CliError::Config(format!("policy: {e}")))?;
             let policy_sink = faucet_core::PolicySink::new(
                 sink,
                 Arc::new(compiled),
@@ -3131,16 +3193,36 @@ fn state_from_override(path: &Path) -> Arc<dyn StateStore> {
 /// Translate a [`crate::config::DlqSpec`] from the YAML/JSON config into a
 /// runtime [`DlqConfig`] ready to attach to a [`Pipeline`].
 pub async fn build_dlq_config(spec: &crate::config::DlqSpec) -> CliResult<DlqConfig> {
-    // DLQ sinks resolve against an empty catalog — shared `auth: { ref }` on a
-    // DLQ sink is out of scope (DLQ targets are typically local jsonl/stdout).
-    let sink = build_sink(
-        &spec.sink.kind,
-        spec.sink.config.clone(),
-        &AuthCatalog::new(),
-    )
-    .await?;
+    let config = crate::dlq_replay::plan::dlq_append_config(&spec.sink, "dlq")?;
+    // One DLQ sink per destination for the whole run (#789 CLI-03): rows and
+    // fan-out invocations dead-lettering into the same file append through one
+    // writer instead of each replacing the file with its own copy.
+    let cache = DLQ_SINKS.try_with(Arc::clone).ok();
+    let key = format!(
+        "{}\u{0}{}",
+        spec.sink.kind,
+        serde_json::to_string(&config).unwrap_or_default()
+    );
+    let mut cached = match &cache {
+        Some(c) => Some(c.lock().await),
+        None => None,
+    };
+    let sink: Arc<dyn Sink> = match cached.as_ref().and_then(|m| m.get(&key)) {
+        Some(sink) => Arc::clone(sink),
+        None => {
+            // DLQ sinks resolve against an empty catalog — shared `auth: { ref }`
+            // on a DLQ sink is out of scope (DLQ targets are typically local).
+            let sink: Arc<dyn Sink> =
+                Arc::from(build_sink(&spec.sink.kind, config, &AuthCatalog::new()).await?);
+            if let Some(map) = cached.as_mut() {
+                map.insert(key, Arc::clone(&sink));
+            }
+            sink
+        }
+    };
+    drop(cached);
     Ok(DlqConfig {
-        sink: Arc::from(sink),
+        sink,
         on_batch_error: match spec.on_batch_error {
             crate::config::OnBatchErrorSpec::Propagate => OnBatchError::Propagate,
             crate::config::OnBatchErrorSpec::DlqAll => OnBatchError::DlqAll,
@@ -3149,6 +3231,14 @@ pub async fn build_dlq_config(spec: &crate::config::DlqSpec) -> CliResult<DlqCon
         max_failures_total: spec.max_failures_total,
         include_original_payload: spec.include_original_payload,
     })
+}
+
+/// DLQ sinks shared by every invocation of one `run_expanded`, keyed by kind +
+/// config (#789 CLI-03).
+type DlqSinkCache = Arc<Mutex<HashMap<String, Arc<dyn Sink>>>>;
+
+tokio::task_local! {
+    static DLQ_SINKS: DlqSinkCache;
 }
 
 /// Classify a pipeline error into a notification event (#280). A circuit-breaker
@@ -3406,6 +3496,96 @@ impl Source for StateKeyOverride {
         >,
     > {
         self.inner.stream_native(ctx, format, batch_size)
+    }
+}
+
+/// Hands a SQL source the bind values of its fan-out tokens (#789 SQL-01).
+/// [`crate::sql_bind`] rewrites `${parent.path}` in the query into
+/// `{faucet_bind_N}` placeholders; the pipeline fetches with an empty context,
+/// so this wrapper supplies the context that the connector turns into native
+/// bind markers.
+struct BindContextSource {
+    inner: Box<dyn Source>,
+    ctx: HashMap<String, Value>,
+}
+
+#[async_trait]
+impl Source for BindContextSource {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        self.inner.fetch_with_context(&self.ctx).await
+    }
+    async fn fetch_with_context_incremental(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
+        self.inner.fetch_with_context_incremental(&self.ctx).await
+    }
+    fn stream_pages<'a>(
+        &'a self,
+        _ctx: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn faucet_core::Stream<Item = Result<faucet_core::StreamPage, FaucetError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.inner.stream_pages(&self.ctx, batch_size)
+    }
+    fn connector_name(&self) -> &'static str {
+        self.inner.connector_name()
+    }
+    fn dataset_uri(&self) -> String {
+        self.inner.dataset_uri()
+    }
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        self.inner.set_run_clock(now);
+    }
+    fn state_key(&self) -> Option<String> {
+        self.inner.state_key()
+    }
+    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        self.inner.apply_start_bookmark(bookmark).await
+    }
+    fn supports_exactly_once(&self) -> bool {
+        self.inner.supports_exactly_once()
+    }
+    fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
+        self.inner.replay_guarantee()
+    }
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.inner.supports_columnar()
+    }
+    #[cfg(feature = "arrow")]
+    fn stream_batches<'a>(
+        &'a self,
+        _ctx: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn faucet_core::Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.inner.stream_batches(&self.ctx, batch_size)
     }
 }
 
@@ -6436,5 +6616,114 @@ matrix:
             assert_eq!(super::faucet_error_kind(&e), want);
         }
         assert_eq!(kind(FaucetError::Sink("x".into())), EventKind::RunFailure);
+    }
+}
+
+#[cfg(test)]
+mod bind_and_dlq_tests {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::json;
+
+    #[cfg(feature = "source-sqlite")]
+    #[tokio::test]
+    async fn bind_context_source_supplies_its_binds_and_forwards_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let url = format!("sqlite://{}?mode=rwc", path.to_str().unwrap());
+        {
+            use sqlx::Connection;
+            let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            for stmt in [
+                "CREATE TABLE t (id INTEGER)",
+                "INSERT INTO t VALUES (1), (2)",
+            ] {
+                sqlx::query(stmt).execute(&mut conn).await.unwrap();
+            }
+        }
+        let inner = build_source(
+            "sqlite",
+            json!({"database_url": url, "query": "SELECT id FROM t WHERE id = {faucet_bind_0}"}),
+            &AuthCatalog::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let name = inner.connector_name();
+        let uri = inner.dataset_uri();
+        let key = inner.state_key();
+        let schema = inner.state_schema();
+        let exactly_once = inner.supports_exactly_once();
+        let replay = inner.replay_guarantee();
+        let src = BindContextSource {
+            inner,
+            ctx: HashMap::from([("faucet_bind_0".to_string(), json!(2))]),
+        };
+        let empty = HashMap::new();
+        assert_eq!(
+            src.fetch_with_context(&empty).await.unwrap(),
+            vec![json!({"id": 2})]
+        );
+        let (rows, _) = src.fetch_with_context_incremental(&empty).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let pages: Vec<_> = src.stream_pages(&empty, 10).collect().await;
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].as_ref().unwrap().records, vec![json!({"id": 2})]);
+
+        assert_eq!(src.connector_name(), name);
+        assert_eq!(src.dataset_uri(), uri);
+        assert_eq!(src.state_key(), key);
+        assert_eq!(src.state_schema(), schema);
+        src.set_run_clock(chrono::Utc::now());
+        src.set_roundtrip_recorder(Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "sqlite",
+            ),
+        ));
+        src.apply_start_bookmark(json!({})).await.unwrap();
+        assert_eq!(src.supports_exactly_once(), exactly_once);
+        assert_eq!(src.replay_guarantee(), replay);
+        let _ = src.lag().await;
+        assert_eq!(
+            src.migrate_state(schema, json!({"a": 1})).unwrap(),
+            json!({"a": 1})
+        );
+        #[cfg(feature = "arrow")]
+        {
+            let _ = src.supports_columnar();
+            let _ = src.stream_batches(&empty, 10).next().await;
+        }
+    }
+
+    #[cfg(feature = "sink-jsonl")]
+    #[tokio::test]
+    async fn dlq_sinks_are_shared_within_a_run_and_built_fresh_outside_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec: crate::config::DlqSpec = serde_json::from_value(json!({
+            "sink": {"type": "jsonl", "config": {"path": dir.path().join("d.jsonl")}}
+        }))
+        .unwrap();
+        let cache: DlqSinkCache = Arc::default();
+        let (a, b) = DLQ_SINKS
+            .scope(Arc::clone(&cache), async {
+                (
+                    build_dlq_config(&spec).await.unwrap(),
+                    build_dlq_config(&spec).await.unwrap(),
+                )
+            })
+            .await;
+        assert!(Arc::ptr_eq(&a.sink, &b.sink));
+        assert_eq!(cache.lock().await.len(), 1);
+        let outside = build_dlq_config(&spec).await.unwrap();
+        assert!(!Arc::ptr_eq(&a.sink, &outside.sink));
+
+        let bad: crate::config::DlqSpec = serde_json::from_value(json!({
+            "sink": {"type": "jsonl", "config": {"path": "x.jsonl", "append": false}}
+        }))
+        .unwrap();
+        assert!(build_dlq_config(&bad).await.is_err());
     }
 }

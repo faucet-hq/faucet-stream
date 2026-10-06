@@ -417,6 +417,17 @@ fn is_direct_overwrite(config: &BigQuerySinkConfig) -> bool {
     config.media_load && !config.overwrite_staging && config.scope.is_none()
 }
 
+/// The disposition a resumable session opens with. A `WRITE_TRUNCATE` session
+/// that re-opens after an earlier one on this writer was finalized appends
+/// instead: truncating again would discard the rows the first load committed.
+fn session_disposition(requested: &str, reopening: bool) -> &str {
+    if reopening && requested == "WRITE_TRUNCATE" {
+        "WRITE_APPEND"
+    } else {
+        requested
+    }
+}
+
 /// Whether an **append** page is written by a bulk load job rather than the
 /// per-row `tabledata.insertAll` path.
 ///
@@ -1227,10 +1238,14 @@ impl BigQuerySink {
         if records.is_empty() {
             return Ok(());
         }
-        let need_open = {
+        let (need_open, reopening) = {
             let guard = self.upload_session.lock().await;
-            guard.as_ref().is_none_or(|s| s.finalized)
+            (
+                guard.as_ref().is_none_or(|s| s.finalized),
+                guard.as_ref().is_some_and(|s| s.finalized),
+            )
         };
+        let write_disposition = session_disposition(write_disposition, reopening);
         if need_open {
             let schema = self
                 .config
@@ -2274,9 +2289,8 @@ impl faucet_core::Sink for BigQuerySink {
     /// staging table is dropped afterwards. Staging was loaded via the query
     /// path, so there is no streaming buffer to miss.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        // Direct mode wrote straight into the target (WRITE_TRUNCATE first page +
-        // WRITE_APPEND rest); a completed load is already durable, so there is
-        // nothing to swap or drop.
+        // Direct mode loads straight into the target with one WRITE_TRUNCATE
+        // job finalized by the terminal flush, so there is nothing to swap or drop.
         if self.direct_overwrite() {
             return Ok(());
         }
@@ -2324,10 +2338,9 @@ impl faucet_core::Sink for BigQuerySink {
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
     /// behind. Best-effort — the destination was never touched.
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        // Direct mode has no staging table to drop. A solo direct overwrite
-        // can't roll back a completed WRITE_TRUNCATE — a single-page refresh is
-        // atomic (the truncate+load is one job), but a multi-page failure may
-        // leave a partially-loaded target. Nothing to clean up here.
+        // Direct mode has no staging table to drop. The pipeline never flushes
+        // a failed or cancelled overwrite, so the single WRITE_TRUNCATE load is
+        // still open here and cancelling it leaves the target untouched.
         if self.direct_overwrite() {
             // Cancel an un-finalized resumable session so a failed run leaves no
             // dangling upload (BigQuery also GCs incomplete sessions). No staging
@@ -2955,6 +2968,26 @@ mod tests {
         assert!(
             is_direct_overwrite(&base()),
             "a default solo overwrite must take the direct load path"
+        );
+    }
+
+    #[test]
+    fn a_reopened_truncate_session_appends_instead_of_truncating_again() {
+        assert_eq!(
+            super::session_disposition("WRITE_TRUNCATE", false),
+            "WRITE_TRUNCATE"
+        );
+        assert_eq!(
+            super::session_disposition("WRITE_TRUNCATE", true),
+            "WRITE_APPEND"
+        );
+        assert_eq!(
+            super::session_disposition("WRITE_APPEND", true),
+            "WRITE_APPEND"
+        );
+        assert_eq!(
+            super::session_disposition("WRITE_APPEND", false),
+            "WRITE_APPEND"
         );
     }
 

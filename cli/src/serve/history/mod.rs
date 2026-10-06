@@ -1621,6 +1621,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trigger_edges_and_recovery_default_to_unsupported() {
+        let h = Bare;
+        for err in [
+            h.trigger_edge_rise("q").await.unwrap_err(),
+            h.trigger_edge_rearm("q").await.unwrap_err(),
+            h.trigger_edge_retract("q", 1).await.unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("queue_depth"), "{err}");
+        }
+        assert!(!h.recover_degraded().await);
+    }
+
+    #[tokio::test]
     async fn tenant_defaults_refuse_writes_and_read_empty() {
         let h = Bare;
         let now = Utc::now();

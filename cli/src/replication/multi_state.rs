@@ -155,6 +155,24 @@ pub struct MirrorState {
 }
 
 impl MirrorState {
+    /// Tables that own their destination: once a table has been accepted, a
+    /// newly discovered table mapping to the same destination is the one refused.
+    pub fn incumbents(&self) -> BTreeSet<String> {
+        self.tables
+            .iter()
+            .filter(|(_, t)| {
+                matches!(
+                    t.phase,
+                    TablePhase::Pending
+                        | TablePhase::Snapshotting
+                        | TablePhase::Active
+                        | TablePhase::Paused
+                )
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// A fresh marker with no tables.
     pub fn new(now: DateTime<Utc>) -> Self {
         Self {
@@ -387,6 +405,28 @@ pub fn lagging(state: &MirrorState, threshold_secs: u64, now: DateTime<Utc>) -> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn incumbents_are_the_tables_that_own_a_destination() {
+        let now = Utc::now();
+        let mut state = MirrorState::new(now);
+        for (name, phase) in [
+            ("a", TablePhase::Pending),
+            ("b", TablePhase::Snapshotting),
+            ("c", TablePhase::Active),
+            ("d", TablePhase::Paused),
+            ("e", TablePhase::Dropped),
+            ("f", TablePhase::Refused),
+        ] {
+            state
+                .tables
+                .insert(name.to_string(), TableState::new(phase, now));
+        }
+        assert_eq!(
+            state.incumbents().into_iter().collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+    }
 
     #[test]
     fn phase_names() {

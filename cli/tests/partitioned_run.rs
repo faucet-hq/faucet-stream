@@ -199,3 +199,94 @@ async fn a_failing_chunk_does_not_silently_pass() {
     // The healthy chunks still wrote their rows.
     assert_eq!(std::fs::read_to_string(&out).unwrap().lines().count(), 4);
 }
+
+#[cfg(feature = "source-sqlite")]
+async fn sqlite_ids(dir: &std::path::Path, ids: &[i64]) -> String {
+    let url = format!("sqlite://{}?mode=rwc", dir.join("src.db").display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in ids {
+        sqlx::query("INSERT INTO t VALUES (?)")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    pool.close().await;
+    url
+}
+
+#[cfg(feature = "source-sqlite")]
+async fn probed_run(bounds: &str, to_unbounded: &str, probe_max: i64, ids: &[i64]) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let src = sqlite_ids(dir.path(), ids).await;
+    let probe = dir.path().join("probe.csv");
+    std::fs::write(&probe, format!("max_id\n{probe_max}\n")).unwrap();
+    let out = dir.path().join("out.jsonl");
+    let op = if bounds == "inclusive" { "<=" } else { "<" };
+    let yaml = format!(
+        r#"
+version: 1
+name: probed
+pipeline:
+  source:
+    type: sqlite
+    config:
+      database_url: "{src}"
+      query: "SELECT id FROM t WHERE id >= ${{partition.start}} AND id {op} ${{partition.end}}"
+  sink:
+    type: jsonl
+    config:
+      path: "{out}"
+      append: true
+partition:
+  kind: integer
+  from: 1
+  chunk_size: 100
+  bounds: {bounds}{to_unbounded}
+  to:
+    from_source:
+      type: csv
+      config:
+        path: "{probe}"
+    value_path: "$.max_id"
+"#,
+        out = out.display(),
+        probe = probe.display(),
+    );
+    let path = dir.path().join("p.yaml");
+    std::fs::write(&path, &yaml).unwrap();
+    let mut cfg = PipelineConfig::from_text(&yaml, &path).expect("config parses");
+    faucet_cli::partition::resolve_config_bounds(&mut cfg, &Default::default())
+        .await
+        .expect("probe");
+    let summary = run_expanded(expand(&cfg).expect("expand"), opts("probed", None))
+        .await
+        .expect("run");
+    assert!(!summary.had_failures(), "{summary:?}");
+    std::fs::read_to_string(&out)
+        .map(|b| b.lines().count())
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "source-sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_probe_still_reads_rows_above_it() {
+    // The probe saw MAX = 3, rows 4 and 5 arrived before the last chunk ran.
+    assert_eq!(probed_run("inclusive", "", 3, &[1, 2, 3, 4, 5]).await, 5);
+    assert_eq!(probed_run("half_open", "", 3, &[1, 2, 3, 4, 5]).await, 5);
+}
+
+#[cfg(feature = "source-sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_half_open_probe_reads_the_maximum_row() {
+    let closed = "\n  to_unbounded: false";
+    assert_eq!(
+        probed_run("half_open", closed, 5, &[1, 2, 3, 4, 5]).await,
+        5
+    );
+    assert_eq!(probed_run("half_open", closed, 1, &[1]).await, 1);
+}

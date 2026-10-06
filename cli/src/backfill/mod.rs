@@ -8,7 +8,7 @@
 //! `${backfill.end}` token substitution + a per-unit `${now.*}` clock), and a
 //! durable progress marker in the pipeline's state store makes the whole
 //! backfill resumable (`--resume`). Unit state keys are namespaced
-//! (`{name}::backfill::{unit}`) so the forward-sync bookmark is never
+//! (`{name}::backfill::{range_hash}::{unit}`) so the forward-sync bookmark is never
 //! touched.
 
 pub mod orchestrator;

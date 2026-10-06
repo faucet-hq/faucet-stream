@@ -8,7 +8,7 @@ use crate::dlq_replay::reader::{DlqDecryptor, DlqReaderSource, SourceOverride};
 use crate::error::{CliError, CliResult};
 use crate::expand::{ExpandedNode, NodeRole, expand};
 use faucet_core::{DeliveryMode, DlqReason, UnwrappedEnvelope};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// Validate a user-supplied `--reason` filter against the closed set of DLQ
@@ -244,6 +244,7 @@ fn file_sink_compresses(config: &serde_json::Value) -> bool {
 /// sink seals such a file whole, so neither `faucet dlq` nor `faucet status`
 /// could read it back envelope by envelope.
 pub fn check_dlq_sink(sink: &ConnectorSpec, context: &str) -> CliResult<()> {
+    dlq_append_config(sink, context)?;
     if sink.kind == "file"
         && sink.config.get("encryption").is_some_and(|e| !e.is_null())
         && file_sink_compresses(&sink.config)
@@ -255,6 +256,52 @@ pub fn check_dlq_sink(sink: &ConnectorSpec, context: &str) -> CliResult<()> {
         )));
     }
     Ok(())
+}
+
+/// File-writing sinks whose existing-file behaviour is the `if_exists` field.
+const IF_EXISTS_DLQ_KINDS: &[&str] = &["file", "s3", "gcs", "azure-blob", "sftp"];
+
+/// The DLQ sink config with appending forced on (#789 CLI-03). A dead-letter
+/// file holds the only copy of rows whose bookmark has already moved on, so a
+/// DLQ must never replace it. An explicit replace setting, or a single-file
+/// format that cannot be appended to, is refused instead of silently changed.
+pub fn dlq_append_config(sink: &ConnectorSpec, context: &str) -> CliResult<Value> {
+    let mut cfg = sink.config.clone();
+    let refuse = |what: &str| {
+        Err(CliError::Config(format!(
+            "{context}: a `{}` DLQ sink {what} — it would replace the dead letters of earlier \
+             runs, whose only copy it holds. Leave the setting unset (a DLQ always appends)",
+            sink.kind
+        )))
+    };
+    let Value::Object(map) = &mut cfg else {
+        return Ok(cfg);
+    };
+    match sink.kind.as_str() {
+        "jsonl" | "csv" => {
+            if map.get("append").and_then(Value::as_bool) == Some(false) {
+                return refuse("sets `append: false`");
+            }
+            map.insert("append".into(), Value::Bool(true));
+        }
+        kind if IF_EXISTS_DLQ_KINDS.contains(&kind) => {
+            let set = map.remove("if_exists").or_else(|| map.remove("mode"));
+            match set.as_ref().and_then(Value::as_str) {
+                None | Some("append") => {
+                    map.insert("if_exists".into(), Value::String("append".into()));
+                }
+                Some("error" | "error_if_exists") => {
+                    map.insert("if_exists".into(), set.unwrap_or(Value::Null));
+                }
+                Some(other) => return refuse(&format!("sets `if_exists: {other}`")),
+            }
+        }
+        "parquet" if crate::registry::sink_truncating_path("parquet", &sink.config).is_some() => {
+            return refuse("writes one fixed `.parquet` file, which cannot be appended to");
+        }
+        _ => {}
+    }
+    Ok(cfg)
 }
 
 /// Two paths refer to the same file. Uses canonicalization when both exist,
@@ -308,6 +355,59 @@ pub fn discard_keep_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dlq_spec(kind: &str, config: Value) -> ConnectorSpec {
+        ConnectorSpec {
+            kind: kind.into(),
+            config,
+            transforms: None,
+            inherit_transforms: true,
+            status: None,
+            tags: Vec::new(),
+            complete_for: None,
+            attributes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn dlq_append_config_forces_append_or_refuses() {
+        let ok = |kind: &str, cfg: Value| dlq_append_config(&dlq_spec(kind, cfg), "dlq").unwrap();
+        let err = |kind: &str, cfg: Value| {
+            dlq_append_config(&dlq_spec(kind, cfg), "row 'r' dlq")
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert_eq!(ok("jsonl", json!({"path": "d.jsonl"}))["append"], true);
+        assert_eq!(
+            ok("csv", json!({"path": "d.csv", "append": true}))["append"],
+            true
+        );
+        assert!(err("jsonl", json!({"path": "d", "append": false})).contains("append: false"));
+
+        let file = ok("file", json!({"path": "d.jsonl", "mode": "append"}));
+        assert_eq!(file["if_exists"], "append");
+        assert!(file.get("mode").is_none());
+        assert_eq!(ok("s3", json!({"bucket": "b"}))["if_exists"], "append");
+        assert_eq!(
+            ok("sftp", json!({"path": "p", "if_exists": "error"}))["if_exists"],
+            "error"
+        );
+        let e = err("gcs", json!({"bucket": "b", "if_exists": "replace"}));
+        assert!(
+            e.contains("row 'r' dlq") && e.contains("if_exists: replace"),
+            "{e}"
+        );
+
+        let fixed = json!({"destination": {"type": "local_path", "path": "d.parquet"}});
+        assert!(err("parquet", fixed).contains(".parquet"));
+        let rolling = json!({"destination": {"type": "local_path", "path": "d.parquet"},
+                             "max_rows_per_file": 10});
+        assert_eq!(ok("parquet", rolling.clone()), rolling);
+
+        assert_eq!(ok("stdout", json!({})), json!({}));
+        assert_eq!(ok("jsonl", json!("not-an-object")), json!("not-an-object"));
+    }
 
     fn env(reason: Option<&str>, ts_ms: Option<i64>) -> UnwrappedEnvelope {
         UnwrappedEnvelope {

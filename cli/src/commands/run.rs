@@ -280,6 +280,18 @@ pub(crate) async fn execute(
                 dry_run: args.dry_run,
                 limit: args.limit,
                 clock: Some(resolve_run_clock(args.clock.as_deref())?),
+                budget: crate::budget::effective_budget(
+                    cfg.budget.as_ref(),
+                    crate::budget::BudgetFlags {
+                        max_records: args.max_records,
+                        max_bytes: args.max_bytes,
+                        max_duration_secs: args.max_duration_secs,
+                        allowed_sinks: args.allowed_sinks.clone(),
+                    }
+                    .into_spec(),
+                )
+                .map_err(CliError::Config)?,
+                run_id: None,
             },
         )
         .await?;
@@ -330,7 +342,10 @@ pub(crate) async fn execute(
     // selection flags) returns every row unchanged.
     let selection =
         crate::select::RunSelection::from_args(&args.selection, cfg.selection.as_ref())?;
+    let all_nodes = nodes.clone();
     let nodes = crate::select::select_nodes(nodes, &selection, !cfg.matrix.is_empty())?;
+    crate::destination::check_overwrite_selection(&all_nodes, &nodes)?;
+    drop(all_nodes);
     // Data-flow policy static gate (#702): a labelled column heading for a
     // sink its rules forbid refuses the whole run before any connector is
     // built. Rows the runtime selection dropped are not judged.

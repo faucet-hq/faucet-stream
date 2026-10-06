@@ -209,6 +209,35 @@ impl PostgresSink {
         if entries.is_empty() || !self.has_column(&mut *conn, run_col).await? {
             return Ok(0);
         }
+        let entries: Vec<&JournalEntry> = entries.iter().collect();
+        self.count_rows_for(conn, &entries, Some((run_id, run_col)))
+            .await
+    }
+
+    /// Journaled keys with a before-image whose row is gone. Only called when
+    /// a later run wrote the table: such a key was deleted by it, and restoring
+    /// the before-image would resurrect it.
+    async fn count_vanished(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        entries: &[JournalEntry],
+    ) -> Result<u64, FaucetError> {
+        let restorable = faucet_core::rollback::restorable(entries);
+        if restorable.is_empty() {
+            return Ok(0);
+        }
+        let present = self.count_rows_for(conn, &restorable, None).await?;
+        Ok((restorable.len() as u64).saturating_sub(present))
+    }
+
+    /// Rows matching the journaled keys, optionally only those whose run-id
+    /// column is not `run_id`.
+    async fn count_rows_for(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        entries: &[&JournalEntry],
+        other_run: Option<(&str, &str)>,
+    ) -> Result<u64, FaucetError> {
         let key = &self.config.write.key;
         let table_ref = self.target_ref();
         let udts: std::collections::HashMap<String, String> = self
@@ -226,18 +255,23 @@ impl PostgresSink {
         for chunk in entries.chunks(per) {
             let (predicate, next) = sql.keys_in(key, chunk.len(), 0);
             let predicate = cast_key_placeholders(&predicate, &key_udts, key.len());
-            let count_sql = format!(
-                "SELECT count(*) FROM {table_ref} WHERE {predicate} AND {c} IS DISTINCT FROM ${n}",
-                c = quote_ident(run_col),
-                n = next + 1
-            );
+            let count_sql = match other_run {
+                Some((_, run_col)) => format!(
+                    "SELECT count(*) FROM {table_ref} WHERE {predicate} AND {c} IS DISTINCT FROM ${n}",
+                    c = quote_ident(run_col),
+                    n = next + 1
+                ),
+                None => format!("SELECT count(*) FROM {table_ref} WHERE {predicate}"),
+            };
             let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
             for e in chunk {
                 for ((_, v), udt) in e.tuple(key).0.iter().zip(key_udts.iter()) {
                     q = q.bind(pg_bind_text(Some(v), udt));
                 }
             }
-            q = q.bind(run_id);
+            if let Some((run_id, _)) = other_run {
+                q = q.bind(run_id);
+            }
             total += q
                 .fetch_one(&mut *conn)
                 .await
@@ -346,9 +380,12 @@ impl PostgresSink {
                 "no journal rows for this run (was `rollback.journal` enabled when it ran?)",
             ));
         }
-        let conflicts = self
+        let mut conflicts = self
             .count_conflicts(&mut *conn, &entries, run_id, &opts.run_id_column)
             .await?;
+        if opts.later_runs {
+            conflicts += self.count_vanished(&mut *conn, &entries).await?;
+        }
         if conflicts > 0 && !opts.force {
             return Ok(RollbackOutcome::blocked(conflicts));
         }

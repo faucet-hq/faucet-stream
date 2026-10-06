@@ -1621,7 +1621,7 @@ pub struct DlqDiscardArgs {
     #[arg(long)]
     pub before: Option<String>,
     /// Permanently delete matching envelopes instead of archiving them to a
-    /// `<file>.archived.jsonl` sibling.
+    /// `<file>.archived` sibling.
     #[arg(long)]
     pub delete: bool,
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
@@ -2084,6 +2084,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
     /// Stop after writing this many records to the sink. Default: unlimited.
+    /// A `write_mode: overwrite` destination is left unchanged (the sample is
+    /// discarded).
     #[arg(long)]
     pub limit: Option<usize>,
     /// Override the state-store directory (file backend only).

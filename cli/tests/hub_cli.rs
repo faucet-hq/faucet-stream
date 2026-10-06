@@ -683,3 +683,69 @@ fn a_per_owner_github_token_takes_precedence() {
     assert!(faucet_cli::hub::remote::GithubHub::new(&loc, "http://127.0.0.1:1").is_ok());
     unsafe { std::env::remove_var(&var) };
 }
+
+#[cfg(feature = "hub-remote")]
+#[tokio::test]
+async fn a_local_hub_refuses_a_version_that_lives_at_another_catalog_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _) = fixture(dir.path());
+    let head = "a".repeat(40);
+    let older = "b".repeat(40);
+    std::fs::write(
+        Path::new(&hub).join("index.json"),
+        serde_json::json!({
+            "commit": head,
+            "sources": [{
+                "id": "shop",
+                "name": "shop",
+                "stable": 2,
+                "newest": 2,
+                "versions": [
+                    {"version": 1, "commit": older},
+                    {"version": 2, "commit": head}
+                ]
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = dir.path().join("composed.yaml");
+    let err = run(&[
+        "hub",
+        "compose",
+        "--source",
+        "shop@1",
+        "--sink",
+        "files",
+        "--hub",
+        &hub,
+        "--out",
+        out.to_str().unwrap(),
+    ])
+    .await
+    .expect_err("a local hub has no history to fetch v1 from");
+    let message = err.to_string();
+    assert!(
+        message.contains("v1 lives at catalog commit bbbbbbb"),
+        "{message}"
+    );
+    assert!(
+        message.contains("local directory hub cannot fetch it"),
+        "{message}"
+    );
+
+    run(&[
+        "hub",
+        "compose",
+        "--source",
+        "shop@2",
+        "--sink",
+        "files",
+        "--hub",
+        &hub,
+        "--out",
+        out.to_str().unwrap(),
+    ])
+    .await
+    .expect("the snapshot's own version needs no fetch");
+}

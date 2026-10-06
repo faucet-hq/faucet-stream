@@ -246,7 +246,11 @@ pub fn sample_sink_config(
 
 /// Two tables whose plans would write the same destination, or share a node
 /// id, cannot both be mirrored. Returns `(kept, refused-with-reason)`.
-pub fn refuse_collisions(plans: Vec<TablePlan>) -> (Vec<TablePlan>, Vec<(String, String)>) {
+pub fn refuse_collisions(
+    mut plans: Vec<TablePlan>,
+    incumbents: &BTreeSet<String>,
+) -> (Vec<TablePlan>, Vec<(String, String)>) {
+    plans.sort_by_key(|p| !incumbents.contains(&p.name));
     let mut by_dest: BTreeMap<String, String> = BTreeMap::new();
     let mut ids: BTreeMap<String, String> = BTreeMap::new();
     let mut kept = Vec::new();
@@ -616,12 +620,15 @@ mod tests {
             schema_drift: None,
             estimated_rows: None,
         };
-        let (kept, refused) = refuse_collisions(vec![
-            plan("a.orders", "orders", "a.orders"),
-            plan("b.orders", "orders", "b.orders"),
-            plan("c x", "cx", "c_x"),
-            plan("c$x", "cy", "c_x"),
-        ]);
+        let (kept, refused) = refuse_collisions(
+            vec![
+                plan("a.orders", "orders", "a.orders"),
+                plan("b.orders", "orders", "b.orders"),
+                plan("c x", "cx", "c_x"),
+                plan("c$x", "cy", "c_x"),
+            ],
+            &BTreeSet::new(),
+        );
         assert_eq!(
             kept.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             ["a.orders", "c x"]
@@ -629,6 +636,30 @@ mod tests {
         assert_eq!(refused.len(), 2);
         assert!(refused[0].1.contains("same destination"));
         assert!(refused[1].1.contains("collides"));
+    }
+
+    #[test]
+    fn an_incumbent_keeps_its_destination_when_a_new_table_sorts_first() {
+        let plan = |name: &str| TablePlan {
+            name: name.into(),
+            id: name.into(),
+            key: vec!["id".into()],
+            write_mode: "upsert".into(),
+            sink_config: json!({"table_name": "users"}),
+            snapshot_config: json!({}),
+            schema_drift: None,
+            estimated_rows: None,
+        };
+        let incumbents = BTreeSet::from(["public.users".to_string()]);
+        let (kept, refused) =
+            refuse_collisions(vec![plan("auth.users"), plan("public.users")], &incumbents);
+        assert_eq!(
+            kept.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["public.users"]
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, "auth.users");
+        assert!(refused[0].1.contains("'public.users'"));
     }
 
     #[test]

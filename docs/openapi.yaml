@@ -808,7 +808,7 @@ paths:
       summary: Discard (archive or delete) DLQ envelopes
       description: >
         Removes DLQ envelopes matching a reason and/or age filter from a
-        server-local location — archived to a `<file>.archived.jsonl` sibling by
+        server-local location — archived to a `<file>.archived` sibling by
         default, or permanently deleted with `delete: true`. Requires the
         `DlqManage` permission (operator); audited as `dlq.discard`.
       security: [{ bearerAuth: [] }]

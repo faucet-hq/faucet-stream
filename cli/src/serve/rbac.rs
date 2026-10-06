@@ -844,11 +844,16 @@ mod tests {
         )
         .unwrap();
         let err = RbacConfig::from_file(&path).unwrap_err().to_string();
-        if cfg!(feature = "secrets-vault") {
-            assert!(err.contains("auth-config"), "{err}");
+        let expected = if cfg!(feature = "secrets-vault") {
+            "auth-config"
         } else {
-            assert!(err.contains("vault"), "{err}");
-        }
+            "vault"
+        };
+        assert!(err.contains(expected), "{err}");
+
+        std::fs::write(&path, "principals: 5\n").unwrap();
+        let err = RbacConfig::from_file(&path).unwrap_err().to_string();
+        assert!(err.contains("parsing --auth-config"), "{err}");
     }
 
     fn spec(name: &str, token: &str, role: Role) -> PrincipalSpec {

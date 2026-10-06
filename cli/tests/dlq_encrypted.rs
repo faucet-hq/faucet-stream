@@ -211,7 +211,7 @@ async fn discard_filters_sealed_envelopes_and_preserves_lines_verbatim() {
     // holds the removed sealed line — nothing was re-encrypted or exposed.
     let after = std::fs::read_to_string(&dlq).unwrap();
     assert_eq!(after.trim(), kept_line);
-    let archive = std::fs::read_to_string(dir.path().join("dlq.archived.jsonl")).unwrap();
+    let archive = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
     assert!(archive.contains(before.lines().next().unwrap()));
     assert!(!archive.contains("\"id\":1"), "archive stays sealed");
 

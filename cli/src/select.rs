@@ -280,11 +280,14 @@ impl SelectionRequest {
         nodes: Vec<ExpandedNode>,
     ) -> CliResult<Vec<ExpandedNode>> {
         refuse_topology(cfg)?;
-        select_nodes(
+        let all = nodes.clone();
+        let selected = select_nodes(
             nodes,
             &self.to_run_selection(cfg.selection.as_ref()),
             !cfg.matrix.is_empty(),
-        )
+        )?;
+        crate::destination::check_overwrite_selection(&all, &selected)?;
+        Ok(selected)
     }
 }
 

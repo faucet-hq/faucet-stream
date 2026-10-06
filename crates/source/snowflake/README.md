@@ -76,7 +76,7 @@ faucet run pipeline.yaml
 | `schema` | string | — *(required)* | Schema for the session. |
 | `role` | string | *(unset)* | Optional role to assume for the session. When unset, the user's default role is used. |
 | `auth` | `AuthSpec<SnowflakeAuth>` | — *(required)* | Authentication — see [Authentication](#authentication). Accepts an inline `{ type, config }` block or `{ ref: <name> }` pointing at a shared provider. |
-| `query` | string | — *(required)* | SQL to execute. May contain positional `?` bind markers (bound from `params` + matrix context) and `${field.path}` placeholders resolved against the parent-record context at runtime. |
+| `query` | string | — *(required)* | SQL to execute. May contain positional `?` bind markers (bound from `params` + matrix context) and, in a matrix child, `${parent.field}` tokens that are bound as query parameters (never spliced into the SQL). |
 | `params` | array | `[]` | Positional bind parameters, applied in order **before** any context-derived values. Each entry is typed from its JSON value. |
 
 ### Reliability & timeouts
