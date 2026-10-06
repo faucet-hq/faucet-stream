@@ -759,8 +759,10 @@ async fn build_topology_inner(
                                  `dlq:` block to route the quarantined records to"
                             )));
                         }
-                        let compiled = faucet_core::CompiledPolicy::compile(policy_spec)
-                            .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+                        let compiled = faucet_core::CompiledPolicy::compile(
+                            &crate::policy::topology_runtime_spec(policy_spec, cfg),
+                        )
+                        .map_err(|e| CliError::Config(format!("policy: {e}")))?;
                         let template_name = template.as_deref().unwrap_or("default");
                         let attributes = if template_name == "default" {
                             spec.sinks.get("default").or(spec.sink.as_ref())

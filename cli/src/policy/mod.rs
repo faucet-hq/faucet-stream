@@ -388,6 +388,29 @@ pub fn runtime_spec(spec: &PolicySpec, node: &ExpandedNode) -> PolicySpec {
     out
 }
 
+/// The runtime-backstop policy for a topology graph: every column a transform
+/// node renames carries the labels of the name it came from, taken across all
+/// transform nodes so a label can only be added, never lost.
+pub fn topology_runtime_spec(spec: &PolicySpec, cfg: &PipelineConfig) -> PolicySpec {
+    use crate::config::NodeSpec;
+    let Ok(compiled) = CompiledPolicy::compile(spec) else {
+        return spec.clone();
+    };
+    let mut ids: Vec<&String> = cfg.pipeline.nodes.keys().collect();
+    ids.sort();
+    let ops: Vec<faucet_lineage::ColumnOp> = ids
+        .into_iter()
+        .filter_map(|id| match &cfg.pipeline.nodes[id] {
+            NodeSpec::Transform { transforms, .. } => Some(transforms),
+            _ => None,
+        })
+        .flat_map(|t| crate::lineage_glue::column_ops(t, false))
+        .collect();
+    let mut out = spec.clone();
+    out.classifications.extend(rename_aliases(&compiled, &ops));
+    out
+}
+
 /// One extra classification per (renamed column, inherited label).
 fn rename_aliases(
     policy: &CompiledPolicy,
@@ -1143,6 +1166,12 @@ pipeline:
         assert_eq!(col.name, "tax_id");
         assert!(col.conservative);
         assert_eq!(col.via.as_deref(), Some("lineage"));
+
+        let runtime = CompiledPolicy::compile(&topology_runtime_spec(&deny, &cfg)).unwrap();
+        assert!(runtime.labels_for_name("tax_id").contains("pii"));
+        assert!(runtime.labels_for_name("mid").contains("pii"));
+        let unchanged = topology_runtime_spec(&deny, &topology_cfg("", ""));
+        assert_eq!(unchanged, deny);
 
         // Without a contract nothing is known statically.
         let no_contract = PipelineConfig::from_text(
