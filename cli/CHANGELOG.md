@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.13.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.13.1...faucet-cli-v1.13.2) - 2026-10-06
+
+### Bug Fixes
+
+- *(docs.rs)* Cap docs.rs build parallelism for faucet-stream and faucet-cli ([#805](https://github.com/faucet-hq/faucet-stream/pull/805))
+
 ## [1.13.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.13.0...faucet-cli-v1.13.1) - 2026-09-30
 
 ### Bug Fixes

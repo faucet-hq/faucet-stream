@@ -4754,7 +4754,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-cli"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "assert_cmd",
  "async-stream",
@@ -7108,7 +7108,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-stream"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "faucet-auth",
  "faucet-common-azure",
