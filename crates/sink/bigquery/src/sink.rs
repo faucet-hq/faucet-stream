@@ -2981,7 +2981,10 @@ mod tests {
             super::session_disposition("WRITE_TRUNCATE", true),
             "WRITE_APPEND"
         );
-        assert_eq!(super::session_disposition("WRITE_APPEND", true), "WRITE_APPEND");
+        assert_eq!(
+            super::session_disposition("WRITE_APPEND", true),
+            "WRITE_APPEND"
+        );
         assert_eq!(
             super::session_disposition("WRITE_APPEND", false),
             "WRITE_APPEND"

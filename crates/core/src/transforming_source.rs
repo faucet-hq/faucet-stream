@@ -1010,7 +1010,11 @@ mod tests {
         while let Some(p) = stream.next().await {
             sub_pages.push(p.unwrap());
         }
-        assert_eq!(sub_pages.len(), 1, "a bookmarked page stays one commit unit");
+        assert_eq!(
+            sub_pages.len(),
+            1,
+            "a bookmarked page stays one commit unit"
+        );
         assert_eq!(sub_pages[0].records.len(), 1000);
         assert_eq!(sub_pages[0].bookmark, Some(json!("bm")));
     }

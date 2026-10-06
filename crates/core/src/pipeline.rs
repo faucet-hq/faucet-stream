@@ -8039,7 +8039,12 @@ mod dlq_span_tests {
     impl StackSubscriber {
         fn entered_names(&self) -> Vec<&'static str> {
             let names = self.names.lock().unwrap();
-            ENTERED.with(|s| s.borrow().iter().filter_map(|id| names.get(id).copied()).collect())
+            ENTERED.with(|s| {
+                s.borrow()
+                    .iter()
+                    .filter_map(|id| names.get(id).copied())
+                    .collect()
+            })
         }
     }
 
@@ -8213,7 +8218,12 @@ mod overwrite_flush_tests {
     }
 
     fn flushes(events: &Arc<Mutex<Vec<String>>>) -> usize {
-        events.lock().unwrap().iter().filter(|e| *e == "flush").count()
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "flush")
+            .count()
     }
 
     #[tokio::test]
@@ -8290,7 +8300,12 @@ mod overwrite_flush_tests {
         let failing_source = Pages {
             fail_on_page: Some(2),
         };
-        assert!(Pipeline::new(&failing_source, &failing).run().await.is_err());
+        assert!(
+            Pipeline::new(&failing_source, &failing)
+                .run()
+                .await
+                .is_err()
+        );
         assert_eq!(flushes(&fail_events), 2);
     }
 }
