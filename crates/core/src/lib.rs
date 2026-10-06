@@ -88,7 +88,7 @@ pub use adaptive::{
 pub use anomaly::AnomalyMethod;
 pub use auth::{
     AuthProvider, AuthReference, AuthSpec, Credential, CredentialPlacement, RequestAuth,
-    SharedAuthProvider,
+    SharedAuthProvider, rejects_credential, send_with_reauth,
 };
 pub use budget::{BudgetKind, BudgetSink, BudgetSpec, BudgetState, BudgetTimer, BudgetVerdict};
 pub use check::{CheckContext, CheckReport, Probe, ProbeStatus};

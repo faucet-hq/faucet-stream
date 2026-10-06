@@ -314,6 +314,53 @@ pub trait AuthProvider: Send + Sync + std::fmt::Debug {
 /// (and its single token cache) across connectors.
 pub type SharedAuthProvider = Arc<dyn AuthProvider>;
 
+/// Whether `err` says the server rejected the credential a request carried: an
+/// HTTP `401`, or one of the provider's declared
+/// [`reauth_statuses`](AuthProvider::reauth_statuses).
+pub fn rejects_credential(err: &FaucetError, provider: &dyn AuthProvider) -> bool {
+    matches!(
+        err,
+        FaucetError::HttpStatus { status, .. }
+            if *status == 401 || provider.reauth_statuses().contains(status)
+    )
+}
+
+/// Send one authenticated request, re-authenticating once when the server
+/// rejects the credential.
+///
+/// With no `provider`, `send(None)` runs as-is. Otherwise the provider's
+/// current credential is passed to `send`; if that attempt fails with
+/// [`rejects_credential`], the provider is told the credential is stale
+/// ([`invalidate`](AuthProvider::invalidate), which refreshes it once even when
+/// several connectors hit the same `401`) and `send` runs again with the fresh
+/// one. A token the server expired or revoked before its client-side expiry
+/// therefore recovers on the next request instead of failing every run until a
+/// restart.
+pub async fn send_with_reauth<T, F, Fut>(
+    provider: Option<&SharedAuthProvider>,
+    mut send: F,
+) -> Result<T, FaucetError>
+where
+    F: FnMut(Option<Credential>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, FaucetError>>,
+{
+    let Some(provider) = provider else {
+        return send(None).await;
+    };
+    let sent = provider.credential().await?;
+    match send(Some(sent.clone())).await {
+        Err(e) if rejects_credential(&e, provider.as_ref()) => {
+            tracing::warn!(
+                provider = provider.provider_name(),
+                "the server rejected the shared credential; re-authenticating and retrying once"
+            );
+            let fresh = provider.invalidate(&sent).await?;
+            send(Some(fresh)).await
+        }
+        other => other,
+    }
+}
+
 /// A `{ ref: <name> }` pointer to a named provider in the top-level `auth:`
 /// catalog. The only permitted key is `ref`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -403,6 +450,109 @@ mod tests {
     enum StubAuth {
         None,
         Bearer { token: String },
+    }
+
+    /// A provider whose tokens go stale on demand: `invalidate` hands out the
+    /// next token and counts the refreshes.
+    #[derive(Debug, Default)]
+    struct RotatingProvider {
+        token: std::sync::Mutex<u32>,
+        refreshes: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl AuthProvider for RotatingProvider {
+        async fn credential(&self) -> Result<Credential, FaucetError> {
+            Ok(Credential::Bearer(format!(
+                "t{}",
+                self.token.lock().unwrap()
+            )))
+        }
+        async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
+            let mut t = self.token.lock().unwrap();
+            if *stale == Credential::Bearer(format!("t{t}")) {
+                *t += 1;
+                self.refreshes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(Credential::Bearer(format!("t{t}")))
+        }
+        fn reauth_statuses(&self) -> &[u16] {
+            &[419]
+        }
+        fn provider_name(&self) -> &'static str {
+            "rotating"
+        }
+    }
+
+    fn rejected(status: u16) -> FaucetError {
+        FaucetError::HttpStatus {
+            status,
+            url: "https://api".into(),
+            body: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_credential_is_refreshed_and_the_request_retried_once() {
+        let provider: SharedAuthProvider = Arc::new(RotatingProvider::default());
+        let mut seen = Vec::new();
+        let out = send_with_reauth(Some(&provider), |cred| {
+            seen.push(cred.clone());
+            let ok = cred == Some(Credential::Bearer("t1".into()));
+            async move { if ok { Ok("data") } else { Err(rejected(401)) } }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, "data");
+        assert_eq!(
+            seen,
+            vec![
+                Some(Credential::Bearer("t0".into())),
+                Some(Credential::Bearer("t1".into()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_reauth_status_also_refreshes_but_only_once() {
+        let provider: SharedAuthProvider = Arc::new(RotatingProvider::default());
+        let mut attempts = 0;
+        let err = send_with_reauth(Some(&provider), |_| {
+            attempts += 1;
+            async { Err::<(), _>(rejected(419)) }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FaucetError::HttpStatus { status: 419, .. }));
+        assert_eq!(attempts, 2, "one retry, never a loop");
+    }
+
+    #[tokio::test]
+    async fn other_failures_and_providerless_requests_are_not_retried() {
+        let provider: SharedAuthProvider = Arc::new(RotatingProvider::default());
+        let mut attempts = 0;
+        let err = send_with_reauth(Some(&provider), |_| {
+            attempts += 1;
+            async { Err::<(), _>(rejected(500)) }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FaucetError::HttpStatus { status: 500, .. }));
+        assert_eq!(attempts, 1);
+
+        let mut got = None;
+        send_with_reauth(None, |cred| {
+            got = Some(cred);
+            async { Ok::<_, FaucetError>(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            Some(None),
+            "no provider → the request gets no credential"
+        );
     }
 
     #[derive(Debug)]

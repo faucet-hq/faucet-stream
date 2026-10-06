@@ -321,80 +321,95 @@ impl GraphqlStream {
             "variables": variables,
         });
 
-        let mut req = self
-            .client
-            .post(&self.config.endpoint)
-            .headers(self.config.headers.clone())
-            .json(&payload);
+        // A shared provider's credential is re-fetched and the request retried
+        // once when the server rejects it (#789 API-06).
+        let body: Value = faucet_core::send_with_reauth(self.auth_provider.as_ref(), |cred| {
+            let payload = &payload;
+            async move {
+                let mut req = self
+                    .client
+                    .post(&self.config.endpoint)
+                    .headers(self.config.headers.clone())
+                    .json(payload);
 
-        // Resolve credentials to concrete auth. A shared auth provider (from
-        // `auth: { ref }` or injected by a library caller) takes precedence;
-        // otherwise the inline auth config is used directly.
-        let effective_auth: GraphqlAuth = if let Some(provider) = &self.auth_provider {
-            credential_to_auth(provider.credential().await?)
-        } else {
-            match &self.config.auth {
-                AuthSpec::Inline(a) => a.clone(),
-                AuthSpec::Reference(r) => {
-                    return Err(FaucetError::Auth(format!(
-                        "auth references provider '{}' but no provider was supplied; \
-                         set one via the CLI `auth:` catalog or `with_auth_provider`",
-                        r.name
-                    )));
-                }
-            }
-        };
+                // Resolve credentials to concrete auth. A shared auth provider
+                // (from `auth: { ref }` or injected by a library caller) takes
+                // precedence; otherwise the inline auth config is used directly.
+                let effective_auth: GraphqlAuth = match cred {
+                    Some(cred) => credential_to_auth(cred),
+                    None => match &self.config.auth {
+                        AuthSpec::Inline(a) => a.clone(),
+                        AuthSpec::Reference(r) => {
+                            return Err(FaucetError::Auth(format!(
+                                "auth references provider '{}' but no provider was supplied; \
+                                 set one via the CLI `auth:` catalog or `with_auth_provider`",
+                                r.name
+                            )));
+                        }
+                    },
+                };
 
-        // Apply resolved auth to the request.
-        match effective_auth {
-            GraphqlAuth::None => {}
-            GraphqlAuth::Bearer { token } => {
-                req = req.bearer_auth(token);
-            }
-            GraphqlAuth::Custom { headers } => {
-                let mut hm = reqwest::header::HeaderMap::new();
-                for (name, value) in &headers {
-                    let n =
-                        reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-                            FaucetError::Auth(format!("invalid custom header name {name:?}: {e}"))
-                        })?;
-                    let v = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
-                        FaucetError::Auth(format!("invalid custom header value for {name:?}: {e}"))
-                    })?;
-                    hm.insert(n, v);
-                }
-                req = req.headers(hm);
-            }
-        }
-
-        // Retry transient failures (5xx / connection resets) with jittered
-        // backoff, matching the REST source's reliability layer (#78/#16).
-        // GraphQL-level `errors` in a 200 body are application errors and are
-        // handled below — unless a `retry_on_response` rule marks them as
-        // throttling (#767), which retries the whole request here.
-        let matches = std::sync::atomic::AtomicU32::new(0);
-        let body: Value = faucet_core::execute_with_policy_recorded(
-            &self.retry_policy,
-            None,
-            self.roundtrips.recorder().as_ref(),
-            || {
-                let attempt = req.try_clone();
-                let matches = &matches;
-                async move {
-                    let req = attempt.ok_or_else(|| {
-                        FaucetError::Source("graphql: request is not cloneable for retry".into())
-                    })?;
-                    self.roundtrips.record("request");
-                    let resp = req.send().await.map_err(FaucetError::Http)?;
-                    if self.config.retry_on_response.is_empty() {
-                        let resp =
-                            util::check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-                        return resp.json().await.map_err(FaucetError::Http);
+                // Apply resolved auth to the request.
+                match effective_auth {
+                    GraphqlAuth::None => {}
+                    GraphqlAuth::Bearer { token } => {
+                        req = req.bearer_auth(token);
                     }
-                    self.read_with_matchers(resp, matches).await
+                    GraphqlAuth::Custom { headers } => {
+                        let mut hm = reqwest::header::HeaderMap::new();
+                        for (name, value) in &headers {
+                            let n = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                                .map_err(|e| {
+                                    FaucetError::Auth(format!(
+                                        "invalid custom header name {name:?}: {e}"
+                                    ))
+                                })?;
+                            let v = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                                FaucetError::Auth(format!(
+                                    "invalid custom header value for {name:?}: {e}"
+                                ))
+                            })?;
+                            hm.insert(n, v);
+                        }
+                        req = req.headers(hm);
+                    }
                 }
-            },
-        )
+
+                // Retry transient failures (5xx / connection resets) with
+                // jittered backoff, matching the REST source's reliability layer
+                // (#78/#16). GraphQL-level `errors` in a 200 body are application
+                // errors and are handled below — unless a `retry_on_response`
+                // rule marks them as throttling (#767), which retries the whole
+                // request here.
+                let matches = std::sync::atomic::AtomicU32::new(0);
+                faucet_core::execute_with_policy_recorded(
+                    &self.retry_policy,
+                    None,
+                    self.roundtrips.recorder().as_ref(),
+                    || {
+                        let attempt = req.try_clone();
+                        let matches = &matches;
+                        async move {
+                            let req = attempt.ok_or_else(|| {
+                                FaucetError::Source(
+                                    "graphql: request is not cloneable for retry".into(),
+                                )
+                            })?;
+                            self.roundtrips.record("request");
+                            let resp = req.send().await.map_err(FaucetError::Http)?;
+                            if self.config.retry_on_response.is_empty() {
+                                let resp =
+                                    util::check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN)
+                                        .await?;
+                                return resp.json().await.map_err(FaucetError::Http);
+                            }
+                            self.read_with_matchers(resp, matches).await
+                        }
+                    },
+                )
+                .await
+            }
+        })
         .await?;
 
         // Check for GraphQL-level errors.

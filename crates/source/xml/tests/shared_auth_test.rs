@@ -163,3 +163,68 @@ async fn unresolved_auth_reference_errors() {
     let err = stream.fetch_all().await.unwrap_err();
     assert!(matches!(err, FaucetError::Auth(_)), "got {err:?}");
 }
+
+/// A shared provider whose current token the server has revoked: `invalidate`
+/// refreshes it (unless a newer token was already handed out), like the real
+/// OAuth2 / token-endpoint providers (#789 API-06).
+#[derive(Debug, Default)]
+struct RevokedThenRefreshed {
+    token: std::sync::Mutex<u32>,
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for RevokedThenRefreshed {
+    async fn credential(&self) -> Result<Credential, FaucetError> {
+        Ok(Credential::Bearer(format!(
+            "t{}",
+            self.token.lock().unwrap()
+        )))
+    }
+    async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
+        let mut t = self.token.lock().unwrap();
+        let current = format!("t{t}");
+        if !matches!(stale, Credential::Bearer(s) if *s != current) {
+            *t += 1;
+        }
+        Ok(Credential::Bearer(format!("t{t}")))
+    }
+    fn provider_name(&self) -> &'static str {
+        "revoked-then-refreshed"
+    }
+}
+
+async fn mount_rejecting_t0(server: &MockServer, verb: &str, route: &str, ok: ResponseTemplate) {
+    Mock::given(method(verb))
+        .and(path(route))
+        .and(header("authorization", "Bearer t0"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(server)
+        .await;
+    Mock::given(method(verb))
+        .and(path(route))
+        .and(header("authorization", "Bearer t1"))
+        .respond_with(ok)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_revoked_shared_token_is_refreshed_and_the_request_retried() {
+    let server = MockServer::start().await;
+    mount_rejecting_t0(
+        &server,
+        "GET",
+        "/feed.xml",
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/xml")
+            .set_body_string(xml_response(2)),
+    )
+    .await;
+    let stream = XmlStream::new(
+        XmlStreamConfig::new(server.uri(), "/feed.xml").records_element_path("root.item"),
+    )
+    .with_auth_provider(Arc::new(RevokedThenRefreshed::default()));
+
+    let records = stream.fetch_all().await.unwrap();
+    assert_eq!(records.len(), 2);
+}

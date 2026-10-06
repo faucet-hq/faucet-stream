@@ -476,3 +476,75 @@ async fn pages_flush_at_batch_size() {
     );
     assert_eq!(page_sizes, vec![2, 2, 1]);
 }
+
+/// A shared provider whose current token the server has revoked: `invalidate`
+/// refreshes it unless a newer one was already handed out (#789 API-06).
+#[derive(Debug, Default)]
+struct RevokedThenRefreshed {
+    token: std::sync::Mutex<u32>,
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for RevokedThenRefreshed {
+    async fn credential(&self) -> Result<Credential, FaucetError> {
+        Ok(Credential::Bearer(format!(
+            "t{}",
+            self.token.lock().unwrap()
+        )))
+    }
+    async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
+        let mut t = self.token.lock().unwrap();
+        let current = format!("t{t}");
+        if !matches!(stale, Credential::Bearer(s) if *s != current) {
+            *t += 1;
+        }
+        Ok(Credential::Bearer(format!("t{t}")))
+    }
+    fn provider_name(&self) -> &'static str {
+        "revoked-then-refreshed"
+    }
+}
+
+/// A handshake rejected with `401` re-authenticates the shared provider and
+/// connects again with the fresh token.
+#[tokio::test]
+async fn a_rejected_handshake_refreshes_the_shared_token() {
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let accepted = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                    let auth = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok());
+                    if auth == Some("Bearer t1") {
+                        Ok(resp)
+                    } else {
+                        let mut reject = ErrorResponse::new(None);
+                        *reject.status_mut() =
+                            tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+                        Err(reject)
+                    }
+                },
+            )
+            .await;
+            if let Ok(mut ws) = accepted {
+                let _ = ws.send(Message::Text(r#"{"id":1}"#.into())).await;
+                while ws.next().await.is_some() {}
+            }
+        }
+    });
+
+    let mut cfg = base_config(&format!("ws://{addr}"));
+    cfg.max_messages = Some(1);
+    cfg.idle_timeout = Some(Duration::from_secs(5));
+    let src = WebsocketSource::new(cfg)
+        .unwrap()
+        .with_auth_provider(Arc::new(RevokedThenRefreshed::default()));
+    let records = src.fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+}

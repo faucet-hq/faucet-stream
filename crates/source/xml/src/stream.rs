@@ -413,7 +413,40 @@ impl XmlStream {
         }
     }
 
+    /// Run one request; when a shared provider's credential is rejected, have
+    /// the provider re-authenticate and run it once more (#789 API-06).
     async fn execute_request(
+        &self,
+        params: &HashMap<String, String>,
+        context: &HashMap<String, serde_json::Value>,
+        body_override: Option<&str>,
+    ) -> Result<String, FaucetError> {
+        match self
+            .execute_request_once(params, context, body_override)
+            .await
+        {
+            Err(e)
+                if self
+                    .auth_provider
+                    .as_ref()
+                    .is_some_and(|p| faucet_core::rejects_credential(&e, p.as_ref())) =>
+            {
+                let provider = self.auth_provider.as_ref().expect("checked above");
+                tracing::warn!(
+                    provider = provider.provider_name(),
+                    "the server rejected the shared credential; re-authenticating and retrying once"
+                );
+                provider
+                    .invalidate(&faucet_core::Credential::Token(String::new()))
+                    .await?;
+                self.execute_request_once(params, context, body_override)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn execute_request_once(
         &self,
         params: &HashMap<String, String>,
         context: &HashMap<String, serde_json::Value>,

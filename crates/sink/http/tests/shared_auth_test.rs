@@ -83,3 +83,61 @@ async fn unresolved_auth_reference_errors() {
         "no requests must be sent when auth reference is unresolved"
     );
 }
+
+/// A shared provider whose current token the server has revoked: `invalidate`
+/// refreshes it (unless a newer token was already handed out), like the real
+/// OAuth2 / token-endpoint providers (#789 API-06).
+#[derive(Debug, Default)]
+struct RevokedThenRefreshed {
+    token: std::sync::Mutex<u32>,
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for RevokedThenRefreshed {
+    async fn credential(&self) -> Result<Credential, FaucetError> {
+        Ok(Credential::Bearer(format!(
+            "t{}",
+            self.token.lock().unwrap()
+        )))
+    }
+    async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
+        let mut t = self.token.lock().unwrap();
+        let current = format!("t{t}");
+        if !matches!(stale, Credential::Bearer(s) if *s != current) {
+            *t += 1;
+        }
+        Ok(Credential::Bearer(format!("t{t}")))
+    }
+    fn provider_name(&self) -> &'static str {
+        "revoked-then-refreshed"
+    }
+}
+
+async fn mount_rejecting_t0(server: &MockServer, verb: &str, route: &str, ok: ResponseTemplate) {
+    Mock::given(method(verb))
+        .and(path(route))
+        .and(header("authorization", "Bearer t0"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(server)
+        .await;
+    Mock::given(method(verb))
+        .and(path(route))
+        .and(header("authorization", "Bearer t1"))
+        .respond_with(ok)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_revoked_shared_token_is_refreshed_and_the_request_retried() {
+    let server = MockServer::start().await;
+    mount_rejecting_t0(&server, "POST", "/ingest", ResponseTemplate::new(200)).await;
+    let sink = HttpSink::new(HttpSinkConfig::new(format!("{}/ingest", server.uri())))
+        .with_auth_provider(Arc::new(RevokedThenRefreshed::default()));
+
+    let written = sink
+        .write_batch(&[json!({"id": 1}), json!({"id": 2})])
+        .await
+        .expect("the refreshed token is accepted");
+    assert_eq!(written, 2);
+}

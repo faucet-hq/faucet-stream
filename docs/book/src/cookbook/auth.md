@@ -309,6 +309,14 @@ Provider `type:` values (catalog only): `static`, `oauth2` (client-credentials),
 Shared providers are supported by the bearer/header-based connectors (rest,
 graphql, xml, grpc, websocket, http sink, elasticsearch, snowflake-OAuth).
 
+When the server rejects a shared provider's credential — a `401`, or a status a
+`flow` provider lists in `reauth_on` — the connector tells the provider the token
+is stale and retries the request once with a fresh one (a WebSocket reconnects,
+gRPC retries on `UNAUTHENTICATED`). The provider refreshes once even when many
+rows hit the same rejection, so a token the server expired or revoked before its
+client-side expiry recovers on the next request instead of failing every run
+until a restart.
+
 **Library use:** build one `faucet_auth` provider, wrap it in an `Arc`, and pass
 it to each source/sink with `.with_auth_provider(provider.clone())`.
 

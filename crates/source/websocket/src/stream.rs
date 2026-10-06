@@ -28,6 +28,19 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A failed WebSocket handshake. An HTTP status the server answered with keeps
+/// its code, so a rejected credential can be told apart from a network failure.
+fn handshake_error(url: &str, e: tokio_tungstenite::tungstenite::Error) -> FaucetError {
+    match e {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => FaucetError::HttpStatus {
+            status: resp.status().as_u16(),
+            url: url.to_string(),
+            body: String::new(),
+        },
+        other => FaucetError::Source(format!("websocket connect {url}: {other}")),
+    }
+}
+
 /// Delay before the next (re)connect after `attempt` consecutive failures,
 /// using the configured `reconnect_backoff` as the exponential base.
 ///
@@ -126,17 +139,29 @@ impl WebsocketSource {
     /// Connect, apply auth + size limits, and send the subscribe frames.
     ///
     /// Auth is resolved here (not once at construction) so that reconnects
-    /// always pick up a freshly-rotated token from a shared provider.
+    /// always pick up a freshly-rotated token from a shared provider, and a
+    /// handshake the server rejects (a `401`, or a status the provider declares)
+    /// re-authenticates the provider and connects once more (#789 API-06).
     async fn connect(&self, url: &str) -> Result<WsStream, FaucetError> {
+        faucet_core::send_with_reauth(self.auth_provider.as_ref(), |cred| {
+            self.connect_with(url, cred)
+        })
+        .await
+    }
+
+    async fn connect_with(
+        &self,
+        url: &str,
+        cred: Option<faucet_core::Credential>,
+    ) -> Result<WsStream, FaucetError> {
         let mut request = url
             .into_client_request()
             .map_err(|e| FaucetError::Config(format!("websocket url {url}: {e}")))?;
 
         // Resolve effective auth: provider-first, then inline, or error on Reference.
-        let effective_auth = if let Some(p) = &self.auth_provider {
-            credential_to_auth(p.credential().await?)
-        } else {
-            match &self.config.auth {
+        let effective_auth = match cred {
+            Some(cred) => credential_to_auth(cred),
+            None => match &self.config.auth {
                 AuthSpec::Inline(a) => a.clone(),
                 AuthSpec::Reference(r) => {
                     return Err(FaucetError::Auth(format!(
@@ -145,7 +170,7 @@ impl WebsocketSource {
                         r.name
                     )));
                 }
-            }
+            },
         };
         apply_auth(&mut request, &effective_auth)?;
 
@@ -157,7 +182,7 @@ impl WebsocketSource {
 
         let (mut ws, _resp) = connect_async_with_config(request, ws_config, false)
             .await
-            .map_err(|e| FaucetError::Source(format!("websocket connect {url}: {e}")))?;
+            .map_err(|e| handshake_error(url, e))?;
 
         for msg in &self.config.subscribe_messages {
             ws.send(Message::Text(msg.clone().into()))

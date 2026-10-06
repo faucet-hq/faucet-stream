@@ -1613,8 +1613,9 @@ impl RestStream {
     /// forever), so a *server-side* expiry surfaces only as a 401 on a real
     /// request. The documented contract is "valid until a 401 forces a
     /// refresh" — so on a 401 with an inline cached token we invalidate the
-    /// cache and retry exactly once with a freshly-fetched token (F57). Shared
-    /// auth providers manage their own refresh and are not retried here.
+    /// cache and retry exactly once with a freshly-fetched token (F57). A shared
+    /// provider is re-authenticated the same way on a 401 or on a status it
+    /// declared in `reauth_statuses` (#511, #789 API-06).
     async fn execute_request(
         &self,
         params: &HashMap<String, String>,
@@ -1651,14 +1652,14 @@ impl RestStream {
                 )
                 .await
             }
-            // #511: a shared provider (e.g. a multi-step flow) whose session
-            // expired mid-run — re-auth on a status it declared in `reauth_on`
-            // and retry once.
+            // A shared provider whose credential the server rejected — a 401, or
+            // a status the provider declared (a multi-step flow's `reauth_on`,
+            // #511) — is re-authenticated and the request retried once.
             Err(FaucetError::HttpStatus { status, .. }) if self.provider_wants_reauth(status) => {
                 if let Some(provider) = &self.auth_provider {
                     tracing::warn!(
                         status,
-                        "shared auth provider requested re-auth on this status; \
+                        "the server rejected the shared credential; \
                          re-authenticating and retrying once"
                     );
                     let _ = provider.invalidate(&Credential::Token(String::new())).await;
@@ -1677,11 +1678,14 @@ impl RestStream {
         }
     }
 
-    /// `true` when a shared provider declared `status` in its `reauth_statuses`.
+    /// `true` when a shared provider should re-authenticate on `status`: a `401`
+    /// (the server rejected the credential — it may have expired or been revoked
+    /// before its client-side expiry, #789 API-06) or a status the provider
+    /// declared in its `reauth_statuses`.
     fn provider_wants_reauth(&self, status: u16) -> bool {
         self.auth_provider
             .as_ref()
-            .is_some_and(|p| p.reauth_statuses().contains(&status))
+            .is_some_and(|p| status == 401 || p.reauth_statuses().contains(&status))
     }
 
     /// `true` when this source resolves its bearer token from one of the inline
