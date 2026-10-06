@@ -79,9 +79,17 @@ pub fn encode_to_kind(value: &Value, ty: &SpannerType) -> Result<Kind, String> {
             Value::Bool(b) => Ok(Kind::StringValue(b.to_string())),
             other => Ok(Kind::StringValue(other.to_string())),
         },
-        // Timestamps/dates must already be RFC 3339 text; bytes must already
-        // be base64 (the same form the source decodes them to).
-        SpannerType::Timestamp | SpannerType::Date | SpannerType::Bytes => match value {
+        // Spanner accepts only UTC `Z` timestamps; an RFC 3339 value with an
+        // offset (as postgres and others emit) is converted to that form.
+        SpannerType::Timestamp => match value {
+            Value::String(s) => Ok(Kind::StringValue(
+                canonical_timestamp(s).unwrap_or_else(|| s.clone()),
+            )),
+            other => Err(mismatch(type_name(ty), other)),
+        },
+        // Dates must already be `YYYY-MM-DD`; bytes must already be base64
+        // (the same form the source decodes them to).
+        SpannerType::Date | SpannerType::Bytes => match value {
             Value::String(s) => Ok(Kind::StringValue(s.clone())),
             other => Err(mismatch(type_name(ty), other)),
         },
@@ -111,6 +119,69 @@ pub fn encode_to_kind(value: &Value, ty: &SpannerType) -> Result<Kind, String> {
     }
 }
 
+/// The text Spanner itself renders for a key value of type `ty`, so a value a
+/// run wrote (`"007"`, `"1.50"`, `"…+00:00"`) compares equal to the same value
+/// read back (`"7"`, `"1.5"`, `"…Z"`). Values that do not parse are returned
+/// unchanged.
+pub fn canonical_kind(kind: Kind, ty: &SpannerType) -> Kind {
+    let Kind::StringValue(s) = &kind else {
+        return kind;
+    };
+    let canonical = match ty {
+        SpannerType::Int64 => s.trim().parse::<i64>().ok().map(|i| i.to_string()),
+        SpannerType::Numeric => canonical_decimal(s),
+        SpannerType::Timestamp => canonical_timestamp(s),
+        _ => None,
+    };
+    canonical.map_or(kind, Kind::StringValue)
+}
+
+/// A plain decimal without leading integer zeros or trailing fractional
+/// zeros (`"-0010.500"` → `"-10.5"`, `"-0.0"` → `"0"`).
+fn canonical_decimal(s: &str) -> Option<String> {
+    let t = s.trim();
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if int.is_empty() && frac.is_empty()
+        || !int.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    let body = if frac.is_empty() {
+        int.to_string()
+    } else {
+        format!("{int}.{frac}")
+    };
+    Some(if negative && body != "0" {
+        format!("-{body}")
+    } else {
+        body
+    })
+}
+
+/// An RFC 3339 timestamp in UTC with trailing fractional zeros trimmed, as
+/// Spanner renders it (`"2024-01-01T02:00:00.500+02:00"` →
+/// `"2024-01-01T00:00:00.5Z"`).
+fn canonical_timestamp(s: &str) -> Option<String> {
+    let utc = chrono::DateTime::parse_from_rfc3339(s.trim())
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let base = utc.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let nanos = utc.timestamp_subsec_nanos();
+    if nanos == 0 {
+        return Some(format!("{base}Z"));
+    }
+    let frac = format!("{nanos:09}");
+    Some(format!("{base}.{}Z", frac.trim_end_matches('0')))
+}
+
 fn type_name(ty: &SpannerType) -> &'static str {
     match ty {
         SpannerType::Timestamp => "TIMESTAMP",
@@ -134,6 +205,57 @@ fn mismatch(expected: &str, got: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn timestamps_are_written_in_utc_zulu_form() {
+        assert_eq!(
+            encode_to_kind(
+                &serde_json::json!("2024-01-01T02:00:00+02:00"),
+                &SpannerType::Timestamp
+            )
+            .unwrap(),
+            Kind::StringValue("2024-01-01T00:00:00Z".into())
+        );
+        assert_eq!(
+            encode_to_kind(&serde_json::json!("garbage"), &SpannerType::Timestamp).unwrap(),
+            Kind::StringValue("garbage".into()),
+            "Spanner reports an unparseable value itself"
+        );
+        assert!(encode_to_kind(&serde_json::json!(5), &SpannerType::Timestamp).is_err());
+    }
+
+    #[test]
+    fn keys_are_compared_in_spanners_own_rendering() {
+        let st = |s: &str| Kind::StringValue(s.into());
+        let canon = |s: &str, ty: &SpannerType| match canonical_kind(st(s), ty) {
+            Kind::StringValue(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(canon("007", &SpannerType::Int64), "7");
+        assert_eq!(canon("-42", &SpannerType::Int64), "-42");
+        assert_eq!(canon("1.50", &SpannerType::Numeric), "1.5");
+        assert_eq!(canon("-0010.500", &SpannerType::Numeric), "-10.5");
+        assert_eq!(canon("+3", &SpannerType::Numeric), "3");
+        assert_eq!(canon("-0.0", &SpannerType::Numeric), "0");
+        assert_eq!(canon(".5", &SpannerType::Numeric), "0.5");
+        assert_eq!(canon("1e3", &SpannerType::Numeric), "1e3", "unparsed kept");
+        assert_eq!(canon(".", &SpannerType::Numeric), ".");
+        assert_eq!(
+            canon("2024-01-01T02:00:00.500+02:00", &SpannerType::Timestamp),
+            "2024-01-01T00:00:00.5Z"
+        );
+        assert_eq!(
+            canon("2024-01-01T00:00:00+00:00", &SpannerType::Timestamp),
+            "2024-01-01T00:00:00Z"
+        );
+        assert_eq!(canon("not a time", &SpannerType::Timestamp), "not a time");
+        assert_eq!(canon("abc", &SpannerType::String), "abc");
+        assert_eq!(
+            canonical_kind(Kind::BoolValue(true), &SpannerType::Bool),
+            Kind::BoolValue(true)
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -5226,6 +5226,7 @@ name = "faucet-common-spanner"
 version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "faucet-core",
  "gcloud-gax",
  "gcloud-googleapis",
@@ -6964,6 +6965,7 @@ version = "1.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "chrono",
  "faucet-common-spanner",
  "faucet-conformance",
  "faucet-core",

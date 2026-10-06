@@ -493,3 +493,51 @@ async fn evolve_widens_nullability_relaxes_not_null_and_rejects_base_type_change
     let schema = sink.current_schema().await.expect("schema").expect("some");
     assert_eq!(schema["properties"]["v"]["type"], json!(["string", "null"]));
 }
+
+/// SQL-31: keys written in a non-canonical text form (`"007"`, `"1.50"`,
+/// `"…+00:00"`) still count as written, so the cleanup deletes only the stale
+/// row — not the rows this run just upserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_matches_written_keys_in_any_text_form() {
+    let conn = support::create_database(
+        "em-cleanup-canon",
+        vec![
+            "CREATE TABLE k (id INT64 NOT NULL, ts TIMESTAMP NOT NULL, amt NUMERIC NOT NULL, \
+             v STRING(MAX)) PRIMARY KEY (id, ts, amt)"
+                .to_string(),
+        ],
+    )
+    .await;
+    let mut cfg = SpannerSinkConfig::new(
+        conn.project_id.clone(),
+        conn.instance.clone(),
+        conn.database.clone(),
+        "k",
+    );
+    cfg.connection.emulator_host = conn.emulator_host.clone();
+    let key = vec!["id".to_string(), "ts".to_string(), "amt".to_string()];
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: key.clone(),
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = SpannerSink::new(cfg).await.expect("sink");
+    let written = vec![
+        json!({"id": "007", "ts": "2024-01-01T00:00:00+00:00", "amt": "1.50", "v": "acme"}),
+        json!({"id": 8, "ts": "2024-01-01T00:00:00.500Z", "amt": "2", "v": "acme"}),
+    ];
+    sink.write_batch(&written).await.expect("write");
+    sink.write_batch(&[json!({"id": 9, "ts": "2024-01-01T00:00:00Z", "amt": "3", "v": "acme"})])
+        .await
+        .expect("stale row");
+
+    let mut seen = faucet_core::SeenKeys::new();
+    seen.record_page(&written, &key, 1000);
+    let deleted = sink
+        .cleanup_scope(&scope_v("acme"), &seen)
+        .await
+        .expect("cleanup");
+    assert_eq!(deleted, 1, "only the row this run did not write");
+    assert_eq!(support::count_rows(&conn, "k").await, 2);
+}
