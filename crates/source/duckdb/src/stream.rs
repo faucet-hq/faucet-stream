@@ -105,8 +105,8 @@ fn json_to_duck(v: &Value) -> DuckValue {
 /// Convert a DuckDB column value to a `serde_json::Value`.
 ///
 /// Scalar types map exactly. `Text` becomes a UTF-8 (lossy) string and `Blob`
-/// becomes base64 so binary survives the JSON round-trip. Temporal, decimal,
-/// and nested (LIST / STRUCT / MAP / …) types are best-effort: temporal values
+/// becomes base64 so binary survives the JSON round-trip, and `Decimal` its
+/// exact text. Temporal and nested (LIST / STRUCT / MAP / …) types are best-effort: temporal values
 /// surface their raw integer, and everything else falls back to a stable
 /// debug string — documented in the crate README.
 fn value_ref_to_json(v: ValueRef<'_>) -> Value {
@@ -135,15 +135,9 @@ fn value_ref_to_json(v: ValueRef<'_>) -> Value {
         ValueRef::Blob(bytes) => {
             Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
-        ValueRef::Decimal(d) => {
-            // DuckDB types bare fractional literals (e.g. `2.5`) as DECIMAL.
-            // Represent as a JSON number when the canonical string parses
-            // (f64-precision), else keep the exact decimal text.
-            let s = d.to_string();
-            serde_json::from_str::<serde_json::Number>(&s)
-                .map(Value::Number)
-                .unwrap_or(Value::String(s))
-        }
+        // Exact decimal text, as the postgres/mysql sources emit: parsing it
+        // into a JSON number rounds through `f64` (#789 SQL-15).
+        ValueRef::Decimal(d) => Value::String(d.to_string()),
         ValueRef::Timestamp(_, n) => json!(n),
         ValueRef::Date32(n) => json!(n),
         ValueRef::Time64(_, n) => json!(n),
@@ -161,10 +155,28 @@ fn value_ref_to_json(v: ValueRef<'_>) -> Value {
 fn row_to_json(row: &duckdb::Row<'_>, col_names: &[String]) -> Result<Value, FaucetError> {
     let mut map = serde_json::Map::with_capacity(col_names.len());
     for (i, name) in col_names.iter().enumerate() {
-        let vr = row
-            .get_ref(i)
-            .map_err(|e| FaucetError::Source(format!("DuckDB column {name} read failed: {e}")))?;
-        map.insert(name.clone(), value_ref_to_json(vr));
+        // duckdb-rs panics on some valid values (a DECIMAL wider than 28
+        // significant digits, a nanosecond TIME); fail the read instead of
+        // letting the panic end the stream as if it were complete.
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            row.get_ref(i).map(value_ref_to_json)
+        }));
+        let value = match read {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                return Err(FaucetError::Source(format!(
+                    "DuckDB column {name} read failed: {e}"
+                )));
+            }
+            Err(_) => {
+                return Err(FaucetError::Source(format!(
+                    "DuckDB column {name} holds a value the driver cannot decode (a DECIMAL \
+                     wider than 28 significant digits or a nanosecond TIME); CAST it to \
+                     VARCHAR in the query"
+                )));
+            }
+        };
+        map.insert(name.clone(), value);
     }
     Ok(Value::Object(map))
 }
@@ -303,7 +315,7 @@ impl faucet_core::Source for DuckdbSource {
         let query_label = self.config.query.clone();
         let (tx, mut rx) = mpsc::channel::<Result<StreamPage, FaucetError>>(4);
 
-        tokio::task::spawn_blocking(move || {
+        let reader = tokio::task::spawn_blocking(move || {
             if let Err(e) = stream_blocking(&conn, &query_str, &binds, batch_size, &tx) {
                 let _ = tx.blocking_send(Err(e));
             }
@@ -316,6 +328,11 @@ impl faucet_core::Source for DuckdbSource {
                 total += page.records.len();
                 yield page;
             }
+            // The channel also closes when the reader panics; only a reader
+            // that returned is a complete result (#789 SQL-42).
+            reader.await.map_err(|e| {
+                FaucetError::Source(format!("DuckDB reader stopped before the end of the result: {e}"))
+            })?;
             tracing::info!(
                 rows = total,
                 batch_size,
@@ -347,6 +364,7 @@ impl faucet_core::Source for DuckdbSource {
 mod tests {
     use super::*;
     use faucet_core::Source;
+    use serde_json::json;
 
     async fn memory_source(setup: &str, query: &str) -> DuckdbSource {
         let source = DuckdbSource::new(DuckdbSourceConfig::new(":memory:", query))
@@ -374,7 +392,7 @@ mod tests {
         assert_eq!(records[0]["val"], 1);
         assert_eq!(records[0]["msg"], "hello");
         assert_eq!(records[0]["flag"], true);
-        assert_eq!(records[0]["score"], 2.5);
+        assert_eq!(records[0]["score"], "2.5", "a DECIMAL literal stays exact");
         assert_eq!(source.connector_name(), "duckdb");
     }
 
@@ -430,6 +448,41 @@ mod tests {
         assert_eq!(seen, 250);
         assert!(peak <= 100, "peak page {peak} exceeds batch_size");
         assert!(peak < 250, "buffered everything into one page");
+    }
+
+    #[tokio::test]
+    async fn decimals_are_exact_strings() {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(
+            ":memory:",
+            "SELECT CAST('12345678901234567.0123456789' AS DECIMAL(38, 10)) AS d",
+        ))
+        .await
+        .unwrap();
+        let records = source.fetch_all().await.unwrap();
+        assert_eq!(records[0]["d"], json!("12345678901234567.0123456789"));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_value_fails_the_stream_instead_of_ending_it() {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(
+            ":memory:",
+            "SELECT * FROM (VALUES (1, CAST(1 AS DECIMAL(38, 2))), \
+             (2, CAST('123456789012345678901234567890.12' AS DECIMAL(38, 2)))) t(id, d)",
+        ))
+        .await
+        .unwrap();
+        let ctx = HashMap::new();
+        let mut stream = source.stream_pages(&ctx, 100);
+        let mut error = None;
+        while let Some(page) = futures::StreamExt::next(&mut stream).await {
+            if let Err(e) = page {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+        let error = error.expect("the stream must not end cleanly");
+        assert!(error.contains("column d"), "{error}");
+        assert!(source.fetch_all().await.is_err());
     }
 
     #[tokio::test]
