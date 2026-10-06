@@ -134,11 +134,161 @@ fn jsonb_value_to_json(
     }
 }
 
-/// Build a `{column_name: json_value}` object from a binlog row.
+/// How a column's binlog value must be rendered to match the `mysql` query
+/// source's snapshot rendering (#789 SQL-14). Built once per `TableMapEvent`;
+/// requires `binlog_row_metadata=FULL` for the ENUM/SET labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnHint {
+    /// `TIMESTAMP`: epoch seconds → RFC 3339 UTC.
+    Timestamp,
+    /// `DATE`: `YYYY-MM-DD`.
+    Date,
+    /// `DATETIME`: `YYYY-MM-DD HH:MM:SS[.fff…]`.
+    DateTime,
+    /// `TIME`: `HH:MM:SS[.fff…]`.
+    Time,
+    /// `YEAR`: a number (`0` for `0000`).
+    Year,
+    /// `FLOAT`: the single-precision value's shortest decimal form.
+    Float,
+    /// `ENUM`: the label for the stored ordinal.
+    Enum(Vec<String>),
+    /// `SET`: the labels of the stored bitmask, comma-joined.
+    Set(Vec<String>),
+    /// Any other column: rendered as before.
+    Other,
+}
+
+/// One [`ColumnHint`] per column of `tme`.
+pub fn column_hints(tme: &mysql_async::binlog::events::TableMapEvent<'_>) -> Vec<ColumnHint> {
+    use mysql_async::binlog::events::OptionalMetadataField;
+    use mysql_async::consts::ColumnType as T;
+    let mut enum_labels: Vec<Vec<String>> = Vec::new();
+    let mut set_labels: Vec<Vec<String>> = Vec::new();
+    for field in tme.iter_optional_meta().flatten() {
+        match field {
+            OptionalMetadataField::EnumStrValue(values) => {
+                enum_labels = values
+                    .iter_values()
+                    .flatten()
+                    .map(|v| v.values().iter().map(|x| x.value().into_owned()).collect())
+                    .collect();
+            }
+            OptionalMetadataField::SetStrValue(values) => {
+                set_labels = values
+                    .iter_values()
+                    .flatten()
+                    .map(|v| v.values().iter().map(|x| x.value().into_owned()).collect())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    let mut enums = enum_labels.into_iter();
+    let mut sets = set_labels.into_iter();
+    (0..tme.columns_count() as usize)
+        .map(|i| match tme.get_column_type(i) {
+            Ok(Some(T::MYSQL_TYPE_TIMESTAMP | T::MYSQL_TYPE_TIMESTAMP2)) => ColumnHint::Timestamp,
+            Ok(Some(T::MYSQL_TYPE_DATE | T::MYSQL_TYPE_NEWDATE)) => ColumnHint::Date,
+            Ok(Some(T::MYSQL_TYPE_DATETIME | T::MYSQL_TYPE_DATETIME2)) => ColumnHint::DateTime,
+            Ok(Some(T::MYSQL_TYPE_TIME | T::MYSQL_TYPE_TIME2)) => ColumnHint::Time,
+            Ok(Some(T::MYSQL_TYPE_YEAR)) => ColumnHint::Year,
+            Ok(Some(T::MYSQL_TYPE_FLOAT)) => ColumnHint::Float,
+            Ok(Some(T::MYSQL_TYPE_ENUM)) => enums
+                .next()
+                .map(ColumnHint::Enum)
+                .unwrap_or(ColumnHint::Other),
+            Ok(Some(T::MYSQL_TYPE_SET)) => sets
+                .next()
+                .map(ColumnHint::Set)
+                .unwrap_or(ColumnHint::Other),
+            _ => ColumnHint::Other,
+        })
+        .collect()
+}
+
+/// Fractional seconds the way chrono prints them (and so the snapshot source):
+/// none when zero, else 3 or 6 digits.
+fn fraction(micros: u32) -> String {
+    if micros == 0 {
+        String::new()
+    } else if micros % 1000 == 0 {
+        format!(".{:03}", micros / 1000)
+    } else {
+        format!(".{micros:06}")
+    }
+}
+
+/// Render `v` for a column with `hint`; `None` when the hint does not apply to
+/// the value's shape, which then falls back to [`value_to_json`].
+fn hinted_value(hint: &ColumnHint, v: &Value) -> Option<Json> {
+    match (hint, v) {
+        (ColumnHint::Timestamp, Value::Bytes(b)) => {
+            let text = std::str::from_utf8(b).ok()?;
+            let (secs, frac) = text.split_once('.').unwrap_or((text, "0"));
+            let secs: i64 = secs.parse().ok()?;
+            let micros: u32 = format!("{frac:0<6}").get(..6)?.parse().ok()?;
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, micros * 1000)?;
+            Some(Json::String(at.to_rfc3339()))
+        }
+        (ColumnHint::Date, Value::Date(y, mo, d, ..)) => {
+            Some(Json::String(format!("{y:04}-{mo:02}-{d:02}")))
+        }
+        (ColumnHint::DateTime, Value::Date(y, mo, d, h, mi, s, micro)) => {
+            Some(Json::String(format!(
+                "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}{}",
+                fraction(*micro)
+            )))
+        }
+        (ColumnHint::Time, Value::Time(false, 0, h, mi, s, micro)) if *h < 24 => Some(
+            Json::String(format!("{h:02}:{mi:02}:{s:02}{}", fraction(*micro))),
+        ),
+        (ColumnHint::Year, Value::Bytes(b)) => {
+            let year: u16 = std::str::from_utf8(b).ok()?.parse().ok()?;
+            Some(Json::from(if year == 1900 { 0 } else { year }))
+        }
+        (ColumnHint::Float, Value::Float(f)) => {
+            let shortest: f64 = f.to_string().parse().ok()?;
+            Some(
+                serde_json::Number::from_f64(shortest)
+                    .map(Json::Number)
+                    .unwrap_or(Json::Null),
+            )
+        }
+        (ColumnHint::Enum(labels), Value::Int(i)) => {
+            let label = usize::try_from(*i)
+                .ok()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| labels.get(i))
+                .cloned()
+                .unwrap_or_default();
+            Some(Json::String(label))
+        }
+        (ColumnHint::Set(labels), Value::Bytes(mask)) => {
+            let chosen: Vec<&str> = labels
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    mask.get(i / 8)
+                        .is_some_and(|byte| byte & (1 << (i % 8)) != 0)
+                })
+                .map(|(_, l)| l.as_str())
+                .collect();
+            Some(Json::String(chosen.join(",")))
+        }
+        _ => None,
+    }
+}
+
+/// Build a `{column_name: json_value}` object from a binlog row, rendering each
+/// column by its [`ColumnHint`].
 ///
 /// Column names require `binlog_row_metadata=FULL` on the server; positional
 /// names (`col_<i>`) are used as a defensive fallback if a name is empty.
-pub fn binlog_row_to_json(row: &BinlogRow) -> Result<Json, FaucetError> {
+pub fn binlog_row_to_json_hinted(
+    row: &BinlogRow,
+    hints: &[ColumnHint],
+) -> Result<Json, FaucetError> {
     let cols = row.columns_ref();
     let mut obj = Map::with_capacity(cols.len());
     for (i, col) in cols.iter().enumerate() {
@@ -151,6 +301,10 @@ pub fn binlog_row_to_json(row: &BinlogRow) -> Result<Json, FaucetError> {
             }
         };
         let val = match row.as_ref(i) {
+            Some(BinlogValue::Value(v)) => match hints.get(i).and_then(|h| hinted_value(h, v)) {
+                Some(j) => j,
+                None => value_to_json(v),
+            },
             Some(bv) => binlog_value_to_json(bv)?,
             None => Json::Null,
         };
@@ -162,6 +316,71 @@ pub fn binlog_row_to_json(row: &BinlogRow) -> Result<Json, FaucetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hinted_values_render_like_the_snapshot_source() {
+        let v = |h: ColumnHint, val: Value| hinted_value(&h, &val);
+        assert_eq!(
+            v(ColumnHint::Timestamp, Value::Bytes(b"1780749000".to_vec())),
+            Some(Json::String("2026-06-06T12:30:00+00:00".into()))
+        );
+        assert_eq!(
+            v(
+                ColumnHint::Timestamp,
+                Value::Bytes(b"1780749000.500000".to_vec())
+            ),
+            Some(Json::String("2026-06-06T12:30:00.500+00:00".into()))
+        );
+        assert_eq!(v(ColumnHint::Timestamp, Value::Bytes(b"x".to_vec())), None);
+        assert_eq!(
+            v(ColumnHint::Date, Value::Date(2026, 6, 6, 0, 0, 0, 0)),
+            Some(Json::String("2026-06-06".into()))
+        );
+        assert_eq!(
+            v(
+                ColumnHint::DateTime,
+                Value::Date(2026, 6, 6, 12, 30, 0, 123_456)
+            ),
+            Some(Json::String("2026-06-06 12:30:00.123456".into()))
+        );
+        assert_eq!(
+            v(ColumnHint::Time, Value::Time(false, 0, 10, 0, 0, 0)),
+            Some(Json::String("10:00:00".into()))
+        );
+        assert_eq!(v(ColumnHint::Time, Value::Time(true, 0, 1, 0, 0, 0)), None);
+        assert_eq!(
+            v(ColumnHint::Year, Value::Bytes(b"1900".to_vec())),
+            Some(Json::from(0))
+        );
+        assert_eq!(
+            v(ColumnHint::Year, Value::Bytes(b"2026".to_vec())),
+            Some(Json::from(2026))
+        );
+        assert_eq!(
+            v(ColumnHint::Float, Value::Float(0.1)),
+            Some(Json::from(0.1))
+        );
+        assert_eq!(
+            v(ColumnHint::Float, Value::Float(f32::NAN)),
+            Some(Json::Null)
+        );
+        let labels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            v(ColumnHint::Enum(labels.clone()), Value::Int(3)),
+            Some(Json::String("c".into()))
+        );
+        assert_eq!(
+            v(ColumnHint::Enum(labels.clone()), Value::Int(0)),
+            Some(Json::String(String::new()))
+        );
+        assert_eq!(
+            v(ColumnHint::Set(labels), Value::Bytes(vec![0b101])),
+            Some(Json::String("a,c".into()))
+        );
+        assert_eq!(v(ColumnHint::Other, Value::Int(1)), None);
+        assert_eq!(fraction(0), "");
+        assert_eq!(fraction(500_000), ".500");
+    }
     use mysql_async::Value;
 
     #[test]

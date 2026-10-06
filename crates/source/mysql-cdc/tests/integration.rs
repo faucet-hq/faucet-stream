@@ -525,3 +525,99 @@ async fn lag_measures_unread_binlog_bytes() {
         "consuming the changes shrinks the lag: {after:?} vs {behind:?}"
     );
 }
+
+/// #789 SQL-24 / SQL-14 / SQL-28 against one server:
+/// - a fresh start persists where it opened, so a change made between a quiet
+///   first cycle and the next run is still captured;
+/// - binlog values render like the `mysql` query source (TIMESTAMP as RFC 3339
+///   UTC, ENUM/SET as labels, DATE/DATETIME/TIME/YEAR/FLOAT exact);
+/// - a compressed transaction bookmarks the payload's end, not position 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_types_and_compressed_transactions() {
+    let (_container, url) = start_mysql_cdc().await;
+    {
+        let mut conn = connect(&url).await;
+        conn.query_drop(
+            "CREATE TABLE test.t (id INT PRIMARY KEY, at TIMESTAMP NULL, \
+             status ENUM('new','paid','shipped'), flags SET('a','b','c'), d DATE, \
+             dt DATETIME(3), tm TIME, y YEAR, f FLOAT)",
+        )
+        .await
+        .expect("create table");
+    }
+
+    // SQL-24: the first cycle sees nothing, yet persists where it opened.
+    let source = MysqlCdcSource::new(build_config(&url))
+        .await
+        .expect("source new");
+    let (records, anchor) = drain(&source).await;
+    assert!(records.is_empty());
+    let anchor = anchor.expect("a quiet first cycle must still persist its start");
+    {
+        let mut conn = connect(&url).await;
+        conn.query_drop("SET time_zone = '+00:00'")
+            .await
+            .expect("tz");
+        conn.query_drop(
+            "INSERT INTO test.t VALUES (1, '2026-06-06 12:30:00', 'shipped', 'a,c', \
+             '2026-06-06', '2026-06-06 12:30:00.500', '10:00:00', 2026, 0.1), \
+             (2, NULL, 'new', '', '2026-01-02', '2026-01-02 00:00:00', '23:59:59', 0, 1.5)",
+        )
+        .await
+        .expect("insert between runs");
+    }
+    source.apply_start_bookmark(anchor).await.expect("resume");
+    let (records, bookmark) = drain(&source).await;
+    let rows: Vec<&Value> = records.iter().map(|r| &r["after"]).collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the change made between runs is captured: {records:?}"
+    );
+    assert_eq!(
+        rows[0],
+        &json!({
+            "id": 1, "at": "2026-06-06T12:30:00+00:00", "status": "shipped",
+            "flags": "a,c", "d": "2026-06-06", "dt": "2026-06-06 12:30:00.500",
+            "tm": "10:00:00", "y": 2026, "f": 0.1
+        })
+    );
+    assert_eq!(rows[1]["at"], json!(null));
+    assert_eq!(rows[1]["flags"], json!(""));
+    assert_eq!(rows[1]["y"], json!(0), "YEAR 0000 is 0, not 1900");
+    assert_eq!(rows[1]["dt"], json!("2026-01-02 00:00:00"));
+
+    // SQL-28: a compressed transaction's bookmark is the payload's end.
+    source
+        .apply_start_bookmark(bookmark.expect("bookmark"))
+        .await
+        .expect("resume");
+    {
+        let mut conn = connect(&url).await;
+        conn.query_drop("SET SESSION binlog_transaction_compression = ON")
+            .await
+            .expect("enable compression");
+        conn.query_drop("INSERT INTO test.t (id) VALUES (3)")
+            .await
+            .expect("compressed insert");
+    }
+    let (records, bookmark) = drain(&source).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let bookmark = bookmark.expect("bookmark");
+    assert_ne!(bookmark["pos"], json!(0), "{bookmark:?}");
+    assert_ne!(records[0]["lsn"]["pos"], json!(0));
+    {
+        let mut conn = connect(&url).await;
+        conn.query_drop("INSERT INTO test.t (id) VALUES (4)")
+            .await
+            .expect("next insert");
+    }
+    source.apply_start_bookmark(bookmark).await.expect("resume");
+    let (records, _) = drain(&source).await;
+    let ids: Vec<&Value> = records.iter().map(|r| &r["after"]["id"]).collect();
+    assert_eq!(
+        ids,
+        vec![&json!(4)],
+        "resume after a compressed transaction"
+    );
+}
