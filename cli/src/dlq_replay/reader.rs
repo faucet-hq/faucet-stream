@@ -230,11 +230,27 @@ pub struct ScanResult {
     pub files_read: usize,
 }
 
+/// Suffix `faucet dlq discard` gives the file it archives discarded envelopes
+/// into (`dlq.jsonl` → `dlq.jsonl.archived`).
+pub const ARCHIVE_SUFFIX: &str = ".archived";
+
+/// Whether `path` is a discard archive — the current `<file>.archived` or the
+/// `<stem>.archived.jsonl` written by older versions. Directory and glob
+/// locations skip them, so a replay never re-reads discarded envelopes; an
+/// archive named explicitly as the location is still read.
+pub fn is_archive(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(ARCHIVE_SUFFIX) || n.ends_with(".archived.jsonl"))
+}
+
 /// Expand a DLQ location into the concrete local files to read.
 ///
 /// * a file path → just that file,
 /// * a directory → every `*.jsonl` entry directly inside it (sorted),
-/// * anything containing a glob metacharacter (`*?[`) → glob matches.
+/// * anything containing a glob metacharacter (`*?[`) → glob matches,
+///
+/// in both of the last two cases without discard archives ([`is_archive`]).
 ///
 /// Returns an error only when the location resolves to nothing (a clear
 /// signal the path is wrong), so callers never silently report an empty DLQ
@@ -245,7 +261,7 @@ pub fn expand_location(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
         glob::glob(location)
             .map_err(|e| FaucetError::Config(format!("invalid DLQ glob '{location}': {e}")))?
             .filter_map(Result::ok)
-            .filter(|p| p.is_file())
+            .filter(|p| p.is_file() && !is_archive(p))
             .collect()
     } else {
         let path = Path::new(location);
@@ -254,7 +270,9 @@ pub fn expand_location(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
                 .map_err(|e| FaucetError::Source(format!("reading DLQ dir '{location}': {e}")))?
                 .filter_map(Result::ok)
                 .map(|e| e.path())
-                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl"))
+                .filter(|p| {
+                    p.is_file() && p.extension().is_some_and(|x| x == "jsonl") && !is_archive(p)
+                })
                 .collect()
         } else if path.is_file() {
             vec![path.to_path_buf()]
@@ -478,6 +496,41 @@ mod tests {
         assert_eq!(got, vec![path]);
         // missing path → error
         assert!(expand_location(dir.path().join("nope.jsonl").to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn directory_and_glob_locations_skip_discard_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "dlq.jsonl",
+            "dlq.jsonl.archived",
+            "old.archived.jsonl",
+            "other.jsonl",
+        ] {
+            std::fs::write(dir.path().join(name), "\n").unwrap();
+        }
+        let names = |files: Vec<PathBuf>| -> Vec<String> {
+            files
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(expand_location(dir.path().to_str().unwrap()).unwrap()),
+            ["dlq.jsonl", "other.jsonl"]
+        );
+        assert_eq!(
+            names(expand_location(&format!("{}/*", dir.path().display())).unwrap()),
+            ["dlq.jsonl", "other.jsonl"]
+        );
+        let explicit = dir.path().join("dlq.jsonl.archived");
+        assert_eq!(
+            expand_location(explicit.to_str().unwrap()).unwrap(),
+            vec![explicit],
+            "an archive named explicitly is still read"
+        );
+        assert!(is_archive(Path::new("a/old.archived.jsonl")));
+        assert!(!is_archive(Path::new("a/archived.jsonl.d/x.jsonl")));
     }
 
     #[tokio::test]

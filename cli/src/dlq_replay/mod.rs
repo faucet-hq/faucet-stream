@@ -266,7 +266,7 @@ pub async fn replay(
 ///
 /// Only DLQ envelopes matching the filter are removed; blank, malformed, and
 /// non-envelope lines are preserved verbatim. By default discarded envelopes
-/// are appended to a `<file>.archived.jsonl` sibling before being removed from
+/// are appended to a `<file>.archived` sibling before being removed from
 /// the source; `delete = true` removes them without archiving. A file is
 /// rewritten only when it actually lost lines.
 pub fn discard(
@@ -347,11 +347,17 @@ fn atomic_rewrite(file: &std::path::Path, contents: &[u8]) -> CliResult<()> {
     Ok(())
 }
 
-/// The archive sibling for a DLQ file: `dlq.jsonl` → `dlq.archived.jsonl`.
+/// The archive sibling for a DLQ file: `dlq.jsonl` → `dlq.jsonl.archived`.
+/// Not a `.jsonl` name, and skipped by directory / glob locations
+/// ([`reader::is_archive`]), so a later replay never re-reads what was
+/// discarded.
 fn archive_path(file: &std::path::Path) -> PathBuf {
-    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("dlq");
+    let name = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dlq.jsonl");
     let parent = file.parent().unwrap_or_else(|| std::path::Path::new("."));
-    parent.join(format!("{stem}.archived.jsonl"))
+    parent.join(format!("{name}{}", reader::ARCHIVE_SUFFIX))
 }
 
 /// Append `body` to `path`, creating it if absent.
@@ -461,7 +467,7 @@ mod tests {
         assert!(remaining.contains("ContractViolation"));
         assert!(remaining.contains("other"));
         // The archive holds the discarded envelope.
-        let archived = std::fs::read_to_string(dir.path().join("dlq.archived.jsonl")).unwrap();
+        let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
         assert!(archived.contains("QualityFailure"));
         // #321 L3: the atomic rewrite leaves no lingering temp file behind.
         let leftover: Vec<_> = std::fs::read_dir(dir.path())
@@ -472,6 +478,34 @@ mod tests {
         assert!(
             leftover.is_empty(),
             "no .tmp file should remain: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn a_replay_of_the_directory_never_rereads_discarded_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}\n{}\n",
+            env_line("quality", "QualityFailure", 1, json!({"id": 1})),
+            env_line("contract", "ContractViolation", 2, json!({"id": 2})),
+        );
+        write(dir.path(), "dlq.jsonl", &body);
+        let location = dir.path().to_str().unwrap();
+        let out = discard(
+            location,
+            Some("quality"),
+            None,
+            false,
+            &DlqDecryptor::default(),
+        )
+        .unwrap();
+        assert_eq!(out.discarded, 1);
+        let files = reader::expand_location(location).unwrap();
+        let scan = reader::scan_files(&files, &DlqDecryptor::default()).unwrap();
+        assert_eq!(scan.envelopes.len(), 1, "only the kept envelope is left");
+        assert_eq!(
+            scan.envelopes[0].error_kind.as_deref(),
+            Some("ContractViolation")
         );
     }
 
@@ -493,7 +527,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.discarded, 1);
         assert!(out.archived_to.is_empty());
-        assert!(!dir.path().join("dlq.archived.jsonl").exists());
+        assert!(!dir.path().join("dlq.jsonl.archived").exists());
     }
 
     #[test]

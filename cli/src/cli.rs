@@ -1621,7 +1621,7 @@ pub struct DlqDiscardArgs {
     #[arg(long)]
     pub before: Option<String>,
     /// Permanently delete matching envelopes instead of archiving them to a
-    /// `<file>.archived.jsonl` sibling.
+    /// `<file>.archived` sibling.
     #[arg(long)]
     pub delete: bool,
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`

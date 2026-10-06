@@ -149,7 +149,7 @@ pub struct DlqDiscardRequest {
     /// Only discard envelopes strictly older than this epoch-millis timestamp.
     #[serde(default)]
     pub before_ms: Option<i64>,
-    /// Permanently delete instead of archiving to a `<file>.archived.jsonl` sibling.
+    /// Permanently delete instead of archiving to a `<file>.archived` sibling.
     #[serde(default)]
     pub delete: bool,
     /// Keys for a DLQ sealed at rest (first = current, rest = rotated).

@@ -229,11 +229,15 @@ them so the DLQ doesn't grow unbounded:
 
 ```console
 $ faucet dlq discard ./dlq/contract_breaches.jsonl --reason contract --before 7d
-DLQ discard: archived 42 envelope(s) across 1 file(s) → ./dlq/contract_breaches.archived.jsonl
+DLQ discard: archived 42 envelope(s) across 1 file(s) → ./dlq/contract_breaches.jsonl.archived
 ```
 
-By default discarded envelopes are moved to a `<file>.archived.jsonl` sibling;
-`--delete` removes them outright. `--reason` and `--before` (an RFC3339 timestamp
+By default discarded envelopes are moved to a `<file>.archived` sibling;
+`--delete` removes them outright. Archives are not `.jsonl` files, and a
+directory or glob location skips them (including the `<stem>.archived.jsonl`
+archives older versions wrote), so a later `inspect` or `replay` of the
+directory never brings discarded envelopes back. Name an archive file
+explicitly to read it. `--reason` and `--before` (an RFC3339 timestamp
 or a relative age like `7d` / `24h` / `30m`) select what to discard — everything
 else, including non-envelope lines, is left untouched.
 
