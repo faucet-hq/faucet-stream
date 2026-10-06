@@ -1024,13 +1024,21 @@ metrics work unchanged (`faucet_tee_records_total`, `faucet_merge_records_total`
 `faucet_join_*`, labelled `pipeline` + `node`).
 
 **State.** Each terminal sink owns a bookmark under `{name}::{node_id}`. On
-restart the source resumes from the **minimum** across every sink's stored
-bookmark (only when all sinks have one), so a lagging sink is never skipped —
-sinks whose bookmarks have diverged must be idempotent.
+restart the source resumes from a stored position only when the graph has one
+source node and every sink's bookmark agrees; otherwise it replays in full, so a
+lagging sink is never skipped — sinks whose bookmarks have diverged must be
+idempotent. Under `delivery: exactly_once` the source resumes from the sink
+furthest behind and every sink ahead of it skips what it already committed.
 
 **`on_error`.** `execution.on_error: stop` aborts the whole topology on the
 first node failure; `continue` lets healthy branches finish and reports the
-failures at the end.
+failures at the end. Either way a sink fed by a failed node is reported failed.
+
+**Runtimes and blocks.** `faucet run`, `faucet schedule` and `faucet serve` run a
+topology config as its graph; row-based commands (`doctor`, `plan`, `backfill`,
+`verify`, `rollback`, `mirror`) refuse it. `budget:`, `metadata_columns:` and
+`reconcile:` apply per sink node, an overwrite sink swaps in only when every node
+succeeded, `verify:` / `rollback:` are refused, and `usage:` is not applied.
 
 #### `join:` — enrich one stream from another by key
 

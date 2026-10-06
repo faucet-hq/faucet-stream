@@ -289,7 +289,9 @@ Request body:
 }
 ```
 
-- **`config`** (required) — the YAML or JSON pipeline body.
+- **`config`** (required) — the YAML or JSON pipeline body. A topology config
+  (`pipeline.nodes`) runs as its node graph; it is refused (`422`) for a tenant
+  run and with `doctor_first`, which probe matrix rows.
 - **`config_format`** — `yaml` (default) or `json`.
 - **`name`** — metadata; also drives the **state-key and metric identity** (see
   the cookbook's cardinality note). Two submissions sharing a `name` share
@@ -970,7 +972,9 @@ server's catalog. Nothing is written and no run starts (the sink is built
 only for its non-mutating probe), but the config is loaded on the server —
 its references resolve and discovery reaches its hosts — so it is `Plan`
 (operator); audited as
-`plan`. `impact` needs the `catalog` feature (`422` otherwise).
+`plan`. `impact` needs the `catalog` feature (`422` otherwise). A topology config
+(`pipeline.nodes`) is refused with `422`: a plan is per matrix row, and a node
+graph has none.
 
 **Policy refusals.** With `faucet serve --policy FILE`, every submission
 (`POST /v1/runs`, template triggers, backfills, trigger fires) is checked

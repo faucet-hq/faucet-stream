@@ -496,16 +496,23 @@ with `matrix:` — both non-empty is a load-time error. `faucet run` / `validate
 [Topology mode](../cookbook/topology.md) for the full grammar, the `join:`
 node, state semantics, and runnable examples.
 
-**What applies in topology mode.** Every top-level block does, each scoped to the
-node where it makes sense. The per-page governance passes — `pipeline.masking`,
+**What applies in topology mode.** Each block is scoped to the node where it
+makes sense. The per-page governance passes — `pipeline.masking`,
 `pipeline.quality`, `pipeline.contract`, `schema:` — are enforced per sink node,
 and `resilience:` applies to its writes. `sla:` keeps per-sink-node history under
 `{pipeline}::{node_id}`; `notifications:` reports per sink node; `lineage:` emits
 one job per sink node (`{pipeline}.{node_id}`) whose inputs are every source that
 reaches it; `catalog:` records a dataset per source and per sink plus an edge for
-each pair the graph connects. So do `--dry-run` / `--limit`, `${now.*}` /
-`--clock`, `state:`, and `dlq:`. See the
+each pair the graph connects. `budget:`, `metadata_columns:` and `reconcile:`
+apply per sink node too. So do `--dry-run` / `--limit`, `${now.*}` / `--clock`,
+`state:`, and `dlq:`. `verify:` and `rollback:` are refused (a graph sink has no
+single source to verify against, and runs are undone per matrix row), and
+`usage:` is accepted but not applied. See the
 [applies-per-node table](../cookbook/topology.md#observability) for the detail.
+
+`faucet run`, `faucet schedule` and `faucet serve` run a topology config as its
+graph; commands that work on matrix rows (`doctor`, `plan`, `backfill`,
+`verify`, `rollback`, `mirror`, change requests) refuse it with an explicit error.
 
 Column lineage is the one thing deliberately withheld: with several inputs
 feeding a sink, the per-column derivation is not knowable from the graph, so the
@@ -515,8 +522,9 @@ emit it as usual.
 **`delivery: exactly_once` is supported**, with five requirements checked at load
 time: exactly one source node, a replayable source, **every** sink idempotent, a
 durable `state:`, and no `dlq:`. Each sink node carries its own commit watermark
-and a restart resumes from the lowest committed sequence, so no sink is resumed
-past its own progress. See
+and a restart resumes from the position furthest behind; every sink ahead of it
+skips the replayed pages it already committed, so no sink is resumed past its own
+progress or writes a page twice. See
 [Exactly-once delivery](../cookbook/topology.md#exactly-once-delivery).
 
 **At-least-once resume is deliberately conservative.** Each sink node owns a
