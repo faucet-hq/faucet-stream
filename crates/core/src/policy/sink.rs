@@ -13,6 +13,7 @@ use super::compile::CompiledPolicy;
 use super::evaluate::{ColumnFacts, SinkFacts, Violation, evaluate};
 use super::spec::RuntimeAction;
 use crate::error::FaucetError;
+use crate::masking::CompiledMasking;
 use crate::traits::{RowOutcome, Sink};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -32,6 +33,7 @@ pub struct PolicySink {
     policy: Arc<CompiledPolicy>,
     facts: SinkFacts,
     scope: PolicyScope,
+    masking: Option<Arc<CompiledMasking>>,
 }
 
 impl PolicySink {
@@ -46,13 +48,22 @@ impl PolicySink {
             policy,
             facts,
             scope,
+            masking: None,
         }
+    }
+
+    /// The masking pass that ran upstream for this sink, so a column it
+    /// rewrote by name counts as masked with that action (as in the static
+    /// pass) instead of breaching a `mask:` rule.
+    pub fn with_masking(mut self, masking: Arc<CompiledMasking>) -> Self {
+        self.masking = Some(masking);
+        self
     }
 
     /// Classify one record's scalar leaves (by name and by value) and evaluate
     /// the rules; returns the violations with the harshest runtime action.
     fn check_record(&self, record: &Value) -> Vec<Violation> {
-        let columns = classify_record(&self.policy, record);
+        let columns = classify_record_masked(&self.policy, record, self.masking.as_deref());
         if columns.is_empty() {
             return Vec::new();
         }
@@ -129,13 +140,26 @@ impl PolicySink {
 /// Classify a record's scalar leaves into [`ColumnFacts`] (dot-paths), by
 /// name and by value. Columns that earn no label are omitted.
 pub fn classify_record(policy: &CompiledPolicy, record: &Value) -> Vec<ColumnFacts> {
+    classify_record_masked(policy, record, None)
+}
+
+/// [`classify_record`] for records that went through `masking`: a name label
+/// on a container covers every leaf beneath it, and a leaf the masking pass
+/// rewrote by name (itself or through an ancestor) reports that action.
+pub fn classify_record_masked(
+    policy: &CompiledPolicy,
+    record: &Value,
+    masking: Option<&CompiledMasking>,
+) -> Vec<ColumnFacts> {
     let mut out: BTreeMap<String, (BTreeSet<String>, &'static str)> = BTreeMap::new();
-    walk(policy, "", record, &mut out);
+    walk(policy, "", record, &BTreeSet::new(), &mut out);
     out.into_iter()
         .map(|(name, (labels, via))| ColumnFacts {
+            masked: masking
+                .and_then(|m| m.name_action_for(&name))
+                .map(str::to_string),
             name,
             labels,
-            masked: None,
             conservative: false,
             via: Some(via.to_string()),
         })
@@ -146,22 +170,32 @@ fn walk(
     policy: &CompiledPolicy,
     path: &str,
     value: &Value,
+    inherited: &BTreeSet<String>,
     out: &mut BTreeMap<String, (BTreeSet<String>, &'static str)>,
 ) {
+    let container_labels = |path: &str| {
+        let mut labels = inherited.clone();
+        if !path.is_empty() {
+            labels.extend(policy.labels_for_name(path));
+        }
+        labels
+    };
     match value {
         Value::Object(map) => {
+            let labels = container_labels(path);
             for (k, v) in map {
                 let child = if path.is_empty() {
                     k.clone()
                 } else {
                     format!("{path}.{k}")
                 };
-                walk(policy, &child, v, out);
+                walk(policy, &child, v, &labels, out);
             }
         }
         Value::Array(items) => {
+            let labels = container_labels(path);
             for (i, v) in items.iter().enumerate() {
-                walk(policy, &format!("{path}.{i}"), v, out);
+                walk(policy, &format!("{path}.{i}"), v, &labels, out);
             }
         }
         Value::Null => {}
@@ -170,6 +204,7 @@ fn walk(
                 return;
             }
             let mut labels = policy.labels_for_name(path);
+            labels.extend(inherited.iter().cloned());
             let mut via = "name";
             if let Value::String(s) = scalar {
                 let by_value = policy.labels_for_value(s);
@@ -467,6 +502,72 @@ mod tests {
             ]
         );
         assert!(classify_record(&p, &json!("scalar")).is_empty());
+    }
+
+    fn phones_policy() -> Arc<CompiledPolicy> {
+        let spec: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "fields": ["phones", "card"]}],
+            "rules": [{"name": "pii-masked", "when": {"label": "pii"}, "mask": ["hash", "partial"], "on_runtime": "fail"}]
+        }))
+        .unwrap();
+        Arc::new(CompiledPolicy::compile(&spec).unwrap())
+    }
+
+    fn phones_masking(action: &str) -> Arc<CompiledMasking> {
+        let spec: crate::masking::MaskingSpec = serde_json::from_value(json!({
+            "key": "k",
+            "rules": [{"match": {"field_pattern": "^(phones|card)$"}, "action": {"type": action}}]
+        }))
+        .unwrap();
+        Arc::new(CompiledMasking::compile(&spec).unwrap())
+    }
+
+    #[test]
+    fn a_container_label_covers_its_leaves_and_masking_is_reported() {
+        let p = phones_policy();
+        let rec = json!({"phones": ["+14155552671"], "card": {"number": "4111"}, "id": 1});
+        let cols = classify_record(&p, &rec);
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["card.number", "phones.0"]);
+        assert!(cols.iter().all(|c| c.masked.is_none()));
+
+        let m = phones_masking("hash");
+        let cols = classify_record_masked(&p, &rec, Some(&m));
+        assert!(cols.iter().all(|c| c.masked.as_deref() == Some("hash")));
+    }
+
+    #[tokio::test]
+    async fn masked_containers_pass_and_unmasked_ones_are_refused() {
+        let p = phones_policy();
+        let m = phones_masking("hash");
+        let records = crate::masking::apply_masking(
+            vec![json!({"phones": ["+14155552671"], "card": {"number": "4111111111111111"}})],
+            &m,
+        )
+        .records;
+        let (s, cap) = sink(Arc::clone(&p), "us");
+        let s = s.with_masking(Arc::clone(&m));
+        assert_eq!(s.write_batch(&records).await.unwrap(), 1);
+        assert_eq!(cap.0.lock().unwrap().len(), 1);
+
+        let (s, cap) = sink(Arc::clone(&p), "us");
+        let err = s
+            .write_batch(&[json!({"phones": ["+14155552671"]})])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::PolicyViolation { column, .. } if column == "phones.0"),
+            "{err}"
+        );
+        assert!(cap.0.lock().unwrap().is_empty());
+
+        let (s, _) = sink(p, "us");
+        let s = s.with_masking(phones_masking("tokenize"));
+        let err = s
+            .write_batch(&[json!({"phones": ["tok"]})])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("only masked with"), "{err}");
     }
 
     #[tokio::test]

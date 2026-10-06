@@ -245,6 +245,52 @@ fn run_refuses_before_any_connector_is_built_and_plan_doctor_report() {
 }
 
 #[test]
+fn runtime_backstop_accepts_a_name_masked_column_and_refuses_an_unmasked_one() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("in.csv"), "id,email\n1,alice@example.com\n").unwrap();
+    let cfg = |name: &str, masking: &str| {
+        write(
+            dir.path(),
+            &format!("{name}.yaml"),
+            &format!(
+                r#"version: 1
+name: rtmask
+policy:
+  classifications:
+    - {{ label: pii, fields: [email] }}
+  rules:
+    - name: pii-masked
+      when: {{ label: pii }}
+      mask: [hash]
+pipeline:
+  source: {{ type: csv, config: {{ path: "{in}" }} }}
+  sink: {{ type: jsonl, config: {{ path: "{out}" }} }}
+{masking}
+"#,
+                r#in = dir.path().join("in.csv").display(),
+                out = dir.path().join(format!("{name}.jsonl")).display(),
+            ),
+        )
+    };
+    let masked = cfg(
+        "masked",
+        "  masking:\n    key: k\n    rules:\n      - name: m\n        match: { fields: [email] }\n        action: { type: hash }\n",
+    );
+    faucet().args(["run"]).arg(&masked).assert().success();
+    let out = fs::read_to_string(dir.path().join("masked.jsonl")).unwrap();
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(!out.contains("alice@example.com"), "{out}");
+
+    let unmasked = cfg("unmasked", "");
+    faucet()
+        .args(["run"])
+        .arg(&unmasked)
+        .assert()
+        .failure()
+        .stderr(contains("Policy `pii-masked` violated"));
+}
+
+#[test]
 fn runtime_backstop_fails_on_a_detected_value_and_quarantines_with_a_dlq() {
     let dir = TempDir::new().unwrap();
     // No contract → nothing is known statically; the row `mail` (not a

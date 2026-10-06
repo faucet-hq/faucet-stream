@@ -2479,7 +2479,7 @@ async fn run_one_invocation(
             }
             let compiled = faucet_core::CompiledPolicy::compile(spec)
                 .map_err(|e| CliError::Config(format!("policy: {e}")))?;
-            Box::new(faucet_core::PolicySink::new(
+            let policy_sink = faucet_core::PolicySink::new(
                 sink,
                 Arc::new(compiled),
                 faucet_core::SinkFacts {
@@ -2491,7 +2491,17 @@ async fn run_one_invocation(
                     pipeline: pipeline_name.clone(),
                     row: row_id.clone(),
                 },
-            ))
+            );
+            Box::new(match &node.masking {
+                Some(masking) => policy_sink.with_masking(Arc::new(
+                    faucet_core::CompiledMasking::compile_for_sink(
+                        masking,
+                        &[node.sink_ref.as_str(), node.sink.kind.as_str()],
+                    )
+                    .map_err(|e| CliError::Config(format!("masking: {e}")))?,
+                )),
+                None => policy_sink,
+            })
         }
         None => sink,
     };

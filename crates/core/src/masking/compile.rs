@@ -81,6 +81,29 @@ impl CompiledMasking {
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
+
+    /// The action a name-based rule applies to the field at the dot-path
+    /// `column`, matched on the field itself or on any ancestor — the same
+    /// depth-first walk [`apply_masking`](super::apply_masking) performs, so a
+    /// container matched by name masks every leaf beneath it. Value-detector
+    /// rules are not consulted: they depend on the value, not the name.
+    pub fn name_action_for(&self, column: &str) -> Option<&'static str> {
+        let mut end = 0;
+        while end < column.len() {
+            end = column[end..].find('.').map_or(column.len(), |i| end + i);
+            let prefix = &column[..end];
+            if let Some(rule) = self.rules.iter().find(|r| {
+                r.fields.contains(prefix)
+                    || r.field_pattern
+                        .as_ref()
+                        .is_some_and(|re| re.is_match(prefix))
+            }) {
+                return Some(rule.action_label);
+            }
+            end += 1;
+        }
+        None
+    }
 }
 
 /// Whether `rule` applies to a sink identified by any of `sink_ids` (unscoped
@@ -192,6 +215,43 @@ mod tests {
         })))
         .unwrap_err();
         assert!(matches!(err, FaucetError::Config(m) if m.contains("tokenize prefix")));
+    }
+
+    #[test]
+    fn name_action_for_matches_the_field_or_an_ancestor() {
+        let c = CompiledMasking::compile_for_sink(
+            &spec(json!({
+                "rules": [
+                    { "match": { "value_detector": "email" }, "action": { "type": "redact" } },
+                    { "match": { "fields": ["phones"] }, "action": { "type": "hash" } },
+                    { "match": { "field_pattern": "^card$" }, "action": { "type": "partial" } },
+                    { "match": { "fields": ["user.ssn"] }, "action": { "type": "tokenize" } },
+                    { "match": { "fields": ["other"] }, "action": { "type": "redact" },
+                      "applies_to": ["elsewhere"] }
+                ]
+            })),
+            &["here"],
+        )
+        .unwrap();
+        assert_eq!(c.name_action_for("phones"), Some("hash"));
+        assert_eq!(c.name_action_for("phones.0"), Some("hash"));
+        assert_eq!(c.name_action_for("card.number"), Some("partial"));
+        assert_eq!(c.name_action_for("card"), Some("partial"));
+        assert_eq!(c.name_action_for("user.ssn"), Some("tokenize"));
+        assert_eq!(
+            c.name_action_for("ssn"),
+            None,
+            "fields match the full path only"
+        );
+        assert_eq!(c.name_action_for("user"), None);
+        assert_eq!(c.name_action_for("cardholder"), None);
+        assert_eq!(c.name_action_for("other"), None, "scoped to another sink");
+        assert_eq!(
+            c.name_action_for("email"),
+            None,
+            "detectors are value-based"
+        );
+        assert_eq!(c.name_action_for(""), None);
     }
 
     #[test]

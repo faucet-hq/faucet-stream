@@ -310,36 +310,19 @@ pub fn masked_action(node: &ExpandedNode, column: &str) -> Option<String> {
 }
 
 /// [`masked_action`] over an explicit masking spec + the sink's ids (its
-/// template / node id and connector kind) — shared with topology mode.
+/// template / node id and connector kind) — shared with topology mode. Uses
+/// the same matching as the masking pass itself, so a column is reported
+/// masked exactly when the pass rewrites it (directly or through an ancestor).
 #[cfg(feature = "masking")]
 pub fn masked_action_for(
     spec: Option<&faucet_core::MaskingSpec>,
     sink_ids: &[&str],
     column: &str,
 ) -> Option<String> {
-    let spec = spec?;
-    let leaf = column.rsplit('.').next().unwrap_or(column);
-    for rule in &spec.rules {
-        let applies = rule.applies_to.is_empty()
-            || rule
-                .applies_to
-                .iter()
-                .any(|t| sink_ids.contains(&t.as_str()));
-        if !applies {
-            continue;
-        }
-        let by_fields = rule.matcher.fields.iter().any(|f| f == column || f == leaf);
-        let by_pattern = rule
-            .matcher
-            .field_pattern
-            .as_deref()
-            .and_then(|p| regex::Regex::new(p).ok())
-            .is_some_and(|re| re.is_match(column));
-        if by_fields || by_pattern {
-            return Some(rule.action.label().to_string());
-        }
-    }
-    None
+    faucet_core::CompiledMasking::compile_for_sink(spec?, sink_ids)
+        .ok()?
+        .name_action_for(column)
+        .map(str::to_string)
 }
 #[cfg(not(feature = "masking"))]
 pub fn masked_action(_node: &ExpandedNode, _column: &str) -> Option<String> {
@@ -649,6 +632,40 @@ pipeline:
             "rule scoped to another sink"
         );
         assert_eq!(report.violations, 1);
+    }
+
+    #[cfg(feature = "masking")]
+    #[test]
+    fn masked_action_for_agrees_with_the_masking_pass() {
+        let spec: faucet_core::MaskingSpec = serde_json::from_value(json!({
+            "rules": [
+                { "match": { "fields": ["phones"] }, "action": { "type": "hash" } },
+                { "match": { "field_pattern": "^card$" }, "action": { "type": "tokenize" } },
+                { "match": { "fields": ["ssn"] }, "action": { "type": "partial" } }
+            ]
+        }))
+        .unwrap();
+        let at = |c: &str| masked_action_for(Some(&spec), &["default", "jsonl"], c);
+        assert_eq!(at("phones").as_deref(), Some("hash"));
+        assert_eq!(at("phones.0").as_deref(), Some("hash"));
+        assert_eq!(at("card.number").as_deref(), Some("tokenize"));
+        assert_eq!(at("ssn").as_deref(), Some("partial"));
+        assert_eq!(
+            at("user.ssn"),
+            None,
+            "the pass matches `fields` on the full path"
+        );
+        assert_eq!(masked_action_for(None, &["default"], "phones"), None);
+
+        let rows = vec![
+            json!({"phones": ["+14155552671"], "card": {"number": "4111111111111111"}, "user": {"ssn": "123-45-6789"}}),
+        ];
+        let compiled =
+            faucet_core::CompiledMasking::compile_for_sink(&spec, &["default", "jsonl"]).unwrap();
+        let out = faucet_core::masking::apply_masking(rows, &compiled).records;
+        assert_ne!(out[0]["phones"][0], json!("+14155552671"));
+        assert_ne!(out[0]["card"]["number"], json!("4111111111111111"));
+        assert_eq!(out[0]["user"]["ssn"], json!("123-45-6789"));
     }
 
     fn topology_cfg(extra_nodes: &str, extra: &str) -> PipelineConfig {
