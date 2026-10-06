@@ -529,4 +529,55 @@ mod serve {
         assert_eq!(doctor.status(), 422);
         assert!(!a.exists(), "nothing ran");
     }
+
+    #[tokio::test]
+    async fn backfill_rollback_and_change_requests_refuse_a_topology() {
+        let dir = TempDir::new().unwrap();
+        let (yaml, a, _) = tee_yaml(dir.path(), "");
+        let port = free_port();
+        spawn_server(port).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        let backfill = client
+            .post(format!("{base}/v1/backfill"))
+            .json(&serde_json::json!({
+                "config": yaml, "from": "2026-06-01", "to": "2026-06-03", "window": "1d"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(backfill.status(), 422);
+        assert!(backfill.text().await.unwrap().contains("topology config"));
+
+        let change = client
+            .post(format!("{base}/v1/changes"))
+            .json(&serde_json::json!({ "kind": "run", "payload": { "config": yaml } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(change.status(), 422);
+        assert!(change.text().await.unwrap().contains("topology config"));
+        assert!(!a.exists(), "nothing ran");
+
+        let run: serde_json::Value = client
+            .post(format!("{base}/v1/runs"))
+            .json(&serde_json::json!({ "config": yaml }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let run_id = run["run_id"].as_str().unwrap().to_string();
+        wait_terminal(&client, &base, &run_id).await;
+        let rollback = client
+            .post(format!("{base}/v1/runs/{run_id}/rollback"))
+            .json(&serde_json::json!({ "invocation_id": "x", "config": yaml }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rollback.status(), 422);
+        assert!(rollback.text().await.unwrap().contains("topology config"));
+    }
 }
