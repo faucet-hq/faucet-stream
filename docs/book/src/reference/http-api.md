@@ -898,7 +898,9 @@ cookbook](../cookbook/backfill.md) for the model.
   "timezone": "UTC",
   "name": "orders",
   "labels": {"requester": "airflow"},
-  "timeout_secs": 3600
+  "timeout_secs": 3600,
+  "resume": false,
+  "restart": false
 }
 ```
 
@@ -912,6 +914,13 @@ cookbook](../cookbook/backfill.md) for the model.
   pipeline `name` is rewritten per unit so state keys never touch the live
   bookmark). `delivery` is forced to `at_least_once`; `timeout_secs` applies
   per unit.
+- **`resume`** / **`restart`** — with a `state:` block the submitted range is
+  recorded in that state store, and a later POST of the same range is refused
+  with `409`: each unit would resume its old bookmark and read nothing. Set
+  `resume: true` to continue that backfill (submitted units replay, the rest
+  submit) or `restart: true` to delete each unit's scoped state and submit
+  every unit as a new run. Setting both is a `422`. Without a `state:` block no
+  unit keeps a bookmark, so the range is not recorded.
 
 `202` response: `{backfill, descriptor, planned, submitted, units: [{unit,
 start, end, status, run_id?, error?}]}` where `backfill` is the stable range
@@ -919,7 +928,8 @@ hash carried as the `backfill` label on every unit run (plus a `backfill_unit`
 label). Each unit is submitted with the deterministic idempotency key
 `backfill:{hash}:{unit}`, so **re-POSTing the same body is replay-safe** —
 already-submitted units replay their existing run, the rest submit (a full
-queue marks the remainder `not_submitted`; re-POST to continue). A config
+queue marks the remainder `not_submitted`; re-POST with `resume: true` to
+continue). A config
 carrying `shard: {count}` makes each unit a sharded run tracked via shard
 progress. Requires `RunWrite` (operator); audited as `backfill.submit`.
 

@@ -678,8 +678,12 @@ paths:
         forward-sync bookmark), `delivery` forced to `at_least_once`, the
         `${now.*}` clock set to the unit's window start, and a deterministic
         idempotency key (`backfill:{hash}:{unit}`). Re-POSTing the same body
-        is replay-safe: already-submitted units replay, the rest submit — the
-        API-level resume. A config carrying `shard: { count }` makes each unit
+        is replay-safe: already-submitted units replay, the rest submit. When
+        the config has a `state:` block the submitted range is recorded there,
+        and a later POST of the same range is refused with 409 unless it sets
+        `resume` (continue — submitted units replay) or `restart` (delete each
+        unit's scoped state and submit every unit as a new run), because each
+        unit would otherwise resume its old bookmark and read nothing. A config carrying `shard: { count }` makes each unit
         a sharded run tracked via shard progress. Requires the `RunWrite`
         permission (operator). Bookmark-range backfills are CLI-only
         (`faucet backfill --from-bookmark`).
@@ -701,6 +705,8 @@ paths:
                 name: { type: string }
                 labels: { type: object, additionalProperties: { type: string } }
                 timeout_secs: { type: integer, description: "Per-unit run timeout" }
+                resume: { type: boolean, default: false, description: "Continue a range submitted before (stateful configs)" }
+                restart: { type: boolean, default: false, description: "Clear each unit's scoped state and run a range submitted before again" }
       responses:
         "202":
           description: Units planned; one run submitted per unit
@@ -727,6 +733,8 @@ paths:
         "400": { description: Malformed body / range / window / timezone, config invalid, or a root source is not window-scoped }
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the required permission }
+        "409": { description: A stateful config's range was submitted before and neither `resume` nor `restart` is set }
+        "422": { description: "`resume` and `restart` both set, or a `callback` was supplied" }
   /v1/dlq/inspect:
     post:
       summary: Inspect a dead-letter-queue location (read-only)
