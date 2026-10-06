@@ -426,6 +426,33 @@ pub(crate) fn build_cleanup_delete_sql(
 
 /// Bind one record's values in `columns` order (SQL NULL for missing keys),
 /// with NULLs typed `varbinary` for the columns flagged in `binary`.
+/// Upsert rows grouped by the subset of `columns` each carries (a key present
+/// with `null` counts as carried), in first-seen order. An upsert writes each
+/// row's own columns only, so a column a row omits keeps its stored value
+/// instead of being overwritten with NULL (#789 SQL-10).
+pub(crate) fn group_by_present_columns<'a>(
+    records: &'a [Value],
+    columns: &[String],
+) -> Vec<(Vec<String>, Vec<&'a Value>)> {
+    let mut groups: Vec<(Vec<String>, Vec<&'a Value>)> = Vec::new();
+    for record in records {
+        let present: Vec<String> = columns
+            .iter()
+            .filter(|c| {
+                record
+                    .as_object()
+                    .is_some_and(|o| o.contains_key(c.as_str()))
+            })
+            .cloned()
+            .collect();
+        match groups.iter_mut().find(|(p, _)| *p == present) {
+            Some((_, rows)) => rows.push(record),
+            None => groups.push((present, vec![record])),
+        }
+    }
+    groups
+}
+
 pub(crate) fn auto_row_params_typed(
     record: &Value,
     columns: &[String],
@@ -446,6 +473,23 @@ pub(crate) fn auto_row_params_typed(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn upsert_rows_group_by_the_columns_they_carry() {
+        let cols: Vec<String> = ["id", "a", "b"].iter().map(|s| s.to_string()).collect();
+        let records = vec![
+            json!({"id": 1, "a": 1, "b": 1}),
+            json!({"id": 2, "a": null}),
+            json!({"id": 3, "a": 3, "b": 3}),
+            json!(7),
+        ];
+        let groups = group_by_present_columns(&records, &cols);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].0, cols);
+        assert_eq!(groups[0].1, vec![&records[0], &records[2]]);
+        assert_eq!(groups[1].0, vec!["id".to_string(), "a".to_string()]);
+        assert!(groups[2].0.is_empty(), "a non-object carries nothing");
+    }
 
     fn build_merge_cast_t(
         table: &str,

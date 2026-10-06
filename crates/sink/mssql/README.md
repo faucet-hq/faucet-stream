@@ -236,7 +236,7 @@ Azure storage and is not exercised in CI (same as the other staged-load sinks).
 
 In addition to the default append, the sink can **upsert** (insert-or-update by key) or **delete** by key. Both require `column_mapping: auto_columns` — the key columns must be real table columns, not buried inside a JSON column (using `json_column` with `upsert`/`delete` is rejected at construction). The key columns should have a `UNIQUE` / `PRIMARY KEY` constraint.
 
-- **`upsert`** — each record is merged via a single T-SQL [`MERGE`](https://learn.microsoft.com/sql/t-sql/statements/merge-transact-sql): matching rows (by `key`) have their non-key columns updated; non-matching rows are inserted. When every column is a key column there's nothing to update, so the `WHEN MATCHED` clause is omitted. Within a batch, records sharing a key are deduplicated **last-write-wins** before the `MERGE` runs (MERGE rejects a source targeting the same key twice).
+- **`upsert`** — each record is merged via a single T-SQL [`MERGE`](https://learn.microsoft.com/sql/t-sql/statements/merge-transact-sql): matching rows (by `key`) have their non-key columns updated; non-matching rows are inserted. When every column is a key column there's nothing to update, so the `WHEN MATCHED` clause is omitted. A record updates only the columns it carries: rows are grouped by their set of keys, one `MERGE` per group, so a column a record omits keeps its stored value (an explicit `null` still clears it). Within a batch, records sharing a key are deduplicated **last-write-wins** before the `MERGE` runs (MERGE rejects a source targeting the same key twice).
 - **`delete`** — every record's `key` is collected and deleted via `MERGE … WHEN MATCHED THEN DELETE` (T-SQL has no row-constructor `IN ((a,b), …)`), so single- and multi-column keys share one code path.
 - **`delete_marker`** (upsert mode only) — rows whose `field` equals one of `values` are routed to a delete instead of an upsert; the marker field is stripped from the upserted record. This lets a CDC stream carrying an operation flag drive inserts, updates, and deletes from one pipeline.
 
@@ -285,7 +285,7 @@ See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 ## Schema evolution
 
-`MssqlSink` reports its live destination schema via `current_schema()` (read from `sys.columns`, including nullability), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
+`MssqlSink` reports its live destination schema via `current_schema()` (read from `sys.columns`, including nullability), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink in `auto_columns` mode. In `json_column` mode the table's columns are not the record's fields, so the sink reports no schema and a `schema:` policy is inert.
 
 Under `on_drift: evolve`, `MssqlSink::evolve_schema()` applies additive DDL:
 

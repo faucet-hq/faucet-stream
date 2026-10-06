@@ -29,7 +29,8 @@ use crate::config::{MssqlColumnMapping, MssqlSinkConfig};
 use crate::encode::{
     BoundParam, auto_row_params_typed, build_cleanup_delete_sql, build_cleanup_key_insert_sql,
     build_cleanup_temp_create_sql, build_cleanup_temp_drop_sql, build_insert_sql_cast,
-    build_merge_cast, build_merge_delete_cast, max_rows_per_insert, resolve_insert_columns,
+    build_merge_cast, build_merge_delete_cast, group_by_present_columns, max_rows_per_insert,
+    resolve_insert_columns,
 };
 
 /// One chunk ready to bind: the column list, each column's `CAST` target, and
@@ -664,26 +665,33 @@ impl MssqlSink {
         if cols.is_empty() {
             return Ok(0);
         }
-        let casts = casts_for(&infos, &cols);
-        let binary = binary_flags(&infos, &cols);
-        let per_insert = max_rows_per_insert(cols.len());
-        for sub in upserts.chunks(per_insert) {
-            let sql = build_merge_cast(
-                &self.table_quoted,
-                &self.config.write.key,
-                &cols,
-                &casts,
-                sub.len(),
-            )
-            .map_err(|e| (e, false))?;
-            // Bind every row's params concatenated row-major — matches the @PN
-            // numbering build_merge emits.
-            let owned: Vec<BoundParam> = sub
-                .iter()
-                .flat_map(|r| auto_row_params_typed(r, &cols, &binary))
-                .collect();
-            let refs: Vec<&dyn ToSql> = owned.iter().map(|p| p.as_tosql()).collect();
-            self.exec_merge(conn, &sql, &refs).await?;
+        // One MERGE per set of carried columns, so an absent column is left
+        // untouched rather than set to NULL (SQL-10).
+        for (cols, rows) in group_by_present_columns(upserts, &cols) {
+            if cols.is_empty() {
+                continue;
+            }
+            let casts = casts_for(&infos, &cols);
+            let binary = binary_flags(&infos, &cols);
+            let per_insert = max_rows_per_insert(cols.len());
+            for sub in rows.chunks(per_insert) {
+                let sql = build_merge_cast(
+                    &self.table_quoted,
+                    &self.config.write.key,
+                    &cols,
+                    &casts,
+                    sub.len(),
+                )
+                .map_err(|e| (e, false))?;
+                // Bind every row's params concatenated row-major — matches the
+                // @PN numbering build_merge emits.
+                let owned: Vec<BoundParam> = sub
+                    .iter()
+                    .flat_map(|r| auto_row_params_typed(r, &cols, &binary))
+                    .collect();
+                let refs: Vec<&dyn ToSql> = owned.iter().map(|p| p.as_tosql()).collect();
+                self.exec_merge(conn, &sql, &refs).await?;
+            }
         }
         Ok(upserts.len())
     }
@@ -1527,6 +1535,14 @@ impl Sink for MssqlSink {
     /// `infer_schema`-shaped object (`{"type":"object","properties":{…}}`), or
     /// `None` when the target table does not exist yet (issue #194).
     async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+        // A JSON column stores each record whole; its physical columns are not
+        // the record's fields, so there is nothing to drift against (SQL-20).
+        if matches!(
+            self.config.column_mapping,
+            MssqlColumnMapping::JsonColumn { .. }
+        ) {
+            return Ok(None);
+        }
         let cols = self.discover_column_types().await?;
         if cols.is_empty() {
             return Ok(None); // table does not exist yet

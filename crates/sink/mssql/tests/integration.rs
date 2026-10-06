@@ -291,3 +291,62 @@ async fn a_timed_out_write_leaves_no_transaction_for_the_next_page() {
     let ids: Vec<i32> = rows.iter().filter_map(|r| r.get::<i32, _>("id")).collect();
     assert_eq!(ids, vec![2], "the page after the timeout must be committed");
 }
+
+/// SQL-10: an upsert leaves a column a record does not carry untouched; an
+/// explicit `null` still clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_keeps_columns_a_record_does_not_carry() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.partial (id INT NOT NULL PRIMARY KEY, a NVARCHAR(20) NULL, \
+         b NVARCHAR(20) NULL)",
+    )
+    .await;
+    exec(
+        &pool,
+        "INSERT INTO dbo.partial VALUES (1, N'a1', N'b1'), (2, N'a2', N'b2')",
+    )
+    .await;
+
+    let mut up = auto_cfg(&cfg, "dbo.partial");
+    up.write = serde_json::from_value(json!({"write_mode": "upsert", "key": ["id"]})).unwrap();
+    let sink = MssqlSink::new(up).await.expect("upsert sink");
+    sink.write_batch(&[
+        json!({"id": 1, "a": "a1-new"}),
+        json!({"id": 2, "a": "a2-new", "b": null}),
+        json!({"id": 3, "b": "b3"}),
+    ])
+    .await
+    .expect("upsert");
+
+    let mut conn = pool.get().await.expect("checkout");
+    let rows = conn
+        .query("SELECT id, a, b FROM dbo.partial ORDER BY id", &[])
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    let got: Vec<(i32, Option<String>, Option<String>)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<i32, _>("id").unwrap(),
+                r.get::<&str, _>("a").map(str::to_string),
+                r.get::<&str, _>("b").map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, Some("a1-new".into()), Some("b1".into())),
+            (2, Some("a2-new".into()), None),
+            (3, None, Some("b3".into())),
+        ]
+    );
+}

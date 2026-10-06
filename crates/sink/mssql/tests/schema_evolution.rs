@@ -243,3 +243,26 @@ async fn relaxing_nullability_keeps_the_declared_type() {
         Some("12345678901234567.1234567891")
     );
 }
+
+/// SQL-20: a JSON-column sink stores each record whole, so it reports no
+/// destination schema and a `schema:` drift policy stays inert instead of
+/// treating every record field as an addition.
+#[tokio::test(flavor = "multi_thread")]
+async fn json_column_mode_reports_no_schema() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 1).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.json_docs (id INT IDENTITY PRIMARY KEY, data NVARCHAR(MAX))",
+    )
+    .await;
+
+    let mut s = sink_cfg(&cfg, "dbo.json_docs");
+    s.column_mapping = MssqlColumnMapping::JsonColumn {
+        column: "data".into(),
+    };
+    let sink = MssqlSink::new(s).await.expect("sink");
+    assert!(sink.current_schema().await.expect("schema").is_none());
+}
