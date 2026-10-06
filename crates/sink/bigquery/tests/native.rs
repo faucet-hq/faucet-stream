@@ -448,3 +448,112 @@ async fn load_native_rejects_an_unsupported_format() {
         .expect_err("parquet is not a load_native format here");
     assert!(err.to_string().contains("unsupported format"), "{err}");
 }
+
+/// SQL-36: once a mid-run flush committed the native append load, later
+/// NDJSON batches — whole buffers and streams split mid-line — stream through
+/// `insertAll` rather than opening one load job per page.
+#[tokio::test]
+async fn load_native_appends_after_a_flush_stream_rows() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_resumable(&server, "/session/native-4", "job-native-4").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}/insertAll"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    let ctx = || NativeLoadContext {
+        write_mode: WriteMode::Append,
+        first_batch: true,
+    };
+
+    let first = NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec());
+    sink.load_native(first, "p::row", ctx())
+        .await
+        .expect("page 1");
+    sink.flush().await.expect("flush 1");
+
+    let second = NativeBatch::bytes(
+        NativeFormat::NdJson,
+        b"{\"Id\":\"2\"}\n\n{\"Id\":\"3\"}\n".to_vec(),
+    );
+    let n = sink
+        .load_native(second, "p::row", ctx())
+        .await
+        .expect("page 2");
+    assert_eq!(n, 2);
+
+    let chunks: Vec<Result<Vec<u8>, faucet_core::FaucetError>> = vec![
+        Ok(b"{\"Id\":\"4\"}\n{\"I".to_vec()),
+        Ok(b"d\":\"5\"}\n{\"Id\":\"6\"}".to_vec()),
+    ];
+    let third = NativeBatch {
+        format: NativeFormat::NdJson,
+        payload: NativePayload::Stream(Box::pin(futures::stream::iter(chunks))),
+        csv: faucet_core::CsvDialect::default(),
+        records: None,
+        bookmark: None,
+    };
+    let n = sink
+        .load_native(third, "p::row", ctx())
+        .await
+        .expect("page 3");
+    assert_eq!(n, 3);
+    sink.flush().await.expect("flush 2");
+
+    assert_eq!(
+        upload_bodies(&server).await.len(),
+        1,
+        "one load job for the run"
+    );
+    let inserts: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/insertAll"))
+        .map(|r| gunzip(&r.body))
+        .collect();
+    let all = inserts.join("\n");
+    for id in ["2", "3", "4", "5", "6"] {
+        assert!(
+            all.contains(&format!("\"Id\":\"{id}\"")),
+            "{id} missing: {all}"
+        );
+    }
+}
+
+/// A malformed NDJSON line on the streamed path is an error, not a silent drop.
+#[tokio::test]
+async fn load_native_streamed_rows_reject_malformed_ndjson() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_resumable(&server, "/session/native-5", "job-native-5").await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    let ctx = NativeLoadContext {
+        write_mode: WriteMode::Append,
+        first_batch: true,
+    };
+    let first = NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec());
+    sink.load_native(first, "p::row", ctx)
+        .await
+        .expect("page 1");
+    sink.flush().await.expect("flush");
+    let bad = NativeBatch::bytes(NativeFormat::NdJson, b"{not json}\n".to_vec());
+    let err = sink
+        .load_native(bad, "p::row", ctx)
+        .await
+        .expect_err("malformed line");
+    assert!(err.to_string().contains("invalid NDJSON"), "{err}");
+}
+
+fn gunzip(bytes: &[u8]) -> String {
+    use std::io::Read;
+    let mut d = flate2::read::GzDecoder::new(bytes);
+    let mut s = String::new();
+    d.read_to_string(&mut s).expect("gunzip");
+    s
+}

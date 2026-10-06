@@ -11,7 +11,7 @@ Reach for it when you want to land events, CDC streams, or query results into a 
 
 ## Feature highlights
 
-- **Bucket-free bulk load (default)** — appends and overwrites stream into a single resumable BigQuery load job (gzip-compressed newline-delimited JSON, no GCS bucket), so a run costs one job rather than one per page. Set `media_load: false` for the per-page `jobs.query` path, or `insert_id_field` for streaming `tabledata.insertAll`.
+- **Bucket-free bulk load (default)** — appends and overwrites stream into a single resumable BigQuery load job (gzip-compressed newline-delimited JSON, no GCS bucket), so a run costs one job rather than one per page (after a mid-run flush, appends switch to `insertAll` — see [Streaming & batching](#streaming--batching)). Set `media_load: false` for the per-page `jobs.query` path, or `insert_id_field` for streaming `tabledata.insertAll`.
 - **Three credential modes** — Application Default Credentials, a service-account key file, or inline service-account JSON. The shared `BigQueryCredentials` enum is re-exported from [`faucet-common-bigquery`](https://crates.io/crates/faucet-common-bigquery) so it matches the BigQuery **source** byte-for-byte.
 - **Write modes** — `append` (default), `upsert`, and `delete` via an in-place `MERGE` over the target table; no staging table required.
 - **Effectively-once delivery** — pair with a CDC source for a multi-statement `MERGE`/`INSERT` transaction that commits records and a `_faucet_commit_token` watermark atomically.
@@ -210,6 +210,8 @@ See the full runnable config at [`cli/examples/postgres_cdc_to_bigquery_upsert.y
 Appends (and overwrites) stream each page into a **single resumable load job** — `multipart/related` uploads of gzip-compressed newline-delimited JSON, finalized on `flush`. No GCS bucket is involved (unlike the `arrow` `bulk_load` path), and no page is buffered past its chunk, so peak memory is O(chunk) regardless of table size.
 
 This is the default because the alternative is job-latency bound rather than volume bound: a ~59k-row overwrite at `batch_size: 1000` issued ~60 sequential query jobs and took 6m44s, and BigQuery's per-table load-job budget (1,500/day) is spent one job per *run* here instead of one per *page*.
+
+**Sources that bookmark every page** (CDC, Kafka, Kinesis, incremental file reads) make the pipeline flush after each committed page, and a flush finalizes the load. So that a continuous stream does not run one load job per page — blocking on each and exhausting the daily budget — the first flush commits the run's load job and later append pages stream through `tabledata.insertAll` for the rest of the run (logged once). The same applies to native NDJSON pages; native CSV pages keep loading per page. On `arrow` builds the first columnar batch is one Parquet load and later batches join the row path, so a run makes at most two load jobs (`bulk_load: true` still stages and loads each batch through GCS).
 
 `batch_size` does not chunk the load — pages feed one stream. Three things opt out of it:
 

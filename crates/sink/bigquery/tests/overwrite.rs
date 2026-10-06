@@ -903,6 +903,66 @@ async fn append_media_load_streams_one_load_on_flush() {
     );
 }
 
+/// SQL-36: a mid-run flush (a bookmark-carrying page) finalizes the append load
+/// once; later pages stream through `insertAll` instead of opening a load job
+/// per page, so a continuously bookmarking source never exhausts the daily
+/// load-job quota.
+#[tokio::test]
+async fn append_media_load_streams_rows_after_a_mid_run_flush() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_resumable(&server, "/resumable/app-2", "load-app-2").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}/insertAll"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let mut config = BigQuerySinkConfig::new(
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ApplicationDefault,
+    );
+    config.media_load = true;
+    config.upload_base_url = Some(server.uri());
+    let config = with_sa_auth(config, &server);
+    let (sink, _sa) = build_sink(&server, config).await;
+
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("page 1");
+    sink.flush().await.expect("flush 1");
+    sink.write_batch(&[json!({"id": 2, "name": "b"})])
+        .await
+        .expect("page 2");
+    sink.flush().await.expect("flush 2");
+    sink.write_batch(&[json!({"id": 3, "name": "c"})])
+        .await
+        .expect("page 3");
+    sink.flush().await.expect("flush 3");
+
+    let reqs = server.received_requests().await.expect("recording");
+    let initiates = reqs
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().starts_with("/upload/"))
+        .count();
+    assert_eq!(initiates, 1, "one load job for the whole run");
+    let inserts: Vec<String> = reqs
+        .iter()
+        .filter(|r| r.url.path().ends_with("/insertAll"))
+        .map(|r| gunzip(&r.body))
+        .collect();
+    assert_eq!(inserts.len(), 2, "pages after the flush stream rows");
+    assert!(inserts[0].contains("\"id\":2") && inserts[1].contains("\"id\":3"));
+    let puts = session_puts(&server, "/resumable/app-2").await;
+    assert_eq!(puts.len(), 1);
+    assert!(gunzip(&puts[0]).contains("\"id\":1"));
+}
+
 /// An empty overwrite source opens no session and finalizes cleanly — no upload
 /// initiate, no PUT — leaving the destination untouched.
 #[tokio::test]

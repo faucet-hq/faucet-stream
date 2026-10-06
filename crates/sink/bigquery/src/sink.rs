@@ -286,6 +286,18 @@ fn build_load_job_json_full(
     job
 }
 
+/// Parse newline-delimited JSON (blank lines skipped) into records.
+fn parse_ndjson(bytes: &[u8]) -> Result<Vec<Value>, FaucetError> {
+    bytes
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .map(|line| {
+            serde_json::from_slice(line)
+                .map_err(|e| FaucetError::Sink(format!("BigQuery: invalid NDJSON line: {e}")))
+        })
+        .collect()
+}
+
 /// A table's own schema as a load-job `schema`, or `None` when it has no fields.
 fn existing_load_schema(
     schema: &gcp_bigquery_client::model::table_schema::TableSchema,
@@ -498,6 +510,8 @@ struct UploadSession {
     /// Set once the terminating chunk has been accepted, so a second
     /// flush/commit is a no-op.
     finalized: bool,
+    /// Whether this session is a `WRITE_APPEND` load.
+    appending: bool,
     /// Compressed-buffer size at which a mid-stream chunk is PUT. Production uses
     /// [`RESUMABLE_CHUNK`] (8 MiB); tests lower it via `config.resumable_chunk`
     /// so the multi-chunk path is reachable without an 8 MiB payload.
@@ -594,6 +608,13 @@ pub struct BigQuerySink {
     /// rather than trusting a flag another instance set. See
     /// [`insert_overwrite_page`](Self::insert_overwrite_page).
     overwrite_setup: AtomicBool,
+    /// Set when the pipeline flushed an append load mid-run (a source that
+    /// bookmarks every page, SQL-36): later appends stream via `insertAll`
+    /// instead of opening one load job per page.
+    stream_appends: AtomicBool,
+    /// Whether a columnar batch has already been loaded with its own job.
+    #[cfg(feature = "arrow")]
+    columnar_loaded: AtomicBool,
     /// In-flight streaming resumable-upload load session (`media_load` append and
     /// solo-direct overwrite). Opened lazily on the first page, fed per page, and
     /// finalized in [`flush`](faucet_core::Sink::flush) — which runs on the same
@@ -637,6 +658,9 @@ impl BigQuerySink {
             roundtrips: faucet_core::observability::RecorderSlot::new(),
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
+            stream_appends: AtomicBool::new(false),
+            #[cfg(feature = "arrow")]
+            columnar_loaded: AtomicBool::new(false),
             upload_session: tokio::sync::Mutex::new(None),
             #[cfg(feature = "arrow")]
             gcs_store: tokio::sync::OnceCell::new(),
@@ -660,6 +684,9 @@ impl BigQuerySink {
             roundtrips: faucet_core::observability::RecorderSlot::new(),
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
+            stream_appends: AtomicBool::new(false),
+            #[cfg(feature = "arrow")]
+            columnar_loaded: AtomicBool::new(false),
             upload_session: tokio::sync::Mutex::new(None),
             #[cfg(feature = "arrow")]
             gcs_store: tokio::sync::OnceCell::new(),
@@ -1266,6 +1293,7 @@ impl BigQuerySink {
             )),
             http,
             finalized: false,
+            appending: write_disposition == "WRITE_APPEND",
             chunk_threshold: self.config.resumable_chunk.unwrap_or(RESUMABLE_CHUNK),
         })
     }
@@ -1396,6 +1424,14 @@ impl BigQuerySink {
                 )));
             }
             sess.finalized = true;
+            if sess.appending && !self.stream_appends.swap(true, Ordering::AcqRel) {
+                tracing::info!(
+                    table = %self.config.table_id,
+                    "BigQuery: the pipeline flushed an append load mid-run (the source \
+                     bookmarks every page); later appends stream via insertAll so the run \
+                     does not spend one load job per page"
+                );
+            }
             let job: Job = serde_json::from_str(&text).map_err(|e| {
                 FaucetError::Sink(format!("resumable finalize: parse job response: {e}"))
             })?;
@@ -1410,6 +1446,53 @@ impl BigQuerySink {
         self.await_load_job(&job_id, location.as_deref())
             .await
             .map(|_| ())
+    }
+
+    /// Append `records` to the target. Via a bucket-free load job when
+    /// `media_load` is on: the page streams into one `WRITE_APPEND` resumable
+    /// load job (finalized in `flush`) — no streaming buffer, no per-row
+    /// insertAll quota, gzip-compressed, peak memory O(chunk + page). Once a
+    /// mid-run flush has committed such a load, the source bookmarks every page
+    /// and a load job per page would collapse throughput and exhaust the
+    /// per-table load-job quota (SQL-36), so later appends use `insertAll`.
+    async fn append_rows(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        if appends_via_media_load(&self.config) && !self.stream_appends.load(Ordering::Acquire) {
+            self.feed_session(&self.config.table_id, "WRITE_APPEND", records)
+                .await?;
+            return Ok(records.len());
+        }
+
+        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
+            // Sentinel: pass the entire upstream page through in a single
+            // insertAll call. Subject to BigQuery's ~10MB request limit.
+            vec![records]
+        } else {
+            records.chunks(self.config.batch_size).collect()
+        };
+
+        let mut total = 0;
+        for chunk in chunks {
+            total += self.insert_batch(chunk).await?;
+        }
+
+        tracing::info!(
+            table = %format!(
+                "{}.{}.{}",
+                self.config.project_id, self.config.dataset_id, self.config.table_id
+            ),
+            rows = total,
+            "BigQuery write complete"
+        );
+        Ok(total)
+    }
+
+    /// Whether a native NDJSON append streams through `insertAll` because a
+    /// mid-run flush already committed a load job (SQL-36).
+    fn streams_native_appends(&self, write_disposition: &str) -> bool {
+        write_disposition == "WRITE_APPEND" && self.stream_appends.load(Ordering::Acquire)
     }
 
     /// Best-effort cancel of an un-finalized resumable session (DELETE the
@@ -1978,40 +2061,7 @@ impl faucet_core::Sink for BigQuerySink {
         }
 
         self.ensure_table_ready(records).await?;
-
-        // Append via a bucket-free load job when `media_load` is on: stream the
-        // page into one `WRITE_APPEND` resumable load job (finalized in `flush`)
-        // instead of the streaming `insertAll` chunk loop — no streaming buffer,
-        // no per-row insertAll quota, gzip-compressed, and peak memory O(chunk +
-        // page) regardless of table size.
-        if appends_via_media_load(&self.config) {
-            self.feed_session(&self.config.table_id, "WRITE_APPEND", records)
-                .await?;
-            return Ok(records.len());
-        }
-
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            // Sentinel: pass the entire upstream page through in a single
-            // insertAll call. Subject to BigQuery's ~10MB request limit.
-            vec![records]
-        } else {
-            records.chunks(self.config.batch_size).collect()
-        };
-
-        let mut total = 0;
-        for chunk in chunks {
-            total += self.insert_batch(chunk).await?;
-        }
-
-        tracing::info!(
-            table = %format!(
-                "{}.{}.{}",
-                self.config.project_id, self.config.dataset_id, self.config.table_id
-            ),
-            rows = total,
-            "BigQuery write complete"
-        );
-        Ok(total)
+        self.append_rows(records).await
     }
 
     /// Write records to BigQuery, returning a per-row outcome vector.
@@ -2198,6 +2248,19 @@ impl faucet_core::Sink for BigQuerySink {
             // from the first chunk; the row count is the NDJSON line count.
             (faucet_core::NativeFormat::NdJson, faucet_core::NativePayload::Stream(mut s)) => {
                 use futures::StreamExt;
+                if self.streams_native_appends(write_disposition) {
+                    let mut rows = 0usize;
+                    let mut carry: Vec<u8> = Vec::new();
+                    while let Some(chunk) = s.next().await {
+                        carry.extend_from_slice(&chunk?);
+                        let complete = carry.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                        let values = parse_ndjson(&carry[..complete])?;
+                        carry.drain(..complete);
+                        rows += self.append_rows(&values).await?;
+                    }
+                    rows += self.append_rows(&parse_ndjson(&carry)?).await?;
+                    return Ok(rows);
+                }
                 let mut rows = 0usize;
                 let mut first = true;
                 while let Some(chunk) = s.next().await {
@@ -2231,6 +2294,9 @@ impl faucet_core::Sink for BigQuerySink {
             (faucet_core::NativeFormat::NdJson, faucet_core::NativePayload::Bytes(raw)) => {
                 if raw.is_empty() {
                     return Ok(0);
+                }
+                if self.streams_native_appends(write_disposition) {
+                    return self.append_rows(&parse_ndjson(&raw)?).await;
                 }
                 let rows = batch
                     .records
@@ -2691,6 +2757,16 @@ impl faucet_core::Sink for BigQuerySink {
             self.roundtrips.record("load");
             return crate::load::write_columnar(&self.client, &self.config, &self.gcs_store, batch)
                 .await;
+        }
+        // One Parquet load per run; later batches take the row path (SQL-36).
+        if self.columnar_loaded.swap(true, Ordering::AcqRel) {
+            let rows = faucet_core::record_batch_to_values(batch)?;
+            if overwrite {
+                self.feed_session(&self.config.table_id, "WRITE_APPEND", &rows)
+                    .await?;
+                return Ok(rows.len());
+            }
+            return self.append_rows(&rows).await;
         }
         let token = self.access_token().await?;
         self.roundtrips.record("load");

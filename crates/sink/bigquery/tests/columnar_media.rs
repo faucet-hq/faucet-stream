@@ -196,10 +196,57 @@ async fn an_empty_batch_uploads_nothing() {
 /// Overwrite truncates on the **first** batch and appends after. Truncating on
 /// every batch would leave only the last one in the table — a silent,
 /// green-run data loss.
+/// The resumable-upload pair later batches feed: initiate (`Location` back at
+/// the mock) and the finalize PUT returning a DONE job.
+async fn mount_resumable(server: &MockServer) {
+    let session = format!("{}/session/col", server.uri());
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
+        .and(query_param("uploadType", "resumable"))
+        .respond_with(ResponseTemplate::new(200).insert_header("location", session.as_str()))
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/session/col"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": { "projectId": PROJECT_ID, "jobId": JOB_ID },
+            "status": { "state": "DONE" }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Upload POSTs in order, each as (`uploadType`, body text).
+async fn uploads(server: &MockServer) -> Vec<(String, String)> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().contains("/upload/bigquery"))
+        .map(|r| {
+            let kind = r
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "uploadType")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            (kind, String::from_utf8_lossy(&r.body).to_string())
+        })
+        .collect()
+}
+
+/// The first batch of an overwrite run truncates with one Parquet load; later
+/// batches join a single `WRITE_APPEND` load finalized on flush rather than one
+/// load job per batch (SQL-36). Previously this asserted a Parquet load per
+/// batch, which is the per-batch quota burn SQL-36 removes.
 #[tokio::test]
 async fn overwrite_truncates_once_then_appends() {
     let server = MockServer::start().await;
     mount(&server).await;
+    mount_resumable(&server).await;
     // The target exists with a designed schema; the truncating load must carry
     // it, or BigQuery replaces it with the Parquet file's own (SQL-35).
     Mock::given(method("GET"))
@@ -220,32 +267,54 @@ async fn overwrite_truncates_once_then_appends() {
     cfg.write.write_mode = faucet_core::WriteMode::Overwrite;
     let sink = build_sink(&server, cfg).await;
 
-    sink.write_batch_columnar(&batch(&["1"])).await.expect("b1");
-    sink.write_batch_columnar(&batch(&["2"])).await.expect("b2");
-    sink.write_batch_columnar(&batch(&["3"])).await.expect("b3");
-
-    let dispositions: Vec<String> = upload_bodies(&server)
-        .await
-        .iter()
-        .map(|b| {
-            let t = String::from_utf8_lossy(b);
-            if t.contains("WRITE_TRUNCATE") {
-                "TRUNCATE".to_string()
-            } else {
-                "APPEND".to_string()
-            }
-        })
-        .collect();
     assert_eq!(
-        dispositions,
-        vec!["TRUNCATE", "APPEND", "APPEND"],
-        "only the first batch of an overwrite run may truncate"
+        sink.write_batch_columnar(&batch(&["1"])).await.expect("b1"),
+        1
     );
-    let first = String::from_utf8_lossy(&upload_bodies(&server).await[0]).to_string();
+    assert_eq!(
+        sink.write_batch_columnar(&batch(&["2"])).await.expect("b2"),
+        1
+    );
+    assert_eq!(
+        sink.write_batch_columnar(&batch(&["3"])).await.expect("b3"),
+        1
+    );
+    sink.flush().await.expect("flush");
+
+    let ups = uploads(&server).await;
+    assert_eq!(
+        ups.len(),
+        2,
+        "one truncating Parquet load, one append load: {ups:?}"
+    );
+    assert_eq!(ups[0].0, "multipart");
+    assert!(ups[0].1.contains("WRITE_TRUNCATE"));
     assert!(
-        first.contains("\"mode\":\"REQUIRED\"") && first.contains("the key"),
-        "the truncating load keeps the table's schema: {first}"
+        ups[0].1.contains("\"mode\":\"REQUIRED\"") && ups[0].1.contains("the key"),
+        "the truncating load keeps the table's schema: {}",
+        ups[0].1
     );
+    assert_eq!(ups[1].0, "resumable");
+    assert!(ups[1].1.contains("WRITE_APPEND"));
+}
+
+/// Append runs load the first columnar batch as Parquet; later batches go
+/// through the row path's single append load (SQL-36).
+#[tokio::test]
+async fn append_loads_parquet_once_per_run() {
+    let server = MockServer::start().await;
+    mount(&server).await;
+    mount_resumable(&server).await;
+    let sink = build_sink(&server, config(&server)).await;
+
+    sink.write_batch_columnar(&batch(&["1"])).await.expect("b1");
+    sink.write_batch_columnar(&batch(&["2", "3"]))
+        .await
+        .expect("b2");
+    sink.flush().await.expect("flush");
+
+    let kinds: Vec<String> = uploads(&server).await.into_iter().map(|u| u.0).collect();
+    assert_eq!(kinds, vec!["multipart", "resumable"]);
 }
 
 /// A non-2xx upload must surface as an error, not a silent success — the load
