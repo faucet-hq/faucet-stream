@@ -19,7 +19,7 @@ Reach for it when you want to stream live mutations out of an operational Postgr
 - **Crash-safe WAL feedback** — the advertised `confirmed_flush_lsn` advances *only* from a durably-persisted bookmark, so Postgres never recycles WAL for changes the consumer hasn't committed.
 - **TLS-capable** — `require` / `verify_ca` / `verify_full` modes for the replication connection (plaintext `disable` is the default for back-compat).
 - **Type-aware decoding** — booleans, integers, floats (incl. `NaN`/`Infinity`), `numeric` (exact precision), `bytea` (base64), `json`/`jsonb`, and 1-D scalar arrays decode to native JSON; everything else is preserved as raw Postgres text.
-- **OOM safety valves** — `max_staged_records` bounds a single in-progress transaction; `idle_timeout` and `max_messages` bound a fetch cycle.
+- **OOM and WAL safety valves** — `max_staged_records` bounds a single in-progress transaction; `idle_timeout`, `max_messages` and `max_cycle_duration` (default 5 minutes, so a cycle ends even under steady writes) bound a fetch cycle.
 
 ## Installation
 
@@ -90,7 +90,7 @@ pipeline:
 faucet run pipeline.yaml
 ```
 
-Each fetch cycle drains all pending changes, then stops once the stream has been idle for `idle_timeout` seconds. Re-running resumes from the persisted bookmark. For a continuously-running mirror, drive this under `faucet schedule` or `faucet replicate`.
+Each fetch cycle drains pending changes and stops once the stream has been idle for `idle_timeout` seconds, or at the first transaction boundary after `max_cycle_duration` (default 300 s). The slot's `confirmed_flush_lsn` advances at the start of the next cycle, from the bookmark this one persisted — so the bound is what keeps a busy primary's `pg_wal` from growing without limit. Re-running resumes from the persisted bookmark. For a continuously-running mirror, drive this under `faucet schedule` or `faucet replicate`.
 
 ## Configuration reference
 
@@ -111,7 +111,8 @@ Each fetch cycle drains all pending changes, then stops once the stream has been
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `idle_timeout` | seconds | `30` | Stop the current fetch cycle after this long with no new replication message. Must be `> 0`. |
-| `max_messages` | usize? | `null` | Optional cap on change events drained per fetch call. Checked **after each COMMIT**, never mid-transaction — a transaction larger than the cap still emits atomically. `idle_timeout` is the primary terminator. |
+| `max_messages` | usize? | `null` | Optional cap on change events drained per fetch call. Checked **after each COMMIT**, never mid-transaction — a transaction larger than the cap still emits atomically. |
+| `max_cycle_duration` | seconds | `300` | End the fetch cycle at the first transaction boundary after this long, even while changes keep arriving, so the next cycle advances the slot. `0` = no bound (a cycle then ends only on `idle_timeout` / `max_messages`; under steady writes it never ends and the slot pins WAL). |
 | `max_staged_records` | usize? | `null` | Max change records buffered for a **single in-progress transaction** before the run aborts with a typed `FaucetError::Source`. `null` = unbounded. The OOM safety valve for huge bulk transactions — see [Transactional consistency](#transactional-consistency). |
 | `status_update_interval` | seconds | `10` | Standby Status Update (keepalive) cadence. Must be **strictly less than** `idle_timeout` and well under the server's `wal_sender_timeout` (default 60 s). |
 | `tcp_keepalive` | seconds | `60` | TCP keepalive on the replication connection. |
