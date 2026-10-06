@@ -28,7 +28,7 @@ running/billed compute and no Python.
 | `storage_options` | map | `{}` | Passed verbatim to delta-rs; explicit keys win over `credentials` |
 | `create_if_not_missing` | bool | `true` | Create the table + schema on first write |
 | `partition_by` | string[] | `[]` | Partition columns (applied only on create) |
-| `schema_sample_size` | int | `100` | Records sampled to infer the schema on create |
+| `schema_sample_size` | int | `100` | Records sampled to infer the schema on create; an existing table's own schema is always used |
 | `batch_size` | int | `1000` | Arrow record-batch write size; `0` = no re-chunk |
 | `target_file_size` | int? | *(unset)* | Commit early once the in-memory parquet buffer reaches this many bytes, which both caps output data-file size and bounds peak memory to roughly this value. Unset means one commit per run and a buffer that grows with the whole dataset — fine for small loads, an OOM risk on a large table, since a bulk source emits no bookmarks and so triggers no intermediate flush. Expect a few commits per run when set: that is the trade the knob exists to let you make. |
 
@@ -69,3 +69,7 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
+## Integer columns
+
+A fractional number bound for an integer column (`10.5` into a `long`) fails the write naming the column instead of being truncated.

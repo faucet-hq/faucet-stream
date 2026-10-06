@@ -163,3 +163,34 @@ async fn an_explicit_schema_casts_and_checks_columnar_batches() {
         .to_string();
     assert!(e.contains("[more]"), "{e}");
 }
+
+/// #789 FILE-04: a value the declared type cannot hold fails the write
+/// instead of landing as NULL (columnar) or truncated (rows).
+#[tokio::test]
+async fn an_explicit_schema_refuses_values_that_do_not_fit() {
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let int32 = json!({"schema": [{"name": "id", "type": "int32"}]});
+
+    let s = sink(json!({"path": p(dir.path(), "c.parquet"), "parquet": int32}));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![1, 3_000_000_000]))],
+    )
+    .unwrap();
+    let e = s
+        .write_batch_columnar(&batch)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("'id'"), "{e}");
+
+    let s = sink(json!({"path": p(dir.path(), "r.parquet"), "parquet": int32}));
+    let e = pages(&s, &[vec![json!({"id": 1}), json!({"id": 3.7})]])
+        .await
+        .unwrap_err();
+    assert!(e.contains("'id'") && e.contains("3.7"), "{e}");
+}

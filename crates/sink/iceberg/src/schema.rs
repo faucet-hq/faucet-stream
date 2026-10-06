@@ -94,11 +94,15 @@ pub fn infer_arrow_schema(records: &[Value], sample: usize) -> Result<SchemaRef,
 /// 2. `decoder.serialize(records)?`
 /// 3. `decoder.flush()?.ok_or(...)`
 ///
-/// Returns `FaucetError::Sink` on any conversion failure.
+/// Returns `FaucetError::Sink` on any conversion failure, including a
+/// fractional number bound for an integer column (arrow-json would truncate
+/// it).
 pub fn json_to_record_batch(
     records: &[Value],
     schema: &SchemaRef,
 ) -> Result<RecordBatch, FaucetError> {
+    faucet_core::check_integral(records, schema)
+        .map_err(|e| FaucetError::Sink(format!("iceberg: {e}")))?;
     let mut decoder = ReaderBuilder::new(schema.clone())
         .build_decoder()
         .map_err(|e| FaucetError::Sink(format!("iceberg: failed to build JSON decoder: {e}")))?;

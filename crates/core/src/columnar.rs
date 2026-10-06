@@ -169,11 +169,13 @@ fn refine_wide_integers(schema: &Schema, records: &[Value]) -> Result<Schema, Fa
 
 /// Encode a slice of JSON records into a single [`RecordBatch`] against `schema`.
 ///
-/// Returns an empty batch if `records` is empty.
+/// Returns an empty batch if `records` is empty. A fractional number bound
+/// for an integer column is an error (see [`check_integral`]).
 pub fn values_to_record_batch(
     records: &[Value],
     schema: SchemaRef,
 ) -> Result<RecordBatch, FaucetError> {
+    check_integral(records, &schema)?;
     let mut decoder = arrow_json::ReaderBuilder::new(schema.clone())
         .build_decoder()
         .map_err(|e| te("decoder build", e))?;
@@ -189,6 +191,79 @@ pub fn values_to_record_batch(
         return Ok(batches.pop().unwrap());
     }
     arrow::compute::concat_batches(&schema, &batches).map_err(|e| te("concat", e))
+}
+
+/// Refuse a fractional JSON number bound for an integer column of `schema`,
+/// at any depth (struct fields, list items).
+///
+/// arrow-json converts a float into an integer column by truncating it
+/// (`3.7` → `3`), so any JSON → Arrow decode against a declared or inferred
+/// integer type should run this first. Whole floats (`3.0`) pass.
+pub fn check_integral(records: &[Value], schema: &Schema) -> Result<(), FaucetError> {
+    use arrow::datatypes::DataType;
+
+    fn holds_integer(dt: &DataType) -> bool {
+        match dt {
+            DataType::Struct(fields) => fields.iter().any(|f| holds_integer(f.data_type())),
+            DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+                holds_integer(f.data_type())
+            }
+            other => other.is_integer(),
+        }
+    }
+
+    fn walk(value: &Value, dt: &DataType, path: &str) -> Result<(), FaucetError> {
+        match (value, dt) {
+            (Value::Number(n), dt) if dt.is_integer() => {
+                if n.as_i64().is_none()
+                    && n.as_u64().is_none()
+                    && n.as_f64()
+                        .is_none_or(|x| x.fract() != 0.0 || !x.is_finite())
+                {
+                    return Err(FaucetError::Transform(format!(
+                        "field '{path}': {n} is not a whole number, but the column is {dt}"
+                    )));
+                }
+                Ok(())
+            }
+            (Value::Object(map), DataType::Struct(fields)) => {
+                for f in fields {
+                    if let Some(child) = map.get(f.name()) {
+                        walk(child, f.data_type(), &format!("{path}.{}", f.name()))?;
+                    }
+                }
+                Ok(())
+            }
+            (
+                Value::Array(items),
+                DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _),
+            ) => {
+                for item in items {
+                    walk(item, f.data_type(), &format!("{path}[]"))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .filter(|f| holds_integer(f.data_type()))
+        .collect();
+    if fields.is_empty() {
+        return Ok(());
+    }
+    for record in records {
+        let Value::Object(map) = record else { continue };
+        for f in &fields {
+            if let Some(v) = map.get(f.name()) {
+                walk(v, f.data_type(), f.name())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convenience: infer the schema from `records` and encode them into a batch.
@@ -342,6 +417,42 @@ pub fn schema_eq(a: &Schema, b: &Schema) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_fractional_number_in_an_integer_column_is_refused() {
+        use arrow::datatypes::{DataType, Field, Fields};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new(
+                "s",
+                DataType::Struct(Fields::from(vec![Field::new("m", DataType::Int32, true)])),
+                true,
+            ),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+                true,
+            ),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let ok = [
+            json!({"n": 3.0, "s": {"m": 2}, "l": [1, 2], "f": 1.5}),
+            json!("x"),
+        ];
+        let batch = values_to_record_batch(&ok[..1], schema.clone()).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        check_integral(&ok, &schema).unwrap();
+        for (bad, field) in [
+            (json!({"n": 3.7}), "n"),
+            (json!({"s": {"m": 0.5}}), "s.m"),
+            (json!({"l": [1, 2.25]}), "l[]"),
+        ] {
+            let err = values_to_record_batch(&[bad], schema.clone()).unwrap_err();
+            assert!(err.to_string().contains(&format!("'{field}'")), "{err}");
+        }
+        let floats = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+        check_integral(&[json!({"f": 0.5})], &floats).unwrap();
+    }
 
     #[test]
     fn round_trip_scalars_nulls_nested() {
