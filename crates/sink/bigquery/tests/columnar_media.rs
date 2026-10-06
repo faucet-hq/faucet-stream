@@ -378,3 +378,39 @@ async fn a_200_upload_without_a_job_id_is_an_error() {
         .expect_err("a job with no jobId must error");
     assert!(err.to_string().contains("jobId"), "{err}");
 }
+
+/// The original seven-argument `write_columnar_media` stays callable and loads
+/// without an explicit schema.
+#[tokio::test]
+async fn write_columnar_media_without_a_schema_still_loads() {
+    let server = MockServer::start().await;
+    mount(&server).await;
+    let sa_file = tempfile::NamedTempFile::new().expect("sa tempfile");
+    std::fs::write(
+        sa_file.path(),
+        serde_json::to_string_pretty(&dummy_service_account_json(&server.uri())).unwrap(),
+    )
+    .expect("write sa");
+    let client = ClientBuilder::new()
+        .with_auth_base_url(format!("{}{AUTH_SCOPE_BASE}", server.uri()))
+        .with_v2_base_url(server.uri())
+        .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+        .await
+        .expect("build client");
+    let cfg = config(&server);
+    let n = faucet_sink_bigquery::load::write_columnar_media(
+        &client,
+        &cfg,
+        &server.uri(),
+        "fake-token",
+        TABLE_ID,
+        "WRITE_APPEND",
+        &batch(&["1"]),
+    )
+    .await
+    .expect("load");
+    assert_eq!(n, 1);
+    let ups = uploads(&server).await;
+    assert_eq!(ups.len(), 1);
+    assert!(!ups[0].1.contains("\"schema\""), "{}", ups[0].1);
+}

@@ -127,8 +127,33 @@ pub async fn write_columnar(
 /// resumable machinery here is built around a gzip encoder that must not touch
 /// Parquet bytes. Batch size is what bounds the body; a very large batch is
 /// what `bulk_load` staging remains for.
-#[allow(clippy::too_many_arguments)]
 pub async fn write_columnar_media(
+    client: &Client,
+    config: &BigQuerySinkConfig,
+    upload_base: &str,
+    token: &str,
+    table_id: &str,
+    write_disposition: &str,
+    batch: &RecordBatch,
+) -> Result<usize, FaucetError> {
+    write_columnar_media_with_schema(
+        client,
+        config,
+        upload_base,
+        token,
+        table_id,
+        write_disposition,
+        None,
+        batch,
+    )
+    .await
+}
+
+/// [`write_columnar_media`] with an explicit load-job `schema`. A truncating
+/// load passes the existing table's schema, so the refresh keeps its types,
+/// modes and descriptions instead of taking the Parquet file's (SQL-35).
+#[allow(clippy::too_many_arguments)]
+pub async fn write_columnar_media_with_schema(
     client: &Client,
     config: &BigQuerySinkConfig,
     upload_base: &str,

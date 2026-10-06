@@ -2775,7 +2775,7 @@ impl faucet_core::Sink for BigQuerySink {
         } else {
             None
         };
-        crate::load::write_columnar_media(
+        crate::load::write_columnar_media_with_schema(
             &self.client,
             &self.config,
             self.upload_base(),
