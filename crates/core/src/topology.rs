@@ -51,6 +51,25 @@
 //!   text*, which is not the replication order — so a "minimum" picked that way
 //!   can sit ahead of the true minimum and skip records. Divergent bookmarks
 //!   therefore replay in full rather than guess.
+//! - **Exactly-once orders by committed position.** Each sink's position comes
+//!   from its state, overridden by the bookmark embedded in its commit token
+//!   when the token is ahead. The source resumes from the earliest position;
+//!   a sink ahead of it skips what it already committed — by position when the
+//!   source can order its positions ([`Source::position_le`]), otherwise by its
+//!   commit-token sequence, with every sink started at the laggard's sequence so
+//!   the sequences keep comparing across sinks.
+//! - **A merge that rejoins one source's copies gates the positions.** After a
+//!   tee fans a source out and a merge joins the branches back, a position is
+//!   forwarded only once every branch has delivered it, so a sink never persists
+//!   a position while another branch's copy of that page is still in flight. A
+//!   join may not read both of its sides from one upstream node: it drains its
+//!   build side first, which would block the shared upstream forever.
+//!
+//! A sink node in `write_mode: overwrite` stages before its first write and swaps
+//! its staging in — then persists its position — only once every node of the
+//! graph has succeeded and the run was not cancelled; otherwise it discards the
+//! staging. A sink whose input closed because an upstream node failed reports
+//! that failure instead of a successful, partial run.
 //!
 //! ## Governance passes
 //!
@@ -427,6 +446,9 @@ enum NodeOutcome {
         bookmark: Option<Value>,
         /// Kept so a fully successful graph can finalize it (#753).
         sink: Box<dyn Sink>,
+        /// Where an overwrite sink's bookmark goes once its staging is
+        /// swapped in (#789 CORE-14).
+        deferred: Option<DeferredState>,
     },
     /// A source node and how many records it emitted. Needed so a lineage /
     /// catalog edge can report the volume *that input* contributed rather than
@@ -549,6 +571,49 @@ impl Topology {
 
         self.detect_cycle()?;
         self.check_reachability()?;
+        self.check_join_inputs()?;
+        Ok(())
+    }
+
+    /// A join drains its whole build side before it reads the probe side, so its
+    /// two inputs must not share an upstream node. A tee feeding both sides blocks
+    /// on the probe send once that channel fills, the build side never closes, and
+    /// the run hangs (#789 CORE-13).
+    fn check_join_inputs(&self) -> Result<(), FaucetError> {
+        let mut rev: HashMap<&str, Vec<&Edge>> = HashMap::new();
+        for e in &self.edges {
+            rev.entry(e.to.as_str()).or_default().push(e);
+        }
+        for n in &self.nodes {
+            let NodeKind::Join(j) = &n.kind else {
+                continue;
+            };
+            let side = |label: &str| -> Option<HashSet<String>> {
+                let from = rev
+                    .get(n.id.as_str())?
+                    .iter()
+                    .find(|e| e.label.as_deref() == Some(label))?
+                    .from
+                    .as_str();
+                let mut set = ancestors_of(from, &rev);
+                set.insert(from.to_string());
+                Some(set)
+            };
+            let (Some(build), Some(probe)) = (side(&j.build_edge), side(&j.probe_edge)) else {
+                continue;
+            };
+            let mut shared: Vec<&String> = build.intersection(&probe).collect();
+            shared.sort();
+            if let Some(node) = shared.first() {
+                return Err(cfg(format!(
+                    "join '{}' reads both its build and probe sides from node '{node}'; the \
+                     join drains its build side before reading the probe side, so a shared \
+                     upstream blocks once the probe channel fills and the run never ends. \
+                     Feed the two sides from separate source nodes",
+                    n.id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -693,66 +758,110 @@ impl Topology {
         opts: TopologyOptions,
         governance: TopologyGovernance,
     ) -> Result<TopologyRun, FaucetError> {
-        self.validate()?;
+        match self.run_attributed(opts, governance).await {
+            (_, Some(e)) => Err(e),
+            (run, None) => Ok(run),
+        }
+    }
+
+    /// [`Topology::run_reported`] that keeps the per-node attribution when the
+    /// run fails.
+    ///
+    /// `run_reported` returns only the error under [`TopologyOnError::Propagate`],
+    /// so a caller reporting per sink node (notifications, SLA, lineage) had
+    /// nothing to report from and skipped the failure entirely (#789 CLI-18).
+    /// Here the [`TopologyRun`] is always returned, alongside the error that
+    /// `run_reported` would have returned. A sink that a failed node feeds is
+    /// reported as failed too: its input closing looked like a normal end of
+    /// stream, but it never received its complete input.
+    pub async fn run_attributed(
+        self,
+        opts: TopologyOptions,
+        governance: TopologyGovernance,
+    ) -> (TopologyRun, Option<FaucetError>) {
+        if let Err(e) = self.validate() {
+            return (TopologyRun::default(), Some(e));
+        }
+        let facts = GraphFacts::of(&self.nodes, &self.edges);
         let Topology { nodes, edges } = self;
 
-        // Capacity per outgoing edge: a tee's edges use its configured
-        // capacity; everything else uses the default.
-        let tee_cap: HashMap<&str, usize> = nodes
+        let order: Vec<(String, &'static str)> = nodes
             .iter()
-            .filter_map(|n| match &n.kind {
-                NodeKind::Tee { capacity, .. } => Some((n.id.as_str(), *capacity)),
-                _ => None,
-            })
+            .map(|n| (n.id.clone(), n.kind.kind_str()))
             .collect();
 
-        // Resume point for the source node(s) — only when provably safe (see
-        // `start_bookmark`); otherwise every source replays in full.
-        let sink_ids: Vec<String> = nodes
-            .iter()
-            .filter(|n| n.kind.is_sink())
-            .map(|n| n.id.clone())
-            .collect();
-        let source_count = nodes.iter().filter(|n| n.kind.is_source()).count();
-        // The graph's source replay capability, captured before the sources are
-        // moved into their futures. Only meaningful with exactly one source —
-        // which is also the only shape exactly-once is allowed in (#458).
-        let source_replay = if source_count == 1 {
-            nodes.iter().find_map(|n| match &n.kind {
-                NodeKind::Source(src) => Some(src.replay_guarantee()),
-                _ => None,
-            })
+        // Sources are shared (`Arc`) so a sink node can ask the graph's source to
+        // order two of its positions when it skips pages it already committed.
+        let mut sources: HashMap<String, Arc<dyn Source>> = HashMap::new();
+        let mut rest: Vec<Node> = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            match n.kind {
+                NodeKind::Source(s) => {
+                    sources.insert(n.id, Arc::from(s));
+                }
+                kind => rest.push(Node { id: n.id, kind }),
+            }
+        }
+        let source_count = sources.len();
+        let only_source: Option<Arc<dyn Source>> = if source_count == 1 {
+            sources.values().next().cloned()
         } else {
             None
         };
+
+        // Capacity per outgoing edge: a tee's edges use its configured
+        // capacity; everything else uses the default.
+        let tee_cap: HashMap<String, usize> = rest
+            .iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Tee { capacity, .. } => Some((n.id.clone(), *capacity)),
+                _ => None,
+            })
+            .collect();
+
+        // The graph's source replay capability. Only meaningful with exactly one
+        // source — which is also the only shape exactly-once is allowed in (#458).
+        let source_replay = only_source.as_ref().map(|s| s.replay_guarantee());
         // How sink nodes store their bookmarks (#736): owned by the graph's
         // only source when there is one; a multi-source graph never resumes
         // from a sink bookmark, so its bookmarks are owned by the graph.
-        let codec = nodes
-            .iter()
-            .find_map(|n| match &n.kind {
-                NodeKind::Source(src) if source_count == 1 => Some(
-                    crate::state_version::StateCodec::for_source(src.as_ref(), false),
-                ),
-                _ => None,
-            })
+        let codec = only_source
+            .as_ref()
+            .map(|s| crate::state_version::StateCodec::for_source(s.as_ref(), false))
             .unwrap_or(crate::state_version::StateCodec {
                 owner: "topology".into(),
                 schema: 0,
                 legacy: false,
             });
-        let only_source = nodes.iter().find_map(|n| match &n.kind {
-            NodeKind::Source(src) if source_count == 1 => Some(src.as_ref()),
-            _ => None,
-        });
-        let start_bookmark = compute_start_bookmark(
+
+        let sink_refs: Vec<(String, Option<&dyn Sink>)> = rest
+            .iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Sink(s) => Some((n.id.clone(), Some(s.as_ref()))),
+                _ => None,
+            })
+            .collect();
+        let plan = match compute_resume(
             &opts,
-            &sink_ids,
+            &sink_refs,
             source_count,
             governance.delivery,
-            only_source,
+            only_source.as_deref(),
         )
-        .await?;
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => return (TopologyRun::default(), Some(e)),
+        };
+        drop(sink_refs);
+
+        // Every node runs under one cooperative token: a caller's cancel reaches
+        // it, and under `Propagate` a node failure cancels it so the siblings stop
+        // at their next page boundary — including a node parked on a full or empty
+        // channel, which a token checked only after `recv` returns never reaches
+        // (#789 CORE-13).
+        let coop = opts.cancel.clone().unwrap_or_default().child_token();
+        let failed: FailedNodes = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // Build channels.
         let mut outs: HashMap<String, Vec<mpsc::Sender<StreamPage>>> = HashMap::new();
@@ -774,82 +883,125 @@ impl Topology {
         // Build one future per node. `Send + 'static` so each node can own a
         // task (see the spawn below).
         type NodeFut = Pin<Box<dyn Future<Output = Result<NodeOutcome, FaucetError>> + Send>>;
-        let mut futs: Vec<NodeFut> = Vec::with_capacity(nodes.len());
-        // Parallel to `futs`, so a failure can be attributed to its node.
-        let mut order: Vec<(String, &'static str)> = Vec::with_capacity(nodes.len());
+        let mut by_id: HashMap<String, NodeFut> = HashMap::new();
 
-        for node in nodes {
+        for (id, source) in sources {
+            let node_outs = outs.remove(&id).unwrap_or_default();
+            let keep = node_outs.clone();
+            let fut: NodeFut = Box::pin(run_source_node(
+                id.clone(),
+                source,
+                plan.start.clone(),
+                opts.batch_size,
+                node_outs,
+                coop.clone(),
+            ));
+            by_id.insert(
+                id.clone(),
+                track_failure(id, fut, keep, Arc::clone(&failed)),
+            );
+        }
+
+        for node in rest {
             let node_outs = outs.remove(&node.id).unwrap_or_default();
+            let keep = node_outs.clone();
             let mut node_ins = ins.remove(&node.id).unwrap_or_default();
             let pipeline = opts.pipeline_name.clone();
-            let cancel = opts.cancel.clone();
+            let cancel = coop.clone();
             let Node { id, kind } = node;
-            order.push((id.clone(), kind.kind_str()));
 
-            let fut: NodeFut = match kind {
-                NodeKind::Source(source) => {
-                    let sb = start_bookmark.clone();
-                    let bs = opts.batch_size;
-                    Box::pin(run_source_node(id, source, sb, bs, node_outs, cancel))
-                }
-                NodeKind::Transform(stages) => {
-                    let rx = take_single(node_ins)
-                        .ok_or_else(|| cfg(format!("transform '{id}' has no input edge")))?;
-                    let labels = Labels::new(pipeline.clone(), id.clone(), opts.run_id.clone());
-                    Box::pin(run_transform_node(stages, labels, rx, node_outs, cancel))
-                }
-                NodeKind::Tee { .. } => {
-                    let rx = take_single(node_ins)
-                        .ok_or_else(|| cfg(format!("tee '{id}' has no input edge")))?;
-                    Box::pin(run_tee_node(id, pipeline, rx, node_outs, cancel))
-                }
+            let built: Result<NodeFut, FaucetError> = match kind {
+                NodeKind::Source(_) => Err(cfg(format!("source '{id}' was not prepared"))),
+                NodeKind::Transform(stages) => take_single(node_ins)
+                    .ok_or_else(|| cfg(format!("transform '{id}' has no input edge")))
+                    .map(|rx| {
+                        let labels = Labels::new(pipeline.clone(), id.clone(), opts.run_id.clone());
+                        Box::pin(run_transform_node(stages, labels, rx, node_outs, cancel))
+                            as NodeFut
+                    }),
+                NodeKind::Tee { .. } => take_single(node_ins)
+                    .ok_or_else(|| cfg(format!("tee '{id}' has no input edge")))
+                    .map(|rx| {
+                        Box::pin(run_tee_node(id.clone(), pipeline, rx, node_outs, cancel))
+                            as NodeFut
+                    }),
                 NodeKind::Merge => {
                     let rxs: Vec<mpsc::Receiver<StreamPage>> =
                         node_ins.into_iter().map(|ie| ie.rx).collect();
-                    Box::pin(run_merge_node(id, pipeline, rxs, node_outs, cancel))
+                    let mode = facts
+                        .merge_modes
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(MergeMode::Passthrough);
+                    Ok(Box::pin(run_merge_node(
+                        id.clone(),
+                        pipeline,
+                        rxs,
+                        node_outs,
+                        cancel,
+                        mode,
+                    )) as NodeFut)
                 }
                 NodeKind::Join(j) => {
                     let build_rx = take_by_label(&mut node_ins, &j.build_edge);
                     let probe_rx = take_by_label(&mut node_ins, &j.probe_edge);
                     match (build_rx, probe_rx) {
-                        (Some(b), Some(p)) => {
-                            Box::pin(run_join_node(id, pipeline, j, b, p, node_outs, cancel))
-                        }
-                        _ => {
-                            return Err(cfg(format!(
-                                "join '{id}' is missing its build/probe input edges"
-                            )));
-                        }
+                        (Some(b), Some(p)) => Ok(Box::pin(run_join_node(
+                            id.clone(),
+                            pipeline,
+                            j,
+                            b,
+                            p,
+                            node_outs,
+                            cancel,
+                        )) as NodeFut),
+                        _ => Err(cfg(format!(
+                            "join '{id}' is missing its build/probe input edges"
+                        ))),
                     }
                 }
-                NodeKind::Sink(sink) => {
-                    let rx = take_single(node_ins)
-                        .ok_or_else(|| cfg(format!("sink '{id}' has no input edge")))?;
-                    let sopts = SinkNodeOpts {
-                        pipeline_name: pipeline,
-                        run_id: opts.run_id.clone(),
-                        state_store: opts.state_store.clone(),
-                        dlq: opts.dlq.clone(),
-                        cancel: cancel.clone(),
-                        // Masking is destination-scoped, so each sink node takes
-                        // the policy compiled for it (if any); the rest are
-                        // pipeline-wide.
-                        #[cfg(feature = "masking")]
-                        masking: governance.masking_by_sink.get(&id).cloned(),
-                        #[cfg(feature = "quality")]
-                        quality: governance.quality.clone(),
-                        #[cfg(feature = "contract")]
-                        contract: governance.contract.clone(),
-                        schema_drift: governance.schema_drift,
-                        resilience: governance.resilience.clone(),
-                        delivery: governance.delivery,
-                        replay: source_replay,
-                        codec: codec.clone(),
-                    };
-                    Box::pin(run_sink_node(id, sink, rx, sopts))
-                }
+                NodeKind::Sink(sink) => match take_single(node_ins) {
+                    None => Err(cfg(format!("sink '{id}' has no input edge"))),
+                    Some(rx) => {
+                        let resume = plan.sinks.get(&id).cloned();
+                        let sopts = SinkNodeOpts {
+                            pipeline_name: pipeline,
+                            run_id: opts.run_id.clone(),
+                            state_store: opts.state_store.clone(),
+                            dlq: opts.dlq.clone(),
+                            cancel: cancel.clone(),
+                            // Masking is destination-scoped, so each sink node
+                            // takes the policy compiled for it (if any); the rest
+                            // are pipeline-wide.
+                            #[cfg(feature = "masking")]
+                            masking: governance.masking_by_sink.get(&id).cloned(),
+                            #[cfg(feature = "quality")]
+                            quality: governance.quality.clone(),
+                            #[cfg(feature = "contract")]
+                            contract: governance.contract.clone(),
+                            schema_drift: governance.schema_drift,
+                            resilience: governance.resilience.clone(),
+                            delivery: governance.delivery,
+                            replay: source_replay,
+                            codec: codec.clone(),
+                            resume,
+                            position_source: only_source.clone(),
+                            upstream: facts.ancestors.get(&id).cloned().unwrap_or_default(),
+                            failed: Arc::clone(&failed),
+                        };
+                        Ok(Box::pin(run_sink_node(id.clone(), sink, rx, sopts)) as NodeFut)
+                    }
+                },
             };
-            futs.push(fut);
+            match built {
+                Ok(fut) => {
+                    by_id.insert(
+                        id.clone(),
+                        track_failure(id, fut, keep, Arc::clone(&failed)),
+                    );
+                }
+                Err(e) => return (TopologyRun::default(), Some(e)),
+            }
         }
 
         // Drop the leftover maps so no dangling senders keep channels open.
@@ -862,6 +1014,10 @@ impl Topology {
         // stall every other node including the sinks (#456 M5). A spawned node
         // also isolates panics: they arrive as a `JoinError` we report, rather
         // than unwinding the caller.
+        let futs: Vec<NodeFut> = order
+            .iter()
+            .filter_map(|(id, _)| by_id.remove(id))
+            .collect();
         let handles: Vec<tokio::task::JoinHandle<Result<NodeOutcome, FaucetError>>> =
             futs.into_iter().map(tokio::spawn).collect();
         // Dropping a `JoinHandle` detaches the task rather than cancelling it, so
@@ -883,6 +1039,7 @@ impl Topology {
             }
         });
 
+        let externally_cancelled = || cancelled(&opts.cancel);
         match opts.on_error {
             TopologyOnError::Propagate => {
                 // Do NOT `try_join_all`: it returns on the first error and drops
@@ -894,7 +1051,6 @@ impl Topology {
                 // (#146 H16, #456 M1). A node that does not stop within the grace
                 // window is still dropped, so a sink wedged mid-write cannot hang
                 // the run.
-                let coop = opts.cancel.clone().unwrap_or_default().child_token();
                 let first_err: Arc<std::sync::Mutex<Option<FaucetError>>> =
                     Arc::new(std::sync::Mutex::new(None));
                 let failures: Arc<std::sync::Mutex<Vec<(String, String, NodeErrorKind)>>> =
@@ -950,19 +1106,19 @@ impl Topology {
                         Vec::new()
                     }
                 };
-                if let Some(e) = first_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
-                    return Err(e);
-                }
                 let outcomes: Vec<NodeOutcome> = outcomes.into_iter().flatten().collect();
-                complete_sinks(&outcomes, &opts.cancel).await?;
+                let err = first_err.lock().unwrap_or_else(|p| p.into_inner()).take();
+                let complete = err.is_none() && !externally_cancelled();
+                let finish = finish_sinks(&outcomes, complete).await;
                 let (result, per_source) = aggregate(outcomes);
                 let failed = failures.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let nodes = reports(&order, &result, &per_source, &failed);
-                Ok(TopologyRun {
+                let nodes = reports(&order, &result, &per_source, &failed, &facts.ancestors);
+                let run = TopologyRun {
                     result,
                     nodes,
                     per_source,
-                })
+                };
+                (run, err.or(finish.err()))
             }
             TopologyOnError::Continue => {
                 let results = futures::future::join_all(joined).await;
@@ -983,70 +1139,377 @@ impl Topology {
                         }
                     }
                 }
-                if errs.is_empty() {
-                    complete_sinks(&ok, &opts.cancel).await?;
-                }
+                let complete = errs.is_empty() && !externally_cancelled();
+                let finish = finish_sinks(&ok, complete).await;
                 let (mut result, per_source) = aggregate(ok);
                 result.errors = errs;
-                let nodes = reports(&order, &result, &per_source, &failed);
-                Ok(TopologyRun {
+                let nodes = reports(&order, &result, &per_source, &failed, &facts.ancestors);
+                let run = TopologyRun {
                     result,
                     nodes,
                     per_source,
-                })
+                };
+                (run, finish.err())
             }
         }
     }
 }
 
+/// Node ids that failed, with their error text and class — the shared record a
+/// sink node consults when its input closes, so it can tell a finished stream
+/// from one cut short by an upstream failure.
+type FailedNodes = Arc<std::sync::Mutex<HashMap<String, (String, NodeErrorKind)>>>;
+
+/// Run a node future and record a failure **before** its output channels close.
+///
+/// `keep` holds clones of the node's senders: the node's own copies drop when
+/// its future returns, but a downstream receiver only sees end-of-stream once
+/// these clones drop too — after the failure is recorded. Without that ordering a
+/// sink could observe a closed input, find no failure yet, and report a partial
+/// input as a complete, successful run (#789 CLI-18).
+fn track_failure(
+    id: String,
+    fut: Pin<Box<dyn Future<Output = Result<NodeOutcome, FaucetError>> + Send>>,
+    keep: Vec<mpsc::Sender<StreamPage>>,
+    failed: FailedNodes,
+) -> Pin<Box<dyn Future<Output = Result<NodeOutcome, FaucetError>> + Send>> {
+    Box::pin(async move {
+        let result = fut.await;
+        if let Err(e) = &result {
+            failed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id, (e.to_string(), NodeErrorKind::classify(e)));
+        }
+        drop(keep);
+        result
+    })
+}
+
+/// How a merge node treats the bookmarks riding on its input pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeMode {
+    /// The inputs carry positions of different sources: forward them as they
+    /// arrive. (A multi-source graph never resumes from them anyway.)
+    Passthrough,
+    /// Every input carries the same single source's positions — a tee fanned the
+    /// source out and this merge joins the copies back. A position is released
+    /// only once **every** input has delivered it, so no sink can persist a
+    /// bookmark while another branch's copy of that page is still in flight
+    /// (#789 CORE-12).
+    Gated,
+    /// Some inputs share a source and some do not, so their positions cannot be
+    /// lined up: forward pages without bookmarks. The sink then never persists a
+    /// position it cannot prove every branch delivered, and the next run replays
+    /// in full — duplicates on a non-idempotent sink, never a skipped record.
+    Strip,
+}
+
+/// Facts derived from the graph shape alone.
+struct GraphFacts {
+    /// Every node upstream of each node (transitively), excluding the node.
+    ancestors: HashMap<String, HashSet<String>>,
+    /// How each merge node treats its inputs' bookmarks.
+    merge_modes: HashMap<String, MergeMode>,
+}
+
+impl GraphFacts {
+    fn of(nodes: &[Node], edges: &[Edge]) -> Self {
+        let mut rev: HashMap<&str, Vec<&Edge>> = HashMap::new();
+        for e in edges {
+            rev.entry(e.to.as_str()).or_default().push(e);
+        }
+        let ancestors: HashMap<String, HashSet<String>> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), ancestors_of(&n.id, &rev)))
+            .collect();
+
+        // The sources whose positions arrive on a node's output pages: a source
+        // emits its own, a transform/tee/sink passes its input's on, a merge
+        // carries the union of its inputs', and a join only its probe side's.
+        let kinds: HashMap<&str, &NodeKind> =
+            nodes.iter().map(|n| (n.id.as_str(), &n.kind)).collect();
+        let mut origins: HashMap<String, HashSet<String>> = HashMap::new();
+        for n in nodes {
+            bookmark_origins(&n.id, &kinds, &rev, &mut origins);
+        }
+
+        let mut merge_modes = HashMap::new();
+        for n in nodes {
+            if !matches!(n.kind, NodeKind::Merge) {
+                continue;
+            }
+            let inputs: Vec<HashSet<String>> = rev
+                .get(n.id.as_str())
+                .map(|es| {
+                    es.iter()
+                        .map(|e| origins.get(&e.from).cloned().unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+            merge_modes.insert(n.id.clone(), merge_mode(&inputs));
+        }
+        Self {
+            ancestors,
+            merge_modes,
+        }
+    }
+}
+
+/// Every node upstream of `id`, excluding `id`.
+fn ancestors_of(id: &str, rev: &HashMap<&str, Vec<&Edge>>) -> HashSet<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<&str> = rev
+        .get(id)
+        .map(|es| es.iter().map(|e| e.from.as_str()).collect())
+        .unwrap_or_default();
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n.to_string()) {
+            continue;
+        }
+        if let Some(es) = rev.get(n) {
+            stack.extend(es.iter().map(|e| e.from.as_str()));
+        }
+    }
+    seen
+}
+
+fn bookmark_origins(
+    id: &str,
+    kinds: &HashMap<&str, &NodeKind>,
+    rev: &HashMap<&str, Vec<&Edge>>,
+    memo: &mut HashMap<String, HashSet<String>>,
+) -> HashSet<String> {
+    if let Some(o) = memo.get(id) {
+        return o.clone();
+    }
+    let inputs: Vec<&Edge> = rev.get(id).cloned().unwrap_or_default();
+    let origins: HashSet<String> = match kinds.get(id) {
+        Some(NodeKind::Source(_)) => HashSet::from([id.to_string()]),
+        Some(NodeKind::Join(j)) => inputs
+            .iter()
+            .filter(|e| e.label.as_deref() == Some(j.probe_edge.as_str()))
+            .flat_map(|e| bookmark_origins(&e.from, kinds, rev, memo))
+            .collect(),
+        _ => inputs
+            .iter()
+            .flat_map(|e| bookmark_origins(&e.from, kinds, rev, memo))
+            .collect(),
+    };
+    memo.insert(id.to_string(), origins.clone());
+    origins
+}
+
+/// Pure merge-mode decision over the bookmark origins of each input.
+fn merge_mode(inputs: &[HashSet<String>]) -> MergeMode {
+    let disjoint = inputs
+        .iter()
+        .enumerate()
+        .all(|(i, a)| inputs[i + 1..].iter().all(|b| a.is_disjoint(b)));
+    if disjoint {
+        return MergeMode::Passthrough;
+    }
+    let first = &inputs[0];
+    if first.len() == 1 && inputs.iter().all(|o| o == first) {
+        MergeMode::Gated
+    } else {
+        MergeMode::Strip
+    }
+}
+
+/// Releases a source position only once every live input of a gated merge has
+/// delivered it.
+///
+/// The inputs of a [`MergeMode::Gated`] merge are copies of one source's pages,
+/// so each sees the same positions in the same order. Counting how many
+/// bookmarked pages each input has delivered is therefore enough: position `k`
+/// is safe once every live input has delivered `k` pages. A closed input has
+/// delivered everything it ever will, so it no longer holds the others back.
+#[derive(Debug)]
+struct BookmarkGate {
+    delivered: Vec<u64>,
+    closed: Vec<bool>,
+    released: u64,
+    /// Positions seen but not yet released; `pending[0]` is position
+    /// `released + 1`.
+    pending: std::collections::VecDeque<Value>,
+}
+
+impl BookmarkGate {
+    fn new(inputs: usize) -> Self {
+        Self {
+            delivered: vec![0; inputs],
+            closed: vec![false; inputs],
+            released: 0,
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// A page carrying `bookmark` arrived on `input`. Returns the bookmark to
+    /// attach to the forwarded page, if this delivery released one.
+    fn arrive(&mut self, input: usize, bookmark: Value) -> Option<Value> {
+        self.delivered[input] += 1;
+        let seen = self.released + self.pending.len() as u64;
+        if self.delivered[input] > seen {
+            self.pending.push_back(bookmark);
+        }
+        self.release()
+    }
+
+    /// `input` has closed. Returns a position released by its absence, if any.
+    fn close(&mut self, input: usize) -> Option<Value> {
+        self.closed[input] = true;
+        self.release()
+    }
+
+    fn release(&mut self) -> Option<Value> {
+        let live_min = self
+            .delivered
+            .iter()
+            .zip(&self.closed)
+            .filter(|(_, closed)| !**closed)
+            .map(|(d, _)| *d)
+            .min()
+            .unwrap_or_else(|| self.released + self.pending.len() as u64);
+        let mut out = None;
+        while self.released < live_min {
+            match self.pending.pop_front() {
+                Some(bm) => {
+                    self.released += 1;
+                    out = Some(bm);
+                }
+                None => break,
+            }
+        }
+        out
+    }
+}
+
 /// Build the per-node report list from the node ids/kinds and their outcomes.
+///
+/// A sink that a failed node feeds is reported as failed even when it returned
+/// normally: its input closing looked like the end of the stream, but the run
+/// never delivered its complete input (#789 CLI-18).
 fn reports(
     order: &[(String, &'static str)],
     sinks: &TopologyResult,
     per_source: &HashMap<String, usize>,
     errors: &[(String, String, NodeErrorKind)],
+    ancestors: &HashMap<String, HashSet<String>>,
 ) -> Vec<NodeReport> {
     order
         .iter()
-        .map(|(id, kind)| NodeReport {
-            node_id: id.clone(),
-            kind,
-            records: sinks
-                .per_sink
-                .get(id)
-                .or_else(|| per_source.get(id))
-                .copied()
-                .unwrap_or(0),
-            bookmark: sinks.bookmarks.get(id).cloned().flatten(),
-            error: errors
-                .iter()
-                .find(|(nid, _, _)| nid == id)
-                .map(|(_, e, _)| e.clone()),
-            error_kind: errors
-                .iter()
-                .find(|(nid, _, _)| nid == id)
-                .map(|(_, _, k)| *k),
+        .map(|(id, kind)| {
+            let own = errors.iter().find(|(nid, _, _)| nid == id);
+            let upstream = (own.is_none() && *kind == "sink")
+                .then(|| {
+                    errors
+                        .iter()
+                        .find(|(nid, _, _)| ancestors.get(id).is_some_and(|a| a.contains(nid)))
+                })
+                .flatten();
+            let (error, error_kind) = match (own, upstream) {
+                (Some((_, e, k)), _) => (Some(e.clone()), Some(*k)),
+                (None, Some((nid, e, k))) => (
+                    Some(format!(
+                        "upstream node '{nid}' failed, so this sink did not receive its \
+                         complete input: {e}"
+                    )),
+                    Some(*k),
+                ),
+                (None, None) => (None, None),
+            };
+            NodeReport {
+                node_id: id.clone(),
+                kind,
+                records: sinks
+                    .per_sink
+                    .get(id)
+                    .or_else(|| per_source.get(id))
+                    .copied()
+                    .unwrap_or(0),
+                bookmark: sinks.bookmarks.get(id).cloned().flatten(),
+                error,
+                error_kind,
+            }
         })
         .collect()
 }
 
-/// Finalize every sink node of a graph in which **no** node failed and the run
-/// was not cancelled (#753) — the graph analogue of `Pipeline::run` calling
-/// [`Sink::complete_run`]. A sink node only sees its input channel close, which
-/// also happens when an upstream node failed, so the decision is graph-wide.
-async fn complete_sinks(
-    outcomes: &[NodeOutcome],
-    cancel: &Option<CancellationToken>,
-) -> Result<(), FaucetError> {
-    if cancelled(cancel) {
+/// Finalize the sink nodes once every node has stopped.
+///
+/// `complete` is true only when **no** node failed and the run was not
+/// cancelled — the graph analogue of `Pipeline::run`'s decision. A sink node
+/// sees only its own input close, which also happens when an upstream node
+/// failed, so the decision is graph-wide:
+///
+/// - **Complete:** every `write_mode: overwrite` sink swaps its staging in
+///   (`commit_overwrite`) and only then persists its bookmark, which `run_stream`
+///   held back; then every sink's [`Sink::complete_run`] runs (#753). A commit
+///   that fails discards the remaining sinks' staging rather than swapping a
+///   subset in.
+/// - **Otherwise:** every overwrite sink discards its staging, leaving its
+///   destination as it was (#789 CORE-14).
+async fn finish_sinks(outcomes: &[NodeOutcome], complete: bool) -> Result<(), FaucetError> {
+    struct Finish<'a> {
+        sink: &'a dyn Sink,
+        deferred: Option<&'a DeferredState>,
+        bookmark: Option<&'a Value>,
+    }
+    let sinks: Vec<Finish<'_>> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            NodeOutcome::Sink {
+                sink,
+                deferred,
+                bookmark,
+                ..
+            } => Some(Finish {
+                sink: sink.as_ref(),
+                deferred: deferred.as_ref(),
+                bookmark: bookmark.as_ref(),
+            }),
+            _ => None,
+        })
+        .collect();
+    if !complete {
+        for f in &sinks {
+            if f.sink.is_overwrite() {
+                abort_quietly(f.sink).await;
+            }
+        }
         return Ok(());
     }
-    for o in outcomes {
-        if let NodeOutcome::Sink { sink, .. } = o {
-            sink.complete_run().await?;
+    for (i, f) in sinks.iter().enumerate() {
+        if !f.sink.is_overwrite() {
+            continue;
+        }
+        if let Err(e) = f.sink.commit_overwrite().await {
+            for rest in &sinks[i + 1..] {
+                if rest.sink.is_overwrite() {
+                    abort_quietly(rest.sink).await;
+                }
+            }
+            return Err(e);
+        }
+        if let (Some(d), Some(bm)) = (f.deferred, f.bookmark) {
+            d.store.put(&d.key, bm).await?;
         }
     }
+    for f in &sinks {
+        f.sink.complete_run().await?;
+    }
     Ok(())
+}
+
+async fn abort_quietly(sink: &dyn Sink) {
+    if let Err(e) = sink.abort_overwrite().await {
+        tracing::warn!(
+            error = %e,
+            "failed to discard overwrite staging after an unsuccessful or cancelled \
+             topology run; the destination is unchanged"
+        );
+    }
 }
 
 /// Aggregate node outcomes into a [`TopologyResult`] plus the per-source counts
@@ -1112,11 +1575,30 @@ fn reaches_any(start: &str, adj: &HashMap<&str, Vec<&str>>, targets: &HashSet<&s
     false
 }
 
+/// Where one sink node resumes under exactly-once delivery.
+#[derive(Debug, Clone, PartialEq)]
+struct SinkResume {
+    /// The commit-token sequence the node's next page follows.
+    start_seq: u64,
+    /// Skip replayed pages whose position is at or before this one: the node
+    /// already committed them. Set only for a node ahead of the replay start,
+    /// and only when the source can order its positions.
+    skip_through: Option<Value>,
+}
+
+/// The source's resume point plus each sink node's resume state.
+#[derive(Debug, Default)]
+struct ResumePlan {
+    start: Option<Value>,
+    sinks: HashMap<String, SinkResume>,
+}
+
 /// Read every sink node's stored bookmark and decide the source's resume point.
 ///
 /// Returns `Some(bookmark)` only when it is provably safe to resume there;
 /// `None` means "replay in full", which costs duplicates on a non-idempotent
 /// sink but can never skip a record. See [`start_bookmark`] for the rules.
+#[cfg(test)]
 async fn compute_start_bookmark(
     opts: &TopologyOptions,
     sink_ids: &[String],
@@ -1124,48 +1606,194 @@ async fn compute_start_bookmark(
     delivery: crate::idempotency::DeliveryMode,
     source: Option<&dyn Source>,
 ) -> Result<Option<Value>, FaucetError> {
+    let sinks: Vec<(String, Option<&dyn Sink>)> =
+        sink_ids.iter().map(|id| (id.clone(), None)).collect();
+    compute_resume(opts, &sinks, source_count, delivery, source)
+        .await
+        .map(|p| p.start)
+}
+
+/// Decide the source's resume point and, under exactly-once delivery, where each
+/// sink node resumes.
+///
+/// At-least-once follows [`start_bookmark`]. Exactly-once is ordered by each
+/// sink's committed position, recovered the way `Pipeline::run` does: the state
+/// store's `(bookmark, seq)`, overridden by the bookmark embedded in the sink's
+/// own commit token when the token is ahead — the crash window between "sink
+/// committed" and "state persisted" (#789 CORE-11). Then:
+///
+/// - **All sinks at one position:** resume there; nothing is replayed.
+/// - **Positions differ, and the source orders them** ([`Source::position_le`]):
+///   resume from the earliest; each sink ahead of it skips the replayed pages at
+///   or before its own committed position and keeps its own sequence. Page
+///   boundaries need not replay identically.
+/// - **Otherwise:** resume from the lowest sequence, and start **every** sink at
+///   that sequence, so a sink ahead skips by its committed token and every
+///   sink's sequence keeps counting the same pages. Starting each at its own
+///   sequence made a sink ahead re-write the replayed pages and left sequences
+///   that no longer compared across sinks (#789 CORE-01).
+///
+/// A sink with no committed position forces a full replay, with every sink
+/// starting from zero (or skipping by position when the source can order them).
+async fn compute_resume(
+    opts: &TopologyOptions,
+    sinks: &[(String, Option<&dyn Sink>)],
+    source_count: usize,
+    delivery: crate::idempotency::DeliveryMode,
+    source: Option<&dyn Source>,
+) -> Result<ResumePlan, FaucetError> {
     let Some(store) = opts.state_store.as_ref() else {
-        return Ok(None);
+        return Ok(ResumePlan::default());
     };
-    if sink_ids.is_empty() {
-        return Ok(None);
+    if sinks.is_empty() {
+        return Ok(ResumePlan::default());
     }
-    let mut values = Vec::with_capacity(sink_ids.len());
-    for id in sink_ids {
+    let mut stored: Vec<(String, Option<Value>)> = Vec::with_capacity(sinks.len());
+    for (id, _) in sinks {
         let key = format!("{}::{}", opts.pipeline_name, id);
-        match store.get(&key).await {
+        let value = match store.get(&key).await {
             // Refuse a bookmark the source cannot read; migrate an older one (#736).
-            Ok(Some(v)) => values.push(match source {
+            Ok(Some(v)) => Some(match source {
                 Some(src) => crate::state_version::resolve_for_source(&key, &v, src)?.data,
                 None => crate::state_version::peel_versioned(&v),
             }),
-            _ => return Ok(None), // a sink with no bookmark → full replay.
+            _ => None,
+        };
+        stored.push((id.clone(), value));
+    }
+
+    if delivery != crate::idempotency::DeliveryMode::ExactlyOnce {
+        if stored.iter().any(|(_, v)| v.is_none()) {
+            return Ok(ResumePlan::default());
+        }
+        let values: Vec<Value> = stored.into_iter().filter_map(|(_, v)| v).collect();
+        return Ok(ResumePlan {
+            start: start_bookmark(&values, source_count),
+            sinks: HashMap::new(),
+        });
+    }
+
+    let mut positions: Vec<(String, Option<Value>, u64)> = Vec::with_capacity(sinks.len());
+    for ((id, sink), (_, value)) in sinks.iter().zip(stored) {
+        let (mut bm, mut seq) = value
+            .as_ref()
+            .map(crate::idempotency::unwrap_state)
+            .unwrap_or((None, 0));
+        let key = format!("{}::{}", opts.pipeline_name, id);
+        if let (Some(sink), Some(src)) = (sink, source)
+            && sink.supports_idempotent_writes()
+            && src.replay_guarantee() == crate::idempotency::ReplayGuarantee::Deterministic
+            && let Some(token) = sink.last_committed_token(&key).await?
+            && let Some((token_seq, Some(token_bm))) = crate::idempotency::parse_token_parts(&token)
+            && token_seq > seq
+        {
+            bm = Some(token_bm);
+            seq = token_seq;
+        }
+        positions.push((id.clone(), bm, seq));
+    }
+    Ok(plan_exactly_once(&positions, source_count, source))
+}
+
+/// Pure exactly-once resume decision over each sink's `(id, position, seq)`.
+fn plan_exactly_once(
+    positions: &[(String, Option<Value>, u64)],
+    source_count: usize,
+    source: Option<&dyn Source>,
+) -> ResumePlan {
+    let own = |skip: &dyn Fn(&Option<Value>) -> Option<Value>| -> HashMap<String, SinkResume> {
+        positions
+            .iter()
+            .map(|(id, bm, seq)| {
+                (
+                    id.clone(),
+                    SinkResume {
+                        start_seq: *seq,
+                        skip_through: skip(bm),
+                    },
+                )
+            })
+            .collect()
+    };
+    if source_count != 1 {
+        if source_count > 1 {
+            tracing::warn!(
+                sources = source_count,
+                "topology: multi-source graph cannot attribute a sink bookmark to a source; \
+                 replaying every source in full"
+            );
+        }
+        return ResumePlan {
+            start: None,
+            sinks: own(&|_| None),
+        };
+    }
+
+    let known: Vec<Value> = positions
+        .iter()
+        .filter_map(|(_, bm, _)| bm.clone())
+        .collect();
+    let all_known = known.len() == positions.len();
+    if all_known && known.iter().all(|b| b == &known[0]) {
+        return ResumePlan {
+            start: known.first().cloned(),
+            sinks: own(&|_| None),
+        };
+    }
+
+    let ordering = source.filter(|src| {
+        known
+            .first()
+            .is_some_and(|b| src.position_le(b, b).is_some())
+    });
+    if let Some(src) = ordering {
+        let start = if all_known {
+            src.position_min(&known)
+        } else {
+            None
+        };
+        if start.is_some() || !all_known {
+            let skip = |bm: &Option<Value>| bm.clone().filter(|b| Some(b) != start.as_ref());
+            return ResumePlan {
+                start: start.clone(),
+                sinks: own(&skip),
+            };
         }
     }
-    if delivery == crate::idempotency::DeliveryMode::ExactlyOnce {
-        // Exactly-once stores `(bookmark, seq)`, and `seq` is a monotonic page
-        // counter — a real total order, so the sinks can be ranked exactly
-        // instead of guessed at. Resume from the *furthest behind* sink; every
-        // sink ahead of it skips the pages it already committed, which is
-        // precisely what the commit token is for. (#458)
-        let ranked: Vec<(u64, Option<Value>)> = values
+
+    let (start, base_seq) = if all_known {
+        positions
             .iter()
-            .map(|v| {
-                let (bm, seq) = crate::idempotency::unwrap_state(v);
-                (seq, bm)
+            .min_by_key(|(_, _, seq)| *seq)
+            .map(|(_, bm, seq)| (bm.clone(), *seq))
+            .unwrap_or((None, 0))
+    } else {
+        (None, 0)
+    };
+    ResumePlan {
+        start,
+        sinks: positions
+            .iter()
+            .map(|(id, _, _)| {
+                (
+                    id.clone(),
+                    SinkResume {
+                        start_seq: base_seq,
+                        skip_through: None,
+                    },
+                )
             })
-            .collect();
-        return Ok(eo_start_bookmark(&ranked, source_count));
+            .collect(),
     }
-    Ok(start_bookmark(&values, source_count))
 }
 
 /// Exactly-once resume point: the bookmark of the lowest-`seq` sink.
 ///
 /// Unlike the at-least-once path this *can* order the sinks, because `seq` is a
 /// monotonic counter rather than an opaque position — so a diverged set resumes
-/// from the laggard instead of replaying from scratch, and the sinks that are
-/// ahead skip their already-committed pages via their commit tokens.
+/// from the laggard instead of replaying from scratch. The runner starts every
+/// sink at that laggard's sequence, so the sinks ahead skip their
+/// already-committed pages via their commit tokens.
 ///
 /// The single-source restriction still applies: nothing records which source a
 /// sink's bookmark came from.
@@ -1227,22 +1855,42 @@ pub fn start_bookmark(sink_bookmarks: &[Value], source_count: usize) -> Option<V
     Some(first.clone())
 }
 
+/// Receive the next page, or `None` once the channel closes or `cancel` fires.
+async fn recv_or_cancel(
+    rx: &mut mpsc::Receiver<StreamPage>,
+    cancel: &CancellationToken,
+) -> Option<StreamPage> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        page = rx.recv() => page,
+    }
+}
+
 /// Send `page` to every live output, moving into the last and cloning for the
 /// rest. Closed (dropped-receiver) outputs are removed. Returns `false` once
-/// every output has closed.
-async fn broadcast(page: StreamPage, outs: &mut Vec<mpsc::Sender<StreamPage>>) -> bool {
+/// every output has closed, or when `cancel` fires while a send is waiting on a
+/// full channel — a send that waited forever is how a tee feeding both sides of
+/// a join wedged the run (#789 CORE-13).
+async fn broadcast(
+    page: StreamPage,
+    outs: &mut Vec<mpsc::Sender<StreamPage>>,
+    cancel: &CancellationToken,
+) -> bool {
     if outs.is_empty() {
         return false;
     }
     let last = outs.len() - 1;
+    let mut page = Some(page);
     let mut closed: Vec<usize> = Vec::new();
-    for (i, tx) in outs.iter().enumerate().take(last) {
-        if tx.send(page.clone()).await.is_err() {
-            closed.push(i);
+    for (i, tx) in outs.iter().enumerate() {
+        let item = if i == last { page.take() } else { page.clone() };
+        let Some(item) = item else { break };
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return false,
+            r = tx.send(item) => if r.is_err() { closed.push(i) },
         }
-    }
-    if outs[last].send(page).await.is_err() {
-        closed.push(last);
     }
     for &i in closed.iter().rev() {
         outs.remove(i);
@@ -1256,11 +1904,11 @@ fn cancelled(cancel: &Option<CancellationToken>) -> bool {
 
 async fn run_source_node(
     node_id: String,
-    source: Box<dyn Source>,
+    source: Arc<dyn Source>,
     start_bookmark: Option<Value>,
     batch_size: usize,
     mut outs: Vec<mpsc::Sender<StreamPage>>,
-    cancel: Option<CancellationToken>,
+    cancel: CancellationToken,
 ) -> Result<NodeOutcome, FaucetError> {
     if let Some(bm) = start_bookmark {
         source.apply_start_bookmark(bm).await?;
@@ -1268,13 +1916,16 @@ async fn run_source_node(
     let ctx = std::collections::HashMap::new();
     let mut pages = source.stream_pages(&ctx, batch_size);
     let mut records = 0usize;
-    while let Some(item) = pages.next().await {
-        if cancelled(&cancel) {
-            break;
-        }
+    loop {
+        let item = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            item = pages.next() => item,
+        };
+        let Some(item) = item else { break };
         let page = item?;
         records += page.records.len();
-        if !broadcast(page, &mut outs).await {
+        if !broadcast(page, &mut outs, &cancel).await {
             break;
         }
     }
@@ -1286,18 +1937,15 @@ async fn run_transform_node(
     labels: Labels,
     mut rx: mpsc::Receiver<StreamPage>,
     mut outs: Vec<mpsc::Sender<StreamPage>>,
-    cancel: Option<CancellationToken>,
+    cancel: CancellationToken,
 ) -> Result<NodeOutcome, FaucetError> {
-    while let Some(page) = rx.recv().await {
-        if cancelled(&cancel) {
-            break;
-        }
+    while let Some(page) = recv_or_cancel(&mut rx, &cancel).await {
         let records = instrumented_apply_stages(page.records, &stages, &labels)?;
         let out = StreamPage {
             records,
             bookmark: page.bookmark,
         };
-        if !broadcast(out, &mut outs).await {
+        if !broadcast(out, &mut outs, &cancel).await {
             break;
         }
     }
@@ -1316,15 +1964,12 @@ async fn run_tee_node(
     pipeline: String,
     mut rx: mpsc::Receiver<StreamPage>,
     mut outs: Vec<mpsc::Sender<StreamPage>>,
-    cancel: Option<CancellationToken>,
+    cancel: CancellationToken,
 ) -> Result<NodeOutcome, FaucetError> {
     let labels = node_labels(&pipeline, &node_id);
-    while let Some(page) = rx.recv().await {
-        if cancelled(&cancel) {
-            break;
-        }
+    while let Some(page) = recv_or_cancel(&mut rx, &cancel).await {
         counter!("faucet_tee_records_total", labels.clone()).increment(page.records.len() as u64);
-        if !broadcast(page, &mut outs).await {
+        if !broadcast(page, &mut outs, &cancel).await {
             break;
         }
     }
@@ -1336,23 +1981,56 @@ async fn run_merge_node(
     pipeline: String,
     rxs: Vec<mpsc::Receiver<StreamPage>>,
     mut outs: Vec<mpsc::Sender<StreamPage>>,
-    cancel: Option<CancellationToken>,
+    cancel: CancellationToken,
+    mode: MergeMode,
 ) -> Result<NodeOutcome, FaucetError> {
     let labels = node_labels(&pipeline, &node_id);
-    let streams = rxs.into_iter().map(|mut rx| {
+    if mode == MergeMode::Strip {
+        tracing::warn!(
+            node = %node_id,
+            "topology: merge '{node_id}' combines inputs that share a source with inputs that \
+             do not, so their positions cannot be lined up; it forwards no bookmarks and the \
+             next run replays in full"
+        );
+    }
+    let mut gate = BookmarkGate::new(rxs.len());
+    let streams = rxs.into_iter().enumerate().map(|(i, mut rx)| {
         Box::pin(async_stream::stream! {
             while let Some(p) = rx.recv().await {
-                yield p;
+                yield (i, Some(p));
             }
-        }) as Pin<Box<dyn futures::Stream<Item = StreamPage> + Send>>
+            yield (i, None);
+        }) as Pin<Box<dyn futures::Stream<Item = (usize, Option<StreamPage>)> + Send>>
     });
     let mut sel = futures::stream::select_all(streams);
-    while let Some(page) = sel.next().await {
-        if cancelled(&cancel) {
-            break;
-        }
-        counter!("faucet_merge_records_total", labels.clone()).increment(page.records.len() as u64);
-        if !broadcast(page, &mut outs).await {
+    loop {
+        let next = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            next = sel.next() => next,
+        };
+        let Some((input, page)) = next else { break };
+        let out = match (mode, page) {
+            (MergeMode::Gated, None) => match gate.close(input) {
+                Some(bm) => StreamPage {
+                    records: Vec::new(),
+                    bookmark: Some(bm),
+                },
+                None => continue,
+            },
+            (_, None) => continue,
+            (MergeMode::Gated, Some(p)) => StreamPage {
+                bookmark: p.bookmark.and_then(|bm| gate.arrive(input, bm)),
+                records: p.records,
+            },
+            (MergeMode::Strip, Some(p)) => StreamPage {
+                records: p.records,
+                bookmark: None,
+            },
+            (MergeMode::Passthrough, Some(p)) => p,
+        };
+        counter!("faucet_merge_records_total", labels.clone()).increment(out.records.len() as u64);
+        if !broadcast(out, &mut outs, &cancel).await {
             break;
         }
     }
@@ -1367,34 +2045,31 @@ async fn run_join_node(
     mut build_rx: mpsc::Receiver<StreamPage>,
     mut probe_rx: mpsc::Receiver<StreamPage>,
     mut outs: Vec<mpsc::Sender<StreamPage>>,
-    cancel: Option<CancellationToken>,
+    cancel: CancellationToken,
 ) -> Result<NodeOutcome, FaucetError> {
     let mode = j.config.mode;
     let mut join = HashJoin::new(j.config);
 
     // Build phase: fully drain the build side before probing.
     let build_start = std::time::Instant::now();
-    while let Some(page) = build_rx.recv().await {
-        if cancelled(&cancel) {
-            return Ok(NodeOutcome::Other);
-        }
+    while let Some(page) = recv_or_cancel(&mut build_rx, &cancel).await {
         join.add_build_page(page.records)?;
+    }
+    if cancel.is_cancelled() {
+        return Ok(NodeOutcome::Other);
     }
     let labels = node_labels(&pipeline, &node_id);
     histogram!("faucet_join_build_duration_seconds", labels.clone())
         .record(build_start.elapsed().as_secs_f64());
 
     // Probe phase.
-    while let Some(page) = probe_rx.recv().await {
-        if cancelled(&cancel) {
-            break;
-        }
+    while let Some(page) = recv_or_cancel(&mut probe_rx, &cancel).await {
         let enriched = join.probe_page(page.records)?;
         let out = StreamPage {
             records: enriched,
             bookmark: page.bookmark,
         };
-        if !broadcast(out, &mut outs).await {
+        if !broadcast(out, &mut outs, &cancel).await {
             break;
         }
     }
@@ -1415,12 +2090,18 @@ fn emit_join_metrics(labels: &[Label], mode: JoinMode, stats: &crate::join::Join
     counter!("faucet_join_misses_total", match_labels).increment(stats.misses);
 }
 
+/// Where an overwrite sink node's bookmark goes once its staging is swapped in.
+struct DeferredState {
+    store: Arc<dyn StateStore>,
+    key: String,
+}
+
 struct SinkNodeOpts {
     pipeline_name: String,
     run_id: String,
     state_store: Option<Arc<dyn StateStore>>,
     dlq: Option<DlqConfig>,
-    cancel: Option<CancellationToken>,
+    cancel: CancellationToken,
     /// Masking policy compiled for *this* sink node (destination-scoped).
     #[cfg(feature = "masking")]
     masking: Option<Arc<crate::masking::CompiledMasking>>,
@@ -1438,6 +2119,26 @@ struct SinkNodeOpts {
     replay: Option<crate::idempotency::ReplayGuarantee>,
     /// How this node's bookmark is stored (#736).
     codec: crate::state_version::StateCodec,
+    /// Where this node resumes under exactly-once delivery.
+    resume: Option<SinkResume>,
+    /// The graph's only source, which orders positions for `resume.skip_through`.
+    position_source: Option<Arc<dyn Source>>,
+    /// Every node upstream of this sink.
+    upstream: HashSet<String>,
+    /// Nodes that have failed so far.
+    failed: FailedNodes,
+}
+
+/// The first failed node among `upstream`, if any.
+fn failed_upstream(failed: &FailedNodes, upstream: &HashSet<String>) -> Option<(String, String)> {
+    let failed = failed.lock().unwrap_or_else(|p| p.into_inner());
+    let mut hits: Vec<(&String, &(String, NodeErrorKind))> = failed
+        .iter()
+        .filter(|(id, _)| upstream.contains(*id))
+        .collect();
+    hits.sort_by(|a, b| a.0.cmp(b.0));
+    hits.first()
+        .map(|(id, (msg, _))| ((*id).clone(), msg.clone()))
 }
 
 async fn run_sink_node(
@@ -1446,9 +2147,41 @@ async fn run_sink_node(
     mut rx: mpsc::Receiver<StreamPage>,
     opts: SinkNodeOpts,
 ) -> Result<NodeOutcome, FaucetError> {
+    let failed = Arc::clone(&opts.failed);
+    let upstream = opts.upstream.clone();
+    let position_source = opts.position_source.clone();
+    let mut skip_through = opts.resume.as_ref().and_then(|r| r.skip_through.clone());
+    let sink_id = node_id.clone();
     let pages = Box::pin(async_stream::stream! {
-        while let Some(page) = rx.recv().await {
-            yield Ok::<StreamPage, FaucetError>(page);
+        loop {
+            match rx.recv().await {
+                Some(page) => {
+                    // Exactly-once: this node already committed every page at or
+                    // before `skip_through`, so a replay from an earlier sink's
+                    // position must not write them again (#789 CORE-01).
+                    if let (Some(through), Some(src)) = (skip_through.as_ref(), position_source.as_ref()) {
+                        let committed = page
+                            .bookmark
+                            .as_ref()
+                            .and_then(|bm| src.position_le(bm, through))
+                            == Some(true);
+                        if committed {
+                            continue;
+                        }
+                        skip_through = None;
+                    }
+                    yield Ok::<StreamPage, FaucetError>(page);
+                }
+                None => {
+                    if let Some((node, error)) = failed_upstream(&failed, &upstream) {
+                        yield Err(FaucetError::Source(format!(
+                            "upstream node '{node}' failed, so sink '{sink_id}' did not \
+                             receive its complete input: {error}"
+                        )));
+                    }
+                    break;
+                }
+            }
         }
     });
 
@@ -1456,6 +2189,8 @@ async fn run_sink_node(
         .with_name(opts.pipeline_name.clone())
         .with_row(node_id.clone())
         .with_run_id(opts.run_id.clone());
+    let overwriting = sink.is_overwrite();
+    let mut deferred = None;
     if let Some(store) = opts.state_store {
         let key = format!("{}::{}", opts.pipeline_name, node_id);
         let store: Arc<dyn StateStore> = Arc::new(crate::state_version::VersionedStateStore::new(
@@ -1463,28 +2198,33 @@ async fn run_sink_node(
             key.clone(),
             opts.codec,
         ));
-        // Exactly-once: this node's state holds `(bookmark, seq)`, and `seq` is
-        // where its commit-token sequence resumes. Read it before handing the
-        // store to `run_stream`, which owns the writes from here (#458).
+        // Exactly-once: this node's commit-token sequence resumes where the
+        // graph-wide resume plan placed it (#458, #789 CORE-01).
         if opts.delivery == crate::idempotency::DeliveryMode::ExactlyOnce {
-            let seq = match store.get(&key).await {
-                Ok(Some(prior)) => crate::idempotency::unwrap_state(&prior).1,
-                Ok(None) => 0,
-                Err(e) => return Err(e),
+            let seq = match opts.resume.as_ref() {
+                Some(r) => r.start_seq,
+                None => match store.get(&key).await? {
+                    Some(prior) => crate::idempotency::unwrap_state(&prior).1,
+                    None => 0,
+                },
             };
             run_opts = run_opts.with_delivery(opts.delivery).with_start_seq(seq);
             if let Some(replay) = opts.replay {
                 run_opts = run_opts.with_replay_guarantee(replay);
             }
         }
+        if overwriting {
+            deferred = Some(DeferredState {
+                store: Arc::clone(&store),
+                key: key.clone(),
+            });
+        }
         run_opts = run_opts.with_state(store, key);
     }
     if let Some(dlq) = opts.dlq {
         run_opts = run_opts.with_dlq(dlq);
     }
-    if let Some(cancel) = opts.cancel {
-        run_opts = run_opts.with_cancel(cancel);
-    }
+    run_opts = run_opts.with_cancel(opts.cancel);
     // Governance passes, in the same order `Pipeline` applies them: masking
     // first (so nothing downstream — sink, DLQ, lineage sample — ever sees
     // unmasked PII), then quality, contract, and drift.
@@ -1507,12 +2247,28 @@ async fn run_sink_node(
         run_opts.resilience = Some(r);
     }
 
-    let result = run_stream(pages, sink.as_ref(), run_opts).await?;
+    // `write_mode: overwrite` stages before the first write; the swap happens
+    // only once the whole graph has succeeded (`finish_sinks`), and a failure
+    // here discards the staging so the destination is left as it was
+    // (#789 CORE-14).
+    if overwriting {
+        sink.begin_overwrite().await?;
+    }
+    let result = match run_stream(pages, sink.as_ref(), run_opts).await {
+        Ok(r) => r,
+        Err(e) => {
+            if overwriting {
+                abort_quietly(sink.as_ref()).await;
+            }
+            return Err(e);
+        }
+    };
     Ok(NodeOutcome::Sink {
         node_id,
         records: result.records_written,
         bookmark: result.bookmark,
         sink,
+        deferred,
     })
 }
 
@@ -2735,5 +3491,782 @@ mod delivery_and_report_tests {
         assert_eq!(run.nodes.len(), 4);
         assert!(run.nodes.iter().any(|n| n.kind == "source"));
         assert!(run.nodes.iter().any(|n| n.kind == "tee"));
+    }
+}
+
+#[cfg(test)]
+mod graph_safety_tests {
+    use super::tests::{CollectSink, FailingSink, VecSource, recs};
+    use super::*;
+    use crate::Stream;
+    use crate::idempotency::{DeliveryMode, format_token_with_bookmark, wrap_state};
+    use crate::state::MemoryStateStore;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    /// A source over `pos` 1..=`total`, `per_page` records per page, each page
+    /// bookmarked `{"pos": <last record>}`. Resuming from `{"pos": p}` continues
+    /// at `p + 1`. `ordered` makes it order positions like a CDC source.
+    struct LogSource {
+        total: u64,
+        per_page: u64,
+        ordered: bool,
+        start: Mutex<u64>,
+        applied: Arc<Mutex<Option<Value>>>,
+    }
+    impl LogSource {
+        fn new(total: u64, per_page: u64, ordered: bool) -> (Self, Arc<Mutex<Option<Value>>>) {
+            let applied = Arc::new(Mutex::new(None));
+            (
+                Self {
+                    total,
+                    per_page,
+                    ordered,
+                    start: Mutex::new(0),
+                    applied: applied.clone(),
+                },
+                applied,
+            )
+        }
+    }
+    #[async_trait]
+    impl Source for LogSource {
+        async fn fetch_with_context(
+            &self,
+            _c: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(Vec::new())
+        }
+        fn stream_pages<'a>(
+            &'a self,
+            _ctx: &'a HashMap<String, Value>,
+            _batch: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+            let mut next = *self.start.lock().unwrap() + 1;
+            let (total, per_page) = (self.total, self.per_page);
+            Box::pin(async_stream::try_stream! {
+                while next <= total {
+                    let last = (next + per_page - 1).min(total);
+                    let records: Vec<Value> = (next..=last).map(|n| json!({ "n": n })).collect();
+                    yield StreamPage { records, bookmark: Some(json!({ "pos": last })) };
+                    next = last + 1;
+                }
+            })
+        }
+        async fn apply_start_bookmark(&self, bm: Value) -> Result<(), FaucetError> {
+            *self.start.lock().unwrap() = bm["pos"].as_u64().unwrap_or(0);
+            *self.applied.lock().unwrap() = Some(bm);
+            Ok(())
+        }
+        fn replay_guarantee(&self) -> crate::idempotency::ReplayGuarantee {
+            crate::idempotency::ReplayGuarantee::Deterministic
+        }
+        fn supports_exactly_once(&self) -> bool {
+            true
+        }
+        fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+            if !self.ordered {
+                return None;
+            }
+            Some(a["pos"].as_u64()? <= b["pos"].as_u64()?)
+        }
+    }
+
+    /// An idempotent sink keeping its rows and one commit token per scope.
+    #[derive(Clone)]
+    struct TokenSink {
+        rows: Arc<Mutex<Vec<Value>>>,
+        tokens: Arc<Mutex<HashMap<String, String>>>,
+    }
+    impl TokenSink {
+        fn new() -> Self {
+            Self {
+                rows: Arc::new(Mutex::new(Vec::new())),
+                tokens: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+        fn committed(self, scope: &str, seq: u64, pos: u64) -> Self {
+            self.tokens.lock().unwrap().insert(
+                scope.into(),
+                format_token_with_bookmark(seq, Some(&json!({ "pos": pos }))),
+            );
+            self
+        }
+        fn ns(&self) -> Vec<u64> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["n"].as_u64())
+                .collect()
+        }
+    }
+    #[async_trait]
+    impl Sink for TokenSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.rows.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        fn supports_idempotent_writes(&self) -> bool {
+            true
+        }
+        async fn write_batch_idempotent(
+            &self,
+            records: &[Value],
+            scope: &str,
+            token: &str,
+        ) -> Result<usize, FaucetError> {
+            self.rows.lock().unwrap().extend_from_slice(records);
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(scope.to_string(), token.to_string());
+            Ok(records.len())
+        }
+        async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
+            Ok(self.tokens.lock().unwrap().get(scope).cloned())
+        }
+    }
+
+    async fn seed(store: &MemoryStateStore, key: &str, pos: u64, seq: u64) {
+        store
+            .put(key, &wrap_state(Some(&json!({ "pos": pos })), seq))
+            .await
+            .unwrap();
+    }
+
+    async fn stored_seq(store: &MemoryStateStore, key: &str) -> u64 {
+        let v = store.get(key).await.unwrap().unwrap();
+        crate::idempotency::unwrap_state(&crate::state_version::peel_versioned(&v)).1
+    }
+
+    fn eo() -> TopologyGovernance {
+        let mut g = TopologyGovernance::new();
+        g.delivery = DeliveryMode::ExactlyOnce;
+        g
+    }
+
+    fn two_sink_graph(source: LogSource, ahead: TokenSink, behind: TokenSink) -> Topology {
+        Topology::builder()
+            .source("s", Box::new(source))
+            .tee("t", 4, Some(2))
+            .sink("ahead", Box::new(ahead))
+            .sink("behind", Box::new(behind))
+            .edge("s", "t")
+            .edge("t", "ahead")
+            .edge("t", "behind")
+            .build()
+            .unwrap()
+    }
+
+    /// CORE-01: with diverged sinks and a source that cannot order positions,
+    /// the replay starts at the laggard and every sink starts at the laggard's
+    /// sequence, so the sink that is ahead skips what it committed instead of
+    /// writing it twice — and both end on the same, comparable sequence.
+    #[tokio::test]
+    async fn eo_diverged_sinks_never_rewrite_committed_pages() {
+        let store = Arc::new(MemoryStateStore::new());
+        seed(&store, "p::ahead", 9, 9).await;
+        seed(&store, "p::behind", 5, 5).await;
+        let ahead = TokenSink::new().committed("p::ahead", 9, 9);
+        let behind = TokenSink::new().committed("p::behind", 5, 5);
+        let (source, applied) = LogSource::new(10, 1, false);
+        let topo = two_sink_graph(source, ahead.clone(), behind.clone());
+
+        topo.run_with(
+            TopologyOptions::new("p").with_state_store(store.clone()),
+            eo(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*applied.lock().unwrap(), Some(json!({ "pos": 5 })));
+        assert_eq!(ahead.ns(), vec![10], "pages 6..=9 were already committed");
+        assert_eq!(behind.ns(), vec![6, 7, 8, 9, 10]);
+        assert_eq!(stored_seq(&store, "p::ahead").await, 10);
+        assert_eq!(stored_seq(&store, "p::behind").await, 10);
+    }
+
+    /// CORE-01 with a source that orders its positions: replayed page boundaries
+    /// may differ from the original ones, and the sink ahead still skips exactly
+    /// what it committed, by position rather than by page count.
+    #[tokio::test]
+    async fn eo_diverged_sinks_skip_by_position_when_the_source_orders_them() {
+        let store = Arc::new(MemoryStateStore::new());
+        seed(&store, "p::ahead", 9, 9).await;
+        seed(&store, "p::behind", 5, 5).await;
+        let ahead = TokenSink::new().committed("p::ahead", 9, 9);
+        let behind = TokenSink::new().committed("p::behind", 5, 5);
+        let (source, applied) = LogSource::new(10, 2, true);
+        let topo = two_sink_graph(source, ahead.clone(), behind.clone());
+
+        topo.run_with(
+            TopologyOptions::new("p").with_state_store(store.clone()),
+            eo(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*applied.lock().unwrap(), Some(json!({ "pos": 5 })));
+        assert_eq!(ahead.ns(), vec![10]);
+        assert_eq!(behind.ns(), vec![6, 7, 8, 9, 10]);
+        assert_eq!(stored_seq(&store, "p::ahead").await, 10);
+    }
+
+    /// CORE-11: the sink committed a page the state store never recorded. The
+    /// source is re-anchored at the position embedded in the sink's token, so
+    /// nothing is re-written and nothing is skipped however the replay is paged.
+    #[tokio::test]
+    async fn eo_resume_reanchors_from_the_sinks_committed_token() {
+        let store = Arc::new(MemoryStateStore::new());
+        seed(&store, "p::k", 4, 4).await;
+        let sink = TokenSink::new().committed("p::k", 5, 7);
+        let (source, applied) = LogSource::new(9, 1, false);
+        let topo = Topology::builder()
+            .source("s", Box::new(source))
+            .sink("k", Box::new(sink.clone()))
+            .edge("s", "k")
+            .build()
+            .unwrap();
+
+        topo.run_with(
+            TopologyOptions::new("p").with_state_store(store.clone()),
+            eo(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*applied.lock().unwrap(), Some(json!({ "pos": 7 })));
+        assert_eq!(sink.ns(), vec![8, 9]);
+        assert_eq!(stored_seq(&store, "p::k").await, 7);
+    }
+
+    #[test]
+    fn eo_plan_without_a_committed_position_replays_from_zero() {
+        let (src, _) = LogSource::new(1, 1, false);
+        let plan = plan_exactly_once(
+            &[
+                ("a".into(), Some(json!({ "pos": 3 })), 3),
+                ("b".into(), None, 0),
+            ],
+            1,
+            Some(&src),
+        );
+        assert_eq!(plan.start, None);
+        assert!(plan.sinks.values().all(|r| r.start_seq == 0));
+
+        let (ordered, _) = LogSource::new(1, 1, true);
+        let plan = plan_exactly_once(
+            &[
+                ("a".into(), Some(json!({ "pos": 3 })), 3),
+                ("b".into(), None, 0),
+            ],
+            1,
+            Some(&ordered),
+        );
+        assert_eq!(plan.start, None);
+        assert_eq!(plan.sinks["a"].skip_through, Some(json!({ "pos": 3 })));
+        assert_eq!(plan.sinks["a"].start_seq, 3);
+        assert_eq!(plan.sinks["b"].skip_through, None);
+    }
+
+    #[test]
+    fn eo_plan_for_several_sources_keeps_each_sinks_sequence() {
+        let plan = plan_exactly_once(
+            &[
+                ("a".into(), Some(json!({ "pos": 3 })), 3),
+                ("b".into(), Some(json!({ "pos": 4 })), 4),
+            ],
+            2,
+            None,
+        );
+        assert_eq!(plan.start, None);
+        assert_eq!(plan.sinks["a"].start_seq, 3);
+        assert_eq!(plan.sinks["b"].start_seq, 4);
+    }
+
+    #[test]
+    fn eo_plan_agreeing_sinks_resume_without_skipping() {
+        let plan = plan_exactly_once(
+            &[
+                ("a".into(), Some(json!({ "pos": 3 })), 3),
+                ("b".into(), Some(json!({ "pos": 3 })), 6),
+            ],
+            1,
+            None,
+        );
+        assert_eq!(plan.start, Some(json!({ "pos": 3 })));
+        assert_eq!(plan.sinks["b"].start_seq, 6);
+        assert!(plan.sinks.values().all(|r| r.skip_through.is_none()));
+    }
+
+    // ── CORE-13 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_a_join_fed_by_one_tee_on_both_sides() {
+        let jn = JoinNode {
+            config: JoinConfig {
+                mode: JoinMode::Inner,
+                build_key: "i".into(),
+                probe_key: "i".into(),
+                ..Default::default()
+            },
+            build_edge: "b".into(),
+            probe_edge: "p".into(),
+        };
+        let (sink, _) = CollectSink::new();
+        let err = Topology::builder()
+            .source("s", VecSource::boxed(recs(1)))
+            .tee("t", 4, Some(2))
+            .join("j", jn)
+            .sink("k", Box::new(sink))
+            .edge("s", "t")
+            .labelled_edge("t", "j", "b")
+            .labelled_edge("t", "j", "p")
+            .edge("j", "k")
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("join 'j'"), "{err}");
+        assert!(err.contains("'s'") || err.contains("'t'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn broadcast_gives_up_on_a_full_channel_when_cancelled() {
+        let (tx, mut rx) = mpsc::channel::<StreamPage>(1);
+        tx.send(StreamPage {
+            records: Vec::new(),
+            bookmark: None,
+        })
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trip.cancel();
+        });
+        let mut outs = vec![tx.clone(), tx];
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            broadcast(
+                StreamPage {
+                    records: recs(1),
+                    bookmark: None,
+                },
+                &mut outs,
+                &cancel,
+            ),
+        )
+        .await
+        .expect("a cancelled broadcast must not wait on a full channel");
+        assert!(!sent);
+        assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn broadcast_drops_closed_outputs() {
+        let (live_tx, mut live_rx) = mpsc::channel::<StreamPage>(4);
+        let (dead_tx, dead_rx) = mpsc::channel::<StreamPage>(4);
+        drop(dead_rx);
+        let mut outs = vec![dead_tx, live_tx];
+        let cancel = CancellationToken::new();
+        let page = StreamPage {
+            records: recs(2),
+            bookmark: None,
+        };
+        assert!(broadcast(page, &mut outs, &cancel).await);
+        assert_eq!(outs.len(), 1);
+        assert_eq!(live_rx.recv().await.unwrap().records.len(), 2);
+        let mut none: Vec<mpsc::Sender<StreamPage>> = Vec::new();
+        let page = StreamPage {
+            records: Vec::new(),
+            bookmark: None,
+        };
+        assert!(!broadcast(page, &mut none, &cancel).await);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_receive_returns_none() {
+        let (_tx, mut rx) = mpsc::channel::<StreamPage>(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(recv_or_cancel(&mut rx, &cancel).await.is_none());
+    }
+
+    // ── CORE-12 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_mode_follows_the_inputs_origins() {
+        let set = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        assert_eq!(
+            merge_mode(&[set(&["a"]), set(&["b"])]),
+            MergeMode::Passthrough
+        );
+        assert_eq!(merge_mode(&[set(&["a"]), set(&["a"])]), MergeMode::Gated);
+        assert_eq!(
+            merge_mode(&[set(&["a", "b"]), set(&["a"])]),
+            MergeMode::Strip
+        );
+    }
+
+    #[test]
+    fn bookmark_gate_releases_a_position_only_once_every_input_delivered_it() {
+        let mut gate = BookmarkGate::new(2);
+        assert_eq!(gate.arrive(0, json!(1)), None);
+        assert_eq!(gate.arrive(0, json!(2)), None);
+        assert_eq!(gate.arrive(1, json!(1)), Some(json!(1)));
+        assert_eq!(gate.arrive(1, json!(2)), Some(json!(2)));
+        assert_eq!(gate.arrive(1, json!(3)), None);
+        // The lagging input closes: everything the other one delivered is safe.
+        assert_eq!(gate.close(0), Some(json!(3)));
+        assert_eq!(gate.close(1), None);
+    }
+
+    #[test]
+    fn graph_facts_gate_a_merge_that_rejoins_one_source() {
+        let (k, _) = CollectSink::new();
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(1)))
+            .tee("t", 4, Some(2))
+            .transform("x", Vec::new())
+            .transform("y", Vec::new())
+            .merge("m")
+            .sink("k", Box::new(k))
+            .edge("s", "t")
+            .edge("t", "x")
+            .edge("t", "y")
+            .edge("x", "m")
+            .edge("y", "m")
+            .edge("m", "k")
+            .build()
+            .unwrap();
+        let facts = GraphFacts::of(topo.nodes(), topo.edges());
+        assert_eq!(facts.merge_modes["m"], MergeMode::Gated);
+        assert!(facts.ancestors["k"].contains("s"));
+        assert!(facts.ancestors["k"].contains("x"));
+    }
+
+    /// A state store that logs every put into the same log a sink writes to, so
+    /// a test can check the order of "row written" and "position persisted".
+    struct LoggingStore {
+        inner: MemoryStateStore,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl StateStore for LoggingStore {
+        async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
+            let data = crate::state_version::peel_versioned(value);
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("put {}", data["pos"].as_u64().unwrap_or(0)));
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    struct LoggingSink {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Sink for LoggingSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            let mut log = self.log.lock().unwrap();
+            for r in records {
+                log.push(format!("row {}", r["n"].as_u64().unwrap_or(0)));
+            }
+            Ok(records.len())
+        }
+    }
+
+    /// CORE-12: in a tee → … → merge diamond, a position is persisted only after
+    /// both branches' copies of its page were written.
+    #[tokio::test]
+    async fn a_diamond_persists_a_position_only_after_both_copies_landed() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(LoggingStore {
+            inner: MemoryStateStore::new(),
+            log: log.clone(),
+        });
+        let (source, _) = LogSource::new(6, 1, false);
+        let topo = Topology::builder()
+            .source("s", Box::new(source))
+            .tee("t", 1, Some(2))
+            .transform("x", Vec::new())
+            .transform("y", Vec::new())
+            .merge("m")
+            .sink("k", Box::new(LoggingSink { log: log.clone() }))
+            .edge("s", "t")
+            .edge("t", "x")
+            .edge("t", "y")
+            .edge("x", "m")
+            .edge("y", "m")
+            .edge("m", "k")
+            .build()
+            .unwrap();
+        topo.run(TopologyOptions::new("p").with_state_store(store))
+            .await
+            .unwrap();
+
+        let log = log.lock().unwrap().clone();
+        for (i, entry) in log.iter().enumerate() {
+            let Some(pos) = entry.strip_prefix("put ") else {
+                continue;
+            };
+            let copies = log[..i]
+                .iter()
+                .filter(|e| **e == format!("row {pos}"))
+                .count();
+            assert_eq!(
+                copies, 2,
+                "position {pos} persisted before both copies: {log:?}"
+            );
+        }
+        assert_eq!(log.iter().filter(|e| e.starts_with("row")).count(), 12);
+        assert!(log.iter().any(|e| e == "put 6"), "{log:?}");
+    }
+
+    // ── CORE-14 ───────────────────────────────────────────────────────────────
+
+    struct OverwriteSink {
+        log: Arc<Mutex<Vec<String>>>,
+        fail_commit: bool,
+    }
+    #[async_trait]
+    impl Sink for OverwriteSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.log.lock().unwrap().push("write".into());
+            Ok(records.len())
+        }
+        fn is_overwrite(&self) -> bool {
+            true
+        }
+        async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+            self.log.lock().unwrap().push("begin".into());
+            Ok(())
+        }
+        async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+            if self.fail_commit {
+                return Err(FaucetError::Sink("swap failed".into()));
+            }
+            self.log.lock().unwrap().push("commit".into());
+            Ok(())
+        }
+        async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+            self.log.lock().unwrap().push("abort".into());
+            Ok(())
+        }
+        async fn complete_run(&self) -> Result<(), FaucetError> {
+            self.log.lock().unwrap().push("complete".into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_sink_node_commits_then_persists_its_position() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(LoggingStore {
+            inner: MemoryStateStore::new(),
+            log: log.clone(),
+        });
+        let (source, _) = LogSource::new(3, 1, false);
+        let topo = Topology::builder()
+            .source("s", Box::new(source))
+            .sink(
+                "k",
+                Box::new(OverwriteSink {
+                    log: log.clone(),
+                    fail_commit: false,
+                }),
+            )
+            .edge("s", "k")
+            .build()
+            .unwrap();
+        topo.run(TopologyOptions::new("p").with_state_store(store))
+            .await
+            .unwrap();
+        let log = log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "begin", "write", "write", "write", "commit", "put 3", "complete"
+            ],
+            "staged, swapped, then the position — never before the swap"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_sink_node_discards_staging_when_another_node_fails() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(3)))
+            .tee("t", 4, Some(2))
+            .sink(
+                "k",
+                Box::new(OverwriteSink {
+                    log: log.clone(),
+                    fail_commit: false,
+                }),
+            )
+            .sink("bad", Box::new(FailingSink))
+            .edge("s", "t")
+            .edge("t", "k")
+            .edge("t", "bad")
+            .build()
+            .unwrap();
+        let run = topo
+            .run_reported(
+                TopologyOptions::new("p").with_on_error(TopologyOnError::Continue),
+                TopologyGovernance::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!run.result.errors.is_empty());
+        let log = log.lock().unwrap().clone();
+        assert!(log.contains(&"abort".to_string()), "{log:?}");
+        assert!(!log.contains(&"commit".to_string()), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_sink_node_discards_staging_on_cancel() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(3)))
+            .sink(
+                "k",
+                Box::new(OverwriteSink {
+                    log: log.clone(),
+                    fail_commit: false,
+                }),
+            )
+            .edge("s", "k")
+            .build()
+            .unwrap();
+        topo.run(TopologyOptions::new("p").with_cancel(cancel))
+            .await
+            .unwrap();
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.first().map(String::as_str), Some("begin"));
+        assert!(log.contains(&"abort".to_string()), "{log:?}");
+        assert!(!log.contains(&"commit".to_string()), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_swap_fails_the_run_and_discards_the_other_staging() {
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(2)))
+            .tee("t", 4, Some(2))
+            .sink(
+                "a",
+                Box::new(OverwriteSink {
+                    log: first.clone(),
+                    fail_commit: true,
+                }),
+            )
+            .sink(
+                "b",
+                Box::new(OverwriteSink {
+                    log: second.clone(),
+                    fail_commit: false,
+                }),
+            )
+            .edge("s", "t")
+            .edge("t", "a")
+            .edge("t", "b")
+            .build()
+            .unwrap();
+        let err = topo
+            .run(TopologyOptions::new("p"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("swap failed"), "{err}");
+        let second = second.lock().unwrap().clone();
+        assert!(second.contains(&"abort".to_string()), "{second:?}");
+        assert!(!second.contains(&"commit".to_string()), "{second:?}");
+    }
+
+    // ── CLI-18 (core side) ────────────────────────────────────────────────────
+
+    struct BrokenSource;
+    #[async_trait]
+    impl Source for BrokenSource {
+        async fn fetch_with_context(
+            &self,
+            _c: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Err(FaucetError::Source("source down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sink_fed_by_a_failed_source_is_reported_failed() {
+        let (sink, _) = CollectSink::new();
+        let topo = Topology::builder()
+            .source("src", Box::new(BrokenSource))
+            .transform("x", Vec::new())
+            .sink("k", Box::new(sink))
+            .edge("src", "x")
+            .edge("x", "k")
+            .build()
+            .unwrap();
+        let run = topo
+            .run_reported(
+                TopologyOptions::new("p").with_on_error(TopologyOnError::Continue),
+                TopologyGovernance::new(),
+            )
+            .await
+            .unwrap();
+        let k = run.nodes.iter().find(|n| n.node_id == "k").unwrap();
+        let err = k.error.as_deref().unwrap_or_default();
+        assert!(err.contains("upstream node 'src' failed"), "{err}");
+        assert_eq!(k.error_kind, Some(NodeErrorKind::Other));
+    }
+
+    #[tokio::test]
+    async fn run_attributed_keeps_the_per_node_report_on_failure() {
+        let (sink, _) = CollectSink::new();
+        let topo = Topology::builder()
+            .source("src", Box::new(BrokenSource))
+            .sink("k", Box::new(sink))
+            .edge("src", "k")
+            .build()
+            .unwrap();
+        let (run, err) = topo
+            .run_attributed(TopologyOptions::new("p"), TopologyGovernance::new())
+            .await;
+        assert!(err.is_some(), "Propagate surfaces the failure");
+        let k = run.nodes.iter().find(|n| n.node_id == "k").unwrap();
+        assert!(k.error.is_some(), "the sink is reported, not dropped");
+        let src = run.nodes.iter().find(|n| n.node_id == "src").unwrap();
+        assert!(
+            src.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("source down")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_attributed_reports_an_invalid_graph() {
+        let (run, err) = Topology {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        }
+        .run_attributed(TopologyOptions::new("p"), TopologyGovernance::new())
+        .await;
+        assert!(err.is_some());
+        assert!(run.nodes.is_empty());
     }
 }
