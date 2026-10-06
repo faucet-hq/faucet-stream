@@ -743,7 +743,7 @@ async fn execute_shard(
     };
 
     let server_shutdown = state.shutdown_token();
-    let span = tracing::info_span!("faucet.serve.shard", serve_run_id = %run_id, shard = %shard_id);
+    let span = tracing::info_span!(parent: None, "faucet.serve.shard", serve_run_id = %run_id, shard = %shard_id);
     let audit_state = state.clone();
     let audit_run_id = run_id.to_string();
     let work = async move {
@@ -1781,7 +1781,7 @@ async fn execute_run(
         budget,
     };
 
-    let span = tracing::info_span!("faucet.serve.run", serve_run_id = %run_id);
+    let span = tracing::info_span!(parent: None, "faucet.serve.run", serve_run_id = %run_id);
     let audit_state = state.clone();
     let audit_run_id = run_id.clone();
     // The resolved+expanded config snapshot (#374) a successful run leaves in

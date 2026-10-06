@@ -779,9 +779,11 @@ For each change event it:
 - **drops** DDL / truncate events (`op` ∈ `drop_ops`) — they have no row to mirror;
 - for a **delete** (`op` ∈ `delete_ops`), emits the pre-image (`before`), falling
   back to `key_field` (MongoDB carries the key in `document_key` when there is no
-  `before`); rows with no usable key are dropped with a `tracing::warn!`;
-- for an **insert / update**, emits the post-image (`after`); events with no row
-  image are dropped with a warning;
+  `before`);
+- for an **insert / update**, emits the post-image (`after`);
+- **fails the run** on an event it cannot turn into a row (an update with no
+  `after`, a delete with no key) unless `on_missing_image: drop`, because
+  dropping it would leave the mirror silently out of date;
 - stamps every emitted row with a `marker_field` (`__op`) set to the normalized
   value **`"d"`** (delete) or **`"u"`** (upsert) — *not* the raw op code. A
   downstream sink's `delete_marker` should therefore match `"d"`.
@@ -800,11 +802,24 @@ declaration order like any other transform.
 | `marker_field` | `__op` | Field stamped on every emitted row (`"d"` / `"u"`) |
 | `delete_ops` | `["d", "delete"]` | `op` values that mean delete |
 | `drop_ops` | `["ddl", "truncate"]` | `op` values dropped entirely |
+| `on_missing_image` | `fail` | `fail` or `drop` an event with no usable row image |
 
 The defaults span all three CDC vocabularies seen in the wild — `insert` /
 `update` / `delete` / `truncate`, `c` / `u` / `d` / `ddl`, and `c` / `u` / `r` /
 `d` / `ddl` — so a bare `- type: cdc_unwrap` works for postgres-cdc, mysql-cdc,
 and mongodb-cdc without per-source tuning.
+
+Sources whose updates can lack an `after` image:
+
+- **mongodb-cdc** sends one only with `full_document: update_lookup` (or
+  `required` with collection post-images enabled). `faucet validate` refuses
+  `cdc_unwrap` over the default `full_document: off` or `when_available`. Under
+  `update_lookup` a missing image means the document was deleted before the
+  lookup and its delete event follows, so `on_missing_image` defaults to `drop`
+  there.
+- **DynamoDB streams** carry a new image only with the `NEW_IMAGE` or
+  `NEW_AND_OLD_IMAGES` stream view type; `faucet doctor` reports the table's
+  view type.
 
 `cdc_unwrap` is a built-in transform gated on the `transform-cdc-unwrap` feature
 (included in the `full` build). It is **opaque** for column-lineage analysis (it
