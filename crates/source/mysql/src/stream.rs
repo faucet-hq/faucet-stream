@@ -205,22 +205,25 @@ fn mysql_value_to_json(
     // BLOB / BINARY → base64; a text column with a binary collation arrives
     // as bytes too, but is text (#789 SQL-13).
     if let Ok(v) = row.try_get::<Vec<u8>, _>(col_name) {
-        if text_columns.contains(col_name) {
-            match String::from_utf8(v) {
-                Ok(s) => return Value::String(s),
-                Err(e) => {
-                    use base64::Engine as _;
-                    return Value::String(
-                        base64::engine::general_purpose::STANDARD.encode(e.into_bytes()),
-                    );
-                }
-            }
-        }
-        use base64::Engine as _;
-        return Value::String(base64::engine::general_purpose::STANDARD.encode(v));
+        return bytes_to_json(v, text_columns.contains(col_name));
     }
 
     Value::Null
+}
+
+/// A byte-valued cell: text (when the column is text with a binary collation
+/// and the bytes are UTF-8) or base64 (#789 SQL-13).
+fn bytes_to_json(bytes: Vec<u8>, is_text: bool) -> Value {
+    use base64::Engine as _;
+    let bytes = if is_text {
+        match String::from_utf8(bytes) {
+            Ok(s) => return Value::String(s),
+            Err(e) => e.into_bytes(),
+        }
+    } else {
+        bytes
+    };
+    Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 /// Build the effective SQL query and ordered context-bind values for a given
@@ -684,6 +687,22 @@ fn key_discovery_error(e: sqlx::Error) -> FaucetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_cells_decode_as_text_only_for_utf8_text_columns() {
+        assert_eq!(
+            bytes_to_json(b"slug".to_vec(), true),
+            serde_json::json!("slug")
+        );
+        assert_eq!(
+            bytes_to_json(vec![0xff, 0x00], true),
+            serde_json::json!("/wA=")
+        );
+        assert_eq!(
+            bytes_to_json(b"slug".to_vec(), false),
+            serde_json::json!("c2x1Zw==")
+        );
+    }
 
     #[test]
     fn charset_probe_query_reads_every_column_over_zero_rows() {

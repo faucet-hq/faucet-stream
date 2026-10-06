@@ -347,3 +347,35 @@ async fn the_dlq_path_reports_the_rows_of_the_page_that_did_not_land() {
             .is_empty()
     );
 }
+
+/// A group whose earlier pages landed before the failing chunk has nothing to
+/// restore; a fully successful per-page write reports every row as written.
+#[tokio::test(flavor = "multi_thread")]
+async fn landed_rows_are_not_restored_and_a_clean_page_reports_all_rows() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE landed (id Int64, name String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let mut cfg = ClickHouseSinkConfig::new(&base, "landed")
+        .with_batch_size(10)
+        .with_create_table(false);
+    cfg.commit_rows = Some(15);
+    let sink = ClickHouseSink::new(cfg).expect("sink");
+
+    sink.write_batch(&rows(0, 10)).await.expect("buffered");
+    let mut bad = rows(10, 10);
+    bad[3] = json!({ "id": "not a number", "name": "x" });
+    assert!(sink.write_batch(&bad).await.is_err());
+    sink.flush().await.expect("nothing left to commit");
+    assert_eq!(count_of(&base, "SELECT count() AS n FROM landed").await, 10);
+
+    let outcomes = sink
+        .write_batch_partial(&rows(20, 5))
+        .await
+        .expect("all rows land");
+    assert!(outcomes.iter().all(Result::is_ok));
+    assert_eq!(count_of(&base, "SELECT count() AS n FROM landed").await, 15);
+}

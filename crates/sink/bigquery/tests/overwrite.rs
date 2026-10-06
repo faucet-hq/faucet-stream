@@ -1954,3 +1954,15 @@ async fn truncating_load_surfaces_a_schema_read_failure() {
         .expect_err("schema read fails");
     assert!(err.to_string().contains("truncate schema"), "{err}");
 }
+
+/// `BigQuerySink::new` builds its client from service-account key JSON without
+/// a network round trip, and the sink it returns writes like `from_parts`.
+#[tokio::test]
+async fn new_builds_a_sink_from_service_account_key_json() {
+    let server = MockServer::start().await;
+    let mut config = config_overwrite();
+    config.write.write_mode = WriteMode::Append;
+    let config = with_sa_auth(config, &server);
+    let sink = BigQuerySink::new(config).await.expect("sink");
+    assert_eq!(sink.connector_name(), "bigquery");
+}

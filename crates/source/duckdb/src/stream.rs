@@ -151,6 +151,25 @@ fn value_ref_to_json(v: ValueRef<'_>) -> Value {
     }
 }
 
+/// A cell read: the value, the driver's error, or a decode panic turned into
+/// an error naming the column.
+fn cell_value<E: std::fmt::Display>(
+    read: std::thread::Result<Result<Value, E>>,
+    name: &str,
+) -> Result<Value, FaucetError> {
+    match read {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(FaucetError::Source(format!(
+            "DuckDB column {name} read failed: {e}"
+        ))),
+        Err(_) => Err(FaucetError::Source(format!(
+            "DuckDB column {name} holds a value the driver cannot decode (a DECIMAL \
+             wider than 28 significant digits or a nanosecond TIME); CAST it to \
+             VARCHAR in the query"
+        ))),
+    }
+}
+
 /// Build a JSON object from the current row using the pre-fetched column names.
 fn row_to_json(row: &duckdb::Row<'_>, col_names: &[String]) -> Result<Value, FaucetError> {
     let mut map = serde_json::Map::with_capacity(col_names.len());
@@ -161,22 +180,7 @@ fn row_to_json(row: &duckdb::Row<'_>, col_names: &[String]) -> Result<Value, Fau
         let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             row.get_ref(i).map(value_ref_to_json)
         }));
-        let value = match read {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                return Err(FaucetError::Source(format!(
-                    "DuckDB column {name} read failed: {e}"
-                )));
-            }
-            Err(_) => {
-                return Err(FaucetError::Source(format!(
-                    "DuckDB column {name} holds a value the driver cannot decode (a DECIMAL \
-                     wider than 28 significant digits or a nanosecond TIME); CAST it to \
-                     VARCHAR in the query"
-                )));
-            }
-        };
-        map.insert(name.clone(), value);
+        map.insert(name.clone(), cell_value(read, name)?);
     }
     Ok(Value::Object(map))
 }
@@ -363,6 +367,26 @@ impl faucet_core::Source for DuckdbSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_value_names_the_column_on_error_and_panic() {
+        let ok: std::thread::Result<Result<Value, String>> = Ok(Ok(Value::Bool(true)));
+        assert_eq!(cell_value(ok, "c").unwrap(), Value::Bool(true));
+        let err: std::thread::Result<Result<Value, String>> = Ok(Err("bad index".into()));
+        assert!(
+            cell_value(err, "c")
+                .unwrap_err()
+                .to_string()
+                .contains("column c read failed")
+        );
+        let panicked: std::thread::Result<Result<Value, String>> = Err(Box::new("boom"));
+        assert!(
+            cell_value(panicked, "c")
+                .unwrap_err()
+                .to_string()
+                .contains("CAST it to")
+        );
+    }
     use faucet_core::Source;
     use serde_json::json;
 

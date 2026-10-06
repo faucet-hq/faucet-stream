@@ -434,3 +434,36 @@ async fn the_dlq_path_commits_per_page_and_reports_each_row() {
     assert!(sink.write_batch_partial(&[]).await.unwrap().is_empty());
     pool.close().await;
 }
+
+/// A group whose earlier rows landed before the failing chunk has nothing to
+/// restore; a fully successful per-page write reports every row as written.
+#[tokio::test(flavor = "multi_thread")]
+async fn landed_rows_are_not_restored_and_a_clean_page_reports_all_rows() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (id BIGINT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let mut cfg = insert_config(port, "events", 1);
+    cfg.commit_rows = Some(2);
+    let sink = RedshiftSink::new(cfg).await.expect("sink builds");
+
+    sink.write_batch(&[json!({"id": 1})])
+        .await
+        .expect("buffered");
+    sink.write_batch(&[json!({"id": "bad"})])
+        .await
+        .expect_err("the second chunk fails");
+    sink.flush().await.expect("nothing left to commit");
+    assert_eq!(row_count(&pool, "events").await, 1);
+
+    let outcomes = sink
+        .write_batch_partial(&[json!({"id": 2}), json!({"id": 3})])
+        .await
+        .expect("all rows land");
+    assert!(outcomes.iter().all(Result::is_ok));
+    assert_eq!(row_count(&pool, "events").await, 3);
+    pool.close().await;
+}

@@ -1475,14 +1475,11 @@ impl BigQuerySink {
             total += self.insert_batch(chunk).await?;
         }
 
-        tracing::info!(
-            table = %format!(
-                "{}.{}.{}",
-                self.config.project_id, self.config.dataset_id, self.config.table_id
-            ),
-            rows = total,
-            "BigQuery write complete"
+        let table = format!(
+            "{}.{}.{}",
+            self.config.project_id, self.config.dataset_id, self.config.table_id
         );
+        tracing::info!(table = %table, rows = total, "BigQuery write complete");
         Ok(total)
     }
 

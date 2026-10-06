@@ -118,3 +118,29 @@ async fn the_dlq_path_commits_per_page_and_reports_each_row() {
     assert!(err.to_string().contains("400"), "{err}");
     assert!(sink.write_batch_partial(&[]).await.unwrap().is_empty());
 }
+
+/// A group whose earlier rows landed before the failing chunk has nothing to
+/// restore; a fully successful per-page write reports every row as written.
+#[tokio::test]
+async fn landed_rows_are_not_restored_and_a_clean_page_reports_all_rows() {
+    let server = MockServer::start().await;
+    mount(&server, "late-row", None).await;
+    let sink = SnowflakeSink::new(config())
+        .unwrap()
+        .with_endpoint(format!("{}/api/v2/statements", server.uri()));
+
+    sink.write_batch(&[json!({"id": "early-row"})])
+        .await
+        .expect("buffered");
+    sink.write_batch(&[json!({"id": "late-row"})])
+        .await
+        .expect_err("the second chunk fails");
+    sink.flush().await.expect("nothing left to commit");
+    assert_eq!(bodies_with(&server, "early-row").await, 1);
+
+    let outcomes = sink
+        .write_batch_partial(&[json!({"id": "a"}), json!({"id": "b"})])
+        .await
+        .expect("all rows land");
+    assert!(outcomes.iter().all(Result::is_ok));
+}
