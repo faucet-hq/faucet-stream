@@ -78,6 +78,20 @@ fn net_err(what: &str, e: impl std::fmt::Display) -> CliError {
     CliError::Config(format!("hub github: {what}: {e}"))
 }
 
+/// A catalog's `index.json` at the hub root: version history, `stable`, trust.
+const INDEX_FILE: &str = "index.json";
+
+/// Whether `commit` is a full git commit id. A catalog's `index.json` is
+/// remote data and its commits become cache paths, so nothing else is used.
+pub fn is_commit_id(commit: &str) -> bool {
+    commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The first seven characters of a commit id, for messages.
+pub fn short_commit(commit: &str) -> String {
+    commit.chars().take(7).collect()
+}
+
 /// The environment variable holding a token for one owner's repos (#696):
 /// `FAUCET_GITHUB_TOKEN_<OWNER>`, the owner upper-cased with `-` and `.` as `_`.
 pub fn owner_token_var(repo: &str) -> String {
@@ -147,6 +161,14 @@ impl GithubHub {
 
     async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> CliResult<reqwest::Response> {
         let resp = req.send().await.map_err(|e| net_err(what, e))?;
+        self.send_checked(resp, what).await
+    }
+
+    async fn send_checked(
+        &self,
+        resp: reqwest::Response,
+        what: &str,
+    ) -> CliResult<reqwest::Response> {
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
@@ -295,7 +317,27 @@ impl GithubHub {
         Ok(files)
     }
 
-    /// Download a complete snapshot of the hub into `dest` (created).
+    /// A file at the hub root, `None` when the catalog has none.
+    async fn fetch_optional(&self, rel: &str) -> CliResult<Option<Vec<u8>>> {
+        let resp = self
+            .get(&self.contents_url(rel), "application/vnd.github.raw+json")
+            .send()
+            .await
+            .map_err(|e| net_err(&format!("fetching {rel}"), e))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let resp = self.send_checked(resp, &format!("fetching {rel}")).await?;
+        resp.bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| net_err(&format!("fetching {rel}"), e))
+    }
+
+    /// Download a complete snapshot of the hub into `dest` (created),
+    /// including the root `index.json` when the catalog has one — it holds the
+    /// launched (`stable`) version of each template and the commits of older
+    /// ones, without which an unpinned run would take the newest body.
     pub async fn download(&self, dest: &Path) -> CliResult<()> {
         let files = self.walk().await?;
         std::fs::create_dir_all(dest)
@@ -325,6 +367,10 @@ impl GithubHub {
             .collect()
             .await;
         results.into_iter().collect::<CliResult<Vec<()>>>()?;
+        if let Some(index) = self.fetch_optional(INDEX_FILE).await? {
+            std::fs::write(dest.join(INDEX_FILE), index)
+                .map_err(|e| net_err(&format!("writing {INDEX_FILE}"), e))?;
+        }
         std::fs::write(
             dest.join(LOCATION_MARKER),
             format!(
@@ -358,7 +404,7 @@ impl GithubHub {
         let resp = self
             .send(
                 self.get(&url, "application/vnd.github.raw+json"),
-                &format!("fetching {rel} @ {}", &commit[..7.min(commit.len())]),
+                &format!("fetching {rel} @ {}", short_commit(commit)),
             )
             .await?;
         resp.bytes()
@@ -385,6 +431,13 @@ pub async fn fetch_file_at(
     commit: &str,
     rel: &str,
 ) -> CliResult<PathBuf> {
+    if !is_commit_id(commit) {
+        return Err(CliError::Config(format!(
+            "hub {}: the catalog index names commit {commit:?} for {rel}, which is not a full \
+             40-character commit id",
+            loc.describe()
+        )));
+    }
     let target = cache_root
         .join(loc.cache_key())
         .join("files")
@@ -469,32 +522,68 @@ pub async fn fetch_cached(
         let tmp = key_dir.join(format!(".tmp-{sha}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         hub.download(&tmp).await?;
-        let _ = std::fs::remove_dir_all(&snapshot);
-        std::fs::rename(&tmp, &snapshot)
-            .map_err(|e| net_err(&format!("installing snapshot {}", snapshot.display()), e))?;
+        install_snapshot(&tmp, &snapshot)?;
         eprintln!(
             "fetched {} @ {} → {}",
             loc.describe(),
-            &sha[..7.min(sha.len())],
+            short_commit(&sha),
             snapshot.display()
         );
     }
+    let previous = std::fs::read_to_string(key_dir.join(CURRENT_FILE)).ok();
     std::fs::write(key_dir.join(CURRENT_FILE), &sha)
         .map_err(|e| net_err("recording current snapshot", e))?;
-    prune_old(&key_dir, &sha);
+    prune_old(&key_dir, &sha, previous.as_deref().map(str::trim));
     Ok(snapshot)
 }
 
-/// Keep only the current snapshot; older commits and abandoned temp dirs go.
-fn prune_old(key_dir: &Path, keep: &str) {
+/// Move a downloaded snapshot into place. A complete snapshot another
+/// process installed meanwhile is never replaced — it may be in use.
+fn install_snapshot(tmp: &Path, snapshot: &Path) -> CliResult<()> {
+    if is_complete(snapshot) {
+        let _ = std::fs::remove_dir_all(tmp);
+        return Ok(());
+    }
+    let _ = std::fs::remove_dir_all(snapshot);
+    match std::fs::rename(tmp, snapshot) {
+        Ok(()) => Ok(()),
+        Err(_) if is_complete(snapshot) => {
+            let _ = std::fs::remove_dir_all(tmp);
+            Ok(())
+        }
+        Err(e) => Err(net_err(
+            &format!("installing snapshot {}", snapshot.display()),
+            e,
+        )),
+    }
+}
+
+/// How long another process's download directory is left alone.
+const TMP_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Drop snapshots older than the current and the one it replaced (a run that
+/// started just before the switch may still read it), keeping the pinned
+/// `files/` cache and other processes' recent downloads.
+fn prune_old(key_dir: &Path, keep: &str, previous: Option<&str>) {
     let Ok(rd) = std::fs::read_dir(key_dir) else {
         return;
     };
     for e in rd.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if name == keep || name == CURRENT_FILE {
+        if name == keep || name == CURRENT_FILE || name == "files" || Some(&*name) == previous {
             continue;
+        }
+        if name.starts_with(".tmp-") {
+            let recent = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age < TMP_GRACE);
+            if recent {
+                continue;
+            }
         }
         if e.path().is_dir() {
             let _ = std::fs::remove_dir_all(e.path());
@@ -624,18 +713,141 @@ mod tests {
         let after = server.received_requests().await.unwrap().len();
         assert_eq!(after - before, 1, "one request: the commit lookup");
 
-        // A new commit replaces the snapshot and prunes the old one.
+        // A new commit becomes current; the one it replaced is kept for a
+        // run that started before the switch (#789 CLI-104) and pruned on the
+        // next advance.
         server.reset().await;
         mock_hub(&server, "fedcba9876543210").await;
         let newer = fetch_cached(&loc(), cache.path(), &server.uri())
             .await
             .expect("refetch");
         assert!(newer.ends_with("fedcba9876543210"));
-        assert!(!dir.exists(), "old snapshot pruned");
+        assert!(dir.exists(), "the previous snapshot is kept one generation");
         assert_eq!(
             std::fs::read_to_string(cache.path().join(loc().cache_key()).join("current")).unwrap(),
             "fedcba9876543210"
         );
+        server.reset().await;
+        mock_hub(&server, "aaaabbbbccccdddd").await;
+        fetch_cached(&loc(), cache.path(), &server.uri())
+            .await
+            .expect("third fetch");
+        assert!(!dir.exists(), "two generations back is pruned");
+        assert!(newer.exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hub_env)]
+    async fn a_remote_snapshot_carries_the_index_and_an_unpinned_run_takes_stable() {
+        let server = MockServer::start().await;
+        mock_hub(&server, "0123456789abcdef").await;
+        let stable_commit = "1".repeat(40);
+        let index = json!({
+            "commit": "2".repeat(40),
+            "sources": [{"id": "acme", "name": "acme", "newest": 2, "stable": 1,
+                "versions": [{"version": 1, "commit": stable_commit}, {"version": 2, "commit": "2".repeat(40)}]}],
+            "sinks": []
+        });
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hub/contents/index.json"))
+            .and(header("Accept", "application/vnd.github.raw+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index.to_string()))
+            .mount(&server)
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        // SAFETY: serial(hub_env); restored below.
+        unsafe {
+            std::env::remove_var(OFFLINE_ENV);
+            std::env::set_var(CACHE_ENV, cache.path());
+        }
+        let dir = fetch_cached(&loc(), cache.path(), &server.uri())
+            .await
+            .expect("fetch");
+        assert!(
+            dir.join("index.json").is_file(),
+            "index.json is part of the snapshot"
+        );
+
+        // The launched version lives at another commit; seed the pinned-file
+        // cache so resolving it needs no network.
+        let pinned = cache
+            .path()
+            .join(loc().cache_key())
+            .join("files")
+            .join(&stable_commit)
+            .join("source-templates/acme.yaml");
+        std::fs::create_dir_all(pinned.parent().unwrap()).unwrap();
+        std::fs::write(&pinned, "kind: source-template\nname: acme\n").unwrap();
+        let got = crate::hub::locate("acme", &dir, crate::hub::catalog::SOURCE_DIR).await;
+        unsafe { std::env::remove_var(CACHE_ENV) };
+        assert_eq!(
+            got.expect("locate"),
+            pinned,
+            "unpinned resolves to stable, not newest"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hub_env)]
+    async fn a_catalog_without_an_index_downloads_cleanly() {
+        let server = MockServer::start().await;
+        mock_hub(&server, "0123456789abcdef").await;
+        let cache = tempfile::tempdir().unwrap();
+        let dir = fetch_cached(&loc(), cache.path(), &server.uri())
+            .await
+            .expect("fetch");
+        assert!(!dir.join("index.json").exists());
+        assert!(dir.join(".complete").is_file());
+    }
+
+    #[tokio::test]
+    async fn an_index_commit_must_be_a_full_commit_id() {
+        let cache = tempfile::tempdir().unwrap();
+        for bad in ["/etc", "../x", "abc", "é".repeat(40).as_str()] {
+            let err = fetch_file_at(&loc(), cache.path(), "http://127.0.0.1:1", bad, "a.yaml")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("40-character"), "{bad}: {err}");
+        }
+        assert!(is_commit_id(&"a".repeat(40)));
+        assert!(!is_commit_id(&"g".repeat(40)));
+        assert_eq!(short_commit("é".repeat(10).as_str()), "é".repeat(7));
+    }
+
+    #[test]
+    fn install_never_replaces_a_complete_snapshot_and_prune_spares_pins_and_downloads() {
+        let root = tempfile::tempdir().unwrap();
+        let snap = root.path().join("abc");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join(".complete"), b"").unwrap();
+        std::fs::write(snap.join("marker"), b"theirs").unwrap();
+        let tmp = root.path().join(".tmp-abc-1");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("marker"), b"ours").unwrap();
+        install_snapshot(&tmp, &snap).unwrap();
+        assert_eq!(std::fs::read(snap.join("marker")).unwrap(), b"theirs");
+        assert!(!tmp.exists());
+
+        let fresh = root.path().join("def");
+        let tmp = root.path().join(".tmp-def-1");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join(".complete"), b"").unwrap();
+        install_snapshot(&tmp, &fresh).unwrap();
+        assert!(is_complete(&fresh));
+
+        for d in ["files/x", "old", "prev", ".tmp-live-2"] {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+        }
+        prune_old(root.path(), "def", Some("prev"));
+        assert!(root.path().join("files/x").exists());
+        assert!(root.path().join("prev").exists());
+        assert!(
+            root.path().join(".tmp-live-2").exists(),
+            "a recent download is spared"
+        );
+        assert!(!root.path().join("old").exists());
+        assert!(!root.path().join("abc").exists());
     }
 
     #[tokio::test]
@@ -842,7 +1054,10 @@ mod tests {
         mock_hub(&server, "0123456789abcdef").await;
         Mock::given(method("GET"))
             .and(path("/repos/acme/hub/contents/source-templates/acme.yaml"))
-            .and(query_param("ref", "aaaa1111"))
+            .and(query_param(
+                "ref",
+                "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+            ))
             .and(header("Accept", "application/vnd.github.raw+json"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -865,19 +1080,21 @@ mod tests {
             &loc(),
             cache.path(),
             &server.uri(),
-            "aaaa1111",
+            "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
             "source-templates/acme.yaml",
         )
         .await
         .expect("fetch at commit");
-        assert!(f.ends_with("files/aaaa1111/source-templates/acme.yaml"));
+        assert!(f.ends_with(
+            "files/aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111/source-templates/acme.yaml"
+        ));
         assert!(std::fs::read_to_string(&f).unwrap().contains("# v1"));
         let before = server.received_requests().await.unwrap().len();
         let again = fetch_file_at(
             &loc(),
             cache.path(),
             &server.uri(),
-            "aaaa1111",
+            "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
             "source-templates/acme.yaml",
         )
         .await
@@ -892,7 +1109,7 @@ mod tests {
             &loc(),
             cache.path(),
             &server.uri(),
-            "bbbb2222",
+            "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
             "source-templates/acme.yaml",
         )
         .await

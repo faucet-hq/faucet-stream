@@ -944,7 +944,7 @@ async fn fetch_version(
         CliError::Config(format!(
             "hub template '{id}' v{} lives at catalog commit {} — a local directory hub cannot fetch it; use a remote hub (`--hub github:…`)",
             target.version,
-            &target.commit[..7.min(target.commit.len())]
+            remote::short_commit(&target.commit)
         ))
     })?;
     let ext = head_file
