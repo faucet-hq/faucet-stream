@@ -302,3 +302,135 @@ async fn lag_reports_millis_behind_latest() {
     let after = source.lag().await.expect("lag").expect("a reading");
     assert!(after.seconds.unwrap() >= 0.0, "{after:?}");
 }
+
+fn seen_is(records: &[serde_json::Value]) -> Vec<i64> {
+    let mut is: Vec<i64> = records
+        .iter()
+        .map(|r| r["data"]["i"].as_i64().unwrap())
+        .collect();
+    is.sort_unstable();
+    is
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_shard_is_read_when_shards_outnumber_shard_concurrency() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    create_stream(&client, "wide", 4).await;
+    put_records(&client, "wide", 0, 80).await;
+
+    let mut cfg = source_config(&endpoint, "wide");
+    cfg.shard_concurrency = 1;
+    let source = KinesisSource::new(cfg).await.expect("source");
+    let records = source.fetch_all().await.expect("fetch");
+    let shards: std::collections::HashSet<&str> = records
+        .iter()
+        .map(|r| r["shard_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(shards.len(), 4, "every shard is read, not only the first");
+    assert_eq!(seen_is(&records), (0..80).collect::<Vec<i64>>());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reshard_drains_the_parent_tail_before_its_children() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    create_stream(&client, "split", 1).await;
+    put_records(&client, "split", 0, 30).await;
+
+    let mut first = source_config(&endpoint, "split");
+    first.max_messages = Some(10);
+    first.batch_size = 10;
+    let source = KinesisSource::new(first).await.expect("source");
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 10);
+    let mut bookmark = None;
+    let mut read = Vec::new();
+    while let Some(page) = pages.next().await {
+        let page = page.expect("page");
+        read.extend(page.records);
+        if bookmark.is_none() {
+            bookmark = page.bookmark;
+        }
+    }
+    drop(pages);
+    assert_eq!(read.len(), 10);
+    let bookmark = bookmark.expect("bookmark");
+
+    let parent = client
+        .list_shards()
+        .stream_name("split")
+        .send()
+        .await
+        .expect("list")
+        .shards()[0]
+        .clone();
+    let range = parent.hash_key_range().expect("hash range");
+    let start: u128 = range.starting_hash_key().parse().unwrap();
+    let end: u128 = range.ending_hash_key().parse().unwrap();
+    client
+        .split_shard()
+        .stream_name("split")
+        .shard_to_split(parent.shard_id())
+        .new_starting_hash_key((start + (end - start) / 2).to_string())
+        .send()
+        .await
+        .expect("split shard");
+    for _ in 0..60 {
+        let shards = client
+            .list_shards()
+            .stream_name("split")
+            .send()
+            .await
+            .expect("list");
+        if shards.shards().len() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    create_stream_ready(&client, "split").await;
+    put_records(&client, "split", 100, 20).await;
+
+    let resumed = KinesisSource::new(source_config(&endpoint, "split"))
+        .await
+        .expect("resumed");
+    resumed.apply_start_bookmark(bookmark).await.expect("apply");
+    let records = resumed.fetch_all().await.expect("resume fetch");
+    let mut expected: Vec<i64> = (10..30).collect();
+    expected.extend(100..120);
+    assert_eq!(
+        seen_is(&records),
+        expected,
+        "the parent's unread tail is kept"
+    );
+    let first_child = records
+        .iter()
+        .position(|r| r["shard_id"] != parent.shard_id())
+        .expect("child records");
+    assert!(
+        records[first_child..]
+            .iter()
+            .all(|r| r["shard_id"] != parent.shard_id()),
+        "every parent record precedes the children's"
+    );
+}
+
+async fn create_stream_ready(client: &aws_sdk_kinesis::Client, name: &str) {
+    for _ in 0..60 {
+        let out = client
+            .describe_stream_summary()
+            .stream_name(name)
+            .send()
+            .await
+            .expect("describe");
+        if out
+            .stream_description_summary()
+            .map(|d| d.stream_status() == &aws_sdk_kinesis::types::StreamStatus::Active)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    panic!("stream {name} never became ACTIVE");
+}
