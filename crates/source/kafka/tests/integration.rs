@@ -490,3 +490,43 @@ async fn a_rebalance_mid_run_resumes_reassigned_partitions_from_delivered_offset
         "no record is skipped when partitions come back after a rebalance"
     );
 }
+
+/// A bookmark that fell out of topic retention resumes at the log start, not
+/// at `auto.offset.reset: latest`, so the still-retained backlog is read
+/// (#789 MSG-24).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bookmark_below_the_log_start_resumes_at_the_log_start() {
+    let (_container, brokers) = start_kafka().await;
+    let topic = "retention";
+    let msgs: Vec<String> = (1..=6).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
+    let refs: Vec<(Option<&str>, &str)> = msgs.iter().map(|m| (None, m.as_str())).collect();
+    produce(&brokers, topic, &refs).await;
+
+    let s1 = KafkaSource::new(source_config(&brokers, topic, "g-ret-1", 2))
+        .await
+        .unwrap();
+    let (first, bookmark) = s1.fetch_all_incremental().await.unwrap();
+    assert_eq!(first.len(), 2);
+    drop(s1);
+
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .unwrap();
+    let mut tpl = rdkafka::TopicPartitionList::new();
+    tpl.add_partition_offset(topic, 0, rdkafka::Offset::Offset(4))
+        .unwrap();
+    admin
+        .delete_records(&tpl, &AdminOptions::new())
+        .await
+        .expect("delete_records");
+
+    let mut cfg = source_config(&brokers, topic, "g-ret-2", 2);
+    cfg.auto_offset_reset = OffsetReset::Latest;
+    cfg.idle_timeout = Some(Duration::from_secs(15));
+    let s2 = KafkaSource::new(cfg).await.unwrap();
+    s2.apply_start_bookmark(bookmark.unwrap()).await.unwrap();
+    let (second, _) = s2.fetch_all_incremental().await.unwrap();
+    let ids: Vec<_> = second.iter().map(|r| r["value"]["id"].clone()).collect();
+    assert_eq!(ids, vec![serde_json::json!(5), serde_json::json!(6)]);
+}

@@ -29,9 +29,9 @@ pub struct KafkaSourceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_format: Option<KafkaValueFormat>,
     #[serde(default)]
-    /// Where to start when the group has no committed offset: `earliest`
-    /// (default) replays the retained log, `latest` consumes only new messages.
-    /// Ignored once a bookmark or committed offset exists.
+    /// Where to start when the group has no committed offset: `latest`
+    /// (default) consumes only new messages, `earliest` replays the retained
+    /// log. Ignored once a bookmark or committed offset exists.
     pub auto_offset_reset: OffsetReset,
     /// Stop after this many messages have been consumed.
     /// At least one of `max_messages` and `idle_timeout` must be set.

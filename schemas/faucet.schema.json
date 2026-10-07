@@ -18670,7 +18670,7 @@
                       ]
                     },
                     "auto_offset_reset": {
-                      "description": "Where to start when the group has no committed offset: `earliest`\n(default) replays the retained log, `latest` consumes only new messages.\nIgnored once a bookmark or committed offset exists.",
+                      "description": "Where to start when the group has no committed offset: `latest`\n(default) consumes only new messages, `earliest` replays the retained\nlog. Ignored once a bookmark or committed offset exists.",
                       "$ref": "#/$defs/source_kafka__OffsetReset",
                       "default": "latest"
                     },
