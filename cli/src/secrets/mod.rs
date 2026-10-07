@@ -50,6 +50,10 @@ pub(crate) fn secret_http_client() -> reqwest::Client {
 
 /// Refuse `#field` on a scheme that cannot extract one, instead of letting
 /// the `#…` reach the backend as part of the name.
+#[cfg_attr(
+    not(any(feature = "secrets-gcp-sm", feature = "secrets-azure-kv")),
+    allow(dead_code)
+)]
 pub(crate) fn reject_field(scheme: &str, reference: &str) -> CliResult<()> {
     if reference.contains('#') {
         return Err(CliError::SecretFetchFailed {

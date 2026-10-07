@@ -94,6 +94,7 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
         },
     };
     // `--offline` is credential-free: secret directives stay unresolved.
+    #[cfg_attr(not(feature = "policy"), allow(unused_mut))]
     let mut cfg = if args.offline {
         PipelineConfig::from_path_tolerating_secrets_with(&path, args.profile.as_deref(), &inputs)?
     } else {

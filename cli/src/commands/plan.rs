@@ -457,6 +457,7 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
     // A live pull connects to the real source, so it needs real credentials
     // and real param values, never the literal directives or placeholders.
     #[cfg_attr(not(feature = "policy"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "catalog"), allow(unused_variables))]
     let (path, mut cfg) = load_plan_config(&args, args.resolve_secrets || args.live).await?;
     #[cfg(feature = "policy")]
     crate::policy::apply_to_config(&mut cfg, args.policy.as_deref())?;
