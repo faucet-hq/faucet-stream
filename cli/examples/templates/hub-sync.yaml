@@ -12,6 +12,8 @@
 # `launch: always` makes each pulled version live immediately — right for a
 # curated public catalog you want usable the moment it syncs. Use `follow` to
 # honour per-template sidecars, or `ignore` to review in the console first.
+# A `faucet template rollback` sticks: a later pull launches only a version
+# that was never live (a new upstream body), never the one you rolled back from.
 #
 # `paths` reads both catalog directories as one origin (source and sink names
 # share the registry's id namespace, so a stem may appear in only one of them).

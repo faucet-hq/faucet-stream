@@ -793,10 +793,15 @@ Templates page grows a **Sync from origins** panel when the server has any.
 **Layout at an origin.** The template id is the file **stem**, with the origin's
 `prefix` prepended: `templates/nightly.yaml` under `prefix: platform-` registers
 as `platform-nightly`. Only `*.yaml` / `*.yml` / `*.json` files directly in the
-directory are read; a GitHub origin may name several directories with
-`paths: [source-templates, sink-templates]` instead of one `path` (a Template
-Hub catalog — stems must be unique across them, and `publish` writes to the
-first). An optional sidecar `<stem>.faucet.yaml` beside the template
+directory — plus one level of owner directories, whose files register as
+`owner/name` — are read, on GitHub and object-store origins alike; a GitHub
+origin may name several directories with `paths: [source-templates,
+sink-templates]` instead of one `path` (a Template Hub catalog — stems must be
+unique across them, and `publish` writes each template to the directory named
+for its kind: `source-templates`, `sink-templates`, `deployments`; a pipeline
+goes to the first). A GitHub pull resolves `ref` to one commit and reads every
+file at that commit, so a push during the pull cannot mix two revisions; a
+directory past the contents API's 1000-entry limit is read from the git tree. An optional sidecar `<stem>.faucet.yaml` beside the template
 carries release intent, kept out of the config body so the body stays runnable
 with `faucet run`:
 
@@ -814,17 +819,25 @@ tags: [staging]       # assignable channels to point at the pulled version
 | New file | `register` a version (launched only if the policy says so) |
 | Body changed (comments/whitespace ignored — the canonical body is hashed) | `register` the next version |
 | Body unchanged | nothing — re-pulling is free and never inflates the version counter |
-| Unchanged, but `stable` lags the policy (`always`, or a sidecar flipped `launch`) | `launch` the existing version |
+| Unchanged, but `stable` lags the policy (`always`, or a sidecar flipped `launch`) and that version was never launched | `launch` the existing version |
+| Unchanged, but an operator rolled back off it (the launch log already holds it) or the version is retired | nothing — a pull never undoes a rollback; a new body is a new version and is launched as usual |
 | File removed | `prune: keep` → reported as orphaned; `prune: deprecate` → deprecated |
-| Removed file returns | under `prune: deprecate` the deprecation is lifted (the origin owns that marker) |
-| Bad id / unparseable body / bad sidecar tag | skipped and reported — one broken file never blocks the origin |
+| Removed file returns | under `prune: deprecate` the deprecation the origin placed is lifted; a deprecation a person placed is left alone, and nothing is launched into that template until they lift it |
+| Bad id / unparseable body / bad or unreadable sidecar / ambiguous stem / a file that could not be read this pull | skipped and reported — one broken file never blocks the origin, and it still counts as upstream, so `prune: deprecate` never retires it |
 
 A pull **only appends**: nothing is overwritten and nothing is deleted (a delete
 would cascade to the launch log and silently repoint `stable`). Under the default
 `launch: ignore` a pull moves nobody — exactly like a manual `register`;
 `follow` lets the sidecar decide; `always` is GitOps mode, where merging upstream
 is the release. Every register is attributed (`created_by: sync:<origin>`, or the
-principal who called the HTTP endpoint).
+principal who called the HTTP endpoint). Pulls of one origin are serialized in a
+process, and a body another pull registered since the plan was made is not
+registered again, so a rollback always has a different version to land on.
+
+`${env:…}` / `${file:…}` / `${secret:…}` in the sync file resolve inside each
+value after it is parsed — an environment value can never add keys. A value that
+is exactly one directive may resolve to a number (`interval_secs:
+${env:SYNC_EVERY}`).
 
 **One owner per template.** Each origin owns the id namespace named by its
 `prefix`; two origins with overlapping prefixes (including an empty prefix beside

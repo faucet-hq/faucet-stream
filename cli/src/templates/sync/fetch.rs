@@ -25,10 +25,13 @@ use crate::serve::load::ConfigFormat;
 const FETCH_CONCURRENCY: usize = 8;
 
 /// One file read from an origin: its basename and UTF-8 body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteFile {
     pub name: String,
     pub body: String,
+    /// Set when the file is listed but could not be read (transient error,
+    /// not UTF-8). The template it belongs to is skipped, not treated as gone.
+    pub error: Option<String>,
 }
 
 /// A template as the planner sees it: the id stem (before the origin's
@@ -42,6 +45,23 @@ pub struct RemoteTemplate {
     /// Set when the origin's catalog marks this body's version deprecated
     /// (#691): the reason, and the planner skips the template.
     pub retired: Option<String>,
+    /// Set when the template is upstream but cannot be used this pull (an
+    /// unreadable file, an invalid sidecar, an ambiguous stem): the planner
+    /// reports it and still counts it as present, so it is never pruned.
+    pub unusable: Option<String>,
+}
+
+impl RemoteTemplate {
+    fn unusable(stem: String, why: String) -> Self {
+        Self {
+            stem,
+            body: String::new(),
+            format: ConfigFormat::Yaml,
+            sidecar: None,
+            retired: None,
+            unusable: Some(why),
+        }
+    }
 }
 
 /// Result of pairing a directory listing.
@@ -93,15 +113,23 @@ fn strip_ext(name: &str) -> &str {
 }
 
 /// Pair templates with their sidecars. Pure.
+///
+/// A template that cannot be used this pull (its file or sidecar unreadable,
+/// its sidecar invalid, two files claiming its stem) is returned with
+/// [`RemoteTemplate::unusable`] set, so the planner keeps it out of the
+/// orphan set instead of deprecating a live template over a typo.
 pub fn pair_files(files: Vec<RemoteFile>) -> Paired {
     use std::collections::BTreeMap;
-    let mut templates: BTreeMap<String, Vec<(String, ConfigFormat, String)>> = BTreeMap::new();
-    let mut sidecars: BTreeMap<String, (String, String)> = BTreeMap::new();
+    type Entry = (String, ConfigFormat, String, Option<String>);
+    let mut templates: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
+    let mut sidecars: BTreeMap<String, (String, String, Option<String>)> = BTreeMap::new();
     let mut warnings = Vec::new();
 
     for f in files {
         if let Some(stem) = sidecar_stem(&f.name) {
-            if let Some((prev, _)) = sidecars.insert(stem.to_string(), (f.name.clone(), f.body)) {
+            if let Some((prev, _, _)) =
+                sidecars.insert(stem.to_string(), (f.name.clone(), f.body, f.error))
+            {
                 warnings.push(format!(
                     "'{stem}': two sidecars ('{prev}' and '{}'); using '{}'",
                     f.name, f.name
@@ -111,30 +139,47 @@ pub fn pair_files(files: Vec<RemoteFile>) -> Paired {
             templates
                 .entry(strip_ext(&f.name).to_string())
                 .or_default()
-                .push((f.name, fmt, f.body));
+                .push((f.name, fmt, f.body, f.error));
         }
     }
 
     let mut out = Vec::new();
     for (stem, mut entries) in templates {
         if entries.len() > 1 {
-            let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
-            warnings.push(format!(
+            let names: Vec<&str> = entries.iter().map(|(n, _, _, _)| n.as_str()).collect();
+            let why = format!(
                 "'{stem}': ambiguous — {} all name the same template; skipped",
                 names.join(", ")
-            ));
+            );
+            warnings.push(why.clone());
             sidecars.remove(&stem);
+            out.push(RemoteTemplate::unusable(stem, why));
             continue;
         }
-        let (_, format, body) = entries.pop().expect("one entry");
+        let (name, format, body, error) = entries.pop().expect("one entry");
+        if let Some(e) = error {
+            let why = format!("'{name}' could not be read ({e}); template skipped");
+            warnings.push(why.clone());
+            sidecars.remove(&stem);
+            out.push(RemoteTemplate::unusable(stem, why));
+            continue;
+        }
         let sidecar = match sidecars.remove(&stem) {
             None => None,
-            Some((name, text)) => match serde_yaml::from_str::<Sidecar>(&text) {
+            Some((name, _, Some(e))) => {
+                let why =
+                    format!("'{stem}': sidecar '{name}' could not be read ({e}); template skipped");
+                warnings.push(why.clone());
+                out.push(RemoteTemplate::unusable(stem, why));
+                continue;
+            }
+            Some((name, text, None)) => match serde_yaml::from_str::<Sidecar>(&text) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    warnings.push(format!(
-                        "'{stem}': sidecar '{name}' is invalid ({e}); template skipped"
-                    ));
+                    let why =
+                        format!("'{stem}': sidecar '{name}' is invalid ({e}); template skipped");
+                    warnings.push(why.clone());
+                    out.push(RemoteTemplate::unusable(stem, why));
                     continue;
                 }
             },
@@ -145,9 +190,10 @@ pub fn pair_files(files: Vec<RemoteFile>) -> Paired {
             format,
             sidecar,
             retired: None,
+            unusable: None,
         });
     }
-    for (stem, (name, _)) in sidecars {
+    for (stem, (name, _, _)) in sidecars {
         warnings.push(format!(
             "'{name}': sidecar without a '{stem}.yaml' / '.json' template"
         ));
@@ -203,6 +249,46 @@ pub trait Publisher: Send + Sync {
     /// Create or overwrite `name` under the origin's directory; returns a
     /// human-readable location of what was written.
     async fn put(&self, name: &str, body: &str) -> CliResult<String>;
+
+    /// [`Self::put`] for a template of `kind`, so an origin reading several
+    /// directories writes it where the next pull reads that kind from.
+    async fn put_kind(
+        &self,
+        name: &str,
+        body: &str,
+        _kind: crate::hub::spec::TemplateKind,
+    ) -> CliResult<String> {
+        self.put(name, body).await
+    }
+}
+
+/// Directory-listing size at which the GitHub contents API truncates.
+const CONTENTS_LIST_CAP: usize = 1000;
+
+/// The `paths:` directory a template of `kind` belongs in: the one named for
+/// the kind (`source-templates`, `sink-templates`, `deployments`), else the
+/// only one, else the first for a pipeline. `None` = ambiguous.
+pub fn dir_for_kind<'a>(dirs: &[&'a str], kind: crate::hub::spec::TemplateKind) -> Option<&'a str> {
+    use crate::hub::spec::TemplateKind;
+    let named = match kind {
+        TemplateKind::SourceTemplate => Some("source-templates"),
+        TemplateKind::SinkTemplate => Some("sink-templates"),
+        TemplateKind::Deployment => Some("deployments"),
+        TemplateKind::Pipeline => None,
+    };
+    if let Some(n) = named
+        && let Some(d) = dirs.iter().find(|d| d.rsplit('/').next() == Some(n))
+    {
+        return Some(d);
+    }
+    if dirs.len() == 1 || named.is_none() {
+        return dirs.first().copied();
+    }
+    None
+}
+
+fn is_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn io_err(kind: &str, msg: impl std::fmt::Display) -> CliError {
@@ -216,6 +302,26 @@ fn io_err(kind: &str, msg: impl std::fmt::Display) -> CliError {
 pub struct GithubFetcher {
     client: reqwest::Client,
     cfg: GithubSource,
+    /// The commit `ref` resolved to, once per fetcher, so a listing and every
+    /// download read one snapshot even if the branch moves mid-pull.
+    pinned: tokio::sync::OnceCell<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TreeListing {
+    #[serde(default)]
+    tree: Vec<TreeEntry>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TreeEntry {
+    path: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    sha: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -243,7 +349,31 @@ impl GithubFetcher {
         Ok(Self {
             client,
             cfg: cfg.clone(),
+            pinned: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// The commit the configured `ref` points at now (resolved once). Falls
+    /// back to the ref itself when the commits API cannot resolve it, so the
+    /// listing reports the real error.
+    async fn read_ref(&self) -> &str {
+        self.pinned
+            .get_or_init(|| async {
+                let base = self.cfg.api_base.trim_end_matches('/');
+                let url = format!("{base}/repos/{}/commits/{}", self.cfg.repo, self.cfg.r#ref);
+                let resp = self
+                    .request(reqwest::Method::GET, &url, "application/vnd.github.sha")
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status().is_success() => match r.text().await {
+                        Ok(t) if is_commit_sha(t.trim()) => t.trim().to_string(),
+                        _ => self.cfg.r#ref.clone(),
+                    },
+                    _ => self.cfg.r#ref.clone(),
+                }
+            })
+            .await
     }
 
     /// The directories this origin reads: `paths` when set, else `path`.
@@ -335,7 +465,68 @@ impl GithubFetcher {
 
 impl GithubFetcher {
     async fn list_dir(&self, dir: &str) -> CliResult<Vec<ContentsEntry>> {
-        let url = format!("{}?ref={}", self.contents_url_in(dir, None), self.cfg.r#ref);
+        let entries = self.list_dir_contents(dir).await?;
+        if entries.len() >= CONTENTS_LIST_CAP {
+            // The contents API stops at 1000 entries; anything past it would
+            // look removed upstream. Read the directory from the git tree.
+            return self.list_dir_tree(dir).await;
+        }
+        Ok(entries)
+    }
+
+    async fn list_dir_tree(&self, dir: &str) -> CliResult<Vec<ContentsEntry>> {
+        let base = self.cfg.api_base.trim_end_matches('/');
+        let url = format!(
+            "{base}/repos/{}/git/trees/{}?recursive=1",
+            self.cfg.repo,
+            self.read_ref().await
+        );
+        let resp = self
+            .send(
+                self.request(reqwest::Method::GET, &url, "application/vnd.github+json"),
+                "listing the git tree",
+            )
+            .await?;
+        let tree: TreeListing = resp
+            .json()
+            .await
+            .map_err(|e| io_err("github", format!("decoding the git tree: {e}")))?;
+        if tree.truncated {
+            return Err(io_err(
+                "github",
+                format!(
+                    "'{dir}' in {} is too large to list (the git tree is truncated); split it \
+                     across several `paths:`",
+                    self.cfg.repo
+                ),
+            ));
+        }
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        Ok(tree
+            .tree
+            .into_iter()
+            .filter_map(|e| {
+                let name = e.path.strip_prefix(&prefix)?;
+                (!name.is_empty() && !name.contains('/')).then(|| ContentsEntry {
+                    name: name.to_string(),
+                    kind: if e.kind == "tree" { "dir" } else { "file" }.to_string(),
+                    url: self.contents_url_in(dir, Some(name)),
+                    sha: e.sha,
+                })
+            })
+            .collect())
+    }
+
+    async fn list_dir_contents(&self, dir: &str) -> CliResult<Vec<ContentsEntry>> {
+        let url = format!(
+            "{}?ref={}",
+            self.contents_url_in(dir, None),
+            self.read_ref().await
+        );
         let resp = self
             .send(
                 self.request(reqwest::Method::GET, &url, "application/vnd.github+json"),
@@ -368,7 +559,7 @@ impl Fetcher for GithubFetcher {
         let url = format!(
             "{}?ref={}",
             self.contents_url_in("", Some("index.json")),
-            self.cfg.r#ref
+            self.read_ref().await
         );
         let resp = self
             .request(
@@ -420,28 +611,59 @@ impl Fetcher for GithubFetcher {
             .into_iter()
             .filter(|e| e.kind == "file" && is_candidate(&e.name))
             .collect();
-        let files: Vec<CliResult<RemoteFile>> = futures::stream::iter(wanted)
+        let rref = self.read_ref().await;
+        let files: Vec<RemoteFile> = futures::stream::iter(wanted)
             .map(|e| async move {
-                let url = format!(
-                    "{}?ref={}",
-                    e.url.split('?').next().unwrap_or(&e.url),
-                    self.cfg.r#ref
-                );
-                let body = self.read_raw(&url).await?;
-                Ok(RemoteFile { name: e.name, body })
+                let url = format!("{}?ref={rref}", e.url.split('?').next().unwrap_or(&e.url));
+                match self.read_raw(&url).await {
+                    Ok(body) => RemoteFile {
+                        name: e.name,
+                        body,
+                        error: None,
+                    },
+                    Err(err) => RemoteFile {
+                        name: e.name,
+                        body: String::new(),
+                        error: Some(err.to_string()),
+                    },
+                }
             })
             .buffer_unordered(FETCH_CONCURRENCY)
             .collect()
             .await;
-        files.into_iter().collect()
+        Ok(files)
     }
 }
 
 #[async_trait]
 impl Publisher for GithubFetcher {
     async fn put(&self, name: &str, body: &str) -> CliResult<String> {
+        self.put_in(self.dir(), name, body).await
+    }
+
+    async fn put_kind(
+        &self,
+        name: &str,
+        body: &str,
+        kind: crate::hub::spec::TemplateKind,
+    ) -> CliResult<String> {
+        let dirs = self.dirs();
+        let dir = dir_for_kind(&dirs, kind).ok_or_else(|| {
+            CliError::Config(format!(
+                "templates-sync github: none of this origin's `paths:` ({}) holds {} files — add \
+                 one, or publish to an origin that reads them",
+                dirs.join(", "),
+                kind.as_str()
+            ))
+        })?;
+        self.put_in(dir, name, body).await
+    }
+}
+
+impl GithubFetcher {
+    async fn put_in(&self, dir: &str, name: &str, body: &str) -> CliResult<String> {
         use base64::Engine as _;
-        let url = self.contents_url(Some(name));
+        let url = self.contents_url_in(dir, Some(name));
         // An update must carry the blob sha of what it replaces.
         let existing = self
             .request(
@@ -606,34 +828,56 @@ impl Fetcher for ObjectStoreFetcher {
             .try_collect()
             .await
             .map_err(|e| io_err(&self.label, format!("listing: {e}")))?;
-        let direct: Vec<object_store::path::Path> = metas
+        // Direct children, plus one level of owner directories (#682) whose
+        // stems become `owner/name` — the same layout the GitHub reader takes.
+        let wanted: Vec<(String, object_store::path::Path)> = metas
             .into_iter()
-            .map(|m| m.location)
-            .filter(|loc| {
-                loc.parts().count() == depth + 1 && loc.filename().is_some_and(is_candidate)
+            .filter_map(|m| {
+                let parts: Vec<String> = m
+                    .location
+                    .parts()
+                    .skip(depth)
+                    .map(|p| p.as_ref().to_string())
+                    .collect();
+                let name = match parts.as_slice() {
+                    [file] => file.clone(),
+                    [owner, file] if !owner.starts_with('.') => format!("{owner}/{file}"),
+                    _ => return None,
+                };
+                is_candidate(&name).then_some((name, m.location))
             })
             .collect();
-        let files: Vec<CliResult<RemoteFile>> = futures::stream::iter(direct)
-            .map(|loc| async move {
-                let bytes = self
-                    .store
-                    .get(&loc)
-                    .await
-                    .map_err(|e| io_err(&self.label, format!("reading {loc}: {e}")))?
-                    .bytes()
-                    .await
-                    .map_err(|e| io_err(&self.label, format!("reading {loc}: {e}")))?;
-                let body = String::from_utf8(bytes.to_vec())
-                    .map_err(|e| io_err(&self.label, format!("{loc} is not UTF-8: {e}")))?;
-                Ok(RemoteFile {
-                    name: loc.filename().unwrap_or_default().to_string(),
-                    body,
-                })
+        let files: Vec<RemoteFile> = futures::stream::iter(wanted)
+            .map(|(name, loc)| async move {
+                let read = async {
+                    let bytes = self
+                        .store
+                        .get(&loc)
+                        .await
+                        .map_err(|e| format!("reading {loc}: {e}"))?
+                        .bytes()
+                        .await
+                        .map_err(|e| format!("reading {loc}: {e}"))?;
+                    String::from_utf8(bytes.to_vec())
+                        .map_err(|e| format!("{loc} is not UTF-8: {e}"))
+                };
+                match read.await {
+                    Ok(body) => RemoteFile {
+                        name,
+                        body,
+                        error: None,
+                    },
+                    Err(e) => RemoteFile {
+                        name,
+                        body: String::new(),
+                        error: Some(e),
+                    },
+                }
             })
             .buffer_unordered(FETCH_CONCURRENCY)
             .collect()
             .await;
-        files.into_iter().collect()
+        Ok(files)
     }
 }
 
@@ -688,6 +932,7 @@ mod tests {
         RemoteFile {
             name: name.into(),
             body: body.into(),
+            error: None,
         }
     }
 
@@ -742,12 +987,79 @@ mod tests {
             f("lonely.faucet.yaml", "{}"),
             f("ok.yaml", "a: 1"),
         ]);
-        let stems: Vec<&str> = p.templates.iter().map(|t| t.stem.as_str()).collect();
-        assert_eq!(stems, vec!["ok"]);
+        let usable: Vec<&str> = p
+            .templates
+            .iter()
+            .filter(|t| t.unusable.is_none())
+            .map(|t| t.stem.as_str())
+            .collect();
+        assert_eq!(usable, vec!["ok"]);
+        // The dropped stems are still reported as upstream, so a prune never
+        // deprecates them (#789 CLI-109).
+        let unusable: Vec<&str> = p
+            .templates
+            .iter()
+            .filter(|t| t.unusable.is_some())
+            .map(|t| t.stem.as_str())
+            .collect();
+        assert_eq!(unusable, vec!["bad", "dup"]);
         assert_eq!(p.warnings.len(), 3, "{:?}", p.warnings);
         assert!(p.warnings.iter().any(|w| w.contains("'dup': ambiguous")));
         assert!(p.warnings.iter().any(|w| w.contains("'bad': sidecar")));
         assert!(p.warnings.iter().any(|w| w.contains("lonely.faucet.yaml")));
+    }
+
+    #[test]
+    fn unreadable_files_make_their_template_unusable() {
+        let broken = |name: &str| RemoteFile {
+            name: name.into(),
+            body: String::new(),
+            error: Some("HTTP 502".into()),
+        };
+        let p = pair_files(vec![
+            broken("a.yaml"),
+            f("b.yaml", "b: 1"),
+            broken("b.faucet.yaml"),
+            f("c.yaml", "c: 1"),
+        ]);
+        let state: Vec<(&str, bool)> = p
+            .templates
+            .iter()
+            .map(|t| (t.stem.as_str(), t.unusable.is_some()))
+            .collect();
+        assert_eq!(state, vec![("a", true), ("b", true), ("c", false)]);
+        assert!(
+            p.templates[0]
+                .unusable
+                .as_deref()
+                .unwrap()
+                .contains("HTTP 502")
+        );
+    }
+
+    #[test]
+    fn publish_picks_the_directory_for_the_kind() {
+        use crate::hub::spec::TemplateKind;
+        let both = ["source-templates", "hub/sink-templates"];
+        assert_eq!(
+            dir_for_kind(&both, TemplateKind::SinkTemplate),
+            Some("hub/sink-templates")
+        );
+        assert_eq!(
+            dir_for_kind(&both, TemplateKind::SourceTemplate),
+            Some("source-templates")
+        );
+        assert_eq!(dir_for_kind(&both, TemplateKind::Deployment), None);
+        assert_eq!(
+            dir_for_kind(&both, TemplateKind::Pipeline),
+            Some("source-templates")
+        );
+        assert_eq!(
+            dir_for_kind(&["templates"], TemplateKind::SinkTemplate),
+            Some("templates")
+        );
+        assert!(is_commit_sha(&"a".repeat(40)));
+        assert!(!is_commit_sha("main"));
     }
 
     #[test]
@@ -828,22 +1140,27 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn lists_only_direct_candidate_children() {
+        async fn lists_candidate_children_and_owner_directories() {
             let s = seeded().await;
             let f = ObjectStoreFetcher::new(s.clone(), "/tpl/", "mem");
             let mut files = f.list().await.unwrap();
             files.sort_by(|a, b| a.name.cmp(&b.name));
             let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
-            assert_eq!(names, vec!["a.faucet.yaml", "a.yaml", "b.json"]);
+            // One level of owner directories reads as `owner/name`, like a
+            // GitHub origin, so a published `owner/name` id round-trips.
+            assert_eq!(
+                names,
+                vec!["a.faucet.yaml", "a.yaml", "b.json", "nested/c.yaml"]
+            );
             assert_eq!(files[1].body, "a: 1");
             // Pairing on top of the listing.
             let p = pair_files(files);
-            assert_eq!(p.templates.len(), 2);
+            assert_eq!(p.templates.len(), 3);
             assert!(p.templates[0].sidecar.as_ref().unwrap().launch);
         }
 
         #[tokio::test]
-        async fn empty_prefix_reads_the_root_only() {
+        async fn empty_prefix_reads_the_root_and_owner_directories() {
             let s = Arc::new(InMemory::new());
             s.put(
                 &Path::from("r.yaml"),
@@ -858,9 +1175,10 @@ mod tests {
             .await
             .unwrap();
             let f = ObjectStoreFetcher::new(s, "", "mem");
-            let files = f.list().await.unwrap();
-            assert_eq!(files.len(), 1);
-            assert_eq!(files[0].name, "r.yaml");
+            let mut files = f.list().await.unwrap();
+            files.sort_by(|a, b| a.name.cmp(&b.name));
+            let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(names, vec!["d/x.yaml", "r.yaml"]);
         }
 
         #[tokio::test]
@@ -890,7 +1208,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn non_utf8_objects_are_a_typed_error() {
+        async fn non_utf8_objects_are_reported_per_file() {
             let s = Arc::new(InMemory::new());
             s.put(
                 &Path::from("x.yaml"),
@@ -899,7 +1217,8 @@ mod tests {
             .await
             .unwrap();
             let f = ObjectStoreFetcher::new(s, "", "mem");
-            let err = f.list().await.unwrap_err().to_string();
+            let files = f.list().await.unwrap();
+            let err = files[0].error.as_deref().unwrap();
             assert!(err.contains("not UTF-8"), "{err}");
         }
 
@@ -972,6 +1291,7 @@ mod tests {
             format: ConfigFormat::Yaml,
             sidecar: None,
             retired: None,
+            unusable: None,
         };
         let mut ts = vec![t("acme/erp"), t("acme/crm"), t("legacy"), t("other")];
         apply_catalog_index(&mut ts, &index);
@@ -1035,6 +1355,135 @@ mod tests {
         let bad = GithubFetcher::new(&src(vec!["s".into()], "acme/bad")).unwrap();
         let err = bad.catalog_index().await.unwrap_err().to_string();
         assert!(err.contains("decoding index.json"), "{err}");
+    }
+
+    /// The ref is resolved to a commit once and every listing and download
+    /// reads that commit (#789 CLI-103); a directory past the contents API's
+    /// 1000-entry cap is read from the git tree (#789 CLI-113).
+    #[tokio::test]
+    async fn github_reads_one_commit_and_lists_large_directories_from_the_tree() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/big/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sha))
+            .mount(&server)
+            .await;
+        let entries: Vec<serde_json::Value> = (0..1000)
+            .map(|i| serde_json::json!({"name": format!("t{i}.md"), "type": "file", "url": "x"}))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/big/contents/tpl"))
+            .and(query_param("ref", sha))
+            .respond_with(ResponseTemplate::new(200).set_body_json(entries))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/big/git/trees/{sha}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "truncated": false,
+                "tree": [
+                    {"path": "tpl", "type": "tree"},
+                    {"path": "tpl/a.yaml", "type": "blob", "sha": "1"},
+                    {"path": "tpl/z1001.yaml", "type": "blob", "sha": "2"},
+                    {"path": "tpl/deep/x/y.yaml", "type": "blob"},
+                    {"path": "other/b.yaml", "type": "blob"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        for name in ["a.yaml", "z1001.yaml"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/acme/big/contents/tpl/{name}")))
+                .and(query_param("ref", sha))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!("n: {name}")))
+                .mount(&server)
+                .await;
+        }
+        let fetcher = GithubFetcher::new(&GithubSource {
+            repo: "acme/big".into(),
+            r#ref: "main".into(),
+            path: "tpl".into(),
+            paths: Vec::new(),
+            token: None,
+            api_base: server.uri(),
+        })
+        .unwrap();
+        let mut files = fetcher.list().await.unwrap();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        let got: Vec<(&str, Option<&str>)> = files
+            .iter()
+            .map(|f| (f.name.as_str(), f.error.as_deref()))
+            .collect();
+        assert_eq!(got, vec![("a.yaml", None), ("z1001.yaml", None)]);
+        assert_eq!(files[1].body, "n: z1001.yaml");
+
+        // A truncated tree refuses rather than dropping templates.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/big/contents/tpl"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                (0..1000)
+                    .map(|i| serde_json::json!({"name": format!("t{i}"), "type": "file", "url": "x"}))
+                    .collect::<Vec<_>>(),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/big/git/trees/{sha}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"truncated": true, "tree": []})),
+            )
+            .mount(&server)
+            .await;
+        let err = fetcher.list().await.unwrap_err().to_string();
+        assert!(err.contains("too large to list"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn github_publish_writes_a_sink_template_to_the_sink_directory() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/acme/hub/contents/sink-templates/files.yaml"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "content": {"html_url": "https://github.com/acme/hub/blob/main/sink-templates/files.yaml"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let fetcher = GithubFetcher::new(&GithubSource {
+            repo: "acme/hub".into(),
+            r#ref: "main".into(),
+            path: String::new(),
+            paths: vec!["source-templates".into(), "sink-templates".into()],
+            token: None,
+            api_base: server.uri(),
+        })
+        .unwrap();
+        let loc = fetcher
+            .put_kind(
+                "files.yaml",
+                "kind: sink-template",
+                crate::hub::spec::TemplateKind::SinkTemplate,
+            )
+            .await
+            .unwrap();
+        assert!(loc.ends_with("sink-templates/files.yaml"), "{loc}");
+        let err = fetcher
+            .put_kind(
+                "ops.yaml",
+                "kind: deployment",
+                crate::hub::spec::TemplateKind::Deployment,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holds deployment files"), "{err}");
     }
 
     #[tokio::test]

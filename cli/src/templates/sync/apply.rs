@@ -55,6 +55,19 @@ impl ApplyOutcome {
     }
 }
 
+/// The newest registered version of `id`, when its body hashes like `body`.
+async fn newest_with_body(store: &TemplateStore, id: &str, body: &str) -> CliResult<Option<u32>> {
+    let Some(rec) = store
+        .template_get(id, None)
+        .await
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
+    else {
+        return Ok(None);
+    };
+    let same = super::plan::body_hash(&rec.body).ok() == super::plan::body_hash(body).ok();
+    Ok(same.then_some(rec.version))
+}
+
 async fn run_action(
     store: &TemplateStore,
     origin: &str,
@@ -72,6 +85,15 @@ async fn run_action(
             tags,
             ..
         } => {
+            // Another pull (a cluster peer, or an HTTP sync racing the interval
+            // one) may have registered this body since the plan was made:
+            // registering it again would leave `previous` pointing at the same
+            // config and make a rollback a no-op.
+            if let Some(version) = newest_with_body(store, &id, &body).await? {
+                out.unchanged += 1;
+                tracing::debug!(template = %id, version, "body already registered by a concurrent pull");
+                return Ok(());
+            }
             let rec = crate::templates::register(
                 store,
                 RegisterRequest {
@@ -108,7 +130,7 @@ async fn run_action(
             crate::templates::set_deprecated(
                 store,
                 &id,
-                Some(format!("removed from origin '{origin}'")),
+                Some(super::plan::removed_reason(origin)),
                 Some(actor),
                 true,
             )
@@ -198,6 +220,25 @@ mod tests {
             tags,
             replaces: None,
         }
+    }
+
+    /// Two pulls planned against the same snapshot register the body once
+    /// (#789 CLI-111).
+    #[tokio::test]
+    async fn a_body_a_concurrent_pull_registered_is_not_registered_again() {
+        let s = store();
+        let plan = |origin: &str| SyncPlan {
+            origin: origin.into(),
+            actions: vec![register("a", true, vec![])],
+        };
+        let first = apply(&s, plan("o"), "sync:o").await;
+        assert_eq!(first.registered.len(), 1);
+        let second = apply(&s, plan("o"), "sync:o").await;
+        assert!(second.failed.is_empty(), "{:?}", second.failed);
+        assert!(second.registered.is_empty());
+        assert_eq!(second.unchanged, 1);
+        let state = crate::templates::template_state(&s, "a").await.unwrap();
+        assert_eq!(state.versions, vec![1]);
     }
 
     #[tokio::test]

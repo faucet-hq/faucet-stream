@@ -38,6 +38,30 @@ pub struct LocalTemplate {
     pub newest_deprecated: bool,
     /// The launched version, if any.
     pub stable: Option<u32>,
+    /// Every version the launch log has ever made `stable`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launched: Vec<u32>,
+    /// Who deprecated the template and why, when it is deprecated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation_reason: Option<String>,
+}
+
+/// The reason a `prune: deprecate` pull records on a template gone upstream.
+pub fn removed_reason(origin: &str) -> String {
+    format!("removed from origin '{origin}'")
+}
+
+impl LocalTemplate {
+    /// Whether the template's deprecation was placed by `origin`'s own prune
+    /// (and so is the origin's to lift). A human's deprecation is never undone
+    /// by a pull.
+    fn deprecated_by_origin(&self, origin: &str) -> bool {
+        self.status == TemplateStatus::Deprecated
+            && (self.deprecated_by.as_deref() == Some(super::sync_actor(origin).as_str())
+                || self.deprecation_reason.as_deref() == Some(removed_reason(origin).as_str()))
+    }
 }
 
 /// One planned step. Serializes with an `action` tag for `--json` / the HTTP
@@ -152,6 +176,16 @@ pub fn plan(origin: &Origin, remote: &[RemoteTemplate], local: &[LocalTemplate])
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     for r in remote {
+        if let Some(why) = &r.unusable {
+            // A file the origin holds but that could not be read or paired is
+            // still upstream: never an orphan, so never deprecated by a typo.
+            seen.insert(format!("{}{}", origin.prefix, r.stem));
+            actions.push(SyncAction::Skipped {
+                name: r.stem.clone(),
+                reason: why.clone(),
+            });
+            continue;
+        }
         if let Some(why) = &r.retired {
             // A body the catalog retired is never registered. When it already is
             // (as the newest version here), the retirement follows it. Either way
@@ -218,16 +252,30 @@ pub fn plan(origin: &Origin, remote: &[RemoteTemplate], local: &[LocalTemplate])
         };
         let launch = should_launch(origin.launch, &sidecar);
 
-        match local_by_id.get(id.as_str()) {
+        let local = local_by_id.get(id.as_str()).copied();
+        // This origin lifts only a deprecation its own prune placed; while a
+        // human's deprecation stands, nothing is launched into the template.
+        let revive = local.is_some_and(|l| {
+            origin.prune == PrunePolicy::Deprecate && l.deprecated_by_origin(&origin.name)
+        });
+        let retired = local.is_some_and(|l| l.status == TemplateStatus::Deprecated) && !revive;
+        match local {
             Some(l) if l.newest.is_some() && l.newest_hash.as_deref() == Some(hash.as_str()) => {
                 let newest = l.newest.expect("checked");
                 let mut acted = false;
-                if l.status == TemplateStatus::Deprecated && origin.prune == PrunePolicy::Deprecate
-                {
+                if revive {
                     actions.push(SyncAction::Revive { id: id.clone() });
                     acted = true;
                 }
-                if launch && l.stable != Some(newest) {
+                // Launch only a version that was never live: one the launch log
+                // already holds was moved off by an operator (a rollback), and a
+                // pull must not undo that.
+                if launch
+                    && !retired
+                    && !l.newest_deprecated
+                    && l.stable != Some(newest)
+                    && !l.launched.contains(&newest)
+                {
                     actions.push(SyncAction::Launch {
                         id: id.clone(),
                         version: newest,
@@ -241,15 +289,20 @@ pub fn plan(origin: &Origin, remote: &[RemoteTemplate], local: &[LocalTemplate])
                     });
                 }
             }
-            other => actions.push(SyncAction::Register {
-                id,
-                body: r.body.clone(),
-                format: r.format,
-                description: sidecar.description.clone(),
-                launch,
-                tags,
-                replaces: other.and_then(|l| l.newest),
-            }),
+            other => {
+                if revive {
+                    actions.push(SyncAction::Revive { id: id.clone() });
+                }
+                actions.push(SyncAction::Register {
+                    id,
+                    body: r.body.clone(),
+                    format: r.format,
+                    description: sidecar.description.clone(),
+                    launch: launch && !retired,
+                    tags,
+                    replaces: other.and_then(|l| l.newest),
+                });
+            }
         }
     }
 
@@ -304,6 +357,7 @@ mod tests {
             format: ConfigFormat::Yaml,
             sidecar,
             retired: None,
+            unusable: None,
         }
     }
 
@@ -321,6 +375,9 @@ mod tests {
             newest_hash: Some(body_hash(body).unwrap()),
             newest_deprecated: false,
             stable,
+            launched: stable.into_iter().collect(),
+            deprecated_by: (status == TemplateStatus::Deprecated).then(|| "sync:o".to_string()),
+            deprecation_reason: (status == TemplateStatus::Deprecated).then(|| removed_reason("o")),
         }
     }
 
@@ -530,6 +587,99 @@ mod tests {
                     version: 2
                 },
             ]
+        );
+    }
+
+    /// An operator rolled back off the newest version: a `launch: always`
+    /// pull of the unchanged body must not re-launch it (#789 CLI-68), nor
+    /// launch a version this registry retired.
+    #[test]
+    fn a_rolled_back_or_retired_version_is_not_relaunched() {
+        let always = origin("", LaunchPolicy::Always, PrunePolicy::Keep);
+        let mut l = local("a", TemplateStatus::Launched, 2, BODY_A, Some(1));
+        l.launched = vec![1, 2];
+        let p = plan(
+            &always,
+            &[remote("a", BODY_A, None)],
+            std::slice::from_ref(&l),
+        );
+        assert!(
+            matches!(&p.actions[0], SyncAction::Unchanged { .. }),
+            "{p:?}"
+        );
+        let mut retired = local("a", TemplateStatus::Launched, 2, BODY_A, Some(1));
+        retired.newest_deprecated = true;
+        let p = plan(&always, &[remote("a", BODY_A, None)], &[retired]);
+        assert!(
+            matches!(&p.actions[0], SyncAction::Unchanged { .. }),
+            "{p:?}"
+        );
+        // A new body is a new version: launched as before.
+        let changed = BODY_A.replace("path: /e", "path: /e2");
+        let p = plan(&always, &[remote("a", &changed, None)], &[l]);
+        assert!(matches!(
+            &p.actions[0],
+            SyncAction::Register { launch: true, .. }
+        ));
+    }
+
+    /// A human's deprecation is never lifted by a pull, and a pull launches
+    /// nothing into a template a human retired (#789 CLI-110, CLI-114).
+    #[test]
+    fn a_human_deprecation_survives_a_pull() {
+        let dep = origin("", LaunchPolicy::Always, PrunePolicy::Deprecate);
+        let mut l = local("a", TemplateStatus::Deprecated, 1, BODY_A, Some(1));
+        l.deprecated_by = Some("alice".into());
+        l.deprecation_reason = Some("superseded".into());
+        let p = plan(&dep, &[remote("a", BODY_A, None)], std::slice::from_ref(&l));
+        assert!(
+            matches!(&p.actions[0], SyncAction::Unchanged { .. }),
+            "{p:?}"
+        );
+        let changed = BODY_A.replace("path: /e", "path: /e2");
+        let p = plan(
+            &dep,
+            &[remote("a", &changed, None)],
+            std::slice::from_ref(&l),
+        );
+        assert_eq!(p.actions.len(), 1, "{p:?}");
+        assert!(matches!(
+            &p.actions[0],
+            SyncAction::Register { launch: false, .. }
+        ));
+        // A deprecation this origin placed (possibly by an HTTP-triggered pull
+        // under a principal's name) is revived before a changed body launches.
+        l.deprecated_by = Some("bob".into());
+        l.deprecation_reason = Some(removed_reason("o"));
+        let p = plan(&dep, &[remote("a", &changed, None)], &[l]);
+        assert_eq!(p.actions[0], SyncAction::Revive { id: "a".into() });
+        assert!(matches!(
+            &p.actions[1],
+            SyncAction::Register { launch: true, .. }
+        ));
+    }
+
+    /// A template whose file could not be read or paired is still upstream,
+    /// so `prune: deprecate` must not retire it (#789 CLI-109, CLI-113).
+    #[test]
+    fn an_unusable_file_is_skipped_but_never_orphaned() {
+        let dep = origin("p-", LaunchPolicy::Ignore, PrunePolicy::Deprecate);
+        let mut r = remote("live", BODY_A, None);
+        r.unusable = Some("sidecar 'live.faucet.yaml' is invalid".into());
+        let l = [local(
+            "p-live",
+            TemplateStatus::Launched,
+            1,
+            BODY_A,
+            Some(1),
+        )];
+        let p = plan(&dep, &[r], &l);
+        assert_eq!(
+            p.actions,
+            vec![SyncAction::Skipped {
+                name: "live".into(),
+                reason: "sidecar 'live.faucet.yaml' is invalid".into(),
+            }]
         );
     }
 

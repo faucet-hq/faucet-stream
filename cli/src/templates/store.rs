@@ -302,6 +302,22 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
         ..
     } = register_prelude(store, &req).await?;
 
+    // `--launch` goes through the same guard `launch` enforces: a retired
+    // template's `stable` must not advance behind its back.
+    if req.launch
+        && store
+            .template_deprecation(id.as_str())
+            .await
+            .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
+            .is_some()
+    {
+        return Err(CliError::Config(format!(
+            "template '{id}' is deprecated, so a new version cannot be launched — un-deprecate \
+             it first with `faucet template deprecate {id} --undo`, or register without \
+             `--launch`"
+        )));
+    }
+
     // A hub template carries its own `description:` — the document is the
     // source of truth, so an edit to it shows on re-register (and sync). For a
     // pipeline, a description describes the *template*, not the build, so carry
@@ -1597,6 +1613,21 @@ pipeline:
             .unwrap_err()
             .to_string();
         assert!(err.contains("deprecated"), "{err}");
+        // So is `register --launch`, which would otherwise move `stable`.
+        let err = register(&s, req_launched(PARAMETERIZED))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("register without"), "{err}");
+        assert_eq!(
+            template_state(&s, "tenant-sync").await.unwrap().stable,
+            Some(1)
+        );
+        assert_eq!(
+            template_state(&s, "tenant-sync").await.unwrap().versions,
+            vec![1],
+            "a refused launch registers nothing"
+        );
 
         // `--undo` restores the prior status, derived rather than remembered.
         let status = set_deprecated(&s, "tenant-sync", None, None, false)
