@@ -691,9 +691,29 @@ impl RestStream {
         let Some(key) = &self.replication_key else {
             return Ok(records);
         };
-        let out = filter_incremental_path(records, key, start, self.config.on_missing_key)?;
-        self.note_missing_key(out.missing);
-        Ok(out.records)
+        // Inclusive (`>=`): the bookmark is the previous run's max, and a row
+        // sharing that value but written after the previous run read it would
+        // otherwise be skipped forever (API-19). Re-delivering the boundary
+        // rows is at-least-once, absorbed by a keyed upsert sink.
+        let mut kept = Vec::with_capacity(records.len());
+        let mut missing = 0;
+        for record in records {
+            let at_bookmark = key.resolve(&record).is_some_and(|v| {
+                !v.is_null()
+                    && std::mem::discriminant(v) == std::mem::discriminant(start)
+                    && !faucet_core::replication::json_gt(v, start)
+                    && !faucet_core::replication::json_gt(start, v)
+            });
+            if at_bookmark {
+                kept.push(record);
+                continue;
+            }
+            let out = filter_incremental_path(vec![record], key, start, self.config.on_missing_key)?;
+            missing += out.missing;
+            kept.extend(out.records);
+        }
+        self.note_missing_key(missing);
+        Ok(kept)
     }
 
     /// The page's max replication value. `count_missing` reports records

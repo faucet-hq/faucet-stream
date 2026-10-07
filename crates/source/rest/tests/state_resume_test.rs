@@ -126,8 +126,8 @@ async fn rest_source_resumes_from_file_state_store_across_runs() {
         .unwrap();
 
     assert_eq!(
-        result2.records_written, 1,
-        "only the new record passes the incremental filter"
+        result2.records_written, 2,
+        "the new record and the one at the bookmark (inclusive filter, API-19) pass"
     );
     assert_eq!(result2.bookmark, Some(json!("2026-04-01")));
     assert_eq!(
@@ -140,9 +140,10 @@ async fn rest_source_resumes_from_file_state_store_across_runs() {
         "bookmark advances to the new max"
     );
     let r2 = sink2.snapshot();
-    assert_eq!(r2.len(), 1);
-    assert_eq!(r2[0]["id"], 4);
-    assert_eq!(r2[0]["updated_at"], "2026-04-01");
+    assert_eq!(r2.len(), 2);
+    assert_eq!(r2[0]["id"], 3);
+    assert_eq!(r2[1]["id"], 4);
+    assert_eq!(r2[1]["updated_at"], "2026-04-01");
 }
 
 #[tokio::test]
@@ -206,17 +207,17 @@ async fn rest_source_apply_start_bookmark_overrides_config_value() {
     let config = rest_config(&server.uri()).start_replication_value(json!("2026-01-01"));
     let source = RestStream::new(config).unwrap();
 
-    // With only the static config value, two records (Feb + Mar) pass.
+    // With only the static config value, Jan (at the bookmark) + Feb + Mar pass.
     let (records, _) = source.fetch_all_incremental().await.unwrap();
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 3);
 
-    // After applying a stricter runtime bookmark, only March passes.
+    // After applying a stricter runtime bookmark, Feb (at it) and March pass.
     source
         .apply_start_bookmark(json!("2026-02-01"))
         .await
         .unwrap();
     let (records, bookmark) = source.fetch_all_incremental().await.unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["id"], 3);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1]["id"], 3);
     assert_eq!(bookmark, Some(json!("2026-03-01")));
 }

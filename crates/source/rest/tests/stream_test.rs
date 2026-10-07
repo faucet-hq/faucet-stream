@@ -635,9 +635,12 @@ async fn test_incremental_replication_filters_old_records() {
     .unwrap();
 
     let records = stream.fetch_all().await.unwrap();
-    // Records at or before "2024-06-01" are filtered out; only id=3 remains.
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["id"], 3);
+    // Records before "2024-06-01" are filtered out. The record AT the bookmark
+    // is kept: a row written in the bookmark's instant after the previous run
+    // read it would otherwise be lost (API-19).
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["id"], 2);
+    assert_eq!(records[1]["id"], 3);
 }
 
 #[tokio::test]

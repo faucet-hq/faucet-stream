@@ -209,7 +209,7 @@ Because the REST source keeps its own `429`/`Retry-After`-aware retry runner, it
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `replication_method` | `{ type: FullTable \| Incremental }` | `FullTable` | `FullTable` fetches all records; `Incremental` filters by bookmark. |
+| `replication_method` | `{ type: FullTable \| Incremental }` | `FullTable` | `FullTable` fetches all records; `Incremental` keeps records whose `replication_key` is **at or after** the bookmark. The comparison is inclusive so a row sharing the bookmark's value but written after the previous run read it is not lost; the boundary rows are re-delivered each run (at-least-once — pair with a keyed `write_mode: upsert` sink to absorb them). |
 | `replication_key` | string / null | `null` | Field used for incremental bookmarking: a top-level name (`updated_at`), a dot path into nested objects (`fields.updated`, `items.0.date` — a literal top-level field of that exact name wins), or a JSON Pointer (`/fields/updated`) for names containing dots. Not a JSONPath. With `async_job`, it is injected into the submit query verbatim, so use a field name or a dotted relationship path there. |
 | `on_missing_key` | `keep \| drop \| fail` | `keep` | A record whose key is missing or `null` is kept (default), dropped, or fails the run. Kept and dropped records are counted in `faucet_source_replication_key_missing_total` and warned about once per run — never dropped silently. |
 | `start_replication_value` | JSON / null | `null` | Bookmark value; records where `record[replication_key] <= start_replication_value` are filtered out in `Incremental` mode. |
@@ -971,7 +971,7 @@ The inherent `stream_pages()` method (yielding `Vec<Value>` pages, no per-page b
 This source supports resumable runs. Set `state_key` and configure a `state:` block (or call `Pipeline::with_state_store` from Rust). On each run the pipeline:
 
 1. loads the previously persisted bookmark and applies it via `apply_start_bookmark` (overriding `start_replication_value`);
-2. fetches only records newer than the bookmark (`replication_method: Incremental` + `replication_key`);
+2. fetches only records at or after the bookmark (`replication_method: Incremental` + `replication_key`; inclusive, so rows sharing the bookmark's value are never skipped);
 3. persists the new bookmark **only after the sink confirms** the batch — so a crash mid-run re-fetches rather than skips.
 
 `state_key` must satisfy `faucet_core::state::validate_state_key`. See the second [example](#oauth2--incremental-replication-with-a-persisted-bookmark) above.
