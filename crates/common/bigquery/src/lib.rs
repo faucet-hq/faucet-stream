@@ -61,23 +61,41 @@ impl std::fmt::Debug for BigQueryCredentials {
 /// Returns [`FaucetError::Auth`] on authentication failures and on inline
 /// service-account JSON that fails to parse.
 pub async fn build_client(creds: &BigQueryCredentials) -> Result<Client, FaucetError> {
+    let mut builder = gcp_bigquery_client::client_builder::ClientBuilder::new();
+    builder.with_client(http_client()?);
     match creds {
-        BigQueryCredentials::ServiceAccountKeyPath { path } => {
-            Client::from_service_account_key_file(path)
-                .await
-                .map_err(|e| FaucetError::Auth(format!("BigQuery auth failed: {e}")))
-        }
+        BigQueryCredentials::ServiceAccountKeyPath { path } => builder
+            .build_from_service_account_key_file(path)
+            .await
+            .map_err(|e| FaucetError::Auth(format!("BigQuery auth failed: {e}"))),
         BigQueryCredentials::ServiceAccountKey { json } => {
             let sa_key = serde_json::from_str(json)
                 .map_err(|e| FaucetError::Auth(format!("invalid service account JSON: {e}")))?;
-            Client::from_service_account_key(sa_key, false)
+            builder
+                .build_from_service_account_key(sa_key, false)
                 .await
                 .map_err(|e| FaucetError::Auth(format!("BigQuery auth failed: {e}")))
         }
-        BigQueryCredentials::ApplicationDefault => Client::from_application_default_credentials()
+        BigQueryCredentials::ApplicationDefault => builder
+            .build_from_application_default_credentials()
             .await
             .map_err(|e| FaucetError::Auth(format!("BigQuery auth failed: {e}"))),
     }
+}
+
+/// TCP connect timeout of the REST client [`build_client`] creates.
+pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle-read timeout of that client: a response that sends nothing for this
+/// long fails instead of hanging the run on a half-open connection.
+pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn http_client() -> Result<reqwest_bq::Client, FaucetError> {
+    reqwest_bq::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .build()
+        .map_err(|e| FaucetError::Config(format!("BigQuery: cannot build HTTP client: {e}")))
 }
 
 #[cfg(test)]

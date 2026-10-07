@@ -200,7 +200,7 @@ pub async fn write_columnar_media_with_schema(
         "{upload_base}/upload/bigquery/v2/projects/{}/jobs?uploadType=multipart",
         config.project_id
     );
-    let resp = reqwest::Client::new()
+    let resp = crate::sink::upload_client()?
         .post(&url)
         .bearer_auth(token)
         .header(

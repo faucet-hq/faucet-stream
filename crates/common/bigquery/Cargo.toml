@@ -13,6 +13,9 @@ categories.workspace = true
 [dependencies]
 faucet-core.workspace = true
 gcp-bigquery-client = "0.28.0"
+# The reqwest major gcp-bigquery-client is built on, to hand it a client with
+# timeouts.
+reqwest-bq = { package = "reqwest", version = "0.12", default-features = false }
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

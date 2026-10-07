@@ -126,8 +126,12 @@ impl BigQuerySource {
     /// The query is run to completion first: the destination table only exists
     /// (and only has rows) once the job is DONE.
     #[cfg(feature = "arrow")]
-    pub(crate) async fn query_destination_table(&self) -> Result<String, FaucetError> {
-        let req = self.build_query_request(self.config.query.clone(), &[]);
+    pub(crate) async fn query_destination_table(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<String, FaucetError> {
+        let (query, bindings) = self.resolve_query(context);
+        let req = self.build_query_request(query, &bindings);
         self.roundtrips.record("query");
         let initial = self
             .client
@@ -142,13 +146,27 @@ impl BigQuerySource {
         let job_id = job_ref.job_id.as_deref().ok_or_else(|| {
             FaucetError::Source("BigQuery jobs.query returned a jobReference with no jobId".into())
         })?;
-        self.roundtrips.record("job");
-        let job = self
-            .client
-            .job()
-            .get_job(&self.config.project_id, job_id, job_ref.location.as_deref())
-            .await
-            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))?;
+        let poll_started = std::time::Instant::now();
+        let job = loop {
+            self.roundtrips.record("job");
+            let job = self
+                .client
+                .job()
+                .get_job(&self.config.project_id, job_id, job_ref.location.as_deref())
+                .await
+                .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))?;
+            if job_finished(job.status.as_ref(), job_id)? {
+                break job;
+            }
+            let poll_timeout = self.config.poll_timeout;
+            if !poll_timeout.is_zero() && poll_started.elapsed() >= poll_timeout {
+                return Err(FaucetError::Source(format!(
+                    "BigQuery job '{job_id}' did not complete within poll_timeout ({}s)",
+                    poll_timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
         let dest = job
             .configuration
             .as_ref()
@@ -327,6 +345,25 @@ impl BigQuerySource {
         }
         Ok(out)
     }
+}
+
+/// Whether a query job is `DONE`; a `DONE` job carrying an `errorResult`
+/// failed, and its destination table holds no (or partial) results.
+#[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+pub(crate) fn job_finished(
+    status: Option<&gcp_bigquery_client::model::job_status::JobStatus>,
+    job_id: &str,
+) -> Result<bool, FaucetError> {
+    let Some(status) = status else {
+        return Ok(false);
+    };
+    if let Some(err) = &status.error_result {
+        return Err(FaucetError::Source(format!(
+            "BigQuery job '{job_id}' failed: {}",
+            err.message.as_deref().unwrap_or("unknown error")
+        )));
+    }
+    Ok(status.state.as_deref() == Some("DONE"))
 }
 
 /// Map one BigQuery table-schema field to a JSON-Schema type fragment
@@ -679,14 +716,14 @@ impl faucet_core::Source for BigQuerySource {
     #[cfg(feature = "arrow")]
     fn stream_batches<'a>(
         &'a self,
-        _context: &'a HashMap<String, Value>,
+        context: &'a HashMap<String, Value>,
         _batch_size: usize,
     ) -> Pin<
         Box<
             dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a,
         >,
     > {
-        crate::storage_read::stream_batches_arrow(self)
+        crate::storage_read::stream_batches_arrow_with(self, context)
     }
 
     fn stream_pages<'a>(
@@ -698,7 +735,7 @@ impl faucet_core::Source for BigQuerySource {
         // JSON on this row path); the `query` path below is skipped entirely.
         #[cfg(feature = "arrow")]
         if self.config.read_api {
-            return crate::storage_read::stream_pages_arrow(self);
+            return crate::storage_read::stream_pages_arrow_with(self, context);
         }
 
         let batch_size = self.config.batch_size;
@@ -974,6 +1011,33 @@ mod tests {
         let mut f = TableFieldSchema::new(name, ty);
         f.mode = mode.map(str::to_owned);
         f
+    }
+
+    #[test]
+    fn job_finished_requires_done_and_no_error() {
+        use gcp_bigquery_client::model::error_proto::ErrorProto;
+        use gcp_bigquery_client::model::job_status::JobStatus;
+        assert!(!job_finished(None, "j").unwrap());
+        let running = JobStatus {
+            state: Some("RUNNING".into()),
+            ..Default::default()
+        };
+        assert!(!job_finished(Some(&running), "j").unwrap());
+        let done = JobStatus {
+            state: Some("DONE".into()),
+            ..Default::default()
+        };
+        assert!(job_finished(Some(&done), "j").unwrap());
+        let failed = JobStatus {
+            state: Some("DONE".into()),
+            error_result: Some(ErrorProto {
+                message: Some("syntax error".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = job_finished(Some(&failed), "j").unwrap_err();
+        assert!(err.to_string().contains("syntax error"), "{err}");
     }
 
     #[test]

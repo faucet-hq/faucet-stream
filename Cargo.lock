@@ -4920,6 +4920,7 @@ version = "1.1.0"
 dependencies = [
  "faucet-core",
  "gcp-bigquery-client",
+ "reqwest 0.12.28",
  "schemars 1.2.1",
  "serde",
  "serde_json",

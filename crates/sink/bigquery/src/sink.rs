@@ -635,6 +635,77 @@ pub struct BigQuerySink {
     roundtrips: faucet_core::observability::RecorderSlot,
 }
 
+/// Connect timeout of the upload clients.
+pub(crate) const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Idle-read timeout of the upload clients: a response that sends nothing for
+/// this long fails instead of hanging on a half-open connection.
+pub(crate) const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A `reqwest` builder with the upload clients' timeouts.
+pub(crate) fn upload_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+}
+
+/// The client media and multipart load uploads use.
+pub(crate) fn upload_client() -> Result<reqwest::Client, FaucetError> {
+    upload_builder()
+        .build()
+        .map_err(|e| FaucetError::Sink(format!("BigQuery: cannot build upload client: {e}")))
+}
+
+/// The application-default credentials file: `GOOGLE_APPLICATION_CREDENTIALS`,
+/// else gcloud's well-known location under `home`.
+fn adc_path(gac: Option<String>, home: Option<String>) -> Option<std::path::PathBuf> {
+    gac.map(std::path::PathBuf::from).or_else(|| {
+        home.map(|h| {
+            std::path::PathBuf::from(h).join(".config/gcloud/application_default_credentials.json")
+        })
+    })
+}
+
+/// The `authorized_user` secret in the ADC file, if that is what it holds
+/// (`gcloud auth application-default login`). yup-oauth2's ADC flow only
+/// knows service accounts and instance metadata.
+async fn authorized_user_adc() -> Result<
+    Option<gcp_bigquery_client::yup_oauth2::authorized_user::AuthorizedUserSecret>,
+    FaucetError,
+> {
+    let Some(path) = adc_path(
+        std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok(),
+        std::env::var("HOME").ok(),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+        return Ok(None);
+    };
+    parse_authorized_user(&contents)
+}
+
+fn parse_authorized_user(
+    contents: &str,
+) -> Result<
+    Option<gcp_bigquery_client::yup_oauth2::authorized_user::AuthorizedUserSecret>,
+    FaucetError,
+> {
+    let is_user = serde_json::from_str::<Value>(contents)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(Value::as_str)
+                .map(|t| t == "authorized_user")
+        })
+        .unwrap_or(false);
+    if !is_user {
+        return Ok(None);
+    }
+    serde_json::from_str(contents)
+        .map(Some)
+        .map_err(|e| FaucetError::Auth(format!("invalid authorized_user ADC file: {e}")))
+}
+
 impl BigQuerySink {
     /// Create a new BigQuery sink from the given configuration.
     ///
@@ -1064,6 +1135,19 @@ impl BigQuerySink {
                     .await
                     .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
             }
+            BigQueryCredentials::ApplicationDefault
+                if let Some(secret) = authorized_user_adc().await? =>
+            {
+                // `gcloud auth application-default login` credentials: the
+                // REST client accepts them, so the media-load path must too.
+                let auth = yup_oauth2::AuthorizedUserAuthenticator::builder(secret)
+                    .build()
+                    .await
+                    .map_err(|e| FaucetError::Auth(format!("BigQuery ADC auth failed: {e}")))?;
+                auth.token(&scopes)
+                    .await
+                    .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
+            }
             BigQueryCredentials::ApplicationDefault => {
                 let opts = ApplicationDefaultCredentialsFlowOpts::default();
                 let auth = match ApplicationDefaultCredentialsAuthenticator::builder(opts).await {
@@ -1127,7 +1211,7 @@ impl BigQuerySink {
             self.upload_base(),
             self.config.project_id
         );
-        let client = reqwest::Client::new();
+        let client = upload_client()?;
         let resp = client
             .post(&url)
             .bearer_auth(&token)
@@ -1250,7 +1334,7 @@ impl BigQuerySink {
             self.config.project_id
         );
         // Redirects disabled: a 308 "Resume Incomplete" must not be auto-followed.
-        let http = reqwest::Client::builder()
+        let http = upload_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| FaucetError::Sink(format!("resumable HTTP client: {e}")))?;
@@ -2785,6 +2869,32 @@ impl faucet_core::Sink for BigQuerySink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn adc_file_location_and_authorized_user_detection() {
+        assert_eq!(
+            super::adc_path(Some("/k.json".into()), Some("/h".into())),
+            Some(std::path::PathBuf::from("/k.json"))
+        );
+        assert_eq!(
+            super::adc_path(None, Some("/h".into())),
+            Some(std::path::PathBuf::from(
+                "/h/.config/gcloud/application_default_credentials.json"
+            ))
+        );
+        assert_eq!(super::adc_path(None, None), None);
+        let user =
+            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}"#;
+        assert!(super::parse_authorized_user(user).unwrap().is_some());
+        assert!(
+            super::parse_authorized_user(r#"{"type":"service_account"}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(super::parse_authorized_user("not json").unwrap().is_none());
+        assert!(super::parse_authorized_user(r#"{"type":"authorized_user"}"#).is_err());
+        assert!(super::upload_client().is_ok());
+    }
+
     use super::{
         BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema, appends_via_media_load,
         build_load_job_json, build_load_job_json_fmt, build_load_job_json_full,
