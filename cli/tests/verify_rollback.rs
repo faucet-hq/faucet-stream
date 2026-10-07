@@ -661,6 +661,118 @@ async fn append_and_overwrite_runs_are_undone() {
     );
 }
 
+/// A rollback whose sink finds nothing of the run (the config now names a
+/// different database) must not rewind the bookmark: the rows are still in
+/// the old destination, and an append run would load them twice.
+#[tokio::test]
+async fn a_rollback_that_finds_nothing_leaves_the_bookmark_and_marker() {
+    use faucet_core::StateStore;
+    let d = fresh().await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "upsert",
+        "rollback: {}",
+    ));
+    let summary = run(&cfg).await;
+    let run_id = summary.invocations[0].run_id.clone().unwrap();
+    let marker = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap()
+        .remove(0);
+    let store = faucet_core::FileStateStore::new(&d.state);
+    store
+        .put(&marker.state_key, &serde_json::json!({"seen": 4}))
+        .await
+        .unwrap();
+    let other = format!(
+        "sqlite://{}?mode=rwc",
+        d.state.parent().unwrap().join("moved.db").display()
+    );
+    let drifted = load(&config_yaml(
+        &d.src,
+        &other,
+        &d.state,
+        "upsert",
+        "rollback: {}",
+    ));
+    let report = faucet_cli::rollback::rollback(
+        &drifted,
+        RollbackInputs {
+            run_id: run_id.clone(),
+            row: None,
+            dry_run: false,
+            force: false,
+            pipeline_name: "mirror".into(),
+            auth: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!report.outcome.applied, "{report:?}");
+    assert!(!report.bookmark_rewound);
+    assert!(
+        report
+            .outcome
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("nothing of this run"),
+        "{report:?}"
+    );
+    assert_eq!(
+        store.get(&marker.state_key).await.unwrap(),
+        Some(serde_json::json!({"seen": 4}))
+    );
+    assert_eq!(
+        rows(&d.dst).await.len(),
+        4,
+        "the original rows are untouched"
+    );
+    let still = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap();
+    assert_eq!(still[0].run_id, run_id, "the run stays undoable");
+}
+
+/// A failing run does not evict the oldest undoable run (#789 CLI-98).
+#[tokio::test]
+async fn a_failing_run_keeps_every_undoable_run() {
+    let d = fresh().await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "upsert",
+        "rollback:\n  retain: 1",
+    ));
+    let first = run(&cfg).await.invocations[0].run_id.clone().unwrap();
+    exec(&d.src, "DROP TABLE src").await;
+    let failed = run(&cfg).await;
+    assert!(failed.had_failures(), "{failed:?}");
+    let listed: Vec<String> = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.run_id)
+        .collect();
+    assert!(listed.contains(&first), "{listed:?}");
+    exec(
+        &d.src,
+        "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec(&d.src, "INSERT INTO src VALUES (9, 'nine')").await;
+    let ok = run(&cfg).await;
+    assert!(!ok.had_failures(), "{ok:?}");
+    let listed = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1, "a success prunes to `retain`");
+    assert_eq!(listed[0].run_id, ok.invocations[0].run_id.clone().unwrap());
+}
+
 #[tokio::test]
 async fn rollback_gates_fire_at_load_time() {
     let d = fresh().await;

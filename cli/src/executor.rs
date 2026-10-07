@@ -2502,10 +2502,12 @@ async fn run_one_invocation(
     // Rollback (#706): record what the bookmark and watermark were before this
     // run writes, so undoing it can rewind them. Never fails the run — a run
     // whose marker could not be written is simply not undoable.
+    let mut rollback_finish = None;
     if rollback_active
         && let (Some(spec), Some(store)) = (&opts.rollback, &state)
         && sink.supports_rollback()
     {
+        rollback_finish = Some((Arc::clone(store), effective_state_key.clone(), spec.retain));
         let marker = crate::rollback::marker_for(
             &run_id,
             &pipeline_name,
@@ -2817,6 +2819,13 @@ async fn run_one_invocation(
         }
         _ => result,
     };
+
+    if let Some((store, key, retain)) = &rollback_finish
+        && result.is_ok()
+        && !cancel.is_cancelled()
+    {
+        crate::rollback::finish_boxed(store.as_ref(), key, *retain).await;
+    }
 
     #[cfg(feature = "lineage")]
     if let Some((em, mut ctx, hb)) = lineage_ctx {
