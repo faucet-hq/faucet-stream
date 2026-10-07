@@ -211,6 +211,9 @@ pub struct StagingLocation {
     pub bucket: String,
     /// Key prefix within the bucket, no leading slash, trailing slash trimmed.
     pub prefix: String,
+    /// Azure storage account, when the URI names one
+    /// (`abfss://container@account.dfs.core.windows.net/…`).
+    pub account: Option<String>,
 }
 
 impl StagingLocation {
@@ -236,6 +239,25 @@ impl StagingLocation {
             Some((b, p)) => (b, p),
             None => (rest, ""),
         };
+        // ADLS form: `container@account.dfs.core.windows.net` (CORE-101).
+        let (bucket, account) = match (scheme, bucket.split_once('@')) {
+            (StagingScheme::Azure, Some((container, host))) => {
+                let account = host.split('.').next().unwrap_or_default();
+                if account.is_empty() {
+                    return Err(FaucetError::Config(format!(
+                        "staging: location `{uri}` names no storage account after `@`"
+                    )));
+                }
+                (container, Some(account.to_string()))
+            }
+            (_, Some(_)) => {
+                return Err(FaucetError::Config(format!(
+                    "staging: location `{uri}`: `@` is only valid in an Azure \
+                     `container@account.host` location"
+                )));
+            }
+            (_, None) => (bucket, None),
+        };
         if bucket.trim().is_empty() {
             return Err(FaucetError::Config(format!(
                 "staging: location `{uri}` has no bucket/container"
@@ -245,6 +267,7 @@ impl StagingLocation {
             scheme,
             bucket: bucket.to_string(),
             prefix: prefix.trim_matches('/').to_string(),
+            account,
         })
     }
 
@@ -343,13 +366,15 @@ fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
 
 /// CSV with a header row. The column set is the union of top-level keys across
 /// the page, in first-seen order, so a jagged page still produces a rectangular
-/// file (missing cells are empty). Nested objects/arrays are JSON-encoded.
+/// file (missing and null cells are bare empty fields; an empty string is
+/// `""`). Nested objects/arrays are JSON-encoded.
 fn serialize_csv(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
     let mut columns: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in records {
         if let Some(map) = r.as_object() {
             for k in map.keys() {
-                if !columns.iter().any(|c| c == k) {
+                if seen.insert(k.as_str()) {
                     columns.push(k.clone());
                 }
             }
@@ -388,8 +413,10 @@ fn serialize_csv(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
 }
 
 /// Quote a CSV field per RFC 4180 when it contains a comma, quote, or newline.
+/// The empty string is always quoted (`""`) so a loader can tell it apart from
+/// a null, which is written as a bare empty field (CORE-36).
 fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
+    if s.is_empty() || s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -428,14 +455,18 @@ mod upload {
                         FaucetError::Sink(format!("staging: GCS store for `{}`: {e}", loc.bucket))
                     })?,
             ),
-            StagingScheme::Azure => Arc::new(
-                object_store::azure::MicrosoftAzureBuilder::from_env()
-                    .with_container_name(&loc.bucket)
-                    .build()
-                    .map_err(|e| {
-                        FaucetError::Sink(format!("staging: Azure store for `{}`: {e}", loc.bucket))
-                    })?,
-            ),
+            StagingScheme::Azure => Arc::new({
+                let builder = object_store::azure::MicrosoftAzureBuilder::from_env()
+                    .with_container_name(&loc.bucket);
+                match &loc.account {
+                    Some(account) => builder.with_account(account),
+                    None => builder,
+                }
+                .build()
+                .map_err(|e| {
+                    FaucetError::Sink(format!("staging: Azure store for `{}`: {e}", loc.bucket))
+                })?
+            }),
         };
         Ok(store)
     }
@@ -576,6 +607,18 @@ mod tests {
         assert!(StagingLocation::parse("bucket/prefix").is_err()); // no scheme
         assert!(StagingLocation::parse("ftp://b/p").is_err()); // unknown scheme
         assert!(StagingLocation::parse("s3:///prefix").is_err()); // no bucket
+        assert!(StagingLocation::parse("s3://a@b/p").is_err()); // @ outside azure
+        assert!(StagingLocation::parse("abfss://c@/p").is_err()); // no account
+    }
+
+    #[test]
+    fn parse_adls_container_at_account() {
+        let l = StagingLocation::parse("abfss://cont@acct.dfs.core.windows.net/stage/x").unwrap();
+        assert_eq!(l.scheme, StagingScheme::Azure);
+        assert_eq!(l.bucket, "cont");
+        assert_eq!(l.account.as_deref(), Some("acct"));
+        assert_eq!(l.prefix, "stage/x");
+        assert_eq!(StagingLocation::parse("az://c/p").unwrap().account, None);
     }
 
     #[test]
@@ -665,6 +708,9 @@ mod tests {
         assert_eq!(lines.next().unwrap(), "id,name,note");
         assert_eq!(lines.next().unwrap(), "1,\"a,b\",");
         assert_eq!(lines.next().unwrap(), "2,,\"he said \"\"hi\"\"\"");
+        // An empty string is quoted; a null stays a bare empty field.
+        let bytes = serialize_records(&[json!({"a": "", "b": null})], StagingFormat::Csv).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\n\"\",\n");
     }
 
     #[test]

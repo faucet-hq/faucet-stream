@@ -38,7 +38,10 @@ pub(crate) async fn build_staged_copy_sql(
         loc.scheme,
         &loc.bucket,
         &staged.key,
-        staging.storage_account.as_deref(),
+        staging
+            .storage_account
+            .as_deref()
+            .or(loc.account.as_deref()),
         staging.endpoint.as_deref(),
     )?;
     // The staged CSV carries a header row → skip it with FIRSTROW = 2.
