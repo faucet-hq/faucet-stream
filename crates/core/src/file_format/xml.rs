@@ -4,7 +4,8 @@
 //! since #515: each element becomes an object of its children, repeated child
 //! tags become arrays, attributes are `@name`, and text is `#text` (or the
 //! value directly when an element has only text). Namespaces are stripped to
-//! their local name.
+//! their local name, except on attributes whose local names would collide
+//! (`a:id` and `b:id` stay `@a:id` / `@b:id`).
 //!
 //! XML has **no canonical record boundary**, so one is declared
 //! ([`XmlOptions::record_element`](super::XmlOptions)). Selecting the wrong
@@ -195,7 +196,7 @@ fn pop(stack: &mut Vec<Frame>, detail: &str) -> Result<Frame, FaucetError> {
 }
 
 fn attrs(e: &BytesStart) -> Result<Map<String, Value>, FaucetError> {
-    let mut m = Map::new();
+    let mut parsed: Vec<(String, String)> = Vec::new();
     for a in e.attributes() {
         let a = a.map_err(|e| FaucetError::Source(format!("xml: malformed attribute: {e}")))?;
         let v = a
@@ -203,10 +204,22 @@ fn attrs(e: &BytesStart) -> Result<Map<String, Value>, FaucetError> {
             .map_err(|e| {
                 FaucetError::Source(format!("xml: attribute `{}`: {e}", a.key.as_ref()))
             })?;
-        m.insert(
-            format!("@{}", local(a.key.as_ref())),
-            Value::String(v.into_owned()),
-        );
+        let qname = a.key.as_ref().to_string();
+        parsed.push((qname, v.into_owned()));
+    }
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (q, _) in &parsed {
+        *seen.entry(local(q)).or_default() += 1;
+    }
+    let mut m = Map::new();
+    for (q, v) in parsed {
+        let short = local(&q);
+        let key = if seen.get(&short).copied().unwrap_or(0) > 1 {
+            format!("@{q}")
+        } else {
+            format!("@{short}")
+        };
+        m.insert(key, Value::String(v));
     }
     Ok(m)
 }
@@ -318,6 +331,11 @@ pub fn to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
             _ => {}
         }
     }
+    if let Some(open) = names.last() {
+        return Err(FaucetError::Source(format!(
+            "xml: document ended inside <{open}> — the input is truncated or not closed"
+        )));
+    }
     let (root, _) = stack
         .pop()
         .ok_or_else(|| unbalanced("document root closed twice"))?;
@@ -328,6 +346,26 @@ pub fn to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_document_cut_between_records_is_an_error() {
+        let xml = br#"<records><record><a>1</a></record><record><a>2"#;
+        let err = decode(xml, "record").unwrap_err().to_string();
+        assert!(err.contains("ended inside <a>"), "{err}");
+        let err = decode(b"<records><record><a>1</a></record>", "record")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ended inside <records>"), "{err}");
+    }
+
+    #[test]
+    fn namespaced_attributes_with_one_local_name_keep_their_prefix() {
+        let xml = br#"<rows xmlns:a="u:a" xmlns:b="u:b"><row a:id="1" b:id="2" n="x"/></rows>"#;
+        assert_eq!(
+            decode(xml, "row").expect("decode"),
+            vec![json!({"@a:id": "1", "@b:id": "2", "@n": "x"})]
+        );
+    }
 
     #[test]
     fn a_named_record_element_selects_the_records() {
