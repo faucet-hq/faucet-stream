@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Authentication method for the HTTP sink.
-#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum HttpSinkAuth {
     /// No authentication.
+    #[default]
     None,
     /// Bearer token in the Authorization header.
     Bearer {
@@ -47,10 +48,11 @@ impl std::fmt::Debug for HttpSinkAuth {
 }
 
 /// How records are sent in HTTP requests.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum HttpBatchMode {
     /// Send one HTTP request per record.
+    #[default]
     Individual,
     /// Send all records as a JSON array in a single request.
     Array,
@@ -63,7 +65,7 @@ pub struct HttpSinkConfig {
     /// Target endpoint URL.
     pub url: String,
     /// HTTP method (default: POST).
-    #[serde(with = "crate::serde_helpers::http_method")]
+    #[serde(with = "crate::serde_helpers::http_method", default = "default_method")]
     #[schemars(with = "String")]
     pub method: reqwest::Method,
     /// Additional request headers.
@@ -71,12 +73,20 @@ pub struct HttpSinkConfig {
     pub headers: HeaderMap,
     /// Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
+    /// Defaults to no authentication.
+    #[serde(default)]
     pub auth: AuthSpec<HttpSinkAuth>,
-    /// How to batch records in requests.
+    /// How to batch records in requests (default: `Individual`).
+    #[serde(default)]
     pub batch_mode: HttpBatchMode,
     /// Number of retries on transient failures (default: 0).
+    #[serde(default)]
     pub max_retries: usize,
     /// Maximum number of concurrent requests in Individual mode (default: 10).
+    /// Above 1 the records of a page are sent in parallel and can reach the
+    /// endpoint out of order — use `1` for a last-write-wins endpoint that
+    /// receives several updates to one entity per page.
+    #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     /// Maximum number of records sent per outbound HTTP request. Defaults to
     /// [`DEFAULT_BATCH_SIZE`] (1000).
@@ -130,6 +140,14 @@ fn default_connect_timeout() -> Option<std::time::Duration> {
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
+}
+
+fn default_method() -> reqwest::Method {
+    reqwest::Method::POST
+}
+
+fn default_concurrency() -> usize {
+    10
 }
 
 impl std::fmt::Debug for HttpSinkConfig {
@@ -349,5 +367,17 @@ mod tests {
     fn batch_atomicity_matches_the_write_path() {
         let c: HttpSinkConfig = serde_json::from_value(serde_json::json!({"url": "https://api.example.com/ingest", "method": "POST", "auth": {"type": "none"}, "batch_mode": {"type": "Array"}, "max_retries": 0, "concurrency": 10})).unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::PerRow);
+    }
+
+    #[test]
+    fn documented_defaults_apply_when_omitted() {
+        // API-51: these fields were documented with defaults but required.
+        let cfg: HttpSinkConfig =
+            serde_json::from_value(serde_json::json!({"url": "https://e.example/in"})).unwrap();
+        assert_eq!(cfg.method, reqwest::Method::POST);
+        assert!(matches!(cfg.auth, AuthSpec::Inline(HttpSinkAuth::None)));
+        assert!(matches!(cfg.batch_mode, HttpBatchMode::Individual));
+        assert_eq!(cfg.max_retries, 0);
+        assert_eq!(cfg.concurrency, 10);
     }
 }
