@@ -83,7 +83,10 @@ impl Source for SingerSource {
 
         Box::pin(async_stream::try_stream! {
             let mut process = TapProcess::spawn(&self.config, start.as_ref())?;
-            let mut assembler = PageAssembler::new(target_stream, batch_size, flush_on_state);
+            let mut assembler = PageAssembler::new(target_stream.clone(), batch_size, flush_on_state);
+            if let Some(alias) = self.config.catalog.as_ref().and_then(|c| stream_alias(c, &target_stream)) {
+                assembler = assembler.with_alias(alias);
+            }
 
             loop {
                 match process.recv(idle).await {
@@ -94,6 +97,10 @@ impl Source for SingerSource {
                             }
                         }
                         SingerMessage::State { value } => {
+                            if let Some(why) = assembler.stream_mismatch() {
+                                process.shutdown().await;
+                                Err(FaucetError::Source(why))?;
+                            }
                             if let Some(page) = assembler.on_state(value) {
                                 yield page;
                             }
@@ -121,6 +128,13 @@ impl Source for SingerSource {
                             )))?;
                         }
                     },
+                    Recv::Line(Line::Overlong(max)) => {
+                        let tail = process.stderr_tail();
+                        process.shutdown().await;
+                        Err(FaucetError::Source(format!(
+                            "tap wrote a line longer than max_line_bytes ({max}); last stderr:\n{tail}"
+                        )))?;
+                    }
                     Recv::IdleTimeout => {
                         let tail = process.stderr_tail();
                         process.shutdown().await;
@@ -234,6 +248,20 @@ fn resolve_executable(exe: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// The other name of the catalog entry `stream` matches: its `tap_stream_id`
+/// when `stream` is the entry's `stream`, and vice versa.
+fn stream_alias(catalog: &Value, stream: &str) -> Option<String> {
+    catalog.get("streams")?.as_array()?.iter().find_map(|s| {
+        let name = s.get("stream").and_then(Value::as_str);
+        let id = s.get("tap_stream_id").and_then(Value::as_str);
+        match (name, id) {
+            (Some(n), Some(i)) if n == stream && i != stream => Some(i.to_string()),
+            (Some(n), Some(i)) if i == stream && n != stream => Some(n.to_string()),
+            _ => None,
+        }
+    })
+}
+
 /// Whether a Singer catalog lists `stream` (by `stream` or `tap_stream_id`).
 fn catalog_has_stream(catalog: &Value, stream: &str) -> bool {
     catalog
@@ -265,6 +293,20 @@ mod tests {
         assert!(catalog_has_stream(&catalog, "orders-v2")); // by `tap_stream_id`
         assert!(!catalog_has_stream(&catalog, "missing"));
         assert!(!catalog_has_stream(&json!({}), "users"));
+    }
+
+    #[test]
+    fn stream_alias_maps_between_the_two_names() {
+        let catalog = json!({
+            "streams": [
+                { "tap_stream_id": "users", "stream": "users" },
+                { "tap_stream_id": "public-orders", "stream": "orders" }
+            ]
+        });
+        assert_eq!(stream_alias(&catalog, "orders").as_deref(), Some("public-orders"));
+        assert_eq!(stream_alias(&catalog, "public-orders").as_deref(), Some("orders"));
+        assert_eq!(stream_alias(&catalog, "users"), None);
+        assert_eq!(stream_alias(&json!({}), "users"), None);
     }
 
     #[test]

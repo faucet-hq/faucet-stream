@@ -62,10 +62,17 @@ pub struct SingerSourceConfig {
     #[serde(default = "default_true")]
     pub flush_on_state: bool,
 
-    /// Abort the run if no line arrives from the tap within this many seconds.
-    /// `None` (default) waits indefinitely.
-    #[serde(default)]
+    /// Abort the run if no line arrives from the tap within this many seconds
+    /// (default 3600). `null` waits indefinitely — a stalled tap then hangs
+    /// the run.
+    #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: Option<u64>,
+
+    /// Longest tap output line accepted, in bytes (default 64 MiB). A longer
+    /// line — a huge RECORD, or binary output with no newline — fails the run
+    /// instead of exhausting memory.
+    #[serde(default = "default_max_line_bytes")]
+    pub max_line_bytes: usize,
 
     /// How to handle a line that is not valid Singer JSON. Default
     /// [`MalformedPolicy::Skip`].
@@ -84,6 +91,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_idle_timeout_secs() -> Option<u64> {
+    Some(3600)
+}
+
+fn default_max_line_bytes() -> usize {
+    faucet_common_singer::DEFAULT_MAX_LINE_BYTES
+}
+
 impl SingerSourceConfig {
     /// Convenience constructor for the two required fields; other fields take
     /// their serde defaults.
@@ -96,7 +111,8 @@ impl SingerSourceConfig {
             stream: stream.into(),
             state_key: None,
             flush_on_state: true,
-            idle_timeout_secs: None,
+            idle_timeout_secs: default_idle_timeout_secs(),
+            max_line_bytes: default_max_line_bytes(),
             on_malformed: MalformedPolicy::Skip,
             inherit_env: InheritEnv::default(),
         }
@@ -142,7 +158,8 @@ mod tests {
         assert_eq!(cfg.on_malformed, MalformedPolicy::Skip);
         assert!(cfg.args.is_empty());
         assert!(cfg.catalog.is_none());
-        assert!(cfg.idle_timeout_secs.is_none());
+        assert_eq!(cfg.idle_timeout_secs, Some(3600));
+        assert_eq!(cfg.max_line_bytes, 64 * 1024 * 1024);
     }
 
     #[test]

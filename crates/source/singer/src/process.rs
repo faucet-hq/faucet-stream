@@ -34,6 +34,8 @@ const SIGTERM_GRACE: Duration = Duration::from_secs(5);
 pub enum Line {
     Parsed(SingerMessage),
     Malformed(String),
+    /// A line longer than `max_line_bytes`; reading stops (always fatal).
+    Overlong(usize),
 }
 
 /// Outcome of a single [`TapProcess::recv`] call.
@@ -128,11 +130,16 @@ impl TapProcess {
         let (tx, rx) = mpsc::channel::<Line>(CHANNEL_CAPACITY);
         let policy_reader = {
             let tx = tx.clone();
+            let max_line = cfg.max_line_bytes;
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
+                let mut reader = BufReader::new(stdout);
                 loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => {
+                    match faucet_common_singer::read_capped_line(&mut reader, max_line).await {
+                        Ok(faucet_common_singer::CappedLine::TooLong) => {
+                            let _ = tx.send(Line::Overlong(max_line)).await;
+                            break;
+                        }
+                        Ok(faucet_common_singer::CappedLine::Line(line)) => {
                             let item = match parse_line(&line) {
                                 Ok(msg) => Line::Parsed(msg),
                                 Err(reason) => Line::Malformed(reason),
@@ -143,7 +150,7 @@ impl TapProcess {
                                 break; // consumer gone
                             }
                         }
-                        Ok(None) => break, // EOF
+                        Ok(faucet_common_singer::CappedLine::Eof) => break,
                         Err(e) => {
                             let _ = tx
                                 .send(Line::Malformed(format!("stdout read error: {e}")))
