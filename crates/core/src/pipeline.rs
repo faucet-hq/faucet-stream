@@ -1086,7 +1086,12 @@ where
             let records = crate::columnar::record_batch_to_values(&page.batch)?;
             let schema = page.batch.schema();
             let gov = apply_governance(records, &specs, &mut gov_state, sink).await?;
-            deferred = gov.deferred_abort;
+            if let Some(e) = gov.deferred_abort {
+                if let Some(dlq_cfg) = dlq.as_ref() {
+                    abort_with_envelopes(dlq_cfg, &gov.envelopes, &mut dlq_stats).await?;
+                }
+                return Err(e);
+            }
 
             if !gov.envelopes.is_empty() {
                 let dlq_cfg = dlq.as_ref().ok_or_else(|| {
@@ -1662,8 +1667,16 @@ where
                     let gov =
                         apply_governance(page.records, &specs, &mut gov_state, sink).await?;
                     let quality_envelopes = gov.envelopes;
-                    let mut drift_abort = gov.deferred_abort;
-                    let _ = &mut drift_abort;
+                    // A drift `fail` stops the run before anything from this
+                    // page is written or bookmarked: only the page's quarantine
+                    // envelopes are made durable first (CORE-20).
+                    if let Some(e) = gov.deferred_abort {
+                        if let Some(dlq_cfg) = dlq.as_ref() {
+                            abort_with_envelopes(dlq_cfg, &quality_envelopes, &mut dlq_stats)
+                                .await?;
+                        }
+                        return Err(e);
+                    }
 
                     let page = StreamPage {
                         records: gov.records,
@@ -2100,13 +2113,6 @@ where
                         if let Some(e) = circuit_error {
                             return Err(e);
                         }
-                        // Deferred schema-drift `fail` abort: this page's survivors
-                        // are committed and its quality/drift quarantine envelopes
-                        // are now in the DLQ, so the run stops without stranding
-                        // them (mirrors the budget/circuit deferral above).
-                        if let Some(e) = drift_abort {
-                            return Err(e);
-                        }
                         Ok::<(), FaucetError>(())
                         }
                         .instrument(span)
@@ -2411,7 +2417,8 @@ pub(crate) struct GovernanceSpecs<'a> {
     pub sink_name: &'a str,
     /// Whether a DLQ is configured. A drift/incompatible `fail` is **deferred**
     /// when it is, so this page's already-built quarantine envelopes still
-    /// reach the DLQ before the run stops (#146 M4).
+    /// reach the DLQ before the run stops (#146 M4); the page's survivors and
+    /// bookmark are never written (CORE-20).
     pub has_dlq: bool,
 }
 
@@ -2432,9 +2439,10 @@ pub(crate) struct GovernanceOutcome {
     /// DLQ envelopes from quality + contract + drift quarantine, merged in that
     /// order so the caller writes them as one batch.
     pub envelopes: Vec<Value>,
-    /// A drift `fail` / incompatible-`fail` abort to raise **after** the
-    /// envelopes are durable. `None` when there is nothing to defer; with no
-    /// DLQ configured the error is returned directly instead.
+    /// A drift `fail` / incompatible-`fail` abort to raise once the envelopes
+    /// are durable, without writing `records` or the page's bookmark. `None`
+    /// when there is nothing to defer; with no DLQ configured the error is
+    /// returned directly instead.
     pub deferred_abort: Option<FaucetError>,
 }
 
@@ -2653,12 +2661,37 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     })
 }
 
+/// Make a page's quarantine envelopes durable ahead of a drift `fail` abort, so
+/// the run stops without writing the page's survivors or its bookmark while the
+/// rows already routed to the DLQ are not lost.
+async fn abort_with_envelopes(
+    dlq_cfg: &crate::dlq::DlqConfig,
+    envelopes: &[Value],
+    dlq_stats: &mut DlqStats,
+) -> Result<(), FaucetError> {
+    if envelopes.is_empty() {
+        return Ok(());
+    }
+    dlq_cfg
+        .sink
+        .write_batch(envelopes)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("DLQ sink write failed: {e}")))?;
+    dlq_cfg
+        .sink
+        .flush()
+        .await
+        .map_err(|e| FaucetError::Sink(format!("DLQ sink flush failed: {e}")))?;
+    dlq_stats.records_dlq += envelopes.len();
+    dlq_stats.pages_with_failures += 1;
+    Ok(())
+}
+
 /// Apply the schema-drift policy to a page (#194). Returns the (possibly
-/// trimmed) records and an optional deferred abort error. The caller raises the
-/// error after this page is durable: with a DLQ it is threaded into the same
-/// post-commit raise site as the budget/circuit aborts (so the page's
-/// quality/drift quarantine envelopes reach the DLQ first); with no DLQ — where
-/// no envelopes can exist — it is raised immediately and the page is not written.
+/// trimmed) records and an optional deferred abort error. The page is never
+/// written when it is set: with a DLQ the caller first makes the page's
+/// quality/drift quarantine envelopes durable, then raises it; with no DLQ —
+/// where no envelopes can exist — it is raised immediately.
 /// Appends drift quarantine envelopes to `drift_envelopes`.
 #[allow(clippy::too_many_arguments)]
 async fn apply_drift_policy<Si: Sink + ?Sized>(
@@ -7029,11 +7062,40 @@ mod tests {
         );
         assert_eq!(dlq[0]["payload"], json!({"id": 2, "email": "b@x"}));
         assert_eq!(dlq[0]["error"]["kind"], "QualityFailure");
-        // The surviving (drifting) row was committed to the main sink before the abort.
-        assert_eq!(
-            sink.written(),
-            vec![json!({"id": 1, "name": "ok", "email": "a@x"})]
+        // Nothing from the drifting page reaches the main sink (CORE-20).
+        assert!(sink.written().is_empty());
+    }
+
+    /// CORE-20: a drift `fail` with a DLQ writes neither the page's survivors
+    /// nor its bookmark.
+    #[tokio::test]
+    async fn drift_fail_with_dlq_persists_no_bookmark() {
+        use crate::dlq::DlqConfig;
+        let sink = SchemaSink::new(
+            json!({"type":"object","properties":{"id":{"type":"integer"}}}),
+            false,
         );
+        let dlq_sink = std::sync::Arc::new(MockSink::new());
+        let store = std::sync::Arc::new(crate::state::MemoryStateStore::new());
+        let policy = crate::drift::SchemaDriftPolicy {
+            on_drift: crate::drift::OnDrift::Fail,
+            allow_widening: true,
+            on_incompatible: crate::drift::OnIncompatible::Fail,
+            relax_nullability_on_missing: false,
+        };
+        let pages = Box::pin(futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"id": 1, "email": "a@x"})],
+            bookmark: Some(json!({"cursor": 1})),
+        })]));
+        let opts = RunStreamOptions::new()
+            .with_schema_drift(policy)
+            .with_dlq(DlqConfig::new(dlq_sink.clone()))
+            .with_state(store.clone(), "k");
+        let err = run_stream(pages, &sink, opts).await.unwrap_err();
+        assert!(matches!(err, FaucetError::SchemaDrift { .. }), "{err:?}");
+        assert!(sink.written().is_empty());
+        assert!(dlq_sink.written().is_empty());
+        assert_eq!(store.get("k").await.unwrap(), None);
     }
 
     // ── #737 batch atomicity + outcomes, #733 source lag ─────────────────────
