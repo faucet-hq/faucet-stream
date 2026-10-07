@@ -111,8 +111,9 @@ pub(crate) fn derive_explicit_hash_key(
         })?,
     };
     let key = scalar_to_key(v, "explicit hash key")?;
-    // Kinesis requires a decimal integer in [0, 2^128).
-    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()) || key.len() > 39 {
+    // Kinesis requires a decimal integer in [0, 2^128); a 39-digit value can
+    // still be 2^128 or more, so parse rather than count digits (#789 MSG-91).
+    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()) || key.parse::<u128>().is_err() {
         return Err(FaucetError::Sink(
             "kinesis: explicit hash key must be a decimal integer in [0, 2^128)".into(),
         ));
@@ -269,7 +270,26 @@ mod tests {
 
     #[test]
     fn explicit_hash_key_rules() {
-        let r = json!({"h": "123456", "bad": "0x12", "big": "1".repeat(40)});
+        let r = json!({
+            "h": "123456",
+            "bad": "0x12",
+            "big": "1".repeat(40),
+            "max": u128::MAX.to_string(),
+            "over": "340282366920938463463374607431768211456"
+        });
+        assert!(
+            derive_explicit_hash_key(&r, &ExplicitHashKey::Field { name: "max".into() }).is_ok()
+        );
+        assert!(
+            derive_explicit_hash_key(
+                &r,
+                &ExplicitHashKey::Field {
+                    name: "over".into()
+                }
+            )
+            .is_err(),
+            "2^128 has 39 digits and is still out of range"
+        );
         assert_eq!(
             derive_explicit_hash_key(&r, &ExplicitHashKey::None).unwrap(),
             None

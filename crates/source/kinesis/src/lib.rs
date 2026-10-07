@@ -18,7 +18,7 @@ mod shard;
 mod state;
 mod stream;
 
-pub use config::{KinesisSourceConfig, StartPosition, ValueFormat};
+pub use config::{KinesisSourceConfig, OnDecodeError, StartPosition, ValueFormat};
 pub use state::ShardBookmarks;
 pub use stream::KinesisSource;
 
