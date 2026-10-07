@@ -88,11 +88,19 @@ idiomatic Elasticsearch **alias swap**, so a reader never sees a half-replaced
 dataset and a failed/cancelled run leaves the previous data intact:
 
 1. `begin` creates a fresh physical index `{index}-faucet-ovw-…` (copying the
-   current target's mappings) and the run's documents are indexed into it;
-2. `commit` atomically repoints the read alias with one `POST /_aliases` call,
-   then drops the old physical index;
+   current target's mappings) behind a marker alias `{index}-faucet-ovw-staging`,
+   and the run's documents are indexed through that marker (`_bulk` with
+   `require_alias=true`, so a write without a staging index fails instead of
+   creating one);
+2. `commit` atomically repoints the read alias with one `POST /_aliases` call
+   (and detaches the marker), then drops the old physical index;
 3. a failed run instead drops the staging index (`abort`) and never touches the
    alias.
+
+The staging index is found through the marker alias, not kept in the sink, so
+begin, the writes and the commit may run on different sink instances (the CLI
+does exactly that). A staging index left behind by a crashed run is dropped by
+the next `begin`. Two overwrite runs against the same alias must not overlap.
 
 **The configured `index` must be an alias** (or a not-yet-existing name — the
 first run creates the alias). A *concrete* index of that name is rejected, because

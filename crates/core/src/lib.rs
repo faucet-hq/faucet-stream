@@ -40,6 +40,7 @@ pub mod file_format;
 pub mod idempotency;
 pub mod join;
 pub mod lag;
+pub mod lease;
 pub mod local_outputs;
 #[cfg(feature = "masking")]
 pub mod masking;

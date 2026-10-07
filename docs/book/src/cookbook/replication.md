@@ -345,8 +345,10 @@ Per-source notes:
 - **MySQL** — discovery names tables without the database; the binlog's
   `database.table` names are matched to the snapshot connection's database.
   Scope the binlog reader with `include_tables` when the server hosts others.
-- **MongoDB** — `scope: { type: database }` (a single collection scope cannot
-  mirror a set); keys default to `_id`.
+- **MongoDB** — `scope: { type: database, database: <name> }`, naming the
+  database the `mongodb` snapshot source reads. The config is refused with a
+  collection or cluster scope (the default), because their change records do
+  not name tables the way the snapshot's discovery does; keys default to `_id`.
 - **SQL Server** — list the tables' capture instances in `capture_instances`;
   left empty, they are derived as `{schema}_{table}` (SQL Server's default
   capture-instance name).

@@ -68,6 +68,19 @@ pub struct NatsSourceConfig {
     /// message produced before the terminator fires goes into a single page.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// JetStream only: send an in-progress ack (`+WPI`) every this many
+    /// seconds for every message pulled but not yet acked (while a page is
+    /// assembled and while the sink writes it), resetting the consumer's
+    /// `ack_wait` so a slow page is not redelivered into the same run. Keep
+    /// it below the consumer's `ack_wait` (30 s by default). `0` disables.
+    /// Default 10.
+    #[serde(default = "default_progress_interval_secs")]
+    pub progress_interval_secs: u64,
+}
+
+fn default_progress_interval_secs() -> u64 {
+    10
 }
 
 impl NatsSourceConfig {
@@ -83,6 +96,7 @@ impl NatsSourceConfig {
             max_messages: None,
             idle_timeout_secs: Some(5),
             batch_size: DEFAULT_BATCH_SIZE,
+            progress_interval_secs: default_progress_interval_secs(),
         }
     }
 

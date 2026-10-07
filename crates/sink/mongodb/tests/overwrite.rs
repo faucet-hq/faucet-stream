@@ -149,3 +149,101 @@ async fn overwrite_in_supported_write_modes() {
     assert!(sink.supported_write_modes().contains(&WriteMode::Overwrite));
     assert!(sink.is_overwrite());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_keeps_the_destination_indexes_and_options() {
+    use futures::TryStreamExt;
+    let (_c, uri) = start_mongo().await;
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let db = client.database("testdb");
+    db.run_command(doc! {
+        "create": "docs",
+        "validator": { "name": { "$type": "string" } },
+        "collation": { "locale": "en", "strength": 2 },
+    })
+    .await
+    .expect("create with options");
+    db.run_command(doc! {
+        "createIndexes": "docs",
+        "indexes": [
+            { "key": { "name": 1 }, "name": "name_unique", "unique": true },
+            { "key": { "seen": 1 }, "name": "seen_ttl", "expireAfterSeconds": 3600 },
+        ],
+    })
+    .await
+    .expect("create indexes");
+    insert_docs(&uri, "docs", vec![doc! {"_id": 1, "name": "old"}]).await;
+
+    let sink = MongoSink::new(overwrite_config(&uri)).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[serde_json::json!({"_id": 10, "name": "new"})])
+        .await
+        .unwrap();
+    sink.commit_overwrite().await.unwrap();
+    assert_eq!(names(&uri, "docs").await, vec!["new"]);
+
+    let indexes: Vec<Document> = db
+        .collection::<Document>("docs")
+        .list_indexes()
+        .await
+        .expect("list indexes")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect")
+        .into_iter()
+        .map(|ix| mongodb::bson::to_document(&ix).unwrap())
+        .collect();
+    let by_name = |n: &str| indexes.iter().find(|ix| ix.get_str("name") == Ok(n));
+    assert_eq!(
+        by_name("name_unique").and_then(|ix| ix.get_bool("unique").ok()),
+        Some(true)
+    );
+    assert!(by_name("seen_ttl").is_some(), "{indexes:?}");
+
+    let spec = db
+        .run_command(doc! { "listCollections": 1, "filter": { "name": "docs" } })
+        .await
+        .expect("listCollections");
+    let options = spec
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap()[0]
+        .as_document()
+        .unwrap()
+        .get_document("options")
+        .unwrap()
+        .clone();
+    assert!(options.get_document("validator").is_ok(), "{options:?}");
+    assert_eq!(
+        options.get_document("collation").unwrap().get_str("locale"),
+        Ok("en")
+    );
+
+    let dup = MongoSink::new(overwrite_config(&uri)).await.unwrap();
+    dup.begin_overwrite().await.unwrap();
+    assert!(
+        dup.write_batch(&[
+            serde_json::json!({"_id": 1, "name": "same"}),
+            serde_json::json!({"_id": 2, "name": "SAME"}),
+        ])
+        .await
+        .is_err(),
+        "the unique index (with its collation) is enforced on staging"
+    );
+    dup.abort_overwrite().await.unwrap();
+    assert_eq!(names(&uri, "docs").await, vec!["new"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_first_run_creates_the_collection() {
+    let (_c, uri) = start_mongo().await;
+    let sink = MongoSink::new(overwrite_config(&uri)).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[serde_json::json!({"_id": 1, "name": "first"})])
+        .await
+        .unwrap();
+    sink.commit_overwrite().await.unwrap();
+    assert_eq!(names(&uri, "docs").await, vec!["first"]);
+    assert!(!collection_exists(&uri, "docs__faucet_ovw").await);
+}

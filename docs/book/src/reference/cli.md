@@ -286,6 +286,14 @@ opts into the real secrets path. With a `policy:` block or `--policy`, the
 row's [data-flow policy](../cookbook/policies.md) verdict is reported too
 (`policy` in the JSON; a preview never fails on it).
 
+`--live` refuses a source whose read has side effects: CDC sources, `kafka`,
+`webhook` and `websocket` (a read moves or consumes a position), and queue
+sources that acknowledge what they read — `sqs`, `pubsub`, `rabbitmq` and
+`nats` with `jetstream_stream`. A preview never writes, so those messages would
+be removed from the queue and lost. `faucet preview`, `faucet run --dry-run`
+and `faucet run --limit` refuse the queue sources for the same reason, and a
+topology graph refuses them as source nodes. Use `--sample <fixture>` instead.
+
 ### `plan --impact` — change impact analysis (#707)
 
 Walks the catalog's lineage graph downstream of the row's sink and reports

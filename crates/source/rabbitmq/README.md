@@ -19,7 +19,10 @@ records per page.
   broker redelivers them — duplicates are possible, loss is not. Pair with a
   keyed-upsert sink (`write_mode: upsert`) for effectively-once results.
 - **`ack_mode: auto`** — at-most-once (`no_ack`): fastest, but a crash loses
-  in-flight messages.
+  in-flight messages. It cannot be combined with `max_messages`: the broker
+  settles every message it pushes and pushes the backlog into the client buffer
+  ahead of consumption, so stopping at a count would lose everything already
+  pushed. Terminate an `auto` run on `idle_timeout_secs`.
 
 The broker owns the queue position, so the source is not resumable from a
 faucet bookmark and does not qualify for `delivery: exactly_once`.

@@ -9,7 +9,11 @@ valid JSON passes through, anything else becomes a JSON string.
 
 Core NATS is fire-and-forget at-least-once, so runs carry **no bookmark** and
 are not resumable/exactly-once. In JetStream mode each page's messages are
-**acked after the page is written**, giving at-least-once delivery.
+**acked after the page is written and flushed**, giving at-least-once delivery:
+every JetStream page carries an informational `{stream, consumer, consumed}`
+bookmark so the pipeline flushes a buffering sink before the page is acked, and
+held messages get in-progress acks every `progress_interval_secs` so a slow page
+is not redelivered into the same run.
 
 ## Configuration
 
@@ -26,6 +30,7 @@ in alongside these fields:
 | `max_messages`      | `Option<usize>`  | —       | stop after this many messages.                                     |
 | `idle_timeout_secs` | `Option<u64>`    | —       | stop after this many seconds with no new message.                  |
 | `batch_size`        | `usize`          | `1000`  | records per emitted page (`0` = one page for the whole run window).|
+| `progress_interval_secs` | `u64`       | `10`    | JetStream only: in-progress ack (`+WPI`) every N s for every message pulled but not yet acked, so a slow page is not redelivered into the same run. Keep it below the consumer's `ack_wait`. `0` disables. |
 
 At least one of `max_messages` / `idle_timeout_secs` must be set so the run
 terminates.

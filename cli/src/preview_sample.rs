@@ -21,15 +21,34 @@ pub struct Sample {
     pub timed_out: bool,
 }
 
+/// The refusal for reading a source that acks, deletes or settles messages
+/// as it is read (`Source::consumes_destructively`) from a command that does
+/// not durably write what it reads — the messages would leave the queue for
+/// good (#789 MSG-01).
+pub fn destructive_read_refusal(kind: &str, command: &str) -> String {
+    format!(
+        "the `{kind}` source removes messages from its queue as it reads them, and {command} \
+         does not durably write what it reads, so those messages would be lost; run against a \
+         test queue or subscription, or run the pipeline for real"
+    )
+}
+
 /// Read pages from `source`, transform each, and stop once `limit` records
 /// are collected or `timeout` passes. A source error ends the preview with
-/// that error.
+/// that error. A source that consumes destructively is refused before any
+/// read.
 pub async fn sample(
     source: &dyn Source,
     stages: &[CompiledStage],
     limit: usize,
     timeout: Duration,
 ) -> CliResult<Sample> {
+    if source.consumes_destructively() {
+        return Err(crate::error::CliError::Config(destructive_read_refusal(
+            source.connector_name(),
+            "a preview",
+        )));
+    }
     let mut records: Vec<Value> = Vec::new();
     let context = HashMap::new();
     let collect = async {
@@ -166,5 +185,36 @@ mod tests {
     async fn a_source_error_ends_the_preview() {
         let (src, _) = endless(None, true);
         assert!(sample(&src, &[], 5, Duration::from_secs(5)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_source_that_consumes_destructively_is_refused_before_any_read() {
+        struct Queue(std::sync::atomic::AtomicUsize);
+        #[faucet_core::async_trait]
+        impl Source for Queue {
+            async fn fetch_with_context(
+                &self,
+                _: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            fn consumes_destructively(&self) -> bool {
+                true
+            }
+            fn connector_name(&self) -> &'static str {
+                "sqs"
+            }
+        }
+        let queue = Queue(Default::default());
+        let err = sample(&queue, &[], 10, PREVIEW_TIMEOUT).await.unwrap_err();
+        assert!(
+            err.to_string().contains("`sqs` source removes messages"),
+            "{err}"
+        );
+        let reads = || queue.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads(), 0, "a refused preview must not read");
+        queue.fetch_all().await.unwrap();
+        assert_eq!(reads(), 1);
     }
 }

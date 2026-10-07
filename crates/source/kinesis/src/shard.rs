@@ -137,7 +137,9 @@ pub(crate) enum ShardEvent {
 
 /// Run one shard's consume loop, pushing [`ShardEvent`]s into `tx`. Exits when
 /// the shard closes, the channel drops (main loop finished), or retries are
-/// exhausted.
+/// exhausted. Each `GetRecords` call holds one `permits` permit, so a stream
+/// with more shards than permits still reads every shard in turn. Returns
+/// `true` when the shard was fully drained.
 pub(crate) async fn run_shard(
     client: Client,
     config: KinesisSourceConfig,
@@ -145,7 +147,8 @@ pub(crate) async fn run_shard(
     bookmarked_sequence: Option<String>,
     tx: tokio::sync::mpsc::Sender<ShardEvent>,
     behind: BehindLatest,
-) {
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+) -> bool {
     let poll_interval = config.poll_interval();
     let mut last_sequence = bookmarked_sequence.clone();
     let mut error_attempts: u32 = 0;
@@ -155,7 +158,7 @@ pub(crate) async fn run_shard(
             Ok(it) => it,
             Err(error) => {
                 let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
-                return;
+                return false;
             }
         };
 
@@ -163,16 +166,21 @@ pub(crate) async fn run_shard(
         let Some(current) = iterator.clone() else {
             // NextShardIterator == None → the shard is closed and drained.
             let _ = tx.send(ShardEvent::Done { shard_id }).await;
-            return;
+            return true;
         };
 
-        match client
+        let permit = permits
+            .acquire()
+            .await
+            .expect("the shard permit semaphore is never closed");
+        let response = client
             .get_records()
             .shard_iterator(&current)
             .limit(config.records_per_request as i32)
             .send()
-            .await
-        {
+            .await;
+        drop(permit);
+        match response {
             Ok(out) => {
                 error_attempts = 0;
                 let records = out.records();
@@ -193,7 +201,7 @@ pub(crate) async fn run_shard(
                             Ok(p) => p,
                             Err(error) => {
                                 let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
-                                return;
+                                return false;
                             }
                         };
                         last_sequence = Some(sequence.to_string());
@@ -216,7 +224,7 @@ pub(crate) async fn run_shard(
                         .await
                         .is_err()
                     {
-                        return; // main loop finished (max_messages / cancel)
+                        return false; // main loop finished (max_messages / cancel)
                     }
                 }
                 iterator = out.next_shard_iterator().map(str::to_string);
@@ -251,7 +259,7 @@ pub(crate) async fn run_shard(
                         }
                         Err(error) => {
                             let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
-                            return;
+                            return false;
                         }
                     }
                 }
@@ -266,7 +274,7 @@ pub(crate) async fn run_shard(
                             )),
                         })
                         .await;
-                    return;
+                    return false;
                 }
                 let delay = backoff_delay(poll_interval, error_attempts);
                 tracing::warn!(shard = %shard_id, error = %service,

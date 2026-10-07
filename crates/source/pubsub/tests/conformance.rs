@@ -9,6 +9,7 @@
 //! criterion.
 
 use faucet_common_pubsub::PubsubMessage;
+use faucet_core::Source as _;
 use faucet_source_pubsub::{
     PubsubConnection, PubsubCredentials, PubsubSource, PubsubSourceConfig, ValueFormat,
 };
@@ -105,6 +106,7 @@ async fn conformance_bounded_memory() {
     cfg.max_messages = Some(150);
     cfg.batch_size = 30;
     let source = PubsubSource::new(cfg).await.expect("source builds");
+    assert!(source.consumes_destructively());
 
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty(&source);

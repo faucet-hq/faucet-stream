@@ -121,18 +121,34 @@ pub(crate) async fn read_last_token(
     // for exactly-once correctness, so pin it explicitly.
     cfg.set("isolation.level", "read_committed");
     let topic = config.exactly_once_spec().commit_token_topic;
-    let scope = scope.to_string();
+    let prefix = config.exactly_once_spec().transactional_id_prefix;
+    let key = token_key(prefix.as_deref(), scope);
+    let legacy = prefix.is_some().then(|| scope.to_string());
     let timeout = config.message_timeout;
 
-    tokio::task::spawn_blocking(move || read_last_token_blocking(&cfg, &topic, &scope, timeout))
-        .await
-        .map_err(|e| FaucetError::Sink(format!("kafka token read task: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        read_last_token_blocking(&cfg, &topic, &key, legacy.as_deref(), timeout)
+    })
+    .await
+    .map_err(|e| FaucetError::Sink(format!("kafka token read task: {e}")))?
+}
+
+/// The side-topic key a scope's commit token is written under. With an
+/// explicit `transactional_id_prefix` it is `"{prefix}.{scope}"`, so two
+/// environments that share pipeline/row names on one cluster never read each
+/// other's watermark; without one it stays the bare scope.
+pub(crate) fn token_key(prefix: Option<&str>, scope: &str) -> String {
+    match prefix {
+        Some(p) => format!("{p}.{scope}"),
+        None => scope.to_string(),
+    }
 }
 
 fn read_last_token_blocking(
     cfg: &ClientConfig,
     topic: &str,
     scope: &str,
+    legacy: Option<&str>,
     timeout: Duration,
 ) -> Result<Option<String>, FaucetError> {
     let consumer: BaseConsumer = cfg
@@ -205,6 +221,7 @@ fn read_last_token_blocking(
     // unbounded backlog cannot blow up memory at startup. Each polled record is
     // folded in and discarded.
     let mut max_token: Option<String> = None;
+    let mut legacy_token: Option<String> = None;
     let mut drained: u64 = 0;
     if position_reached(&consumer, &ends) {
         // Every partition empty (or already at its watermark) — nothing to read.
@@ -213,8 +230,11 @@ fn read_last_token_blocking(
     loop {
         match consumer.poll(timeout) {
             Some(Ok(msg)) => {
-                max_token =
-                    fold_token_for_scope(max_token, msg.key().unwrap_or(&[]), msg.payload(), scope);
+                let key = msg.key().unwrap_or(&[]);
+                max_token = fold_token_for_scope(max_token, key, msg.payload(), scope);
+                if let Some(legacy) = legacy {
+                    legacy_token = fold_token_for_scope(legacy_token, key, msg.payload(), legacy);
+                }
                 drained += 1;
                 if position_reached(&consumer, &ends) {
                     break;
@@ -246,7 +266,7 @@ fn read_last_token_blocking(
         }
     }
 
-    Ok(max_token)
+    Ok(max_token.or(legacy_token))
 }
 
 /// Derive the producer `transactional.id` from a stable pipeline scope.
@@ -501,5 +521,25 @@ mod tests {
             Some(bm),
             "embedded bookmark must survive the fold"
         );
+    }
+
+    #[test]
+    fn token_key_is_namespaced_only_by_an_explicit_prefix() {
+        assert_eq!(token_key(None, "p::row"), "p::row");
+        assert_eq!(token_key(Some("staging"), "p::row"), "staging.p::row");
+        assert_ne!(
+            token_key(Some("staging"), "p::row"),
+            token_key(Some("prod"), "p::row"),
+            "two environments sharing a scope never share a watermark key"
+        );
+        // The reader folds only its own key: another environment's token is
+        // invisible to it.
+        let theirs = fold_token_for_scope(
+            None,
+            token_key(Some("prod"), "p::row").as_bytes(),
+            Some(faucet_core::idempotency::format_token(9).as_bytes()),
+            &token_key(Some("staging"), "p::row"),
+        );
+        assert_eq!(theirs, None);
     }
 }

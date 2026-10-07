@@ -21,7 +21,7 @@ mod convert;
 mod state;
 mod stream;
 
-pub use config::{DEFAULT_ATTRIBUTES_KEY, PubsubSourceConfig, ValueFormat};
+pub use config::{DEFAULT_ATTRIBUTES_KEY, OnDecodeError, PubsubSourceConfig, ValueFormat};
 pub use state::PubsubBookmark;
 pub use stream::PubsubSource;
 

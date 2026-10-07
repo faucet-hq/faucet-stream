@@ -1252,6 +1252,19 @@ pub fn sink_guarantee(kind: &str) -> faucet_core::SinkGuarantee {
     }
 }
 
+/// Config-level mirror of `Source::consumes_destructively` for the built-in
+/// queue sources: reading them acks, deletes or settles messages as the
+/// pipeline moves past each page (`sqs`, `pubsub`, `rabbitmq`, and `nats` in
+/// JetStream mode). Lets graph validation refuse them without building a
+/// connector (#789 MSG-14).
+pub fn source_kind_consumes_destructively(kind: &str, config: &Value) -> bool {
+    match kind {
+        "sqs" | "pubsub" | "rabbitmq" => true,
+        "nats" => config.get("jetstream_stream").is_some_and(|v| !v.is_null()),
+        _ => false,
+    }
+}
+
 /// See [`EXACTLY_ONCE_SOURCE_KINDS`].
 pub fn source_supports_exactly_once(kind: &str) -> bool {
     source_replay_guarantee(kind) == faucet_core::ReplayGuarantee::Deterministic
@@ -2709,7 +2722,22 @@ fn unknown(name: &str, kind: &'static str, available: Vec<&'static str>) -> CliE
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use serde_json::json;
+
+    #[test]
+    fn queue_sources_consume_destructively_by_kind() {
+        let empty = serde_json::json!({});
+        for kind in ["sqs", "pubsub", "rabbitmq"] {
+            assert!(source_kind_consumes_destructively(kind, &empty), "{kind}");
+        }
+        assert!(!source_kind_consumes_destructively("nats", &empty));
+        assert!(source_kind_consumes_destructively(
+            "nats",
+            &serde_json::json!({"jetstream_stream": "S"})
+        ));
+        assert!(!source_kind_consumes_destructively("kafka", &empty));
+    }
 
     #[test]
     fn bookmark_schema_and_migration_per_source_kind() {

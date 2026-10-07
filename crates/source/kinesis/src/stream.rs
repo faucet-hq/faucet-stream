@@ -3,6 +3,7 @@
 //! idle / max-messages termination.
 
 use crate::config::KinesisSourceConfig;
+use crate::config::StartPosition;
 use crate::shard::{BehindLatest, ShardEvent, probe_behind, run_shard};
 use crate::state::{ShardBookmarks, state_key};
 use aws_sdk_kinesis::Client;
@@ -28,19 +29,61 @@ pub struct KinesisSource {
 pub(crate) struct EligibleShard {
     pub id: String,
     pub closed: bool,
+    /// `ParentShardId` and `AdjacentParentShardId` from `ListShards`.
+    pub parents: Vec<String>,
 }
 
-/// Filter discovered shards per the config: explicit allowlist, and closed
-/// shards only when `include_closed`. Pure.
-pub(crate) fn filter_shards(
+/// A shard this run reads, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedShard {
+    pub id: String,
+    /// Planned parents that must be drained before this shard starts, so a
+    /// key's older records (in the parent) land before its newer ones.
+    pub wait_for: Vec<String>,
+    /// Start an unbookmarked shard at `TRIM_HORIZON` instead of the
+    /// configured start position: its parent was read, so everything the
+    /// child holds is newer than what was read and must not be skipped.
+    pub from_trim_horizon: bool,
+}
+
+/// Decide which shards to read. Open shards are always read (subject to the
+/// allowlist). A closed shard is read when `include_closed` is set or it has a
+/// bookmark — after a reshard the parent's unread tail must be drained, never
+/// dropped; a fully read one ends at its first `GetRecords`. A shard waits for its
+/// planned parents, and an unbookmarked child of a read parent starts at
+/// `TRIM_HORIZON`. Pure.
+pub(crate) fn plan_shards(
     shards: Vec<EligibleShard>,
     allowlist: &[String],
     include_closed: bool,
-) -> Vec<EligibleShard> {
-    shards
+    bookmarks: &ShardBookmarks,
+) -> Vec<PlannedShard> {
+    let selected: Vec<EligibleShard> = shards
         .into_iter()
         .filter(|s| allowlist.is_empty() || allowlist.iter().any(|a| a == &s.id))
-        .filter(|s| include_closed || !s.closed)
+        .filter(|s| !s.closed || include_closed || bookmarks.get(&s.id).is_some())
+        .collect();
+    let planned: std::collections::HashSet<String> =
+        selected.iter().map(|s| s.id.clone()).collect();
+    selected
+        .into_iter()
+        .map(|s| {
+            let wait_for: Vec<String> = s
+                .parents
+                .iter()
+                .filter(|p| planned.contains(*p))
+                .cloned()
+                .collect();
+            let parent_read = s
+                .parents
+                .iter()
+                .any(|p| planned.contains(p) || bookmarks.get(p).is_some());
+            PlannedShard {
+                from_trim_horizon: bookmarks.get(&s.id).is_none() && parent_read,
+                id: s.id,
+                wait_for,
+            }
+        })
         .collect()
 }
 
@@ -64,9 +107,12 @@ impl KinesisSource {
         })
     }
 
-    /// Enumerate the stream's shards (paged `ListShards`), applying the
-    /// config's allowlist / closed-shard filters.
-    async fn discover_shards(&self) -> Result<Vec<EligibleShard>, FaucetError> {
+    /// Enumerate the stream's shards (paged `ListShards`) and plan which to
+    /// read and in what order ([`plan_shards`]).
+    async fn discover_shards(
+        &self,
+        bookmarks: &ShardBookmarks,
+    ) -> Result<Vec<PlannedShard>, FaucetError> {
         let mut all = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
@@ -85,13 +131,18 @@ impl KinesisSource {
                 ))
             })?;
             for s in out.shards() {
-                let closed = s
-                    .sequence_number_range()
-                    .and_then(|r| r.ending_sequence_number())
-                    .is_some();
                 all.push(EligibleShard {
                     id: s.shard_id().to_string(),
-                    closed,
+                    closed: s
+                        .sequence_number_range()
+                        .and_then(|r| r.ending_sequence_number())
+                        .is_some(),
+                    parents: s
+                        .parent_shard_id()
+                        .into_iter()
+                        .chain(s.adjacent_parent_shard_id())
+                        .map(str::to_string)
+                        .collect(),
                 });
             }
             next_token = out.next_token().map(str::to_string);
@@ -99,7 +150,12 @@ impl KinesisSource {
                 break;
             }
         }
-        let eligible = filter_shards(all, &self.config.shard_ids, self.config.include_closed);
+        let eligible = plan_shards(
+            all,
+            &self.config.shard_ids,
+            self.config.include_closed,
+            bookmarks,
+        );
         if eligible.is_empty() {
             return Err(FaucetError::Source(format!(
                 "kinesis: stream '{}' has no eligible shards (shard_ids filter: {:?}, \
@@ -142,35 +198,55 @@ impl faucet_core::Source for KinesisSource {
         };
 
         Box::pin(async_stream::try_stream! {
-            let shards = self.discover_shards().await?;
             let bookmarks = self
                 .start_bookmarks
                 .lock()
                 .expect("bookmark mutex poisoned")
                 .clone()
                 .unwrap_or_default();
+            let shards = self.discover_shards(&bookmarks).await?;
 
-            // Workers push decoded chunks; the semaphore bounds concurrency.
+            // Every shard gets a worker; the semaphore bounds concurrent
+            // `GetRecords` calls, not shard lifetimes, so every shard is read.
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ShardEvent>(16);
             let semaphore = Arc::new(tokio::sync::Semaphore::new(
                 self.config.shard_concurrency,
             ));
+            let drained: std::collections::HashMap<String, tokio::sync::watch::Sender<bool>> =
+                shards
+                    .iter()
+                    .map(|s| (s.id.clone(), tokio::sync::watch::channel(false).0))
+                    .collect();
             let total_shards = shards.len();
             let mut handles = Vec::with_capacity(total_shards);
             for shard in &shards {
-                let permit_sem = semaphore.clone();
+                let permits = semaphore.clone();
                 let client = self.client.clone();
-                let config = self.config.clone();
+                let mut config = self.config.clone();
+                if shard.from_trim_horizon {
+                    config.start_position = StartPosition::TrimHorizon;
+                }
                 let shard_id = shard.id.clone();
                 let bookmark = bookmarks.get(&shard_id).map(str::to_string);
                 let tx = tx.clone();
                 let behind = Arc::clone(&self.behind);
+                let parents: Vec<tokio::sync::watch::Receiver<bool>> = shard
+                    .wait_for
+                    .iter()
+                    .filter_map(|p| drained.get(p).map(|s| s.subscribe()))
+                    .collect();
+                let done = drained.get(&shard_id).cloned();
                 handles.push(tokio::spawn(async move {
-                    let _permit = permit_sem
-                        .acquire_owned()
-                        .await
-                        .expect("semaphore closed");
-                    run_shard(client, config, shard_id, bookmark, tx, behind).await;
+                    for mut parent in parents {
+                        if parent.wait_for(|d| *d).await.is_err() {
+                            return;
+                        }
+                    }
+                    let finished =
+                        run_shard(client, config, shard_id, bookmark, tx, behind, permits).await;
+                    if finished && let Some(done) = done {
+                        let _ = done.send(true);
+                    }
                 }));
             }
             drop(tx); // the channel closes when every worker exits
@@ -299,7 +375,7 @@ impl faucet_core::Source for KinesisSource {
                     .clone()
                     .unwrap_or_default();
                 let mut worst: Option<i64> = None;
-                for shard in self.discover_shards().await? {
+                for shard in self.discover_shards(&bookmarks).await? {
                     if let Some(ms) = probe_behind(
                         &self.client,
                         &self.config,
@@ -373,26 +449,101 @@ mod tests {
         EligibleShard {
             id: id.to_string(),
             closed,
+            parents: Vec::new(),
         }
     }
 
+    fn child(id: &str, parents: &[&str]) -> EligibleShard {
+        EligibleShard {
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+            ..shard(id, false)
+        }
+    }
+
+    fn ids(plan: &[PlannedShard]) -> Vec<&str> {
+        plan.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    fn marks(pairs: &[(&str, &str)]) -> ShardBookmarks {
+        let mut b = ShardBookmarks::default();
+        for (id, seq) in pairs {
+            b.advance(id, seq);
+        }
+        b
+    }
+
     #[test]
-    fn shard_filtering_applies_allowlist_and_closed_rules() {
+    fn shard_planning_applies_allowlist_and_closed_rules() {
+        let all = vec![shard("s0", false), shard("s1", true), shard("s2", false)];
+        let none = ShardBookmarks::default();
+        assert_eq!(
+            ids(&plan_shards(all.clone(), &[], false, &none)),
+            ["s0", "s2"]
+        );
+        assert_eq!(plan_shards(all.clone(), &[], true, &none).len(), 3);
+        let picked = plan_shards(all, &["s1".to_string()], true, &none);
+        assert_eq!(ids(&picked), ["s1"]);
+    }
+
+    #[test]
+    fn a_closed_parent_with_an_unread_tail_is_drained_before_its_children() {
         let all = vec![
-            shard("shardId-000000000000", false),
-            shard("shardId-000000000001", true),
-            shard("shardId-000000000002", false),
+            shard("parent", true),
+            child("left", &["parent"]),
+            child("right", &["parent"]),
         ];
-        // Default: open shards only.
-        let open = filter_shards(all.clone(), &[], false);
-        assert_eq!(open.len(), 2);
-        assert!(open.iter().all(|s| !s.closed));
-        // include_closed keeps everything.
-        assert_eq!(filter_shards(all.clone(), &[], true).len(), 3);
-        // Allowlist narrows.
-        let picked = filter_shards(all, &["shardId-000000000001".to_string()], true);
-        assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].id, "shardId-000000000001");
+        let plan = plan_shards(all.clone(), &[], false, &marks(&[("parent", "500")]));
+        assert_eq!(ids(&plan), ["parent", "left", "right"]);
+        assert!(plan[0].wait_for.is_empty());
+        assert_eq!(plan[1].wait_for, ["parent"]);
+        assert!(
+            plan[1].from_trim_horizon,
+            "the child holds only newer records"
+        );
+
+        let gone = plan_shards(
+            vec![child("left", &["parent"])],
+            &[],
+            false,
+            &marks(&[("parent", "900")]),
+        );
+        assert!(
+            gone[0].wait_for.is_empty(),
+            "an expired parent is not waited on"
+        );
+        assert!(gone[0].from_trim_horizon);
+    }
+
+    #[test]
+    fn a_merged_child_waits_for_both_parents_and_keeps_its_own_bookmark() {
+        let all = vec![
+            shard("a", true),
+            shard("b", true),
+            child("merged", &["a", "b"]),
+        ];
+        let plan = plan_shards(all.clone(), &[], true, &ShardBookmarks::default());
+        assert_eq!(plan[2].wait_for, ["a", "b"]);
+        assert!(plan[2].from_trim_horizon);
+
+        let resumed = plan_shards(all, &[], false, &marks(&[("a", "900"), ("merged", "7")]));
+        assert_eq!(ids(&resumed), ["a", "merged"]);
+        assert_eq!(resumed[1].wait_for, ["a"]);
+        assert!(
+            !resumed[0].from_trim_horizon,
+            "a bookmarked shard resumes after it"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_child_keeps_the_configured_start_position() {
+        let plan = plan_shards(
+            vec![child("c", &["gone"])],
+            &[],
+            false,
+            &ShardBookmarks::default(),
+        );
+        assert!(plan[0].wait_for.is_empty());
+        assert!(!plan[0].from_trim_horizon);
     }
 
     async fn offline_source(mut config: KinesisSourceConfig) -> KinesisSource {

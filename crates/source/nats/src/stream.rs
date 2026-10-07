@@ -13,6 +13,7 @@
 
 use crate::config::NatsSourceConfig;
 use async_trait::async_trait;
+use faucet_core::lease::LeaseExtender;
 use faucet_core::{FaucetError, Source, Stream, StreamPage};
 use futures::StreamExt;
 use serde_json::Value;
@@ -145,9 +146,21 @@ impl Source for NatsSource {
                 let mut to_ack: Vec<async_nats::jetstream::Message> = Vec::new();
                 let mut total = 0usize;
                 let mut last_at = Instant::now();
+                let progress = self.config.progress_interval_secs;
+                let lease = (progress > 0).then(|| {
+                    LeaseExtender::spawn(Duration::from_secs(progress), mark_in_progress)
+                });
+                let hold = |page: &[async_nats::jetstream::Message], yielded: &[async_nats::jetstream::Message]| {
+                    if let Some(l) = &lease {
+                        l.hold(page.iter().chain(yielded).cloned().collect());
+                    }
+                };
 
                 loop {
-                    ack_all(std::mem::take(&mut to_ack)).await;
+                    if !to_ack.is_empty() {
+                        ack_all(std::mem::take(&mut to_ack)).await;
+                        hold(&page_msgs, &to_ack);
+                    }
 
                     let (budget, deadline) = poll_budget(idle, last_at, poll_fallback);
                     let mut stop = false;
@@ -164,6 +177,7 @@ impl Source for NatsSource {
                                 last_at = Instant::now();
                                 let record = payload_to_value(&msg.payload);
                                 page_msgs.push(msg);
+                                hold(&page_msgs, &to_ack);
                                 Polled::Record(record)
                             }
                             Ok(Some(Err(e))) => {
@@ -197,9 +211,13 @@ impl Source for NatsSource {
 
                     if !buffer.is_empty() && buffer.len() >= page_chunk {
                         let records = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
-                        yield StreamPage { records, bookmark: None };
-                        // Resumed ⇒ the page was written; ack its messages next iteration.
                         to_ack = std::mem::take(&mut page_msgs);
+                        // The bookmark makes the pipeline flush the sink before
+                        // it resumes us — and resuming is when this page is acked.
+                        yield StreamPage {
+                            records,
+                            bookmark: Some(page_bookmark(stream_name, consumer_name, total)),
+                        };
                     }
 
                     if stop {
@@ -211,9 +229,13 @@ impl Source for NatsSource {
                 // trailing partial page (and its acks).
                 ack_all(std::mem::take(&mut to_ack)).await;
                 if !buffer.is_empty() {
-                    yield StreamPage { records: buffer, bookmark: None };
+                    yield StreamPage {
+                        records: buffer,
+                        bookmark: Some(page_bookmark(stream_name, consumer_name, total)),
+                    };
                     ack_all(std::mem::take(&mut page_msgs)).await;
                 }
+                drop(lease);
                 tracing::info!(messages = total, "nats source: jetstream stream complete");
             } else {
                 // ── Core NATS subscription mode ─────────────────────────────
@@ -290,6 +312,10 @@ impl Source for NatsSource {
         serde_json::to_value(faucet_core::schema_for!(NatsSourceConfig)).unwrap_or(Value::Null)
     }
 
+    fn consumes_destructively(&self) -> bool {
+        self.config.is_jetstream()
+    }
+
     fn connector_name(&self) -> &'static str {
         "nats"
     }
@@ -331,6 +357,24 @@ fn idle_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
 
+/// The informational bookmark every JetStream page carries: the consumer, not
+/// faucet, owns the position; the bookmark exists so the pipeline flushes the
+/// sink before resuming the generator, which is when the page is acked
+/// (MSG-07). Pure.
+pub(crate) fn page_bookmark(stream: &str, consumer: &str, consumed: usize) -> Value {
+    serde_json::json!({ "stream": stream, "consumer": consumer, "consumed": consumed })
+}
+
+/// Send an in-progress ack for every held message, resetting its `ack_wait`.
+/// Best-effort.
+async fn mark_in_progress(messages: Vec<async_nats::jetstream::Message>) {
+    for msg in messages {
+        if let Err(e) = msg.ack_with(async_nats::jetstream::AckKind::Progress).await {
+            tracing::warn!(error = %e, "nats source: in-progress ack failed");
+        }
+    }
+}
+
 /// Ack a page's JetStream messages best-effort — a failed ack triggers at most
 /// a redelivery (at-least-once), never data loss, so it is logged not fatal.
 async fn ack_all(messages: Vec<async_nats::jetstream::Message>) {
@@ -344,6 +388,14 @@ async fn ack_all(messages: Vec<async_nats::jetstream::Message>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_jetstream_page_carries_an_informational_bookmark() {
+        assert_eq!(
+            page_bookmark("ORDERS", "faucet", 3),
+            serde_json::json!({"stream": "ORDERS", "consumer": "faucet", "consumed": 3})
+        );
+    }
 
     #[test]
     fn payload_json_passthrough() {
