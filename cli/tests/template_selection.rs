@@ -467,6 +467,38 @@ async fn a_selection_runs_the_subset_from_every_http_path() {
     assert!(exists(&out, "deals") && exists(&out, "deal_lines"));
     assert!(!exists(&out, "accounts"));
 
+    // An overlay tuning a stream the selection drops still applies to the
+    // rest (#789 CLI-67); a stream the template does not have is refused.
+    let overlay = |stream: &str| {
+        json!({
+            "kind": "deployment",
+            "name": "ops",
+            "streams": {
+                stream: { "delivery": "at_least_once" },
+                "deals": { "delivery": "at_least_once" }
+            }
+        })
+    };
+    let (code, v) = api
+        .post(
+            "/v1/templates/crm/runs",
+            json!({ "sink": "files", "overlay": overlay("accounts"),
+                    "selection": { "select": ["deal_lines"], "include_parents": "eligible" } }),
+        )
+        .await;
+    assert_eq!(code, 202, "{v}");
+    let run = api.wait_terminal(v["run_id"].as_str().unwrap()).await;
+    assert_eq!(run["status"], "completed", "{run}");
+    let (code, v) = api
+        .post(
+            "/v1/templates/crm/runs",
+            json!({ "sink": "files", "overlay": overlay("nope"),
+                    "selection": { "select": ["deal_lines"], "include_parents": "eligible" } }),
+        )
+        .await;
+    assert_eq!(code, 422, "{v}");
+    assert!(v.to_string().contains("names no stream"), "{v}");
+
     // Unknown stream → 400 naming the valid ones.
     let (code, v) = api
         .post(

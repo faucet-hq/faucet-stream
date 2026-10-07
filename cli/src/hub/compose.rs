@@ -601,7 +601,21 @@ impl Composition {
     /// whatever the composition carried, and its per-stream overrides land on
     /// the matching matrix rows. Connector selection and stream shape are out
     /// of its reach by construction ([`DeploymentTemplate::from_value`]).
-    pub fn apply_overlay(mut self, overlay: &DeploymentTemplate) -> CliResult<Self> {
+    pub fn apply_overlay(self, overlay: &DeploymentTemplate) -> CliResult<Self> {
+        let known: Vec<String> = self.streams.iter().map(|p| p.stream.clone()).collect();
+        self.apply_overlay_within(overlay, &known)
+    }
+
+    /// [`Self::apply_overlay`] on a composition of a **narrowed** source
+    /// template (a row selection, or only the streams a sink can run):
+    /// `streams.<name>` is checked against `all_streams` — the template's full
+    /// list — and an override for a stream the narrowing dropped is skipped
+    /// rather than refused.
+    pub fn apply_overlay_within(
+        mut self,
+        overlay: &DeploymentTemplate,
+        all_streams: &[String],
+    ) -> CliResult<Self> {
         overlay.validate()?;
         let doc = self
             .document
@@ -646,24 +660,26 @@ impl Composition {
             }
         }
 
-        let known: Vec<String> = self.streams.iter().map(|p| p.stream.clone()).collect();
         let rows = doc
             .get_mut("matrix")
             .and_then(Value::as_array_mut)
             .ok_or_else(|| CliError::Internal("hub compose: document has no matrix".into()))?;
         for (stream, o) in &overlay.streams {
-            let row = rows
+            if !all_streams.contains(stream) {
+                return Err(CliError::Config(format!(
+                    "deployment '{}': `streams.{stream}` names no stream of '{}' (streams: {})",
+                    overlay.id(),
+                    self.source,
+                    all_streams.join(", ")
+                )));
+            }
+            let Some(row) = rows
                 .iter_mut()
                 .find(|r| r.get("id").and_then(Value::as_str) == Some(stream.as_str()))
                 .and_then(Value::as_object_mut)
-                .ok_or_else(|| {
-                    CliError::Config(format!(
-                        "deployment '{}': `streams.{stream}` names no stream of '{}' (streams: {})",
-                        overlay.id(),
-                        self.source,
-                        known.join(", ")
-                    ))
-                })?;
+            else {
+                continue;
+            };
             let dlq = o.dlq.as_ref().map(|v| v.clone().unwrap_or(Value::Null));
             for (key, value) in [
                 ("sla", o.sla.clone()),
@@ -1208,6 +1224,36 @@ streams:
             d["pipeline"]["sinks"],
             jsonl_pair().document["pipeline"]["sinks"]
         );
+    }
+
+    /// A row selection narrows the template before composition; an overlay
+    /// tuning a stream the selection dropped still applies to the rest
+    /// (#789 CLI-67).
+    #[test]
+    fn an_overlay_skips_a_stream_the_narrowing_dropped() {
+        let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let full = src();
+        let all: Vec<String> = full.streams.iter().map(|s| s.name.clone()).collect();
+        let mut narrowed = full.clone();
+        narrowed.streams.retain(|s| s.name != "bills");
+        let kept = narrowed.streams[0].name.clone();
+        let o = overlay(&format!(
+            "kind: deployment\nname: x\nstreams:\n  bills: {{ delivery: at_least_once }}\n  {kept}: {{ delivery: at_least_once }}\n"
+        ));
+        let c = compose_with(&narrowed, &k, ALL)
+            .unwrap()
+            .apply_overlay_within(&o, &all)
+            .unwrap();
+        let rows = c.document["matrix"].as_array().unwrap();
+        assert!(rows.iter().all(|r| r["id"] != "bills"));
+        let row = rows.iter().find(|r| r["id"] == kept.as_str()).unwrap();
+        assert_eq!(row["delivery"], "at_least_once");
+        let err = compose_with(&narrowed, &k, ALL)
+            .unwrap()
+            .apply_overlay(&o)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names no stream"), "{err}");
     }
 
     #[test]

@@ -247,7 +247,10 @@ message saying so, so the shape of a run is always fixed by its two templates.
 overlay's value replaces whatever the composition carried. Its `params:` merge
 with the templates' (a name declared on both sides must be declared
 identically). The run keeps the source's `name`, so its state keys are the
-same with or without an overlay, and across sink swaps.
+same with or without an overlay, and across sink swaps. A `streams.<name>`
+entry must name a stream of the source template; on a run that selects only
+some streams (a row selection, or the streams a sink can run), entries for the
+streams left out are skipped.
 
 `faucet validate` and `faucet hub check --overlay` print what the overlay set
 (`pipeline.state, notifications, matrix.invoices.sla`, …). Two warnings are

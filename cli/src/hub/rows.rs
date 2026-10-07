@@ -636,7 +636,8 @@ pub fn rows_for_source(
         if !narrowed.streams.is_empty() {
             let mut c = super::compose::compose_with(&narrowed, sink, supported)?;
             if let Some(o) = overlay {
-                c = c.apply_overlay(o)?;
+                let all: Vec<String> = src.streams.iter().map(|s| s.name.clone()).collect();
+                c = c.apply_overlay_within(o, &all)?;
             }
             let (_, real) = placeholder_nodes(&c.document)?;
             composed = Some(c.document);

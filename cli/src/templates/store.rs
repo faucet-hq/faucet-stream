@@ -1072,6 +1072,7 @@ async fn materialize_pair_selected(
                 "stored sink-template '{sink_id}' v{sink_version}: {e}"
             ))
         })?;
+    let all_streams: Vec<String> = source.streams.iter().map(|s| s.name.clone()).collect();
     let (source, effective) = match selection {
         Some(sel) => {
             let (narrowed, effective) = crate::hub::rows::narrow_source_template(&source, sel)?;
@@ -1083,7 +1084,7 @@ async fn materialize_pair_selected(
     let (mut overlay_id, mut overlay_version) = (None, None);
     if let Some(choice) = overlay {
         let (t, oid, over) = resolve_overlay(store, choice).await?;
-        composition = composition.apply_overlay(&t)?;
+        composition = composition.apply_overlay_within(&t, &all_streams)?;
         overlay_id = Some(oid);
         overlay_version = over;
     }
