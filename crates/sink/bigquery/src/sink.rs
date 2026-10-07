@@ -489,6 +489,26 @@ const RESUMABLE_CHUNK: usize = 8 * 1024 * 1024;
 /// Resumable-upload chunk alignment: every non-final `Content-Range` upper bound
 /// must be a multiple of 256 KiB.
 const RESUMABLE_ALIGN: usize = 256 * 1024;
+/// Consecutive 308s without progress tolerated before a chunk PUT gives up.
+const RESUMABLE_MAX_STALLS: u32 = 3;
+
+/// Bytes a resumable session has persisted, from a 308's `Range` header
+/// (`bytes=0-N` → `N + 1`); an absent header means none (SQL-180).
+fn persisted_bytes(range: Option<&str>) -> Result<u64, FaucetError> {
+    let Some(range) = range else {
+        return Ok(0);
+    };
+    range
+        .trim()
+        .strip_prefix("bytes=0-")
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .map(|last| last + 1)
+        .ok_or_else(|| {
+            FaucetError::Sink(format!(
+                "resumable upload: unreadable Range header `{range}` on 308"
+            ))
+        })
+}
 
 /// An in-flight BigQuery **resumable upload** session for a single load job fed
 /// incrementally across many source pages (so peak memory is O(chunk + one
@@ -553,16 +573,7 @@ impl UploadSession {
                 .get_mut()
                 .drain(..n)
                 .collect();
-            let end = self.offset + chunk.len() as u64 - 1;
-            let range = format!("bytes {}-{}/*", self.offset, end);
-            let resp = self
-                .http
-                .put(&self.session_uri)
-                .header(reqwest::header::CONTENT_RANGE, range)
-                .body(chunk.clone())
-                .send()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("resumable chunk PUT failed: {e}")))?;
+            let resp = self.put_range(self.offset, &chunk, None).await?;
             if resp.status().as_u16() != 308 {
                 let s = resp.status();
                 let t = resp.text().await.unwrap_or_default();
@@ -573,6 +584,67 @@ impl UploadSession {
             self.offset += chunk.len() as u64;
         }
         Ok(())
+    }
+
+    /// PUT `data` (which starts at stream offset `start`) to the session. A 308
+    /// whose `Range` header reports fewer bytes than were sent is resumed from
+    /// the persisted offset (SQL-180) until the server holds all of `data`.
+    /// Returns the last response; `total` is the stream length on the final PUT.
+    async fn put_range(
+        &self,
+        start: u64,
+        data: &[u8],
+        total: Option<u64>,
+    ) -> Result<reqwest::Response, FaucetError> {
+        let end = start + data.len() as u64;
+        let mut pos = start;
+        let mut stalls = 0;
+        loop {
+            let body = data[(pos - start) as usize..].to_vec();
+            let size = total.map_or_else(|| "*".to_string(), |t| t.to_string());
+            let range = if body.is_empty() {
+                format!("bytes */{size}")
+            } else {
+                format!("bytes {pos}-{}/{size}", end - 1)
+            };
+            let resp = self
+                .http
+                .put(&self.session_uri)
+                .header(reqwest::header::CONTENT_RANGE, range)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("resumable chunk PUT failed: {e}")))?;
+            if resp.status().as_u16() != 308 {
+                return Ok(resp);
+            }
+            let persisted = persisted_bytes(
+                resp.headers()
+                    .get(reqwest::header::RANGE)
+                    .and_then(|v| v.to_str().ok()),
+            )?;
+            if persisted >= end {
+                return Ok(resp);
+            }
+            if persisted < start {
+                return Err(FaucetError::Sink(format!(
+                    "resumable upload: server reports {persisted} bytes persisted, below the \
+                     {start} it had already confirmed"
+                )));
+            }
+            if persisted <= pos {
+                stalls += 1;
+                if stalls > RESUMABLE_MAX_STALLS {
+                    return Err(FaucetError::Sink(format!(
+                        "resumable upload made no progress past byte {pos} after \
+                         {RESUMABLE_MAX_STALLS} retries"
+                    )));
+                }
+            } else {
+                stalls = 0;
+            }
+            pos = persisted;
+        }
     }
 
     /// Finish the gzip stream, returning the final bytes (remaining buffered
@@ -1486,17 +1558,8 @@ impl BigQuerySink {
             }
             let remaining = sess.finish()?;
             let total = sess.offset + remaining.len() as u64;
-            let range = if remaining.is_empty() {
-                format!("bytes */{total}")
-            } else {
-                format!("bytes {}-{}/{}", sess.offset, total - 1, total)
-            };
             let resp = sess
-                .http
-                .put(&sess.session_uri)
-                .header(reqwest::header::CONTENT_RANGE, range)
-                .body(remaining)
-                .send()
+                .put_range(sess.offset, &remaining, Some(total))
                 .await
                 .map_err(|e| FaucetError::Sink(format!("resumable finalize PUT failed: {e}")))?;
             let status = resp.status();
@@ -2886,6 +2949,19 @@ impl faucet_core::Sink for BigQuerySink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persisted_bytes_reads_the_308_range_header() {
+        assert_eq!(super::persisted_bytes(None).unwrap(), 0);
+        assert_eq!(
+            super::persisted_bytes(Some("bytes=0-262143")).unwrap(),
+            262_144
+        );
+        assert_eq!(super::persisted_bytes(Some(" bytes=0-0 ")).unwrap(), 1);
+        for bad in ["bytes=5-9", "bytes=0-x", "0-9"] {
+            assert!(super::persisted_bytes(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn adc_file_location_and_authorized_user_detection() {
         assert_eq!(
