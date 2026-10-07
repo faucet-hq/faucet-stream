@@ -46,8 +46,10 @@ pub async fn build_client(conn: &PubsubConnection) -> Result<Client, FaucetError
     // Pub/Sub client in the process (a `faucet serve` or matrix run) to the
     // emulator, and wrote the environment from a multi-threaded runtime
     // (#789 MSG-38). The SDK still honours the variable when it is set.
-    let mut config = ClientConfig::default();
-    config.connection_option = connection_options();
+    let mut config = ClientConfig {
+        connection_option: connection_options(),
+        ..Default::default()
+    };
     if let Some(host) = conn.explicit_emulator_host() {
         config.environment = Environment::Emulator(host);
         if config.project_id.is_none() {
