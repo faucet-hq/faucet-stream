@@ -122,6 +122,15 @@ impl WasmEngine {
                             &self.module_label,
                             start.elapsed().as_secs_f64(),
                         );
+                        if let Err(e) = self.instance_for(&module) {
+                            tracing::warn!(
+                                target: "faucet::transform::wasm",
+                                module = %self.module_label,
+                                error = %e,
+                                "wasm module changed but fails the ABI check; keeping previous module"
+                            );
+                            return;
+                        }
                         self.module = module;
                         self.mtime = cur;
                         tracing::info!(
@@ -155,6 +164,10 @@ impl WasmEngine {
 
     /// Create a fresh store + instance for one page.
     pub(crate) fn new_page_instance(&self) -> Result<WasmInstance, FaucetError> {
+        self.instance_for(&self.module)
+    }
+
+    fn instance_for(&self, module: &Module) -> Result<WasmInstance, FaucetError> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.memory_bytes)
             .memories(1)
@@ -179,15 +192,12 @@ impl WasmEngine {
         store.set_fuel(self.fuel_limit).map_err(|e| {
             FaucetError::Config(format!("wasm transform: could not enable fuel: {e}"))
         })?;
-        let instance = self
-            .linker
-            .instantiate(&mut store, &self.module)
-            .map_err(|e| {
-                FaucetError::Transform(format!(
-                    "wasm transform: instantiation failed for '{}': {e}",
-                    self.module_label
-                ))
-            })?;
+        let instance = self.linker.instantiate(&mut store, module).map_err(|e| {
+            FaucetError::Transform(format!(
+                "wasm transform: instantiation failed for '{}': {e}",
+                self.module_label
+            ))
+        })?;
         WasmInstance::new(store, instance, &self.function, self.fuel_limit)
     }
 }
