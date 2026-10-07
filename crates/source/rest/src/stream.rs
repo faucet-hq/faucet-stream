@@ -774,24 +774,16 @@ impl RestStream {
         if self.config.partitions.is_empty() {
             self.fetch_partition(None, None).await
         } else if let Some(concurrency) = self.config.partition_concurrency {
-            // Process partitions concurrently using a semaphore to limit parallelism.
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
-            let mut handles = Vec::with_capacity(self.config.partitions.len());
-
-            for ctx in &self.config.partitions {
-                let permit =
-                    semaphore.clone().acquire_owned().await.map_err(|e| {
-                        FaucetError::Config(format!("semaphore acquire failed: {e}"))
-                    })?;
-                let fut = self.fetch_partition(Some(ctx), None);
-                handles.push(async move {
-                    let result = fut.await;
-                    drop(permit);
-                    result
-                });
-            }
-
-            let results = futures::future::try_join_all(handles).await?;
+            // Bounded, order-preserving concurrency: each partition future
+            // starts only when a slot frees, so more `requests:` than permits
+            // can never deadlock (API-39).
+            use futures::{StreamExt, TryStreamExt};
+            let partitions = &self.config.partitions;
+            let results: Vec<Vec<Value>> = futures::stream::iter(0..partitions.len())
+                .map(|i| self.fetch_partition(Some(&partitions[i]), None))
+                .buffered(concurrency.max(1))
+                .try_collect()
+                .await?;
             Ok(results.into_iter().flatten().collect())
         } else {
             let mut all_records = Vec::new();

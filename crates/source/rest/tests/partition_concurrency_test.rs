@@ -128,3 +128,33 @@ async fn a_concurrency_of_one_stays_sequential() {
     assert_eq!(records, 8);
     assert_eq!(peak, 1, "explicit 1 means one at a time, got {peak}");
 }
+
+/// API-39: `fetch_all` with more `requests:` than `request_concurrency` used
+/// to hold every permit inside lazy futures and wait forever on the next one.
+#[tokio::test]
+async fn fetch_all_with_more_requests_than_permits_completes() {
+    let server = MockServer::start().await;
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/p/\d+$"))
+        .respond_with(CountingResponder {
+            in_flight: Arc::clone(&in_flight),
+            peak: Arc::clone(&peak),
+        })
+        .mount(&server)
+        .await;
+    let mut cfg = RestStreamConfig::new(&server.uri(), "/p/{n}");
+    cfg.pagination = PaginationStyle::None;
+    cfg.partition_concurrency = Some(2);
+    cfg.partitions = (0..6)
+        .map(|n| HashMap::from([("n".to_string(), json!(n))]))
+        .collect();
+    let stream = RestStream::new(cfg).unwrap();
+    let records = tokio::time::timeout(std::time::Duration::from_secs(20), stream.fetch_all())
+        .await
+        .expect("fetch_all must not deadlock")
+        .unwrap();
+    assert_eq!(records.len(), 6);
+    assert!(peak.load(Ordering::SeqCst) <= 2);
+}
