@@ -42,9 +42,10 @@ pub struct CountProbe {
     /// Connector-specific config (e.g. a `SELECT count(*) AS n …` query).
     #[serde(default)]
     pub config: Value,
-    /// Field in the probe's first record holding the count. When omitted, the
-    /// first numeric field of the first record is used (so a bare
-    /// `SELECT count(*)` works whatever the column is named).
+    /// Field in the probe's first record holding the count. May be omitted
+    /// when that record has exactly one numeric field (so a bare
+    /// `SELECT count(*)` works whatever the column is named); required when it
+    /// has more than one.
     #[serde(default)]
     pub count_field: Option<String>,
 }
@@ -89,14 +90,31 @@ pub fn extract_count(records: &[Value], field: Option<&str>) -> Result<u64, Stri
             })?;
             as_u64(v).ok_or_else(|| format!("reconcile: count_field '{f}' is not a number: {v}"))
         }
-        None => first
-            .as_object()
-            .and_then(|m| m.values().find_map(as_u64))
+        None => match first.as_object() {
+            Some(m) => {
+                let numeric: Vec<(&String, u64)> = m
+                    .iter()
+                    .filter_map(|(k, v)| as_u64(v).map(|n| (k, n)))
+                    .collect();
+                match numeric.as_slice() {
+                    [(_, n)] => Ok(*n),
+                    [] => Err("reconcile: the count probe's first row has no numeric field".into()),
+                    many => {
+                        let mut names: Vec<&str> = many.iter().map(|(k, _)| k.as_str()).collect();
+                        names.sort_unstable();
+                        Err(format!(
+                            "reconcile: the count probe's first row has several numeric fields \
+                             ({}) — set `count.count_field` to the one holding the count",
+                            names.join(", ")
+                        ))
+                    }
+                }
+            }
             // A bare scalar probe row (not an object) is also accepted.
-            .or_else(|| as_u64(first))
-            .ok_or_else(|| {
+            None => as_u64(first).ok_or_else(|| {
                 "reconcile: the count probe's first row has no numeric field".to_string()
             }),
+        },
     }
 }
 
@@ -153,6 +171,15 @@ mod tests {
     fn extract_first_numeric_when_no_field() {
         let recs = vec![json!({"label": "orders", "count": 7})];
         assert_eq!(extract_count(&recs, None).unwrap(), 7);
+    }
+
+    #[test]
+    fn several_numeric_fields_need_a_count_field() {
+        let recs = vec![json!({"total": 7, "max_id": 99})];
+        let err = extract_count(&recs, None).unwrap_err();
+        assert!(err.contains("max_id, total") && err.contains("count_field"), "{err}");
+        assert_eq!(extract_count(&recs, Some("total")).unwrap(), 7);
+        assert_eq!(extract_count(&[json!(12)], None).unwrap(), 12);
     }
 
     #[test]

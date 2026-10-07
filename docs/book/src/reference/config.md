@@ -437,7 +437,8 @@ Semantics:
   per-invocation without multiplying the matrix.
 - Each dimension is folded into the row's `depends_on`, so readiness, the skip
   cascade, and cycle detection reuse the ordering machinery. Per-tuple state
-  keys (`{name}::{row}::alias=value&…`) let every cell resume independently.
+  keys (`{name}::{row}::alias:value/…`; a value outside `[A-Za-z0-9_.-]` or longer
+  than 64 characters is replaced by a readable prefix plus a hash) let every cell resume independently.
 - Guards (all at load time via `faucet validate`): `for_each` must name
   `fan_out:` rows; a `fan_out:` row can't carry a sink or `parent:`;
   `for_each` can't combine with `parent:` (v1). The product is
@@ -1201,7 +1202,7 @@ reconcile:
     config:
       connection_url: ${secret:PG_URL}
       query: "SELECT count(*) AS n FROM orders WHERE updated_at >= '${now.date}'"
-    count_field: n             # optional; defaults to the first numeric field
+    count_field: n             # required when the probe row has more than one numeric field
   tolerance_pct: 0.0           # allow this % shortfall before failing (default 0)
 ```
 
@@ -1209,7 +1210,10 @@ The count probe is any faucet source (a SQL `count(*)`, an OData `$count`
 endpoint via `rest`, …); its first returned record supplies the count. The run
 fails when `rows_written < authoritative × (1 − tolerance_pct/100)`. Compares
 rows **written** to the destination, so it is most meaningful for straight
-loads / full-refreshes. Schema: `faucet schema` (the `reconcile` block).
+loads / full-refreshes. The count describes one dataset, so `reconcile:` is
+refused on a config with more than one root row or a partitioned row (each
+invocation would be compared with the whole dataset's count). Schema: `faucet
+schema` (the `reconcile` block).
 
 ## `verify`
 
