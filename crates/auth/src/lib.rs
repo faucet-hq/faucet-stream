@@ -53,7 +53,7 @@ pub(crate) fn auth_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-pub use flow::FlowProvider;
+pub use flow::{FLOW_SESSION_KEY, FlowProvider};
 #[cfg(feature = "google-sa")]
 pub use google_sa::{GoogleServiceAccountProvider, JWT_BEARER_GRANT};
 #[cfg(feature = "oauth1")]

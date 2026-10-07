@@ -613,7 +613,15 @@ pub struct FlowProvider {
     http: reqwest::Client,
     config: FlowConfig,
     state: Mutex<Option<Session>>,
+    /// Logins so far; each session's number is exposed as [`FLOW_SESSION_KEY`].
+    logins: std::sync::atomic::AtomicU64,
 }
+
+/// Captured-context key holding the current session's number. A connector
+/// that consumes [`request_auth`](AuthProvider::request_auth) passes
+/// `Credential::Token(<that value>)` to `invalidate`, so concurrent 401s
+/// against one session cause one re-login, not one each.
+pub const FLOW_SESSION_KEY: &str = "__session__";
 
 impl std::fmt::Debug for FlowProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -634,6 +642,7 @@ impl FlowProvider {
             http: auth_http_client(),
             config,
             state: Mutex::new(None),
+            logins: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -778,7 +787,12 @@ impl FlowProvider {
         {
             return Ok(s.ctx.clone());
         }
-        let ctx = self.run_login().await?;
+        let mut ctx = self.run_login().await?;
+        let session = self
+            .logins
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        ctx.insert(FLOW_SESSION_KEY.to_owned(), session.to_string());
         let expires_at = self
             .config
             .ttl_secs
@@ -821,9 +835,21 @@ impl AuthProvider for FlowProvider {
         ))
     }
 
-    async fn invalidate(&self, _stale: &Credential) -> Result<Credential, FaucetError> {
-        // Force a re-login on the next ensure_ctx.
-        *self.state.lock().await = None;
+    async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
+        {
+            let mut state = self.state.lock().await;
+            // A caller naming an older session than the live one hit a 401
+            // another caller already re-logged for: keep the new session.
+            let superseded = match (state.as_ref(), stale) {
+                (Some(s), Credential::Token(sent)) => {
+                    s.valid() && s.ctx.get(FLOW_SESSION_KEY).is_some_and(|cur| cur != sent)
+                }
+                _ => false,
+            };
+            if !superseded {
+                *state = None;
+            }
+        }
         self.credential().await
     }
 
@@ -1184,6 +1210,37 @@ mod tests {
         // Within the TTL window the session is reused (Session::valid == true).
         let _ = p.credential().await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_invalidations_of_one_session_log_in_once() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(CountingLogin(hits.clone()))
+            .mount(&server)
+            .await;
+        let cfg = json!({
+            "steps": [ { "request": { "method": "POST", "url": format!("{}/login", server.uri()) },
+                         "capture": { "sid": "$.sid" } } ],
+            "apply": [ { "into": "header", "name": "X", "value": "${sid}" } ]
+        });
+        let p = FlowProvider::from_config(&cfg).unwrap();
+        let ra = p.request_auth("GET", "http://x", &Default::default()).await.unwrap();
+        let sent = Credential::Token(ra.captured[FLOW_SESSION_KEY].clone());
+        assert_eq!(ra.captured[FLOW_SESSION_KEY], "1");
+        // Two workers saw a 401 on session 1: one re-login between them.
+        p.invalidate(&sent).await.unwrap();
+        p.invalidate(&sent).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // A 401 on the live session (or an unknown credential) re-logs again.
+        let ra = p.request_auth("GET", "http://x", &Default::default()).await.unwrap();
+        assert_eq!(ra.captured[FLOW_SESSION_KEY], "2");
+        p.invalidate(&Credential::Token("2".into())).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        p.invalidate(&Credential::Bearer("whatever".into())).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

@@ -14,6 +14,9 @@ use faucet_core::replication::{
 };
 use faucet_core::schema;
 use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, SharedAuthProvider};
+
+/// faucet-auth's `FLOW_SESSION_KEY`: the captured key naming a flow session.
+const FLOW_SESSION_KEY: &str = "__session__";
 use futures_core::Stream;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -1625,6 +1628,7 @@ impl RestStream {
         body_params: &[(String, Value)],
         window_binds: &[ResolvedBind],
     ) -> Result<(Value, HeaderMap), FaucetError> {
+        let mut sent: Option<Credential> = None;
         match self
             .execute_request_once(
                 params,
@@ -1633,6 +1637,7 @@ impl RestStream {
                 is_first_page,
                 body_params,
                 window_binds,
+                &mut sent,
             )
             .await
         {
@@ -1649,6 +1654,7 @@ impl RestStream {
                     is_first_page,
                     body_params,
                     window_binds,
+                    &mut None,
                 )
                 .await
             }
@@ -1662,7 +1668,8 @@ impl RestStream {
                         "the server rejected the shared credential; \
                          re-authenticating and retrying once"
                     );
-                    let _ = provider.invalidate(&Credential::Token(String::new())).await;
+                    let stale = sent.take().unwrap_or(Credential::Token(String::new()));
+                    let _ = provider.invalidate(&stale).await;
                 }
                 self.execute_request_once(
                     params,
@@ -1671,6 +1678,7 @@ impl RestStream {
                     is_first_page,
                     body_params,
                     window_binds,
+                    &mut None,
                 )
                 .await
             }
@@ -2295,6 +2303,7 @@ impl RestStream {
     ///   are **not** appended (Link header pagination encodes them in the URL).
     /// - When `path_context` is `Some`, `{key}` placeholders in `config.path`
     ///   are substituted with values from the context map (partition support).
+    #[allow(clippy::too_many_arguments)]
     async fn execute_request_once(
         &self,
         params: &HashMap<String, String>,
@@ -2303,6 +2312,7 @@ impl RestStream {
         is_first_page: bool,
         body_params: &[(String, Value)],
         window_binds: &[ResolvedBind],
+        sent: &mut Option<Credential>,
     ) -> Result<(Value, HeaderMap), FaucetError> {
         let use_override = url_override.is_some();
 
@@ -2336,6 +2346,13 @@ impl RestStream {
                 .await?;
             if !ra.is_empty() {
                 used_request_auth = true;
+                // What a flow provider's `invalidate` compares against (#789 API-21).
+                *sent = Some(Credential::Token(
+                    ra.captured
+                        .get(FLOW_SESSION_KEY)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
                 if let Some(b) = ra.base_url {
                     base_url = b;
                 }
@@ -2414,6 +2431,7 @@ impl RestStream {
                 Some(cred) => cred,
                 None => provider.credential().await?,
             };
+            *sent = Some(cred.clone());
             Some(credential_to_auth(cred))
         } else {
             match &self.config.auth {
