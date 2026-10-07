@@ -17,10 +17,12 @@ pub async fn decode(
         .map_err(|e| FaucetError::Source(format!("json-schema decode: {e}")))?;
     if validate {
         let registered = client.get_schema(schema_id).await?;
-        let schema_value: Value = serde_json::from_str(&registered.schema)
-            .map_err(|e| FaucetError::Source(format!("json-schema parse: {e}")))?;
-        let validator = jsonschema::validator_for(&schema_value)
-            .map_err(|e| FaucetError::Source(format!("json-schema compile: {e}")))?;
+        let validator = client.parsed("json-schema", &registered.schema, |text| {
+            let schema_value: Value = serde_json::from_str(text)
+                .map_err(|e| FaucetError::Source(format!("json-schema parse: {e}")))?;
+            jsonschema::validator_for(&schema_value)
+                .map_err(|e| FaucetError::Source(format!("json-schema compile: {e}")))
+        })?;
         let messages: Vec<String> = validator
             .iter_errors(&json)
             .map(|e| e.to_string())

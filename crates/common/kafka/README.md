@@ -55,14 +55,26 @@ project-wide auth convention (not a flat shape).
 | `sasl_plain` | `username`, `password` | `SASL_PLAINTEXT` + `sasl.mechanism = PLAIN`; both fields must be non-empty |
 | `sasl_scram` | `mechanism` (`sha256`/`sha512`), `username`, `password` | `SASL_PLAINTEXT` + `SCRAM-SHA-256`/`SCRAM-SHA-512` |
 | `ssl` | `ca_path`, `cert_path`, `key_path`, `key_password?` | `SSL`; all three paths validated to exist at config time |
-| `sasl_ssl` | `sasl` (a `sasl_plain`/`sasl_scram`), `ssl` (an `ssl`) | applies `ssl` then `sasl`, then forces `security.protocol = SASL_SSL` |
+| `tls` | `ca_path?` | `SSL` with server authentication only (no client certificate); the system trust store unless `ca_path` is set |
+| `sasl_ssl` | `sasl` (a `sasl_plain`/`sasl_scram`), `ssl` (a `tls`, `ssl` or `none`) | applies `ssl` then `sasl`, then forces `security.protocol = SASL_SSL` |
+
+`sasl_plain` and `sasl_scram` on their own send credentials over a plaintext
+connection. For a TLS listener without client certificates — the usual shape of
+a managed cluster — wrap them in `sasl_ssl` with a `tls` layer:
 
 ```yaml
 auth:
-  type: sasl_scram
-  mechanism: sha512
-  username: my-user
-  password: my-secret
+  type: sasl_ssl
+  config:
+    sasl:
+      type: sasl_scram
+      config:
+        mechanism: sha512
+        username: my-user
+        password: my-secret
+    ssl:
+      type: tls
+      config: {}          # or { ca_path: /etc/kafka/ca.pem }
 ```
 
 ### `KafkaValueFormat` formats
@@ -75,8 +87,8 @@ require the `schema-registry` feature.
 | `json` (default) | — | Parse bytes as a JSON document |
 | `raw_string` | — | UTF-8 string → `value` field |
 | `bytes` | — | Raw bytes passed through as a base64 string |
-| `confluent_avro` | `schema-registry` | Confluent wire envelope; writer schema fetched by id and cached |
-| `confluent_protobuf` | `schema-registry` | Type present for symmetry; v1 returns `FaucetError::Config` (full descriptor support tracked in #44) |
+| `confluent_avro` | `schema-registry` | Confluent wire envelope; writer schema fetched by id and cached; logical types map like the Avro file format (`decimal` → exact string, `bytes`/`fixed` → hex, temporals → ISO 8601) |
+| `confluent_protobuf` | `schema-registry` | Confluent wire envelope + single-message `.proto` compiled in-process; every field is emitted (proto3 defaults included) under its `.proto` name |
 | `confluent_json_schema` | `schema-registry` | Confluent wire envelope; optional `validate: true` checks decoded JSON against the schema |
 
 ```yaml

@@ -158,8 +158,8 @@ Configured via `value_format` (and optionally `key_format`); all use a `type` di
 | `json` | Parse value bytes as a JSON document. **Default.** | base |
 | `raw_string` | Decode value bytes as a UTF-8 string into `value`. | base |
 | `bytes` | Pass bytes through as a **base64-encoded string** in `value`; no parsing. | base |
-| `confluent_avro` | Confluent wire-format Avro: `[0x00][schema_id 4B][Avro binary]`. | `schema-registry` |
-| `confluent_protobuf` | Confluent wire-format Protobuf. v1 returns an error — descriptor support tracked in [#44](https://github.com/faucet-hq/faucet-stream/issues/44). | `schema-registry` |
+| `confluent_avro` | Confluent wire-format Avro: `[0x00][schema_id 4B][Avro binary]`. Logical types map like the Avro file format: `decimal` → exact decimal string, `bytes`/`fixed` → hex, `date`/`time`/`timestamp` → ISO 8601 strings. | `schema-registry` |
+| `confluent_protobuf` | Confluent wire-format Protobuf (single-message schemas). Every field is emitted, proto3 defaults (`0`, `false`, `""`) included, under its `.proto` field name (`order_id`, not `orderId`); 64-bit integers follow the proto3 JSON mapping (strings). | `schema-registry` |
 | `confluent_json_schema` | Confluent wire-format JSON: `[0x00][schema_id 4B][JSON bytes]`; optional validation. | `schema-registry` |
 
 The three Confluent formats take a `schema_registry` block (URL, optional basic auth, cache capacity, request timeout) — see the [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka) README for the full `SchemaRegistryConfig`.
@@ -448,7 +448,7 @@ In the CLI / umbrella, enable the connector with `source-kafka`, and the registr
 | `Source` error / connection refused / timeout | Broker unreachable or wrong `brokers`. `faucet doctor` runs a non-consuming metadata probe to validate connectivity + auth without reading messages. |
 | SASL / SSL handshake failure | Wrong `auth` type or credentials, or a `key_path` / `cert_path` / `ca_path` that doesn't exist (paths are validated at config time). Confirm the broker's `security.protocol` matches. |
 | Messages fail to decode | The `value_format` doesn't match the wire data (e.g. `json` against Avro). Match the producer's format; use `on_decode_error: skip` to drop bad messages instead of aborting. |
-| `confluent_protobuf` returns an error | Protobuf decoding is not yet implemented (issue [#44](https://github.com/faucet-hq/faucet-stream/issues/44)). Use `confluent_avro` / `confluent_json_schema`, or decode raw `bytes` and parse downstream. |
+| `confluent_protobuf` fails with "only supports single-message schemas" | The record's `message_indexes` names a message other than the first in the `.proto`. Only single-message schemas are supported; use `bytes` and decode downstream. |
 | Confluent format rejected as unknown `type` | Build with the `schema-registry` feature (CLI: `kafka-schema-registry`). |
 | Throughput lower than expected | Partition the topic and run multiple instances with the same `group_id`, and/or tune `fetch.max.bytes` / `max.partition.fetch.bytes` via `extra_client_config`. |
 
