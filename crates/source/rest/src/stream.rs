@@ -434,11 +434,21 @@ fn inject_sql_predicate(query: &str, predicate: &str) -> String {
 fn sql_literal(v: &Value) -> String {
     match v {
         Value::String(s) if is_sql_datetime(s) => s.clone(),
+        Value::String(s) if let Some(t) = offset_datetime_as_rfc3339(s) => t,
         Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         other => format!("'{}'", other.to_string().replace('\'', "\\'")),
     }
+}
+
+/// A timestamp with a colon-less UTC offset (`2026-08-28T12:00:00.000+0000`,
+/// the shape many record payloads carry) rendered as RFC 3339, so a bookmark a
+/// sync-routed run persisted is emitted as a datetime literal (API-57).
+fn offset_datetime_as_rfc3339(s: &str) -> Option<String> {
+    chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z")
+        .ok()
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
 }
 
 /// Whether a string is a datetime/date literal (RFC3339 or `YYYY-MM-DD`).
@@ -4437,6 +4447,15 @@ mod tests {
         // Number → bare.
         assert_eq!(sql_literal(&json!(42)), "42");
         assert!(is_sql_datetime("2026-08-28T00:00:00+05:30"));
+        // API-57: a colon-less offset is normalised, not quoted.
+        assert_eq!(
+            sql_literal(&json!("2026-08-28T12:00:00.000+0000")),
+            "2026-08-28T12:00:00Z"
+        );
+        assert_eq!(
+            sql_literal(&json!("2026-08-28T12:00:00.250+0530")),
+            "2026-08-28T12:00:00.250+05:30"
+        );
         assert!(!is_sql_datetime("not-a-date"));
     }
 
