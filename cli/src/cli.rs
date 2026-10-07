@@ -1240,9 +1240,14 @@ pub struct DlqInspectArgs {
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
-    /// with the `encryption` feature.
-    #[arg(long = "encryption-key")]
+    /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
+    /// `--encryption-key-file`: an argv value is visible in `ps` and history.
+    #[arg(long = "encryption-key", env = "FAUCET_DLQ_ENCRYPTION_KEY", hide_env_values = true)]
     pub encryption_key: Vec<String>,
+    /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
+    /// after any `--encryption-key`.
+    #[arg(long = "encryption-key-file")]
+    pub encryption_key_file: Vec<std::path::PathBuf>,
     /// Emit a machine-readable JSON summary instead of the human report.
     #[arg(long)]
     pub json: bool,
@@ -1273,9 +1278,14 @@ pub struct DlqReplayArgs {
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
-    /// with the `encryption` feature.
-    #[arg(long = "encryption-key")]
+    /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
+    /// `--encryption-key-file`: an argv value is visible in `ps` and history.
+    #[arg(long = "encryption-key", env = "FAUCET_DLQ_ENCRYPTION_KEY", hide_env_values = true)]
     pub encryption_key: Vec<String>,
+    /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
+    /// after any `--encryption-key`.
+    #[arg(long = "encryption-key-file")]
+    pub encryption_key_file: Vec<std::path::PathBuf>,
     /// (Replay picks up the config's own dlq `encryption` block automatically
     /// when no key is passed.)
     /// Emit a machine-readable JSON result instead of the human summary.
@@ -1627,9 +1637,14 @@ pub struct DlqDiscardArgs {
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
-    /// with the `encryption` feature.
-    #[arg(long = "encryption-key")]
+    /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
+    /// `--encryption-key-file`: an argv value is visible in `ps` and history.
+    #[arg(long = "encryption-key", env = "FAUCET_DLQ_ENCRYPTION_KEY", hide_env_values = true)]
     pub encryption_key: Vec<String>,
+    /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
+    /// after any `--encryption-key`.
+    #[arg(long = "encryption-key-file")]
+    pub encryption_key_file: Vec<std::path::PathBuf>,
     /// Emit a machine-readable JSON result instead of the human summary.
     #[arg(long)]
     pub json: bool,

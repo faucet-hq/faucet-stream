@@ -277,6 +277,10 @@ The `faucet dlq` verbs handle sealed files transparently:
   `--encryption-key` overrides.
 - `discard` keeps and archives lines **verbatim** (still sealed) — filtering
   decrypts only in memory; nothing is ever re-written in plaintext.
+- Rows that fail again during a `replay` land in the fresh failure DLQ sealed
+  with the same keys.
+- Supply keys without putting them on the command line with
+  `FAUCET_DLQ_ENCRYPTION_KEY` or `--encryption-key-file <path>`.
 
 The same `encryption` block also seals `file` state-store bookmarks — see
 [State & resumability](./state.md#encryption-at-rest-file-backend).

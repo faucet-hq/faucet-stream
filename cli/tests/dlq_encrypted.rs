@@ -292,3 +292,47 @@ async fn replay_seals_the_refailed_rows_like_the_source_dlq() {
         assert_eq!(seen.undecryptable, 0);
     }
 }
+
+/// The key can come from `FAUCET_DLQ_ENCRYPTION_KEY` or a key file instead of
+/// argv (CLI-152).
+#[tokio::test]
+async fn inspect_takes_the_key_from_the_environment_or_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dir.path().join("dlq.jsonl");
+    write_encrypted_dlq(&dlq, &[envelope("quality", json!({"id": 1}))]).await;
+    let key_file = dir.path().join("dlq.key");
+    std::fs::write(&key_file, format!("{KEY}\n")).unwrap();
+    let count = |out: std::process::Output| -> u64 {
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["total_envelopes"].as_u64().unwrap()
+    };
+    let faucet = || {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_faucet"));
+        c.env_remove("FAUCET_DLQ_ENCRYPTION_KEY")
+            .args(["dlq", "inspect", dlq.to_str().unwrap(), "--json"]);
+        c
+    };
+    assert_eq!(count(faucet().output().unwrap()), 0);
+    assert_eq!(
+        count(faucet().env("FAUCET_DLQ_ENCRYPTION_KEY", KEY).output().unwrap()),
+        1
+    );
+    assert_eq!(
+        count(
+            faucet()
+                .arg("--encryption-key-file")
+                .arg(&key_file)
+                .output()
+                .unwrap()
+        ),
+        1
+    );
+    let out = faucet()
+        .arg("--encryption-key-file")
+        .arg(dir.path().join("missing.key"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--encryption-key-file"));
+}
