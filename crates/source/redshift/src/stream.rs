@@ -204,7 +204,8 @@ impl Source for RedshiftSource {
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let cap = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
-            let mut running_max: Option<Value> = None;
+            // Seeded with the start bookmark so it can never move backwards.
+            let mut running_max: Option<Value> = incr.as_ref().map(|ic| ic.start.clone());
             let mut total = 0usize;
 
             while let Some(row) = rows
@@ -212,7 +213,7 @@ impl Source for RedshiftSource {
                 .await
                 .map_err(|e| FaucetError::Source(format!("redshift query failed: {e}")))?
             {
-                let obj = row_to_json(&row);
+                let obj = row_to_json(&row)?;
                 // Track the running max BEFORE the client-side filter so the
                 // persisted bookmark reflects the full scan.
                 if let Some(ic) = &incr

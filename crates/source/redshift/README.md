@@ -32,7 +32,17 @@ greater than the stored bookmark (or `initial_value` on the first run) are
 emitted. If the query contains the literal `${bookmark}` token it is replaced
 with a positional bind so Redshift filters server-side; the source also filters
 client-side as a correctness backstop. The new maximum of `column` is persisted
-on the final page.
+on the final page; it starts from the stored bookmark, so it never moves
+backwards even when the row that held the old maximum is gone.
+
+## Type decoding
+
+Integers, floats, booleans, JSON and text map to JSON natively; `NUMERIC` is an
+exact decimal string, timestamps/dates/times are ISO strings, `TIMETZ` keeps its
+offset, `INTERVAL` is an ISO 8601 duration (`P1Y2DT3H1.5S`) and `VARBYTE` is
+base64. Any other type (`SUPER`, `GEOMETRY`, …) is emitted as its text form. A
+non-NULL value the source cannot decode fails the read naming the column — cast
+it in the query (`col::varchar`) — rather than becoming `null`.
 
 ```yaml
 host: my-cluster.abc123.us-east-1.redshift.amazonaws.com
@@ -51,8 +61,8 @@ replication:
 
 ## Testing
 
-Redshift has no local container image, so live round-trip tests live in
-`tests/integration.rs` and are `#[ignore]`d — they run only when `REDSHIFT_*`
-environment variables point at a real cluster.
+Redshift has no local container image, but it speaks the PostgreSQL wire
+protocol, so `tests/integration.rs` runs the read path against a Postgres
+container (Docker required).
 
 License: MIT OR Apache-2.0
