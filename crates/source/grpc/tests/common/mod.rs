@@ -141,10 +141,37 @@ impl Drop for ServerHandle {
 /// Start an EchoService server bound to an OS-assigned port. Returns a
 /// handle whose `endpoint` field is the `http://127.0.0.1:PORT` URL the
 /// `GrpcStream` should connect to.
+#[allow(dead_code)]
 pub async fn start_server() -> ServerHandle {
+    start(None).await
+}
+
+/// The test CA and server identity under `tests/fixtures/tls` (`localhost`
+/// / `127.0.0.1`, signed by `ca.pem`).
+#[allow(dead_code)]
+pub fn tls_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls").join(name)
+}
+
+/// [`start_server`] serving TLS with the fixture identity; the endpoint is
+/// `https://localhost:PORT`.
+#[allow(dead_code)]
+pub async fn start_tls_server() -> ServerHandle {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let identity = tonic::transport::Identity::from_pem(
+        std::fs::read(tls_fixture("server.pem")).unwrap(),
+        std::fs::read(tls_fixture("server.key")).unwrap(),
+    );
+    start(Some(tonic::transport::ServerTlsConfig::new().identity(identity))).await
+}
+
+async fn start(tls: Option<tonic::transport::ServerTlsConfig>) -> ServerHandle {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
-    let endpoint = format!("http://{addr}");
+    let endpoint = match tls {
+        Some(_) => format!("https://localhost:{}", addr.port()),
+        None => format!("http://{addr}"),
+    };
 
     let server = EchoServer::default();
     let tail_attempts = server.tail_attempts.clone();
@@ -152,8 +179,12 @@ pub async fn start_server() -> ServerHandle {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let mut builder = Server::builder();
+    if let Some(tls) = tls {
+        builder = builder.tls_config(tls).expect("server tls");
+    }
     let join = tokio::spawn(async move {
-        let _ = Server::builder()
+        let _ = builder
             .add_service(EchoServiceServer::new(server))
             .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown_rx.await;

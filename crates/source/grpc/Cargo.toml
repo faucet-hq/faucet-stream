@@ -17,8 +17,8 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-tokio.workspace = true
-tonic.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tonic = { workspace = true, features = ["tls-native-roots", "tls-webpki-roots"] }
 prost.workspace = true
 prost-reflect.workspace = true
 prost-types.workspace = true
@@ -30,11 +30,12 @@ base64.workspace = true
 faucet-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time", "sync"] }
 serde_json.workspace = true
-tonic = { workspace = true, features = ["transport", "server"] }
+tonic = { workspace = true, features = ["transport", "server", "tls-ring"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 futures = { workspace = true }
 prost.workspace = true
 tempfile = "3"
+rustls = { workspace = true, features = ["ring"] }
 
 [build-dependencies]
 tonic-build = "0.13"

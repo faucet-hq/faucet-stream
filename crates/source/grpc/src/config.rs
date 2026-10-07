@@ -71,7 +71,17 @@ pub struct GrpcStreamConfig {
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
     pub auth: AuthSpec<GrpcAuth>,
     /// Whether to use TLS (detected from `https://` in endpoint by default).
+    /// The server certificate is verified against the operating system's
+    /// trust store and the bundled Mozilla roots, plus [`ca_cert`](Self::ca_cert).
     pub tls: Option<bool>,
+    /// PEM file with an extra CA certificate to trust — for a server whose
+    /// certificate is signed by a private CA.
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
+    /// Host name to verify the server certificate against, when it differs
+    /// from the endpoint's host (connecting by IP or through a tunnel).
+    #[serde(default)]
+    pub domain_name: Option<String>,
     /// JSONPath to extract records from the response.
     /// If not set, the entire response is returned as a single record.
     pub records_path: Option<String>,
@@ -236,6 +246,8 @@ impl GrpcStreamConfig {
             descriptor_set_path: descriptor_set_path.into(),
             auth: AuthSpec::Inline(GrpcAuth::None),
             tls: None,
+            ca_cert: None,
+            domain_name: None,
             records_path: None,
             batch_size: DEFAULT_BATCH_SIZE,
             rpc_kind: RpcKind::Unary,
@@ -268,6 +280,19 @@ impl GrpcStreamConfig {
     /// Set the TLS mode explicitly.
     pub fn tls(mut self, tls: bool) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Trust the CA certificate in this PEM file (in addition to the system
+    /// and bundled roots).
+    pub fn ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_cert = Some(path.into());
+        self
+    }
+
+    /// Verify the server certificate against `name` instead of the endpoint's host.
+    pub fn domain_name(mut self, name: impl Into<String>) -> Self {
+        self.domain_name = Some(name.into());
         self
     }
 
