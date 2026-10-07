@@ -1684,6 +1684,15 @@ pub struct DoctorArgs {
     /// a labelled column may reach. Violations are reported and refuse a run.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<PathBuf>,
+    /// Supply a declared param: `--param tenant_id=acme`. Repeatable. With
+    /// `--offline` an unsupplied required param gets a placeholder.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub param: Vec<String>,
+    /// Override an environment variable for this check only:
+    /// `--param-env REGION=eu`, or bare `--param-env TOKEN` to take it from the
+    /// caller's environment. Repeatable.
+    #[arg(long = "param-env", value_name = "NAME[=VALUE]")]
+    pub param_env: Vec<String>,
 }
 
 /// `faucet contract` arguments.

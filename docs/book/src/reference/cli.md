@@ -42,7 +42,7 @@ JSON-RPC stream.
 | `faucet serve` | Run a long-running HTTP control plane: submit / poll / cancel pipeline runs over REST. |
 | `faucet completions <shell>` | Print a shell tab-completion script (bash / zsh / fish / powershell / elvish). |
 | `faucet migrate [config]` | Upgrade a config written against an older grammar to the current shape (idempotent); `--state` upgrades the pipeline's stored bookmarks instead. |
-| `faucet doctor --offline [config]` | Static, credential-free config lints (no network) — dangling/unused auth, unused vars, no-op sink `batch_size`. |
+| `faucet doctor --offline [config]` | Static, credential-free config lints (no network; secret-manager directives stay unresolved, an unsupplied required param gets a placeholder) — dangling/unused auth, unused vars, no-op sink `batch_size`. `faucet doctor` takes `--param NAME=VALUE` / `--param-env NAME[=VALUE]` like `run`. |
 | `faucet fmt [config] [--check]` | Canonicalize a config (stable key order); `--check` is a CI gate. |
 | `faucet explain [config]` | Plain-English narration of what a pipeline does (offline, zero I/O). |
 | `faucet history [config]` | Terminal view of the run history in a config's `catalog:` store. |
