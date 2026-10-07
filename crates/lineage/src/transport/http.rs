@@ -46,11 +46,33 @@ impl Transport for HttpTransport {
             return Err(FaucetError::HttpStatus {
                 status: status.as_u16(),
                 url: faucet_core::util::redact_uri_credentials(&self.url),
-                body: resp.text().await.unwrap_or_default(),
+                body: read_capped(resp, MAX_ERROR_BODY_BYTES).await,
             });
         }
         Ok(())
     }
+}
+
+/// Longest error-response body kept for the error message.
+pub const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        let room = max - buf.len();
+        if chunk.len() > room {
+            buf.extend_from_slice(&chunk[..room]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        text.push_str("…[truncated]");
+    }
+    text
 }
 
 #[cfg(test)]
@@ -59,6 +81,23 @@ mod tests {
     use crate::config::HttpAuth;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn a_huge_error_body_is_truncated() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("x".repeat(1024 * 1024)))
+            .mount(&server)
+            .await;
+        let t = HttpTransport::new(server.uri(), std::time::Duration::from_secs(5), None).unwrap();
+        let err = t.send(b"{}".to_vec()).await.unwrap_err();
+        let FaucetError::HttpStatus { status, body, .. } = err else {
+            panic!("unexpected error {err:?}");
+        };
+        assert_eq!(status, 500);
+        assert!(body.len() < MAX_ERROR_BODY_BYTES + 32, "{}", body.len());
+        assert!(body.ends_with("[truncated]"));
+    }
 
     #[tokio::test]
     async fn posts_event_with_bearer_auth() {

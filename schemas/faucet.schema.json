@@ -3843,6 +3843,7 @@
           "type": "string"
         },
         "run_id": {
+          "description": "The parent's run id. Without it no parent facet is emitted.",
           "type": [
             "string",
             "null"

@@ -49,10 +49,19 @@ pub fn derive(input_fields: &[String], ops: &[ColumnOp]) -> Option<ColumnLineage
         match op {
             ColumnOp::Identity => {}
             ColumnOp::Rename(pairs) => {
+                // Mirrors the runtime: every pair reads the pre-rename record.
+                let staged: Vec<(String, BTreeSet<String>)> = pairs
+                    .iter()
+                    .filter(|(from, to)| from != to)
+                    .filter_map(|(from, to)| cur.get(from).map(|s| (to.clone(), s.clone())))
+                    .collect();
                 for (from, to) in pairs {
-                    if let Some(sources) = cur.shift_remove(from) {
-                        cur.insert(to.clone(), sources);
+                    if from != to {
+                        cur.shift_remove(from);
                     }
+                }
+                for (to, sources) in staged {
+                    cur.insert(to, sources);
                 }
             }
             ColumnOp::Select(keep) => {
@@ -99,6 +108,31 @@ mod tests {
         let cl = derive(&inputs(), &ops).unwrap();
         assert_eq!(cl.edges.get("contact").unwrap(), &vec!["email".to_string()]);
         assert!(!cl.edges.contains_key("email"));
+    }
+
+    #[test]
+    fn interacting_renames_read_the_pre_rename_record() {
+        let ab = || vec!["a".to_string(), "b".to_string()];
+        let swap = [ColumnOp::Rename(vec![
+            ("a".into(), "b".into()),
+            ("b".into(), "a".into()),
+        ])];
+        let cl = derive(&ab(), &swap).unwrap();
+        assert_eq!(cl.edges.get("a").unwrap(), &vec!["b".to_string()]);
+        assert_eq!(cl.edges.get("b").unwrap(), &vec!["a".to_string()]);
+        assert_eq!(cl.edges.len(), 2);
+
+        let chain = [ColumnOp::Rename(vec![
+            ("a".into(), "b".into()),
+            ("b".into(), "c".into()),
+        ])];
+        let cl = derive(&ab(), &chain).unwrap();
+        assert_eq!(cl.edges.get("b").unwrap(), &vec!["a".to_string()]);
+        assert_eq!(cl.edges.get("c").unwrap(), &vec!["b".to_string()]);
+        assert!(!cl.edges.contains_key("a"));
+
+        let noop = [ColumnOp::Rename(vec![("a".into(), "a".into())])];
+        assert_eq!(derive(&ab(), &noop).unwrap().edges.len(), 2);
     }
 
     #[test]

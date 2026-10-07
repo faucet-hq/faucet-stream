@@ -91,6 +91,10 @@ faucet-lineage emits standard OpenLineage `RunEvent`s. The pipeline's lifecycle 
 
 "Terminal facets" (schema + column-lineage) are attached only to the terminal events (`COMPLETE` / `ABORT` / `FAIL`), because they depend on the record sample observed during the run.
 
+Two facets are always present when they apply: `FAIL` and `ABORT` events carry the `errorMessage` run facet (the run's error, with resolved secrets redacted), and `RUNNING` / `COMPLETE` / `ABORT` / `FAIL` events carry the `outputStatistics` output facet with the records written so far (`rowCount`).
+
+A heartbeat started with `LineageEmitter::spawn_heartbeat` stops when its `HeartbeatGuard` is dropped, so a run whose future is dropped (timeout, cancellation, panic) stops emitting `RUNNING` events.
+
 ## Configuration reference
 
 The `lineage:` block deserializes into [`LineageConfig`]. Unknown top-level fields are rejected.
@@ -165,7 +169,7 @@ The nested `auth` uses the same `{ type, config }` shape as connector auth. Only
 |-------|------|---------|-------------|
 | `namespace` | string | — *(required)* | Orchestrator namespace (e.g. `airflow`). |
 | `name` | string | — *(required)* | Parent job name (e.g. `warehouse_dag.load_orders`). |
-| `run_id` | string | *(unset)* | Parent run id. When omitted, the pipeline's own run id is used as the parent run reference. |
+| `run_id` | string | *(unset)* | Parent run id. OpenLineage's parent facet requires it, so when it is omitted no parent facet is emitted (and the emitter warns once at start-up). |
 
 ```yaml
 parent_job:
