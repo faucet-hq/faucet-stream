@@ -1830,7 +1830,13 @@ pipeline:
         let overrides: BTreeMap<String, String> = [("A".to_string(), "v".to_string())].into();
         let err = check_env_overrides(&json!({"x": "plain"}), &overrides).unwrap_err();
         assert!(err.to_string().contains("(it reads: none)"), "{err}");
-        assert!(check_env_overrides(&json!({"x": ["${secret:A}"]}), &overrides).is_ok());
+        assert!(
+            check_env_overrides(
+                &json!({"x": ["${secret:A}", 1], "y": "${vars.z}"}),
+                &overrides
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

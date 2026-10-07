@@ -498,6 +498,59 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
         3
     );
 
+    // A named run keeps its name; a config the server cannot load is a tool
+    // error; a template run is a tracked run too.
+    let named_out = dir.path().join("named-out.jsonl");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {
+                "name": "run_pipeline",
+                "arguments": { "config": csv_config(&input, &named_out, "x"), "name": "mcp-named" }
+            }}),
+        )
+        .await;
+    let sub: Value =
+        serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let rec = api.wait_run(sub["run_id"].as_str().unwrap()).await;
+    assert_eq!(rec["name"], "mcp-named", "{rec}");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {
+                "name": "run_pipeline",
+                "arguments": { "config": "{ not yaml" }
+            }}),
+        )
+        .await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let tpl_out = dir.path().join("tpl-out.jsonl");
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({ "config": format!("kind: pipeline\n{}", csv_config(&input, &tpl_out, "tpl-mcp")),
+                    "id": "tpl-mcp", "launch": true }),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {
+                "name": "run_template", "arguments": { "id": "tpl-mcp" }
+            }}),
+        )
+        .await;
+    assert!(!r["result"]["isError"].as_bool().unwrap_or(false), "{r}");
+    let sub: Value =
+        serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let rec = api.wait_run(sub["run_id"].as_str().unwrap()).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+
     // A proposal whose config cannot be planned comes back as a tool error
     // carrying the server error's `code: message` rendering.
     let (_, bad) = api

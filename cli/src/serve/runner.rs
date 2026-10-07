@@ -2330,6 +2330,67 @@ mod tests {
         assert!(matches!(err, ServeError::Draining), "{err:?}");
     }
 
+    async fn wait_terminal(state: &ServerState, run_id: &str) -> RunRecord {
+        for _ in 0..200 {
+            if let Some(r) = state.history().get(run_id).await.unwrap()
+                && r.status.is_terminal()
+            {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("run {run_id} never finished");
+    }
+
+    #[tokio::test]
+    async fn an_inline_action_is_refused_while_every_run_slot_is_busy() {
+        let state = crate::serve::test_support::test_state();
+        let held = state.semaphore().acquire_many_owned(4).await.unwrap();
+        assert!(matches!(
+            inline_permit(&state),
+            Err(ServeError::TooManyRequests(_))
+        ));
+        drop(held);
+        assert!(inline_permit(&state).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_queued_run_is_failed_by_a_shutdown_before_it_starts() {
+        let state = crate::serve::test_support::test_state();
+        let _held = state.semaphore().acquire_many_owned(4).await.unwrap();
+        let req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": "version: 1\npipeline:\n  source: { type: csv, config: { path: x.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n"
+        }))
+        .unwrap();
+        let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        state.shutdown_token().cancel();
+        let rec = wait_terminal(&state, &resp.run_id).await;
+        assert_eq!(rec.status, RunStatus::Failed, "{rec:?}");
+    }
+
+    #[cfg(feature = "source-webhook")]
+    #[tokio::test]
+    async fn a_run_that_outlives_its_timeout_is_stopped_and_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": format!(
+                "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                dir.path().join("out.jsonl").display()
+            ),
+            "timeout_secs": 1,
+        }))
+        .unwrap();
+        let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
+        let rec = wait_terminal(&state, &resp.run_id).await;
+        assert_eq!(rec.status, RunStatus::Failed, "{rec:?}");
+        assert!(
+            rec.error.as_deref().unwrap_or_default().contains("1s"),
+            "{rec:?}"
+        );
+    }
+
     #[test]
     fn timeout_maps_to_failed_with_timeout_reason() {
         let (status, reason, _, _, error) = Terminal::timeout(30).into_parts();
@@ -2761,6 +2822,13 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         async fn sqlite_state(dir: &std::path::Path) -> ServerState {
+            sqlite_state_with(dir, crate::serve::cluster::ClusterConfig::disabled()).await
+        }
+
+        async fn sqlite_state_with(
+            dir: &std::path::Path,
+            cluster: crate::serve::cluster::ClusterConfig,
+        ) -> ServerState {
             let url = format!("sqlite://{}/h.db", dir.display());
             let history = Arc::new(
                 SqliteHistory::connect(
@@ -2796,7 +2864,7 @@ mod tests {
                 no_env_file: false,
                 log_level: "info".into(),
                 ui_enabled: true,
-                cluster: crate::serve::cluster::ClusterConfig::disabled(),
+                cluster,
                 triggers_path: None,
                 templates_sync_path: None,
                 policy_path: None,
@@ -3156,6 +3224,98 @@ mod tests {
             }
             assert_eq!(status, RunStatus::Completed, "shard ran → parent completed");
             assert!(output.exists(), "shard wrote its output");
+        }
+
+        #[cfg(feature = "source-webhook")]
+        fn waiting_yaml(dir: &std::path::Path) -> String {
+            format!(
+                "version: 1\npipeline:\n  \
+                 source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  \
+                 sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                dir.join("out.jsonl").display()
+            )
+        }
+
+        #[cfg(feature = "source-webhook")]
+        #[tokio::test]
+        async fn a_shard_stops_cleanly_on_a_remote_cancel_a_timeout_or_a_shutdown() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = sqlite_state(dir.path()).await;
+            let yaml = waiting_yaml(dir.path());
+            let run = |coop: CancellationToken, timeout: Option<u64>| {
+                let state = state.clone();
+                let yaml = yaml.clone();
+                async move {
+                    execute_shard(
+                        &state,
+                        loaded(&yaml).await,
+                        "r",
+                        "0",
+                        ShardSpec::whole(),
+                        coop,
+                        timeout,
+                        None,
+                        None,
+                        Utc::now(),
+                    )
+                    .await
+                }
+            };
+            let coop = CancellationToken::new();
+            let fire = coop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                fire.cancel();
+            });
+            assert_ne!(run(coop, None).await, ShardOutcome::Failed);
+            assert_eq!(
+                run(CancellationToken::new(), Some(1)).await,
+                ShardOutcome::Failed
+            );
+            let shutdown = state.shutdown_token();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                shutdown.cancel();
+            });
+            assert_eq!(
+                run(CancellationToken::new(), None).await,
+                ShardOutcome::Failed
+            );
+        }
+
+        #[cfg(feature = "source-webhook")]
+        #[tokio::test]
+        async fn a_clustered_shutdown_hands_a_claimed_run_back_as_pending() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cluster = crate::serve::cluster::ClusterConfig::disabled();
+            cluster.enabled = true;
+            let state = sqlite_state_with(dir.path(), cluster).await;
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Pending;
+            rec.config_body = Some(waiting_yaml(dir.path()));
+            state.history().upsert(&rec).await.unwrap();
+            let claimed = state.history().claim_pending(1).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            resume_claimed_run(state.clone(), claimed.into_iter().next().unwrap());
+            let mut status = RunStatus::Pending;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                status = state.history().get("r").await.unwrap().unwrap().status;
+                if status == RunStatus::Running {
+                    break;
+                }
+            }
+            assert_eq!(status, RunStatus::Running);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            state.shutdown_token().cancel();
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                status = state.history().get("r").await.unwrap().unwrap().status;
+                if status == RunStatus::Pending {
+                    break;
+                }
+            }
+            assert_eq!(status, RunStatus::Pending, "handed back to the cluster");
         }
 
         #[tokio::test]

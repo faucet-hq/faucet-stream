@@ -1609,6 +1609,16 @@ async fn an_old_database_is_migrated_and_a_newer_one_refused() {
             .execute(&mut conn)
             .await
             .unwrap();
+        for (id, body) in [("chg-a", r#"{"tenant":"acme"}"#), ("chg-b", "{}")] {
+            sqlx::query(
+                "INSERT INTO faucet_serve_changes VALUES (?,'run','pending','u','2026-10-01T00:00:00Z','2099-01-01T00:00:00Z',?)",
+            )
+            .bind(id)
+            .bind(body)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
         conn.close().await.unwrap();
     }
     let store = SqliteHistory::connect(
@@ -1634,6 +1644,23 @@ async fn an_old_database_is_migrated_and_a_newer_one_refused() {
     assert_eq!(rows.len(), 1, "the tenant column was backfilled");
     assert_eq!(store.usage_delete_tenant("acme").await.unwrap(), 1);
     drop(store);
+    {
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        let tenants: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, tenant FROM faucet_serve_changes ORDER BY id")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            tenants,
+            vec![
+                ("chg-a".into(), Some("acme".into())),
+                ("chg-b".into(), None)
+            ],
+            "change tenants were backfilled from each body"
+        );
+        conn.close().await.unwrap();
+    }
     // Connecting again is a no-op.
     let again = SqliteHistory::connect(
         &format!("sqlite:{}", path.display()),

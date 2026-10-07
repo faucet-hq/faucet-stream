@@ -1088,6 +1088,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revoked_grant_marks_reauth_when_the_stored_connection_cannot_be_reloaded() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let idp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("{\"error\":\"invalid_grant\"}"),
+            )
+            .mount(&idp)
+            .await;
+        let (state, v) = state_with_vault();
+        state
+            .history()
+            .tenant_upsert(&tenant("acme"))
+            .await
+            .unwrap();
+        let spec = serde_json::json!({"type": "oauth2_refresh", "config": {
+            "token_url": format!("{}/token", idp.uri()), "client_id": "c",
+            "client_secret": "s", "refresh_token": "rt"}});
+        let mut wrong_owner = conn(&v, "acme", "sealed-elsewhere", spec.clone());
+        wrong_owner.sealed = v.seal_for(&spec, &Vault::connection_context("other", "x"));
+        state
+            .history()
+            .connection_upsert(&wrong_owner)
+            .await
+            .unwrap();
+        let unbuildable = conn(
+            &v,
+            "acme",
+            "unbuildable",
+            serde_json::json!({"type": "nonsense", "config": {}}),
+        );
+        state
+            .history()
+            .connection_upsert(&unbuildable)
+            .await
+            .unwrap();
+        for name in ["missing", "sealed-elsewhere", "unbuildable"] {
+            let p = connection_provider(&state, "acme", name, &spec).unwrap();
+            assert!(p.credential().await.is_err(), "{name}");
+        }
+        let err = open_connection(&state.tenants(), &wrong_owner).unwrap_err();
+        assert!(format!("{err:?}").contains("sealed-elsewhere"), "{err:?}");
+    }
+
+    #[test]
+    fn sealed_notifications_open_only_with_the_vault_and_as_a_list() {
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let mut rec = tenant("acme");
+        rec.notifications = vec![serde_json::json!({"plain": true})];
+        let none = TenantsRuntime::new(None, Default::default());
+        assert_eq!(open_notifications(&none, &rec).unwrap(), rec.notifications);
+        rec.notifications_sealed = Some(v.seal_for(
+            &serde_json::json!({"not": "a list"}),
+            &notifications_context("acme"),
+        ));
+        assert!(
+            open_notifications(&none, &rec)
+                .unwrap_err()
+                .contains("no vault key")
+        );
+        let with = TenantsRuntime::new(Some(v), Default::default());
+        assert!(
+            open_notifications(&with, &rec)
+                .unwrap_err()
+                .contains("not a list")
+        );
+    }
+
+    #[tokio::test]
     async fn scope_refuses_missing_and_suspended_tenants_and_needs_a_vault() {
         let state = crate::serve::test_support::test_state();
         assert!(matches!(
