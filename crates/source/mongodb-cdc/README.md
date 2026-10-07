@@ -55,23 +55,24 @@ Connect with `?replicaSet=rs0` in the URI. Some additional requirements dependin
 ```yaml
 # pipeline.yaml
 version: 1
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://user:pass@localhost:27017/?replicaSet=rs0
-    scope:
-      type: collection
-      database: appdb
-      collection: orders
-    full_document: update_lookup
-    idle_timeout: 30
-sink:
-  type: file
-  config:
-    path: ./changes.jsonl
-state:
-  type: file
-  config: { path: ./state }
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://user:pass@localhost:27017/?replicaSet=rs0
+      scope:
+        type: collection
+        database: appdb
+        collection: orders
+      full_document: update_lookup
+      idle_timeout: 30
+  sink:
+    type: file
+    config:
+      path: ./changes.jsonl
+  state:
+    type: file
+    config: { path: ./state }
 ```
 
 ```bash
@@ -82,21 +83,20 @@ Every change to `appdb.orders` lands as one JSON line in `changes.jsonl`; the re
 
 ## Output record schema
 
-Every change event is one JSON object — a flat CDC envelope:
+Every change event is one JSON object — a flat CDC envelope. Document values are BSON rendered as **relaxed Extended JSON**, so an `ObjectId` is `{"$oid": "…"}`, a date `{"$date": "…"}`, a `Decimal128` `{"$numberDecimal": "…"}`:
 
 ```json
 {
   "op": "c",
   "ts_ms": 1779019200000,
   "namespace": { "db": "appdb", "coll": "orders" },
-  "document_key": { "_id": "6654a1b2c3d4e5f600000001" },
+  "document_key": { "_id": { "$oid": "6654a1b2c3d4e5f600000001" } },
   "before": null,
   "after": {
-    "_id": "6654a1b2c3d4e5f600000001",
+    "_id": { "$oid": "6654a1b2c3d4e5f600000001" },
     "status": "shipped",
     "total": 49.99
   },
-  "update_description": null,
   "resume_token": { "_data": "826654A1B20000000..." }
 }
 ```
@@ -106,12 +106,12 @@ Every change event is one JSON object — a flat CDC envelope:
 | Field | Type | Description |
 |-------|------|-------------|
 | `op` | string | Operation type: `c` (insert), `u` (update), `r` (replace), `d` (delete), `ddl` (drop / rename / dropDatabase / invalidate) |
-| `ts_ms` | number | Wall-clock time of the change in Unix-epoch milliseconds (from `clusterTime`) |
+| `ts_ms` | number \| null | The change's `clusterTime` in Unix-epoch milliseconds — **second precision** (the cluster time's seconds × 1000). `null` when the event carries no cluster time. |
 | `namespace` | object \| null | `{ "db": "…", "coll": "…" }`. `null` for cluster-scope events that carry no namespace (e.g. a cluster-level invalidate) |
 | `document_key` | object \| null | Document identity key (typically `{ "_id": … }`) |
 | `before` | object \| null | Pre-image of the document. Populated only when `full_document_before_change` is enabled and the collection has `changeStreamPreAndPostImages` turned on (MongoDB 6.0+). |
 | `after` | object \| null | Post-image of the document. Always populated on inserts and replaces. On updates it is populated only with `full_document: update_lookup`, or with `when_available` / `required` on a collection that has `changeStreamPreAndPostImages` enabled (MongoDB 6.0+); with the default `off` it is `null` on every update. `null` on deletes. |
-| `update_description` | object \| null | Present on `u` events: `{ "updated_fields": {…}, "removed_fields": ["…"], "truncated_arrays": [{…}] }`. `null` for all other op types. |
+| `update_description` | object | Only on `u` events (the key is absent otherwise): `{ "updated_fields": {…}, "removed_fields": ["…"] }`, plus `truncated_arrays` when the server reports any. |
 | `resume_token` | object | Opaque server-assigned token. The pipeline persists this as the page bookmark and passes it to `resumeAfter` on the next run. |
 
 ### Operation-type mapping
@@ -190,55 +190,57 @@ start_from: { type: timestamp, timestamp_secs: 1779019200 }  # a cluster time, i
 
 ```yaml
 version: 1
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://faucet:secret@mongo1:27017,mongo2:27017/?replicaSet=rs0&authSource=admin
-    scope:
-      type: collection
-      database: myapp
-      collection: events
-    operation_types: ["insert", "update", "replace", "delete"]
-    full_document: when_available
-    full_document_before_change: off
-    idle_timeout: 60
-    max_await_time_ms: 500
-    batch_size: 500
-sink:
-  type: bigquery
-  config:
-    project_id: my-gcp-project
-    dataset_id: cdc
-    table_id: events_stream
-    credentials:
-      type: service_account_file
-      config: { path: /secrets/bq-sa.json }
-state:
-  type: redis
-  config:
-    url: redis://localhost:6379
-    namespace: faucet-cdc
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://faucet:secret@mongo1:27017,mongo2:27017/?replicaSet=rs0&authSource=admin
+      scope:
+        type: collection
+        database: myapp
+        collection: events
+      operation_types: ["insert", "update", "replace", "delete"]
+      full_document: when_available
+      full_document_before_change: off
+      idle_timeout: 60
+      max_await_time_ms: 500
+      batch_size: 500
+  sink:
+    type: bigquery
+    config:
+      project_id: my-gcp-project
+      dataset_id: cdc
+      table_id: events_stream
+      credentials:
+        type: service_account_file
+        config: { path: /secrets/bq-sa.json }
+  state:
+    type: redis
+    config:
+      url: redis://localhost:6379
+      namespace: faucet-cdc
 ```
 
 ### Cluster-wide CDC with operation filtering, printed to stdout
 
 ```yaml
 version: 1
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://faucet:secret@mongos:27017/?tls=true
-    scope:
-      type: cluster
-    operation_types: ["insert", "delete"]
-    idle_timeout: 30
-sink:
-  type: stdout
-  config:
-    format: pretty
-state:
-  type: file
-  config: { path: ./state/mongodb-cdc }
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://faucet:secret@mongos:27017/?tls=true
+      scope:
+        type: cluster
+      operation_types: ["insert", "delete"]
+      idle_timeout: 30
+  sink:
+    type: stdout
+    config:
+      format: pretty
+  state:
+    type: file
+    config: { path: ./state/mongodb-cdc }
 ```
 
 ### Server-side projection via an aggregation pipeline
@@ -247,24 +249,25 @@ Strip large fields and redact a secret before events ever leave the server:
 
 ```yaml
 version: 1
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://localhost:27017/?replicaSet=rs0
-    scope:
-      type: collection
-      database: appdb
-      collection: users
-    full_document: update_lookup
-    aggregation_pipeline:
-      - { $unset: ["fullDocument.password_hash", "fullDocument.blob"] }
-state:
-  type: file
-  config: { path: ./state }
-sink:
-  type: file
-  config:
-    path: ./users-changes.jsonl
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://localhost:27017/?replicaSet=rs0
+      scope:
+        type: collection
+        database: appdb
+        collection: users
+      full_document: update_lookup
+      aggregation_pipeline:
+        - { $unset: ["fullDocument.password_hash", "fullDocument.blob"] }
+  state:
+    type: file
+    config: { path: ./state }
+  sink:
+    type: file
+    config:
+      path: ./users-changes.jsonl
 ```
 
 ## Streaming & batching
@@ -308,21 +311,22 @@ The CLI enforces a hard gate at config-load time (caught by `faucet validate` be
 ```yaml
 version: 1
 delivery: exactly_once
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://localhost:27017/?replicaSet=rs0
-    scope: { type: collection, database: appdb, collection: orders }
-    full_document: update_lookup
-sink:
-  type: postgres
-  config:
-    connection_url: postgres://user:pass@localhost/warehouse
-    table: orders_cdc
-state:
-  type: postgres
-  config:
-    connection_url: postgres://user:pass@localhost/warehouse
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://localhost:27017/?replicaSet=rs0
+      scope: { type: collection, database: appdb, collection: orders }
+      full_document: update_lookup
+  sink:
+    type: postgres
+    config:
+      connection_url: postgres://user:pass@localhost/warehouse
+      table: orders_cdc
+  state:
+    type: postgres
+    config:
+      connection_url: postgres://user:pass@localhost/warehouse
 ```
 
 > **Note:** a mirror built with the `cdc_unwrap` transform + `write_mode: upsert` needs an `after` image on every update, so set `full_document: update_lookup` (or `required` on a collection with `changeStreamPreAndPostImages` enabled). `faucet validate` refuses the pairing with the default `full_document: off`, and `cdc_unwrap` fails the run on an update it cannot turn into a row rather than dropping it. `update_lookup` re-reads the document at lookup time, not change time (see [Caveats](#caveats)). See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).

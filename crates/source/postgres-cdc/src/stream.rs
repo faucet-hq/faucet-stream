@@ -144,10 +144,11 @@ impl Source for PostgresCdcSource {
         Ok((all, bookmark))
     }
 
-    /// Per-transaction streaming.
+    /// Transaction-safe streaming.
     ///
-    /// Each committed transaction is emitted as its own
-    /// [`StreamPage`] with `bookmark = Some(commit_lsn)`. Because the
+    /// Committed transactions are coalesced into [`StreamPage`]s of up to
+    /// `batch_size` records (or `status_update_interval`), each with
+    /// `bookmark = Some(end_lsn)` of its last transaction. Because the
     /// pipeline flushes the sink and persists the bookmark on every page
     /// that carries one, a mid-stream crash recovers from the last fully-
     /// committed transaction with no partial-transaction leakage.
@@ -159,9 +160,8 @@ impl Source for PostgresCdcSource {
     ///
     /// **`batch_size = 0`** is the "no batching" sentinel: every committed
     /// transaction during the run window is accumulated into a single
-    /// trailing page with `bookmark = max(commit_lsn)`. This negates
-    /// per-transaction durability and is only useful for tests / initial
-    /// snapshot runs.
+    /// trailing page with the last transaction's `end_lsn`. Only useful for
+    /// tests / initial snapshot runs.
     ///
     /// The trait-level `batch_size` argument is intentionally ignored in
     /// favour of the config field (matches the convention used by the
@@ -449,11 +449,9 @@ impl PostgresCdcSource {
             send_status_update(&mut duplex, initial_confirmed, false).await?;
 
             // 4. Drain the replication stream until idle_timeout, ctrl_c, or
-            //    max_messages. Per-transaction mode (`batch_size > 0`) emits
-            //    one page per COMMIT carrying `bookmark = Some(commit_lsn)`.
-            //    Aggregated mode (`batch_size == 0`) accumulates every
-            //    transaction's records into one buffer and emits a single
-            //    trailing page with `bookmark = max(commit_lsn)`.
+            //    max_messages. With `batch_size > 0` committed transactions
+            //    are coalesced into pages carrying `bookmark = Some(end_lsn)`;
+            //    `batch_size == 0` emits a single trailing page.
             let mut registry = RelationRegistry::new();
             let mut state = TxnState {
                 max_staged_records: self.config.max_staged_records,
