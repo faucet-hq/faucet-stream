@@ -152,3 +152,56 @@ async fn discover_surfaces_http_errors_as_typed_source_errors() {
         "HTTP status surfaces in the error: {err}"
     );
 }
+
+/// Data streams (hidden `.ds-*` backing indices) are listed by name, and an
+/// index whose mapping cannot be read is skipped instead of failing the whole
+/// discovery (#789 MSG-83, MSG-94).
+#[tokio::test(flavor = "multi_thread")]
+async fn discover_lists_data_streams_and_skips_unreadable_mappings() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/_cat/indices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"index": "good", "docs.count": "1"},
+            {"index": "closed", "docs.count": "1"},
+            {"index": ".ds-logs-app-2026.10.07-000001", "docs.count": "9"},
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/_data_stream"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data_streams": [{"name": "logs-app"}, {"name": ".internal"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/good/_mapping"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"good": {"mappings": {}}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/closed/_mapping"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "index_closed"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/logs-app/_mapping"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            ".ds-logs-app-2026.10.07-000001": {"mappings": {"properties": {"m": {"type": "keyword"}}}}
+        })))
+        .mount(&server)
+        .await;
+    let source =
+        ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "x")).unwrap();
+    let datasets = source.discover().await.expect("discover");
+    let got: Vec<(&str, &str)> = datasets
+        .iter()
+        .map(|d| (d.name.as_str(), d.kind.as_str()))
+        .collect();
+    assert_eq!(got, vec![("good", "index"), ("logs-app", "data_stream")]);
+    assert_eq!(
+        datasets[1].schema.as_ref().unwrap()["properties"]["m"]["type"],
+        "string"
+    );
+}

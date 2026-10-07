@@ -65,10 +65,12 @@ faucet run pipeline.yaml
 | `base_url` | string | — *(required)* | Base URL of the Elasticsearch cluster (e.g. `http://localhost:9200`). A trailing slash is trimmed. |
 | `index` | string | — *(required)* | Index (or pattern, e.g. `metrics-*`) to search. Supports `${field.path}` matrix-context placeholders. |
 | `query` | object | `{ "match_all": {} }` | Elasticsearch query DSL, sent verbatim as the `query` of the search body. Supports `${field.path}` placeholders resolved against the parent-record context. |
-| `scroll_timeout` | string | `"1m"` | Scroll-context keep-alive sent on the initial and every follow-up scroll request (e.g. `"1m"`, `"5m"`). Must exceed the time taken to process one page downstream. |
+| `scroll_timeout` | string | `"5m"` | Scroll-context keep-alive sent on the initial and every follow-up scroll request (e.g. `"1m"`, `"5m"`). Must exceed the time taken to process one page downstream. |
+| `connect_timeout_secs` | int | `10` | Seconds to wait for a connection to the cluster. |
+| `request_timeout_secs` | int | `300` | Seconds one search or scroll request may take; a half-open connection or wedged node fails the request instead of hanging the run. |
 | `auth` | `ElasticsearchAuth` | `{ type: none }` | Authentication — inline `{ type, config }` or `{ ref: <name> }`. See [Authentication](#authentication). |
 | `max_pages` | int | *(unset = no limit)* | Maximum number of scroll responses to emit. The cap applies *after* a page is yielded. |
-| `batch_size` | int | `1000` | Docs per emitted `StreamPage`, also the scroll API `size` parameter. **`0` = no batching**: a single non-scroll `_search?size=10000` is issued instead. Validated against `MAX_BATCH_SIZE` (1,000,000) at construction (an empty `base_url` / `index` is likewise rejected with `FaucetError::Config`). |
+| `batch_size` | int | `1000` | Docs per emitted `StreamPage`, also the scroll API `size` parameter. **`0` = no batching**: the whole result set is drained through the scroll API (10 000 docs per request) and emitted as one page. Validated against `MAX_BATCH_SIZE` (1,000,000) at construction (an empty `base_url` / `index` is likewise rejected with `FaucetError::Config`). |
 
 ### Authentication
 
@@ -231,14 +233,16 @@ The Elasticsearch search source is **stateless** — it does not implement `stat
 
 ## Dataset discovery
 
-The source implements [`Source::discover`](https://docs.rs/faucet-core/latest/faucet_core/trait.Source.html#method.discover) (#211): it lists the cluster's indices via `GET _cat/indices?format=json` (skipping system indices whose name starts with `.`) and returns one `DatasetDescriptor` per index with
+The source implements [`Source::discover`](https://docs.rs/faucet-core/latest/faucet_core/trait.Source.html#method.discover) (#211): it lists the cluster's indices via `GET _cat/indices?format=json` (skipping system indices whose name starts with `.`) and its data streams via `GET _data_stream` (kind `data_stream`; their `.ds-*` backing indices are hidden), and returns one `DatasetDescriptor` per index or stream with
 
 - `name` — the index name; `kind` — `"index"`;
 - `config_patch` — `{"index": "<name>"}`, ready to deep-merge over the connection config (one matrix row per index);
 - `estimated_rows` — parsed from the `_cat` `docs.count` column (`None` when unavailable);
 - `schema` — top-level columns from `GET /<index>/_mapping`: `long`/`integer`/`short`/`byte` → `integer`; `double`/`float`/`half_float`/`scaled_float` → `number`; `boolean` → `boolean`; `object`/`nested` (or a type-less field with nested `properties`) → `object`; everything else (`text`, `keyword`, `date`, `ip`, …) → `string`. Mappings carry no nullability, so types stay scalar.
 
-Discovery is catalog metadata only — no document scan. Both requests use the configured `auth`.
+Discovery is catalog metadata only — no document scan. Every request uses the configured `auth`. An index whose mapping cannot be read (closed, no permission) is skipped with a `WARN` instead of failing discovery for the whole cluster.
+
+A parent value substituted into `index` (`logs-{parent.tenant}`) is percent-encoded, so it stays one URL path segment. Auth from a shared provider is resolved per request, so a token that expires during a long scroll is refreshed.
 
 ## Config loading & schema
 
@@ -320,7 +324,6 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | `401 Unauthorized` / `403` | Missing or wrong credentials. Set `auth` to `basic` / `bearer` / `api_key` with valid values; confirm the user/key has `read` privilege on the index. |
 | `auth references provider '<name>' but no provider was supplied` | The config uses `auth: { ref: <name> }` but no matching entry exists in the top-level `auth:` catalog. Add the provider, or switch to inline `{ type, config }`. |
 | Auth provider error: *"must yield a bearer or basic credential"* | A shared provider returned a `Header`/`Token` credential, which Elasticsearch can't use. Use a provider type that yields a bearer or basic credential, or inline `api_key` auth. |
-| Empty result / `0 documents` with `batch_size: 0` | The index's `max_result_window` is below the matched-doc count, or more than 10,000 docs match. The no-batching path caps at 10,000 hits — switch to scroll (`batch_size: 1000`) to drain everything. |
 | `Search context not found` / scroll expired mid-run | `scroll_timeout` is shorter than the time to process one page downstream. Raise it (e.g. `5m`) so the context outlives each page's sink write. |
 | `index_not_found_exception` | The `index` doesn't exist (after any `${...}` substitution). Verify the index/pattern name; patterns like `metrics-*` need `allow_no_indices` semantics on the cluster. |
 | `parsing_exception` / `400` on the query | The `query` object isn't a valid query-DSL clause. It is sent verbatim as the body's `query` — wrap a single clause directly (e.g. `{ "match": { … } }`), not inside another `query:` key. |
