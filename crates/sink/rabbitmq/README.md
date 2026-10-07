@@ -14,10 +14,12 @@ write is broker-acknowledged before it returns.
 
 - **Publisher confirms** (`confirm: true`, default): a write returns only after
   the broker has acknowledged every message.
-- **`mandatory: true`**: a message no queue is bound to receive is returned by
-  the broker. Through `write_batch_partial` it becomes that row's error, so the
-  pipeline routes it to the `dlq:`; without a DLQ the batch fails. Requires
-  `confirm: true`.
+- **`mandatory: true`** (default): a message no queue is bound to receive is
+  returned by the broker instead of being confirmed and dropped. Through
+  `write_batch_partial` it becomes that row's error, so the pipeline routes it
+  to the `dlq:`; without a DLQ the batch fails. Takes effect with
+  `confirm: true`; set `mandatory: false` to publish to an exchange that may
+  legitimately have no bindings.
 - Per-row problems — a routing key that resolves to nothing / null / a
   container / more than 255 bytes, a record that does not fit `value_format`, a
   broker `nack` — are row errors too. A channel-level failure (e.g. publishing
@@ -41,7 +43,8 @@ flattened in alongside these fields:
 | `routing_key_jsonpath` | `Option<String>`        | —       | JSONPath whose first match is the routing key |
 | `value_format`         | `json`/`string`/`bytes` | `json`  | body encoding (`string` needs string records, `bytes` base64 strings) |
 | `persistent`           | `bool`                  | `true`  | delivery mode 2 (persisted on durable queues) |
-| `mandatory`            | `bool`                  | `false` | return unroutable messages as row errors |
+| `mandatory`            | `bool`                  | `true`  | return unroutable messages as row errors (takes effect with `confirm`; ignored without it) |
+| `publish_timeout_secs` | `u64`                   | `60`    | bound on one publish batch and its confirms — a broker resource alarm blocks publishers indefinitely; a timeout fails the write as retriable |
 | `confirm`              | `bool`                  | `true`  | wait for publisher confirms |
 | `batch_size`           | `usize`                 | `1000`  | messages published before awaiting their confirms (`0` = whole batch) |
 
