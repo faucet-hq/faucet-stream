@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// The default is [`DeltaCredentials::Default`], which resolves credentials from
 /// the ambient environment / instance metadata via the object-store default
 /// provider chain — nothing is injected into `storage_options`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum DeltaCredentials {
     /// Resolve credentials from the ambient environment / default provider
@@ -34,6 +34,23 @@ pub enum DeltaCredentials {
     Azure(AzureCredentials),
     /// Google Cloud Storage credentials.
     Gcp(GcpCredentials),
+}
+
+impl std::fmt::Debug for DeltaCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(
+            f,
+            "DeltaCredentials",
+            self,
+            &[
+                "secret_access_key",
+                "session_token",
+                "access_key",
+                "sas_token",
+                "service_account_key",
+            ],
+        )
+    }
 }
 
 impl DeltaCredentials {
@@ -101,7 +118,7 @@ impl DeltaCredentials {
 /// Leaving a field unset lets the object-store default chain resolve it (so
 /// `region` alone with an instance profile is valid). `endpoint_url` +
 /// `allow_http: true` targets MinIO / LocalStack.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AwsCredentials {
     /// `AWS_ACCESS_KEY_ID`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,8 +140,19 @@ pub struct AwsCredentials {
     pub allow_http: Option<bool>,
 }
 
+impl std::fmt::Debug for AwsCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(
+            f,
+            "AwsCredentials",
+            self,
+            &["secret_access_key", "session_token"],
+        )
+    }
+}
+
 /// Azure Blob / ADLS Gen2 credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AzureCredentials {
     /// `AZURE_STORAGE_ACCOUNT_NAME`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,8 +165,14 @@ pub struct AzureCredentials {
     pub sas_token: Option<String>,
 }
 
+impl std::fmt::Debug for AzureCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "AzureCredentials", self, &["access_key", "sas_token"])
+    }
+}
+
 /// Google Cloud Storage credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GcpCredentials {
     /// `GOOGLE_SERVICE_ACCOUNT` — path to a service-account JSON key file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +180,12 @@ pub struct GcpCredentials {
     /// `GOOGLE_SERVICE_ACCOUNT_KEY` — inline service-account JSON key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_account_key: Option<String>,
+}
+
+impl std::fmt::Debug for GcpCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "GcpCredentials", self, &["service_account_key"])
+    }
 }
 
 #[cfg(test)]
@@ -246,5 +286,28 @@ mod tests {
         // Default variant is just `{ "type": "default" }`.
         let d: DeltaCredentials = serde_json::from_value(json!({ "type": "default" })).unwrap();
         assert_eq!(d, DeltaCredentials::Default);
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: DeltaCredentials = serde_json::from_str(r#"{"type":"aws","config":{"access_key_id":"AK","secret_access_key":"S3CRET-1","session_token":"S3CRET-2"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: DeltaCredentials = serde_json::from_str(
+            r#"{"type":"azure","config":{"account_name":"a","access_key":"S3CRET-3"}}"#,
+        )
+        .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: DeltaCredentials =
+            serde_json::from_str(r#"{"type":"gcp","config":{"service_account_key":"S3CRET-4"}}"#)
+                .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

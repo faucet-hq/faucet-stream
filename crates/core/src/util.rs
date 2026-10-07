@@ -243,6 +243,52 @@ fn json_escape_string(s: &str) -> String {
     escaped
 }
 
+/// `Debug`-format `value` through its `Serialize` form, with the value of every
+/// object entry whose key is in `secret_keys` masked as `"***"` — at any
+/// depth; an object or array under such a key keeps its shape (header names
+/// stay visible) with every leaf masked. `null` is left as is.
+///
+/// For connector config and credential types whose derived `Debug` would
+/// print secrets (#789 SUPPLY-17). Serialization failures print the type
+/// name only.
+pub fn fmt_redacted<T: serde::Serialize + ?Sized>(
+    f: &mut std::fmt::Formatter<'_>,
+    name: &str,
+    value: &T,
+    secret_keys: &[&str],
+) -> std::fmt::Result {
+    fn mask_all(v: &mut Value) {
+        match v {
+            Value::Null => {}
+            Value::Object(map) => map.values_mut().for_each(mask_all),
+            Value::Array(items) => items.iter_mut().for_each(mask_all),
+            other => *other = Value::String("***".into()),
+        }
+    }
+    fn mask(v: &mut Value, keys: &[&str]) {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map.iter_mut() {
+                    if keys.contains(&k.as_str()) {
+                        mask_all(child);
+                    } else {
+                        mask(child, keys);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|i| mask(i, keys)),
+            _ => {}
+        }
+    }
+    match serde_json::to_value(value) {
+        Ok(mut v) => {
+            mask(&mut v, secret_keys);
+            write!(f, "{name}({v})")
+        }
+        Err(_) => write!(f, "{name}(..)"),
+    }
+}
+
 /// Strip credentials from a connection string so it can be used as a lineage
 /// dataset URI without leaking secrets. Handles two shapes, best-effort:
 ///
@@ -514,6 +560,46 @@ mod snake_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fmt_redacted_masks_secret_keys_at_any_depth() {
+        struct Show<'a>(&'a Value);
+        impl std::fmt::Debug for Show<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                super::fmt_redacted(f, "Cfg", self.0, &["password", "headers"])
+            }
+        }
+        let v = serde_json::json!({
+            "user": "u",
+            "password": "hunter22",
+            "nested": [{"password": 7, "headers": {"X-Key": "k1", "list": ["a"]}}],
+            "headers": null,
+        });
+        let out = format!("{:?}", Show(&v));
+        assert!(out.starts_with("Cfg("), "{out}");
+        for secret in ["hunter22", "k1", "\"a\"", ":7"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(
+            out.contains("X-Key") && out.contains("\"user\":\"u\""),
+            "{out}"
+        );
+        assert!(out.contains("\"headers\":null"), "{out}");
+
+        struct Bad;
+        impl serde::Serialize for Bad {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("no"))
+            }
+        }
+        struct ShowBad;
+        impl std::fmt::Debug for ShowBad {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                super::fmt_redacted(f, "Bad", &Bad, &[])
+            }
+        }
+        assert_eq!(format!("{ShowBad:?}"), "Bad(..)");
+    }
+
     use super::*;
     use serde_json::json;
 

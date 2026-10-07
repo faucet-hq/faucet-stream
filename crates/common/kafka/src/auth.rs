@@ -16,14 +16,20 @@ pub enum ScramMechanism {
 }
 
 /// Basic username/password credentials reused across auth modes.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BasicAuth {
     pub username: String,
     pub password: String,
 }
 
+impl std::fmt::Debug for BasicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "BasicAuth", self, &["password"])
+    }
+}
+
 /// Kafka broker authentication configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum KafkaAuth {
     /// No authentication — plaintext brokers only.
@@ -57,6 +63,12 @@ pub enum KafkaAuth {
         /// TLS layer (must be `Ssl`).
         ssl: Box<KafkaAuth>,
     },
+}
+
+impl std::fmt::Debug for KafkaAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "KafkaAuth", self, &["password", "key_password"])
+    }
 }
 
 impl KafkaAuth {
@@ -291,5 +303,27 @@ mod tests {
     #[test]
     fn schema_for_kafka_auth_compiles() {
         let _ = schemars::schema_for!(KafkaAuth);
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: KafkaAuth = serde_json::from_str(
+            r#"{"type":"sasl_plain","config":{"username":"u","password":"S3CRET-1"}}"#,
+        )
+        .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: KafkaAuth = serde_json::from_str(r#"{"type":"ssl","config":{"ca_path":"/c","cert_path":"/c","key_path":"/k","key_password":"S3CRET-2"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: BasicAuth =
+            serde_json::from_str(r#"{"username":"u","password":"S3CRET-3"}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

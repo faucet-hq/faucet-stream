@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 /// Authentication for GraphQL endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum GraphqlAuth {
     /// No authentication.
@@ -21,6 +21,12 @@ pub enum GraphqlAuth {
     Bearer { token: String },
     /// Custom headers (e.g. API keys, cookies).
     Custom { headers: HashMap<String, String> },
+}
+
+impl std::fmt::Debug for GraphqlAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "GraphqlAuth", self, &["token", "headers"])
+    }
 }
 
 /// Cursor-based pagination configuration for GraphQL.
@@ -805,5 +811,23 @@ mod tests {
         }))
         .unwrap();
         assert!(null.variables.is_null());
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: GraphqlAuth =
+            serde_json::from_str(r#"{"type":"bearer","config":{"token":"S3CRET-1"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: GraphqlAuth =
+            serde_json::from_str(r#"{"type":"custom","config":{"headers":{"X":"S3CRET-2"}}}"#)
+                .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }
