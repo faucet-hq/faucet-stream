@@ -6173,6 +6173,7 @@ dependencies = [
  "arrow 58.3.0",
  "async-stream",
  "async-trait",
+ "chrono",
  "faucet-common-bigquery",
  "faucet-conformance",
  "faucet-core",

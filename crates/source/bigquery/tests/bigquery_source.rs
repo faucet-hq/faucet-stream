@@ -373,7 +373,7 @@ async fn fetch_all_decodes_all_bigquery_types_to_json() {
             "ratio": 2.5,
             "active": true,
             "label": "hello",
-            "ts": "1.7e9",
+            "ts": "2023-11-14T22:13:20Z",
             "tags": ["a", "b"],
             "owner": {"uid": 7, "email": "x@y.z"}
         })

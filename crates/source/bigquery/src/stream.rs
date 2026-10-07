@@ -338,13 +338,11 @@ impl BigQuerySource {
 fn bq_field_to_json_schema(field: &TableFieldSchema) -> Value {
     let base = match field.r#type {
         FieldType::Integer | FieldType::Int64 => "integer",
-        FieldType::Float | FieldType::Float64 | FieldType::Numeric | FieldType::Bignumeric => {
-            "number"
-        }
+        FieldType::Float | FieldType::Float64 => "number",
         FieldType::Boolean | FieldType::Bool => "boolean",
         FieldType::Record | FieldType::Struct | FieldType::Json => "object",
-        // STRING, BYTES, DATE, DATETIME, TIME, TIMESTAMP, GEOGRAPHY,
-        // INTERVAL — all serialized as JSON strings by this source.
+        // STRING, BYTES, DATE, DATETIME, TIME, TIMESTAMP, GEOGRAPHY, INTERVAL,
+        // and NUMERIC/BIGNUMERIC (exact decimal text) — emitted as strings.
         _ => "string",
     };
     match field.mode.as_deref() {
@@ -985,8 +983,8 @@ mod tests {
             (FieldType::Int64, "integer"),
             (FieldType::Float, "number"),
             (FieldType::Float64, "number"),
-            (FieldType::Numeric, "number"),
-            (FieldType::Bignumeric, "number"),
+            (FieldType::Numeric, "string"),
+            (FieldType::Bignumeric, "string"),
             (FieldType::Boolean, "boolean"),
             (FieldType::Bool, "boolean"),
             (FieldType::Record, "object"),

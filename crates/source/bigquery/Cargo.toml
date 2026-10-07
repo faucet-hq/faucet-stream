@@ -11,6 +11,7 @@ keywords = ["bigquery", "gcp", "etl", "pipeline", "connector"]
 categories.workspace = true
 
 [dependencies]
+chrono.workspace = true
 faucet-core.workspace = true
 faucet-common-bigquery.workspace = true
 gcp-bigquery-client = "0.28.0"
