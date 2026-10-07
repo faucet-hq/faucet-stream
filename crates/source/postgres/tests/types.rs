@@ -92,3 +92,89 @@ async fn types_without_a_native_decode_are_read_as_text() {
     let n = row["n"].as_str().expect("numeric is a string");
     assert_eq!(n.parse::<f64>().unwrap(), 1.5, "{n}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn infinite_dates_reals_and_partitions() {
+    let (_c, url) = start_postgres().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    for sql in [
+        "CREATE TABLE inf (id INT PRIMARY KEY, d DATE, ts TIMESTAMP, tz TIMESTAMPTZ, r REAL)",
+        "INSERT INTO inf VALUES (1, 'infinity', 'infinity', '-infinity', 0.1), \
+         (2, '-infinity', '-infinity', 'infinity', NULL), \
+         (3, '2024-01-02', '2024-01-02 03:04:05', '2024-01-02 03:04:05+00', 'NaN')",
+        "CREATE TABLE parted (id INT, region TEXT) PARTITION BY LIST (region)",
+        "CREATE TABLE parted_eu PARTITION OF parted FOR VALUES IN ('eu')",
+        "CREATE TABLE parted_us PARTITION OF parted FOR VALUES IN ('us')",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect(sql);
+    }
+    pool.close().await;
+
+    let source = PostgresSource::new(PostgresSourceConfig::new(
+        &url,
+        "SELECT d, ts, tz, r FROM inf ORDER BY id",
+    ))
+    .await
+    .expect("source");
+    let rows = source.fetch_all().await.expect("fetch");
+    assert_eq!(
+        rows[0],
+        json!({"d": "infinity", "ts": "infinity", "tz": "-infinity", "r": 0.1})
+    );
+    assert_eq!(
+        rows[1],
+        json!({"d": "-infinity", "ts": "-infinity", "tz": "infinity", "r": null})
+    );
+    assert_eq!(rows[2]["d"], json!("2024-01-02"));
+    assert_eq!(rows[2]["r"], json!("NaN"));
+
+    let names: Vec<String> = source
+        .discover()
+        .await
+        .expect("discover")
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(names.iter().any(|n| n.ends_with("parted")), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.contains("parted_")),
+        "partitions must not be listed beside their parent: {names:?}"
+    );
+}
+
+/// #789 SQL-49: a JSON number a 64-bit float cannot hold exactly fails the
+/// read by default and, with `json_big_numbers: string`, arrives as its exact
+/// digits; ordinary numbers stay numbers.
+#[tokio::test(flavor = "multi_thread")]
+async fn big_json_numbers_fail_or_stay_exact() {
+    let (_c, url) = start_postgres().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    for sql in [
+        "CREATE TABLE j (id INT PRIMARY KEY, b JSONB, t JSON)",
+        "INSERT INTO j VALUES (1, '{\"n\": 12345678901234567890.123, \"k\": 1.5}', \
+         '[98765432109876543210987]')",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect(sql);
+    }
+    pool.close().await;
+
+    let strict = PostgresSource::new(PostgresSourceConfig::new(&url, "SELECT b FROM j"))
+        .await
+        .expect("source");
+    let err = strict.fetch_all().await.expect_err("inexact number");
+    assert!(err.to_string().contains("column b"), "{err}");
+    assert!(
+        err.to_string().contains("12345678901234567890.123"),
+        "{err}"
+    );
+
+    let mut cfg = PostgresSourceConfig::new(&url, "SELECT b, t FROM j");
+    cfg.json_big_numbers = faucet_core::JsonBigNumbers::String;
+    let lenient = PostgresSource::new(cfg).await.expect("source");
+    let rows = lenient.fetch_all().await.expect("fetch");
+    assert_eq!(
+        rows[0]["b"],
+        json!({"n": "12345678901234567890.123", "k": 1.5})
+    );
+    assert_eq!(rows[0]["t"], json!(["98765432109876543210987"]));
+}

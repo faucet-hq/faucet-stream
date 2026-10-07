@@ -55,14 +55,15 @@ pub(crate) struct CopyPayload {
 ///   record (declared table order) — a column absent from every record is
 ///   left out entirely so its DEFAULT still applies;
 /// - a record missing a unioned column ships SQL NULL (`\N`);
-/// - records with **no** matching columns are skipped (the caller logs);
+/// - a record with **no** matching column is an error, never skipped;
 /// - non-object records are an error;
 /// - each value is rendered with the same text semantics as the `INSERT`
 ///   path's [`pg_bind_text`] (JSON/JSONB columns get JSON text; scalars get
 ///   plain text; containers into non-JSON columns get JSON text so the
 ///   server's input function fails loudly), then COPY-escaped.
 ///
-/// Returns `Ok(None)` when no record matched any column.
+/// Returns `Ok(None)` for an empty page, and an error naming the first record
+/// that matches no column.
 pub(crate) fn build_auto_map_payload(
     records: &[Value],
     table_columns: &[(String, String)],
@@ -70,7 +71,7 @@ pub(crate) fn build_auto_map_payload(
     // Pass 1: validate + find which table columns any record uses.
     let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut matched_any: Vec<&serde_json::Map<String, Value>> = Vec::with_capacity(records.len());
-    for record in records {
+    for (idx, record) in records.iter().enumerate() {
         let obj = record
             .as_object()
             .ok_or_else(|| "AutoMap requires JSON object records".to_string())?;
@@ -81,14 +82,16 @@ pub(crate) fn build_auto_map_payload(
                 matched = true;
             }
         }
-        if matched {
-            matched_any.push(obj);
-        } else {
-            tracing::warn!(
-                record_keys = ?obj.keys().collect::<Vec<_>>(),
-                "record has no keys matching table columns, skipping"
-            );
+        if !matched {
+            // Never a silent skip: the row would be lost with the bookmark
+            // advancing past it (#789 SQL-50).
+            return Err(crate::sink::no_matching_column_message(
+                idx,
+                obj,
+                table_columns,
+            ));
         }
+        matched_any.push(obj);
     }
     if matched_any.is_empty() {
         return Ok(None);
@@ -268,18 +271,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_map_skips_no_match_records_and_reports_none_when_empty() {
+    fn auto_map_refuses_a_record_matching_no_column() {
         let table = cols(&[("id", "int8")]);
-        let payload =
-            build_auto_map_payload(&[json!({"id": 1}), json!({"unrelated": true})], &table)
-                .unwrap()
-                .unwrap();
-        assert_eq!(payload.rows, 1);
-        assert!(
-            build_auto_map_payload(&[json!({"unrelated": true})], &table)
-                .unwrap()
-                .is_none()
-        );
+        let err =
+            build_auto_map_payload(&[json!({"id": 1}), json!({"ID": true})], &table).unwrap_err();
+        assert!(err.contains("record 1 has no field matching"), "{err}");
+        assert!(build_auto_map_payload(&[], &table).unwrap().is_none());
     }
 
     #[test]

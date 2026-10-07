@@ -4,13 +4,13 @@
 //! failure mid-restore leaves the destination exactly as it was.
 
 use crate::config::SqliteColumnMapping;
+use crate::sink::quote_ident_sqlite;
 use crate::sink::{BEGIN_WRITE, SqliteSink};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, canonical_key,
     key_json, plan_restore,
 };
-use faucet_core::util::quote_ident;
 use serde_json::Value;
 use sqlx::Row;
 
@@ -25,7 +25,7 @@ fn placeholder(_n: usize) -> String {
 
 fn journal_sql() -> JournalSql {
     JournalSql {
-        quote: quote_ident,
+        quote: quote_ident_sqlite,
         placeholder,
         before_type: "TEXT",
         insert_prefix: "INSERT OR IGNORE",
@@ -40,13 +40,59 @@ fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Sink(format!("sqlite rollback: {context}: {e}"))
 }
 
-/// `json_object('c1', "c1", …)` over `columns` — the row as JSON text.
+/// Marker key of a journaled BLOB value: `{"__faucet_blob_hex": "<hex>"}`.
+const BLOB_HEX_KEY: &str = "__faucet_blob_hex";
+
+/// `json_object('c1', <c1>, …)` over `columns` — the row as JSON text. REALs
+/// are printed with 17 significant digits (`json_object` keeps only 15) and
+/// BLOBs as a hex marker object (`json_object` refuses BLOBs) (#789 SQL-71).
 fn row_json_expr(columns: &[String]) -> String {
     let parts: Vec<String> = columns
         .iter()
-        .map(|c| format!("'{}', {}", c.replace('\'', "''"), quote_ident(c)))
+        .map(|c| {
+            let q = quote_ident_sqlite(c);
+            format!(
+                "'{}', CASE typeof({q}) \
+                 WHEN 'real' THEN CASE WHEN abs({q}) < 9e999 THEN json(printf('%!.17g', {q})) ELSE {q} END \
+                 WHEN 'blob' THEN json_object('{BLOB_HEX_KEY}', hex({q})) \
+                 ELSE {q} END",
+                c.replace('\'', "''")
+            )
+        })
         .collect();
     format!("json_object({})", parts.join(", "))
+}
+
+/// Restore every journaled before-image of one run straight from the journal:
+/// each column is read back with `json_extract` (exact for 17-digit REALs) and
+/// a BLOB marker is decoded with `unhex`, so no value passes through `f64`
+/// text or JSON strings. Binds, in order: two JSON paths per column, then the
+/// run id and the table name.
+fn restore_from_journal_sql(table_ref: &str, columns: &[String], key: &[String]) -> String {
+    let exprs: Vec<String> = (1..=columns.len())
+        .map(|p| {
+            format!(
+                "CASE WHEN json_type(j.before_json, ?{p}) = 'object' \
+                 THEN unhex(json_extract(j.before_json, ?{p} || '.{BLOB_HEX_KEY}')) \
+                 ELSE json_extract(j.before_json, ?{p}) END"
+            )
+        })
+        .collect();
+    let insert = format!(
+        "INSERT INTO {table_ref} ({cols}) SELECT {exprs} FROM {journal} j \
+         WHERE j.run_id = ?{r} AND j.table_name = ?{t} AND j.before_json IS NOT NULL",
+        cols = crate::sink::column_list(columns),
+        exprs = exprs.join(", "),
+        journal = quote_ident_sqlite(faucet_core::rollback::RUN_JOURNAL_TABLE),
+        r = columns.len() + 1,
+        t = columns.len() + 2,
+    );
+    format!("{insert} {}", crate::sink::on_conflict_clause(key, columns))
+}
+
+/// The JSON path of a top-level column in a before-image.
+fn column_path(column: &str) -> String {
+    format!("$.\"{column}\"")
 }
 
 impl SqliteSink {
@@ -92,7 +138,7 @@ impl SqliteSink {
             return Ok(());
         }
         self.ensure_journal(tx).await?;
-        let table_ref = quote_ident(&self.config.table_name);
+        let table_ref = quote_ident_sqlite(&self.config.table_name);
         let columns = self.columns_of(tx, &self.config.table_name).await?;
         let row_expr = row_json_expr(&columns);
         let sql = journal_sql();
@@ -178,7 +224,7 @@ impl SqliteSink {
             return Ok(0);
         }
         let key = &self.config.write.key;
-        let table_ref = quote_ident(&self.config.table_name);
+        let table_ref = quote_ident_sqlite(&self.config.table_name);
         let sql = journal_sql();
         let per = ((MAX_SQLITE_PARAMS - 1) / key.len().max(1)).max(1);
         let mut total = 0u64;
@@ -186,7 +232,7 @@ impl SqliteSink {
             let (predicate, _) = sql.keys_in(key, chunk.len(), 0);
             let count_sql = format!(
                 "SELECT count(*) FROM {table_ref} WHERE {predicate} AND {c} IS NOT ?",
-                c = quote_ident(run_col)
+                c = quote_ident_sqlite(run_col)
             );
             let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
             for e in chunk {
@@ -216,7 +262,7 @@ impl SqliteSink {
             return Ok(0);
         }
         let key = &self.config.write.key;
-        let table_ref = quote_ident(&self.config.table_name);
+        let table_ref = quote_ident_sqlite(&self.config.table_name);
         let sql = journal_sql();
         let per = (MAX_SQLITE_PARAMS / key.len().max(1)).max(1);
         let mut present = 0u64;
@@ -293,7 +339,7 @@ impl SqliteSink {
             )));
         }
         let sql = journal_sql();
-        let table_ref = quote_ident(&self.config.table_name);
+        let table_ref = quote_ident_sqlite(&self.config.table_name);
         let count: i64 = sqlx::query_scalar(&sql.count_by_run(&table_ref, col))
             .bind(run_id)
             .fetch_one(&mut **tx)
@@ -367,8 +413,7 @@ impl SqliteSink {
         let restored = if restores.is_empty() {
             0
         } else {
-            self.insert_auto_map_with_conflict_tx(tx, &restores, Some(key))
-                .await? as u64
+            self.restore_images(tx, run_id, &restores).await?
         };
         sqlx::query(&journal_sql().delete_table())
             .bind(run_id)
@@ -409,8 +454,8 @@ impl SqliteSink {
                 self.config.table_name
             )));
         }
-        let target = quote_ident(&self.config.table_name);
-        let prev = quote_ident(&self.previous_table());
+        let target = quote_ident_sqlite(&self.config.table_name);
+        let prev = quote_ident_sqlite(&self.previous_table());
         let col = &opts.run_id_column;
         let columns = self.columns_of(tx, &self.config.table_name).await?;
         // The kept copy is the image before the *latest* overwrite; if the
@@ -418,7 +463,7 @@ impl SqliteSink {
         let conflicts: i64 = if columns.iter().any(|c| c == col) {
             sqlx::query_scalar(&format!(
                 "SELECT count(*) FROM {target} WHERE {c} IS NOT ?",
-                c = quote_ident(col)
+                c = quote_ident_sqlite(col)
             ))
             .bind(run_id)
             .fetch_one(&mut **tx)
@@ -472,6 +517,44 @@ impl SqliteSink {
         })
     }
 
+    /// Re-insert the journaled before-images of `run_id` (upserting by key)
+    /// over the columns the images carry that the target can still take.
+    async fn restore_images(
+        &self,
+        tx: &mut Tx<'_>,
+        run_id: &str,
+        images: &[Value],
+    ) -> Result<u64, FaucetError> {
+        let insertable = crate::sink::insertable_columns(tx, &self.config.table_name).await?;
+        let columns: Vec<String> = insertable
+            .into_iter()
+            .filter(|c| {
+                images
+                    .iter()
+                    .any(|img| img.as_object().is_some_and(|o| o.contains_key(c)))
+            })
+            .collect();
+        if columns.is_empty() {
+            return Ok(0);
+        }
+        let sql = restore_from_journal_sql(
+            &quote_ident_sqlite(&self.config.table_name),
+            &columns,
+            &self.config.write.key,
+        );
+        let mut q = sqlx::query(&sql);
+        for c in &columns {
+            q = q.bind(column_path(c));
+        }
+        let res = q
+            .bind(run_id)
+            .bind(&self.config.table_name)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| sink_err("restore before-images", e))?;
+        Ok(res.rows_affected())
+    }
+
     /// Drop the journal rows of `run_id` for this table.
     pub(crate) async fn forget_run_impl(&self, run_id: &str) -> Result<(), FaucetError> {
         let mut tx = self
@@ -497,9 +580,9 @@ impl SqliteSink {
         token: Option<&str>,
     ) -> Result<(), FaucetError> {
         self.ensure_commit_table().await?;
-        let t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE);
-        let s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL);
-        let k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL);
+        let t = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_TABLE);
+        let s = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL);
+        let k = quote_ident_sqlite(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL);
         match token {
             Some(token) => {
                 sqlx::query(&format!(
@@ -530,7 +613,7 @@ impl SqliteSink {
             "sqlite".to_string(),
             serde_json::json!({
                 "database_url": self.config.database_url,
-                "query": format!("SELECT * FROM {}", quote_ident(&self.config.table_name)),
+                "query": format!("SELECT * FROM {}", quote_ident_sqlite(&self.config.table_name)),
                 "max_connections": 1,
             }),
         ))
@@ -539,8 +622,8 @@ impl SqliteSink {
     /// Inside the overwrite swap: keep a copy of the target as
     /// `<table>__faucet_prev` (replacing an older copy) before it is cleared.
     pub(crate) async fn keep_previous_copy(&self, tx: &mut Tx<'_>) -> Result<(), FaucetError> {
-        let target = quote_ident(&self.config.table_name);
-        let prev = quote_ident(&self.previous_table());
+        let target = quote_ident_sqlite(&self.config.table_name);
+        let prev = quote_ident_sqlite(&self.previous_table());
         for stmt in [
             format!("DROP TABLE IF EXISTS {prev}"),
             format!("CREATE TABLE {prev} AS SELECT * FROM {target}"),
@@ -601,7 +684,7 @@ fn positional_key_select(table_ref: &str, key: &[String], row_expr: &str, rows: 
     let join: Vec<String> = key
         .iter()
         .enumerate()
-        .map(|(i, k)| format!("{table_ref}.{} = v.__faucet_k{i}", quote_ident(k)))
+        .map(|(i, k)| format!("{table_ref}.{} = v.__faucet_k{i}", quote_ident_sqlite(k)))
         .collect();
     format!(
         "WITH v({}) AS (VALUES {}) SELECT v.__faucet_idx, {row_expr} FROM v JOIN {table_ref} ON {}",
@@ -617,10 +700,33 @@ mod tests {
 
     #[test]
     fn row_json_expr_quotes_names_and_identifiers() {
-        assert_eq!(
-            row_json_expr(&["id".into(), "o'k".into()]),
-            "json_object('id', \"id\", 'o''k', \"o'k\")"
+        let expr = row_json_expr(&["id".into(), "o'k".into()]);
+        assert!(
+            expr.starts_with("json_object('id', CASE typeof(`id`)"),
+            "{expr}"
         );
+        assert!(expr.contains("'o''k', CASE typeof(`o'k`)"), "{expr}");
+        assert!(expr.contains("printf('%!.17g', `id`)"), "{expr}");
+        assert!(
+            expr.contains("json_object('__faucet_blob_hex', hex(`id`))"),
+            "{expr}"
+        );
+    }
+
+    #[test]
+    fn restore_sql_reads_each_column_from_the_journal() {
+        let sql = restore_from_journal_sql("`t`", &["id".into(), "b".into()], &["id".into()]);
+        assert!(
+            sql.starts_with("INSERT INTO `t` (`id`, `b`) SELECT CASE"),
+            "{sql}"
+        );
+        assert!(sql.contains("unhex(json_extract(j.before_json, ?2 || '.__faucet_blob_hex'))"));
+        assert!(sql.contains("j.run_id = ?3 AND j.table_name = ?4"), "{sql}");
+        assert!(
+            sql.ends_with("ON CONFLICT(`id`) DO UPDATE SET `b` = excluded.`b`"),
+            "{sql}"
+        );
+        assert_eq!(column_path("a b"), "$.\"a b\"");
     }
 
     #[test]

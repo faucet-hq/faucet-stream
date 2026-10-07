@@ -43,12 +43,47 @@ fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Sink(format!("mysql rollback: {context}: {e}"))
 }
 
-/// `CAST(JSON_OBJECT('c1', `c1`, …) AS CHAR)` over `columns` — the row as JSON
-/// text.
-fn row_json_expr(columns: &[String]) -> String {
+/// A column as the journal sees it: name, lowercase `DATA_TYPE`, `EXTRA`.
+pub(crate) struct JournalColumn {
+    pub(crate) name: String,
+    pub(crate) data_type: String,
+    pub(crate) extra: String,
+}
+
+impl JournalColumn {
+    /// A stored or virtual generated column: the database computes it, so it
+    /// is neither journaled nor restored (#789 SQL-107).
+    fn is_generated(&self) -> bool {
+        let extra = self.extra.to_ascii_lowercase();
+        extra.contains("generated") && !extra.contains("default_generated")
+    }
+
+    /// The value as it goes into the before-image, typed so the restore binds
+    /// it back exactly: binary as base64 (the form every faucet source emits,
+    /// decoded by the insert path for binary columns), BIT as its unsigned
+    /// integer, DECIMAL as its exact text — `JSON_OBJECT` alone renders binary
+    /// as `"base64:typeNN:…"` text and DECIMAL as a JSON number that is parsed
+    /// through `f64` (#789 SQL-75).
+    fn image_expr(&self) -> String {
+        let q = quote_ident_mysql(&self.name);
+        match self.data_type.as_str() {
+            "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => {
+                format!("TO_BASE64({q})")
+            }
+            "bit" => format!("CAST({q} AS UNSIGNED)"),
+            "decimal" => format!("CAST({q} AS CHAR)"),
+            _ => q,
+        }
+    }
+}
+
+/// `CAST(JSON_OBJECT('c1', <c1>, …) AS CHAR)` over the journaled columns —
+/// the row as JSON text.
+fn row_json_expr(columns: &[JournalColumn]) -> String {
     let parts: Vec<String> = columns
         .iter()
-        .map(|c| format!("'{}', {}", c.replace('\'', "''"), quote_ident_mysql(c)))
+        .filter(|c| !c.is_generated())
+        .map(|c| format!("'{}', {}", c.name.replace('\'', "''"), c.image_expr()))
         .collect();
     format!("CAST(JSON_OBJECT({}) AS CHAR)", parts.join(", "))
 }
@@ -82,11 +117,45 @@ impl MysqlSink {
             .collect())
     }
 
-    async fn ensure_journal(&self, conn: &mut MySqlConnection) -> Result<(), FaucetError> {
+    /// The target's columns with their types, for the before-image.
+    async fn journal_columns(
+        &self,
+        conn: &mut MySqlConnection,
+    ) -> Result<Vec<JournalColumn>, FaucetError> {
+        let rows = sqlx::query(
+            "SELECT CAST(COLUMN_NAME AS CHAR) AS COLUMN_NAME, \
+                    CAST(DATA_TYPE AS CHAR) AS DATA_TYPE, CAST(EXTRA AS CHAR) AS EXTRA \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION",
+        )
+        .bind(&self.config.table_name)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| sink_err("read table columns", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| JournalColumn {
+                name: r.get("COLUMN_NAME"),
+                data_type: r.get::<String, _>("DATA_TYPE").to_ascii_lowercase(),
+                extra: r.get::<Option<String>, _>("EXTRA").unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Create the journal table. MySQL commits the open transaction on any
+    /// `CREATE TABLE` — even `IF NOT EXISTS` on a table that exists — so this
+    /// runs on its own connection **before** a write transaction begins
+    /// (#789 SQL-74).
+    pub(crate) async fn ensure_journal(&self) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.journal_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         sqlx::query(&journal_sql().create())
-            .execute(&mut *conn)
+            .execute(&self.pool)
             .await
             .map_err(|e| sink_err("create journal", e))?;
+        self.journal_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -106,9 +175,8 @@ impl MysqlSink {
         if keys.is_empty() {
             return Ok(());
         }
-        self.ensure_journal(&mut *conn).await?;
         let table_ref = quote_ident_mysql(&self.config.table_name);
-        let columns = self.columns_of(&mut *conn, &self.config.table_name).await?;
+        let columns = self.journal_columns(&mut *conn).await?;
         let row_expr = row_json_expr(&columns);
         let sql = journal_sql();
 
@@ -282,6 +350,7 @@ impl MysqlSink {
                 .map_err(|e| sink_err("acquire", e))?;
             return self.rollback_overwrite(&mut conn, run_id, opts).await;
         }
+        self.ensure_journal().await?;
         let mut tx = self.pool.begin().await.map_err(|e| sink_err("begin", e))?;
         let outcome = match opts.mode {
             RollbackMode::Append => self.rollback_append(&mut tx, run_id, opts).await?,
@@ -357,7 +426,6 @@ impl MysqlSink {
                     .into(),
             ));
         }
-        self.ensure_journal(&mut *conn).await?;
         let entries = self.journal_entries(&mut *conn, run_id).await?;
         if entries.is_empty() {
             return Ok(RollbackOutcome::nothing(
@@ -457,6 +525,27 @@ impl MysqlSink {
                 ..Default::default()
             });
         }
+        // A target with foreign keys or triggers gets its rows back in place,
+        // keeping its definition (#789 SQL-108).
+        let deps = crate::sink::table_dependents(&mut *conn, &self.config.table_name).await?;
+        if !deps.pinned.is_empty() || !deps.referenced_by.is_empty() {
+            crate::sink::replace_rows_in_place(
+                &mut *conn,
+                &self.config.table_name,
+                &self.previous_table_name(),
+            )
+            .await?;
+            sqlx::query(&format!("DROP TABLE IF EXISTS {prev}"))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| sink_err("drop previous table", e))?;
+            return Ok(RollbackOutcome {
+                restored: restored as u64,
+                conflicts: conflicts as u64,
+                applied: true,
+                ..Default::default()
+            });
+        }
         for stmt in [
             format!("DROP TABLE IF EXISTS {old}"),
             format!("RENAME TABLE {target} TO {old}, {prev} TO {target}"),
@@ -482,7 +571,7 @@ impl MysqlSink {
             .acquire()
             .await
             .map_err(|e| sink_err("acquire", e))?;
-        self.ensure_journal(&mut conn).await?;
+        self.ensure_journal().await?;
         sqlx::query(&journal_sql().delete_table())
             .bind(run_id)
             .bind(&self.config.table_name)
@@ -568,9 +657,25 @@ mod tests {
 
     #[test]
     fn row_json_expr_quotes_names_and_identifiers() {
+        let col = |name: &str, data_type: &str, extra: &str| JournalColumn {
+            name: name.into(),
+            data_type: data_type.into(),
+            extra: extra.into(),
+        };
         assert_eq!(
-            row_json_expr(&["id".into(), "o'k".into()]),
+            row_json_expr(&[col("id", "int", ""), col("o'k", "varchar", "")]),
             "CAST(JSON_OBJECT('id', `id`, 'o''k', `o'k`) AS CHAR)"
+        );
+        assert_eq!(
+            row_json_expr(&[
+                col("b", "varbinary", ""),
+                col("f", "bit", ""),
+                col("d", "decimal", ""),
+                col("g", "int", "STORED GENERATED"),
+                col("ts", "timestamp", "DEFAULT_GENERATED"),
+            ]),
+            "CAST(JSON_OBJECT('b', TO_BASE64(`b`), 'f', CAST(`f` AS UNSIGNED), \
+             'd', CAST(`d` AS CHAR), 'ts', `ts`) AS CHAR)"
         );
     }
 

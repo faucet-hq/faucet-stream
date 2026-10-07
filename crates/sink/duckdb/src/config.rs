@@ -28,8 +28,7 @@ impl Default for DuckdbColumnMapping {
 #[serde(deny_unknown_fields)]
 pub struct DuckdbSinkConfig {
     /// Path to the DuckDB database file, or `:memory:`. A `duckdb://` /
-    /// `duckdb:` scheme prefix is accepted and stripped. The target table must
-    /// already exist.
+    /// `duckdb:` scheme prefix is accepted and stripped.
     pub database: String,
     /// Target table name.
     pub table_name: String,

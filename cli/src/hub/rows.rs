@@ -169,7 +169,7 @@ pub struct RowGuarantees {
     /// The `faucet validate` derivation: `at-least-once`, or
     /// `effectively-once (atomic watermark | keyed upsert)`.
     pub delivery_guarantee: String,
-    /// Whether scoped cleanup (`complete_for` + `delete_missing`) could run.
+    /// Whether scoped cleanup (`complete_for` with `on_missing: delete`) could run.
     pub cleanup_capable: bool,
 }
 

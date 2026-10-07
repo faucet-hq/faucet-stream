@@ -86,6 +86,7 @@ fn cfg(url: &str) -> PostgresCdcSourceConfig {
         max_messages: Some(TOTAL),
         max_cycle_duration: std::time::Duration::from_secs(300),
         max_staged_records: None,
+        max_buffered_events: 100_000,
         status_update_interval: Duration::from_secs(1),
         tcp_keepalive: Duration::from_secs(60),
         // Per-transaction paging: batch_size > 0 turns on per-commit page

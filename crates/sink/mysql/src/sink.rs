@@ -25,6 +25,8 @@ pub struct MysqlSink {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// Whether the rollback journal table is known to exist.
+    pub(crate) journal_ready: std::sync::atomic::AtomicBool,
 }
 
 /// Quote a MySQL identifier using backticks.
@@ -188,10 +190,12 @@ pub(crate) fn bind_value<'q>(
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 q.bind(i)
+            } else if let Some(u) = n.as_u64() {
+                // Above i64::MAX: exact, never through f64 (#789 SQL-73).
+                q.bind(u)
             } else if let Some(f) = n.as_f64() {
                 q.bind(f)
             } else {
-                // u64 above i64::MAX — preserve exact text.
                 q.bind(n.to_string())
             }
         }
@@ -200,6 +204,229 @@ pub(crate) fn bind_value<'q>(
         // text (suitable for TEXT / JSON columns).
         other => q.bind(other.to_string()),
     }
+}
+
+/// A table's `(column, lowercase DATA_TYPE)` pairs in declared order.
+pub(crate) async fn table_columns(
+    conn: &mut MySqlConnection,
+    table: &str,
+) -> Result<Vec<(String, String)>, FaucetError> {
+    let columns: Vec<(String, String)> = sqlx::query(
+        "SELECT COLUMN_NAME, CAST(DATA_TYPE AS CHAR) AS DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION",
+    )
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
+    .iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("COLUMN_NAME"),
+            row.get::<String, _>("DATA_TYPE").to_ascii_lowercase(),
+        )
+    })
+    .collect();
+    if columns.is_empty() {
+        return Err(FaucetError::Sink(format!(
+            "table '{table}' has no columns or does not exist"
+        )));
+    }
+    Ok(columns)
+}
+
+/// Run a write under `secs` (0 = unbounded): a server that stops answering
+/// fails the write instead of hanging the run forever (#789 SQL-109).
+pub(crate) async fn bounded<T>(
+    secs: u64,
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, FaucetError>>,
+) -> Result<T, FaucetError> {
+    if secs == 0 {
+        return fut.await;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+        Ok(result) => result,
+        Err(_) => Err(FaucetError::Sink(format!(
+            "mysql {what} timed out after {secs}s waiting for the server (write_timeout_secs)"
+        ))),
+    }
+}
+
+/// What else hangs off a table that a `RENAME TABLE` swap would lose.
+#[derive(Debug, Default)]
+pub(crate) struct Dependents {
+    /// Other tables whose foreign keys reference this one.
+    pub(crate) referenced_by: Vec<String>,
+    /// This table's own foreign keys plus its triggers: neither moves to a
+    /// renamed-in replacement (#789 SQL-108).
+    pub(crate) pinned: Vec<String>,
+}
+
+pub(crate) async fn table_dependents(
+    conn: &mut MySqlConnection,
+    table: &str,
+) -> Result<Dependents, FaucetError> {
+    let err = |e: sqlx::Error| FaucetError::Sink(format!("mysql: read dependents of {table}: {e}"));
+    let referenced_by: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT CAST(TABLE_NAME AS CHAR) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS \
+         WHERE CONSTRAINT_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME = ? AND TABLE_NAME <> ? \
+         ORDER BY 1",
+    )
+    .bind(table)
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(err)?;
+    let mut pinned: Vec<String> = sqlx::query_scalar(
+        "SELECT CONCAT('foreign key ', CAST(CONSTRAINT_NAME AS CHAR)) \
+         FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS \
+         WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY 1",
+    )
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(err)?;
+    let triggers: Vec<String> = sqlx::query_scalar(
+        "SELECT CONCAT('trigger ', CAST(TRIGGER_NAME AS CHAR)) FROM INFORMATION_SCHEMA.TRIGGERS \
+         WHERE TRIGGER_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = ? ORDER BY 1",
+    )
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(err)?;
+    pinned.extend(triggers);
+    Ok(Dependents {
+        referenced_by,
+        pinned,
+    })
+}
+
+/// A table's non-generated columns, in order.
+pub(crate) async fn insertable_columns(
+    conn: &mut MySqlConnection,
+    table: &str,
+) -> Result<Vec<String>, FaucetError> {
+    let rows = sqlx::query(
+        "SELECT CAST(COLUMN_NAME AS CHAR) AS COLUMN_NAME, CAST(EXTRA AS CHAR) AS EXTRA \
+         FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() \
+         ORDER BY ORDINAL_POSITION",
+    )
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| FaucetError::Sink(format!("mysql: read columns of {table}: {e}")))?;
+    Ok(rows
+        .iter()
+        .filter(|r| {
+            let extra = r
+                .get::<Option<String>, _>("EXTRA")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            !extra.contains("generated") || extra.contains("default_generated")
+        })
+        .map(|r| r.get("COLUMN_NAME"))
+        .collect())
+}
+
+/// Replace every row of `target` with the rows of `source` in one transaction
+/// (`DELETE` + `INSERT … SELECT` over the shared non-generated columns), so the
+/// target keeps its foreign keys and triggers — which fire for these rows.
+pub(crate) async fn replace_rows_in_place(
+    conn: &mut MySqlConnection,
+    target: &str,
+    source: &str,
+) -> Result<(), FaucetError> {
+    let into = insertable_columns(&mut *conn, target).await?;
+    let from = insertable_columns(&mut *conn, source).await?;
+    let cols = into
+        .iter()
+        .filter(|c| from.contains(c))
+        .map(|c| quote_ident_mysql(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (t, s) = (quote_ident_mysql(target), quote_ident_mysql(source));
+    let err = |e: sqlx::Error| FaucetError::Sink(format!("mysql overwrite: replace rows: {e}"));
+    let mut tx = sqlx::Connection::begin(&mut *conn).await.map_err(err)?;
+    for stmt in [
+        format!("DELETE FROM {t}"),
+        format!("INSERT INTO {t} ({cols}) SELECT {cols} FROM {s}"),
+    ] {
+        sqlx::query(&stmt).execute(&mut *tx).await.map_err(err)?;
+    }
+    tx.commit().await.map_err(err)?;
+    Ok(())
+}
+
+/// The refusal for an overwrite of a table other tables reference: InnoDB
+/// re-points their foreign keys at the renamed-away table (#789 SQL-129), and a
+/// `DELETE` would cascade into or be blocked by them.
+pub(crate) fn referenced_overwrite_error(table: &str, referenced_by: &[String]) -> FaucetError {
+    FaucetError::Config(format!(
+        "mysql overwrite: table '{table}' is referenced by a foreign key from {}; replacing its \
+         rows would cascade into, break or be blocked by those tables. Use write_mode: upsert, \
+         or drop the foreign key",
+        referenced_by.join(", ")
+    ))
+}
+
+/// The `(column, type, value)` triples a record carries, in table order.
+/// MySQL column names are case-insensitive, so a field matches its column
+/// exactly first and otherwise ignoring ASCII case (#789 SQL-50).
+pub(crate) fn match_columns<'a>(
+    columns: &'a [(String, String)],
+    obj: &'a serde_json::Map<String, Value>,
+) -> Vec<(&'a String, &'a String, &'a Value)> {
+    columns
+        .iter()
+        .filter_map(|(col, ty)| {
+            obj.get(col)
+                .or_else(|| {
+                    obj.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(col))
+                        .map(|(_, v)| v)
+                })
+                .map(|v| (col, ty, v))
+        })
+        .collect()
+}
+
+/// The error text for a record that matches no column of the target.
+fn no_matching_column_message(
+    idx: usize,
+    obj: &serde_json::Map<String, Value>,
+    columns: &[(String, String)],
+) -> String {
+    format!(
+        "mysql: record {idx} has no field matching a column of the target table \
+         (record fields: {:?}; table columns: {:?})",
+        obj.keys().collect::<Vec<_>>(),
+        columns.iter().map(|(c, _)| c).collect::<Vec<_>>()
+    )
+}
+
+/// Split a page into per-row outcomes and the records to write: a record that
+/// matches no column fails on its own row instead of failing the page.
+fn split_unmatched(
+    records: &[Value],
+    columns: &[(String, String)],
+) -> (Vec<faucet_core::RowOutcome>, Vec<Value>) {
+    let mut outcomes = Vec::with_capacity(records.len());
+    let mut writable = Vec::with_capacity(records.len());
+    for (idx, record) in records.iter().enumerate() {
+        match record.as_object() {
+            Some(obj) if match_columns(columns, obj).is_empty() => {
+                outcomes.push(Err(FaucetError::Sink(no_matching_column_message(
+                    idx, obj, columns,
+                ))));
+            }
+            _ => {
+                outcomes.push(Ok(()));
+                writable.push(record.clone());
+            }
+        }
+    }
+    (outcomes, writable)
 }
 
 /// Whether a MySQL `DATA_TYPE` stores raw bytes.
@@ -298,6 +525,20 @@ struct MysqlColumnDef {
 /// `ALTER TABLE … MODIFY COLUMN` that keeps `def` exactly and only drops NOT
 /// NULL. `None` for a generated column, whose definition is not reproduced.
 fn relax_column_sql(table: &str, col: &str, def: &MysqlColumnDef) -> Option<String> {
+    redefine_column_sql(table, col, def, None, true)
+}
+
+/// `ALTER TABLE … MODIFY COLUMN` that re-emits `def` — charset, collation,
+/// default, AUTO_INCREMENT, ON UPDATE, comment — with `new_type` in place of
+/// its type when given (a numeric type drops the text-only charset/collation)
+/// and `NULL`/`NOT NULL` per `nullable`. `None` for a generated column.
+fn redefine_column_sql(
+    table: &str,
+    col: &str,
+    def: &MysqlColumnDef,
+    new_type: Option<&str>,
+    nullable: bool,
+) -> Option<String> {
     let extra = def.extra.to_ascii_lowercase();
     if extra.contains("generated") && !extra.contains("default_generated") {
         return None;
@@ -306,15 +547,17 @@ fn relax_column_sql(table: &str, col: &str, def: &MysqlColumnDef) -> Option<Stri
     let mut sql = format!(
         "ALTER TABLE {table} MODIFY COLUMN {} {}",
         quote_ident_mysql(col),
-        def.column_type
+        new_type.unwrap_or(&def.column_type)
     );
-    if let Some(cs) = &def.charset {
-        sql.push_str(&format!(" CHARACTER SET {cs}"));
+    if new_type.is_none() {
+        if let Some(cs) = &def.charset {
+            sql.push_str(&format!(" CHARACTER SET {cs}"));
+        }
+        if let Some(co) = &def.collation {
+            sql.push_str(&format!(" COLLATE {co}"));
+        }
     }
-    if let Some(co) = &def.collation {
-        sql.push_str(&format!(" COLLATE {co}"));
-    }
-    sql.push_str(" NULL");
+    sql.push_str(if nullable { " NULL" } else { " NOT NULL" });
     if let Some(d) = &def.default {
         if extra.contains("default_generated") {
             let upper = d.to_ascii_uppercase();
@@ -356,15 +599,15 @@ fn build_add_column_sql(table: &str, col: &str, t: SqlBaseType) -> String {
     )
 }
 
-/// `ALTER TABLE <table> MODIFY COLUMN `col` <kw>` — widen an existing column's
-/// type. Naturally idempotent (re-running the same MODIFY is a no-op). `table`
-/// is the already-quoted table reference.
-fn build_modify_column_sql(table: &str, col: &str, t: SqlBaseType) -> String {
-    format!(
-        "ALTER TABLE {table} MODIFY COLUMN {} {}",
-        quote_ident_mysql(col),
-        mysql_keyword(t)
-    )
+/// The type a widening rewrites a column to: exact `DECIMAL(65,30)` for an
+/// integer column that starts receiving fractions, otherwise the base type's
+/// keyword. A value outside DECIMAL's range then fails loudly instead of being
+/// rounded.
+fn widened_type(from: Option<SqlBaseType>, to: SqlBaseType) -> &'static str {
+    match (from, to) {
+        (Some(SqlBaseType::Integer), SqlBaseType::Double) => "DECIMAL(65,30)",
+        _ => mysql_keyword(to),
+    }
 }
 
 /// Map a MySQL `INFORMATION_SCHEMA.COLUMNS.DATA_TYPE` value (lowercase, no
@@ -426,6 +669,28 @@ fn key_matches_unique_index(
     unique_indexes.contains(&key_set)
 }
 
+/// The unique indexes other than the one `key` names, each rendered
+/// `(col, …)`.
+fn other_unique_indexes(
+    unique_indexes: &[std::collections::BTreeSet<String>],
+    key: &[String],
+) -> Vec<String> {
+    let key_set: std::collections::BTreeSet<String> = key.iter().cloned().collect();
+    unique_indexes
+        .iter()
+        .filter(|idx| **idx != key_set)
+        .map(|idx| {
+            format!(
+                "({})",
+                idx.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect()
+}
+
 fn on_duplicate_clause(key: &[String], all_cols: &[String]) -> String {
     let updates: Vec<String> = all_cols
         .iter()
@@ -444,6 +709,47 @@ fn on_duplicate_clause(key: &[String], all_cols: &[String]) -> String {
 }
 
 impl MysqlSink {
+    /// A column's definition and whether it is nullable, or `None` when the
+    /// column does not exist.
+    async fn column_definition(
+        &self,
+        conn: &mut MySqlConnection,
+        col: &str,
+    ) -> Result<Option<(MysqlColumnDef, bool)>, FaucetError> {
+        let row = sqlx::query(
+            "SELECT CAST(COLUMN_TYPE AS CHAR) AS COLUMN_TYPE, \
+                    CAST(CHARACTER_SET_NAME AS CHAR) AS CHARACTER_SET_NAME, \
+                    CAST(COLLATION_NAME AS CHAR) AS COLLATION_NAME, \
+                    CAST(COLUMN_DEFAULT AS CHAR) AS COLUMN_DEFAULT, \
+                    CAST(EXTRA AS CHAR) AS EXTRA, \
+                    CAST(COLUMN_COMMENT AS CHAR) AS COLUMN_COMMENT, \
+                    CAST(IS_NULLABLE AS CHAR) AS IS_NULLABLE \
+               FROM INFORMATION_SCHEMA.COLUMNS \
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+        )
+        .bind(&self.config.table_name)
+        .bind(col)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("MySQL read definition of {col} failed: {e}")))?;
+        Ok(row.map(|row| {
+            let def = MysqlColumnDef {
+                column_type: row.get("COLUMN_TYPE"),
+                charset: row.get("CHARACTER_SET_NAME"),
+                collation: row.get("COLLATION_NAME"),
+                default: row.get("COLUMN_DEFAULT"),
+                extra: row.get::<Option<String>, _>("EXTRA").unwrap_or_default(),
+                comment: row
+                    .get::<Option<String>, _>("COLUMN_COMMENT")
+                    .unwrap_or_default(),
+            };
+            let nullable = row
+                .get::<Option<String>, _>("IS_NULLABLE")
+                .is_some_and(|n| n.eq_ignore_ascii_case("YES"));
+            (def, nullable)
+        }))
+    }
+
     /// Make sure the target table exists before the first write (#580).
     ///
     /// Runs once per sink instance. With `create_table: true` (the default) a
@@ -536,6 +842,7 @@ impl MysqlSink {
             config,
             pool,
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            journal_ready: std::sync::atomic::AtomicBool::new(false),
         };
 
         // For upsert/delete, MySQL's anonymous `ON DUPLICATE KEY UPDATE` /
@@ -658,6 +965,20 @@ impl MysqlSink {
                 available.join(", "),
             )));
         }
+        if self.config.write.write_mode == faucet_core::WriteMode::Upsert {
+            let others = other_unique_indexes(&unique_indexes, &self.config.write.key);
+            if !others.is_empty() {
+                return Err(FaucetError::Config(format!(
+                    "mysql sink: write_mode upsert on table '{}' needs `key` {:?} to be its only \
+                     PRIMARY KEY / UNIQUE index — `ON DUPLICATE KEY UPDATE` fires on whichever \
+                     unique index a row collides with, so a collision on {} would update a \
+                     different row instead of inserting this one (#789 SQL-76)",
+                    self.config.table_name,
+                    self.config.write.key,
+                    others.join(", "),
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -724,27 +1045,7 @@ impl MysqlSink {
 
         // Column names and base types, in declared order.
         let effective_table = self.effective_table_name();
-        let columns: Vec<(String, String)> = sqlx::query(
-            "SELECT COLUMN_NAME, CAST(DATA_TYPE AS CHAR) AS DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION"
-        )
-        .bind(&effective_table)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
-        .iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("COLUMN_NAME"),
-                row.get::<String, _>("DATA_TYPE").to_ascii_lowercase(),
-            )
-        })
-        .collect();
-
-        if columns.is_empty() {
-            return Err(FaucetError::Sink(format!(
-                "table '{effective_table}' has no columns or does not exist"
-            )));
-        }
+        let columns = table_columns(&mut *conn, &effective_table).await?;
 
         // Pre-validate all records and collect matched column values per
         // record, in declared table order.
@@ -752,23 +1053,18 @@ impl MysqlSink {
             Vec::with_capacity(records.len());
         let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
-        for record in records {
+        for (idx, record) in records.iter().enumerate() {
             let obj = record
                 .as_object()
                 .ok_or_else(|| FaucetError::Sink("AutoMap requires JSON object records".into()))?;
 
-            let matching: Vec<(&String, &String, &Value)> = columns
-                .iter()
-                .filter_map(|(col, ty)| obj.get(col).map(|v| (col, ty, v)))
-                .collect();
+            let matching = match_columns(&columns, obj);
 
             if matching.is_empty() {
-                tracing::warn!(
-                    record_keys = ?obj.keys().collect::<Vec<_>>(),
-                    table_columns = ?columns,
-                    "record has no keys matching table columns, skipping"
-                );
-                continue;
+                // Never a silent skip (#789 SQL-50).
+                return Err(FaucetError::Sink(no_matching_column_message(
+                    idx, obj, &columns,
+                )));
             }
 
             for (c, _, _) in &matching {
@@ -961,6 +1257,9 @@ impl MysqlSink {
     /// transaction. Upserts and deletes are wrapped together so they commit
     /// atomically.
     async fn apply_plan(&self, plan: &faucet_core::WritePlan) -> Result<usize, FaucetError> {
+        if self.config.write.journals() {
+            self.ensure_journal().await?;
+        }
         let mut tx = self
             .pool
             .begin()
@@ -1205,6 +1504,192 @@ impl MysqlSink {
     }
 }
 
+impl MysqlSink {
+    async fn write_batch_unbounded(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_table_ready(records).await?;
+
+        // Upsert/delete modes: plan the writes and apply atomically. Append and
+        // overwrite are insert-shaped (overwrite lands in the staging table via
+        // `effective_table_name`).
+        if matches!(
+            self.config.write.write_mode,
+            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
+        ) {
+            let plan = faucet_core::plan_writes(records, &self.config.write);
+            if let Some((idx, msg)) = plan.failed.first() {
+                return Err(FaucetError::Sink(format!(
+                    "mysql {}: row {idx}: {msg}",
+                    self.config.write.write_mode.as_str()
+                )));
+            }
+            return self.apply_plan(&plan).await;
+        }
+
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
+
+        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
+            // Sentinel: pass the entire upstream page through in a single
+            // multi-row INSERT. Subject to MySQL's max_allowed_packet
+            // (default 64MB).
+            vec![records]
+        } else {
+            records.chunks(self.config.batch_size).collect()
+        };
+
+        let mut total = 0;
+        for chunk in chunks {
+            total += match &self.config.column_mapping {
+                MysqlColumnMapping::Json { column } => {
+                    self.insert_json(&mut conn, chunk, column).await?
+                }
+                MysqlColumnMapping::AutoMap => self.insert_auto_map(&mut conn, chunk).await?,
+            };
+        }
+
+        tracing::info!(
+            table = %self.config.table_name,
+            rows = total,
+            "MySQL write complete"
+        );
+        Ok(total)
+    }
+
+    async fn write_batch_partial_unbounded(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
+        if !matches!(
+            self.config.write.write_mode,
+            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
+        ) {
+            // Append and overwrite: insert-shaped. A record matching no column
+            // is that row's failure, not a silent skip (#789 SQL-50).
+            if !matches!(self.config.column_mapping, MysqlColumnMapping::AutoMap) {
+                self.write_batch_unbounded(records).await?;
+                return Ok(records.iter().map(|_| Ok(())).collect());
+            }
+            let mut conn =
+                self.pool.acquire().await.map_err(|e| {
+                    FaucetError::Sink(format!("MySQL connection acquire failed: {e}"))
+                })?;
+            let columns = table_columns(&mut conn, &self.effective_table_name()).await?;
+            drop(conn);
+            let (outcomes, writable) = split_unmatched(records, &columns);
+            self.write_batch_unbounded(&writable).await?;
+            return Ok(outcomes);
+        }
+
+        let plan = faucet_core::plan_writes(records, &self.config.write);
+        self.apply_plan(&plan).await?;
+
+        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
+        for (idx, msg) in &plan.failed {
+            outcomes[*idx] = Err(FaucetError::Sink(format!(
+                "mysql {}: {msg}",
+                self.config.write.write_mode.as_str()
+            )));
+        }
+        Ok(outcomes)
+    }
+
+    async fn write_batch_idempotent_unbounded(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<usize, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
+        self.ensure_commit_table().await?;
+
+        // For upsert/delete modes, plan the page before opening the transaction
+        // so a key-extraction failure aborts without leaving an open tx.
+        let plan = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
+            None
+        } else {
+            let plan = faucet_core::plan_writes(records, &self.config.write);
+            if let Some((idx, msg)) = plan.failed.first() {
+                return Err(FaucetError::Sink(format!(
+                    "mysql {}: row {idx}: {msg}",
+                    self.config.write.write_mode.as_str()
+                )));
+            }
+            Some(plan)
+        };
+        if plan.is_some() && self.config.write.journals() {
+            self.ensure_journal().await?;
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL transaction begin failed: {e}")))?;
+
+        // Data write and the commit-token upsert share ONE transaction so the
+        // page is committed atomically with its watermark. For upsert/delete the
+        // planned upserts/deletes commit together with the watermark in this same
+        // tx (no nested tx — the helpers run on this transaction's connection).
+        let written = match &plan {
+            Some(plan) => {
+                if self.config.write.journals()
+                    && let Some(run_id) = self.config.write.rollback_run_id()
+                {
+                    self.journal_plan(&mut tx, plan, run_id).await?;
+                }
+                let mut affected = 0usize;
+                if !plan.upserts.is_empty() {
+                    affected += self
+                        .insert_auto_map_with_conflict(
+                            &mut tx,
+                            &plan.upserts,
+                            Some(&self.config.write.key),
+                        )
+                        .await?;
+                }
+                if !plan.deletes.is_empty() {
+                    affected += self.delete_by_keys(&mut tx, &plan.deletes).await?;
+                }
+                affected
+            }
+            None => match &self.config.column_mapping {
+                MysqlColumnMapping::Json { column } => {
+                    self.insert_json(&mut tx, records, column).await?
+                }
+                MysqlColumnMapping::AutoMap => self.insert_auto_map(&mut tx, records).await?,
+            },
+        };
+
+        let upsert = format!(
+            "INSERT INTO {t} ({s}, {k}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {k} = VALUES({k})",
+            t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
+            s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
+            k = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
+        );
+        sqlx::query(&upsert)
+            .bind(scope_key(scope))
+            .bind(token)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL token upsert failed: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL transaction commit failed: {e}")))?;
+
+        Ok(written)
+    }
+}
+
 #[async_trait]
 impl faucet_core::Sink for MysqlSink {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
@@ -1308,6 +1793,15 @@ impl faucet_core::Sink for MysqlSink {
             .acquire()
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
+        if !first_run {
+            let deps = table_dependents(&mut conn, &self.config.table_name).await?;
+            if !deps.referenced_by.is_empty() {
+                return Err(referenced_overwrite_error(
+                    &self.config.table_name,
+                    &deps.referenced_by,
+                ));
+            }
+        }
         let mut stmts = vec![
             format!("DROP TABLE IF EXISTS {staging}"),
             format!("DROP TABLE IF EXISTS {old}"),
@@ -1351,6 +1845,42 @@ impl faucet_core::Sink for MysqlSink {
                         FaucetError::Sink(format!("mysql overwrite: publish staging: {e}"))
                     })?;
             }
+            return Ok(());
+        }
+        // A target with foreign keys or triggers keeps its definition: its
+        // rows are replaced in place instead of renaming staging over it,
+        // which would publish a table without them (#789 SQL-108).
+        let deps = table_dependents(&mut conn, &self.config.table_name).await?;
+        if !deps.referenced_by.is_empty() {
+            return Err(referenced_overwrite_error(
+                &self.config.table_name,
+                &deps.referenced_by,
+            ));
+        }
+        if !deps.pinned.is_empty() {
+            if self.config.write.keeps_previous() {
+                let prev = self.previous_table_name();
+                let q = quote_ident_mysql(&prev);
+                for stmt in [
+                    format!("DROP TABLE IF EXISTS {q}"),
+                    format!("CREATE TABLE {q} LIKE {target}"),
+                ] {
+                    sqlx::query(&stmt).execute(&mut *conn).await.map_err(|e| {
+                        FaucetError::Sink(format!("mysql overwrite: keep previous copy: {e}"))
+                    })?;
+                }
+                replace_rows_in_place(&mut conn, &prev, &self.config.table_name).await?;
+            }
+            replace_rows_in_place(
+                &mut conn,
+                &self.config.table_name,
+                &self.staging_table_name(),
+            )
+            .await?;
+            sqlx::query(&format!("DROP TABLE IF EXISTS {staging}"))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("mysql overwrite: drop staging: {e}")))?;
             return Ok(());
         }
         // `rollback.keep_previous`: the replaced table is kept as
@@ -1523,13 +2053,31 @@ impl faucet_core::Sink for MysqlSink {
         }
 
         for c in &evolution.widenings {
+            // An integer column that starts receiving fractions becomes an
+            // exact DECIMAL, never DOUBLE (which would round every stored value
+            // above 2^53), and MODIFY re-emits the rest of the definition so
+            // NOT NULL, the default and the comment survive (#789 SQL-78).
             let t = json_schema_base_type(&c.to).unwrap_or(SqlBaseType::Text);
-            sqlx::query(&build_modify_column_sql(&table_ref, &c.name, t))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| {
-                    FaucetError::Sink(format!("MySQL MODIFY COLUMN {} failed: {e}", c.name))
-                })?;
+            let new_type = widened_type(c.from.as_ref().and_then(json_schema_base_type), t);
+            let sql = match self.column_definition(&mut conn, &c.name).await? {
+                Some((def, nullable)) => {
+                    if def.extra.to_ascii_lowercase().contains("auto_increment") {
+                        return Err(FaucetError::SchemaDrift {
+                            columns: vec![c.name.clone()],
+                            message: format!(
+                                "mysql: column {} is AUTO_INCREMENT and cannot widen to {new_type}",
+                                c.name
+                            ),
+                        });
+                    }
+                    redefine_column_sql(&table_ref, &c.name, &def, Some(new_type), nullable)
+                }
+                None => None,
+            };
+            let Some(sql) = sql else { continue };
+            sqlx::query(&sql).execute(&mut *conn).await.map_err(|e| {
+                FaucetError::Sink(format!("MySQL MODIFY COLUMN {} failed: {e}", c.name))
+            })?;
         }
 
         for col in &evolution.relax_nullability {
@@ -1537,33 +2085,8 @@ impl faucet_core::Sink for MysqlSink {
             // the column exactly as it is — type, charset, collation, default,
             // AUTO_INCREMENT, ON UPDATE, comment — with only NOT NULL dropped
             // (#789 SQL-33).
-            let row = sqlx::query(
-                "SELECT CAST(COLUMN_TYPE AS CHAR) AS COLUMN_TYPE, \
-                        CAST(CHARACTER_SET_NAME AS CHAR) AS CHARACTER_SET_NAME, \
-                        CAST(COLLATION_NAME AS CHAR) AS COLLATION_NAME, \
-                        CAST(COLUMN_DEFAULT AS CHAR) AS COLUMN_DEFAULT, \
-                        CAST(EXTRA AS CHAR) AS EXTRA, \
-                        CAST(COLUMN_COMMENT AS CHAR) AS COLUMN_COMMENT \
-                   FROM INFORMATION_SCHEMA.COLUMNS \
-                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
-            )
-            .bind(&self.config.table_name)
-            .bind(col)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| {
-                FaucetError::Sink(format!("MySQL read definition of {col} failed: {e}"))
-            })?;
-            let Some(row) = row else { continue };
-            let def = MysqlColumnDef {
-                column_type: row.get("COLUMN_TYPE"),
-                charset: row.get("CHARACTER_SET_NAME"),
-                collation: row.get("COLLATION_NAME"),
-                default: row.get("COLUMN_DEFAULT"),
-                extra: row.get::<Option<String>, _>("EXTRA").unwrap_or_default(),
-                comment: row
-                    .get::<Option<String>, _>("COLUMN_COMMENT")
-                    .unwrap_or_default(),
+            let Some((def, _)) = self.column_definition(&mut conn, col).await? else {
+                continue;
             };
             let Some(sql) = relax_column_sql(&table_ref, col, &def) else {
                 tracing::warn!(column = %col, "mysql: not relaxing NOT NULL on a generated column");
@@ -1591,59 +2114,12 @@ impl faucet_core::Sink for MysqlSink {
     /// through it under autocommit (no explicit transaction), preserving the
     /// pre-refactor observable behaviour.
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        self.ensure_table_ready(records).await?;
-
-        // Upsert/delete modes: plan the writes and apply atomically. Append and
-        // overwrite are insert-shaped (overwrite lands in the staging table via
-        // `effective_table_name`).
-        if matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "mysql {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            return self.apply_plan(&plan).await;
-        }
-
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
-
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            // Sentinel: pass the entire upstream page through in a single
-            // multi-row INSERT. Subject to MySQL's max_allowed_packet
-            // (default 64MB).
-            vec![records]
-        } else {
-            records.chunks(self.config.batch_size).collect()
-        };
-
-        let mut total = 0;
-        for chunk in chunks {
-            total += match &self.config.column_mapping {
-                MysqlColumnMapping::Json { column } => {
-                    self.insert_json(&mut conn, chunk, column).await?
-                }
-                MysqlColumnMapping::AutoMap => self.insert_auto_map(&mut conn, chunk).await?,
-            };
-        }
-
-        tracing::info!(
-            table = %self.config.table_name,
-            rows = total,
-            "MySQL write complete"
-        );
-        Ok(total)
+        bounded(
+            self.config.write_timeout_secs,
+            "write_batch",
+            self.write_batch_unbounded(records),
+        )
+        .await
     }
 
     /// Write a batch and report per-row outcomes.
@@ -1658,28 +2134,12 @@ impl faucet_core::Sink for MysqlSink {
         &self,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        // The DLQ and exactly-once paths must create a missing target too (#676).
-        self.ensure_table_ready(records).await?;
-        if !matches!(
-            self.config.write.write_mode,
-            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) {
-            // Append and overwrite: insert-shaped, no per-row key failures.
-            self.write_batch(records).await?;
-            return Ok(records.iter().map(|_| Ok(())).collect());
-        }
-
-        let plan = faucet_core::plan_writes(records, &self.config.write);
-        self.apply_plan(&plan).await?;
-
-        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
-        for (idx, msg) in &plan.failed {
-            outcomes[*idx] = Err(FaucetError::Sink(format!(
-                "mysql {}: {msg}",
-                self.config.write.write_mode.as_str()
-            )));
-        }
-        Ok(outcomes)
+        bounded(
+            self.config.write_timeout_secs,
+            "write_batch_partial",
+            self.write_batch_partial_unbounded(records),
+        )
+        .await
     }
 
     fn supports_idempotent_writes(&self) -> bool {
@@ -1708,83 +2168,12 @@ impl faucet_core::Sink for MysqlSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        // The DLQ and exactly-once paths must create a missing target too (#676).
-        self.ensure_table_ready(records).await?;
-        self.ensure_commit_table().await?;
-
-        // For upsert/delete modes, plan the page before opening the transaction
-        // so a key-extraction failure aborts without leaving an open tx.
-        let plan = if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-            None
-        } else {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            if let Some((idx, msg)) = plan.failed.first() {
-                return Err(FaucetError::Sink(format!(
-                    "mysql {}: row {idx}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
-            }
-            Some(plan)
-        };
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL transaction begin failed: {e}")))?;
-
-        // Data write and the commit-token upsert share ONE transaction so the
-        // page is committed atomically with its watermark. For upsert/delete the
-        // planned upserts/deletes commit together with the watermark in this same
-        // tx (no nested tx — the helpers run on this transaction's connection).
-        let written = match &plan {
-            Some(plan) => {
-                if self.config.write.journals()
-                    && let Some(run_id) = self.config.write.rollback_run_id()
-                {
-                    self.journal_plan(&mut tx, plan, run_id).await?;
-                }
-                let mut affected = 0usize;
-                if !plan.upserts.is_empty() {
-                    affected += self
-                        .insert_auto_map_with_conflict(
-                            &mut tx,
-                            &plan.upserts,
-                            Some(&self.config.write.key),
-                        )
-                        .await?;
-                }
-                if !plan.deletes.is_empty() {
-                    affected += self.delete_by_keys(&mut tx, &plan.deletes).await?;
-                }
-                affected
-            }
-            None => match &self.config.column_mapping {
-                MysqlColumnMapping::Json { column } => {
-                    self.insert_json(&mut tx, records, column).await?
-                }
-                MysqlColumnMapping::AutoMap => self.insert_auto_map(&mut tx, records).await?,
-            },
-        };
-
-        let upsert = format!(
-            "INSERT INTO {t} ({s}, {k}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {k} = VALUES({k})",
-            t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
-            s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
-            k = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
-        );
-        sqlx::query(&upsert)
-            .bind(scope_key(scope))
-            .bind(token)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL token upsert failed: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL transaction commit failed: {e}")))?;
-
-        Ok(written)
+        bounded(
+            self.config.write_timeout_secs,
+            "write_batch_idempotent",
+            self.write_batch_idempotent_unbounded(records, scope, token),
+        )
+        .await
     }
 }
 
@@ -1933,12 +2322,69 @@ mod tests {
     }
 
     #[test]
-    fn mysql_modify_column_ddl() {
-        let sql = build_modify_column_sql("`t`", "score", SqlBaseType::Double);
-        assert_eq!(sql, "ALTER TABLE `t` MODIFY COLUMN `score` DOUBLE");
+    fn widening_redefines_the_column_with_an_exact_type() {
+        assert_eq!(
+            widened_type(Some(SqlBaseType::Integer), SqlBaseType::Double),
+            "DECIMAL(65,30)"
+        );
+        assert_eq!(widened_type(None, SqlBaseType::Double), "DOUBLE");
+        let def = MysqlColumnDef {
+            column_type: "bigint".into(),
+            default: Some("0".into()),
+            comment: "cents".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            redefine_column_sql("`t`", "amount", &def, Some("DECIMAL(65,30)"), false).as_deref(),
+            Some(
+                "ALTER TABLE `t` MODIFY COLUMN `amount` DECIMAL(65,30) NOT NULL DEFAULT '0' COMMENT 'cents'"
+            )
+        );
+        let text = MysqlColumnDef {
+            column_type: "varchar(10)".into(),
+            charset: Some("utf8mb4".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            redefine_column_sql("`t`", "s", &text, Some("LONGTEXT"), true).as_deref(),
+            Some("ALTER TABLE `t` MODIFY COLUMN `s` LONGTEXT NULL")
+        );
+    }
 
-        let sql = build_modify_column_sql("`t`", "flag", SqlBaseType::Boolean);
-        assert_eq!(sql, "ALTER TABLE `t` MODIFY COLUMN `flag` TINYINT(1)");
+    #[test]
+    fn other_unique_indexes_lists_every_index_but_the_key() {
+        let idx = |cols: &[&str]| -> std::collections::BTreeSet<String> {
+            cols.iter().map(|c| c.to_string()).collect()
+        };
+        let indexes = vec![idx(&["id"]), idx(&["email"]), idx(&["a", "b"])];
+        assert_eq!(
+            other_unique_indexes(&indexes, &keyvec(&["id"])),
+            vec!["(email)".to_string(), "(a, b)".to_string()]
+        );
+        assert!(other_unique_indexes(&[idx(&["id"])], &keyvec(&["id"])).is_empty());
+    }
+
+    #[test]
+    fn unmatched_records_split_off_case_insensitively() {
+        let cols = vec![
+            ("userId".to_string(), "int".to_string()),
+            ("kind".to_string(), "varchar".to_string()),
+        ];
+        let obj = serde_json::json!({"USERID": 1, "Kind": "a"});
+        let matched = match_columns(&cols, obj.as_object().unwrap());
+        assert_eq!(matched.len(), 2);
+        let (outcomes, writable) = split_unmatched(
+            &[
+                obj.clone(),
+                serde_json::json!({"other": 1}),
+                serde_json::json!(1),
+            ],
+            &cols,
+        );
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
+        let err = outcomes[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("record 1 has no field matching"), "{err}");
+        assert_eq!(writable.len(), 2);
     }
 
     #[test]

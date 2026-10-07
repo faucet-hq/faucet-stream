@@ -408,6 +408,17 @@ Inspect the exact fields with `faucet schema source <name>` / `faucet schema sin
 - **MongoDB CDC source** — `max_staged_records` (default unbounded) caps the
   in-memory change-event buffer (including under `batch_size: 0`) and aborts with
   a typed error rather than risking OOM, mirroring `postgres-cdc` / `mysql-cdc`.
+- **Postgres / MySQL query sources — JSON columns** — a number inside a `json` /
+  `jsonb` / `JSON` column that a 64-bit float cannot hold exactly (more than about
+  17 significant digits, or beyond the 64-bit integer range) fails the read with
+  an error naming the column — it is never silently rounded. Set
+  `json_big_numbers: string` on the source to emit such numbers as JSON strings
+  holding their exact digits instead (one warning per column). The check runs on
+  the column's text, before any conversion. *(Breaking default change.)*
+- **Postgres / MySQL query sources — timeouts** — `read_timeout_secs` (default
+  3600, `0` = forever) bounds every wait for the next row; the MySQL source also
+  sets the session's `net_write_timeout` (`net_write_timeout_secs`, default 3600)
+  so a slow sink does not make the server abort a large result.
 
 ## Schema evolution
 

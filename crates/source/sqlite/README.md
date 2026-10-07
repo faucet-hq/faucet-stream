@@ -13,7 +13,7 @@ SQLite is an in-process, file-based engine — there is no server, no network wi
 
 - **Native cursor streaming** — overrides `Source::stream_pages` to drive a sqlx row cursor (`Query::fetch`) without buffering the whole result. Rows are accumulated into a `batch_size` buffer and yielded as a `StreamPage` as soon as it fills, so peak client-side memory is `O(batch_size)` and the sink can start writing while the rest of the table is still being read off disk.
 - **`batch_size: 0` "no batching" sentinel** — drain the entire cursor into one page for small lookup tables or for sinks that prefer one large request to many small ones.
-- **Dynamic-type aware decoding** — SQLite's storage classes (INTEGER, REAL, TEXT, BLOB, NULL) are probed in order of specificity; TEXT that parses as JSON is returned as a native JSON value, BLOBs are base64-encoded so binary survives the round-trip.
+- **Dynamic-type aware decoding** — SQLite's storage classes (INTEGER, REAL, TEXT, BLOB, NULL) are probed in order of specificity; TEXT holding a JSON object or array is returned as that native JSON value (any other TEXT — `'19.90'`, `'00501'`, `'null'` — stays a string), a column declared `BOOLEAN` yields `true`/`false`, BLOBs are base64-encoded so binary survives the round-trip.
 - **Connection pooling** — a `sqlx::SqlitePool` is built once in `new()` and reused for every query; pool size is configurable.
 - **Safe parameter binding** — in a parent/child matrix run, `${parent.field}` tokens in the query are bound as positional `?` parameters, so values are never string-interpolated into SQL (no injection). Library callers pass the same values as `{key}` placeholders through `fetch_with_context`.
 - **File or in-memory** — point at `sqlite:data.db`, an absolute path, or `sqlite::memory:`.
@@ -95,7 +95,7 @@ pipeline:
 
 ### Project a JSON column out of a row
 
-`json_extract` is a SQLite built-in; the extracted TEXT is returned as a native JSON value when it parses.
+`json_extract` is a SQLite built-in; an extracted JSON object or array is returned as a native JSON value; an extracted scalar comes back as SQLite returns it.
 
 ```yaml
 source:
@@ -159,12 +159,12 @@ SQLite has dynamic typing — values are stored as INTEGER, REAL, TEXT, BLOB, or
 
 | SQLite storage class | JSON type |
 |----------------------|-----------|
-| TEXT (valid JSON) | native JSON value |
-| TEXT | `string` |
+| TEXT holding a JSON object / array | native JSON object / array |
+| TEXT (anything else, including `'19.90'`, `'null'`, `'true'`) | `string` |
 | INTEGER (`i64`) | `number` |
 | INTEGER (`i32`) | `number` |
 | REAL (`f64`) | `number` |
-| BOOLEAN | `boolean` |
+| INTEGER 0 / 1 in a column declared `BOOLEAN` / `BOOL` | `boolean` (other values stay numbers) |
 | BLOB | `string` (base64) |
 | NULL / unsupported | `null` |
 
@@ -279,10 +279,11 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 |---------|--------------------|
 | `FaucetError::Config: SQLite connection failed` at startup | The database file doesn't exist or the path is wrong. sqlx does **not** create the file for a read-only URL — point at an existing `.db`, or use `sqlite:data.db?mode=rwc` to create it. Check the path is relative to the process working directory. |
 | `unable to open database file` | The directory doesn't exist or the process lacks read permission on the file. Verify the path and file permissions. |
-| `FaucetError::Config: SQLite query failed` | A SQL syntax error or a reference to a missing table/column. Run the query directly with the `sqlite3` CLI to confirm it's valid. |
+| `FaucetError::Source: SQLite query failed` | A SQL syntax error or a reference to a missing table/column. Run the query directly with the `sqlite3` CLI to confirm it's valid. |
 | In-memory DB looks empty / each query sees a fresh database | `sqlite::memory:` databases are per-connection. With a pool of more than one connection, different queries may hit different empty databases — use `max_connections: 1` for `:memory:`, or a real file. |
 | A `{placeholder}` in the query wasn't substituted | `{field}` substitution only happens when a matrix / parent-record context is present. For a non-matrix run there is no context, so the literal query is used as-is. Encode static filters as literals or bind via a matrix parent. |
 | `database is locked` errors under concurrent writes | Another process holds a write lock. SQLite is single-writer; lower `max_connections`, or enable WAL mode on the database (`PRAGMA journal_mode=WAL;`) out of band. |
+| `SQLite query returns two columns named "id"` | The query's result has two columns with one name (`SELECT * FROM a JOIN b`). A JSON row holds one value per name, so the source refuses rather than dropping one: alias the columns. |
 | A BLOB column arrives as a base64 string | Intentional — binary data is base64-encoded so it survives the JSON round-trip. Decode it in a downstream transform if you need the raw bytes. |
 | `batch_size` rejected at startup | `batch_size` exceeds `MAX_BATCH_SIZE` (1,000,000). Lower it, or use `0` for the no-batching sentinel. |
 | Need only changed rows, not the whole table | This source has no incremental/CDC mode. Add a `WHERE` watermark to the query (driven by `${now.*}` or a matrix context), or use a CDC source. |

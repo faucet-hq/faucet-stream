@@ -163,6 +163,8 @@ CREATE TABLE faucet_state (
 
 `ensure_table()` runs the `CREATE TABLE IF NOT EXISTS` form (the identifier is double-quoted via `faucet_core::util::quote_ident`). If you manage schema with migrations, skip it.
 
+JSONB cannot hold the character U+0000, so a value that contains it (an opaque API cursor, a text bookmark) is stored as its JSON text inside a one-key envelope `{"$faucet_nul_escaped_json": "…"}` and unwrapped on read; every other value is stored as-is.
+
 ### Operations
 
 | Trait method | SQL | Notes |

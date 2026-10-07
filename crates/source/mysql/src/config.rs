@@ -35,6 +35,29 @@ pub struct MysqlSourceConfig {
     /// it is fully backward compatible. See [`ShardConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<ShardConfig>,
+    /// Longest the source waits on the server for the next row (or for a
+    /// whole result in `fetch_all`), in seconds, before the read fails.
+    /// Defaults to 3600; `0` waits forever.
+    ///
+    /// A peer that disappears without closing the connection (a failover, an
+    /// idle eviction by a NAT or load balancer) otherwise leaves the read
+    /// waiting forever, and a scheduled or served run stuck in "running".
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+    /// What to do with a number inside a JSON column that a 64-bit float
+    /// cannot represent exactly (more than about 17 significant digits, or
+    /// beyond the `u64` / `i64` range): `fail` (default) fails the read with
+    /// an error naming the column, `string` emits the number as a JSON string
+    /// holding its exact digits (with one warning per column).
+    #[serde(default)]
+    pub json_big_numbers: faucet_core::JsonBigNumbers,
+    /// The session's `net_write_timeout`, in seconds: how long the server
+    /// waits for the source to read more of a result before it aborts the
+    /// query. The pipeline stops reading while the sink writes a page, so the
+    /// server default (60 s) kills large extracts behind a slow sink.
+    /// Defaults to 3600; `0` keeps the server's setting.
+    #[serde(default = "default_read_timeout_secs")]
+    pub net_write_timeout_secs: u64,
 }
 
 /// Primary-key range sharding settings for the MySQL source.
@@ -55,6 +78,10 @@ pub struct ShardConfig {
     /// before use, so it is safe against injection but must name a real output
     /// column.
     pub key: String,
+}
+
+fn default_read_timeout_secs() -> u64 {
+    3600
 }
 
 fn default_max_connections() -> u32 {
@@ -85,6 +112,9 @@ impl MysqlSourceConfig {
             max_connections: 10,
             batch_size: DEFAULT_BATCH_SIZE,
             shard: None,
+            read_timeout_secs: default_read_timeout_secs(),
+            json_big_numbers: faucet_core::JsonBigNumbers::Fail,
+            net_write_timeout_secs: default_read_timeout_secs(),
         }
     }
 

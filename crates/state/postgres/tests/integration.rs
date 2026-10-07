@@ -167,6 +167,23 @@ async fn list_by_prefix_and_atomic_batch() {
     assert_eq!(store.get("o_x::d").await.unwrap(), None);
 }
 
+/// #789 SQL-165: a value holding U+0000 (an opaque cursor) persists and reads
+/// back unchanged, alone and in a batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn values_containing_nul_round_trip() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStateStore::connect(&url).await.expect("connect");
+    store.ensure_table().await.expect("ensure_table");
+    let v = json!({"cursor": "abc\u{0}def"});
+    store.put("nul", &v).await.expect("put with NUL");
+    assert_eq!(store.get("nul").await.expect("get"), Some(v.clone()));
+    store
+        .put_batch(&[("nul2".into(), v.clone())])
+        .await
+        .expect("batch with NUL");
+    assert_eq!(store.get("nul2").await.expect("get"), Some(v));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn compare_and_put_is_atomic_across_concurrent_callers() {
     let (_container, url) = start_postgres().await;
@@ -242,4 +259,19 @@ async fn compare_and_put_mismatch_leaves_the_value() {
     );
     assert_eq!(store.get("k").await.unwrap(), Some(b));
     assert!(store.compare_and_put("bad key!", None, &a).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_and_put_handles_values_containing_nul() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStateStore::connect(&url).await.expect("connect");
+    store.ensure_table().await.expect("ensure_table");
+    let a = json!({"cursor": "abc\u{0}def"});
+    let b = json!({"cursor": "next\u{0}"});
+    assert!(store.compare_and_put("k", None, &a).await.unwrap());
+    let held = store.get("k").await.unwrap().unwrap();
+    assert_eq!(held, a);
+    assert!(!store.compare_and_put("k", Some(&b), &b).await.unwrap());
+    assert!(store.compare_and_put("k", Some(&held), &b).await.unwrap());
+    assert_eq!(store.get("k").await.unwrap(), Some(b));
 }

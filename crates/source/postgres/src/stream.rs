@@ -22,6 +22,8 @@ pub struct PostgresSource {
     /// whole-dataset shard) means the full query is streamed. Stored behind a
     /// `Mutex` so `apply_shard(&self, …)` can record it before streaming.
     applied_shard: Mutex<Option<PkShardBounds>>,
+    /// Columns already warned about under `json_big_numbers: string`.
+    json_warned: Mutex<std::collections::HashSet<String>>,
 }
 
 impl PostgresSource {
@@ -46,6 +48,7 @@ impl PostgresSource {
             config,
             pool,
             applied_shard: Mutex::new(None),
+            json_warned: Mutex::new(Default::default()),
         })
     }
 
@@ -64,6 +67,13 @@ impl PostgresSource {
                 text_cast_query(&query, &columns).unwrap_or(query)
             }
             Err(_) => query,
+        }
+    }
+
+    fn json_context(&self) -> JsonContext<'_> {
+        JsonContext {
+            mode: self.config.json_big_numbers,
+            warned: &self.json_warned,
         }
     }
 
@@ -150,14 +160,121 @@ fn float_json(v: f64) -> Value {
         })
 }
 
+/// A `real` as JSON through its shortest decimal form: `0.1::real` is `0.1`,
+/// not the widened `0.10000000149011612`.
+fn float4_json(v: f32) -> Value {
+    if !v.is_finite() {
+        return float_json(f64::from(v));
+    }
+    v.to_string()
+        .parse::<f64>()
+        .map_or_else(|_| float_json(f64::from(v)), float_json)
+}
+
+/// `"infinity"` / `"-infinity"` for Postgres's date / timestamp sentinels
+/// (`i32::MAX` / `i32::MIN` days, `i64::MAX` / `i64::MIN` microseconds).
+fn temporal_infinity(raw: &sqlx::postgres::PgValueRef<'_>) -> Option<Value> {
+    use sqlx::{TypeInfo as _, ValueRef as _};
+    if raw.is_null() {
+        return None;
+    }
+    let name = raw.type_info().name().to_ascii_uppercase();
+    let bytes = raw.as_bytes().ok()?;
+    let positive = match (name.as_str(), raw.format()) {
+        (_, sqlx::postgres::PgValueFormat::Text) => match bytes {
+            b"infinity" => true,
+            b"-infinity" => false,
+            _ => return None,
+        },
+        ("DATE", _) => match i32::from_be_bytes(bytes.try_into().ok()?) {
+            i32::MAX => true,
+            i32::MIN => false,
+            _ => return None,
+        },
+        ("TIMESTAMP" | "TIMESTAMPTZ", _) => match i64::from_be_bytes(bytes.try_into().ok()?) {
+            i64::MAX => true,
+            i64::MIN => false,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !matches!(name.as_str(), "DATE" | "TIMESTAMP" | "TIMESTAMPTZ") {
+        return None;
+    }
+    Some(Value::String(
+        if positive { "infinity" } else { "-infinity" }.into(),
+    ))
+}
+
+/// A JSON / JSONB column read exactly: every number is checked on the
+/// column's text, and one a JSON value cannot hold exactly is refused or kept
+/// as an exact string per `json_big_numbers` (#789 SQL-49).
+fn json_text_to_value(
+    text: &str,
+    column: &str,
+    mode: faucet_core::JsonBigNumbers,
+    warned: &Mutex<std::collections::HashSet<String>>,
+) -> Result<Value, FaucetError> {
+    use faucet_core::json_numbers::JsonNumberError;
+    match faucet_core::parse_json_exact(text, mode) {
+        Ok((value, inexact)) => {
+            if !inexact.is_empty()
+                && warned
+                    .lock()
+                    .expect("json warning mutex poisoned")
+                    .insert(column.to_string())
+            {
+                tracing::warn!(
+                    column,
+                    "PostgreSQL column holds JSON numbers a 64-bit float cannot represent \
+                     exactly; emitting them as strings (json_big_numbers: string)"
+                );
+            }
+            Ok(value)
+        }
+        Err(JsonNumberError::Inexact(found)) => Err(FaucetError::Source(format!(
+            "PostgreSQL column {column} holds a JSON number a 64-bit float cannot represent \
+             exactly ({}); set `json_big_numbers: string` to emit such numbers as exact \
+             strings, or cast the column in the query",
+            found[0].preview()
+        ))),
+        Err(JsonNumberError::Invalid(e)) => Err(FaucetError::Source(format!(
+            "PostgreSQL column {column} holds invalid JSON: {e}"
+        ))),
+    }
+}
+
+/// The text of a `json` / `jsonb` cell (`None` for other types or NULL).
+fn pg_json_text<'r>(raw: &sqlx::postgres::PgValueRef<'r>) -> Option<&'r str> {
+    use sqlx::{TypeInfo as _, ValueRef as _};
+    if raw.is_null() {
+        return None;
+    }
+    let name = raw.type_info().name().to_ascii_uppercase();
+    let bytes = raw.as_bytes().ok()?;
+    let bytes = match (name.as_str(), raw.format()) {
+        ("JSON", _) => bytes,
+        // Binary JSONB carries a one-byte format version before the text.
+        ("JSONB", sqlx::postgres::PgValueFormat::Binary) => bytes.get(1..)?,
+        ("JSONB", _) => bytes,
+        _ => return None,
+    };
+    std::str::from_utf8(bytes).ok()
+}
+
 /// Convert a raw sqlx column value to a `serde_json::Value`.
 ///
 /// Tries the native decodes in turn; a non-NULL cell none of them can decode
 /// is an error rather than a silent `null`.
-fn pg_value_to_json(row: &sqlx::postgres::PgRow, col_name: &str) -> Result<Value, FaucetError> {
-    // Try JSON/JSONB first — this is the most flexible
-    if let Ok(v) = row.try_get::<Value, _>(col_name) {
-        return Ok(v);
+fn pg_value_to_json(
+    row: &sqlx::postgres::PgRow,
+    col_name: &str,
+    json: &JsonContext<'_>,
+) -> Result<Value, FaucetError> {
+    if let Ok(raw) = row.try_get_raw(col_name)
+        && let Some(text) = pg_json_text(&raw)
+    {
+        return json_text_to_value(text, col_name, json.mode, json.warned);
     }
 
     // Try common scalar types
@@ -177,10 +294,18 @@ fn pg_value_to_json(row: &sqlx::postgres::PgRow, col_name: &str) -> Result<Value
         return Ok(float_json(v));
     }
     if let Ok(v) = row.try_get::<f32, _>(col_name) {
-        return Ok(float_json(f64::from(v)));
+        return Ok(float4_json(v));
     }
     if let Ok(v) = row.try_get::<bool, _>(col_name) {
         return Ok(Value::Bool(v));
+    }
+
+    // `infinity` / `-infinity` dates and timestamps would overflow chrono
+    // (a panic inside sqlx's decode), so the sentinels are read first.
+    if let Ok(raw) = row.try_get_raw(col_name)
+        && let Some(v) = temporal_infinity(&raw)
+    {
+        return Ok(v);
     }
 
     // Richer types that would otherwise silently decode to Null (#78/#43).
@@ -226,6 +351,27 @@ fn pg_value_to_json(row: &sqlx::postgres::PgRow, col_name: &str) -> Result<Value
             "PostgreSQL column {col_name} read failed: {e}"
         ))),
     }
+}
+
+/// Await a server read, failing it after `secs` seconds (`0` = no limit), so a
+/// peer that vanished without closing the connection cannot hang the run.
+async fn bounded_read<T>(
+    secs: u64,
+    fut: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, FaucetError> {
+    let result = if secs == 0 {
+        fut.await
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(FaucetError::Source(format!(
+                    "PostgreSQL read timed out after {secs}s waiting for the server (read_timeout_secs)"
+                )));
+            }
+        }
+    };
+    result.map_err(|e| FaucetError::Source(format!("PostgreSQL query failed: {e}")))
 }
 
 /// Build the effective SQL query and ordered context-bind values for a given
@@ -380,11 +526,18 @@ fn descriptors_from_catalog(
 
 /// Convert a single `PgRow` into a JSON object whose keys are the row's
 /// column names.
-fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Value, FaucetError> {
+/// How JSON columns are read: the `json_big_numbers` mode and the columns
+/// already warned about.
+struct JsonContext<'a> {
+    mode: faucet_core::JsonBigNumbers,
+    warned: &'a Mutex<std::collections::HashSet<String>>,
+}
+
+fn row_to_json(row: &sqlx::postgres::PgRow, json: &JsonContext<'_>) -> Result<Value, FaucetError> {
     let mut map = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name().to_string();
-        let value = pg_value_to_json(row, &name)?;
+        let value = pg_value_to_json(row, &name, json)?;
         map.insert(name, value);
     }
     Ok(Value::Object(map))
@@ -400,12 +553,12 @@ impl faucet_core::Source for PostgresSource {
         let query_str = self.typed_query(self.shard_wrap(query_str)).await;
         let query = bind_params(sqlx::query(&query_str), &self.config.params, &bind_values)?;
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Source(format!("PostgreSQL query failed: {e}")))?;
+        let rows = bounded_read(self.config.read_timeout_secs, query.fetch_all(&self.pool)).await?;
 
-        let records: Vec<Value> = rows.iter().map(row_to_json).collect::<Result<_, _>>()?;
+        let records: Vec<Value> = rows
+            .iter()
+            .map(|r| row_to_json(r, &self.json_context()))
+            .collect::<Result<_, _>>()?;
         tracing::info!(rows = records.len(), query = %self.config.query, "PostgreSQL source fetch complete");
         Ok(records)
     }
@@ -444,12 +597,8 @@ impl faucet_core::Source for PostgresSource {
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            while let Some(row) = rows
-                .try_next()
-                .await
-                .map_err(|e| FaucetError::Source(format!("PostgreSQL query failed: {e}")))?
-            {
-                buffer.push(row_to_json(&row)?);
+            while let Some(row) = bounded_read(self.config.read_timeout_secs, rows.try_next()).await? {
+                buffer.push(row_to_json(&row, &self.json_context())?);
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
@@ -491,7 +640,8 @@ impl faucet_core::Source for PostgresSource {
         true
     }
 
-    /// Enumerate every base table outside `pg_catalog` / `information_schema`,
+    /// Enumerate every base table outside `pg_catalog` / `information_schema`
+    /// (a partitioned table once, as its parent — never also its partitions),
     /// with column types from `information_schema.columns` and a row estimate
     /// from `pg_class.reltuples` (catalog metadata only — no data scan).
     async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
@@ -508,6 +658,13 @@ impl faucet_core::Source for PostgresSource {
                 ON t.table_schema = c.table_schema AND t.table_name = c.table_name
              WHERE t.table_type = 'BASE TABLE'
                AND c.table_schema NOT IN ('pg_catalog', 'information_schema')
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM pg_class pc
+                       JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+                      WHERE pn.nspname = t.table_schema
+                        AND pc.relname = t.table_name
+                        AND pc.relispartition)
              ORDER BY c.table_schema, c.table_name, c.ordinal_position"#;
         let rows = sqlx::query(sql)
             .fetch_all(&self.pool)
@@ -675,6 +832,36 @@ fn key_discovery_error(e: sqlx::Error) -> FaucetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_values_use_their_shortest_form() {
+        assert_eq!(float4_json(0.1), serde_json::json!(0.1));
+        assert_eq!(float4_json(f32::INFINITY), serde_json::json!("Infinity"));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_times_out_and_passes_through() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok::<_, sqlx::Error>(1)
+        };
+        tokio::time::pause();
+        let err = bounded_read(1, slow).await.unwrap_err();
+        assert!(err.to_string().contains("read_timeout_secs"), "{err}");
+        assert_eq!(
+            bounded_read(0, async { Ok::<_, sqlx::Error>(2) })
+                .await
+                .unwrap(),
+            2
+        );
+        let failed = bounded_read(5, async { Err::<i32, _>(sqlx::Error::RowNotFound) })
+            .await
+            .unwrap_err();
+        assert!(
+            failed.to_string().contains("PostgreSQL query failed"),
+            "{failed}"
+        );
+    }
 
     #[test]
     fn text_cast_query_wraps_only_columns_without_a_native_decode() {
@@ -1155,6 +1342,7 @@ mod tests {
             config,
             pool,
             applied_shard: Mutex::new(None),
+            json_warned: Mutex::new(Default::default()),
         }
     }
 

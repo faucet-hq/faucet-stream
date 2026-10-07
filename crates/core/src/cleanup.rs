@@ -68,9 +68,8 @@ pub const DEFAULT_MAX_KEYS: usize = 100_000;
 /// What to do about destination rows inside the claimed scope that this run did
 /// not write.
 ///
-/// Serialized as the sink-config field `cleanup:` via
-/// [`WriteSpec`](crate::write_mode::WriteSpec), so every upsert-capable sink
-/// accepts it without a per-connector config change.
+/// Opted into on the **source**, through its `complete_for.on_missing: delete`
+/// claim; no sink config field selects it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupMode {

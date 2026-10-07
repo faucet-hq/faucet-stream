@@ -14,7 +14,7 @@ Reach for it when you want to stream live mutations out of an operational Postgr
 - **Real CDC, not polling** — reads the write-ahead log directly through logical replication; no `updated_at` columns, triggers, or query load on the source tables.
 - **Transactionally consistent** — each transaction is buffered in memory and flushed to the sink only on `COMMIT`, so a sink never sees half a transaction.
 - **Resumable across restarts** — the connector overrides `state_key()` / `apply_start_bookmark()`; the durable LSN bookmark survives process crashes and restarts.
-- **Effectively-once delivery** — `supports_exactly_once()` is `true`; pair with an idempotent sink (`postgres`, `mysql`, `mssql`, `sqlite`, `iceberg`, `bigquery`) under `delivery: exactly_once`.
+- **Effectively-once delivery** — `supports_exactly_once()` is `true`; pair with an idempotent sink (`postgres`, `mysql`, `mssql`, `sqlite`, `iceberg`, `bigquery`, `kafka`, `snowflake`, `redis`, `mongodb`, `spanner`, `databricks`, `oracle`) under `delivery: exactly_once`.
 - **Snapshot → CDC handoff** — implements `capture_resume_position()` so `faucet replicate` can bulk-snapshot a table and hand off to CDC with no gap and no duplicate.
 - **Crash-safe WAL feedback** — the advertised `confirmed_flush_lsn` advances *only* from a durably-persisted bookmark, so Postgres never recycles WAL for changes the consumer hasn't committed.
 - **TLS-capable** — `require` / `verify_ca` / `verify_full` modes for the replication connection (plaintext `disable` is the default for back-compat).
@@ -98,11 +98,11 @@ Each fetch cycle drains pending changes and stops once the stream has been idle 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `connection_url` | string | — *(required)* | Postgres connection URL. The crate internally upgrades it to `replication=database` — you do **not** add that yourself. Redacted in logs/`Debug`. |
+| `connection_url` | string | — *(required)* | Postgres connection URL. The crate internally upgrades it to `replication=database` — you do **not** add that yourself. Percent-encoded user, password and database name are decoded (`p%40ss` is `p@ss`), and `?user=` / `?password=` / `?dbname=` query parameters are honoured. Redacted in logs/`Debug`. |
 | `slot_name` | string | — *(required)* | Logical replication slot. Must match `[a-z0-9_]{1,63}` (lowercase letters, digits, underscores; ≤ 63 chars). |
 | `publication_name` | string | — *(required)* | Existing publication that selects which tables are replicated. |
 | `create_slot_if_missing` | bool | `true` | Create the slot as a logical/`pgoutput` slot on first connect if it doesn't exist. |
-| `slot_type` | enum | `permanent` | `permanent` (survives disconnect, pins WAL until consumed or dropped) or `temporary` (auto-dropped when the replication connection closes). See [Slot lifecycle](#slot-lifecycle). |
+| `slot_type` | enum | `permanent` | Only `permanent` is accepted. `temporary` is **refused at config load**: a temporary slot is dropped with the session that creates it, before replication can start on its own connection. See [Slot lifecycle](#slot-lifecycle). |
 | `start_lsn` | string? | `null` | One-time starting-LSN override (e.g. `"0/16A4F88"`). Ignored when a state-store bookmark exists — the bookmark wins. With neither set, replication starts from the slot's `confirmed_flush_lsn`. |
 | `proto_version` | u32 | `1` | pgoutput protocol version. Only `1` is supported in this release (`validate` rejects anything else). |
 
@@ -115,9 +115,10 @@ Each fetch cycle drains pending changes and stops once the stream has been idle 
 | `max_cycle_duration` | seconds | `300` | End the fetch cycle at the first transaction boundary after this long, even while changes keep arriving, so the next cycle advances the slot. `0` = no bound (a cycle then ends only on `idle_timeout` / `max_messages`; under steady writes it never ends and the slot pins WAL). |
 | `max_staged_records` | usize? | `null` | Max change records buffered for a **single in-progress transaction** before the run aborts with a typed `FaucetError::Source`. `null` = unbounded. The OOM safety valve for huge bulk transactions — see [Transactional consistency](#transactional-consistency). |
 | `status_update_interval` | seconds | `10` | Standby Status Update (keepalive) cadence. Must be **strictly less than** `idle_timeout` and well under the server's `wal_sender_timeout` (default 60 s). |
-| `tcp_keepalive` | seconds | `60` | TCP keepalive on the replication connection. |
+| `tcp_keepalive` | seconds | `60` | Accepted for compatibility and **ignored**: the replication client sets no socket keepalive (a non-default value logs a warning). A dead replication connection is detected through `status_update_interval` and the server's `wal_sender_timeout`. |
+| `max_buffered_events` | usize | `100000` | Replication events read ahead while the pipeline writes a page, so status updates keep flowing and a long sink write does not hit `wal_sender_timeout`. Past this many buffered events reading pauses until the pipeline catches up. |
 | `slot_acquire_retries` | u32 | `10` | Retries when the slot is still **active** (held by a not-yet-released prior connection) on a rapid restart. Both the pre-stream slot advance and `START_REPLICATION` retry with exponential backoff (250 ms, doubling, capped at 4 s). `0` = fail fast. |
-| `batch_size` | usize | `1000` | Advisory page size. The source emits **one `StreamPage` per committed transaction** for per-transaction durability; transactions are never split, so a transaction larger than `batch_size` still emits as one page. **`0` = no batching**: accumulate every transaction in the run window into a single trailing page (negates per-transaction durability; for tests/snapshot-style runs only). |
+| `batch_size` | usize | `1000` | Records per page. Committed transactions are coalesced into one page until it holds `batch_size` records or `status_update_interval` passes; a transaction is never split, so one larger than `batch_size` still emits as one page. A commit with no captured rows only moves the bookmark. **`0` = no batching**: accumulate every transaction in the run window into a single trailing page (for tests/snapshot-style runs only). |
 
 ### TLS (`tls`)
 
@@ -136,7 +137,7 @@ tls:
   ca_path: /etc/ssl/certs/rds-ca.pem
 ```
 
-> Use `verify_full` (or `?sslmode=verify-full` in the URL) in any production / cross-network deployment — `disable` sends database credentials and all WAL data in the clear, and `require` does not authenticate the server. An explicit `tls.mode` that contradicts the URL's `sslmode` is refused at startup.
+> Use `verify_full` (or `?sslmode=verify-full` in the URL) in any production / cross-network deployment — `disable` sends database credentials and all WAL data in the clear, and `require` does not authenticate the server. An explicit `tls.mode` that contradicts the URL's `sslmode` is refused at startup. `check()` (`faucet doctor`) connects with the same TLS policy as replication.
 
 ## Output record schema
 
@@ -236,36 +237,21 @@ source:
     idle_timeout: 60
 ```
 
-### Ephemeral / test run with a self-cleaning slot
-
-A temporary slot is dropped automatically when the connection closes, so it won't pin WAL after the run. (Note: temporary slots reset on reconnect — not for cross-run resume.)
-
-```yaml
-source:
-  type: postgres-cdc
-  config:
-    connection_url: postgres://faucet:faucet@localhost:5432/appdb
-    slot_name: ephemeral_slot
-    publication_name: faucet_pub
-    slot_type: temporary
-    idle_timeout: 10
-```
-
 ## Streaming & batching
 
-The source overrides `Source::stream_pages` and emits **one `StreamPage` per committed transaction**, carrying `bookmark = commit_lsn`. The pipeline persists that bookmark to the state store after the sink flushes, giving per-transaction durability for free. Because transactions are atomic units, they are never split across pages — a transaction whose record count exceeds `batch_size` still emits as a single page.
+The source overrides `Source::stream_pages` and coalesces committed transactions into pages of up to `batch_size` records (or until `status_update_interval` passes), each carrying `bookmark` = the `end_lsn` of its last transaction. The pipeline persists that bookmark to the state store after the sink flushes, so one flush and one state write cover many small transactions. Transactions are never split across pages — a transaction whose record count exceeds `batch_size` still emits as a single page.
 
-`batch_size: 0` is the "no batching" sentinel: every committed transaction in the run window is accumulated into a single trailing page emitted at the end with `bookmark = max(commit_lsn)`. This negates per-transaction durability and is only useful for tests or snapshot-style runs.
+`batch_size: 0` is the "no batching" sentinel: every committed transaction in the run window is accumulated into a single trailing page emitted at the end with the last transaction's `end_lsn` as its bookmark. Only useful for tests or snapshot-style runs.
 
 ## Resume & state
 
 The connector overrides `state_key()` and `apply_start_bookmark()` for durable, resumable replication:
 
 - **State key:** `postgres-cdc:<slot_name>` (e.g. `postgres-cdc:faucet_slot`). One bookmark per slot.
-- **Bookmark:** the most-recently-committed `commit_lsn`, persisted by the pipeline only **after the sink confirms** the batch flushed.
+- **Bookmark:** the `end_lsn` (the position just past the COMMIT) of the last transaction on the page, persisted by the pipeline only **after the sink confirms** the batch flushed.
 - **On resume:** `apply_start_bookmark` receives that LSN and advances the slot's `confirmed_flush_lsn` to it before streaming continues.
 
-Configure any `faucet-core` `StateStore` — `file`, `memory`, [`faucet-state-postgres`](https://crates.io/crates/faucet-state-postgres), or [`faucet-state-redis`](https://crates.io/crates/faucet-state-redis). **Always configure a durable (non-`memory`) state store in production** — without one the slot's `confirmed_flush_lsn` never advances and WAL is retained indefinitely.
+Configure any `faucet-core` `StateStore` — `file`, `memory`, [`faucet-state-postgres`](https://crates.io/crates/faucet-state-postgres), or [`faucet-state-redis`](https://crates.io/crates/faucet-state-redis). **A `state:` block is required** — `faucet run` / `validate` refuse a postgres-cdc row without one, because the slot's `confirmed_flush_lsn` only advances from a persisted bookmark (without one every run replays from the slot's start and WAL is retained indefinitely). A `memory` store is accepted with a warning: it only advances within one `faucet schedule` / `serve` process.
 
 ## Effectively-once delivery
 
@@ -274,7 +260,7 @@ Configure any `faucet-core` `StateStore` — `file`, `memory`, [`faucet-state-po
 The CLI enforces the full effectively-once gate at config-load time (`faucet validate` catches all four):
 
 1. **Source** supports effectively-once — `postgres-cdc` does. ✅
-2. **Sink** supports idempotent writes — one of `postgres` / `mysql` / `mssql` / `sqlite` / `iceberg` / `bigquery`.
+2. **Sink** supports idempotent writes — one of `postgres` / `mysql` / `mssql` / `sqlite` / `iceberg` / `bigquery` / `kafka` / `snowflake` / `redis` / `mongodb` / `spanner` / `databricks` / `oracle`.
 3. A **`state:`** block is configured.
 4. **No `dlq:`** block (DLQ and effectively-once are mutually exclusive in this version).
 
@@ -293,15 +279,14 @@ The decoder **fails fast** (`FaucetError::Source`, which the pipeline restarts f
 | `slot_type` | Survives disconnect? | WAL retention | Cross-run resume? | Use for |
 |-------------|----------------------|---------------|-------------------|---------|
 | `permanent` *(default)* | Yes | Pins WAL until consumed or dropped | Yes | Production pipelines, snapshot→CDC handoff. |
-| `temporary` | No (auto-dropped) | Released on disconnect | No (resets on reconnect) | Ephemeral / test runs that should self-clean. |
 
-A **permanent** slot keeps pinning WAL even when no consumer is connected — an abandoned slot fills `pg_wal` and can take the whole instance down. Decommission an unused pipeline by calling `PostgresCdcSource::drop_slot()` (or dropping it via `SELECT pg_drop_replication_slot('faucet_slot');` in `psql`). Permanent-slot creation logs a loud warning so the WAL-retention obligation is hard to miss.
+A **permanent** slot keeps pinning WAL even when no consumer is connected — an abandoned slot fills `pg_wal` and can take the whole instance down. Decommission an unused pipeline by calling `PostgresCdcSource::drop_slot()` (or dropping it via `SELECT pg_drop_replication_slot('faucet_slot');` in `psql`). Permanent-slot creation logs a loud warning so the WAL-retention obligation is hard to miss. `slot_type: temporary` is refused at config load (the slot would be dropped with the control session before replication started); for a throwaway run, use a permanent slot and drop it afterwards.
 
 ## Snapshot → CDC handoff
 
 This source implements `capture_resume_position()`: it ensures the slot exists, reads the server's **current WAL LSN** (`pg_current_wal_lsn`) as a resume bookmark, and consumes no changes. The `faucet replicate` command uses it to anchor the CDC stream at-or-before a bulk snapshot of the table, so the combined snapshot + CDC result is a gap-free, duplicate-free mirror when paired with a `write_mode: upsert` sink.
 
-Capture **requires a permanent slot** (`slot_type: permanent`, the default): a temporary slot is dropped when the short-lived capture connection closes and so cannot retain WAL across the snapshot. Capture rejects a temporary slot with a typed error. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) for the full handoff model.
+Capture uses the permanent slot (`slot_type: temporary` is refused at config load), so WAL is retained across the snapshot. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) for the full handoff model.
 
 ## Crash-safe WAL feedback (durability)
 
@@ -368,7 +353,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | Replication connection dropped after ~60 s of silence | `status_update_interval` ≥ the server's `wal_sender_timeout`. Keep it well below (default 10 s vs 60 s). |
 | Process OOM-killed during a bulk load | A giant single transaction is buffered in full. Set `max_staged_records` sized to your RAM. |
 | `pg_wal` keeps growing / disk fills | A permanent slot is pinning WAL (no consumer, or fetch cycles too long). Run the pipeline more often, shorten cycles, or drop the slot via `PostgresCdcSource::drop_slot()` / `pg_drop_replication_slot(...)`. |
-| Pipeline doesn't resume / replays everything | No durable state store, or a `temporary` slot (resets on reconnect). Use `slot_type: permanent` + `file`/`postgres`/`redis` state. |
+| Pipeline doesn't resume / replays everything | A `memory` state store across separate runs. Use `file`/`postgres`/`redis` state. |
 | `proto_version must be 1` | Only pgoutput protocol v1 is supported. Remove the `proto_version` override or set it to `1`. |
 | Initial changes missing | The slot is created on first fetch — changes made **before** it exists aren't replicated. Create the slot (or do a warm-up fetch) before applying writes. |
 | `exactly_once` rejected by `faucet validate` | The sink isn't idempotent, no `state:` block, or a `dlq:` block is present. See [Effectively-once delivery](#effectively-once-delivery). |

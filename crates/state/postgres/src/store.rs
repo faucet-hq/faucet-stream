@@ -157,6 +157,45 @@ pub(crate) fn list_sql(table: &str) -> String {
     )
 }
 
+/// The single key of the envelope a value containing U+0000 is stored in.
+const NUL_ENVELOPE_KEY: &str = "$faucet_nul_escaped_json";
+
+fn holds_nul(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.contains('\0'),
+        Value::Array(a) => a.iter().any(holds_nul),
+        Value::Object(o) => o.iter().any(|(k, v)| k.contains('\0') || holds_nul(v)),
+        _ => false,
+    }
+}
+
+/// JSONB rejects U+0000, so a value holding it (an opaque cursor, a text
+/// bookmark) is stored as its JSON text inside a one-key envelope, where the
+/// NUL is the escape `\u0000`, not a character.
+pub(crate) fn wrap_nul(value: &Value) -> Result<std::borrow::Cow<'_, Value>, FaucetError> {
+    if !holds_nul(value) {
+        return Ok(std::borrow::Cow::Borrowed(value));
+    }
+    let text = serde_json::to_string(value)
+        .map_err(|e| FaucetError::State(format!("failed to serialize state: {e}")))?;
+    Ok(std::borrow::Cow::Owned(
+        serde_json::json!({ NUL_ENVELOPE_KEY: text }),
+    ))
+}
+
+/// The inverse of [`wrap_nul`].
+pub(crate) fn unwrap_nul(value: Value) -> Result<Value, FaucetError> {
+    match &value {
+        Value::Object(o) if o.len() == 1 => match o.get(NUL_ENVELOPE_KEY) {
+            Some(Value::String(text)) => serde_json::from_str(text).map_err(|e| {
+                FaucetError::State(format!("stored escaped state is not valid JSON: {e}"))
+            }),
+            _ => Ok(value),
+        },
+        _ => Ok(value),
+    }
+}
+
 #[async_trait]
 impl StateStore for PostgresStateStore {
     async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
@@ -176,16 +215,17 @@ impl StateStore for PostgresStateStore {
                         "failed to decode JSONB column for key '{key}': {e}"
                     ))
                 })?;
-                Ok(Some(value))
+                unwrap_nul(value).map(Some)
             }
         }
     }
 
     async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
         validate_state_key(key)?;
+        let stored = wrap_nul(value)?;
         sqlx::query(&upsert_sql(&self.table))
             .bind(key)
-            .bind(value)
+            .bind(stored.as_ref())
             .execute(&self.pool)
             .await
             .map_err(|e| {
@@ -242,9 +282,13 @@ impl StateStore for PostgresStateStore {
             Some(_) => compare_update_sql(&self.table),
             None => insert_absent_sql(&self.table),
         };
-        let mut query = sqlx::query(&sql).bind(key).bind(value);
-        if let Some(old) = expected {
-            query = query.bind(old);
+        // Both sides in their stored form, so a NUL-escaped value compares
+        // against its envelope.
+        let stored = wrap_nul(value)?;
+        let old = expected.map(wrap_nul).transpose()?;
+        let mut query = sqlx::query(&sql).bind(key).bind(stored.as_ref());
+        if let Some(old) = &old {
+            query = query.bind(old.as_ref());
         }
         let done = query.execute(&self.pool).await.map_err(|e| {
             FaucetError::State(format!(
@@ -266,9 +310,10 @@ impl StateStore for PostgresStateStore {
         let mut tx = self.pool.begin().await.map_err(err)?;
         let sql = upsert_sql(&self.table);
         for (key, value) in entries {
+            let stored = wrap_nul(value)?;
             sqlx::query(&sql)
                 .bind(key)
-                .bind(value)
+                .bind(stored.as_ref())
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -336,6 +381,23 @@ impl PostgresStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nul_values_round_trip_through_the_envelope() {
+        let v = serde_json::json!({"cursor": "a\u{0}b", "n": [1, {"k\u{0}": 2}]});
+        let wrapped = wrap_nul(&v).unwrap().into_owned();
+        assert!(!holds_nul(&wrapped));
+        assert_eq!(unwrap_nul(wrapped).unwrap(), v);
+        let plain = serde_json::json!({"cursor": "ab"});
+        assert!(matches!(
+            wrap_nul(&plain).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(unwrap_nul(plain.clone()).unwrap(), plain);
+        let other = serde_json::json!({ NUL_ENVELOPE_KEY: 3 });
+        assert_eq!(unwrap_nul(other.clone()).unwrap(), other);
+        assert!(unwrap_nul(serde_json::json!({ NUL_ENVELOPE_KEY: "{" })).is_err());
+    }
 
     #[test]
     fn validate_table_name_accepts_typical_values() {

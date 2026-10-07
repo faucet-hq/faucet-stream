@@ -709,6 +709,13 @@ pub struct CdcUnwrapSpec {
     /// dropping it leaves the mirror silently out of date.
     #[serde(default)]
     pub on_missing_image: CdcMissingImage,
+    /// The row's key columns — the upsert sink's `key`. When an update's
+    /// `before` image carries a different key than its `after` image (the
+    /// source changed the primary key), a delete row for the old key is
+    /// emitted ahead of the upsert, so the mirror does not keep a stale row
+    /// under the old key. Empty (the default) disables the check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key: Vec<String>,
 }
 
 /// [`CdcUnwrapSpec::on_missing_image`] policy.
@@ -774,6 +781,7 @@ impl Default for CdcUnwrapSpec {
             delete_ops: cdc_default_delete_ops(),
             drop_ops: cdc_default_drop_ops(),
             on_missing_image: CdcMissingImage::Fail,
+            key: Vec::new(),
         }
     }
 }
@@ -849,7 +857,39 @@ impl CompiledCdcUnwrap {
         map.remove(CDC_UNCHANGED_TOAST_FIELD);
         let marker = if is_delete { "d" } else { "u" };
         map.insert(s.marker_field.clone(), Value::String(marker.to_string()));
-        Ok(vec![Value::Object(map)])
+        let mut out = Vec::with_capacity(2);
+        if !is_delete && let Some(old) = self.moved_key(&rec, &map) {
+            out.push(Value::Object(old));
+        }
+        out.push(Value::Object(map));
+        Ok(out)
+    }
+
+    /// A delete row for the old key when an update changed the row's `key`
+    /// (#789 SQL-48): the `before` image's key columns, marked as a delete.
+    fn moved_key(
+        &self,
+        rec: &Value,
+        after: &serde_json::Map<String, Value>,
+    ) -> Option<serde_json::Map<String, Value>> {
+        let s = &self.spec;
+        if s.key.is_empty() {
+            return None;
+        }
+        let Some(Value::Object(before)) = rec.get(&s.before_field) else {
+            return None;
+        };
+        let old: Option<serde_json::Map<String, Value>> = s
+            .key
+            .iter()
+            .map(|k| before.get(k).map(|v| (k.clone(), v.clone())))
+            .collect();
+        let mut old = old?;
+        if s.key.iter().all(|k| old.get(k) == after.get(k)) {
+            return None;
+        }
+        old.insert(s.marker_field.clone(), Value::String("d".into()));
+        Some(old)
     }
 }
 
@@ -2164,6 +2204,30 @@ mod tests {
         let row = out[0].as_object().unwrap();
         assert!(!row.contains_key(CDC_UNCHANGED_TOAST_FIELD));
         assert_eq!(row[CDC_DEFAULT_MARKER_FIELD], json!("d"));
+    }
+
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_deletes_the_old_key_when_an_update_moves_it() {
+        let spec: CdcUnwrapSpec = serde_json::from_value(json!({"key": ["id"]})).unwrap();
+        let stages = compile(&[TransformStage::CdcUnwrap(spec)]);
+        let moved = json!({"op": "u", "before": {"id": 1, "v": "a"}, "after": {"id": 2, "v": "a"}});
+        let out = apply_stages(moved.clone(), &stages).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                json!({"id": 1, CDC_DEFAULT_MARKER_FIELD: "d"}),
+                json!({"id": 2, "v": "a", CDC_DEFAULT_MARKER_FIELD: "u"}),
+            ]
+        );
+        let same = json!({"op": "u", "before": {"id": 2, "v": "a"}, "after": {"id": 2, "v": "b"}});
+        assert_eq!(apply_stages(same, &stages).unwrap().len(), 1);
+        let no_before = json!({"op": "u", "before": null, "after": {"id": 2}});
+        assert_eq!(apply_stages(no_before, &stages).unwrap().len(), 1);
+        let partial_before = json!({"op": "u", "before": {"v": "a"}, "after": {"id": 2}});
+        assert_eq!(apply_stages(partial_before, &stages).unwrap().len(), 1);
+        let keyless = compile(&[cdc_unwrap_default()]);
+        assert_eq!(apply_stages(moved, &keyless).unwrap().len(), 1);
     }
 
     #[cfg(feature = "transform-cdc-unwrap")]

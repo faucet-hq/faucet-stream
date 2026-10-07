@@ -155,6 +155,9 @@ pub enum ColumnHint {
     Enum(Vec<String>),
     /// `SET`: the labels of the stored bitmask, comma-joined.
     Set(Vec<String>),
+    /// `BINARY` / `VARBINARY` / `BLOB` (the `binary` character set) and `BIT`:
+    /// always base64, as the snapshot source emits them, whatever the bytes.
+    Binary,
     /// Any other column: rendered as before.
     Other,
 }
@@ -165,8 +168,20 @@ pub fn column_hints(tme: &mysql_async::binlog::events::TableMapEvent<'_>) -> Vec
     use mysql_async::consts::ColumnType as T;
     let mut enum_labels: Vec<Vec<String>> = Vec::new();
     let mut set_labels: Vec<Vec<String>> = Vec::new();
+    let mut charsets = CharsetMeta::default();
     for field in tme.iter_optional_meta().flatten() {
         match field {
+            OptionalMetadataField::DefaultCharset(d) => {
+                charsets.default = Some(d.default_charset());
+                charsets.overrides = d
+                    .iter_non_default()
+                    .flatten()
+                    .map(|nd| (nd.column_index() as usize, nd.charset()))
+                    .collect();
+            }
+            OptionalMetadataField::ColumnCharset(c) => {
+                charsets.per_column = c.iter_charsets().flatten().collect();
+            }
             OptionalMetadataField::EnumStrValue(values) => {
                 enum_labels = values
                     .iter_values()
@@ -186,8 +201,14 @@ pub fn column_hints(tme: &mysql_async::binlog::events::TableMapEvent<'_>) -> Vec
     }
     let mut enums = enum_labels.into_iter();
     let mut sets = set_labels.into_iter();
+    let types: Vec<Option<T>> = (0..tme.columns_count() as usize)
+        .map(|i| tme.get_column_type(i).ok().flatten())
+        .collect();
+    let binary = charsets.binary_columns(&types);
     (0..tme.columns_count() as usize)
         .map(|i| match tme.get_column_type(i) {
+            _ if binary[i] => ColumnHint::Binary,
+            Ok(Some(T::MYSQL_TYPE_BIT)) => ColumnHint::Binary,
             Ok(Some(T::MYSQL_TYPE_TIMESTAMP | T::MYSQL_TYPE_TIMESTAMP2)) => ColumnHint::Timestamp,
             Ok(Some(T::MYSQL_TYPE_DATE | T::MYSQL_TYPE_NEWDATE)) => ColumnHint::Date,
             Ok(Some(T::MYSQL_TYPE_DATETIME | T::MYSQL_TYPE_DATETIME2)) => ColumnHint::DateTime,
@@ -205,6 +226,67 @@ pub fn column_hints(tme: &mysql_async::binlog::events::TableMapEvent<'_>) -> Vec
             _ => ColumnHint::Other,
         })
         .collect()
+}
+
+/// The `binary` character set id: a character column in it is binary data.
+const BINARY_CHARSET: u16 = 63;
+
+/// Character-set metadata of a `TableMapEvent` (`binlog_row_metadata=FULL`).
+/// Charset entries are positional over the table's *character* columns
+/// (`CHAR` / `VARCHAR` / `BLOB`-family), not over all columns.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct CharsetMeta {
+    pub default: Option<u16>,
+    pub overrides: Vec<(usize, u16)>,
+    pub per_column: Vec<u16>,
+}
+
+impl CharsetMeta {
+    /// Which columns hold binary data. Without charset metadata nothing is
+    /// marked (the bytes then decide, as before).
+    pub(crate) fn binary_columns(
+        &self,
+        types: &[Option<mysql_async::consts::ColumnType>],
+    ) -> Vec<bool> {
+        let mut char_pos = 0usize;
+        types
+            .iter()
+            .map(|t| {
+                if !t.is_some_and(|t| t.is_character_type()) {
+                    return false;
+                }
+                let pos = char_pos;
+                char_pos += 1;
+                let charset = self.per_column.get(pos).copied().or_else(|| {
+                    self.overrides
+                        .iter()
+                        .find(|(i, _)| *i == pos)
+                        .map(|(_, c)| *c)
+                        .or(self.default)
+                });
+                charset == Some(BINARY_CHARSET)
+            })
+            .collect()
+    }
+}
+
+/// The primary-key column indexes a `TableMapEvent` declares
+/// (`binlog_row_metadata=FULL`); empty when the table has none.
+pub fn primary_key_columns(tme: &mysql_async::binlog::events::TableMapEvent<'_>) -> Vec<usize> {
+    use mysql_async::binlog::events::OptionalMetadataField;
+    let mut out = Vec::new();
+    for field in tme.iter_optional_meta().flatten() {
+        match field {
+            OptionalMetadataField::SimplePrimaryKey(pk) => {
+                out.extend(pk.iter_indexes().flatten().map(|i| i as usize));
+            }
+            OptionalMetadataField::PrimaryKeyWithPrefix(pk) => {
+                out.extend(pk.iter_keys().flatten().map(|k| k.column_index() as usize));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Fractional seconds the way chrono prints them (and so the snapshot source):
@@ -255,6 +337,9 @@ fn hinted_value(hint: &ColumnHint, v: &Value) -> Option<Json> {
                     .unwrap_or(Json::Null),
             )
         }
+        (ColumnHint::Binary, Value::Bytes(b)) => Some(Json::String(
+            base64::engine::general_purpose::STANDARD.encode(b),
+        )),
         (ColumnHint::Enum(labels), Value::Int(i)) => {
             let label = usize::try_from(*i)
                 .ok()
@@ -316,6 +401,45 @@ pub fn binlog_row_to_json_hinted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_columns_follow_the_character_column_charsets() {
+        use mysql_async::consts::ColumnType as T;
+        let types = [
+            Some(T::MYSQL_TYPE_LONG),
+            Some(T::MYSQL_TYPE_VARCHAR),
+            Some(T::MYSQL_TYPE_VARCHAR),
+            Some(T::MYSQL_TYPE_BLOB),
+            None,
+        ];
+        let defaulted = CharsetMeta {
+            default: Some(255),
+            overrides: vec![(1, 63), (2, 63)],
+            per_column: Vec::new(),
+        };
+        assert_eq!(
+            defaulted.binary_columns(&types),
+            vec![false, false, true, true, false]
+        );
+        let listed = CharsetMeta {
+            default: None,
+            overrides: Vec::new(),
+            per_column: vec![63, 45, 63],
+        };
+        assert_eq!(
+            listed.binary_columns(&types),
+            vec![false, true, false, true, false]
+        );
+        assert_eq!(
+            CharsetMeta::default().binary_columns(&types),
+            vec![false; 5]
+        );
+        assert_eq!(
+            hinted_value(&ColumnHint::Binary, &Value::Bytes(b"A".to_vec())),
+            Some(Json::String("QQ==".into()))
+        );
+        assert_eq!(hinted_value(&ColumnHint::Binary, &Value::Int(1)), None);
+    }
 
     #[test]
     fn hinted_values_render_like_the_snapshot_source() {

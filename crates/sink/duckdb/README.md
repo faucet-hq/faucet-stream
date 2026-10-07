@@ -7,15 +7,24 @@ single JSON text column or dynamic column mapping. Each batch is one
 back on error.
 
 DuckDB is a synchronous embedded engine, so writes run on a blocking thread.
-The target table must already exist. The sink is **append-only**; keyed upsert
-and an Arrow-native columnar fast path are tracked as follow-ups.
+A missing target table is created from the first page (`create_table: true`,
+the default); with `create_table: false` it must already exist. An unqualified
+`table_name` resolves to the connection's current database and schema, exactly
+as the `INSERT` does; `schema.table` and `catalog.schema.table` are honoured.
+The sink is **append-only**; keyed upsert and an Arrow-native columnar fast path
+are tracked as follow-ups.
+
+In `auto_map` mode a record with no field matching a column of the table is
+refused rather than skipped: `write_batch` fails the page, and with a `dlq:`
+block the record fails on its own row (routed to the DLQ) while the rest of the
+page is written.
 
 ## Config
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `database` | string | — | Path to the `.duckdb` file, or `:memory:`. A `duckdb://` / `duckdb:` prefix is accepted and stripped. |
-| `table_name` | string | — | Target table (must already exist). |
+| `table_name` | string | — | Target table, optionally `schema.table` or `catalog.schema.table`. |
 | `column_mapping` | enum | `{json: {column: "data"}}` | `json` stores each record as one JSON text column; `auto_map` maps top-level keys onto matching columns. |
 | `batch_size` | integer | `1000` | Rows per multi-row INSERT. `0` = one INSERT for the whole slice. |
 

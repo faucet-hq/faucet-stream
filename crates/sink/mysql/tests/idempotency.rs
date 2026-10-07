@@ -215,7 +215,7 @@ async fn auto_map_into_missing_table_errors_with_no_columns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn auto_map_skips_records_with_no_matching_columns_then_noop() {
+async fn auto_map_refuses_records_with_no_matching_columns() {
     let (_container, url) = start_mysql().await;
     {
         let pool = sqlx::MySqlPool::connect(&url).await.expect("pool");
@@ -229,11 +229,16 @@ async fn auto_map_skips_records_with_no_matching_columns_then_noop() {
     let config = MysqlSinkConfig::new(&url, "t").column_mapping(MysqlColumnMapping::AutoMap);
     let sink = MysqlSink::new(config).await.expect("sink new");
 
-    let written = sink
+    // Unmatched records fail the page rather than vanishing while the
+    // bookmark advances (#789 SQL-50).
+    let err = sink
         .write_batch(&[json!({"nope": 1}), json!({"other": 2})])
         .await
-        .expect("write");
-    assert_eq!(written, 0, "all records skipped → zero written");
+        .expect_err("unmatched records must fail");
+    assert!(
+        err.to_string().contains("record 0 has no field matching"),
+        "{err}"
+    );
 
     let pool = sqlx::MySqlPool::connect(&url).await.expect("pool");
     let count: i64 = sqlx::query("SELECT COUNT(*) FROM t")

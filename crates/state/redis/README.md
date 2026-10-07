@@ -58,7 +58,7 @@ pipeline:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `url` | string | — *(required)* | Standard Redis URL: `redis://[:password@]host:port[/db]`. Use `rediss://` for TLS. |
+| `url` | string | — *(required)* | Standard Redis URL: `redis://[:password@]host:port[/db]`. Use `rediss://` for TLS (rustls, verified against the bundled Mozilla root set). |
 | `namespace` | string | `faucet` | Prefix applied to every key (`{namespace}:{key}`). Use it to isolate pipelines that share one Redis instance — e.g. `prod`, `staging`, `team-a`. Must be non-empty and contain only ASCII alphanumerics plus `_ - .` (no `:`). |
 
 Point `url` at a secret directive to keep credentials out of the file, e.g. `url: ${env:REDIS_URL}` or `url: ${secret:redis-url}`.
@@ -125,7 +125,7 @@ The three `StateStore` methods map directly onto Redis commands on a namespaced 
 - `put_batch(entries)` → one `MSET`, so a `faucet state import` lands all-or-nothing (`supports_atomic_batch() == true`).
 - `compare_and_put(key, expected, value)` → reads the key, compares it with `expected` as JSON (`None` = absent), then runs a Lua script that `SET`s only while the stored string is still the one compared (or the key is still absent). Atomic across processes (`supports_compare_and_put() == true`), so two `faucet run` processes sharing this store cannot both take a row's run lease.
 
-Connections use `redis::aio::MultiplexedConnection`, which is cheaply cloneable and safe to share across concurrent tasks — the store clones it per call, so no locking or pooling is needed on the caller's side. The connection is opened once in `connect()` and reused for the lifetime of the store.
+`connect()` opens a `redis::aio::ConnectionManager`, which is cheaply cloneable and safe to share across concurrent tasks — the store clones it per call, so no locking or pooling is needed on the caller's side. A dropped connection (a Redis restart, a failover, a server or load-balancer idle cut) is re-established, and an operation that hit the drop is retried once on the new connection, so one blip no longer fails every later bookmark read and write. Connecting is bounded by 10 s and every reply by 30 s (`CONNECT_TIMEOUT` / `RESPONSE_TIMEOUT`), so a black-holed server fails the operation instead of stalling the run for the OS TCP timeout. `list()` walks every `SCAN` page and fails on any page's error rather than returning a partial key set. A connection passed to `from_connection()` is used as given (no reconnect).
 
 ### Validation & preflight
 

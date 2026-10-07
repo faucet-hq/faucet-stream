@@ -10,7 +10,6 @@
 //! [`ClickHouseSink::stage_and_build_sql`]) stays unit-tested and inside the
 //! coverage denominator.
 
-use faucet_common_clickhouse::{apply_auth, query_params};
 use faucet_core::FaucetError;
 use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
 use serde_json::Value;
@@ -18,12 +17,17 @@ use serde_json::Value;
 use crate::sink::ClickHouseSink;
 
 impl ClickHouseSink {
-    /// Send a bare SQL statement (no row body) over the HTTP interface — used by
-    /// the staged-load path's `INSERT … SELECT FROM s3(…)`.
+    /// Send the staged-load `INSERT … SELECT FROM s3(…)` over the HTTP
+    /// interface. The statement (which may carry storage credentials) rides the
+    /// request body, never the URL: a body-less POST is rejected with HTTP 411,
+    /// and a URL lands in proxy and access logs.
     pub(crate) async fn send_query(&self, statement: &str) -> Result<(), FaucetError> {
-        let params = query_params(&self.config.connection.database, &[("query", statement)]);
-        let req = self.client.post(&self.base_url).query(&params);
-        let req = apply_auth(req, &self.config.connection);
+        let req = crate::sink::staged_request(
+            &self.client,
+            &self.base_url,
+            &self.config.connection,
+            statement,
+        );
         let resp = req.send().await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
         Ok(())

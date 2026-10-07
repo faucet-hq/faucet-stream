@@ -12,7 +12,7 @@ Reach for it when you want to mirror a MySQL database into a warehouse, lake, qu
 ## Feature highlights
 
 - **Row-level change events** — each committed transaction is decoded from the binlog into a Debezium-style envelope (`op` / `before` / `after` / `lsn` / `txid`) and emitted as JSON.
-- **Per-transaction durability** — every committed transaction is its own `StreamPage` with a `{ file, pos }` bookmark attached, so the pipeline persists progress per commit. Uncommitted partial transactions never leak: they're buffered in memory and discarded at idle timeout, then re-delivered from the last persisted bookmark on the next run.
+- **Transaction-safe pages** — committed transactions are grouped into `StreamPage`s of up to `batch_size` records (never splitting a transaction; a page is also cut after one second), each with the `{ file, pos }` bookmark of its last commit, so a busy server costs one sink flush and state write per page rather than per commit. A commit that touches no captured table only moves the bookmark. `SAVEPOINT` / `ROLLBACK TO` / `RELEASE SAVEPOINT` stay inside their transaction, and an XA transaction is held until its `XA COMMIT` (emitted) or `XA ROLLBACK` (dropped) — nothing after an undecided XA transaction is bookmarked. Uncommitted partial transactions never leak: they're buffered in memory and discarded at idle timeout, then re-delivered from the last persisted bookmark on the next run.
 - **Resumable** — overrides `state_key()` / `apply_start_bookmark()`; on resume the binlog stream reopens from the persisted file/position.
 - **Effectively-once delivery** — `supports_exactly_once()` is `true`. Pair with an idempotent sink (postgres / mysql / mssql / sqlite / iceberg / bigquery) + a state store for end-to-end effectively-once semantics, gated and validated by the CLI.
 - **Snapshot → CDC handoff** — implements `capture_resume_position()` (anchor the binlog *before* a bulk snapshot); `faucet replicate` uses it to build a gap-free, duplicate-free mirror. Works against MySQL **5.7 / 8.0 / 8.4+** — current-position capture tries `SHOW BINARY LOG STATUS` (8.4) and falls back to `SHOW MASTER STATUS` (5.7 / 8.0).
@@ -132,7 +132,7 @@ Every change event is one JSON object:
 | `ts_ms` | number | Wall-clock time of the binlog event in Unix-epoch milliseconds (from the event header timestamp). |
 | `schema` | string | Source database (schema) name. |
 | `table` | string | Source table name. |
-| `before` | object \| null | Pre-image of the row. Populated on updates and deletes when `include_columns: true`. `null` on inserts, or when `include_columns: false`. |
+| `before` | object \| null | Pre-image of the row. Populated on updates and deletes when `include_columns: true`. With `include_columns: false` a delete still carries its primary-key columns (the whole row when the table has no primary key), so `cdc_unwrap` and `faucet mirror` can apply it; updates and inserts carry `null`. |
 | `after` | object \| null | Post-image of the row. Populated on inserts and updates. `null` on deletes. |
 | `lsn` | object | Binlog coordinates of the commit event: `{ "file": "mysql-bin.000003", "pos": 4567 }`. Used as the persisted bookmark. |
 | `txid` | number | Monotonically increasing per-session transaction counter (resets to 0 on each `faucet run`). Useful for grouping rows from the same transaction. |
@@ -148,6 +148,8 @@ Every change event is one JSON object:
 | `YEAR` | number |
 | `FLOAT` | the single-precision value's shortest decimal form |
 | `ENUM` / `SET` | the label / the comma-joined labels (needs `binlog_row_metadata=FULL`, already required) |
+| `BINARY` / `VARBINARY` / `BLOB` (the `binary` character set) and `BIT` | base64, whatever the bytes — decided from the column's type and character set, never from whether the bytes happen to be UTF-8 |
+| `CHAR` / `VARCHAR` / `TEXT` | string |
 
 Binlog transaction compression (`binlog_transaction_compression=ON`) is supported; each row's `lsn.pos` is the end of its compressed transaction, so a resume never re-reads a transaction it already delivered.
 
@@ -158,7 +160,8 @@ Binlog transaction compression (`binlog_transaction_compression=ON`) is supporte
 | `WriteRowsEvent` (INSERT) | `c` |
 | `UpdateRowsEvent` (UPDATE) | `u` |
 | `DeleteRowsEvent` (DELETE) | `d` |
-| DDL (`QueryEvent` other than BEGIN/COMMIT), when `emit_schema_changes: true` | `ddl` |
+| `TRUNCATE TABLE` on a captured table | `truncate` (`schema` / `table` set, `before` and `after` `null`; `cdc_unwrap` drops it, so a mirror keeps the truncated rows — truncate the destination yourself) |
+| DDL (any other `QueryEvent` except transaction control, savepoints and XA), when `emit_schema_changes: true` | `ddl` |
 
 ## Configuration reference
 
@@ -183,7 +186,7 @@ Both lists must use fully-qualified names (e.g. `appdb.users`); an unqualified e
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `include_columns` | bool | `true` | Emit the pre-image (`before`) on updates and deletes. Set `false` to suppress before-images and shrink payloads. |
+| `include_columns` | bool | `true` | Emit the pre-image (`before`) on updates and deletes. Set `false` to suppress before-images and shrink payloads; deletes then keep only their primary-key columns. |
 | `emit_schema_changes` | bool | `false` | Emit DDL statements (CREATE/ALTER/DROP TABLE etc.) as `{ op: "ddl" }` records. A DDL implicitly auto-commits any in-progress transaction in MySQL; any rows already buffered for that transaction are flushed (and the bookmark advanced) **before** the DDL is processed, so no rows are lost on resume regardless of this setting. |
 
 ### Reliability & batching
@@ -192,7 +195,7 @@ Both lists must use fully-qualified names (e.g. `appdb.users`); an unqualified e
 |-------|------|---------|-------------|
 | `idle_timeout` | int (seconds) | `30` | End the fetch cycle after this long with no new events. The accumulated page is flushed and the bookmark saved. Must be `> 0`. |
 | `max_staged_records` | int \| null | `null` | Abort if a single in-progress transaction buffers more than this many rows. `null` = unbounded. Set it to guard against OOM on bulk transactions. |
-| `batch_size` | int | `1000` | Advisory page-size hint. `0` = accumulate all committed transactions into one trailing page (useful for tiny lookup tables). Per-transaction streaming still emits one page per commit when the pipeline drives `stream_pages`. |
+| `batch_size` | int | `1000` | Records per page: committed transactions are coalesced until a page holds at least this many (a transaction is never split) or its oldest transaction has waited one second. `0` = accumulate all committed transactions into one trailing page (useful for tiny lookup tables). |
 
 ### TLS
 
@@ -312,9 +315,9 @@ pipeline:
 
 ## Streaming & batching
 
-The source overrides `Source::stream_pages`. Binlog events are decoded and buffered per transaction; on a commit boundary (`XidEvent` for InnoDB, or an explicit `COMMIT` `QueryEvent`) the accumulated rows are emitted as a single `StreamPage` carrying the commit's `{ file, pos }` as its bookmark. The pipeline writes the page, flushes the sink, and persists the bookmark — giving you **per-transaction durability** out of the box.
+The source overrides `Source::stream_pages`. Binlog events are decoded and buffered per transaction; on a commit boundary (`XidEvent` for InnoDB, or an explicit `COMMIT` `QueryEvent`) the transaction's rows join the pending page; the page is emitted when it reaches `batch_size` records or after one second, carrying the last commit's `{ file, pos }` as its bookmark. The pipeline writes the page, flushes the sink, and persists the bookmark — a resume never starts inside a transaction.
 
-`batch_size` is advisory: per-transaction streaming naturally emits one page per commit. With `batch_size: 0` all committed transactions seen before the idle timeout are accumulated into one trailing page (handy for tiny tables). `idle_timeout` bounds how long a fetch cycle waits for new events before flushing and returning.
+With `batch_size: 0` all committed transactions seen before the idle timeout are accumulated into one trailing page (handy for tiny tables). `idle_timeout` bounds how long a fetch cycle waits for new events before flushing and returning.
 
 ## Resume & state
 
@@ -417,7 +420,7 @@ For resumable / effectively-once runs, drive the source through `faucet_core::Pi
 1. `new()` validates the config, opens a replication connection (honouring `tls`), and verifies the server variables (`log_bin`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL`, and `binlog_row_value_options` empty — not `PARTIAL_JSON`).
 2. The start position is resolved: a persisted bookmark wins; otherwise `start_position` (`current` capture tries `SHOW BINARY LOG STATUS` then falls back to `SHOW MASTER STATUS`).
 3. Binlog events stream in; row events are decoded against the relation metadata (column names come from `binlog_row_metadata=FULL`) and buffered per transaction.
-4. On each commit boundary, the buffered rows are emitted as one `StreamPage` with the commit's `{ file, pos }` bookmark; uncommitted buffers are bounded by `max_staged_records`.
+4. On each commit boundary, the buffered rows join the pending page (emitted at `batch_size` records or after one second) with the commit's `{ file, pos }` bookmark; uncommitted buffers — and transactions held behind an undecided XA transaction — are bounded by `max_staged_records`.
 5. The cycle ends after `idle_timeout` of quiet, flushing the final page and saving the bookmark.
 
 ## Lineage dataset URI

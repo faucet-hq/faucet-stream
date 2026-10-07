@@ -68,6 +68,84 @@ fn split_table(table: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// `(catalog, schema, name)` of a target written as `name`, `schema.name` or
+/// `catalog.schema.name`. A missing part means the connection's current
+/// database / schema, which is where an unqualified INSERT lands.
+fn split_qualified(table: &str) -> (Option<&str>, Option<&str>, &str) {
+    let (rest, name) = split_table(table);
+    match rest {
+        None => (None, None, name),
+        Some(rest) => match rest.rsplit_once('.') {
+            Some((catalog, schema)) => (Some(catalog), Some(schema), name),
+            None => (None, Some(rest), name),
+        },
+    }
+}
+
+fn opt_param(v: Option<&str>) -> DuckValue {
+    v.map_or(DuckValue::Null, |s| DuckValue::Text(s.to_string()))
+}
+
+/// The target's columns in declared order, read from the one table an INSERT
+/// into `table` resolves to — never a same-named table or view in another
+/// schema or attached database.
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, FaucetError> {
+    let (catalog, schema, name) = split_qualified(table);
+    let mut stmt = conn
+        .prepare(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_catalog = coalesce(?, current_database()) \
+               AND table_schema = coalesce(?, current_schema()) \
+               AND table_name = ? \
+             ORDER BY ordinal_position",
+        )
+        .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?;
+    stmt.query_map(
+        duckdb::params_from_iter([
+            opt_param(catalog),
+            opt_param(schema),
+            DuckValue::Text(name.to_string()),
+        ]),
+        |row| row.get::<_, String>(0),
+    )
+    .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
+    .collect::<Result<Vec<String>, _>>()
+    .map_err(|e| FaucetError::Sink(format!("failed to decode table columns: {e}")))
+}
+
+/// Whether the (possibly qualified) target table exists.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, FaucetError> {
+    let (catalog, schema, name) = split_qualified(table);
+    let found: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_tables() \
+             WHERE database_name = coalesce(?, current_database()) \
+               AND schema_name = coalesce(?, current_schema()) \
+               AND table_name = ?",
+            duckdb::params_from_iter([
+                opt_param(catalog),
+                opt_param(schema),
+                DuckValue::Text(name.to_string()),
+            ]),
+            |r| r.get(0),
+        )
+        .map_err(|e| FaucetError::Sink(format!("duckdb table probe failed: {e}")))?;
+    Ok(found > 0)
+}
+
+/// The error for a record that matches no column of the target.
+fn no_matching_column_message(
+    idx: usize,
+    obj: &serde_json::Map<String, Value>,
+    columns: &[String],
+) -> String {
+    format!(
+        "duckdb: record {idx} has no field matching a column of the target table \
+         (record fields: {:?}; table columns: {columns:?})",
+        obj.keys().collect::<Vec<_>>()
+    )
+}
+
 /// A sink that writes JSON records to a DuckDB table.
 pub struct DuckdbSink {
     config: DuckdbSinkConfig,
@@ -210,38 +288,7 @@ fn insert_auto_map(
         return Ok(0);
     }
 
-    // Discover the table's columns (in declared order) via information_schema.
-    // `table` may be schema-qualified, and information_schema keeps the schema and
-    // the name in separate columns — matching `table_name` against the whole
-    // dotted string would find nothing (#456 L3).
-    let (schema, name) = split_table(table);
-    let cols: Vec<String> = match schema {
-        Some(schema) => {
-            let mut cstmt = conn
-                .prepare(
-                    "SELECT column_name FROM information_schema.columns \
-                     WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
-                )
-                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?;
-            cstmt
-                .query_map([schema, name], |row| row.get::<_, String>(0))
-                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
-                .collect::<Result<Vec<String>, _>>()
-        }
-        None => {
-            let mut cstmt = conn
-                .prepare(
-                    "SELECT column_name FROM information_schema.columns \
-                     WHERE table_name = ? ORDER BY ordinal_position",
-                )
-                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?;
-            cstmt
-                .query_map([name], |row| row.get::<_, String>(0))
-                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
-                .collect::<Result<Vec<String>, _>>()
-        }
-    }
-    .map_err(|e| FaucetError::Sink(format!("failed to decode table columns: {e}")))?;
+    let cols = table_columns(conn, table)?;
 
     if cols.is_empty() {
         return Err(FaucetError::Sink(format!(
@@ -249,22 +296,20 @@ fn insert_auto_map(
         )));
     }
 
-    // Records with at least one matching column; the INSERT column set is the
-    // union of table columns present in any such record (declared order). A row
-    // missing a unioned column binds SQL NULL. Records with no matching key are
-    // skipped (mirrors the SQLite sink).
+    // The INSERT column set is the union of table columns present in any
+    // record (declared order); a row missing a unioned column binds SQL NULL.
+    // A record with no matching column is refused: skipping it would count it
+    // written while nothing landed.
     let mut used: HashSet<&str> = HashSet::new();
     let mut rows: Vec<&serde_json::Map<String, Value>> = Vec::with_capacity(records.len());
-    for rec in records {
+    for (idx, rec) in records.iter().enumerate() {
         let obj = rec
             .as_object()
             .ok_or_else(|| FaucetError::Sink("AutoMap requires JSON object records".into()))?;
         if !cols.iter().any(|c| obj.contains_key(c)) {
-            tracing::warn!(
-                record_keys = ?obj.keys().collect::<Vec<_>>(),
-                "record has no keys matching table columns, skipping"
-            );
-            continue;
+            return Err(FaucetError::Sink(no_matching_column_message(
+                idx, obj, &cols,
+            )));
         }
         for c in &cols {
             if obj.contains_key(c) {
@@ -377,14 +422,7 @@ impl DuckdbSink {
             .map_err(|e| FaucetError::Sink(format!("duckdb connection mutex poisoned: {e}")))?;
 
         if !self.config.create_table {
-            let found: i64 = guard
-                .query_row(
-                    "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?",
-                    [&self.config.table_name],
-                    |r| r.get(0),
-                )
-                .map_err(|e| FaucetError::Sink(format!("duckdb table probe failed: {e}")))?;
-            if found == 0 {
+            if !table_exists(&guard, &self.config.table_name)? {
                 return Err(faucet_core::missing_target_error(
                     "duckdb sink",
                     &self.config.table_name,
@@ -505,6 +543,59 @@ impl faucet_core::Sink for DuckdbSink {
         );
         Ok(n)
     }
+
+    /// In `auto_map` mode a record that matches no column of the target fails
+    /// on its own row (DLQ-routable) and the rest of the page is written.
+    async fn write_batch_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !matches!(self.config.column_mapping, DuckdbColumnMapping::AutoMap) {
+            self.write_batch(records).await?;
+            return Ok(records.iter().map(|_| Ok(())).collect());
+        }
+        self.ensure_table_ready(records)?;
+        let cols = {
+            let guard = self
+                .conn
+                .lock()
+                .map_err(|_| FaucetError::Sink("duckdb connection mutex poisoned".into()))?;
+            table_columns(&guard, &self.config.table_name)?
+        };
+        let (outcomes, writable) = split_unmatched(records, &cols);
+        if !writable.is_empty() {
+            self.write_batch(&writable).await?;
+        }
+        Ok(outcomes)
+    }
+}
+
+/// Per-row outcomes plus the records to write: a record matching no column of
+/// the target fails on its own row. Non-object records are left to the writer,
+/// which refuses them.
+fn split_unmatched(
+    records: &[Value],
+    columns: &[String],
+) -> (Vec<faucet_core::RowOutcome>, Vec<Value>) {
+    let mut outcomes = Vec::with_capacity(records.len());
+    let mut writable = Vec::with_capacity(records.len());
+    for (idx, record) in records.iter().enumerate() {
+        match record.as_object() {
+            Some(obj) if !columns.iter().any(|c| obj.contains_key(c)) => {
+                outcomes.push(Err(FaucetError::Sink(no_matching_column_message(
+                    idx, obj, columns,
+                ))));
+            }
+            _ => {
+                outcomes.push(Ok(()));
+                writable.push(record.clone());
+            }
+        }
+    }
+    (outcomes, writable)
 }
 
 #[cfg(test)]
@@ -569,6 +660,85 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2);
         assert_eq!(count(&sink, "t"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_record_matching_no_column_is_refused_not_skipped() {
+        let sink = sink_with_table(
+            "CREATE TABLE t (id INTEGER, name TEXT)",
+            "t",
+            DuckdbColumnMapping::AutoMap,
+        )
+        .await;
+        let page = [json!({"id": 1}), json!({"other": "x"})];
+        let err = sink.write_batch(&page).await.expect_err("unmatched record");
+        assert!(err.to_string().contains("record 1 has no field"), "{err}");
+        assert_eq!(count(&sink, "t"), 0, "the page is all-or-nothing");
+
+        let outcomes = sink.write_batch_partial(&page).await.unwrap();
+        assert!(outcomes[0].is_ok());
+        assert!(
+            outcomes[1]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("record 1")
+        );
+        assert_eq!(count(&sink, "t"), 1);
+
+        let json_sink = sink_with_table(
+            "CREATE TABLE j (data TEXT)",
+            "j",
+            DuckdbColumnMapping::Json {
+                column: "data".into(),
+            },
+        )
+        .await;
+        let outcomes = json_sink.write_batch_partial(&page).await.unwrap();
+        assert!(outcomes.iter().all(Result::is_ok));
+        assert!(json_sink.write_batch_partial(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_qualified_and_shadowed_targets_resolve_to_one_table() {
+        let sink = DuckdbSink::new(
+            DuckdbSinkConfig::new(":memory:", "analytics.events")
+                .column_mapping(DuckdbColumnMapping::AutoMap)
+                .with_create_table(false),
+        )
+        .await
+        .unwrap();
+        sink.run_sql(
+            "CREATE SCHEMA analytics; CREATE TABLE analytics.events (id INTEGER); \
+             CREATE TABLE main.events (id INTEGER, extra TEXT);",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sink.write_batch(&[json!({"id": 1, "extra": "x"})])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(count(&sink, "analytics.events"), 1);
+        assert_eq!(count(&sink, "main.events"), 0);
+
+        let plain = sink_with_table(
+            "CREATE SCHEMA other; CREATE TABLE other.t (id INTEGER, ghost TEXT); \
+             CREATE TABLE t (id INTEGER);",
+            "t",
+            DuckdbColumnMapping::AutoMap,
+        )
+        .await;
+        assert_eq!(
+            plain
+                .write_batch(&[json!({"id": 1, "ghost": "g"})])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(count(&plain, "t"), 1);
+        assert_eq!(split_qualified("db.s.t"), (Some("db"), Some("s"), "t"));
     }
 
     #[tokio::test]

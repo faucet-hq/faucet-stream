@@ -2,14 +2,17 @@
 //!
 //! `duckdb` is a synchronous, embedded engine, so every database call runs
 //! inside [`tokio::task::spawn_blocking`]. Streaming stays bounded-memory: a
-//! dedicated blocking task holds the connection, iterates the result row by
-//! row, and hands finished [`StreamPage`]s to the async side over a small
-//! bounded channel — never buffering the whole result set.
+//! dedicated blocking task holds the connection, pulls the result chunk by
+//! chunk through DuckDB's streaming execution, and hands finished
+//! [`StreamPage`]s to the async side over a small bounded channel — never
+//! materializing the whole result set.
 
 use crate::config::DuckdbSourceConfig;
+use crate::convert;
 use async_trait::async_trait;
-use base64::Engine as _;
-use duckdb::types::{Value as DuckValue, ValueRef};
+use duckdb::arrow::array::{Array as _, StringArray};
+use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::types::Value as DuckValue;
 use duckdb::{AccessMode, Config, Connection};
 use faucet_core::{FaucetError, Stream, StreamPage};
 use serde_json::Value;
@@ -102,87 +105,198 @@ fn json_to_duck(v: &Value) -> DuckValue {
     }
 }
 
-/// Convert a DuckDB column value to a `serde_json::Value`.
-///
-/// Scalar types map exactly. `Text` becomes a UTF-8 (lossy) string and `Blob`
-/// becomes base64 so binary survives the JSON round-trip, and `Decimal` its
-/// exact text. Temporal and nested (LIST / STRUCT / MAP / …) types are best-effort: temporal values
-/// surface their raw integer, and everything else falls back to a stable
-/// debug string — documented in the crate README.
-fn value_ref_to_json(v: ValueRef<'_>) -> Value {
-    use serde_json::json;
-    match v {
-        ValueRef::Null => Value::Null,
-        ValueRef::Boolean(b) => Value::Bool(b),
-        ValueRef::TinyInt(n) => json!(n),
-        ValueRef::SmallInt(n) => json!(n),
-        ValueRef::Int(n) => json!(n),
-        ValueRef::BigInt(n) => json!(n),
-        ValueRef::HugeInt(n) => i64::try_from(n)
-            .map(|x| json!(x))
-            .unwrap_or_else(|_| Value::String(n.to_string())),
-        ValueRef::UTinyInt(n) => json!(n),
-        ValueRef::USmallInt(n) => json!(n),
-        ValueRef::UInt(n) => json!(n),
-        ValueRef::UBigInt(n) => json!(n),
-        ValueRef::Float(f) => serde_json::Number::from_f64(f as f64)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        ValueRef::Double(f) => serde_json::Number::from_f64(f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
-        ValueRef::Blob(bytes) => {
-            Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+/// DuckDB types whose Arrow export loses information, so the source casts them
+/// to `VARCHAR`: `UHUGEINT` arrives as a signed 128-bit decimal (values from
+/// 2^127 up turn negative), `BIT` / `BIGNUM` as DuckDB's internal bytes and
+/// `TIMETZ` without its offset.
+fn needs_text_cast(duck_type: &str) -> bool {
+    matches!(
+        duck_type.to_ascii_uppercase().as_str(),
+        "UHUGEINT" | "BIT" | "BITSTRING" | "BIGNUM" | "VARINT" | "TIMETZ" | "TIME WITH TIME ZONE"
+    )
+}
+
+/// The query as it will run: the user's text with trailing `;` removed, and,
+/// when a column needs a text cast, wrapped in a projection applying it.
+#[derive(Debug, PartialEq)]
+struct Plan {
+    sql: String,
+    duck_types: Vec<String>,
+}
+
+fn trimmed(query: &str) -> &str {
+    query.trim_end().trim_end_matches(';').trim_end()
+}
+
+/// Build the plan from `DESCRIBE`'s `(name, type)` rows. Two result columns
+/// sharing a name are refused: a JSON row holds one value per name.
+fn plan_from_description(query: &str, columns: &[(String, String)]) -> Result<Plan, FaucetError> {
+    let mut seen = std::collections::HashSet::new();
+    for (name, _) in columns {
+        if !seen.insert(name.as_str()) {
+            return Err(duplicate_column(name));
         }
-        // Exact decimal text, as the postgres/mysql sources emit: parsing it
-        // into a JSON number rounds through `f64` (#789 SQL-15).
-        ValueRef::Decimal(d) => Value::String(d.to_string()),
-        ValueRef::Timestamp(_, n) => json!(n),
-        ValueRef::Date32(n) => json!(n),
-        ValueRef::Time64(_, n) => json!(n),
-        ValueRef::Interval {
-            months,
-            days,
-            nanos,
-        } => json!({ "months": months, "days": days, "nanos": nanos }),
-        // List, Struct, Map, Array, Enum, Union — best-effort.
-        other => Value::String(format!("{other:?}")),
     }
+    let query = trimmed(query);
+    let duck_types = columns.iter().map(|(_, t)| t.clone()).collect();
+    if !columns.iter().any(|(_, t)| needs_text_cast(t)) {
+        return Ok(Plan {
+            sql: query.to_string(),
+            duck_types,
+        });
+    }
+    let projection = columns
+        .iter()
+        .map(|(name, t)| {
+            let q = faucet_core::util::quote_ident(name);
+            if needs_text_cast(t) {
+                format!("CAST({q} AS VARCHAR) AS {q}")
+            } else {
+                q
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Plan {
+        sql: format!("SELECT {projection} FROM (\n{query}\n) AS __faucet_q"),
+        duck_types: columns
+            .iter()
+            .map(|(_, t)| {
+                if needs_text_cast(t) {
+                    "VARCHAR".to_string()
+                } else {
+                    t.clone()
+                }
+            })
+            .collect(),
+    })
 }
 
-/// A cell read: the value, the driver's error, or a decode panic turned into
-/// an error naming the column.
-fn cell_value<E: std::fmt::Display>(
-    read: std::thread::Result<Result<Value, E>>,
-    name: &str,
-) -> Result<Value, FaucetError> {
-    match read {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(FaucetError::Source(format!(
-            "DuckDB column {name} read failed: {e}"
-        ))),
-        Err(_) => Err(FaucetError::Source(format!(
-            "DuckDB column {name} holds a value the driver cannot decode (a DECIMAL \
-             wider than 28 significant digits or a nanosecond TIME); CAST it to \
-             VARCHAR in the query"
-        ))),
-    }
+fn duplicate_column(name: &str) -> FaucetError {
+    FaucetError::Source(format!(
+        "DuckDB query returns two columns named {name:?}; alias them \
+         (`SELECT a.{name} AS a_{name}, b.{name} AS b_{name} …`) so neither is lost"
+    ))
 }
 
-/// Build a JSON object from the current row using the pre-fetched column names.
-fn row_to_json(row: &duckdb::Row<'_>, col_names: &[String]) -> Result<Value, FaucetError> {
-    let mut map = serde_json::Map::with_capacity(col_names.len());
-    for (i, name) in col_names.iter().enumerate() {
-        // duckdb-rs panics on some valid values (a DECIMAL wider than 28
-        // significant digits, a nanosecond TIME); fail the read instead of
-        // letting the panic end the stream as if it were complete.
-        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            row.get_ref(i).map(value_ref_to_json)
-        }));
-        map.insert(name.clone(), cell_value(read, name)?);
+fn source_err(what: &str) -> impl Fn(duckdb::Error) -> FaucetError + '_ {
+    move |e| FaucetError::Source(format!("DuckDB {what} failed: {e}"))
+}
+
+/// `DESCRIBE` the query to learn each column's DuckDB type. `None` when the
+/// statement cannot be described (a `PRAGMA`, `CALL`, …).
+fn describe(conn: &Connection, query: &str, params: &[DuckValue]) -> Option<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(&format!("DESCRIBE {}", trimmed(query))).ok()?;
+    let batches: Vec<_> = stmt
+        .query_arrow(duckdb::params_from_iter(params.iter().cloned()))
+        .ok()?
+        .collect();
+    let mut out = Vec::new();
+    for batch in batches {
+        let names = batch.column(0).as_any().downcast_ref::<StringArray>()?;
+        let types = batch.column(1).as_any().downcast_ref::<StringArray>()?;
+        for i in 0..batch.num_rows() {
+            out.push((names.value(i).to_string(), types.value(i).to_string()));
+        }
     }
-    Ok(Value::Object(map))
+    Some(out)
+}
+
+/// Run `query`, handing each converted Arrow batch to `sink`. Results stream
+/// chunk by chunk (`duckdb_execute_prepared_streaming`), so memory stays
+/// bounded; only a statement that cannot be wrapped for the schema probe (a
+/// `PRAGMA`, `SHOW`, …) falls back to a materialized result. `sink` returns
+/// `false` to stop early.
+fn run_query(
+    conn: &Connection,
+    query: &str,
+    binds: &[Value],
+    mut sink: impl FnMut(Vec<Value>) -> Result<bool, FaucetError>,
+) -> Result<(), FaucetError> {
+    let params: Vec<DuckValue> = binds.iter().map(json_to_duck).collect();
+    let plan = match describe(conn, query, &params) {
+        Some(columns) => plan_from_description(query, &columns)?,
+        None => Plan {
+            sql: trimmed(query).to_string(),
+            duck_types: Vec::new(),
+        },
+    };
+    let bound = || duckdb::params_from_iter(params.iter().cloned());
+
+    let schema = conn
+        .prepare(&format!(
+            "SELECT * FROM (\n{}\n) AS __faucet_probe LIMIT 0",
+            plan.sql
+        ))
+        .and_then(|mut probe| {
+            let _ = probe.query_arrow(bound())?.count();
+            Ok(probe.schema())
+        });
+
+    let mut stmt = conn.prepare(&plan.sql).map_err(source_err("prepare"))?;
+    match schema {
+        Ok(schema) => {
+            check_unique(schema.fields().iter().map(|f| f.name().as_str()))?;
+            let stream = stmt
+                .stream_arrow(bound(), schema)
+                .map_err(source_err("query"))?;
+            for batch in guarded(stream) {
+                if !sink(convert::batch_to_values(&batch?, &plan.duck_types)?)? {
+                    break;
+                }
+            }
+        }
+        Err(_) => {
+            let arrow = stmt.query_arrow(bound()).map_err(source_err("query"))?;
+            let mut checked = false;
+            for batch in guarded(arrow) {
+                let batch = batch?;
+                if !checked {
+                    check_unique(batch.schema().fields().iter().map(|f| f.name().as_str()))?;
+                    checked = true;
+                }
+                if !sink(convert::batch_to_values(&batch, &plan.duck_types)?)? {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_unique<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), FaucetError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(duplicate_column(name));
+        }
+    }
+    Ok(())
+}
+
+/// Iterate batches, turning a driver panic (it `expect`s inside the FFI
+/// import) into an error so a failed read never looks like the end of the
+/// result.
+fn guarded<I: Iterator<Item = RecordBatch>>(
+    mut iter: I,
+) -> impl Iterator<Item = Result<RecordBatch, FaucetError>> {
+    let mut failed = false;
+    std::iter::from_fn(move || {
+        if failed {
+            return None;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next())) {
+            Ok(next) => next.map(Ok),
+            Err(_) => {
+                failed = true;
+                Some(Err(FaucetError::Source(
+                    "DuckDB result chunk could not be decoded; CAST unusual columns to \
+                     VARCHAR in the query"
+                        .into(),
+                )))
+            }
+        }
+    })
 }
 
 /// Run the query on the blocking thread and drain every row into a `Vec`
@@ -195,27 +309,11 @@ fn collect_blocking(
     let guard = conn
         .lock()
         .map_err(|_| FaucetError::Source("duckdb connection mutex poisoned".into()))?;
-    let mut stmt = guard
-        .prepare(query)
-        .map_err(|e| FaucetError::Source(format!("DuckDB prepare failed: {e}")))?;
-    let params: Vec<DuckValue> = binds.iter().map(json_to_duck).collect();
-    let mut rows = stmt
-        .query(duckdb::params_from_iter(params))
-        .map_err(|e| FaucetError::Source(format!("DuckDB query failed: {e}")))?;
-    // DuckDB populates column metadata only after execution, so column names are
-    // read from the first row (via `Row: AsRef<Statement>`), not the prepared
-    // statement.
-    let mut col_names: Vec<String> = Vec::new();
     let mut out = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| FaucetError::Source(format!("DuckDB row read failed: {e}")))?
-    {
-        if col_names.is_empty() {
-            col_names = row.as_ref().column_names();
-        }
-        out.push(row_to_json(row, &col_names)?);
-    }
+    run_query(&guard, query, binds, |rows| {
+        out.extend(rows);
+        Ok(true)
+    })?;
     Ok(out)
 }
 
@@ -230,14 +328,6 @@ fn stream_blocking(
     let guard = conn
         .lock()
         .map_err(|_| FaucetError::Source("duckdb connection mutex poisoned".into()))?;
-    let mut stmt = guard
-        .prepare(query)
-        .map_err(|e| FaucetError::Source(format!("DuckDB prepare failed: {e}")))?;
-    let params: Vec<DuckValue> = binds.iter().map(json_to_duck).collect();
-    let mut rows = stmt
-        .query(duckdb::params_from_iter(params))
-        .map_err(|e| FaucetError::Source(format!("DuckDB query failed: {e}")))?;
-
     let chunk = if batch_size == 0 {
         usize::MAX
     } else {
@@ -245,32 +335,28 @@ fn stream_blocking(
     };
     let cap = if batch_size == 0 { 1024 } else { batch_size };
     let mut buffer: Vec<Value> = Vec::with_capacity(cap);
-    // Column names come from the first row (see `collect_blocking`).
-    let mut col_names: Vec<String> = Vec::new();
-
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| FaucetError::Source(format!("DuckDB row read failed: {e}")))?
-    {
-        if col_names.is_empty() {
-            col_names = row.as_ref().column_names();
-        }
-        buffer.push(row_to_json(row, &col_names)?);
-        if buffer.len() >= chunk {
-            let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
-            // Receiver dropped (stream cancelled) → stop cleanly.
-            if tx
-                .blocking_send(Ok(StreamPage {
-                    records: page,
-                    bookmark: None,
-                }))
-                .is_err()
-            {
-                return Ok(());
+    let mut open = true;
+    run_query(&guard, query, binds, |rows| {
+        for row in rows {
+            buffer.push(row);
+            if buffer.len() >= chunk {
+                let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
+                // Receiver dropped (stream cancelled) → stop cleanly.
+                if tx
+                    .blocking_send(Ok(StreamPage {
+                        records: page,
+                        bookmark: None,
+                    }))
+                    .is_err()
+                {
+                    open = false;
+                    return Ok(false);
+                }
             }
         }
-    }
-    if !buffer.is_empty() {
+        Ok(true)
+    })?;
+    if open && !buffer.is_empty() {
         let _ = tx.blocking_send(Ok(StreamPage {
             records: buffer,
             bookmark: None,
@@ -368,25 +454,6 @@ impl faucet_core::Source for DuckdbSource {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cell_value_names_the_column_on_error_and_panic() {
-        let ok: std::thread::Result<Result<Value, String>> = Ok(Ok(Value::Bool(true)));
-        assert_eq!(cell_value(ok, "c").unwrap(), Value::Bool(true));
-        let err: std::thread::Result<Result<Value, String>> = Ok(Err("bad index".into()));
-        assert!(
-            cell_value(err, "c")
-                .unwrap_err()
-                .to_string()
-                .contains("column c read failed")
-        );
-        let panicked: std::thread::Result<Result<Value, String>> = Err(Box::new("boom"));
-        assert!(
-            cell_value(panicked, "c")
-                .unwrap_err()
-                .to_string()
-                .contains("CAST it to")
-        );
-    }
     use faucet_core::Source;
     use serde_json::json;
 
@@ -487,7 +554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_undecodable_value_fails_the_stream_instead_of_ending_it() {
+    async fn wide_decimals_decode_exactly() {
         let source = DuckdbSource::new(DuckdbSourceConfig::new(
             ":memory:",
             "SELECT * FROM (VALUES (1, CAST(1 AS DECIMAL(38, 2))), \
@@ -495,15 +562,8 @@ mod tests {
         ))
         .await
         .unwrap();
-        let ctx = HashMap::new();
-        let pages: Vec<_> = futures::StreamExt::collect(source.stream_pages(&ctx, 100)).await;
-        let error = pages
-            .into_iter()
-            .find_map(Result::err)
-            .expect("the stream must not end cleanly")
-            .to_string();
-        assert!(error.contains("column d"), "{error}");
-        assert!(source.fetch_all().await.is_err());
+        let rows = source.fetch_all().await.unwrap();
+        assert_eq!(rows[1]["d"], json!("123456789012345678901234567890.12"));
     }
 
     #[tokio::test]
@@ -549,17 +609,127 @@ mod tests {
         ));
     }
 
+    async fn one_row(query: &str) -> Value {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(":memory:", query))
+            .await
+            .unwrap();
+        let mut rows = source.fetch_all().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        rows.remove(0)
+    }
+
+    #[tokio::test]
+    async fn temporal_values_are_iso_at_their_precision() {
+        let row = one_row(
+            "SELECT TIMESTAMP_S '2024-01-01 10:00:00' AS ts_s, \
+             TIMESTAMP_NS '2024-01-01 10:00:00.123456789' AS ts_ns, \
+             TIMESTAMP '2024-01-01 10:00:00.5' AS ts, \
+             TIMESTAMPTZ '2024-01-01 10:00:00+05:30' AS tz, \
+             DATE '2024-01-02' AS d, TIME '10:11:12.5' AS t, \
+             TIMETZ '10:00:00+05' AS ttz, INTERVAL 3 DAY AS i, \
+             'infinity'::TIMESTAMP AS inf, '-infinity'::DATE AS ninf",
+        )
+        .await;
+        assert_eq!(row["ts_s"], json!("2024-01-01T10:00:00"));
+        assert_eq!(row["ts_ns"], json!("2024-01-01T10:00:00.123456789"));
+        assert_eq!(row["ts"], json!("2024-01-01T10:00:00.500"));
+        assert_eq!(row["tz"], json!("2024-01-01T04:30:00Z"));
+        assert_eq!(row["d"], json!("2024-01-02"));
+        assert_eq!(row["t"], json!("10:11:12.500"));
+        assert_eq!(row["ttz"], json!("10:00:00+05"));
+        assert_eq!(row["i"], json!({"months": 0, "days": 3, "nanos": 0}));
+        assert_eq!(row["inf"], json!("infinity"));
+        assert_eq!(row["ninf"], json!("-infinity"));
+    }
+
+    #[tokio::test]
+    async fn nested_values_are_json_of_this_row_only() {
+        let source = memory_source(
+            "CREATE TABLE n AS SELECT * FROM (VALUES \
+               (1, [1, 2], {'k': 'a'}, MAP {'x': 1}, MAP {1: 'one'}, 'x'::ENUM('x', 'y')), \
+               (2, [3], {'k': 'b'}, MAP {'y': 2}, MAP {2: 'two'}, 'y'::ENUM('x', 'y'))) \
+             t(id, l, s, m, mi, e)",
+            "SELECT id, l, s, m, mi, e, [1, 2]::INT[2] AS arr, union_value(n := 7) AS un \
+             FROM n ORDER BY id",
+        )
+        .await;
+        let rows = source.fetch_all().await.unwrap();
+        assert_eq!(rows[1]["l"], json!([3]));
+        assert_eq!(rows[1]["s"], json!({"k": "b"}));
+        assert_eq!(rows[1]["m"], json!({"y": 2}));
+        assert_eq!(rows[1]["mi"], json!([{"key": 2, "value": "two"}]));
+        assert_eq!(rows[1]["e"], json!("y"));
+        assert_eq!(rows[0]["arr"], json!([1, 2]));
+        assert_eq!(rows[0]["un"], json!(7));
+    }
+
+    #[tokio::test]
+    async fn wide_and_opaque_types_come_out_exact() {
+        let row = one_row(
+            "SELECT 340282366920938463463374607431768211455::UHUGEINT AS u, \
+             170141183460469231731687303715884105728::UHUGEINT AS u127, \
+             '101'::BIT AS b, 12345678901234567890123456789::BIGNUM AS g, \
+             42::HUGEINT AS h, 170141183460469231731687303715884105727::HUGEINT AS hmax, \
+             18446744073709551615::UBIGINT AS ub, \
+             '11111111-1111-1111-1111-111111111111'::UUID AS uu, \
+             0.1::REAL AS r, 'nan'::DOUBLE AS nd, '-inf'::REAL AS nr, NULL::INT AS z",
+        )
+        .await;
+        assert_eq!(row["u"], json!("340282366920938463463374607431768211455"));
+        assert_eq!(
+            row["u127"],
+            json!("170141183460469231731687303715884105728")
+        );
+        assert_eq!(row["b"], json!("101"));
+        assert_eq!(row["g"], json!("12345678901234567890123456789"));
+        assert_eq!(row["h"], json!(42));
+        assert_eq!(
+            row["hmax"],
+            json!("170141183460469231731687303715884105727")
+        );
+        assert_eq!(row["ub"], json!(18446744073709551615u64));
+        assert_eq!(row["uu"], json!("11111111-1111-1111-1111-111111111111"));
+        assert_eq!(row["r"], json!(0.1));
+        assert_eq!(row["nd"], json!("NaN"));
+        assert_eq!(row["nr"], json!("-Infinity"));
+        assert_eq!(row["z"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn duplicate_column_names_are_refused() {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(
+            ":memory:",
+            "SELECT 1 AS id, 2 AS id;",
+        ))
+        .await
+        .unwrap();
+        let err = source.fetch_all().await.expect_err("duplicate names");
+        assert!(
+            err.to_string().contains("two columns named \"id\""),
+            "{err}"
+        );
+        assert!(check_unique(["a", "b", "a"].into_iter()).is_err());
+    }
+
+    #[tokio::test]
+    async fn statements_that_cannot_be_wrapped_still_run() {
+        let row = one_row("PRAGMA version").await;
+        assert!(row.get("library_version").is_some(), "{row}");
+    }
+
     #[test]
-    fn value_ref_json_scalars() {
-        assert_eq!(value_ref_to_json(ValueRef::Null), Value::Null);
+    fn plans_cast_only_lossy_columns() {
+        let cols = vec![
+            ("a".to_string(), "INTEGER".to_string()),
+            ("b".to_string(), "UHUGEINT".to_string()),
+        ];
+        let plan = plan_from_description("SELECT a, b FROM t -- note\n;", &cols).unwrap();
         assert_eq!(
-            value_ref_to_json(ValueRef::Boolean(true)),
-            Value::Bool(true)
+            plan.sql,
+            "SELECT \"a\", CAST(\"b\" AS VARCHAR) AS \"b\" FROM (\nSELECT a, b FROM t -- note\n) AS __faucet_q"
         );
-        assert_eq!(value_ref_to_json(ValueRef::Int(7)), serde_json::json!(7));
-        assert_eq!(
-            value_ref_to_json(ValueRef::Text(b"hi")),
-            Value::String("hi".into())
-        );
+        assert_eq!(plan.duck_types, vec!["INTEGER", "VARCHAR"]);
+        let plain = plan_from_description("SELECT 1 AS a;", &cols[..1]).unwrap();
+        assert_eq!(plain.sql, "SELECT 1 AS a");
     }
 }

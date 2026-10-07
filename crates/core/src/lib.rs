@@ -39,6 +39,7 @@ pub mod error;
 pub mod file_format;
 pub mod idempotency;
 pub mod join;
+pub mod json_numbers;
 pub mod lag;
 pub mod lease;
 pub mod local_outputs;
@@ -119,8 +120,8 @@ pub use dlq::{
     dlq_all_is_safe, dlq_all_refusal, unwrap_envelope,
 };
 pub use drift::{
-    ColumnChange, OnDrift, OnIncompatible, SchemaDiff, SchemaDriftPolicy, SchemaDriftSpec,
-    SchemaEvolution, SqlBaseType, adds_null, base_widened, json_schema_base_type,
+    ColumnChange, DRIFT_ALSO_ACCEPTS, OnDrift, OnIncompatible, SchemaDiff, SchemaDriftPolicy,
+    SchemaDriftSpec, SchemaEvolution, SqlBaseType, adds_null, base_widened, json_schema_base_type,
 };
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
@@ -138,6 +139,7 @@ pub use idempotency::{
 pub use join::{
     HashJoin, JoinConfig, JoinMode, JoinStats, KeyNormalize, OnCollision, OnDuplicate, Projection,
 };
+pub use json_numbers::{JsonBigNumbers, parse_json_exact};
 pub use lag::{LagObserver, SourceLag};
 pub use local_outputs::{LocalOutput, LocalOutputLog, probe_pre_existing};
 pub use metadata::{

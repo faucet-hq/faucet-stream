@@ -79,6 +79,18 @@ pub struct MysqlSinkConfig {
     /// index to detect conflicts.
     #[serde(flatten)]
     pub write: WriteSpec,
+    /// Longest a page write may wait on the server, in seconds, before it
+    /// fails. Defaults to 3600; `0` waits forever.
+    ///
+    /// A peer that disappears without closing the connection (a failover, an
+    /// idle-eviction by a NAT or load balancer) otherwise leaves the write
+    /// waiting forever, and a scheduled or served run stuck in "running".
+    #[serde(default = "default_write_timeout_secs")]
+    pub write_timeout_secs: u64,
+}
+
+fn default_write_timeout_secs() -> u64 {
+    3600
 }
 
 fn default_batch_size() -> usize {
@@ -101,6 +113,7 @@ impl std::fmt::Debug for MysqlSinkConfig {
             .field("column_mapping", &self.column_mapping)
             .field("batch_size", &self.batch_size)
             .field("max_connections", &self.max_connections)
+            .field("write_timeout_secs", &self.write_timeout_secs)
             .finish()
     }
 }
@@ -116,6 +129,7 @@ impl MysqlSinkConfig {
             max_connections: 5,
             create_table: default_create_table(),
             write: WriteSpec::default(),
+            write_timeout_secs: default_write_timeout_secs(),
         }
     }
 

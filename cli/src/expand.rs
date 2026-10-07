@@ -125,8 +125,8 @@ pub struct ExpandedNode {
     /// Scoped-cleanup claim (#478): the source's `complete_for` scope, still
     /// carrying any `${parent.*}` / `${now.*}` tokens — the executor resolves
     /// them per invocation, like the connector configs. `Some` only when the
-    /// destination sink also opted in with `cleanup: delete_missing`, so this
-    /// being present already means a cleanup is intended.
+    /// claim sets `on_missing: delete`, so this being present already means a
+    /// cleanup is intended.
     pub cleanup_scope: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// Pipeline-level `_faucet_*` metadata columns (#510), shared by every node;
     /// the executor wraps the sink in a `MetadataSink` decorator when present.
@@ -1028,6 +1028,32 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     tracing::warn!(
                         row = %row_id,
                         "profiling: the `memory` state store resets on process exit — the                          profile baseline only persists within a single `faucet                          schedule`/`serve` process; use `file`, `redis`, or `postgres`                          for one-shot runs"
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+
+        // postgres-cdc gate (#789 SQL-131): the replication slot only advances
+        // from a persisted bookmark, so without state every run replays from
+        // the slot's original position and the primary keeps the WAL.
+        if merged_source.kind == "postgres-cdc" {
+            match state.as_ref() {
+                None => {
+                    return Err(CliError::Config(format!(
+                        "row '{row_id}': postgres-cdc needs a `state:` block — the slot only \
+                         advances from a persisted bookmark, so without one every run \
+                         replays from the slot's start and the server retains WAL \
+                         (use `file`, `redis`, or `postgres`)"
+                    )));
+                }
+                Some(s) if s.kind == "memory" => {
+                    tracing::warn!(
+                        row = %row_id,
+                        "postgres-cdc: the `memory` state store resets on process exit — the \
+                         slot only advances within one `faucet schedule`/`serve` process and \
+                         a restart replays from the slot's start; use `file`, `redis`, or \
+                         `postgres`"
                     );
                 }
                 Some(_) => {}
@@ -3800,6 +3826,26 @@ pipeline:
             }
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn postgres_cdc_requires_a_state_block() {
+        let yaml = r#"
+version: 1
+pipeline:
+  source: { type: postgres-cdc, config: {} }
+  sink:   { type: stdout, config: {} }
+"#;
+        let cfg = parse_with_extension(yaml, "yaml").unwrap();
+        match expand(&cfg).unwrap_err() {
+            CliError::Config(msg) => {
+                assert!(msg.contains("postgres-cdc needs a `state:`"), "{msg}")
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+        let with_memory = format!("{yaml}  state: {{ type: memory, config: {{}} }}\n");
+        let cfg = parse_with_extension(&with_memory, "yaml").unwrap();
+        assert_eq!(expand(&cfg).unwrap().len(), 1, "memory state only warns");
     }
 
     #[test]
