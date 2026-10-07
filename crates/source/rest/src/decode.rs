@@ -162,7 +162,35 @@ pub async fn run_decode_with_nulls(
     steps: &[DecodeStep],
     csv_null_values: &[String],
 ) -> Result<Vec<Value>, FaucetError> {
-    let mut buf = body.to_vec();
+    let body = body.to_vec();
+    let owned_steps = steps.to_vec();
+    // Base64 / gunzip / unzip are CPU-bound and can be large: run them off the
+    // async runtime (API-42).
+    let (buf, parse) = tokio::task::spawn_blocking(move || decode_bytes(body, &owned_steps))
+        .await
+        .map_err(|e| FaucetError::Source(format!("decode: worker failed: {e}")))??;
+    // No explicit `parse` → default to JSON.
+    let parse = parse.unwrap_or(ParseSpec {
+        format: ParseFormat::Json,
+        records_path: None,
+        delimiter: None,
+        has_headers: true,
+        sheet: None,
+        header_row: 0,
+    });
+    parse_records(&buf, &parse, csv_null_values).await
+}
+
+/// Largest buffer a decompression step may produce (1 GiB); a bigger member
+/// fails instead of exhausting memory.
+pub const MAX_DECODED_BYTES: u64 = 1 << 30;
+
+/// Run the byte steps up to the first `parse`, returning the buffer and that
+/// `parse` step (if any).
+fn decode_bytes(
+    mut buf: Vec<u8>,
+    steps: &[DecodeStep],
+) -> Result<(Vec<u8>, Option<ParseSpec>), FaucetError> {
     for step in steps {
         match step {
             DecodeStep::Extract { extract } => {
@@ -185,34 +213,51 @@ pub async fn run_decode_with_nulls(
                     .map_err(|e| FaucetError::Source(format!("decode `base64`: {e}")))?;
             }
             DecodeStep::Simple(SimpleStep::Gunzip) => {
-                let mut out = Vec::new();
-                flate2::read::GzDecoder::new(Cursor::new(&buf))
-                    .read_to_end(&mut out)
-                    .map_err(|e| FaucetError::Source(format!("decode `gunzip`: {e}")))?;
-                buf = out;
+                buf = read_capped(
+                    flate2::read::GzDecoder::new(Cursor::new(&buf)),
+                    MAX_DECODED_BYTES,
+                    "gunzip",
+                )?;
             }
             DecodeStep::Unzip { unzip } => {
                 buf = unzip_member(&buf, unzip.member.as_deref())?;
             }
-            DecodeStep::Parse { parse } => {
-                return parse_records(&buf, parse, csv_null_values).await;
-            }
+            DecodeStep::Parse { parse } => return Ok((buf, Some(parse.clone()))),
         }
     }
-    // No explicit `parse` → default to JSON.
-    parse_records(
-        &buf,
-        &ParseSpec {
-            format: ParseFormat::Json,
-            records_path: None,
-            delimiter: None,
-            has_headers: true,
-            sheet: None,
-            header_row: 0,
-        },
-        &[],
-    )
-    .await
+    Ok((buf, None))
+}
+
+/// Read `reader` to the end, failing once it yields more than `cap` bytes.
+fn read_capped(reader: impl Read, cap: u64, step: &str) -> Result<Vec<u8>, FaucetError> {
+    let mut out = Vec::new();
+    reader
+        .take(cap + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| FaucetError::Source(format!("decode `{step}`: {e}")))?;
+    if out.len() as u64 > cap {
+        return Err(FaucetError::Source(format!(
+            "decode `{step}`: the decompressed data exceeds {cap} bytes"
+        )));
+    }
+    Ok(out)
+}
+
+/// Check every `parse.records_path` at load time, so a typo fails the config
+/// rather than every run yielding zero records (API-62).
+pub fn validate_steps(steps: &[DecodeStep]) -> Result<(), FaucetError> {
+    for step in steps {
+        if let DecodeStep::Parse { parse } = step
+            && let Some(path) = &parse.records_path
+        {
+            Value::Null.query(path).map_err(|e| {
+                FaucetError::Config(format!(
+                    "decode `parse`: invalid `records_path` '{path}': {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn jsonpath_first_string(v: &Value, path: &str) -> Option<String> {
@@ -256,39 +301,38 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 fn unzip_member(bytes: &[u8], member: Option<&str>) -> Result<Vec<u8>, FaucetError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| FaucetError::Source(format!("decode `unzip`: not a valid zip: {e}")))?;
-    // Resolve the member index first (immutable name scan), then read it.
-    let mut chosen: Option<usize> = None;
+    let mut matched: Vec<(usize, String)> = Vec::new();
     for i in 0..archive.len() {
         let f = archive
             .by_index(i)
             .map_err(|e| FaucetError::Source(format!("decode `unzip`: {e}")))?;
-        if !f.is_file() {
-            continue;
-        }
-        let matches = match member {
-            Some(pat) => glob_match(pat, f.name()),
-            None => true, // first file
-        };
-        if matches {
-            chosen = Some(i);
-            break;
+        if f.is_file() && member.is_none_or(|pat| glob_match(pat, f.name())) {
+            matched.push((i, f.name().to_string()));
         }
     }
-    let idx = chosen.ok_or_else(|| {
-        FaucetError::Source(format!(
-            "decode `unzip`: no member matched {}",
-            member
-                .map(|m| format!("'{m}'"))
-                .unwrap_or_else(|| "any".into())
-        ))
-    })?;
-    let mut f = archive
+    let selector = member
+        .map(|m| format!("'{m}'"))
+        .unwrap_or_else(|| "any".into());
+    let idx = match matched.as_slice() {
+        [(idx, _)] => *idx,
+        [] => {
+            return Err(FaucetError::Source(format!(
+                "decode `unzip`: no member matched {selector}"
+            )));
+        }
+        several => {
+            let names: Vec<&str> = several.iter().map(|(_, n)| n.as_str()).collect();
+            return Err(FaucetError::Source(format!(
+                "decode `unzip`: {} members match {selector} ({}); set `member` to select exactly one",
+                several.len(),
+                names.join(", ")
+            )));
+        }
+    };
+    let f = archive
         .by_index(idx)
         .map_err(|e| FaucetError::Source(format!("decode `unzip`: {e}")))?;
-    let mut out = Vec::new();
-    f.read_to_end(&mut out)
-        .map_err(|e| FaucetError::Source(format!("decode `unzip`: reading member: {e}")))?;
-    Ok(out)
+    read_capped(f, MAX_DECODED_BYTES, "unzip")
 }
 
 async fn parse_records(
@@ -300,7 +344,7 @@ async fn parse_records(
         ParseFormat::Json => {
             let v: Value = serde_json::from_slice(bytes)
                 .map_err(|e| FaucetError::Source(format!("decode `parse` json: {e}")))?;
-            Ok(records_from_value(v, spec.records_path.as_deref()))
+            records_from_value(v, spec.records_path.as_deref())
         }
         ParseFormat::Csv => {
             let dialect = crate::format::CsvDialect {
@@ -318,24 +362,27 @@ async fn parse_records(
         }
         ParseFormat::Xml => {
             let v = xml_to_json(bytes)?;
-            Ok(records_from_value(v, spec.records_path.as_deref()))
+            records_from_value(v, spec.records_path.as_deref())
         }
     }
 }
 
 /// Turn a JSON value into records: apply `records_path` if given, else an array
 /// becomes the records and any other value becomes a single record.
-fn records_from_value(v: Value, records_path: Option<&str>) -> Vec<Value> {
+fn records_from_value(v: Value, records_path: Option<&str>) -> Result<Vec<Value>, FaucetError> {
     match records_path {
         Some(path) => v
             .query(path)
-            .ok()
             .map(|ms| ms.into_iter().cloned().collect())
-            .unwrap_or_default(),
-        None => match v {
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "decode `parse`: invalid `records_path` '{path}': {e}"
+                ))
+            }),
+        None => Ok(match v {
             Value::Array(a) => a,
             other => vec![other],
-        },
+        }),
     }
 }
 
@@ -845,5 +892,72 @@ mod tests {
             let err = xml_to_json(xml).unwrap_err();
             assert!(err.to_string().contains(want), "{err}");
         }
+    }
+
+    fn two_csv_zip() -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut cur = Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut cur);
+            let opts = SimpleFileOptions::default();
+            zw.start_file("a.csv", opts).unwrap();
+            zw.write_all(b"x\n1\n").unwrap();
+            zw.start_file("b.csv", opts).unwrap();
+            zw.write_all(b"x\n2\n").unwrap();
+            zw.finish().unwrap();
+        }
+        cur.into_inner()
+    }
+
+    #[tokio::test]
+    async fn unzip_refuses_several_matching_members() {
+        // API-42: only the first matching member used to be read, silently.
+        for member in [Some("*.csv".to_string()), None] {
+            let steps = vec![DecodeStep::Unzip {
+                unzip: UnzipSpec { member },
+            }];
+            let err = run_decode(&two_csv_zip(), &steps).await.unwrap_err();
+            assert!(err.to_string().contains("2 members match"), "{err}");
+            assert!(err.to_string().contains("a.csv, b.csv"), "{err}");
+        }
+        let steps = vec![
+            DecodeStep::Unzip {
+                unzip: UnzipSpec {
+                    member: Some("b.*".into()),
+                },
+            },
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Csv,
+                    ..parse_json()
+                },
+            },
+        ];
+        assert_eq!(run_decode(&two_csv_zip(), &steps).await.unwrap()[0]["x"], "2");
+    }
+
+    #[test]
+    fn decompression_is_capped() {
+        let data = vec![7u8; 64];
+        assert_eq!(read_capped(&data[..], 64, "gunzip").unwrap().len(), 64);
+        let err = read_capped(&data[..], 63, "gunzip").unwrap_err();
+        assert!(err.to_string().contains("exceeds 63 bytes"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_parse_records_path_is_an_error_not_zero_records() {
+        // API-62: a JSONPath syntax error used to yield an empty list.
+        let steps = vec![DecodeStep::Parse {
+            parse: ParseSpec {
+                records_path: Some("$.items[".into()),
+                ..parse_json()
+            },
+        }];
+        let err = run_decode(br#"{"items":[1]}"#, &steps).await.unwrap_err();
+        assert!(err.to_string().contains("invalid `records_path`"), "{err}");
+        let err = validate_steps(&steps).unwrap_err();
+        assert!(matches!(err, FaucetError::Config(_)), "{err:?}");
+        assert!(validate_steps(&[DecodeStep::Parse { parse: parse_json() }]).is_ok());
     }
 }

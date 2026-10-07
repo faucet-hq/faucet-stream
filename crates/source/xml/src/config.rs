@@ -428,6 +428,7 @@ impl XmlStreamConfig {
         if let Some(tls) = &self.tls {
             tls.validate()?;
         }
+        crate::decode::validate_steps(&self.decode)?;
         Ok(())
     }
 }

@@ -28,11 +28,63 @@ fn page_fingerprint(records: &[Value]) -> u64 {
     hasher.finish()
 }
 
-/// Substitute `${name}` tokens with flow-captured login values (#567) — e.g. an
-/// XML-gateway `sessionid` captured from the login response and needed inside every
-/// data request's raw XML body. Only exact `${name}` occurrences for a captured
-/// `name` are replaced; any other `${...}` token is left untouched. Applied per
-/// request, after the parent-context substitution.
+/// Render an XML request-body template in one pass: `${name}` takes a
+/// flow-captured login value (#567) or, for `name = next_token`, the body-cursor
+/// token; `{key}` takes a parent-record value. Every substituted value is
+/// XML-escaped and never re-scanned, so a value such as `A&B Ltd` or one
+/// containing markup or another placeholder cannot change the request (API-25).
+fn render_xml_body(
+    template: &str,
+    context: &HashMap<String, Value>,
+    captured: &BTreeMap<String, String>,
+    next_token: Option<&str>,
+) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open + 1..].find('}').map(|c| open + 1 + c) else {
+            break;
+        };
+        let key = &rest[open + 1..close];
+        let dollar = rest[..open].ends_with('$');
+        let dollar_value = if dollar {
+            captured
+                .get(key)
+                .map(String::as_str)
+                .or(next_token.filter(|_| key == "next_token"))
+        } else {
+            None
+        };
+        let value = match dollar_value {
+            Some(v) => {
+                out.push_str(&rest[..open - 1]);
+                Some(v.to_string())
+            }
+            None => context.get(key).map(|v| {
+                out.push_str(&rest[..open]);
+                match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                }
+            }),
+        };
+        match value {
+            Some(v) => {
+                out.push_str(&quick_xml::escape::escape(v.as_str()));
+                rest = &rest[close + 1..];
+            }
+            None => {
+                out.push_str(&rest[..=open]);
+                rest = &rest[open + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Substitute `${name}` captured login values into a header or query value
+/// (no XML escaping — these are not XML).
 fn substitute_captured(s: &str, captured: &BTreeMap<String, String>) -> String {
     if captured.is_empty() || !s.contains("${") {
         return s.to_string();
@@ -42,6 +94,32 @@ fn substitute_captured(s: &str, captured: &BTreeMap<String, String>) -> String {
         out = out.replace(&format!("${{{k}}}"), v);
     }
     out
+}
+
+/// A SOAP endpoint's HTTP 500: a `<Fault>` body is returned for fault handling
+/// (never retried — re-POSTing a failed operation is not safe, API-46); any
+/// other 500 is the usual retriable status error.
+async fn soap_fault_or_error(resp: reqwest::Response) -> Result<String, FaucetError> {
+    let url = resp.url().to_string();
+    let text = resp.text().await.map_err(FaucetError::Http)?;
+    if convert::xml_to_json(&text)
+        .ok()
+        .and_then(|doc| convert::detect_soap_fault(&doc))
+        .is_some()
+    {
+        return Ok(text);
+    }
+    let body = if text.len() > DEFAULT_ERROR_BODY_MAX_LEN {
+        let end = text.floor_char_boundary(DEFAULT_ERROR_BODY_MAX_LEN);
+        format!("{}...(truncated)", &text[..end])
+    } else {
+        text
+    };
+    Err(FaucetError::HttpStatus {
+        status: 500,
+        url,
+        body,
+    })
 }
 
 /// Retries on transient (5xx / connection) failures before giving up.
@@ -226,6 +304,26 @@ impl XmlStream {
         }
     }
 
+    /// A SOAP `<Fault>`: an error with `fault_as_error`, else zero records and
+    /// one warning per run.
+    fn soap_fault(
+        &self,
+        message: String,
+        fault_logged: &mut bool,
+    ) -> Result<Vec<Value>, FaucetError> {
+        if self.config.soap.as_ref().is_some_and(|s| s.fault_as_error) {
+            return Err(FaucetError::Source(format!("SOAP fault: {message}")));
+        }
+        if !*fault_logged {
+            tracing::warn!(
+                fault = %message,
+                "SOAP fault in response; emitting zero records (fault_as_error=false)"
+            );
+            *fault_logged = true;
+        }
+        Ok(Vec::new())
+    }
+
     /// Eagerly convert one HTTP page of XML to JSON and extract its records,
     /// applying SOAP fault handling when a `soap:` block is present.
     ///
@@ -242,20 +340,10 @@ impl XmlStream {
     ) -> Result<Vec<Value>, FaucetError> {
         let doc = convert::xml_to_json(xml_text)?;
 
-        if let Some(soap) = &self.config.soap
+        if self.config.soap.is_some()
             && let Some(message) = convert::detect_soap_fault(&doc)
         {
-            if soap.fault_as_error {
-                return Err(FaucetError::Source(format!("SOAP fault: {message}")));
-            }
-            if !*fault_logged {
-                tracing::warn!(
-                    fault = %message,
-                    "SOAP fault in response; emitting zero records (fault_as_error=false)"
-                );
-                *fault_logged = true;
-            }
-            return Ok(Vec::new());
+            return self.soap_fault(message, fault_logged);
         }
 
         let records = match (&self.config.soap, &self.config.records_element_path) {
@@ -280,113 +368,130 @@ impl XmlStream {
         &self,
         context: &HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Value>, FaucetError> {
-        self.config.validate()?;
-
+        use futures::StreamExt;
         let mut all_records = Vec::new();
-        let mut pages_fetched = 0usize;
-        let mut offset = 0usize;
-        let mut page_number = None;
-        let mut prev_fingerprint: Option<u64> = None;
-        let mut fault_logged = false;
-        // Body-cursor pagination (#544): the request body for pages after the
-        // first (the rendered `next_body`), and the last-seen token for the
-        // loop guard. `None` on the first page → use the configured body/soap.
-        let mut body_override: Option<String> = None;
-        let mut prev_token: Option<String> = None;
-
-        // Initialize pagination state.
-        if let Some(XmlPagination::PageNumber { start_page, .. }) = &self.config.pagination {
-            page_number = Some(*start_page);
+        let mut pages = self.http_pages(context);
+        while let Some(page) = pages.next().await {
+            all_records.extend(page?);
         }
-
-        loop {
-            if let Some(max) = self.config.max_pages
-                && pages_fetched >= max
-            {
-                tracing::warn!("max pages ({max}) reached");
-                break;
-            }
-
-            let mut params = self.config.query_params.clone();
-            self.apply_pagination_params(&mut params, page_number, offset);
-
-            let xml_text = self
-                .execute_request(&params, context, body_override.as_deref())
-                .await?;
-            // #540: when a decode pipeline is configured, records come from the
-            // decoded output (extract → base64/gunzip/unzip → parse) rather than
-            // navigating `records_element_path` over the raw XML.
-            let records = if self.config.decode.is_empty() {
-                self.extract_records_eager(&xml_text, &mut fault_logged)?
-            } else {
-                crate::decode::run_decode(xml_text.as_bytes(), &self.config.decode).await?
-            };
-
-            let record_count = records.len();
-            let fingerprint = page_fingerprint(&records);
-            pages_fetched += 1;
-
-            // Loop guard: a server that ignores the page/offset parameter (or
-            // clamps to the last page) returns the same non-empty page forever.
-            // Stop when two consecutive pages are identical (audit #146 H4/H5) —
-            // and do it BEFORE appending, so the duplicate page's records are
-            // never emitted to the sink a second time (audit #321 M4).
-            if record_count > 0 && prev_fingerprint == Some(fingerprint) {
-                tracing::warn!(
-                    "XML pagination returned an identical page; stopping to avoid an infinite loop"
-                );
-                break;
-            }
-            prev_fingerprint = Some(fingerprint);
-            all_records.extend(records);
-
-            // Advance pagination or stop.
-            match &self.config.pagination {
-                Some(XmlPagination::PageNumber { page_size, .. }) => {
-                    if record_count == 0 {
-                        break;
-                    }
-                    // Stop if page_size is set and we got fewer records than the page size.
-                    if let Some(size) = page_size
-                        && record_count < *size
-                    {
-                        break;
-                    }
-                    page_number = page_number.map(|p| p + 1);
-                }
-                Some(XmlPagination::Offset { limit, .. }) => {
-                    if record_count < *limit {
-                        break;
-                    }
-                    offset += record_count;
-                }
-                Some(XmlPagination::BodyCursor {
-                    next_token_path,
-                    next_body,
-                }) => {
-                    // Read the continuation token from THIS page's response.
-                    match crate::decode::xml_extract_text(xml_text.as_bytes(), next_token_path)? {
-                        // Absent/empty token → done. Repeated token → loop guard.
-                        Some(t)
-                            if !t.trim().is_empty()
-                                && prev_token.as_deref() != Some(t.as_str()) =>
-                        {
-                            body_override = Some(next_body.replace("${next_token}", &t));
-                            prev_token = Some(t);
-                        }
-                        _ => break,
-                    }
-                }
-                None => break,
-            }
-        }
-
-        tracing::info!(
-            records = all_records.len(),
-            pages = pages_fetched,
-            "XML fetch complete"
-        );
+        tracing::info!(records = all_records.len(), "XML fetch complete");
         Ok(all_records)
+    }
+
+    /// The records of one HTTP response: the decode pipeline's output when one
+    /// is configured, else the elements at `records_element_path`. With a
+    /// `soap:` block a `<Fault>` is detected first.
+    async fn page_records(
+        &self,
+        xml_text: &str,
+        fault_logged: &mut bool,
+    ) -> Result<Vec<Value>, FaucetError> {
+        if self.config.soap.is_some() {
+            if self.config.decode.is_empty() {
+                return self.extract_records_eager(xml_text, fault_logged);
+            }
+            let doc = convert::xml_to_json(xml_text)?;
+            if let Some(message) = convert::detect_soap_fault(&doc) {
+                return self.soap_fault(message, fault_logged);
+            }
+        }
+        if !self.config.decode.is_empty() {
+            return crate::decode::run_decode(xml_text.as_bytes(), &self.config.decode).await;
+        }
+        let mut records = Vec::new();
+        convert::stream_extract(
+            xml_text,
+            self.config.records_element_path.as_deref(),
+            |rec| records.push(rec),
+        )?;
+        Ok(records)
+    }
+
+    /// One item per HTTP response, for every pagination mode, so a caller
+    /// holds at most one response's records at a time.
+    fn http_pages<'a>(
+        &'a self,
+        context: &'a HashMap<String, Value>,
+    ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + 'a>> {
+        Box::pin(async_stream::try_stream! {
+            self.config.validate()?;
+            let mut pages_fetched = 0usize;
+            let mut offset = 0usize;
+            let mut page_number = match &self.config.pagination {
+                Some(XmlPagination::PageNumber { start_page, .. }) => Some(*start_page),
+                _ => None,
+            };
+            let mut prev_fingerprint: Option<u64> = None;
+            let mut fault_logged = false;
+            // Body-cursor pagination (#544): the token for the next request;
+            // `None` on the first page → the configured body/soap is sent.
+            let mut token: Option<String> = None;
+
+            loop {
+                if let Some(max) = self.config.max_pages
+                    && pages_fetched >= max
+                {
+                    tracing::warn!("max pages ({max}) reached");
+                    break;
+                }
+
+                let mut params = self.config.query_params.clone();
+                self.apply_pagination_params(&mut params, page_number, offset);
+                let next = match (&self.config.pagination, token.as_deref()) {
+                    (Some(XmlPagination::BodyCursor { next_body, .. }), Some(t)) => {
+                        Some((next_body.as_str(), t))
+                    }
+                    _ => None,
+                };
+                let xml_text = self.execute_request(&params, context, next).await?;
+                let records = self.page_records(&xml_text, &mut fault_logged).await?;
+                let record_count = records.len();
+                let fingerprint = page_fingerprint(&records);
+                pages_fetched += 1;
+
+                // Loop guard: a server that ignores the page/offset parameter
+                // (or clamps to the last page) returns the same non-empty page
+                // forever (#146 H4/H5); stop before emitting the duplicate
+                // (#321 M4).
+                if record_count > 0 && prev_fingerprint == Some(fingerprint) {
+                    tracing::warn!(
+                        "XML pagination returned an identical page; stopping to avoid an infinite loop"
+                    );
+                    break;
+                }
+                prev_fingerprint = Some(fingerprint);
+
+                // Advance pagination. Without a total, only an empty page ends
+                // page/offset paging: a short page may just be the server
+                // clamping the requested size (API-15).
+                let more = match &self.config.pagination {
+                    Some(XmlPagination::PageNumber { .. }) => {
+                        page_number = page_number.map(|p| p + 1);
+                        record_count > 0
+                    }
+                    Some(XmlPagination::Offset { .. }) => {
+                        offset += record_count;
+                        record_count > 0
+                    }
+                    Some(XmlPagination::BodyCursor { next_token_path, .. }) => {
+                        match crate::decode::xml_extract_text(xml_text.as_bytes(), next_token_path)? {
+                            Some(t)
+                                if !t.trim().is_empty() && token.as_deref() != Some(t.as_str()) =>
+                            {
+                                token = Some(t);
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                    None => false,
+                };
+                yield records;
+                if !more {
+                    break;
+                }
+            }
+        })
     }
 
     fn apply_pagination_params(
@@ -430,11 +535,9 @@ impl XmlStream {
         &self,
         params: &HashMap<String, String>,
         context: &HashMap<String, serde_json::Value>,
-        body_override: Option<&str>,
+        next: Option<(&str, &str)>,
     ) -> Result<String, FaucetError> {
-        match self
-            .execute_request_once(params, context, body_override)
-            .await
+        match self.execute_request_once(params, context, next).await
         {
             Err(e)
                 if self
@@ -451,8 +554,7 @@ impl XmlStream {
                 provider
                     .invalidate(&faucet_core::Credential::Token(String::new()))
                     .await?;
-                self.execute_request_once(params, context, body_override)
-                    .await
+                self.execute_request_once(params, context, next).await
             }
             other => other,
         }
@@ -462,7 +564,7 @@ impl XmlStream {
         &self,
         params: &HashMap<String, String>,
         context: &HashMap<String, serde_json::Value>,
-        body_override: Option<&str>,
+        next: Option<(&str, &str)>,
     ) -> Result<String, FaucetError> {
         let path = if context.is_empty() {
             self.config.path.clone()
@@ -619,28 +721,17 @@ impl XmlStream {
         // These headers are set here regardless of the `auth` variant, so real
         // bearer / basic auth (applied above) is left untouched. Otherwise the
         // legacy raw-`body` path is used verbatim (byte-for-byte unchanged).
-        if let Some(ob) = body_override {
+        if let Some((next_body, token)) = next {
             // #544 body-cursor: a rendered `next_body` replaces the request body
             // for pages after the first (e.g. a `readMore` request). Takes
             // precedence over the configured soap/raw body.
-            let resolved = if context.is_empty() {
-                ob.to_string()
-            } else {
-                faucet_core::util::substitute_context(ob, context)
-            };
-            let resolved = substitute_captured(&resolved, &captured);
             req = req
                 .header("Content-Type", "text/xml; charset=utf-8")
-                .body(resolved);
+                .body(render_xml_body(next_body, context, &captured, Some(token)));
         } else if let Some(soap) = &self.config.soap {
             let inner = soap.body_inner.as_deref().unwrap_or("");
-            let resolved_inner = if context.is_empty() {
-                inner.to_string()
-            } else {
-                faucet_core::util::substitute_context(inner, context)
-            };
-            let resolved_inner = substitute_captured(&resolved_inner, &captured);
-            let envelope = soap.build_envelope(&resolved_inner);
+            let envelope =
+                soap.build_envelope(&render_xml_body(inner, context, &captured, None));
             req = req
                 .header("Content-Type", soap.content_type())
                 .body(envelope);
@@ -648,15 +739,9 @@ impl XmlStream {
                 req = req.header("SOAPAction", action);
             }
         } else if let Some(body) = &self.config.body {
-            let resolved_body = if context.is_empty() {
-                body.clone()
-            } else {
-                faucet_core::util::substitute_context(body, context)
-            };
-            let resolved_body = substitute_captured(&resolved_body, &captured);
             req = req
                 .header("Content-Type", "text/xml; charset=utf-8")
-                .body(resolved_body);
+                .body(render_xml_body(body, context, &captured, None));
         }
 
         // Retry transient failures (5xx / connection resets) with jittered
@@ -674,6 +759,11 @@ impl XmlStream {
                     })?;
                     self.roundtrips.record("request");
                     let resp = req.send().await.map_err(FaucetError::Http)?;
+                    if self.config.soap.is_some()
+                        && resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                    {
+                        return soap_fault_or_error(resp).await;
+                    }
                     let resp =
                         util::check_http_response_rate_limited(resp, DEFAULT_ERROR_BODY_MAX_LEN)
                             .await?;
@@ -722,141 +812,28 @@ impl faucet_core::Source for XmlStream {
         _batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         let batch_size = self.config.batch_size;
-        let owned_context = context.clone();
+        let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
 
         Box::pin(async_stream::try_stream! {
-            self.config.validate()?;
-
-            // A decode pipeline (#540) and body-cursor paging (#544) both buffer
-            // the whole payload, so they can't use the event-driven streaming
-            // parser — fall back to the eager fetch and emit it in chunks.
-            if !self.config.decode.is_empty()
-                || matches!(self.config.pagination, Some(XmlPagination::BodyCursor { .. }))
-            {
-                let records = self.fetch_all_with_context(&owned_context).await?;
-                let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
-                for c in records.chunks(chunk) {
-                    yield StreamPage { records: c.to_vec(), bookmark: None };
-                }
-                return;
-            }
-
-            let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
-            let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
-            let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
+            use futures::StreamExt;
+            let mut buffer: Vec<Value> = Vec::new();
             let mut total = 0usize;
-            let mut pages_fetched = 0usize;
-            let mut offset = 0usize;
-            let mut page_number = None;
-            let mut prev_fingerprint: Option<u64> = None;
-            let mut fault_logged = false;
-
-            if let Some(XmlPagination::PageNumber { start_page, .. }) =
-                &self.config.pagination
-            {
-                page_number = Some(*start_page);
-            }
-
-            loop {
-                if let Some(max) = self.config.max_pages
-                    && pages_fetched >= max
-                {
-                    tracing::warn!("max pages ({max}) reached");
-                    break;
-                }
-
-                let mut params = self.config.query_params.clone();
-                self.apply_pagination_params(&mut params, page_number, offset);
-
-                let xml_text = self.execute_request(&params, &owned_context, None).await?;
-
-                // Event-driven extraction: only the matched subtree is
-                // ever materialised. The closure pushes into the local
-                // buffer; once it crosses `chunk`, the surrounding loop
-                // can flush, but we can't `yield` from inside the closure,
-                // so we collect this HTTP page's records into a scratch
-                // Vec and then iterate them after.
-                //
-                // A `soap:` block routes through the eager converter so the
-                // SOAP `<Fault>` check and `Envelope.Body.`-relative path
-                // resolution apply (SOAP responses are small — the bounded-
-                // memory streaming path is reserved for the non-SOAP case,
-                // which stays byte-for-byte unchanged).
-                let mut page_records: Vec<Value> = Vec::new();
-                if self.config.soap.is_some() {
-                    page_records = self.extract_records_eager(&xml_text, &mut fault_logged)?;
-                } else {
-                    convert::stream_extract(
-                        &xml_text,
-                        self.config.records_element_path.as_deref(),
-                        |rec| page_records.push(rec),
-                    )?;
-                }
-
-                let record_count = page_records.len();
-                let fingerprint = page_fingerprint(&page_records);
-                pages_fetched += 1;
-
-                // Loop guard: stop when two consecutive pages are identical — a
-                // server ignoring the page/offset parameter (or clamping to the
-                // last page) returns the same non-empty page forever (#146 H4/H5).
-                // Check BEFORE buffering/yielding so the duplicate page's records
-                // are not emitted to the sink a second time (audit #321 M4).
-                if record_count > 0 && prev_fingerprint == Some(fingerprint) {
-                    tracing::warn!(
-                        "XML pagination returned an identical page; stopping to avoid an infinite loop"
-                    );
-                    break;
-                }
-                prev_fingerprint = Some(fingerprint);
-
-                for rec in page_records.drain(..) {
+            let mut pages = self.http_pages(context);
+            while let Some(page) = pages.next().await {
+                for rec in page? {
                     buffer.push(rec);
                     if buffer.len() >= chunk {
-                        let flush = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
+                        let flush = std::mem::take(&mut buffer);
                         total += flush.len();
                         yield StreamPage { records: flush, bookmark: None };
                     }
                 }
-
-                // Advance pagination using the same rules as
-                // `fetch_all_with_context`.
-                match &self.config.pagination {
-                    Some(XmlPagination::PageNumber { page_size, .. }) => {
-                        if record_count == 0 {
-                            break;
-                        }
-                        if let Some(size) = page_size
-                            && record_count < *size
-                        {
-                            break;
-                        }
-                        page_number = page_number.map(|p| p + 1);
-                    }
-                    Some(XmlPagination::Offset { limit, .. }) => {
-                        if record_count < *limit {
-                            break;
-                        }
-                        offset += record_count;
-                    }
-                    // Handled by the buffered fallback above (this streaming
-                    // path is never entered for body-cursor paging).
-                    Some(XmlPagination::BodyCursor { .. }) => break,
-                    None => break,
-                }
             }
-
             if !buffer.is_empty() {
                 total += buffer.len();
                 yield StreamPage { records: buffer, bookmark: None };
             }
-
-            tracing::info!(
-                records = total,
-                pages = pages_fetched,
-                batch_size,
-                "XML source stream complete",
-            );
+            tracing::info!(records = total, batch_size, "XML source stream complete");
         })
     }
 

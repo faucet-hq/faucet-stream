@@ -474,8 +474,8 @@ extraction (replaces `response_format` parsing; requires `pagination: none`):
 |------|------|--------|
 | `extract` | `{ extract: "$.d.reportBytes" }` | Pull a string field out of a JSON envelope. |
 | `base64` | `base64` | Base64-decode the buffer. |
-| `gunzip` | `gunzip` | Gzip-decompress. |
-| `unzip` | `{ unzip: { member: "*.csv" } }` | Extract a zip member (glob; first file if omitted). |
+| `gunzip` | `gunzip` | Gzip-decompress (at most 1 GiB decompressed). |
+| `unzip` | `{ unzip: { member: "*.csv" } }` | Extract a zip member (glob; the whole archive if omitted). Exactly one file must match — several matches fail with their names. At most 1 GiB decompressed. |
 | `parse` | `{ parse: { format: json\|csv\|xlsx\|xml, … } }` | Terminal: parse bytes → records. |
 
 ```yaml

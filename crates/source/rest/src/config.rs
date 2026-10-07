@@ -815,6 +815,7 @@ impl RestStreamConfig {
         // Static custom headers: reject an invalid header name/value at load
         // time rather than panicking on the first request (#539).
         build_header_map(&self.headers)?;
+        crate::decode::validate_steps(&self.decode)?;
         if let Some(key) = &self.replication_key {
             ReplicationKey::parse(key)
                 .map_err(|e| faucet_core::FaucetError::Config(format!("rest: {e}")))?;

@@ -29,7 +29,7 @@ async-trait.workspace = true
 async-stream.workspace = true
 futures.workspace = true
 tracing.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 reqwest.workspace = true
 quick-xml.workspace = true
 # Response-decode pipeline (#540): base64 → gunzip/unzip → parse csv/xlsx.

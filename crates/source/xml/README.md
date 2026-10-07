@@ -298,11 +298,13 @@ pipeline:
 
 | Style (`type`) | Fields | Stops when |
 |----------------|--------|------------|
-| `PageNumber` | `param_name`, `start_page`, `page_size` *(optional)*, `page_size_param` *(optional)* | A page returns zero records, or fewer records than `page_size`. |
-| `Offset` | `offset_param`, `limit_param`, `limit` | A page returns fewer records than `limit`, or a loop is detected. |
+| `PageNumber` | `param_name`, `start_page`, `page_size` *(optional)*, `page_size_param` *(optional)* | A page returns zero records, or a loop is detected. A short page does not stop paging — the server may clamp `page_size` to its own maximum. |
+| `Offset` | `offset_param`, `limit_param`, `limit` | A page returns zero records, or a loop is detected. The offset advances by the records received, so a server that clamps `limit` is still read in full. |
 | `BodyCursor` | `next_token_path`, `next_body` | The continuation token is absent/empty, or repeats (loop guard). |
 
-`max_pages` caps the total number of pages for all styles. With no `pagination` block, exactly one request is made.
+`max_pages` caps the total number of pages for all styles. With no `pagination` block, exactly one request is made. Every style — including `BodyCursor` and a `decode:` pipeline — emits each HTTP response's records as it arrives, so memory stays bounded by one response plus `batch_size`.
+
+Values substituted into a request body — `{field}` parent-record values, `${name}` captured login values and `${next_token}` — are XML-escaped (`A&B Ltd` is sent as `A&amp;B Ltd`) and never re-scanned for placeholders.
 
 ### Body-cursor pagination (`BodyCursor`, #544)
 
@@ -330,9 +332,9 @@ A declarative chain applied to the raw response body **before** record extractio
 | Step | Effect |
 |---|---|
 | `extract: "<dot.path>"` | Element text at the dot-path (namespace-insensitive, trailing-match) becomes the buffer. |
-| `base64` / `gunzip` | Decode base64 text / gzip-decompress the buffer. |
-| `unzip: { member: "*.csv" }` | Select a member from a zip archive. |
-| `parse: { format: csv\|xlsx\|xml\|json, header_row, delimiter, has_headers, sheet, records_path }` | Parse the bytes into records. |
+| `base64` / `gunzip` | Decode base64 text / gzip-decompress the buffer (at most 1 GiB decompressed). |
+| `unzip: { member: "*.csv" }` | Select a member from a zip archive. The glob (or, without `member`, the archive) must match exactly one file; several matches fail with their names. At most 1 GiB decompressed. |
+| `parse: { format: csv\|xlsx\|xml\|json, header_row, delimiter, has_headers, sheet, records_path }` | Parse the bytes into records. An invalid `records_path` JSONPath fails at config load. |
 
 Example — a SOAP `runReport` report service returns a base64-encoded XLSX inside `<reportBytes>`:
 
@@ -426,7 +428,7 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 | `401` / `403` | Auth missing or wrong. Set the right `auth` variant; for SOAP endpoints that gate on `SOAPAction`, add it via `custom` headers. |
 | `FaucetError::Source: request is not cloneable for retry` | A streaming/non-cloneable request body can't be retried. Pass the SOAP envelope as a plain `body` string (the default), which is cloneable. |
 | Persistent `5xx` after retries | The source retries transient failures **3 times** with backoff before failing. A persistent 5xx is upstream — check the service; raising your own request timeout won't help. |
-| Pagination never stops / fetches too much | Set `max_pages` as a hard cap. Confirm `page_size` (PageNumber) or `limit` (Offset) matches what the API actually returns per page so the "fewer than expected" stop condition fires. |
+| Pagination never stops / fetches too much | Set `max_pages` as a hard cap. Paging stops on an empty page or an identical repeated page; an API that never returns an empty page past the end needs `max_pages`. |
 | Headers set in code aren't sent from YAML | `headers` is `#[serde(skip)]` and not configurable from YAML/JSON. Use `custom` auth (or `query_params`) to attach headers from config. |
 | Malformed XML / parse error | The body isn't well-formed XML (often an HTML error page returned with a 200). Verify the endpoint and that auth/headers select the XML representation (e.g. `Accept: application/xml`). |
 

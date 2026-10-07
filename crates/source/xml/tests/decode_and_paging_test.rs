@@ -169,3 +169,88 @@ async fn decode_pipeline_parses_xml_with_attributes() {
         assert!(text.contains(needle), "{needle} in {text}");
     }
 }
+
+/// API-25: parent-record values and the body-cursor token are XML-escaped in
+/// the request body, so `A&B Ltd` and markup-bearing values stay data.
+#[tokio::test]
+async fn body_values_are_xml_escaped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/gw"))
+        .and(body_string_contains("<name>A&amp;B Ltd</name>"))
+        .and(body_string_contains("<f>&lt;/f&gt;&lt;x&gt;{id}</f>"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<response><data><row><id>1</id></row></data><resultId>a&amp;b&lt;</resultId></response>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/gw"))
+        .and(body_string_contains("<resultId>a&amp;b&lt;</resultId>"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<response><data><row><id>2</id></row></data></response>"),
+        )
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/gw")
+        .method(reqwest::Method::POST)
+        .body("<q><name>{company}</name><f>{filter}</f></q>")
+        .records_element_path("response.data.row")
+        .pagination(XmlPagination::BodyCursor {
+            next_token_path: "resultId".into(),
+            next_body: "<readMore><resultId>${next_token}</resultId></readMore>".into(),
+        });
+    let ctx: HashMap<String, serde_json::Value> = [
+        ("company".to_string(), serde_json::json!("A&B Ltd")),
+        ("filter".to_string(), serde_json::json!("</f><x>{id}")),
+        ("id".to_string(), serde_json::json!("SHOULD-NOT-APPEAR")),
+    ]
+    .into_iter()
+    .collect();
+    let records = XmlStream::new(config).fetch_with_context(&ctx).await.unwrap();
+    assert_eq!(records.len(), 2);
+}
+
+/// API-31: body-cursor paging yields each HTTP page as it arrives instead of
+/// buffering the whole run first.
+#[tokio::test]
+async fn body_cursor_pages_stream_before_the_next_request() {
+    use futures::StreamExt;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/gw"))
+        .and(body_string_contains("readByQuery"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<response><data><row><id>1</id></row></data><resultId>T1</resultId></response>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/gw"))
+        .and(body_string_contains("readMore"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<response><data><row><id>2</id></row></data></response>"),
+        )
+        .mount(&server)
+        .await;
+    let mut config = XmlStreamConfig::new(server.uri(), "/gw")
+        .method(reqwest::Method::POST)
+        .body("<readByQuery/>")
+        .records_element_path("response.data.row")
+        .pagination(XmlPagination::BodyCursor {
+            next_token_path: "resultId".into(),
+            next_body: "<readMore>${next_token}</readMore>".into(),
+        });
+    config.batch_size = 1;
+    let stream = XmlStream::new(config);
+    let ctx = HashMap::new();
+    let mut pages = stream.stream_pages(&ctx, 1);
+    let first = pages.next().await.unwrap().unwrap();
+    assert_eq!(first.records[0]["id"], "1");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let second = pages.next().await.unwrap().unwrap();
+    assert_eq!(second.records[0]["id"], "2");
+    assert!(pages.next().await.is_none());
+}
