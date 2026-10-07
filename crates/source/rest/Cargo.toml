@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 description = "REST API source connector for the faucet-stream ecosystem"
 readme = "README.md"
+# Test fixtures (TLS keys among them) stay out of the published crate.
+exclude = ["tests/fixtures/**"]
 keywords = ["rest", "http", "api", "etl", "pipeline"]
 categories.workspace = true
 

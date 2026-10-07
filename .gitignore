@@ -43,6 +43,8 @@ docs/superpowers/
 !/scripts/inject-page-meta.py
 !/scripts/patch-coverage.py
 !/scripts/integration-coverage.py
+!/scripts/retry-on-image-pull.sh
+!/scripts/semver-exclude.py
 !/scripts/test_integration_coverage.py
 !/scripts/demo_catalog.py
 !/scripts/vendor-names.py

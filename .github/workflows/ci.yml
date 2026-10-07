@@ -217,16 +217,19 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/oracle/instantclient-basiclite-linuxx64.zip
-          key: oracle-instantclient-basiclite-linuxx64-v1
+          key: oracle-instantclient-basiclite-linuxx64-23.26.2.0.0
       - name: Install Oracle Instant Client
         run: |
           set -euo pipefail
           zip="$HOME/.cache/oracle/instantclient-basiclite-linuxx64.zip"
+          # A pinned release, verified (#789 SUPPLY-12); bump the URL, the
+          # digest and the cache key together.
           if [ ! -s "$zip" ]; then
             mkdir -p "$(dirname "$zip")"
             curl -fsSL --retry 3 -o "$zip" \
-              https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
+              https://download.oracle.com/otn_software/linux/instantclient/2326200/instantclient-basiclite-linux.x64-23.26.2.0.0.zip
           fi
+          echo "c5e97765e633ad02597b8274c35efe5c10bd249a3285e34ee58fa7b318243225  $zip" | sha256sum -c -
           sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
           if [ ! -e /usr/lib/x86_64-linux-gnu/libaio.so.1 ] && [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ]; then
             sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
@@ -239,23 +242,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run workspace tests
         # Integration tests boot Docker containers via testcontainers, whose
-        # in-process (bollard) image pull intermittently fails with
-        # "bytes remaining on stream". That flake is transient (the same test
-        # passes on a re-run), so retry the suite a few times: a genuine test
-        # failure still fails the job after the retries are exhausted.
-        run: |
-          for attempt in 1 2 3; do
-            echo "::group::cargo test (attempt $attempt)"
-            if cargo test --workspace --all-features; then
-              echo "::endgroup::"
-              exit 0
-            fi
-            echo "::endgroup::"
-            echo "::warning::workspace tests failed on attempt $attempt (often a flaky Docker image pull); retrying in 20s"
-            sleep 20
-          done
-          echo "::error::workspace tests failed after 3 attempts"
-          exit 1
+        # in-process (bollard) image pull intermittently fails. Only that is
+        # retried: any other failure — a flaky test included — fails at once.
+        run: scripts/retry-on-image-pull.sh cargo test --workspace --all-features
       - name: Run serve-ui and serve-openapi tests in isolation
         # Explicitly target the embedded-console tests with serve-ui so the
         # feature-gated #![cfg(feature = "serve-ui")] gate is exercised and
@@ -345,6 +334,21 @@ jobs:
             --set serve.enabled=true \
             --set serve.persistence.existingClaim=my-pvc \
             --set secretFiles.enabled=true > /dev/null
+      - name: helm template (history URL never on the command line; replica gates)
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/faucet-stream
+          out=$(helm template t "$chart" --set serve.enabled=true --set serve.replicaCount=2 \
+            --set serve.cluster.enabled=true --set serve.history.backend=postgres \
+            --set serve.history.url=postgres://u:secret@pg/db)
+          ! grep -q -- '--history' <<<"$out"
+          grep -q 'name: FAUCET_SERVE_HISTORY' <<<"$out"
+          for bad in "serve.replicaCount=2" "serve.autoscaling.enabled=true" \
+                     "serve.replicaCount=2,serve.history.backend=postgres,serve.history.url=x"; do
+            if helm template t "$chart" --set serve.enabled=true --set "$bad" >/dev/null 2>&1; then
+              echo "::error::$bad rendered; it must be refused"; exit 1
+            fi
+          done
 
   # Verify each feature compiles in isolation (catches accidental cross-feature deps)
   feature-check:
@@ -684,36 +688,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # These steps boot Docker containers (Kafka, Elasticsearch) via
       # testcontainers, whose in-process (bollard) image pull intermittently
-      # fails with "bytes remaining on stream". The flake is transient, so each
-      # command is retried up to 3 times; a genuine failure still fails the job.
+      # fails. Only an image-pull failure is retried; anything else fails once.
       - name: Run kafka source integration tests
-        run: |
-          for attempt in 1 2 3; do
-            cargo test -p faucet-source-kafka --test integration -- --test-threads=1 && exit 0
-            echo "::warning::attempt $attempt failed (often a flaky Docker image pull); retrying in 20s"; sleep 20
-          done
-          exit 1
+        run: scripts/retry-on-image-pull.sh cargo test -p faucet-source-kafka --test integration -- --test-threads=1
       - name: Run kafka sink integration tests
-        run: |
-          for attempt in 1 2 3; do
-            cargo test -p faucet-sink-kafka --test integration -- --test-threads=1 && exit 0
-            echo "::warning::attempt $attempt failed (often a flaky Docker image pull); retrying in 20s"; sleep 20
-          done
-          exit 1
+        run: scripts/retry-on-image-pull.sh cargo test -p faucet-sink-kafka --test integration -- --test-threads=1
       - name: Run kafka schema-registry-enabled tests
-        run: |
-          for attempt in 1 2 3; do
-            cargo test -p faucet-common-kafka --all-features && exit 0
-            echo "::warning::attempt $attempt failed (often a flaky Docker image pull); retrying in 20s"; sleep 20
-          done
-          exit 1
+        run: scripts/retry-on-image-pull.sh cargo test -p faucet-common-kafka --all-features
       - name: Run faucet-common-elasticsearch tests
-        run: |
-          for attempt in 1 2 3; do
-            cargo test -p faucet-common-elasticsearch && exit 0
-            echo "::warning::attempt $attempt failed (often a flaky Docker image pull); retrying in 20s"; sleep 20
-          done
-          exit 1
+        run: scripts/retry-on-image-pull.sh cargo test -p faucet-common-elasticsearch
 
   supply-chain:
     name: Supply chain (cargo-deny)
@@ -728,11 +711,11 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check bans licenses sources
-      # Informational: RustSec advisories. Non-blocking because nearly all live
-      # in transitive deps we don't control and the advisory DB updates daily;
-      # see the note in deny.toml.
-      - name: Advisories (informational)
-        continue-on-error: true
+      # Hard gate (#789 SUPPLY-03): RustSec advisories and yanked crates. A
+      # known advisory that cannot be fixed yet is triaged in deny.toml with a
+      # dated reason; anything else fails the build. advisories.yml re-runs this
+      # daily and opens an issue for advisories published between merges.
+      - name: Advisories
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
@@ -769,28 +752,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Excluded: faucet-cli / faucet-stream / the Delta trio (see
+      # scripts/semver-exclude.py for why) plus any crate not yet on crates.io
+      # — computed, so a crate is guarded from its first release on without
+      # anyone pruning a hand-kept list (#789 SUPPLY-18).
+      - name: Crates without a published baseline
+        id: semver-exclude
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        run: echo "list=$(python3 scripts/semver-exclude.py)" >> "$GITHUB_OUTPUT"
       - name: Check every published crate's public API for breaking changes
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
-          # Temporarily unguarded (2026-09-21): the published versions of these
-          # five cannot be *built* under a fresh dependency resolution, so
-          # there is no baseline API to compare against. They used
-          # `deltalake 0.32.4`, whose `buoyant_kernel 0.22.2` declares
-          # `buoyant_kernel_derive ^1`; upstream's `buoyant_kernel_derive 1.2.0`
-          # removed the `parse_column_name!` macro the 0.22 line calls (#794).
-          #
-          # #795 moves the Delta crates to `deltalake 1.x` (the
-          # `buoyant_kernel` 0.28 line built for derive 1.2), so the *current*
-          # code builds again. Restore these five once that release is
-          # published: it becomes the baseline, and it builds.
-          #
-          # The RabbitMQ (#561), Oracle (#710), Iceberg source (#711), DynamoDB
-          # (#712) and Databricks sink (#713) crates are new and have no
-          # published baseline yet — cargo-semver-checks can only compare
-          # against a crates.io release. Drop them from this list once
-          # release-plz publishes 1.0.0.
-          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta,faucet-common-rabbitmq,faucet-source-rabbitmq,faucet-sink-rabbitmq,faucet-common-oracle,faucet-source-oracle,faucet-source-oracle-cdc,faucet-sink-oracle,faucet-common-iceberg,faucet-source-iceberg,faucet-common-dynamodb,faucet-source-dynamodb,faucet-sink-dynamodb,faucet-common-databricks,faucet-sink-databricks,faucet-common-singer,faucet-sink-singer,faucet-common-file,faucet-source-file,faucet-sink-file
+          exclude: ${{ steps.semver-exclude.outputs.list }}
           # No `package:` — check the whole workspace. Gating only `faucet-core`
           # left 89 crates unguarded, so a genuine removal or signature change in
           # a connector could publish in a minor and break dependents silently
@@ -855,16 +829,19 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/oracle/instantclient-basiclite-linuxx64.zip
-          key: oracle-instantclient-basiclite-linuxx64-v1
+          key: oracle-instantclient-basiclite-linuxx64-23.26.2.0.0
       - name: Install Oracle Instant Client
         run: |
           set -euo pipefail
           zip="$HOME/.cache/oracle/instantclient-basiclite-linuxx64.zip"
+          # A pinned release, verified (#789 SUPPLY-12); bump the URL, the
+          # digest and the cache key together.
           if [ ! -s "$zip" ]; then
             mkdir -p "$(dirname "$zip")"
             curl -fsSL --retry 3 -o "$zip" \
-              https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
+              https://download.oracle.com/otn_software/linux/instantclient/2326200/instantclient-basiclite-linux.x64-23.26.2.0.0.zip
           fi
+          echo "c5e97765e633ad02597b8274c35efe5c10bd249a3285e34ee58fa7b318243225  $zip" | sha256sum -c -
           sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
           if [ ! -e /usr/lib/x86_64-linux-gnu/libaio.so.1 ] && [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ]; then
             sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
@@ -901,16 +878,7 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: "0"
           IGNORE_RE: '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
         run: |
-          retry() {
-            for attempt in 1 2 3; do
-              echo "::group::$* (attempt $attempt)"
-              if "$@"; then echo "::endgroup::"; return 0; fi
-              echo "::endgroup::"
-              echo "::warning::'$*' failed on attempt $attempt (often a flaky Docker image pull); retrying in 20s"
-              sleep 20
-            done
-            echo "::error::'$*' failed after 3 attempts"; return 1
-          }
+          retry() { scripts/retry-on-image-pull.sh "$@"; }
           cargo llvm-cov clean --workspace
           rm -f target/*.profraw
           eval "$(cargo llvm-cov show-env --sh)"

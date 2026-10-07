@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 description = "GraphQL API source connector for the faucet-stream ecosystem"
 readme = "README.md"
+# Test fixtures (TLS keys among them) stay out of the published crate.
+exclude = ["tests/fixtures/**"]
 keywords = ["graphql", "api", "etl", "pipeline", "connector"]
 categories.workspace = true
 
