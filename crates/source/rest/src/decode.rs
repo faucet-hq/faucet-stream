@@ -379,26 +379,33 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
     // A stack of (object, text-accumulator) frames; index 0 is the document root.
     let mut stack: Vec<(Map<String, Value>, String)> = vec![(Map::new(), String::new())];
 
-    fn attrs(e: &quick_xml::events::BytesStart) -> Map<String, Value> {
-        let mut m = Map::new();
-        for a in e.attributes().with_checks(false).flatten() {
-            let k = String::from_utf8_lossy(a.key.as_ref())
-                .rsplit(':')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            if let Ok(v) = a.unescape_value() {
-                m.insert(format!("@{k}"), Value::String(v.to_string()));
-            }
-        }
-        m
+    fn local(name: &str) -> String {
+        name.rsplit(':').next().unwrap_or_default().to_string()
     }
-    fn local(name: &[u8]) -> String {
-        String::from_utf8_lossy(name)
-            .rsplit(':')
-            .next()
-            .unwrap_or_default()
-            .to_string()
+    fn bad(m: impl std::fmt::Display) -> FaucetError {
+        FaucetError::Source(format!("decode `parse` xml: {m}"))
+    }
+    fn attrs(e: &quick_xml::events::BytesStart) -> Result<Map<String, Value>, FaucetError> {
+        let mut m = Map::new();
+        for a in e.attributes() {
+            let a = a.map_err(|e| bad(format!("malformed attribute: {e}")))?;
+            let v = a
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(|e| bad(format!("attribute `{}`: {e}", a.key.as_ref())))?;
+            m.insert(format!("@{}", local(a.key.as_ref())), Value::String(v.into_owned()));
+        }
+        Ok(m)
+    }
+    fn reference(r: &quick_xml::events::BytesRef<'_>) -> Result<String, FaucetError> {
+        if let Some(ch) = r
+            .resolve_char_ref()
+            .map_err(|e| bad(format!("invalid character reference `&{};`: {e}", &**r)))?
+        {
+            return Ok(ch.to_string());
+        }
+        quick_xml::escape::resolve_predefined_entity(r)
+            .map(str::to_string)
+            .ok_or_else(|| bad(format!("undefined entity reference `&{};`", &**r)))
     }
     fn insert_child(parent: &mut Map<String, Value>, key: String, val: Value) {
         match parent.get_mut(&key) {
@@ -426,17 +433,19 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
     }
 
     loop {
-        match reader
-            .read_event()
-            .map_err(|e| FaucetError::Source(format!("decode `parse` xml: {e}")))?
-        {
+        let event = reader.read_event().map_err(bad)?;
+        let text = match &event {
             Event::Eof => break,
-            Event::Start(e) => stack.push((attrs(&e), String::new())),
+            Event::Start(e) => {
+                stack.push((attrs(e)?, String::new()));
+                continue;
+            }
             Event::Empty(e) => {
                 let name = local(e.name().as_ref());
-                let val = finish(attrs(&e), String::new());
+                let val = finish(attrs(e)?, String::new());
                 let top = top_frame(&mut stack, "element after the document root closed")?;
                 insert_child(&mut top.0, name, val);
+                continue;
             }
             Event::End(e) => {
                 let name = local(e.name().as_ref());
@@ -445,21 +454,16 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
                 let val = finish(obj, text);
                 let top = top_frame(&mut stack, &detail)?;
                 insert_child(&mut top.0, name, val);
+                continue;
             }
-            Event::Text(t) => {
-                if let Ok(s) = t.unescape() {
-                    top_frame(&mut stack, "text after the document root closed")?
-                        .1
-                        .push_str(&s);
-                }
-            }
-            Event::CData(t) => {
-                top_frame(&mut stack, "CDATA after the document root closed")?
-                    .1
-                    .push_str(&String::from_utf8_lossy(&t));
-            }
-            _ => {}
-        }
+            Event::Text(t) => t.xml10_content().into_owned(),
+            Event::CData(t) => t.xml10_content().into_owned(),
+            Event::GeneralRef(r) => reference(r)?,
+            _ => continue,
+        };
+        top_frame(&mut stack, "text after the document root closed")?
+            .1
+            .push_str(&text);
     }
     let (root, _) = stack.pop().unwrap_or_default();
     Ok(Value::Object(root))
@@ -825,5 +829,21 @@ mod tests {
             v,
             json!({"r": {"a": [{"@x": "1", "#text": "hi"}, "there"]}})
         );
+    }
+
+    #[test]
+    fn xml_parse_resolves_references_and_refuses_undefined_ones() {
+        let v = xml_to_json(br#"<r><v p:a="A &amp; B">x &lt; &#65;<![CDATA[&z]]></v></r>"#).unwrap();
+        assert_eq!(v["r"]["v"]["@a"], "A & B");
+        assert_eq!(v["r"]["v"]["#text"], "x < A&z");
+        for (xml, want) in [
+            (&b"<r>&nbsp;</r>"[..], "undefined entity"),
+            (&b"<r>&#0;</r>"[..], "invalid character reference"),
+            (&br#"<r a="1" a="2"/>"#[..], "malformed attribute"),
+            (&br#"<r a="&x;"/>"#[..], "attribute `a`"),
+        ] {
+            let err = xml_to_json(xml).unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+        }
     }
 }

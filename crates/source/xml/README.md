@@ -11,7 +11,7 @@ Reach for it when the upstream system only speaks XML or SOAP: legacy enterprise
 
 ## Feature highlights
 
-- **Automatic XML → JSON conversion** — every response is parsed into a `serde_json::Value` tree; attributes, text nodes, and repeated elements all map to predictable JSON shapes.
+- **Automatic XML → JSON conversion** — every response is parsed into a `serde_json::Value` tree; attributes, text nodes, and repeated elements all map to predictable JSON shapes. Attribute values and text are unescaped (`&amp;` → `&`, `&#65;` → `A`); text split by CDATA or comments is joined as written and trimmed once. An undefined entity (`&nbsp;`) or a repeated attribute name fails the page rather than dropping the value.
 - **Element-path record extraction** — `records_element_path` walks a dot-separated path (e.g. `Envelope.Body.GetUsersResponse.Users.User`) to the repeating element and emits one record per match. A single element collapses to one record; a repeated element fans out to many.
 - **First-class SOAP** — a `soap:` block assembles the envelope, injects the version-correct headers (SOAPAction for 1.1, `Content-Type` action param for 1.2), resolves `records_element_path` relative to `Envelope.Body`, and surfaces SOAP `<Fault>` responses as errors. Or drop down to the raw-envelope path (`method: POST` + `body`) any time.
 - **Two pagination styles** — page-number and offset/limit, each with a built-in loop guard so a misbehaving endpoint can't spin forever; `max_pages` is a hard cap across both.

@@ -125,7 +125,7 @@ pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>,
                 // text content becomes the buffer (e.g. pull a base64 file blob
                 // out of a SOAP `<reportBytes>` element). The path is matched by
                 // its trailing element names, namespace-prefix-insensitive.
-                let s = xml_extract_text(&buf, extract).ok_or_else(|| {
+                let s = xml_extract_text(&buf, extract)?.ok_or_else(|| {
                     FaucetError::Source(format!(
                         "decode `extract`: '{extract}' matched no element text in the XML body"
                     ))
@@ -174,24 +174,18 @@ pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>,
 /// dot-path segments (namespace-prefix-insensitive). Used by the XML `extract`
 /// decode step to pull a blob (e.g. a base64-encoded file) out of a SOAP body —
 /// e.g. `runReportResponse.runReportReturn.reportBytes`.
-pub(crate) fn xml_extract_text(bytes: &[u8], dot_path: &str) -> Option<String> {
+pub(crate) fn xml_extract_text(bytes: &[u8], dot_path: &str) -> Result<Option<String>, FaucetError> {
     let want: Vec<String> = dot_path
         .split('.')
         .filter(|s| !s.is_empty())
         .map(|s| s.rsplit(':').next().unwrap_or(s).to_string())
         .collect();
     if want.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let text = std::str::from_utf8(bytes).ok()?;
+    let bad = |m: String| FaucetError::Source(format!("decode `extract`: {m}"));
+    let text = std::str::from_utf8(bytes).map_err(|e| bad(format!("body is not UTF-8: {e}")))?;
     let mut reader = quick_xml::Reader::from_str(text);
-    let local = |name: &[u8]| -> String {
-        String::from_utf8_lossy(name)
-            .rsplit(':')
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    };
     let ends_with = |stack: &[String]| -> bool {
         stack.len() >= want.len() && stack[stack.len() - want.len()..] == want[..]
     };
@@ -199,7 +193,8 @@ pub(crate) fn xml_extract_text(bytes: &[u8], dot_path: &str) -> Option<String> {
     let mut capture_depth: Option<usize> = None;
     let mut out = String::new();
     loop {
-        match reader.read_event().ok()? {
+        let event = reader.read_event().map_err(|e| bad(e.to_string()))?;
+        match &event {
             Event::Eof => break,
             Event::Start(e) => {
                 stack.push(local(e.name().as_ref()));
@@ -211,28 +206,30 @@ pub(crate) fn xml_extract_text(bytes: &[u8], dot_path: &str) -> Option<String> {
             Event::Empty(e) => {
                 stack.push(local(e.name().as_ref()));
                 if capture_depth.is_none() && ends_with(&stack) {
-                    return Some(String::new());
+                    return Ok(Some(String::new()));
                 }
                 stack.pop();
             }
             Event::End(_) => {
                 if capture_depth == Some(stack.len()) {
-                    return Some(out);
+                    return Ok(Some(out));
                 }
                 stack.pop();
             }
-            Event::Text(t) if capture_depth.is_some() => {
-                if let Ok(s) = t.unescape() {
-                    out.push_str(&s);
+            other if capture_depth.is_some() => {
+                if let Some(t) = crate::xmltext::event_text(other).map_err(bad)? {
+                    out.push_str(&t);
                 }
-            }
-            Event::CData(t) if capture_depth.is_some() => {
-                out.push_str(&String::from_utf8_lossy(&t));
             }
             _ => {}
         }
     }
-    None
+    Ok(None)
+}
+
+/// The local part of a (possibly prefixed) element or attribute name.
+fn local(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or_default().to_string()
 }
 
 /// Minimal glob: `*` matches any run. Supports `*.ext`, `prefix*`, `*mid*`,
@@ -381,26 +378,14 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
     // A stack of (object, text-accumulator) frames; index 0 is the document root.
     let mut stack: Vec<(Map<String, Value>, String)> = vec![(Map::new(), String::new())];
 
-    fn attrs(e: &quick_xml::events::BytesStart) -> Map<String, Value> {
+    fn attrs(e: &quick_xml::events::BytesStart) -> Result<Map<String, Value>, FaucetError> {
         let mut m = Map::new();
-        for a in e.attributes().with_checks(false).flatten() {
-            let k = String::from_utf8_lossy(a.key.as_ref())
-                .rsplit(':')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            if let Ok(v) = a.unescape_value() {
-                m.insert(format!("@{k}"), Value::String(v.to_string()));
-            }
+        for (k, v) in crate::xmltext::attributes(e)
+            .map_err(|m| FaucetError::Source(format!("decode `parse` xml: {m}")))?
+        {
+            m.insert(format!("@{}", local(&k)), Value::String(v));
         }
-        m
-    }
-    fn local(name: &[u8]) -> String {
-        String::from_utf8_lossy(name)
-            .rsplit(':')
-            .next()
-            .unwrap_or_default()
-            .to_string()
+        Ok(m)
     }
     fn insert_child(parent: &mut Map<String, Value>, key: String, val: Value) {
         match parent.get_mut(&key) {
@@ -428,15 +413,15 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
     }
 
     loop {
-        match reader
+        let event = reader
             .read_event()
-            .map_err(|e| FaucetError::Source(format!("decode `parse` xml: {e}")))?
-        {
+            .map_err(|e| FaucetError::Source(format!("decode `parse` xml: {e}")))?;
+        match &event {
             Event::Eof => break,
-            Event::Start(e) => stack.push((attrs(&e), String::new())),
+            Event::Start(e) => stack.push((attrs(e)?, String::new())),
             Event::Empty(e) => {
                 let name = local(e.name().as_ref());
-                let val = finish(attrs(&e), String::new());
+                let val = finish(attrs(e)?, String::new());
                 let top = top_frame(&mut stack, "element after the document root closed")?;
                 insert_child(&mut top.0, name, val);
             }
@@ -448,19 +433,15 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
                 let top = top_frame(&mut stack, &detail)?;
                 insert_child(&mut top.0, name, val);
             }
-            Event::Text(t) => {
-                if let Ok(s) = t.unescape() {
+            other => {
+                if let Some(t) = crate::xmltext::event_text(other)
+                    .map_err(|m| FaucetError::Source(format!("decode `parse` xml: {m}")))?
+                {
                     top_frame(&mut stack, "text after the document root closed")?
                         .1
-                        .push_str(&s);
+                        .push_str(&t);
                 }
             }
-            Event::CData(t) => {
-                top_frame(&mut stack, "CDATA after the document root closed")?
-                    .1
-                    .push_str(&String::from_utf8_lossy(&t));
-            }
-            _ => {}
         }
     }
     let (root, _) = stack.pop().unwrap_or_default();
@@ -769,5 +750,30 @@ mod tests {
             v,
             json!({"r": {"a": [{"@x": "1", "#text": "hi"}, "there"]}})
         );
+    }
+
+    #[test]
+    fn extract_text_resolves_references_and_fails_on_undefined_ones() {
+        // API-47: a token whose text could not be unescaped was silently dropped.
+        assert_eq!(
+            xml_extract_text(b"<r><t>a&amp;b<![CDATA[c]]></t></r>", "t").unwrap(),
+            Some("a&bc".to_string())
+        );
+        let err = xml_extract_text(b"<r><t>a&nbsp;</t></r>", "t").unwrap_err();
+        assert!(err.to_string().contains("undefined entity"), "{err}");
+        assert!(xml_extract_text(b"\xff", "t").is_err());
+        assert!(xml_extract_text(b"<r><a></b></r>", "t").is_err());
+        assert_eq!(xml_extract_text(b"<r/>", "").unwrap(), None);
+    }
+
+    #[test]
+    fn xml_parse_propagates_entity_and_attribute_errors() {
+        let err = xml_to_json(b"<r><v>&nbsp;</v></r>").unwrap_err();
+        assert!(err.to_string().contains("undefined entity"), "{err}");
+        let err = xml_to_json(br#"<r><v a="1" a="2"/></r>"#).unwrap_err();
+        assert!(err.to_string().contains("malformed attribute"), "{err}");
+        let v = xml_to_json(br#"<r><v x:a="A &amp; B">t&lt;</v></r>"#).unwrap();
+        assert_eq!(v["r"]["v"]["@a"], "A & B");
+        assert_eq!(v["r"]["v"]["#text"], "t<");
     }
 }

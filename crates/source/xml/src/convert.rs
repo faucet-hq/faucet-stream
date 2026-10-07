@@ -4,150 +4,81 @@
 //! hierarchy. Attributes are prefixed with `@`, text content uses `#text`.
 
 use faucet_core::FaucetError;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use serde_json::{Map, Value, json};
+
+use crate::xmltext::{attributes, event_text};
 
 /// Convert an XML string to a JSON value.
 ///
 /// Elements become objects, repeated elements become arrays, attributes
 /// are stored with `@` prefix, and text content uses `#text`.
 pub fn xml_to_json(xml: &str) -> Result<Value, FaucetError> {
-    let mut reader = Reader::from_str(xml);
-    let mut stack: Vec<(String, Map<String, Value>)> = vec![("$root".into(), Map::new())];
+    let mut doc = None;
+    stream_extract(xml, None, |v| doc = Some(v))?;
+    doc.ok_or_else(|| FaucetError::Transform("empty XML document".into()))
+}
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                let mut obj = Map::new();
+/// One open element: its name, children/attributes, and raw character data.
+struct Frame {
+    name: String,
+    obj: Map<String, Value>,
+    text: String,
+}
 
-                // Collect attributes.
-                for attr in e.attributes().with_checks(false).flatten() {
-                    let key = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
-                    let val = String::from_utf8_lossy(&attr.value).into_owned();
-                    obj.insert(key, Value::String(val));
-                }
-
-                stack.push((name, obj));
-            }
-            Ok(Event::End(_)) => {
-                let (name, obj) = stack.pop().ok_or_else(|| {
-                    FaucetError::Transform("malformed XML: unexpected end tag".into())
-                })?;
-
-                let value = if obj.len() == 1 && obj.contains_key("#text") {
-                    // Simplify: element with only text becomes a string.
-                    obj.into_iter().next().unwrap().1
-                } else {
-                    Value::Object(obj)
-                };
-
-                let parent = stack.last_mut().ok_or_else(|| {
-                    FaucetError::Transform("malformed XML: no parent element".into())
-                })?;
-
-                // If the key already exists, convert to array.
-                match parent.1.get_mut(&name) {
-                    Some(Value::Array(arr)) => arr.push(value),
-                    Some(existing) => {
-                        let prev = existing.clone();
-                        *existing = Value::Array(vec![prev, value]);
-                    }
-                    None => {
-                        parent.1.insert(name, value);
-                    }
-                }
-            }
-            Ok(Event::Text(e)) => {
-                let text = e
-                    .unescape()
-                    .map_err(|err| FaucetError::Transform(format!("XML decode error: {err}")))?
-                    .trim()
-                    .to_string();
-
-                if !text.is_empty()
-                    && let Some(current) = stack.last_mut()
-                {
-                    match current.1.get_mut("#text") {
-                        Some(Value::String(s)) => {
-                            s.push(' ');
-                            s.push_str(&text);
-                        }
-                        _ => {
-                            current.1.insert("#text".into(), Value::String(text));
-                        }
-                    }
-                }
-            }
-            Ok(Event::CData(e)) => {
-                // CDATA is literal (un-escaped) text that quick_xml emits as a
-                // separate event; without this arm the content was silently
-                // dropped — data loss for SOAP / feed APIs that wrap markup in
-                // CDATA (audit #146 H15). Decode and append to `#text` exactly
-                // like Event::Text.
-                let text = e
-                    .decode()
-                    .map_err(|err| {
-                        FaucetError::Transform(format!("XML CDATA decode error: {err}"))
-                    })?
-                    .trim()
-                    .to_string();
-
-                if !text.is_empty()
-                    && let Some(current) = stack.last_mut()
-                {
-                    match current.1.get_mut("#text") {
-                        Some(Value::String(s)) => {
-                            s.push(' ');
-                            s.push_str(&text);
-                        }
-                        _ => {
-                            current.1.insert("#text".into(), Value::String(text));
-                        }
-                    }
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                let mut obj = Map::new();
-                for attr in e.attributes().with_checks(false).flatten() {
-                    let key = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
-                    let val = String::from_utf8_lossy(&attr.value).into_owned();
-                    obj.insert(key, Value::String(val));
-                }
-                let value = if obj.is_empty() {
-                    json!(null)
-                } else {
-                    Value::Object(obj)
-                };
-
-                if let Some(parent) = stack.last_mut() {
-                    match parent.1.get_mut(&name) {
-                        Some(Value::Array(arr)) => arr.push(value),
-                        Some(existing) => {
-                            let prev = existing.clone();
-                            *existing = Value::Array(vec![prev, value]);
-                        }
-                        None => {
-                            parent.1.insert(name, value);
-                        }
-                    }
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {} // Skip comments, processing instructions, etc.
-            Err(e) => {
-                return Err(FaucetError::Transform(format!("XML parse error: {e}")));
-            }
+impl Frame {
+    fn open(e: &BytesStart<'_>) -> Result<Self, FaucetError> {
+        let mut obj = Map::new();
+        for (key, value) in attributes(e).map_err(|m| FaucetError::Transform(format!("XML {m}")))? {
+            obj.insert(format!("@{key}"), Value::String(value));
         }
+        Ok(Self {
+            name: e.name().as_ref().to_string(),
+            obj,
+            text: String::new(),
+        })
     }
 
-    let (_, root) = stack
-        .pop()
-        .ok_or_else(|| FaucetError::Transform("empty XML document".into()))?;
+    /// Close the element: text chunks are joined as they appeared and trimmed
+    /// once; an element holding only text becomes a bare string.
+    fn close(self) -> (String, Value) {
+        let mut obj = self.obj;
+        let text = self.text.trim();
+        if !text.is_empty() {
+            obj.insert("#text".into(), Value::String(text.to_string()));
+        }
+        let value = if obj.len() == 1 && obj.contains_key("#text") {
+            obj.into_iter().next().map(|(_, v)| v).unwrap_or(Value::Null)
+        } else {
+            Value::Object(obj)
+        };
+        (self.name, value)
+    }
 
-    Ok(Value::Object(root))
+    fn empty(e: &BytesStart<'_>) -> Result<(String, Value), FaucetError> {
+        let frame = Self::open(e)?;
+        let value = if frame.obj.is_empty() {
+            json!(null)
+        } else {
+            Value::Object(frame.obj)
+        };
+        Ok((frame.name, value))
+    }
+}
+
+/// Append a child value under `name`, converting to an array on repetition.
+fn append_child(parent: &mut Map<String, Value>, name: String, value: Value) {
+    match parent.get_mut(&name) {
+        Some(Value::Array(arr)) => arr.push(value),
+        Some(existing) => {
+            let prev = existing.take();
+            *existing = Value::Array(vec![prev, value]);
+        }
+        None => {
+            parent.insert(name, value);
+        }
+    }
 }
 
 /// Walk an XML document with `quick_xml::Reader::read_event` and invoke
@@ -160,261 +91,111 @@ pub fn xml_to_json(xml: &str) -> Result<Value, FaucetError> {
 /// When `records_element_path` is `None` the entire document is emitted as
 /// a single record (matches the eager `xml_to_json` behaviour).
 ///
-/// The key difference from `xml_to_json` is that subtree JSON values are
-/// only materialised while inside a matched element — surrounding elements
-/// are observed via the event stream but never accumulated, which bounds
-/// memory to one matched element + the path stack regardless of total
-/// document size. Combined with batched yielding in
-/// [`crate::stream::XmlStream`]'s `stream_pages`, this keeps client-side
-/// memory at `O(batch_size * record_size)` even for multi-gigabyte
-/// payloads.
+/// Subtree JSON values are only materialised while inside a matched element —
+/// surrounding elements are observed via the event stream but never
+/// accumulated, which bounds memory to one matched element + the path stack
+/// regardless of total document size.
 pub fn stream_extract<F: FnMut(Value)>(
     xml: &str,
     records_element_path: Option<&str>,
     mut on_record: F,
 ) -> Result<(), FaucetError> {
-    let target_segments: Option<Vec<&str>> = records_element_path.map(|p| p.split('.').collect());
-
+    let target: Option<Vec<&str>> = records_element_path.map(|p| p.split('.').collect());
+    let full_doc = target.is_none();
     let mut reader = Reader::from_str(xml);
 
-    // Current element path: outer-most → inner-most element name.
+    // Open element names, outer-most first.
     let mut path: Vec<String> = Vec::new();
-
-    // When `Some(start_depth)`, we are currently building a subtree rooted
-    // at the element opened at `path[start_depth]`. The subtree stack
-    // mirrors `xml_to_json`'s stack but is rooted at the matched element
-    // rather than the document.
-    let mut start_depth: Option<usize> = None;
-    let mut subtree: Vec<(String, Map<String, Value>)> = Vec::new();
-
-    // When `records_element_path` is None, we eagerly build the whole
-    // document and emit it as one record on EOF. This preserves the
-    // historical "no path = full doc" behaviour.
-    let mut full_doc: Option<Vec<(String, Map<String, Value>)>> = if target_segments.is_none() {
-        Some(vec![("$root".into(), Map::new())])
+    // Frames being materialised: the synthetic root in full-document mode, or
+    // the matched element and its open descendants.
+    let mut frames: Vec<Frame> = if full_doc {
+        vec![Frame {
+            name: "$root".into(),
+            obj: Map::new(),
+            text: String::new(),
+        }]
     } else {
-        None
+        Vec::new()
+    };
+    // Depth (path length) at which the current matched element was opened.
+    let mut start_depth: Option<usize> = None;
+
+    let matches = |path: &[String]| -> bool {
+        target.as_deref().is_some_and(|t| {
+            path.len() == t.len() && path.iter().zip(t).all(|(a, b)| a.as_str() == *b)
+        })
     };
 
-    /// Returns true when the current open-element path matches the target
-    /// dot-path selector exactly (i.e. the element just opened is the
-    /// repeating record element).
-    fn path_matches(path: &[String], target: &[&str]) -> bool {
-        path.len() == target.len() && path.iter().zip(target).all(|(a, b)| a.as_str() == *b)
-    }
-
-    /// Append a child value under `name` to the topmost frame, converting to
-    /// an array on repetition (mirrors `xml_to_json`).
-    fn append_child(parent: &mut Map<String, Value>, name: String, value: Value) {
-        match parent.get_mut(&name) {
-            Some(Value::Array(arr)) => arr.push(value),
-            Some(existing) => {
-                let prev = existing.clone();
-                *existing = Value::Array(vec![prev, value]);
-            }
-            None => {
-                parent.insert(name, value);
-            }
-        }
-    }
-
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                let mut obj = Map::new();
-                for attr in e.attributes().with_checks(false).flatten() {
-                    let key = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
-                    let val = String::from_utf8_lossy(&attr.value).into_owned();
-                    obj.insert(key, Value::String(val));
-                }
-
-                path.push(name.clone());
-
-                if let Some(doc) = full_doc.as_mut() {
-                    doc.push((name, obj));
-                } else if let Some(target) = target_segments.as_deref() {
-                    if start_depth.is_some() {
-                        subtree.push((name, obj));
-                    } else if path_matches(&path, target) {
-                        // Opening the matched element itself — start a new
-                        // subtree builder rooted at it.
-                        start_depth = Some(path.len() - 1);
-                        subtree.push((name, obj));
-                    }
-                    // Otherwise: outside any matched element — drop the
-                    // event without materialising anything.
+        let event = reader
+            .read_event()
+            .map_err(|e| FaucetError::Transform(format!("XML parse error: {e}")))?;
+        match &event {
+            Event::Start(e) => {
+                let frame = Frame::open(e)?;
+                path.push(frame.name.clone());
+                if full_doc || start_depth.is_some() {
+                    frames.push(frame);
+                } else if matches(&path) {
+                    start_depth = Some(path.len());
+                    frames.push(frame);
                 }
             }
-            Ok(Event::Empty(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                let mut obj = Map::new();
-                for attr in e.attributes().with_checks(false).flatten() {
-                    let key = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
-                    let val = String::from_utf8_lossy(&attr.value).into_owned();
-                    obj.insert(key, Value::String(val));
-                }
-                let value = if obj.is_empty() {
-                    json!(null)
-                } else {
-                    Value::Object(obj)
-                };
-
-                // Treat self-closing tag as a transient open+close at the
-                // current depth.
-                path.push(name.clone());
-                let matches_target = target_segments
-                    .as_deref()
-                    .map(|t| path_matches(&path, t))
-                    .unwrap_or(false);
-                path.pop();
-
-                if let Some(doc) = full_doc.as_mut() {
-                    if let Some(parent) = doc.last_mut() {
-                        append_child(&mut parent.1, name, value);
+            Event::Empty(e) => {
+                let (name, value) = Frame::empty(e)?;
+                path.push(name);
+                let is_match = matches(&path);
+                let name = path.pop().unwrap_or_default();
+                if full_doc || start_depth.is_some() {
+                    if let Some(parent) = frames.last_mut() {
+                        append_child(&mut parent.obj, name, value);
                     }
-                } else if matches_target && start_depth.is_none() {
-                    // Self-closing matched element: emit immediately.
+                } else if is_match {
                     on_record(value);
-                } else if start_depth.is_some()
-                    && let Some(parent) = subtree.last_mut()
-                {
-                    append_child(&mut parent.1, name, value);
                 }
             }
-            Ok(Event::End(_)) => {
-                let name = path.pop().ok_or_else(|| {
+            Event::End(_) => {
+                let depth = path.len();
+                path.pop().ok_or_else(|| {
                     FaucetError::Transform("malformed XML: unexpected end tag".into())
                 })?;
-
-                if let Some(doc) = full_doc.as_mut() {
-                    let (popped_name, obj) = doc.pop().ok_or_else(|| {
-                        FaucetError::Transform("malformed XML: no element on stack".into())
-                    })?;
-                    debug_assert_eq!(popped_name, name);
-                    let value = if obj.len() == 1 && obj.contains_key("#text") {
-                        obj.into_iter().next().unwrap().1
-                    } else {
-                        Value::Object(obj)
-                    };
-                    let parent = doc.last_mut().ok_or_else(|| {
-                        FaucetError::Transform("malformed XML: no parent element".into())
-                    })?;
-                    append_child(&mut parent.1, popped_name, value);
-                } else if let Some(depth) = start_depth {
-                    let (popped_name, obj) = subtree.pop().ok_or_else(|| {
-                        FaucetError::Transform("malformed XML: no element on subtree stack".into())
-                    })?;
-                    debug_assert_eq!(popped_name, name);
-                    let value = if obj.len() == 1 && obj.contains_key("#text") {
-                        obj.into_iter().next().unwrap().1
-                    } else {
-                        Value::Object(obj)
-                    };
-
-                    if subtree.is_empty() {
-                        // We just closed the matched element itself —
-                        // emit and reset.
-                        debug_assert_eq!(path.len(), depth);
+                if full_doc || start_depth.is_some() {
+                    let (name, value) = frames
+                        .pop()
+                        .ok_or_else(|| {
+                            FaucetError::Transform("malformed XML: no element on stack".into())
+                        })?
+                        .close();
+                    if start_depth == Some(depth) {
                         start_depth = None;
                         on_record(value);
-                    } else if let Some(parent) = subtree.last_mut() {
-                        append_child(&mut parent.1, popped_name, value);
+                    } else {
+                        let parent = frames.last_mut().ok_or_else(|| {
+                            FaucetError::Transform("malformed XML: no parent element".into())
+                        })?;
+                        append_child(&mut parent.obj, name, value);
                     }
                 }
-                // Outside any matched element and no full-doc mode: drop.
             }
-            Ok(Event::Text(e)) => {
-                let text = e
-                    .unescape()
-                    .map_err(|err| FaucetError::Transform(format!("XML decode error: {err}")))?
-                    .trim()
-                    .to_string();
-                if text.is_empty() {
-                    continue;
-                }
-
-                if let Some(doc) = full_doc.as_mut() {
-                    if let Some(current) = doc.last_mut() {
-                        match current.1.get_mut("#text") {
-                            Some(Value::String(s)) => {
-                                s.push(' ');
-                                s.push_str(&text);
-                            }
-                            _ => {
-                                current.1.insert("#text".into(), Value::String(text));
-                            }
-                        }
-                    }
-                } else if start_depth.is_some()
-                    && let Some(current) = subtree.last_mut()
+            Event::Eof => break,
+            other => {
+                if (full_doc || start_depth.is_some())
+                    && let Some(text) = event_text(other)
+                        .map_err(|m| FaucetError::Transform(format!("XML decode error: {m}")))?
+                    && let Some(current) = frames.last_mut()
                 {
-                    match current.1.get_mut("#text") {
-                        Some(Value::String(s)) => {
-                            s.push(' ');
-                            s.push_str(&text);
-                        }
-                        _ => {
-                            current.1.insert("#text".into(), Value::String(text));
-                        }
-                    }
+                    current.text.push_str(&text);
                 }
-            }
-            Ok(Event::CData(e)) => {
-                // CDATA is literal text emitted as its own event; capture it
-                // instead of dropping it — data loss for CDATA-wrapped markup
-                // (audit #146 H15). Decode and append to `#text` like Text.
-                let text = e
-                    .decode()
-                    .map_err(|err| {
-                        FaucetError::Transform(format!("XML CDATA decode error: {err}"))
-                    })?
-                    .trim()
-                    .to_string();
-                if text.is_empty() {
-                    continue;
-                }
-                if let Some(doc) = full_doc.as_mut() {
-                    if let Some(current) = doc.last_mut() {
-                        match current.1.get_mut("#text") {
-                            Some(Value::String(s)) => {
-                                s.push(' ');
-                                s.push_str(&text);
-                            }
-                            _ => {
-                                current.1.insert("#text".into(), Value::String(text));
-                            }
-                        }
-                    }
-                } else if start_depth.is_some()
-                    && let Some(current) = subtree.last_mut()
-                {
-                    match current.1.get_mut("#text") {
-                        Some(Value::String(s)) => {
-                            s.push(' ');
-                            s.push_str(&text);
-                        }
-                        _ => {
-                            current.1.insert("#text".into(), Value::String(text));
-                        }
-                    }
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {} // Comments, PIs, etc.
-            Err(e) => {
-                return Err(FaucetError::Transform(format!("XML parse error: {e}")));
             }
         }
     }
 
-    if let Some(mut doc) = full_doc {
-        let (_, root) = doc
+    if full_doc {
+        let root = frames
             .pop()
             .ok_or_else(|| FaucetError::Transform("empty XML document".into()))?;
-        on_record(Value::Object(root));
+        on_record(Value::Object(root.obj));
     }
-
     Ok(())
 }
 
@@ -1038,5 +819,50 @@ mod tests {
         assert_eq!(streamed.len(), 2);
         assert_eq!(streamed[0]["v"], "1");
         assert_eq!(streamed[1]["v"], "2");
+    }
+
+    #[test]
+    fn attribute_values_are_unescaped_in_both_converters() {
+        // API-29: `&amp;` in an attribute used to reach the sink verbatim.
+        let xml = r#"<root><co name="A &amp; B" id="&#49;"/></root>"#;
+        let json = xml_to_json(xml).unwrap();
+        assert_eq!(json["root"]["co"]["@name"], "A & B");
+        assert_eq!(json["root"]["co"]["@id"], "1");
+        let recs = collect_stream_extract(xml, Some("root.co"));
+        assert_eq!(recs[0]["@name"], "A & B");
+    }
+
+    #[test]
+    fn text_chunks_join_without_inserted_spaces() {
+        // API-47: `a<![CDATA[b]]>c` used to become "a b c".
+        let json = xml_to_json("<r><v>a<![CDATA[b]]>c</v><w>x<!-- c -->y</w></r>").unwrap();
+        assert_eq!(json["r"]["v"], "abc");
+        assert_eq!(json["r"]["w"], "xy");
+    }
+
+    #[test]
+    fn undefined_entity_fails_instead_of_dropping_text() {
+        // API-47: an undefined entity used to drop the text node silently.
+        let err = xml_to_json("<r><v>a&nbsp;b</v></r>").unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Transform(m) if m.contains("undefined entity")),
+            "{err:?}"
+        );
+        let err = xml_to_json(r#"<r><v n="&nbsp;"/></r>"#).unwrap_err();
+        assert!(matches!(&err, FaucetError::Transform(m) if m.contains("attribute `n`")));
+    }
+
+    #[test]
+    fn many_attributes_on_one_tag_parse_in_linear_time() {
+        // SUPPLY-15: quick-xml < 0.41 checked duplicate attribute names in O(N^2).
+        let mut xml = String::from("<r><a");
+        for i in 0..50_000 {
+            xml.push_str(&format!(" k{i}=\"v\""));
+        }
+        xml.push_str("/></r>");
+        let started = std::time::Instant::now();
+        let json = xml_to_json(&xml).unwrap();
+        assert_eq!(json["r"]["a"]["@k49999"], "v");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 }

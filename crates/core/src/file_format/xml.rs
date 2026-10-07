@@ -194,23 +194,33 @@ fn pop(stack: &mut Vec<Frame>, detail: &str) -> Result<Frame, FaucetError> {
     stack.pop().ok_or_else(|| unbalanced(detail))
 }
 
-fn attrs(e: &BytesStart) -> Map<String, Value> {
+fn attrs(e: &BytesStart) -> Result<Map<String, Value>, FaucetError> {
     let mut m = Map::new();
-    for a in e.attributes().with_checks(false).flatten() {
-        let k = local(a.key.as_ref());
-        if let Ok(v) = a.unescape_value() {
-            m.insert(format!("@{k}"), Value::String(v.to_string()));
-        }
+    for a in e.attributes() {
+        let a = a.map_err(|e| FaucetError::Source(format!("xml: malformed attribute: {e}")))?;
+        let v = a
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|e| FaucetError::Source(format!("xml: attribute `{}`: {e}", a.key.as_ref())))?;
+        m.insert(format!("@{}", local(a.key.as_ref())), Value::String(v.into_owned()));
     }
-    m
+    Ok(m)
 }
 
-fn local(name: &[u8]) -> String {
-    String::from_utf8_lossy(name)
-        .rsplit(':')
-        .next()
-        .unwrap_or_default()
-        .to_string()
+fn local(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or_default().to_string()
+}
+
+/// Resolve `&name;` (the five XML entities) or a character reference.
+fn reference(r: &quick_xml::events::BytesRef<'_>) -> Result<String, FaucetError> {
+    if let Some(ch) = r
+        .resolve_char_ref()
+        .map_err(|e| FaucetError::Source(format!("xml: invalid character reference `&{};`: {e}", &**r)))?
+    {
+        return Ok(ch.to_string());
+    }
+    quick_xml::escape::resolve_predefined_entity(r)
+        .map(str::to_string)
+        .ok_or_else(|| FaucetError::Source(format!("xml: undefined entity reference `&{};`", &**r)))
 }
 
 fn insert_child(parent: &mut Map<String, Value>, key: String, val: Value) {
@@ -265,26 +275,27 @@ pub fn to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
                     )));
                 }
                 names.push(local(e.name().as_ref()));
-                stack.push((attrs(&e), String::new()));
+                stack.push((attrs(&e)?, String::new()));
             }
             Event::Empty(e) => {
                 let name = local(e.name().as_ref());
-                let val = finish(attrs(&e), String::new());
+                let val = finish(attrs(&e)?, String::new());
                 let t = top(&mut stack, "element after the document root closed")?;
                 insert_child(&mut t.0, name, val);
             }
             Event::Text(t) => {
-                let s = t
-                    .unescape()
-                    .map_err(|e| FaucetError::Source(format!("xml: {e}")))?
-                    .to_string();
                 top(&mut stack, "text after the document root closed")?
                     .1
-                    .push_str(&s);
+                    .push_str(&t.xml10_content());
             }
             Event::CData(t) => {
-                let s = String::from_utf8_lossy(t.as_ref()).to_string();
                 top(&mut stack, "CDATA after the document root closed")?
+                    .1
+                    .push_str(&t.xml10_content());
+            }
+            Event::GeneralRef(r) => {
+                let s = reference(&r)?;
+                top(&mut stack, "text after the document root closed")?
                     .1
                     .push_str(&s);
             }
@@ -321,14 +332,28 @@ mod tests {
     }
 
     #[test]
-    fn attributes_are_read_without_the_quadratic_duplicate_check() {
-        // RUSTSEC-2026-0194: the duplicate-name check is quadratic in the
-        // attribute count, so it is off; a repeated name keeps its last value.
-        let many: String = (0..5_000).map(|i| format!(" a{i}=\"{i}\"")).collect();
-        let xml = format!("<rows><row{many} id=\"1\" id=\"2\"/></rows>");
+    fn many_attributes_parse_and_a_duplicate_name_is_refused() {
+        // RUSTSEC-2026-0194 is fixed in quick-xml 0.41+, so the duplicate-name
+        // check is back on: a repeated attribute is malformed XML, not "last wins".
+        let many: String = (0..50_000).map(|i| format!(" a{i}=\"{i}\"")).collect();
+        let xml = format!("<rows><row{many} id=\"1\"/></rows>");
         let rows = decode(xml.as_bytes(), "row").expect("decode");
-        assert_eq!(rows[0]["@id"], json!("2"));
-        assert_eq!(rows[0]["@a4999"], json!("4999"));
+        assert_eq!(rows[0]["@a49999"], json!("49999"));
+        let err = decode(br#"<rows><row id="1" id="2"/></rows>"#, "row").expect_err("dup");
+        assert!(err.to_string().contains("malformed attribute"), "{err}");
+    }
+
+    #[test]
+    fn references_resolve_and_undefined_entities_fail() {
+        let v = to_json(br#"<r><v a="A &amp; B">x &lt; &#65;<![CDATA[&z]]></v></r>"#).unwrap();
+        assert_eq!(v["r"]["v"]["@a"], json!("A & B"));
+        assert_eq!(v["r"]["v"]["#text"], json!("x < A&z"));
+        let err = to_json(b"<r>&nbsp;</r>").expect_err("undefined");
+        assert!(err.to_string().contains("undefined entity"), "{err}");
+        let err = to_json(b"<r>&#0;</r>").expect_err("bad char ref");
+        assert!(err.to_string().contains("invalid character reference"), "{err}");
+        let err = to_json(br#"<r a="&nbsp;"/>"#).expect_err("attr");
+        assert!(err.to_string().contains("attribute `a`"), "{err}");
     }
 
     fn nested(depth: usize) -> Vec<u8> {

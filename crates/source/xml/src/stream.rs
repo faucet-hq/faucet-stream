@@ -365,7 +365,7 @@ impl XmlStream {
                     next_body,
                 }) => {
                     // Read the continuation token from THIS page's response.
-                    match crate::decode::xml_extract_text(xml_text.as_bytes(), next_token_path) {
+                    match crate::decode::xml_extract_text(xml_text.as_bytes(), next_token_path)? {
                         // Absent/empty token → done. Repeated token → loop guard.
                         Some(t)
                             if !t.trim().is_empty()
