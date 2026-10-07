@@ -66,23 +66,43 @@ pub enum PollPlan {
     Query { from: Lsn, to: Lsn, gap: bool },
 }
 
+/// A capture instance's LSN range for one poll.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LsnBounds {
+    /// `sys.fn_cdc_get_min_lsn(instance)` — oldest retained change.
+    pub min: Option<Lsn>,
+    /// `sys.fn_cdc_get_max_lsn()` — newest captured change.
+    pub max: Option<Lsn>,
+    /// `cdc.change_tables.start_lsn` — where the instance began capturing.
+    pub start: Option<Lsn>,
+}
+
 /// Decide what to poll for a capture instance.
 ///
 /// - `bookmark`: last committed LSN for this instance (`None` on a fresh run).
 /// - `min_lsn` / `max_lsn`: the instance's retained range (`None` when CDC has
 ///   produced nothing yet, or the capture instance is not yet active).
-pub fn plan_poll(
-    bookmark: Option<Lsn>,
-    min_lsn: Option<Lsn>,
-    max_lsn: Option<Lsn>,
-    start: StartPosition,
-) -> PollPlan {
+pub fn plan_poll(bookmark: Option<Lsn>, bounds: LsnBounds, start: StartPosition) -> PollPlan {
+    // A fresh `current` start anchors as soon as it can, so a change committed
+    // before the next poll is never skipped: at the database's max LSN, or —
+    // before the capture job has harvested anything — just before the
+    // instance's own start LSN (every change of the instance is at or after it).
+    if bookmark.is_none() && start == StartPosition::Current {
+        let anchor = bounds
+            .max
+            .or_else(|| bounds.start.and_then(|s| s.decrement()));
+        if anchor.is_some() {
+            return PollPlan::NoChanges {
+                set_bookmark: anchor,
+            };
+        }
+    }
     // No max LSN => no change activity yet; nothing to do, keep the bookmark.
-    let Some(to) = max_lsn else {
+    let Some(to) = bounds.max else {
         return PollPlan::NoChanges { set_bookmark: None };
     };
     // No min LSN alongside a max is anomalous (min briefly unavailable); skip.
-    let Some(min) = min_lsn else {
+    let Some(min) = bounds.min else {
         return PollPlan::NoChanges { set_bookmark: None };
     };
 
@@ -239,9 +259,60 @@ mod tests {
 
     // ── plan_poll ─────────────────────────────────────────────────────────────
 
+    fn plan(
+        bookmark: Option<Lsn>,
+        min: Option<Lsn>,
+        max: Option<Lsn>,
+        start: StartPosition,
+    ) -> PollPlan {
+        plan_poll(
+            bookmark,
+            LsnBounds {
+                min,
+                max,
+                start: None,
+            },
+            start,
+        )
+    }
+
+    #[test]
+    fn a_fresh_current_start_anchors_before_the_capture_job_has_run() {
+        // SQL-167: min is NULL for a while after enabling CDC; anchor anyway.
+        let max = lsn("00000000000000000100");
+        let only_max = LsnBounds {
+            min: None,
+            max: Some(max),
+            start: None,
+        };
+        assert_eq!(
+            plan_poll(None, only_max, StartPosition::Current),
+            PollPlan::NoChanges {
+                set_bookmark: Some(max)
+            }
+        );
+        // Nothing harvested yet: anchor just before the instance's start LSN.
+        let start = lsn("00000000000000000040");
+        let unharvested = LsnBounds {
+            min: None,
+            max: None,
+            start: Some(start),
+        };
+        assert_eq!(
+            plan_poll(None, unharvested, StartPosition::Current),
+            PollPlan::NoChanges {
+                set_bookmark: start.decrement()
+            }
+        );
+        assert_eq!(
+            plan_poll(None, LsnBounds::default(), StartPosition::Current),
+            PollPlan::NoChanges { set_bookmark: None }
+        );
+    }
+
     #[test]
     fn plan_no_max_lsn_is_no_changes() {
-        let p = plan_poll(
+        let p = plan(
             None,
             Some(lsn("00000000000000000001")),
             None,
@@ -253,7 +324,7 @@ mod tests {
     #[test]
     fn plan_fresh_current_anchors_at_max() {
         let max = lsn("00000000000000000100");
-        let p = plan_poll(
+        let p = plan(
             None,
             Some(lsn("00000000000000000001")),
             Some(max),
@@ -271,7 +342,7 @@ mod tests {
     fn plan_fresh_earliest_queries_from_min() {
         let min = lsn("00000000000000000005");
         let max = lsn("00000000000000000100");
-        let p = plan_poll(None, Some(min), Some(max), StartPosition::Earliest);
+        let p = plan(None, Some(min), Some(max), StartPosition::Earliest);
         assert_eq!(
             p,
             PollPlan::Query {
@@ -287,7 +358,7 @@ mod tests {
         let bm = lsn("00000000000000000010");
         let min = lsn("00000000000000000001");
         let max = lsn("00000000000000000100");
-        let p = plan_poll(Some(bm), Some(min), Some(max), StartPosition::Current);
+        let p = plan(Some(bm), Some(min), Some(max), StartPosition::Current);
         assert_eq!(
             p,
             PollPlan::Query {
@@ -304,7 +375,7 @@ mod tests {
         let bm = lsn("00000000000000000100");
         let min = lsn("00000000000000000001");
         let max = lsn("00000000000000000100");
-        let p = plan_poll(Some(bm), Some(min), Some(max), StartPosition::Current);
+        let p = plan(Some(bm), Some(min), Some(max), StartPosition::Current);
         assert_eq!(p, PollPlan::NoChanges { set_bookmark: None });
     }
 
@@ -314,7 +385,7 @@ mod tests {
         let bm = lsn("00000000000000000001");
         let min = lsn("00000000000000000050");
         let max = lsn("00000000000000000100");
-        let p = plan_poll(Some(bm), Some(min), Some(max), StartPosition::Current);
+        let p = plan(Some(bm), Some(min), Some(max), StartPosition::Current);
         assert_eq!(
             p,
             PollPlan::Query {

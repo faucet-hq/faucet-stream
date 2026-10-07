@@ -14,9 +14,13 @@ never re-reads an already-committed change.
 - **Native CDC, LSN-driven.** Advances by Log Sequence Number using the built-in
   `cdc.fn_cdc_get_all_changes_*` table-valued functions — no triggers, no
   polling of the base table.
-- **Per-transaction durability.** Change rows are buffered by commit LSN
-  (`__$start_lsn`); each committed transaction is emitted as its own
-  `StreamPage` with a bookmark, so nothing partially-visible ever leaks.
+- **Per-transaction durability.** Every capture instance's changes are read
+  together and merged by (`__$start_lsn`, `__$seqval`), then buffered by
+  commit LSN; each committed transaction — including one that touches several
+  captured tables — is emitted whole, in its own order, as one `StreamPage`
+  with a bookmark, so nothing partially-visible ever leaks. Each poll holds one
+  pooled connection per capture instance (`max_connections` is raised to that
+  count when lower).
 - **Resumable & exactly-once capable.** The bookmark is a monotonic LSN; on
   resume the next poll starts at `increment(bookmark)`. `supports_exactly_once()`
   is `true`, and `capture_resume_position()` anchors CDC before a bulk snapshot
@@ -50,7 +54,7 @@ pipeline:
 | Field | Default | Notes |
 |-------|---------|-------|
 | `capture_instances` | — (required) | Capture-instance names (`sys.sp_cdc_enable_table` defaults to `<schema>_<table>`). Only `[A-Za-z0-9_]` accepted (injected into the function name). |
-| `start_position` | `current` | `current` skips existing history; `earliest` replays whatever the CDC cleanup job still retains. Ignored once a bookmark exists. |
+| `start_position` | `current` | `current` skips existing history; `earliest` replays whatever the CDC cleanup job still retains. Ignored once a bookmark exists. `current` anchors on the first run even before the capture job has harvested the instance (just before its `start_lsn`), so changes committed right after enabling CDC are not skipped. |
 | `poll_interval` | `1s` | Wait between empty polls. |
 | `idle_timeout` | `30s` | End the fetch cycle after this much continuous quiet. A long-running runtime (`faucet schedule` / `faucet serve`) re-invokes to keep tailing. |
 | `batch_size` | `1000` | `0` accumulates every change into a single trailing page. |
