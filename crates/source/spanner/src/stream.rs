@@ -2,7 +2,6 @@
 //! execution, streaming, and incremental-replication bookkeeping.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -238,9 +237,8 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
 /// Derive a default state-store key from the database path + a query
 /// fingerprint, stable across runs.
 fn default_state_key(config: &SpannerSourceConfig) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.query.hash(&mut hasher);
-    let fingerprint = hasher.finish();
+    // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
+    let fingerprint = faucet_core::shard::shard_hash(&config.query);
     // Project/instance/database ids are [a-z0-9-] by Spanner's naming rules;
     // sanitise defensively anyway (`:` is the key-segment separator).
     let path: String = format!(
@@ -728,6 +726,7 @@ mod tests {
         let k2 = default_state_key(&cfg);
         assert_eq!(k1, k2);
         assert!(k1.starts_with("spanner:proj.inst.db:"));
+        assert!(k1.contains(&format!("{:x}", faucet_core::shard::shard_hash(&cfg.query))));
         faucet_core::state::validate_state_key(&k1).expect("derived key must be valid");
     }
 
