@@ -2,8 +2,10 @@
 //!
 //! Tails the MySQL binary log via `mysql_async`'s async [`BinlogStream`] and
 //! emits per-row change events as CDC envelopes.  Transactions are buffered
-//! in memory (BEGIN → ROWS → COMMIT) and emitted atomically as one
-//! [`StreamPage`] per commit, matching the postgres-cdc durability contract.
+//! in memory (BEGIN → ROWS → COMMIT) and committed transactions are coalesced
+//! into pages of up to `batch_size` records — a transaction is never split —
+//! each carrying the bookmark of its last commit. XA transactions are held
+//! until their outcome; savepoints never split a transaction.
 //!
 //! **Target engine:** primarily InnoDB / transactional tables, where commits
 //! arrive as `XidEvent`.  Explicit `COMMIT` statements (emitted by
@@ -21,7 +23,9 @@
 //! README.
 
 use crate::config::{CdcTls, MysqlCdcSourceConfig, StartPosition};
-use crate::convert::{binlog_row_to_json_hinted, column_hints};
+use crate::batch::PageBuilder;
+use crate::convert::{binlog_row_to_json_hinted, column_hints, primary_key_columns};
+use crate::query::{QueryKind, classify_query, parse_xa_prepare};
 use crate::state::{Bookmark, state_key};
 use async_trait::async_trait;
 use faucet_core::{FaucetError, Source, Stream, StreamPage};
@@ -110,9 +114,10 @@ impl Source for MysqlCdcSource {
         Ok(all)
     }
 
-    /// Per-transaction streaming.  Each committed transaction is emitted as
-    /// its own [`StreamPage`] with `bookmark = Some(file_pos)`.  The
-    /// trait-level `batch_size` argument is ignored in favour of the config
+    /// Streaming: committed transactions are grouped into pages of up to the
+    /// config's `batch_size` records (never splitting a transaction) or after
+    /// one second, each with `bookmark = Some(file_pos)` of its last commit.
+    /// The trait-level `batch_size` argument is ignored in favour of the config
     /// field.
     fn stream_pages<'a>(
         &'a self,
@@ -267,7 +272,6 @@ impl MysqlCdcSource {
         batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         let idle_timeout = self.config.idle_timeout;
-        let per_transaction = batch_size != 0;
 
         Box::pin(async_stream::try_stream! {
             use futures::StreamExt;
@@ -309,57 +313,45 @@ impl MysqlCdcSource {
                 ResolvedStart::FilePos { file, .. } => file.clone(),
                 _ => String::new(),
             };
+            // Rows of the transaction in progress.
             let mut buffer: Vec<Value> = Vec::new();
-            let mut in_txn = false;
             let mut payload_end: Option<u64> = None;
             let mut txid: u64 = 0;
-            // Bookmark of the last successfully committed transaction.
-            let mut last_commit_bookmark: Option<Bookmark> = None;
-            // Aggregate buffer used when batch_size == 0.
-            let mut agg_records: Vec<Value> = Vec::new();
+            // Committed transactions waiting to become pages (#789 SQL-118).
+            let mut pages = PageBuilder::new(batch_size, PAGE_MAX_AGE, self.config.max_staged_records);
+            let mut last_event = std::time::Instant::now();
 
-            // commit_buffer!($bm) — factors out the emit/accumulate logic shared by
-            // XidEvent (InnoDB), QueryEvent("COMMIT") (non-transactional/mixed), and
-            // the desync-guard flush that runs when a new transaction starts while the
-            // buffer is unexpectedly non-empty.
-            //
-            // The macro does NOT update `in_txn` or `txid`; the caller is responsible
-            // for those so that desync-guard callers (which immediately set `in_txn =
-            // true` afterward) don't trigger a dead-assignment lint.
-            //
-            // Behaviour:
-            //  - per_transaction mode: yields one StreamPage per commit (even if the
-            //    buffer is empty, so the bookmark still advances).
-            //  - aggregate mode (batch_size == 0): extends agg_records and records the
-            //    bookmark for the trailing flush at stream end; skips empty buffers.
-            //
-            // Must be a macro (not a closure) because it needs to `yield` inside the
-            // async_stream::try_stream! block and capture locals by mutable reference.
-            macro_rules! commit_buffer {
-                ($bm:expr) => {{
-                    let bm: Bookmark = $bm;
-                    if per_transaction {
-                        // Always yield — even an empty page advances the bookmark.
-                        self.note_emitted(&bm);
+            // emit!(ready) — yield each finished page with its bookmark.
+            macro_rules! emit {
+                ($ready:expr) => {{
+                    for page in $ready {
+                        self.note_emitted(&page.bookmark);
                         yield StreamPage {
-                            records: std::mem::take(&mut buffer),
-                            bookmark: Some(bm.to_value()?),
+                            records: page.records,
+                            bookmark: Some(page.bookmark.to_value()?),
                         };
-                    } else if !buffer.is_empty() {
-                        // Aggregate mode: accumulate; last_commit_bookmark records
-                        // the bookmark for the trailing flush at stream end.
-                        // Only guard assignment in aggregate mode — per_transaction
-                        // already yields the bookmark directly.
-                        last_commit_bookmark = Some(bm);
-                        agg_records.extend(std::mem::take(&mut buffer));
                     }
+                }};
+            }
+            // commit!(pos) — the transaction in `buffer` committed at `pos`.
+            macro_rules! commit {
+                ($pos:expr) => {{
+                    let bm = Bookmark::FilePos { file: current_file.clone(), pos: $pos };
+                    let ready =
+                        pages.commit(std::mem::take(&mut buffer), bm, std::time::Instant::now());
+                    txid = txid.wrapping_add(1);
+                    emit!(ready);
                 }};
             }
 
             // 5. Drain loop.
             loop {
-                match tokio::time::timeout(idle_timeout, stream.next()).await {
+                let now = std::time::Instant::now();
+                let idle_left = idle_timeout.saturating_sub(now.duration_since(last_event));
+                let wait = pages.time_left(now).map_or(idle_left, |t| t.min(idle_left));
+                match tokio::time::timeout(wait, stream.next()).await {
                     Ok(Some(Ok(event))) => {
+                        last_event = std::time::Instant::now();
                         let header = event.header();
                         let ts_ms = u64::from(header.timestamp()) * 1_000;
                         // Events decompressed from a Transaction_payload carry
@@ -387,92 +379,108 @@ impl MysqlCdcSource {
                             }
                             Some(EventData::GtidEvent(_g)) => {
                                 // A GtidEvent precedes BEGIN in GTID mode.
-                                // We don't need the SID/GNO here because we
-                                // bookmark with file/pos on commit (see module note).
-                                //
-                                // Desync guard: if the buffer is non-empty when a new
-                                // transaction starts, the previous transaction ended
-                                // without an explicit commit boundary event — flush it
-                                // now to prevent silent conflation into the next txid.
+                                // Desync guard: rows still buffered when a new
+                                // transaction starts belong to one that ended
+                                // without a boundary event — commit them now
+                                // rather than conflate them with the next txid.
                                 if !buffer.is_empty() {
-                                    let bm = Bookmark::FilePos {
-                                        file: current_file.clone(),
-                                        pos: log_pos,
-                                    };
-                                    commit_buffer!(bm);
-                                    txid = txid.wrapping_add(1);
+                                    commit!(log_pos);
                                 }
-                                in_txn = true;
                             }
                             Some(EventData::QueryEvent(qe)) => {
-                                let q = qe.query();
-                                let q_upper = q.trim().to_ascii_uppercase();
-                                if q_upper == "BEGIN" {
-                                    // Desync guard: same reasoning as GtidEvent.
-                                    if !buffer.is_empty() {
-                                        let bm = Bookmark::FilePos {
-                                            file: current_file.clone(),
-                                            pos: log_pos,
-                                        };
-                                        commit_buffer!(bm);
-                                        txid = txid.wrapping_add(1);
-                                    }
-                                    in_txn = true;
-                                } else if q_upper == "COMMIT" {
-                                    // Non-transactional / mixed-engine explicit COMMIT.
-                                    // MySQL emits QueryEvent("COMMIT") instead of XidEvent
-                                    // for non-InnoDB engines; treat it identically.
-                                    let bm = Bookmark::FilePos {
-                                        file: current_file.clone(),
-                                        pos: log_pos,
-                                    };
-                                    commit_buffer!(bm);
-                                    in_txn = false;
-                                    txid = txid.wrapping_add(1);
-                                } else {
-                                    // DDL statement — auto-commits implicitly (F36).
-                                    //
-                                    // A DDL statement in MySQL forces an implicit commit
-                                    // of any in-progress transaction *before* it runs.
-                                    // If `buffer` still holds rows here, they belong to
-                                    // that just-committed transaction. We MUST flush them
-                                    // (advancing the bookmark atomically with their emit)
-                                    // before touching the DDL — otherwise the DDL's own
-                                    // bookmark below would advance past those un-emitted
-                                    // rows and they would be silently lost on resume.
-                                    // Mirror the BEGIN/COMMIT/desync flush exactly.
-                                    if should_flush_buffer_before_ddl(buffer.is_empty()) {
-                                        let bm = Bookmark::FilePos {
-                                            file: current_file.clone(),
-                                            pos: log_pos,
-                                        };
-                                        commit_buffer!(bm);
-                                        txid = txid.wrapping_add(1);
-                                    }
-
-                                    if self.config.emit_schema_changes {
-                                        let envelope = build_ddl_envelope(
-                                            q.as_ref(),
-                                            ts_ms,
-                                            &current_file,
-                                            log_pos,
-                                        );
-                                        let bm = Bookmark::FilePos {
-                                            file: current_file.clone(),
-                                            pos: log_pos,
-                                        };
-                                        if per_transaction {
-                                            self.note_emitted(&bm);
-                                            yield StreamPage {
-                                                records: vec![envelope],
-                                                bookmark: Some(bm.to_value()?),
-                                            };
-                                        } else {
-                                            last_commit_bookmark = Some(bm);
-                                            agg_records.push(envelope);
+                                let default_schema = qe.schema().into_owned();
+                                match classify_query(&qe.query(), &default_schema) {
+                                    QueryKind::Begin => {
+                                        if !buffer.is_empty() {
+                                            commit!(log_pos);
                                         }
                                     }
-                                    in_txn = false;
+                                    // Non-transactional / mixed-engine explicit
+                                    // COMMIT (or ROLLBACK of one): MySQL logs a
+                                    // QueryEvent instead of an XidEvent.
+                                    QueryKind::Commit => commit!(log_pos),
+                                    // SAVEPOINT / ROLLBACK TO / RELEASE / XA END
+                                    // sit inside the transaction (#789 SQL-59).
+                                    QueryKind::InTransaction => {}
+                                    QueryKind::XaOutcome { xid, commit: commit_it } => {
+                                        if !buffer.is_empty() {
+                                            commit!(log_pos);
+                                        }
+                                        let bm = Bookmark::FilePos {
+                                            file: current_file.clone(),
+                                            pos: log_pos,
+                                        };
+                                        let (known, ready) = pages.decide(
+                                            &xid,
+                                            commit_it,
+                                            bm,
+                                            std::time::Instant::now(),
+                                        );
+                                        if !known && commit_it {
+                                            tracing::warn!(
+                                                connector = "mysql-cdc",
+                                                "an XA transaction prepared before this stream \
+                                                 started was committed; its rows were not captured"
+                                            );
+                                        }
+                                        emit!(ready);
+                                    }
+                                    QueryKind::Truncate { schema, table } => {
+                                        // TRUNCATE commits implicitly, like DDL.
+                                        if !buffer.is_empty() {
+                                            commit!(log_pos);
+                                        }
+                                        if self.config.table_included(&schema, &table) {
+                                            buffer.push(build_envelope(
+                                                "truncate",
+                                                ts_ms,
+                                                &schema,
+                                                &table,
+                                                Value::Null,
+                                                Value::Null,
+                                                json!({ "file": &current_file, "pos": log_pos }),
+                                                txid,
+                                            ));
+                                        }
+                                        commit!(log_pos);
+                                    }
+                                    QueryKind::Ddl => {
+                                        // A DDL statement commits any open
+                                        // transaction before it runs (F36): emit
+                                        // those rows first, so the DDL's bookmark
+                                        // never passes un-emitted rows.
+                                        if !buffer.is_empty() {
+                                            commit!(log_pos);
+                                        }
+                                        if self.config.emit_schema_changes {
+                                            buffer.push(build_ddl_envelope(
+                                                qe.query().as_ref(),
+                                                ts_ms,
+                                                &current_file,
+                                                log_pos,
+                                            ));
+                                        }
+                                        commit!(log_pos);
+                                    }
+                                }
+                            }
+                            Some(EventData::XaPrepareLogEvent(body)) => {
+                                let (one_phase, xid) = parse_xa_prepare(&body).ok_or_else(|| {
+                                    FaucetError::Source(
+                                        "mysql-cdc: malformed XA_PREPARE_LOG_EVENT".into(),
+                                    )
+                                })?;
+                                if one_phase {
+                                    // XA COMMIT … ONE PHASE: the prepare is the commit.
+                                    commit!(log_pos);
+                                } else {
+                                    // The outcome arrives later as XA COMMIT /
+                                    // XA ROLLBACK; until then nothing after it
+                                    // may be bookmarked (#789 SQL-59).
+                                    pages
+                                        .prepare(xid, std::mem::take(&mut buffer))
+                                        .map_err(FaucetError::Source)?;
+                                    txid = txid.wrapping_add(1);
                                 }
                             }
                             Some(EventData::RowsEvent(re)) => {
@@ -487,13 +495,17 @@ impl MysqlCdcSource {
                                 let table = tme.table_name().into_owned();
 
                                 if !self.config.table_included(&db, &table) {
-                                    // Skip filtered tables but still mark as in_txn.
                                     continue;
                                 }
 
                                 let op = op_from_rows_event(&re);
                                 let lsn = json!({ "file": &current_file, "pos": log_pos });
                                 let hints = column_hints(tme);
+                                let key_columns = if self.config.include_columns {
+                                    Vec::new()
+                                } else {
+                                    primary_key_columns(tme)
+                                };
 
                                 for row_result in re.rows(tme) {
                                     let (before_row, after_row) = row_result.map_err(|e| {
@@ -502,13 +514,19 @@ impl MysqlCdcSource {
                                         ))
                                     })?;
 
-                                    let before_json = if self.config.include_columns {
-                                        match &before_row {
-                                            Some(r) => binlog_row_to_json_hinted(r, &hints)?,
-                                            None => Value::Null,
+                                    let before_json = match &before_row {
+                                        Some(r) if self.config.include_columns => {
+                                            binlog_row_to_json_hinted(r, &hints)?
                                         }
-                                    } else {
-                                        Value::Null
+                                        // Without before-images a delete still
+                                        // needs its key, or nothing downstream can
+                                        // apply it (#789 SQL-117).
+                                        Some(r) if after_row.is_none() => key_image(
+                                            binlog_row_to_json_hinted(r, &hints)?,
+                                            r,
+                                            &key_columns,
+                                        ),
+                                        _ => Value::Null,
                                     };
                                     let after_json = match &after_row {
                                         Some(r) => binlog_row_to_json_hinted(r, &hints)?,
@@ -521,7 +539,6 @@ impl MysqlCdcSource {
                                         lsn.clone(), txid,
                                     );
 
-                                    // Fix 4: use let-chain (stable in edition 2024).
                                     if let Some(max) = self.config.max_staged_records
                                         && buffer.len() >= max
                                     {
@@ -536,45 +553,31 @@ impl MysqlCdcSource {
                                 }
                             }
                             Some(EventData::XidEvent(_xid)) => {
-                                // InnoDB COMMIT — emit the buffered transaction.
-                                let bm = Bookmark::FilePos {
-                                    file: current_file.clone(),
-                                    pos: log_pos,
-                                };
-                                commit_buffer!(bm);
-                                in_txn = false;
-                                txid = txid.wrapping_add(1);
+                                // InnoDB COMMIT.
+                                commit!(log_pos);
                             }
                             _ => {
                                 // FormatDescriptionEvent, PreviousGtidsEvent, etc. — ignored.
                             }
                         }
+                        if let Some(e) = pages.take_error() {
+                            Err(FaucetError::Source(e))?;
+                        }
+                        if pages.due(std::time::Instant::now()) {
+                            emit!(pages.take());
+                        }
                     }
                     Ok(Some(Err(e))) => {
                         Err(FaucetError::Source(format!("mysql-cdc: stream error: {e}")))?;
                     }
-                    // Idle timeout or stream closed: flush remaining buffer and end.
+                    Err(_) if pages.due(std::time::Instant::now()) => {
+                        emit!(pages.take());
+                    }
+                    // Idle timeout or stream closed. A transaction still open
+                    // (or an XA one still undecided) is dropped: the server
+                    // redelivers it from the last persisted bookmark next run.
                     Ok(None) | Err(_) => {
-                        // Drop any uncommitted partial transaction — the server will
-                        // redeliver it from the last persisted bookmark on the next run.
-                        let _ = in_txn;
-
-                        // Aggregate mode: emit one trailing page with all accumulated
-                        // records across the fetch window.  If every transaction was
-                        // filtered (all rows excluded by table_included), agg_records
-                        // stays empty and last_commit_bookmark is None, so the bookmark
-                        // is not advanced — those transactions are harmlessly re-scanned
-                        // on the next cycle (aggregate mode is for test/snapshot use only).
-                        if !per_transaction
-                            && let Some(bm) = last_commit_bookmark.take()
-                            && !agg_records.is_empty()
-                        {
-                            self.note_emitted(&bm);
-                            yield StreamPage {
-                                records: std::mem::take(&mut agg_records),
-                                bookmark: Some(bm.to_value()?),
-                            };
-                        }
+                        emit!(pages.take());
                         break;
                     }
                 }
@@ -816,68 +819,26 @@ fn build_request<'r>(
     }
 }
 
-/// Whether a non-empty in-progress row buffer must be flushed before handling a
-/// DDL `QueryEvent` (F36).
-///
-/// A DDL statement implicitly auto-commits any open transaction in MySQL, so rows
-/// staged in `buffer` when a DDL arrives belong to a transaction that has already
-/// committed on the server. They must be emitted (and their bookmark advanced)
-/// *before* the DDL is processed — otherwise the DDL event's own bookmark advances
-/// past those rows and they are silently lost on resume. This mirrors the
-/// BEGIN/COMMIT/desync flush contract. Returns `true` iff the buffer is non-empty.
-///
-/// Pure seam so the data-loss-prevention decision is unit-testable without a live
-/// binlog stream.
-pub(crate) fn should_flush_buffer_before_ddl(buffer_is_empty: bool) -> bool {
-    !buffer_is_empty
-}
+/// How long a committed transaction may wait for its page to fill.
+const PAGE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// A single page the DDL branch emits, modelled purely for testing (F36).
-///
-/// `bookmark_pos` is the `Some(pos)` the page advances the bookmark to, or `None`
-/// when no bookmark is attached (which never happens in the DDL branch but keeps
-/// the model general).
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlannedPage {
-    /// Number of records on the page (DDL envelope counts as 1; buffered rows as N).
-    pub record_count: usize,
-    /// Whether this page carries the DDL envelope (vs. flushed buffered rows).
-    pub is_ddl: bool,
-    pub bookmark_pos: Option<u64>,
-}
-
-/// Pure model of the per-transaction (`batch_size != 0`) DDL-branch emit sequence,
-/// faithful to the real branch in `stream_pages_impl` (F36 regression guard).
-///
-/// Given the count of rows currently staged in `buffer`, whether the source is
-/// configured to `emit_schema_changes`, and the DDL event's `log_pos`, it returns the
-/// ordered pages the branch emits. The invariant under test: **any buffered rows are
-/// flushed (as their own page, with the pre-DDL bookmark) before the DDL envelope** —
-/// so the DDL's bookmark can never advance past un-emitted rows.
-#[cfg(test)]
-pub(crate) fn plan_ddl_pages(
-    buffered_rows: usize,
-    emit_schema_changes: bool,
-    log_pos: u64,
-) -> Vec<PlannedPage> {
-    let mut pages = Vec::new();
-    // Flush staged rows first, exactly as the real branch's `commit_buffer!` does.
-    if should_flush_buffer_before_ddl(buffered_rows == 0) {
-        pages.push(PlannedPage {
-            record_count: buffered_rows,
-            is_ddl: false,
-            bookmark_pos: Some(log_pos),
-        });
+/// The key columns of a delete's before-image, for `include_columns: false`
+/// (the whole image when the table declares no primary key).
+fn key_image(full: Value, row: &mysql_async::binlog::row::BinlogRow, key_columns: &[usize]) -> Value {
+    if key_columns.is_empty() {
+        return full;
     }
-    if emit_schema_changes {
-        pages.push(PlannedPage {
-            record_count: 1,
-            is_ddl: true,
-            bookmark_pos: Some(log_pos),
-        });
+    let names: Vec<String> = key_columns
+        .iter()
+        .filter_map(|i| row.columns_ref().get(*i).map(|c| c.name_str().into_owned()))
+        .collect();
+    match full {
+        Value::Object(mut obj) => {
+            obj.retain(|k, _| names.contains(k));
+            Value::Object(obj)
+        }
+        other => other,
     }
-    pages
 }
 
 /// Map a `RowsEventData` variant to its CDC operation string.
@@ -1729,74 +1690,5 @@ mod tests {
         assert!(!obj.contains_key("after"));
         assert!(!obj.contains_key("schema"));
         assert!(!obj.contains_key("table"));
-    }
-
-    // ── F36: DDL implicit-commit must flush buffered rows before advancing ────────
-
-    #[test]
-    fn should_flush_buffer_before_ddl_decision() {
-        // Non-empty buffer → must flush; empty buffer → nothing to flush.
-        assert!(should_flush_buffer_before_ddl(false));
-        assert!(!should_flush_buffer_before_ddl(true));
-    }
-
-    #[test]
-    fn ddl_with_buffered_rows_flushes_them_first() {
-        // A DDL arriving with 3 staged rows must emit those rows FIRST (their own page,
-        // bookmarked at the pre-DDL position) and only then the DDL envelope. This is
-        // the F36 fix: without the flush, the rows are silently lost on resume.
-        let pages = plan_ddl_pages(3, true, 4567);
-        assert_eq!(
-            pages.len(),
-            2,
-            "expected a buffer-flush page then a DDL page"
-        );
-
-        // Page 1: the flushed buffered rows.
-        assert_eq!(pages[0].record_count, 3);
-        assert!(
-            !pages[0].is_ddl,
-            "first page must be the buffered rows, not the DDL"
-        );
-        assert_eq!(
-            pages[0].bookmark_pos,
-            Some(4567),
-            "buffered rows must advance the bookmark — no silent loss"
-        );
-
-        // Page 2: the DDL envelope.
-        assert!(pages[1].is_ddl);
-        assert_eq!(pages[1].record_count, 1);
-        assert_eq!(pages[1].bookmark_pos, Some(4567));
-    }
-
-    #[test]
-    fn ddl_with_empty_buffer_emits_only_the_ddl() {
-        // No staged rows → no flush page; just the DDL envelope.
-        let pages = plan_ddl_pages(0, true, 100);
-        assert_eq!(pages.len(), 1);
-        assert!(pages[0].is_ddl);
-        assert_eq!(pages[0].bookmark_pos, Some(100));
-    }
-
-    #[test]
-    fn ddl_with_buffered_rows_flushes_even_when_schema_changes_disabled() {
-        // The critical safety property: even when `emit_schema_changes` is OFF (so the
-        // DDL envelope itself is dropped), buffered rows MUST still be flushed before
-        // the DDL implicitly auto-commits — otherwise those rows vanish on resume.
-        let pages = plan_ddl_pages(2, false, 888);
-        assert_eq!(pages.len(), 1, "buffered rows must still be flushed");
-        assert!(!pages[0].is_ddl);
-        assert_eq!(pages[0].record_count, 2);
-        assert_eq!(pages[0].bookmark_pos, Some(888));
-    }
-
-    #[test]
-    fn ddl_with_empty_buffer_and_no_schema_changes_emits_nothing() {
-        let pages = plan_ddl_pages(0, false, 12);
-        assert!(
-            pages.is_empty(),
-            "nothing to emit: empty buffer + schema changes off"
-        );
     }
 }
