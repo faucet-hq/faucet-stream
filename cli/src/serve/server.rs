@@ -967,6 +967,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     .with_graceful_shutdown(async move {
         wait_for_signal().await;
         tracing::info!("shutdown signal received; draining in-flight runs");
+        drain_state.set_draining();
         // Stop pulling NEW work the moment we begin draining.
         if let Some(claim) = claim {
             claim.abort();

@@ -2438,9 +2438,10 @@ paths:
     get:
       summary: Readiness probe (unauthenticated)
       description: >
-        503 when the history backend is degraded or the run queue is full.
-        Always returns a JSON body with `status`, `history_ok`, `queue_ok`, and
-        a `cluster` object (`enabled` bool + `instances` live-member count).
+        503 when the history backend is degraded, the run queue is full, or the
+        server is shutting down (`draining`). Always returns a JSON body with
+        `status`, `history_ok`, `queue_ok`, `draining`, and a `cluster` object
+        (`enabled` bool + `instances` live-member count).
       operationId: readyz
       security: []
       responses:
@@ -2454,6 +2455,7 @@ paths:
                   status: { type: string, example: ready }
                   history_ok: { type: boolean }
                   queue_ok: { type: boolean }
+                  draining: { type: boolean, description: "true once shutdown began; new work is refused." }
                   cluster:
                     type: object
                     properties:
@@ -2477,6 +2479,7 @@ paths:
                   status: { type: string, example: not_ready }
                   history_ok: { type: boolean }
                   queue_ok: { type: boolean }
+                  draining: { type: boolean }
                   cluster:
                     type: object
                     properties:

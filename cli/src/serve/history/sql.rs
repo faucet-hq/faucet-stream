@@ -571,6 +571,8 @@ pub struct Stmts {
     pub reclaim_fail: String,
     /// Finalize a run owned by this instance (terminal status update).
     pub finalize_owned: String,
+    /// Requeue a run its owner gives up on at shutdown. Params: body, run_id, owner.
+    pub release_owned: String,
     /// Cancel a pending run directly (transition pending → cancelled).
     pub cancel_pending: String,
     /// Request cancellation of an in-flight run owned by another instance.
@@ -1007,6 +1009,10 @@ impl Stmts {
             // record, so a stale zombie execution that shares the same owner (a
             // lease-lapse re-claim by the same instance) can never overwrite the
             // terminal record written by the live execution. First finalizer wins.
+            release_owned: "UPDATE faucet_serve_runs \
+                SET status = 'pending', owner = NULL, lease_expires_at = NULL, body = $1 \
+                WHERE run_id = $2 AND owner = $3 AND status = 'running'"
+                .into(),
             finalize_owned: "UPDATE faucet_serve_runs \
                 SET status = $1, finished_at = $2, lease_expires_at = $3, body = $4 \
                 WHERE run_id = $5 AND owner = $6 \
@@ -1427,6 +1433,10 @@ impl Stmts {
                 AND (lease_expires_at IS NULL OR lease_expires_at < ?)"
                 .into(),
             // Status-fenced (audit #321 L5): first finalizer wins.
+            release_owned: "UPDATE faucet_serve_runs \
+                SET status = 'pending', owner = NULL, lease_expires_at = NULL, body = ? \
+                WHERE run_id = ? AND owner = ? AND status = 'running'"
+                .into(),
             finalize_owned: "UPDATE faucet_serve_runs \
                 SET status = ?, finished_at = ?, lease_expires_at = ?, body = ? \
                 WHERE run_id = ? AND owner = ? \
@@ -2627,6 +2637,25 @@ macro_rules! impl_sql_history {
                     }
                 }
                 Ok(report)
+            }
+
+            async fn release_owned(
+                &self,
+                rec: &$crate::serve::history::RunRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let mut rec = rec.clone();
+                rec.status = $crate::serve::history::RunStatus::Pending;
+                rec.started_at = None;
+                let n = sqlx::query(&self.stmts.release_owned)
+                    .bind(sql::encode_body(&rec)?)
+                    .bind(&rec.run_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?
+                    .rows_affected();
+                Ok(n == 1)
             }
 
             async fn finalize_owned(

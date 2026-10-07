@@ -67,6 +67,8 @@ struct Inner {
     /// Whether a caller-supplied config may use subprocess connectors
     /// (`--allow-subprocess-connectors`).
     allow_subprocess_connectors: bool,
+    /// Set when shutdown begins: new work is refused and `/readyz` is 503.
+    draining: std::sync::atomic::AtomicBool,
 }
 
 impl ServerState {
@@ -109,6 +111,7 @@ impl ServerState {
                 require_approval: config.require_approval.clone(),
                 approval_expiry: config.approval_expiry,
                 allow_subprocess_connectors: config.allow_subprocess_connectors,
+                draining: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -229,6 +232,21 @@ impl ServerState {
 
     pub fn render_metrics(&self) -> Option<String> {
         self.inner.prometheus.as_ref().map(|h| h.render())
+    }
+
+    /// Begin draining: from now on submissions are refused (503 +
+    /// `Retry-After`) and `/readyz` reports not ready.
+    pub fn set_draining(&self) {
+        self.inner
+            .draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the server is shutting down.
+    pub fn is_draining(&self) -> bool {
+        self.inner
+            .draining
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {

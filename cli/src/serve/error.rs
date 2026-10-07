@@ -20,6 +20,9 @@ pub struct ApiErrorBody {
     pub details: Option<serde_json::Value>,
 }
 
+/// The `Retry-After` a draining server answers with.
+pub const DRAINING_RETRY_AFTER_SECS: u64 = 5;
+
 /// All error outcomes a serve handler can produce.
 #[derive(Debug)]
 pub enum ServeError {
@@ -49,6 +52,9 @@ pub enum ServeError {
     /// 503 — a required dependency is temporarily unavailable (e.g. idempotency
     /// can't be honored while the run-history backend is degraded).
     Unavailable(String),
+    /// 503 — the server is shutting down and takes no new work; retry against
+    /// another instance (or this one once it is back).
+    Draining,
     Internal(String),
 }
 
@@ -72,7 +78,7 @@ impl ServeError {
             ServeError::Conflict(_) => StatusCode::CONFLICT,
             ServeError::QueueFull { .. } => StatusCode::TOO_MANY_REQUESTS,
             ServeError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
-            ServeError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ServeError::Unavailable(_) | ServeError::Draining => StatusCode::SERVICE_UNAVAILABLE,
             ServeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -88,6 +94,7 @@ impl ServeError {
             ServeError::QueueFull { .. } => "queue_full",
             ServeError::TooManyRequests(_) => "limit_exceeded",
             ServeError::Unavailable(_) => "unavailable",
+            ServeError::Draining => "draining",
             ServeError::Internal(_) => "internal",
         }
     }
@@ -103,6 +110,9 @@ impl ServeError {
             ServeError::QueueFull { .. } => "run queue is full; retry later".into(),
             ServeError::TooManyRequests(m) => m.clone(),
             ServeError::Unavailable(m) => m.clone(),
+            ServeError::Draining => "the server is shutting down and accepts no new work; retry \
+                                     against another instance"
+                .into(),
             ServeError::Internal(m) => m.clone(),
         }
     }
@@ -142,8 +152,13 @@ impl IntoResponse for ServeError {
     fn into_response(self) -> Response {
         let status = self.status();
         let mut resp = (status, Json(self.api_error())).into_response();
-        if let ServeError::QueueFull { retry_after_secs } = &self
-            && let Ok(v) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string())
+        let retry_after = match &self {
+            ServeError::QueueFull { retry_after_secs } => Some(*retry_after_secs),
+            ServeError::Draining => Some(DRAINING_RETRY_AFTER_SECS),
+            _ => None,
+        };
+        if let Some(secs) = retry_after
+            && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())
         {
             resp.headers_mut()
                 .insert(axum::http::header::RETRY_AFTER, v);
@@ -250,6 +265,18 @@ mod tests {
         let body = ServeError::NotFound.api_error();
         let v = serde_json::to_value(&body).unwrap();
         assert!(v["error"].get("details").is_none());
+    }
+
+    #[tokio::test]
+    async fn draining_is_a_503_with_retry_after() {
+        let resp = ServeError::Draining.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            &DRAINING_RETRY_AFTER_SECS.to_string()
+        );
+        assert_eq!(ServeError::Draining.api_error().error.code, "draining");
+        assert!(ServeError::Draining.to_string().contains("shutting down"));
     }
 
     #[tokio::test]

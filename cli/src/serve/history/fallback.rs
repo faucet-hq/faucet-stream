@@ -260,6 +260,9 @@ impl RunHistory for FallbackHistory {
     async fn reclaim_orphans(&self, max_attempts: u32) -> Result<ReclaimReport, HistoryError> {
         via!(self, p => p.reclaim_orphans(max_attempts), f => f.reclaim_orphans(max_attempts))
     }
+    async fn release_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        strict!(self, p => p.release_owned(rec), f => f.release_owned(rec))
+    }
     async fn finalize_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
         via!(self, p => p.finalize_owned(rec), f => f.finalize_owned(rec))
     }
@@ -801,6 +804,14 @@ mod tests {
         );
         let fb = FallbackHistory::healthy(Box::new(AlwaysFail), Duration::from_secs(60), "test");
         assert!(!fb.change_transition(&change("c1"), pending).await.unwrap());
+        let run = RunRecord::queued(
+            "r0".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(!fb.release_owned(&run).await.unwrap());
         assert!(fb.change_get("c1").await.unwrap().is_none());
         assert!(
             fb.change_list(&Default::default())

@@ -20,7 +20,8 @@ pub async fn healthz() -> impl IntoResponse {
 pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
     let history_ok = !state.history().degraded();
     let queue_ok = !state.registry().is_full();
-    let code = if history_ok && queue_ok {
+    let draining = state.is_draining();
+    let code = if history_ok && queue_ok && !draining {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -34,6 +35,7 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
         "status": if code == StatusCode::OK { "ready" } else { "not_ready" },
         "history_ok": history_ok,
         "queue_ok": queue_ok,
+        "draining": draining,
         "cluster": {
             "enabled": state.cluster().enabled(),
             "instances": state.cluster().members(),
@@ -139,6 +141,19 @@ mod tests {
         assert_eq!(v["status"], "ready");
         assert_eq!(v["history_ok"], true);
         assert_eq!(v["queue_ok"], true);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_draining() {
+        let st = state(false);
+        st.set_draining();
+        let resp = readyz(axum::extract::State(st)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["draining"], true);
     }
 
     #[tokio::test]

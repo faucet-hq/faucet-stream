@@ -620,6 +620,16 @@ pub trait RunHistory: Send + Sync {
     /// the run. Returns `true` if the write landed, `false` if another instance
     /// reclaimed it (the caller should discard its result). Default: delegate to
     /// `upsert` (memory/single-process always owns its runs).
+    /// Hand a run this instance owns back to the cluster (#789 SERVE-25): a
+    /// still-running record becomes `pending` with no owner, for a peer to
+    /// claim, instead of failing because this instance is shutting down.
+    /// `false` = not released (not owned here, already terminal, or a backend
+    /// without cluster support — the default).
+    async fn release_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        let _ = rec;
+        Ok(false)
+    }
+
     async fn finalize_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
         self.upsert(rec).await.map(|_| true)
     }
@@ -1730,6 +1740,14 @@ mod tests {
         assert!(!h.change_delete("c1").await.unwrap());
         assert_eq!(h.usage_delete_runs(&["r".to_string()]).await.unwrap(), 0);
         assert_eq!(h.usage_delete_tenant("acme").await.unwrap(), 0);
+        let rec = RunRecord::queued(
+            "r".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(!h.release_owned(&rec).await.unwrap());
     }
 
     #[test]

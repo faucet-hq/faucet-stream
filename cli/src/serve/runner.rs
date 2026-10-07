@@ -354,7 +354,35 @@ pub struct SubmitResponse {
 /// execution inputs from the persisted record (re-resolving config with this
 /// instance's own env/credentials), acquires a permit, and runs the shared tail.
 pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
+    resume_claimed(state, rec, None);
+}
+
+/// [`resume_claimed_run`] with the run slot the claim loop already took, so a
+/// claimed run never waits on (or is over-claimed past) the semaphore
+/// (#789 SERVE-46).
+pub fn resume_claimed_run_with_permit(
+    state: ServerState,
+    rec: RunRecord,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    resume_claimed(state, rec, Some(permit));
+}
+
+fn resume_claimed(
+    state: ServerState,
+    rec: RunRecord,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) {
+    // In flight from the moment it is claimed, so a shutdown drain waits for
+    // it while it is still loading its config (#789 SERVE-48).
+    state.registry().mark_running_unqueued();
+    metrics::set_run_gauges(&state);
+    let guard = InFlightGuard {
+        state: state.clone(),
+        run_id: rec.run_id.clone(),
+    };
     tokio::spawn(async move {
+        let guard = guard;
         let run_id = rec.run_id.clone();
         let Some(body) = rec.config_body.as_deref() else {
             tracing::error!(run_id, "claimed run has no stored config; failing it");
@@ -429,13 +457,14 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             }
         }
 
-        // The claim loop only claims up to available_permits and is the sole
-        // permit consumer, so this acquire returns immediately.
-        let _permit = state
-            .semaphore()
-            .acquire_owned()
-            .await
-            .expect("semaphore not closed");
+        let _permit = match permit {
+            Some(p) => p,
+            None => state
+                .semaphore()
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed"),
+        };
         // Register a local cancel token so a cross-instance cancel (the claim loop
         // calling registry.cancel) reaches this run.
         let run_token = CancellationToken::new();
@@ -449,7 +478,7 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             rec.timeout_secs,
             rec.clock.clone(),
             rec.concurrency,
-            false,
+            Some(guard),
         )
         .await;
     });
@@ -801,29 +830,23 @@ async fn execute_shard(
             // Fired by the claim loop for a remote cancel. Flush within the grace
             // window; a cooperative cancel returns Ok(partial), so the shard is
             // Cancelled — but a flush that FAILS must surface, not be masked.
-            match tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await {
-                Ok(failed @ Terminal::Failed { .. }) => failed,
-                Ok(_) | Err(_) => Terminal::Cancelled,
-            }
+            Terminal::cancelled()
+                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
         _ = server_shutdown.cancelled() => {
             coop.cancel();
-            match tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await {
-                Ok(failed @ Terminal::Failed { .. }) => failed,
-                Ok(_) | Err(_) => Terminal::ShutdownFailed,
-            }
+            Terminal::shutdown_failed()
+                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
         _ = &mut timeout_fut => {
             coop.cancel();
-            match tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await {
-                Ok(failed @ Terminal::Failed { .. }) => failed,
-                Ok(_) | Err(_) => Terminal::Timeout { secs: timeout_secs.unwrap_or(0) },
-            }
+            Terminal::timeout(timeout_secs.unwrap_or(0))
+                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
     };
     match terminal {
         Terminal::Completed { .. } => ShardOutcome::Completed,
-        Terminal::Cancelled => ShardOutcome::Cancelled,
+        Terminal::Cancelled { .. } => ShardOutcome::Cancelled,
         _ => ShardOutcome::Failed,
     }
 }
@@ -963,6 +986,10 @@ pub async fn submit(
     req: SubmitRequest,
     actor: AuthContext,
 ) -> Result<SubmitResponse, ServeError> {
+    // A draining server takes no new work (#789 SERVE-25).
+    if state.is_draining() {
+        return Err(ServeError::Draining);
+    }
     // `0` is rejected rather than clamped: under the house sentinel it reads as
     // "unlimited", but here it would mean "no connections" — far enough apart
     // that guessing either way would be wrong (#610).
@@ -1436,14 +1463,78 @@ enum Terminal {
         records: u64,
         invs: Vec<InvocationRecord>,
     },
+    /// The interrupted variants keep what the pipeline wrote before it
+    /// stopped (#789 SERVE-28): rows landed even though the run did not finish.
     Timeout {
         secs: u64,
+        records: u64,
+        invs: Vec<InvocationRecord>,
     },
-    Cancelled,
-    ShutdownFailed,
+    Cancelled {
+        records: u64,
+        invs: Vec<InvocationRecord>,
+    },
+    ShutdownFailed {
+        records: u64,
+        invs: Vec<InvocationRecord>,
+    },
 }
 
 impl Terminal {
+    fn cancelled() -> Self {
+        Terminal::Cancelled {
+            records: 0,
+            invs: Vec::new(),
+        }
+    }
+
+    fn shutdown_failed() -> Self {
+        Terminal::ShutdownFailed {
+            records: 0,
+            invs: Vec::new(),
+        }
+    }
+
+    fn timeout(secs: u64) -> Self {
+        Terminal::Timeout {
+            secs,
+            records: 0,
+            invs: Vec::new(),
+        }
+    }
+
+    /// An interrupted run's terminal state, carrying what the pipeline wrote
+    /// before it stopped at a page boundary.
+    fn with_partial(self, written: u64, done: Vec<InvocationRecord>) -> Self {
+        match self {
+            Terminal::Timeout { secs, .. } => Terminal::Timeout {
+                secs,
+                records: written,
+                invs: done,
+            },
+            Terminal::Cancelled { .. } => Terminal::Cancelled {
+                records: written,
+                invs: done,
+            },
+            Terminal::ShutdownFailed { .. } => Terminal::ShutdownFailed {
+                records: written,
+                invs: done,
+            },
+            other => other,
+        }
+    }
+
+    /// After a cancel trigger: a flush failure surfaces as itself, a
+    /// cooperative stop keeps its partial counts under the trigger's status,
+    /// and a run that never answered within the grace keeps nothing.
+    fn after_interrupt(self, finished: Option<Terminal>) -> Self {
+        match finished {
+            Some(failed @ Terminal::Failed { .. }) => failed,
+            Some(Terminal::Completed { records, invs }) => self.with_partial(records, invs),
+            _ => self,
+        }
+    }
+
     /// (status, metric reason label, records, invocations, error message)
     fn into_parts(
         self,
@@ -1463,19 +1554,25 @@ impl Terminal {
                 records,
                 invs,
             } => (RunStatus::Failed, "error", records, invs, Some(reason)),
-            Terminal::Timeout { secs } => (
+            Terminal::Timeout {
+                secs,
+                records,
+                invs,
+            } => (
                 RunStatus::Failed,
                 "timeout",
-                0,
-                Vec::new(),
+                records,
+                invs,
                 Some(format!("run exceeded timeout_secs ({secs}s)")),
             ),
-            Terminal::Cancelled => (RunStatus::Cancelled, "cancelled", 0, Vec::new(), None),
-            Terminal::ShutdownFailed => (
+            Terminal::Cancelled { records, invs } => {
+                (RunStatus::Cancelled, "cancelled", records, invs, None)
+            }
+            Terminal::ShutdownFailed { records, invs } => (
                 RunStatus::Failed,
                 "server_shutdown",
-                0,
-                Vec::new(),
+                records,
+                invs,
                 Some("server shutdown before the run finished".into()),
             ),
         }
@@ -1590,11 +1687,12 @@ fn spawn_run(
         let _permit = tokio::select! {
             biased;
             _ = run_token.cancelled() => {
-                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::Cancelled).await;
+                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::cancelled()).await;
                 return;
             }
             _ = server_shutdown.cancelled() => {
-                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::ShutdownFailed).await;
+                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::shutdown_failed())
+                    .await;
                 return;
             }
             permit = state.semaphore().acquire_owned() => permit.expect("semaphore not closed"),
@@ -1608,7 +1706,7 @@ fn spawn_run(
             req.timeout_secs,
             req.clock,
             req.concurrency,
-            true,
+            None,
         )
         .await;
         // `_permit` drops here.
@@ -1630,7 +1728,7 @@ async fn execute_run(
     timeout_secs: Option<u64>,
     clock_flag: Option<String>,
     concurrency: Option<usize>,
-    from_queue: bool,
+    claimed: Option<InFlightGuard>,
 ) {
     let server_shutdown = state.shutdown_token();
     let auth_result = loaded.auth_catalog();
@@ -1642,14 +1740,15 @@ async fn execute_run(
     // gauge refresh) on EVERY exit, including early returns and panics.
     // A submit-path run consumed a local queue slot (Queued→Running); a cluster
     // claim-path run never did (#228) — only bump in_flight for it.
-    if from_queue {
-        state.registry().mark_running();
-    } else {
-        state.registry().mark_running_unqueued();
-    }
-    let _guard = InFlightGuard {
-        state: state.clone(),
-        run_id: run_id.clone(),
+    let _guard = match claimed {
+        Some(g) => g,
+        None => {
+            state.registry().mark_running();
+            InFlightGuard {
+                state: state.clone(),
+                run_id: run_id.clone(),
+            }
+        }
     };
     let started = Utc::now();
     if let Ok(Some(mut rec)) = state.history().get(&run_id).await {
@@ -1902,6 +2001,7 @@ async fn execute_run(
         _ = &mut timeout_fut => Trigger::Timeout(timeout_secs.unwrap_or(0)),
     };
 
+    let shutting_down = matches!(trigger, Trigger::Shutdown);
     let terminal = match trigger {
         Trigger::Done(t) => t,
         triggered => {
@@ -1911,9 +2011,9 @@ async fn execute_run(
             // genuinely stuck mid-write) so a hung run can't wedge shutdown.
             coop.cancel();
             let trigger_terminal = match triggered {
-                Trigger::Cancel => Terminal::Cancelled,
-                Trigger::Shutdown => Terminal::ShutdownFailed,
-                Trigger::Timeout(secs) => Terminal::Timeout { secs },
+                Trigger::Cancel => Terminal::cancelled(),
+                Trigger::Shutdown => Terminal::shutdown_failed(),
+                Trigger::Timeout(secs) => Terminal::timeout(secs),
                 Trigger::Done(_) => unreachable!("matched in the outer arm"),
             };
             // A cooperative cancel makes `run_stream` flush and return Ok(partial),
@@ -1921,19 +2021,49 @@ async fn execute_run(
             // correct status for that path. But if the flush itself FAILS within
             // the grace window, surface that real failure — never mask it behind
             // the trigger label, which would hide a data error / partial write.
-            match tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await {
-                Ok(failed @ Terminal::Failed { .. }) => failed,
-                Ok(_) | Err(_) => trigger_terminal,
-            }
+            trigger_terminal
+                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
     };
 
+    // A clustered instance shutting down hands an unfinished run back to the
+    // cluster rather than failing it (#789 SERVE-25): a peer claims it and
+    // resumes from its bookmark (at-least-once, as any failover is).
+    if shutting_down
+        && state.cluster().enabled()
+        && matches!(terminal, Terminal::ShutdownFailed { .. })
+        && release_for_peer(&state, &run_id).await
+    {
+        state.log_hub().finish(&run_id);
+        schedule_log_drop(state.clone(), run_id.clone());
+        return;
+    }
     finalize(&state, &run_id, started, terminal).await;
     // Signal `/logs` readers the run is done, then drop the buffer after a
     // drain window so a late fetcher can still replay it (spec §12).
     state.log_hub().finish(&run_id);
     schedule_log_drop(state.clone(), run_id.clone());
     // `_guard` drops here → mark_finished + gauge refresh.
+}
+
+/// Requeue a run this instance owns as `pending` for a peer. `false` when it
+/// could not be released (the caller then fails it as before).
+async fn release_for_peer(state: &ServerState, run_id: &str) -> bool {
+    let rec = match state.history().get(run_id).await {
+        Ok(Some(r)) => r,
+        _ => return false,
+    };
+    match state.history().release_owned(&rec).await {
+        Ok(true) => {
+            tracing::info!(%run_id, "shutdown: run handed back to the cluster as pending");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::warn!(%run_id, error = %e, "shutdown: could not requeue the run");
+            false
+        }
+    }
 }
 
 /// Write the authoritative terminal record + the run-finished metric.
@@ -2124,8 +2254,54 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_runs_keep_what_they_wrote() {
+        let inv: InvocationRecord = serde_json::from_value(serde_json::json!({
+            "row_id": "r", "parent_record_key": null, "records_written": 7, "error": null
+        }))
+        .unwrap();
+        let done = || Terminal::Completed {
+            records: 7,
+            invs: vec![inv.clone()],
+        };
+        for (t, status) in [
+            (Terminal::cancelled(), RunStatus::Cancelled),
+            (Terminal::shutdown_failed(), RunStatus::Failed),
+            (Terminal::timeout(3), RunStatus::Failed),
+        ] {
+            let (s, _, records, invs, _) = t.after_interrupt(Some(done())).into_parts();
+            assert_eq!((s, records, invs.len()), (status, 7, 1));
+        }
+        let (_, _, records, _, _) = Terminal::cancelled().after_interrupt(None).into_parts();
+        assert_eq!(records, 0, "a run that never answered keeps nothing");
+        let failed = Terminal::Failed {
+            reason: "flush".into(),
+            records: 1,
+            invs: Vec::new(),
+        };
+        let (s, reason, ..) = Terminal::cancelled()
+            .after_interrupt(Some(failed))
+            .into_parts();
+        assert_eq!((s, reason), (RunStatus::Failed, "error"));
+        let (_, _, records, ..) = done().with_partial(1, Vec::new()).into_parts();
+        assert_eq!(records, 7, "only interrupted variants take partial counts");
+    }
+
+    #[tokio::test]
+    async fn a_draining_server_refuses_submissions() {
+        let state = crate::serve::test_support::test_state();
+        assert!(!state.is_draining());
+        state.set_draining();
+        let req: SubmitRequest =
+            serde_json::from_value(serde_json::json!({ "config": "version: 1\n" })).unwrap();
+        let err = submit(state, req, AuthContext::system("t"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Draining), "{err:?}");
+    }
+
+    #[test]
     fn timeout_maps_to_failed_with_timeout_reason() {
-        let (status, reason, _, _, error) = Terminal::Timeout { secs: 30 }.into_parts();
+        let (status, reason, _, _, error) = Terminal::timeout(30).into_parts();
         assert_eq!(status, RunStatus::Failed);
         assert_eq!(reason, "timeout");
         assert!(error.unwrap().contains("30s"));

@@ -1715,3 +1715,24 @@ async fn failing_an_orphan_spares_a_run_whose_lease_was_renewed() {
         RunStatus::Running
     );
 }
+
+/// #789 SERVE-25: a run its owner gives up on at shutdown goes back to
+/// `pending` with no owner, so a peer can claim it.
+#[tokio::test]
+async fn release_owned_requeues_only_the_owners_running_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = store_with(&dir, "release.db", Duration::from_secs(3600), "a").await;
+    let b = store_with(&dir, "release.db", Duration::from_secs(3600), "b").await;
+    let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+    rec.status = RunStatus::Running;
+    rec.started_at = Some(Utc::now());
+    a.upsert(&rec).await.unwrap();
+    assert!(!b.release_owned(&rec).await.unwrap(), "not b's run");
+    assert!(a.release_owned(&rec).await.unwrap());
+    let back = a.get("r").await.unwrap().unwrap();
+    assert_eq!(back.status, RunStatus::Pending);
+    assert!(back.started_at.is_none());
+    assert!(!a.release_owned(&rec).await.unwrap(), "already released");
+    let claimed = b.claim_pending(5).await.unwrap();
+    assert_eq!(claimed.len(), 1, "a peer claims it");
+}

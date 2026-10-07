@@ -181,6 +181,11 @@ pub async fn claim_loop(state: ServerState, shutdown: CancellationToken) {
         if free == 0 {
             continue;
         }
+        // Take the slots before claiming, so a kick that arrives while
+        // just-claimed runs are still loading cannot claim past capacity.
+        let Ok(mut slots) = state.semaphore().try_acquire_many_owned(free as u32) else {
+            continue;
+        };
         let mut claimed_count = 0usize;
         match state.history().claim_pending(free).await {
             Ok(claimed) => {
@@ -188,12 +193,20 @@ pub async fn claim_loop(state: ServerState, shutdown: CancellationToken) {
                     crate::serve::metrics::record_runs_claimed(claimed.len());
                     claimed_count = claimed.len();
                     for rec in claimed {
-                        crate::serve::runner::resume_claimed_run(state.clone(), rec);
+                        match slots.split(1) {
+                            Some(slot) => crate::serve::runner::resume_claimed_run_with_permit(
+                                state.clone(),
+                                rec,
+                                slot,
+                            ),
+                            None => crate::serve::runner::resume_claimed_run(state.clone(), rec),
+                        }
                     }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "cluster: claim_pending failed"),
         }
+        drop(slots);
 
         // 3. Mode B (#230): claim source shards with the remaining budget and
         //    dispatch each to a per-shard executor. A claimed shard flips to
