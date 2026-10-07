@@ -308,6 +308,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_permanent_failure_is_an_auth_error_with_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden-body"))
+            .mount(&server)
+            .await;
+        let p = TokenEndpointProvider::from_config(&serde_json::json!({
+            "url": server.uri(), "token_path": "$.t",
+        }))
+        .unwrap();
+        let err = p.credential().await.unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP 403") && err.contains("forbidden-body"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn extracts_token_via_jsonpath_and_single_flights() {
         let server = MockServer::start().await;
         let hits = Arc::new(AtomicUsize::new(0));

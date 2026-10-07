@@ -87,6 +87,23 @@ impl TlsClientConfig {
 mod tests {
     use super::TlsClientConfig;
 
+    #[test]
+    fn debug_never_prints_key_material() {
+        let cfg = TlsClientConfig {
+            client_cert: Some("CERT".into()),
+            client_key: Some("PRIVATE-KEY-PEM".into()),
+            client_identity_pkcs12: None,
+            pkcs12_password: Some("p12-pass".into()),
+            min_version: None,
+        };
+        let text = format!("{cfg:?}");
+        assert!(
+            !text.contains("PRIVATE-KEY-PEM") && !text.contains("p12-pass"),
+            "{text}"
+        );
+        assert!(text.contains("CERT") && text.contains("***"), "{text}");
+    }
+
     fn pem() -> TlsClientConfig {
         TlsClientConfig {
             client_cert: Some("cert".into()),

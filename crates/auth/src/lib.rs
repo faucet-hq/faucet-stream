@@ -275,6 +275,21 @@ mod tests {
             .is_err()
         );
         assert!(super::reject_unknown_keys("flow", &serde_json::json!({ "anything": 1 })).is_ok());
+        assert!(super::reject_unknown_keys("oauth1", &serde_json::json!({ "nonce": 1 })).is_err());
+        assert!(
+            super::reject_unknown_keys(
+                "google_service_account",
+                &serde_json::json!({ "scope": 1 })
+            )
+            .is_err()
+        );
+        assert!(
+            super::reject_unknown_keys(
+                "oauth2_refresh",
+                &serde_json::json!({ "persist": { "path": "p", "key": "k" } })
+            )
+            .is_ok()
+        );
     }
 
     #[test]

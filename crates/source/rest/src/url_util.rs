@@ -133,6 +133,7 @@ mod tests {
         assert!(err.contains("downgrade"), "{err}");
         assert!(credentials_allowed("http://h/x", "http://h/y", &none).unwrap());
         assert!(!credentials_allowed("http://h/x", "https://other/y", &none).unwrap());
+        assert!(!credentials_allowed("http://h/x", "data:text/plain,hi", &none).unwrap());
     }
 
     fn r(base: &str, link: &str) -> String {

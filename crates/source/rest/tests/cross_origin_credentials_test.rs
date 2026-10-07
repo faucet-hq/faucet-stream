@@ -167,3 +167,28 @@ async fn an_async_job_result_on_another_origin_is_fetched_without_credentials() 
     let fetched = &storage.received_requests().await.unwrap()[0];
     assert!(fetched.headers.get("authorization").is_none());
 }
+
+#[tokio::test]
+async fn an_https_base_never_follows_an_http_job_url() {
+    let plain = MockServer::start().await;
+    let async_job: AsyncJobConfig = serde_json::from_value(json!({
+        "submit": { "method": "POST", "url": format!("{}/jobs", plain.uri()) },
+        "job_id": "$.id",
+        "poll": { "url": "/jobs/${job_id}", "interval_secs": 0, "timeout_secs": 30 },
+        "status": { "path": "$.status", "success": ["ok"], "failure": ["failed"] },
+        "fetch": { "url": "/jobs/${job_id}/result" }
+    }))
+    .unwrap();
+    let mut cfg = RestStreamConfig::new("https://api.example.invalid", "").auth(Auth::Bearer {
+        token: "tok-123".into(),
+    });
+    cfg.async_job = Some(async_job);
+    let err = RestStream::new(cfg)
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("downgrade"), "{err}");
+    assert!(plain.received_requests().await.unwrap().is_empty());
+}
