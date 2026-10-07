@@ -25,7 +25,7 @@ transform-spell-symbols = []
 transform-keys-case = []
 # SHA-256 / BLAKE3 field pseudonymization (#403). Pulls the hashing + encoding
 # deps only when enabled.
-transform-hash = ["dep:sha2", "dep:blake3", "dep:base64"]
+transform-hash = ["dep:blake3", "dep:base64"]
 # Parse a stringified-JSON field into a real nested value (#404). Dependency-free.
 transform-json-parse = []
 # Fill a missing/null field with a default or first-non-null fallback (#405).
@@ -101,14 +101,14 @@ contract = ["dep:regex"]
 # issue #206): classify sensitive fields (name pattern / value detector /
 # explicit list) and redact/hash/tokenize/partial-mask them per page, before
 # every sink. `hmac`+`sha2` back the keyed hashing/tokenization actions.
-masking = ["dep:regex", "dep:sha2", "dep:hmac"]
+masking = ["dep:regex", "dep:hmac"]
 # Data-flow policies (#702): classification-driven residency / destination
 # rules. Reuses the masking value detectors, so it implies `masking`.
 policy = ["masking"]
 # Encryption at rest (#207): AES-256-GCM sealing for FileStateStore bookmark
 # files and per-line JSONL/DLQ output. `sha2` derives the 32-byte key from the
 # configured key string.
-encryption = ["dep:aes-gcm", "dep:sha2"]
+encryption = ["dep:aes-gcm"]
 # Opt-in Apache Arrow columnar record path (RFC 0002 / #375). Adds the
 # escape-hatch trait methods (`Source::stream_batches` /
 # `Sink::write_batch_columnar`), the `ColumnarPage` type, and the
@@ -175,7 +175,7 @@ flate2 = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 chrono = { workspace = true }
 jsonschema = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
 # BLAKE3 + base64 back the `hash` transform (feature `transform-hash`, #403).
 blake3 = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
