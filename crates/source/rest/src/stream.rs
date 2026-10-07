@@ -442,6 +442,28 @@ fn sql_literal(v: &Value) -> String {
     }
 }
 
+/// Fill `{key}` placeholders in a URL path with percent-encoded values, so a
+/// parent value containing `/`, `?` or `#` stays inside its segment (API-58).
+/// A value that is exactly `.` or `..` is refused: URL parsing would resolve it
+/// as a dot-segment even encoded.
+fn substitute_path(template: &str, ctx: &HashMap<String, Value>) -> Result<String, FaucetError> {
+    let mut encoded = HashMap::with_capacity(ctx.len());
+    for (k, v) in ctx {
+        let raw = match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if template.contains(&format!("{{{k}}}")) && (raw == "." || raw == "..") {
+            return Err(FaucetError::Source(format!(
+                "rest: path placeholder `{{{k}}}` resolved to `{raw}`, which would change the \
+                 request path"
+            )));
+        }
+        encoded.insert(k.clone(), Value::String(urlencoding::encode(&raw).into_owned()));
+    }
+    Ok(faucet_core::util::substitute_context(template, &encoded))
+}
+
 /// A timestamp with a colon-less UTC offset (`2026-08-28T12:00:00.000+0000`,
 /// the shape many record payloads carry) rendered as RFC 3339, so a bookmark a
 /// sync-routed run persisted is emitted as a datetime literal (API-57).
@@ -2444,7 +2466,7 @@ impl RestStream {
             Some(u) => u.to_string(),
             None => {
                 let path = match path_context {
-                    Some(ctx) => faucet_core::util::substitute_context(&self.config.path, ctx),
+                    Some(ctx) => substitute_path(&self.config.path, ctx)?,
                     None => self.config.path.clone(),
                 };
                 format!("{}/{}", base_url, path.trim_start_matches('/'))
@@ -3853,6 +3875,23 @@ impl RestStream {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn path_placeholders_are_percent_encoded() {
+        let ctx: HashMap<String, Value> = [
+            ("id".to_string(), json!("a/b?c#d e")),
+            ("n".to_string(), json!(7)),
+            ("dot".to_string(), json!("..")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            substitute_path("/items/{id}/n/{n}", &ctx).unwrap(),
+            "/items/a%2Fb%3Fc%23d%20e/n/7"
+        );
+        let err = substitute_path("/items/{dot}", &ctx).unwrap_err();
+        assert!(err.to_string().contains("`{dot}`"), "{err}");
+    }
 
     #[test]
     fn records_path_resolution_tells_absent_from_empty() {

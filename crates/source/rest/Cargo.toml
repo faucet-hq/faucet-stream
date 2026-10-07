@@ -50,6 +50,7 @@ excel = ["dep:calamine"]
 arrow = ["faucet-core/arrow", "dep:arrow"]
 
 [dependencies]
+urlencoding = { workspace = true }
 arrow = { workspace = true, optional = true }
 faucet-core.workspace = true
 # `stream` for `Response::bytes_stream()` — the native byte-passthrough path (#633)

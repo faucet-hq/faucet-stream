@@ -78,7 +78,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `base_url` | string | `""` | Base URL of the API (trailing slash trimmed). |
-| `path` | string | `""` | URL path relative to `base_url`. Supports `{key}` placeholders for partition substitution (e.g. `/orgs/{org_id}/users`). |
+| `path` | string | `""` | URL path relative to `base_url`. Supports `{key}` placeholders for partition substitution (e.g. `/orgs/{org_id}/users`). Substituted values are percent-encoded, so `/`, `?` or `#` in a value stays inside its segment; a value of exactly `.` or `..` is refused. |
 | `method` | string | `GET` | HTTP method for the request. |
 | `auth` | `Auth` / `{ ref }` | `none` | Inline `{ type, config }` auth, or a `{ ref: <name> }` pointer to a shared provider. See [Authentication](#authentication). |
 | `headers` | map<string,string> | empty | Static HTTP headers sent on **every** request (data pages, async-job requests, and OData `$metadata` probes). Applied *before* auth, so an auth header of the same name wins on a clash. Values honor `${env:}` / `${param.*}` interpolation and pass through the secrets/redaction boundary. An invalid header name/value is rejected at config load. See [Custom request headers](#custom-request-headers). |

@@ -158,3 +158,20 @@ async fn fetch_all_with_more_requests_than_permits_completes() {
     assert_eq!(records.len(), 6);
     assert!(peak.load(Ordering::SeqCst) <= 2);
 }
+
+/// API-58: a parent value with `/` used to rewrite the request path.
+#[tokio::test]
+async fn path_placeholders_are_percent_encoded_on_the_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path("/p/a%2Fb%3F"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{ "id": 1 }])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut cfg = RestStreamConfig::new(&server.uri(), "/p/{n}");
+    cfg.pagination = PaginationStyle::None;
+    cfg.partitions = vec![HashMap::from([("n".to_string(), json!("a/b?"))])];
+    let records = RestStream::new(cfg).unwrap().fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+}
