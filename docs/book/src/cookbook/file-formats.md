@@ -401,7 +401,9 @@ later becomes a new column and earlier rows get an empty cell;
 `csv: { on_unknown_field: warn | error }` fixes the header from the first page
 instead (drop the field with a warning, or fail). `json_lines: { pretty: true }`
 pretty-prints each record. Two matrix rows writing the same path, or a fan-out
-row without a per-invocation token in its path, are refused at load time. The
+row without a per-invocation token in its path, are refused at load time — for
+the `file` sink and for `jsonl` / `csv` / `parquet` writing one fixed file
+(root rows included). The
 `jsonl`, `csv` and `parquet` sinks stay for existing configs, and the file sink
 matches them option for option — see the
 [crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/sink/file)
@@ -441,6 +443,12 @@ past one that is not there. Without `path` each object gets a fresh name,
 replace. The
 format × option matrix that pins the local sink runs against MinIO,
 fake-gcs-server, Azurite and an SFTP server too.
+
+With a `path` (`file_name` on SFTP) the names are fixed, so the same load-time
+rule as the local file sink applies: two rows may not write the same bucket /
+container / host + `prefix` + `path`, and a fan-out row needs a per-invocation
+token (`${parent.id}`) in the prefix or path — otherwise concurrent writers
+overwrite each other's parts and the last to finish prunes the rest.
 
 ### Run it locally
 

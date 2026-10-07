@@ -836,8 +836,9 @@ impl SinkTemplate {
             .collect()
     }
 
-    /// Whether every invocation of this sink replaces its output (#752) — the
-    /// base config with the per-stream keys laid over it. A child stream runs
+    /// Whether every invocation of this sink replaces its output (#752), or
+    /// writes a fixed set of remote names (#789 FILE-05) — the base config
+    /// with the per-stream keys laid over it. A child stream runs
     /// once per parent record, so on such a sink it keeps only the last
     /// parent's rows.
     pub fn truncates_per_invocation(&self) -> bool {
@@ -848,6 +849,10 @@ impl SinkTemplate {
             }
         }
         crate::registry::sink_truncating_path(&self.sink.kind, &cfg).is_some()
+            || matches!(
+                self.sink.kind.as_str(),
+                "s3" | "gcs" | "azure-blob" | "sftp"
+            ) && crate::registry::sink_shared_destination(&self.sink.kind, &cfg).is_some()
     }
 }
 

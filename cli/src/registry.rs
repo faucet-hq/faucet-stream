@@ -1107,6 +1107,50 @@ pub fn sink_truncating_path<'a>(kind: &str, cfg: &'a Value) -> Option<&'a str> {
     }
 }
 
+/// Where a sink on the shared file writer puts a fixed set of file names, as
+/// one comparable string (`file:<path>`, `s3://bucket/key`, `gs://…`,
+/// `az://account/container/key`, `sftp://host:port/dir/name`). Two writers
+/// with the same destination overwrite each other's files and prune the parts
+/// the other wrote, so rows must not share one, and a row that runs once per
+/// parent record needs a per-invocation token in it. `None` when the sink
+/// names every file uniquely per run (a remote sink without `path` /
+/// `file_name`), or for any other kind.
+pub fn sink_shared_destination(kind: &str, cfg: &Value) -> Option<String> {
+    let text = |k: &str| cfg.get(k).and_then(Value::as_str);
+    let prefix = || text("prefix").unwrap_or("");
+    match kind {
+        "file" => text("path").map(|p| format!("file:{p}")),
+        "jsonl" | "csv" | "parquet" => sink_truncating_path(kind, cfg).map(|p| format!("file:{p}")),
+        "s3" => Some(format!(
+            "s3://{}/{}{}",
+            text("bucket")?,
+            prefix(),
+            text("path")?
+        )),
+        "gcs" => Some(format!(
+            "gs://{}/{}{}",
+            text("bucket")?,
+            prefix(),
+            text("path")?
+        )),
+        "azure-blob" => Some(format!(
+            "az://{}/{}/{}{}",
+            text("account").unwrap_or(""),
+            text("container")?,
+            prefix(),
+            text("path")?
+        )),
+        "sftp" => Some(format!(
+            "sftp://{}:{}/{}/{}",
+            text("host")?,
+            cfg.get("port").and_then(Value::as_u64).unwrap_or(22),
+            text("path")?.trim_end_matches('/'),
+            text("file_name")?
+        )),
+        _ => None,
+    }
+}
+
 /// Sinks that support a **scoped/windowed** overwrite (#518) — replacing only
 /// the rows matching a `scope` (a date window) instead of the whole table. A
 /// subset of [`OVERWRITE_SINK_KINDS`]; the others still support full overwrite.
@@ -3835,6 +3879,57 @@ mod tests {
 mod truncating_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shared_destination_by_kind() {
+        let d = |k: &str, v: Value| sink_shared_destination(k, &v);
+        assert_eq!(
+            d("file", json!({"path": "o/a.jsonl"})).as_deref(),
+            Some("file:o/a.jsonl")
+        );
+        assert_eq!(
+            d("jsonl", json!({"path": "o/a.jsonl"})).as_deref(),
+            Some("file:o/a.jsonl")
+        );
+        assert_eq!(
+            d("jsonl", json!({"path": "o/a.jsonl", "append": true})),
+            None
+        );
+        assert_eq!(
+            d(
+                "s3",
+                json!({"bucket": "b", "prefix": "p/", "path": "x-{part}.csv"})
+            )
+            .as_deref(),
+            Some("s3://b/p/x-{part}.csv")
+        );
+        assert_eq!(d("s3", json!({"bucket": "b", "prefix": "p/"})), None);
+        assert_eq!(
+            d("gcs", json!({"bucket": "b", "path": "x.csv"})).as_deref(),
+            Some("gs://b/x.csv")
+        );
+        assert_eq!(
+            d(
+                "azure-blob",
+                json!({"account": "a", "container": "c", "path": "x.csv"})
+            )
+            .as_deref(),
+            Some("az://a/c/x.csv")
+        );
+        assert_eq!(
+            d(
+                "sftp",
+                json!({"host": "h", "path": "/d/", "file_name": "x.csv"})
+            )
+            .as_deref(),
+            Some("sftp://h:22//d/x.csv")
+        );
+        assert_eq!(
+            d("sftp", json!({"host": "h", "port": 2222, "path": "/d"})),
+            None
+        );
+        assert_eq!(d("postgres", json!({"table": "t"})), None);
+    }
 
     #[test]
     fn truncating_path_by_kind() {

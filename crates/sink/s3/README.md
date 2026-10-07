@@ -163,6 +163,9 @@ pipeline:
       region: us-east-1
 ```
 
+
+> **Shared destinations are refused at load.** With `path` set, the CLI refuses two matrix rows writing the same destination and a fan-out row without a per-invocation token (`${parent.id}`) in it: concurrent writers would overwrite each other's parts and prune the rest.
+
 ## Streaming & batching
 
 Records accumulate across `write_batch` calls into one open object, built in a local scratch file. An object closes at the per-object cap — `max_records_per_file`, else `batch_size` (the smaller when both are set) — at `max_bytes_per_file`, or at `flush`, which the pipeline calls at every bookmark-carrying page and at the end of the run.

@@ -188,6 +188,9 @@ sink:
     parquet: { compression: zstd, row_group_size: 131072 }
 ```
 
+
+> **Shared destinations are refused at load.** With `path` set, the CLI refuses two matrix rows writing the same destination and a fan-out row without a per-invocation token (`${parent.id}`) in it: concurrent writers would overwrite each other's parts and prune the rest.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **atomic** without a rollover cap —
