@@ -245,9 +245,7 @@ pub(crate) fn parse_expiry_ratio(config: &Value) -> Result<f64, FaucetError> {
 mod tests {
     #[test]
     fn unknown_provider_config_keys_are_refused() {
-        let spec = |kind: &str, config: serde_json::Value| {
-            serde_json::json!({ "type": kind, "config": config })
-        };
+        let spec = |kind: &str, config: serde_json::Value| serde_json::json!({ "type": kind, "config": config });
         let err = super::build_provider(&spec(
             "token_endpoint",
             serde_json::json!({ "url": "http://x", "token_path": "$.t", "expiry_pth": "$.e" }),
@@ -266,10 +264,15 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(err.contains("`persist.dir`"), "{err}");
-        assert!(super::build_provider(&spec("static", serde_json::json!({ "token": "t" }))).is_ok());
         assert!(
-            super::build_provider(&spec("static", serde_json::json!({ "token": "t", "headers": {} })))
-                .is_err()
+            super::build_provider(&spec("static", serde_json::json!({ "token": "t" }))).is_ok()
+        );
+        assert!(
+            super::build_provider(&spec(
+                "static",
+                serde_json::json!({ "token": "t", "headers": {} })
+            ))
+            .is_err()
         );
         assert!(super::reject_unknown_keys("flow", &serde_json::json!({ "anything": 1 })).is_ok());
     }

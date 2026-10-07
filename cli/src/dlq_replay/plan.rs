@@ -172,9 +172,11 @@ pub fn build_replay_node(
         .and_then(|n| n.dlq.clone());
     let mut node = select_replay_node(nodes, row)?;
 
-    let sealing = decryptor
-        .sealing_value()
-        .or_else(|| original_dlq.as_ref().and_then(|o| o.sink.config.get("encryption").cloned()));
+    let sealing = decryptor.sealing_value().or_else(|| {
+        original_dlq
+            .as_ref()
+            .and_then(|o| o.sink.config.get("encryption").cloned())
+    });
     let reader = DlqReaderSource::new(from_files, reason, decryptor);
     node.source_override = Some(SourceOverride::new(Box::new(reader)));
 

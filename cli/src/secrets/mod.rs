@@ -651,9 +651,15 @@ lineage:
         let mut cfg = PipelineConfig::from_text(cfg_yaml, std::path::Path::new("p.yaml")).unwrap();
         assert_eq!(scan_config(&cfg).len(), 2);
         resolve_secrets_with(&mut cfg, &set).await.unwrap();
-        assert_eq!(cfg.pipeline.masking.as_ref().unwrap().key.as_deref(), Some("RESOLVED"));
+        assert_eq!(
+            cfg.pipeline.masking.as_ref().unwrap().key.as_deref(),
+            Some("RESOLVED")
+        );
         let lineage = serde_json::to_string(&cfg.lineage).unwrap();
-        assert!(lineage.contains("RESOLVED") && !lineage.contains("vault"), "{lineage}");
+        assert!(
+            lineage.contains("RESOLVED") && !lineage.contains("vault"),
+            "{lineage}"
+        );
 
         let stray = r#"
 version: 1
@@ -666,7 +672,10 @@ matrix:
     tags: ["${vault:secret/data/x#y}"]
 "#;
         let mut cfg = PipelineConfig::from_text(stray, std::path::Path::new("p.yaml")).unwrap();
-        let err = resolve_secrets_with(&mut cfg, &set).await.unwrap_err().to_string();
+        let err = resolve_secrets_with(&mut cfg, &set)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not resolved in"), "{err}");
         let err = resolve_secrets(&mut cfg).await.unwrap_err().to_string();
         assert!(err.contains("not resolved in"), "{err}");

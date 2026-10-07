@@ -23,7 +23,10 @@ fn dlq_keys(keys: &[String], files: &[std::path::PathBuf]) -> CliResult<Vec<Stri
     let mut out = keys.to_vec();
     for path in files {
         let text = std::fs::read_to_string(path).map_err(|e| {
-            CliError::Config(format!("reading --encryption-key-file {}: {e}", path.display()))
+            CliError::Config(format!(
+                "reading --encryption-key-file {}: {e}",
+                path.display()
+            ))
         })?;
         out.push(text.trim_end().to_string());
     }

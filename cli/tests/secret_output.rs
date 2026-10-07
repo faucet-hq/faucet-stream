@@ -1,11 +1,7 @@
 //! Commands never print secret material: `--help` hides secret-bearing env
 //! values (CLI-153) and `template run --dry-run --json` masks values bound
 //! from the environment (CLI-40).
-#![cfg(all(
-    feature = "templates",
-    feature = "source-csv",
-    feature = "sink-jsonl"
-))]
+#![cfg(all(feature = "templates", feature = "source-csv", feature = "sink-jsonl"))]
 
 use assert_cmd::Command;
 
@@ -63,11 +59,23 @@ fn template_dry_run_json_masks_values_bound_from_the_environment() {
         .success();
     let out = faucet()
         .env("FAUCET_TEST_SINK_PATH", "/tmp/sink-secret-path-77.jsonl")
-        .args(["template", "run", "tpl", "--dry-run", "--json", "--store", &store])
+        .args([
+            "template",
+            "run",
+            "tpl",
+            "--dry-run",
+            "--json",
+            "--store",
+            &store,
+        ])
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{text} {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(text.contains("\"pipeline\""), "{text}");
     assert!(!text.contains("sink-secret-path-77"), "{text}");
 }

@@ -1248,7 +1248,11 @@ pub struct DlqInspectArgs {
     /// Repeat the flag to also try older (rotated) keys. Requires a build
     /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
     /// `--encryption-key-file`: an argv value is visible in `ps` and history.
-    #[arg(long = "encryption-key", env = "FAUCET_DLQ_ENCRYPTION_KEY", hide_env_values = true)]
+    #[arg(
+        long = "encryption-key",
+        env = "FAUCET_DLQ_ENCRYPTION_KEY",
+        hide_env_values = true
+    )]
     pub encryption_key: Vec<String>,
     /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
     /// after any `--encryption-key`.
@@ -1286,7 +1290,11 @@ pub struct DlqReplayArgs {
     /// Repeat the flag to also try older (rotated) keys. Requires a build
     /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
     /// `--encryption-key-file`: an argv value is visible in `ps` and history.
-    #[arg(long = "encryption-key", env = "FAUCET_DLQ_ENCRYPTION_KEY", hide_env_values = true)]
+    #[arg(
+        long = "encryption-key",
+        env = "FAUCET_DLQ_ENCRYPTION_KEY",
+        hide_env_values = true
+    )]
     pub encryption_key: Vec<String>,
     /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
     /// after any `--encryption-key`.
@@ -1645,7 +1653,11 @@ pub struct DlqDiscardArgs {
     /// Repeat the flag to also try older (rotated) keys. Requires a build
     /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
     /// `--encryption-key-file`: an argv value is visible in `ps` and history.
-    #[arg(long = "encryption-key", env = "FAUCET_DLQ_ENCRYPTION_KEY", hide_env_values = true)]
+    #[arg(
+        long = "encryption-key",
+        env = "FAUCET_DLQ_ENCRYPTION_KEY",
+        hide_env_values = true
+    )]
     pub encryption_key: Vec<String>,
     /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
     /// after any `--encryption-key`.
@@ -1819,7 +1831,12 @@ pub struct ServeArgs {
     #[arg(long, env = "FAUCET_SERVE_LISTEN", default_value = "127.0.0.1:8080")]
     pub listen: String,
     /// Bearer token required on /v1/* requests. Prefer the env var (avoids `ps` leakage).
-    #[arg(long, env = "FAUCET_SERVE_AUTH_TOKEN", hide_env_values = true, conflicts_with = "no_auth")]
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_AUTH_TOKEN",
+        hide_env_values = true,
+        conflicts_with = "no_auth"
+    )]
     pub auth_token: Option<String>,
     /// Explicitly disable authentication. Required if no token is set, so an
     /// unauthenticated server is never accidental.

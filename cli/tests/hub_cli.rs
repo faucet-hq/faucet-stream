@@ -782,8 +782,14 @@ async fn a_community_template_may_not_read_operator_env_unless_trusted() {
     let refused = args(&[]);
     let refused: Vec<&str> = refused.iter().map(String::as_str).collect();
     let err = run(&refused).await.unwrap_err().to_string();
-    assert!(err.contains("${env:HOME}") && err.contains("--trust mallory"), "{err}");
-    for trust in [&["--trust", "mallory"][..], &["--trust", "mallory/leaky"][..]] {
+    assert!(
+        err.contains("${env:HOME}") && err.contains("--trust mallory"),
+        "{err}"
+    );
+    for trust in [
+        &["--trust", "mallory"][..],
+        &["--trust", "mallory/leaky"][..],
+    ] {
         let ok = args(trust);
         let ok: Vec<&str> = ok.iter().map(String::as_str).collect();
         run(&ok).await.expect("trusted template validates");

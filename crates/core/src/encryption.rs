@@ -190,7 +190,13 @@ impl CompiledEncryption {
         let nonce = GcmNonce::generate();
         let ciphertext = self
             .write
-            .encrypt(&nonce, Payload { msg: plaintext, aad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             // AES-GCM encryption only fails on plaintexts beyond 2^36 bytes;
             // faucet payloads (bookmarks, JSON lines) are nowhere near it.
             .expect("AES-GCM encryption of an in-memory payload cannot fail");
@@ -291,8 +297,14 @@ mod tests {
         let enc = CompiledEncryption::compile(&spec("k1")).unwrap();
         let sealed = enc.encrypt_bound(b"bookmark", b"pipeline::a");
         assert_eq!(sealed[MAGIC.len()], FORMAT_AES256GCM_BOUND);
-        assert_eq!(enc.decrypt_bound(&sealed, b"pipeline::a").unwrap(), b"bookmark");
-        let err = enc.decrypt_bound(&sealed, b"pipeline::b").unwrap_err().to_string();
+        assert_eq!(
+            enc.decrypt_bound(&sealed, b"pipeline::a").unwrap(),
+            b"bookmark"
+        );
+        let err = enc
+            .decrypt_bound(&sealed, b"pipeline::b")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("another"), "{err}");
         let err = enc.decrypt(&sealed).unwrap_err().to_string();
         assert!(err.contains("bound to its identity"), "{err}");

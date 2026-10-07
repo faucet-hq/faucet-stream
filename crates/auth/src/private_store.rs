@@ -24,8 +24,10 @@ impl PrivateFileStore {
     }
 
     fn entry_path(&self, key: &str) -> PathBuf {
-        self.root
-            .join(format!("{}.json", key.replace(':', "%3A").replace('/', "%2F")))
+        self.root.join(format!(
+            "{}.json",
+            key.replace(':', "%3A").replace('/', "%2F")
+        ))
     }
 
     async fn ensure_root(&self) -> Result<(), FaucetError> {
@@ -137,7 +139,10 @@ mod tests {
         let store = PrivateFileStore::new(blocker.join("sub"));
         let err = store.put("k", &serde_json::json!(1)).await.unwrap_err();
         assert!(err.to_string().contains("cannot create"), "{err}");
-        let err = store.put("bad key", &serde_json::json!(1)).await.unwrap_err();
+        let err = store
+            .put("bad key", &serde_json::json!(1))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("key"), "{err}");
 
         let ro = dir.path().join("ro");

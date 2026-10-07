@@ -48,7 +48,10 @@ fn preview_masks_records_of_a_matrix_config() {
     );
     assert!(stdout.contains("\"id\""), "{stdout}");
     assert!(!stdout.contains("ada@example.com"), "{stdout}");
-    assert!(!stdout.contains("Ada"), "every rule applies, applies_to aside: {stdout}");
+    assert!(
+        !stdout.contains("Ada"),
+        "every rule applies, applies_to aside: {stdout}"
+    );
 }
 
 #[test]

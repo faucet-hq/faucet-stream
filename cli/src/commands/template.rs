@@ -687,10 +687,7 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     if args.dry_run && args.common.json {
         // Secret-manager directives stay unresolved, and any value bound from
         // the environment or a secret param is masked.
-        println!(
-            "{}",
-            crate::secrets::registry::redact(&to_pretty(&cfg)?)
-        );
+        println!("{}", crate::secrets::registry::redact(&to_pretty(&cfg)?));
         return Ok(());
     }
     crate::secrets::resolve_secrets(&mut cfg).await?;

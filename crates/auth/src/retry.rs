@@ -83,8 +83,8 @@ pub(crate) async fn send_token_request(
                 attempt,
                 "token endpoint transient failure; retrying after backoff"
             );
-            let delay =
-                wait.unwrap_or_else(|| faucet_core::retry::backoff_with_jitter(RETRY_BASE, attempt));
+            let delay = wait
+                .unwrap_or_else(|| faucet_core::retry::backoff_with_jitter(RETRY_BASE, attempt));
             tokio::time::sleep(delay).await;
             continue;
         }

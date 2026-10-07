@@ -150,7 +150,9 @@ pub async fn start_server() -> ServerHandle {
 /// / `127.0.0.1`, signed by `ca.pem`).
 #[allow(dead_code)]
 pub fn tls_fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/tls")
+        .join(name)
 }
 
 /// [`start_server`] serving TLS with the fixture identity; the endpoint is
@@ -162,7 +164,10 @@ pub async fn start_tls_server() -> ServerHandle {
         std::fs::read(tls_fixture("server.pem")).unwrap(),
         std::fs::read(tls_fixture("server.key")).unwrap(),
     );
-    start(Some(tonic::transport::ServerTlsConfig::new().identity(identity))).await
+    start(Some(
+        tonic::transport::ServerTlsConfig::new().identity(identity),
+    ))
+    .await
 }
 
 async fn start(tls: Option<tonic::transport::ServerTlsConfig>) -> ServerHandle {

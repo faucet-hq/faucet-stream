@@ -285,7 +285,10 @@ async fn replay_seals_the_refailed_rows_like_the_source_dlq() {
         .unwrap();
         let raw = std::fs::read_to_string(&failed).unwrap();
         assert!(!raw.trim().is_empty(), "the id-less row fails again");
-        assert!(!raw.contains("987-65-4321"), "re-failed row written in clear");
+        assert!(
+            !raw.contains("987-65-4321"),
+            "re-failed row written in clear"
+        );
         let dec = DlqDecryptor::from_keys(&[KEY.to_string()]).unwrap();
         let seen = dlq_replay::inspect(failed.to_str().unwrap(), None, 5, &dec).unwrap();
         assert_eq!(seen.total_envelopes, 1);
@@ -303,19 +306,32 @@ async fn inspect_takes_the_key_from_the_environment_or_a_file() {
     let key_file = dir.path().join("dlq.key");
     std::fs::write(&key_file, format!("{KEY}\n")).unwrap();
     let count = |out: std::process::Output| -> u64 {
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
         v["total_envelopes"].as_u64().unwrap()
     };
     let faucet = || {
         let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_faucet"));
-        c.env_remove("FAUCET_DLQ_ENCRYPTION_KEY")
-            .args(["dlq", "inspect", dlq.to_str().unwrap(), "--json"]);
+        c.env_remove("FAUCET_DLQ_ENCRYPTION_KEY").args([
+            "dlq",
+            "inspect",
+            dlq.to_str().unwrap(),
+            "--json",
+        ]);
         c
     };
     assert_eq!(count(faucet().output().unwrap()), 0);
     assert_eq!(
-        count(faucet().env("FAUCET_DLQ_ENCRYPTION_KEY", KEY).output().unwrap()),
+        count(
+            faucet()
+                .env("FAUCET_DLQ_ENCRYPTION_KEY", KEY)
+                .output()
+                .unwrap()
+        ),
         1
     );
     assert_eq!(

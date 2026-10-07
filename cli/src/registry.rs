@@ -3107,14 +3107,20 @@ mod tests {
         let msg = "invalid type: integer `48213907`, expected a string at line 1 column 3";
         let scrubbed = scrub_config_error(msg);
         assert!(!scrubbed.contains("48213907"), "{scrubbed}");
-        assert!(scrubbed.contains("expected a string at line 1"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("expected a string at line 1"),
+            "{scrubbed}"
+        );
         let msg = "unknown variant `hunter2`, expected one of `bearer`, `basic`";
         let scrubbed = scrub_config_error(msg);
         assert!(!scrubbed.contains("hunter2"), "{scrubbed}");
         assert!(scrubbed.contains("`bearer`"), "{scrubbed}");
         let msg = "unknown field `tokn`, expected `token`";
         assert_eq!(scrub_config_error(msg), msg);
-        assert_eq!(scrub_config_error("missing field `url`"), "missing field `url`");
+        assert_eq!(
+            scrub_config_error("missing field `url`"),
+            "missing field `url`"
+        );
         assert!(scrub_config_error("unterminated `abc").contains("<redacted>"));
     }
 

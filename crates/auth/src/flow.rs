@@ -1227,7 +1227,10 @@ mod tests {
             "apply": [ { "into": "header", "name": "X", "value": "${sid}" } ]
         });
         let p = FlowProvider::from_config(&cfg).unwrap();
-        let ra = p.request_auth("GET", "http://x", &Default::default()).await.unwrap();
+        let ra = p
+            .request_auth("GET", "http://x", &Default::default())
+            .await
+            .unwrap();
         let sent = Credential::Token(ra.captured[FLOW_SESSION_KEY].clone());
         assert_eq!(ra.captured[FLOW_SESSION_KEY], "1");
         // Two workers saw a 401 on session 1: one re-login between them.
@@ -1235,11 +1238,16 @@ mod tests {
         p.invalidate(&sent).await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         // A 401 on the live session (or an unknown credential) re-logs again.
-        let ra = p.request_auth("GET", "http://x", &Default::default()).await.unwrap();
+        let ra = p
+            .request_auth("GET", "http://x", &Default::default())
+            .await
+            .unwrap();
         assert_eq!(ra.captured[FLOW_SESSION_KEY], "2");
         p.invalidate(&Credential::Token("2".into())).await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 3);
-        p.invalidate(&Credential::Bearer("whatever".into())).await.unwrap();
+        p.invalidate(&Credential::Bearer("whatever".into()))
+            .await
+            .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 

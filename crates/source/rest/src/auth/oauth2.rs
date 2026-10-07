@@ -161,7 +161,11 @@ async fn fetch_oauth2_token_inner_with_client(
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
             if !last && is_transient_token_status(status, &body) {
-                tracing::warn!(status, attempt, "OAuth2 token endpoint transient failure; retrying");
+                tracing::warn!(
+                    status,
+                    attempt,
+                    "OAuth2 token endpoint transient failure; retrying"
+                );
                 token_backoff(attempt).await;
                 continue;
             }
@@ -253,7 +257,10 @@ mod tests {
         let unreachable = fetch_oauth2_token("http://127.0.0.1:1/token", "id", "s", &[])
             .await
             .unwrap_err();
-        assert!(matches!(unreachable, FaucetError::Http(_)), "{unreachable:?}");
+        assert!(
+            matches!(unreachable, FaucetError::Http(_)),
+            "{unreachable:?}"
+        );
     }
 
     #[tokio::test]

@@ -410,8 +410,16 @@ fn utf8_env(
 
 /// Words that mark a `FAUCET_*` variable as holding a credential.
 const SECRET_NAME_PARTS: &[&str] = &[
-    "PASSWORD", "PASSWD", "SECRET", "TOKEN", "KEY", "CREDENTIAL", "AUTH", "PRIVATE",
-    "CONNECTION_STRING", "DSN",
+    "PASSWORD",
+    "PASSWD",
+    "SECRET",
+    "TOKEN",
+    "KEY",
+    "CREDENTIAL",
+    "AUTH",
+    "PRIVATE",
+    "CONNECTION_STRING",
+    "DSN",
 ];
 
 fn register_secret_values(env: &HashMap<String, String>) {
@@ -445,7 +453,9 @@ mod tests {
         .unwrap();
         assert_eq!(env.get("FAUCET_SOURCE").map(String::as_str), Some("csv"));
         assert!(!env.contains_key("OTHER"));
-        let err = utf8_env([("FAUCET_SINK".into(), bad())]).unwrap_err().to_string();
+        let err = utf8_env([("FAUCET_SINK".into(), bad())])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("FAUCET_SINK"), "{err}");
     }
 
@@ -456,7 +466,10 @@ mod tests {
             ("FAUCET_SOURCE_PG_PASSWORD", "pg-pass-4417"),
             ("FAUCET_SOURCE_PG_TABLE", "orders-table-4417"),
             ("FAUCET_SINK_PG_DATABASE_URL", "postgres://u:p@db-4417/x"),
-            ("FAUCET_SOURCE_REST_BASE_URL", "https://api-4417.example.com"),
+            (
+                "FAUCET_SOURCE_REST_BASE_URL",
+                "https://api-4417.example.com",
+            ),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -465,7 +478,10 @@ mod tests {
         let out = crate::secrets::registry::redact(
             "pg-pass-4417 orders-table-4417 postgres://u:p@db-4417/x https://api-4417.example.com",
         );
-        assert_eq!(out, "*** orders-table-4417 *** https://api-4417.example.com");
+        assert_eq!(
+            out,
+            "*** orders-table-4417 *** https://api-4417.example.com"
+        );
     }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {

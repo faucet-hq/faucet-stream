@@ -120,7 +120,10 @@ mod tests {
         assert!(!credentials_allowed(base, "https://cdn.example.net/x", &none).unwrap());
         assert!(!credentials_allowed(base, "https://api.example.com:8443/x", &none).unwrap());
         assert!(!credentials_allowed(base, "not a url", &none).unwrap());
-        let trusted = ["files.example.net".to_string(), "*.blob.example.org".to_string()];
+        let trusted = [
+            "files.example.net".to_string(),
+            "*.blob.example.org".to_string(),
+        ];
         assert!(credentials_allowed(base, "https://files.example.net/x", &trusted).unwrap());
         assert!(credentials_allowed(base, "https://a.blob.example.org/x", &trusted).unwrap());
         assert!(!credentials_allowed(base, "https://blob.example.org/x", &trusted).unwrap());

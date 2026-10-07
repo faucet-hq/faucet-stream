@@ -84,7 +84,13 @@ async fn an_api_key_query_param_stays_on_the_base_origin() {
     );
     assert_eq!(drain(&RestStream::new(cfg).unwrap()).await.len(), 2);
     let first = &api.received_requests().await.unwrap()[0];
-    assert!(first.url.query().unwrap_or_default().contains("api_key=k-999"));
+    assert!(
+        first
+            .url
+            .query()
+            .unwrap_or_default()
+            .contains("api_key=k-999")
+    );
     let foreign = &other.received_requests().await.unwrap()[0];
     assert_eq!(foreign.url.query(), Some("k=v"));
 }
@@ -101,7 +107,10 @@ async fn a_trusted_host_receives_the_credentials() {
     .trusted_host("127.0.0.1");
     assert_eq!(drain(&RestStream::new(cfg).unwrap()).await.len(), 2);
     let foreign = &other.received_requests().await.unwrap()[0];
-    assert_eq!(foreign.headers.get("authorization").unwrap(), "Bearer tok-123");
+    assert_eq!(
+        foreign.headers.get("authorization").unwrap(),
+        "Bearer tok-123"
+    );
 }
 
 #[tokio::test]

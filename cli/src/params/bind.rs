@@ -943,10 +943,17 @@ mod tests {
             "x ***"
         );
         let spec = spec_of("region: { secret: true, values: [eu, us] }\n");
-        let err = resolve(&spec, &supplied(&[("region", json!("apac-s3cr3t"))]), BindMode::Strict)
-            .unwrap_err()
-            .to_string();
-        assert!(!err.contains("s3cr3t") && err.contains("the supplied value"), "{err}");
+        let err = resolve(
+            &spec,
+            &supplied(&[("region", json!("apac-s3cr3t"))]),
+            BindMode::Strict,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !err.contains("s3cr3t") && err.contains("the supplied value"),
+            "{err}"
+        );
     }
 
     #[test]

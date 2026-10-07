@@ -1059,7 +1059,9 @@ pipeline:
         let (_d, path) = write_cfg(
             "version: 1\nparams: { base: { required: true } }\npipeline:\n  source: { type: rest, config: { base_url: \"${param.base}\", auth: { type: bearer, config: { token: \"${vault:secret/x#t}\" } } } }\n  sink: { type: jsonl, config: { path: o } }\n",
         );
-        super::run(offline_args(path.clone())).await.expect("offline lint ok");
+        super::run(offline_args(path.clone()))
+            .await
+            .expect("offline lint ok");
         let mut args = offline_args(path);
         args.param = vec!["base=https://api".into()];
         args.param_env = vec!["X=1".into()];

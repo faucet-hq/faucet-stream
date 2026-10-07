@@ -301,10 +301,9 @@ impl OAuth2RefreshProvider {
         if let Some(scope) = &self.scope {
             form.push(("scope", scope));
         }
-        let reply = crate::retry::send_token_request(|| {
-            Ok(self.http.post(&self.token_url).form(&form))
-        })
-        .await?;
+        let reply =
+            crate::retry::send_token_request(|| Ok(self.http.post(&self.token_url).form(&form)))
+                .await?;
         let body = parse_token_response(reply)?;
         state.access_token = Some(body.access_token.clone());
         state.expires_at = expiry_instant(body.expires_in, self.expiry_ratio);
@@ -749,7 +748,10 @@ mod tests {
             "token_url": server.uri(), "client_id": "id", "client_secret": "s",
         }))
         .unwrap();
-        assert_eq!(p.credential().await.unwrap(), Credential::Bearer("A1".into()));
+        assert_eq!(
+            p.credential().await.unwrap(),
+            Credential::Bearer("A1".into())
+        );
     }
 
     #[tokio::test]

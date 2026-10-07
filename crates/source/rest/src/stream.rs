@@ -2401,11 +2401,9 @@ impl RestStream {
         // never hand them to a third-party host (#789 API-17).
         let send_credentials = match url_override {
             None => true,
-            Some(_) => crate::url_util::credentials_allowed(
-                &base_url,
-                &url,
-                &self.config.trusted_hosts,
-            )?,
+            Some(_) => {
+                crate::url_util::credentials_allowed(&base_url, &url, &self.config.trusted_hosts)?
+            }
         };
         if !send_credentials {
             ra_headers.clear();
