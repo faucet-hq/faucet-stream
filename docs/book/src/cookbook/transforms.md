@@ -786,10 +786,23 @@ For each change event it:
   dropping it would leave the mirror silently out of date;
 - stamps every emitted row with a `marker_field` (`__op`) set to the normalized
   value **`"d"`** (delete) or **`"u"`** (upsert) — *not* the raw op code. A
-  downstream sink's `delete_marker` should therefore match `"d"`.
+  downstream sink's `delete_marker` should therefore match `"d"`;
+- with `key` set (the sink's upsert `key`), turns an update that **changed the
+  key** — `before` and `after` disagree on a key column — into a delete of the
+  old key followed by the upsert of the new row. Without it a mirror keeps the
+  row under its old key forever:
 
-It is a 1→0|1 stage (every input row becomes zero or one output row) and runs in
-declaration order like any other transform.
+  ```yaml
+  transforms:
+    - type: cdc_unwrap
+      key: [id]
+  ```
+
+  postgres-cdc carries the old key on such an update under the default
+  `REPLICA IDENTITY`; mysql-cdc carries it with `include_columns: true`.
+
+It is a 1→0|1|2 stage (an input row becomes zero or one output row, two for a
+key-changing update) and runs in declaration order like any other transform.
 
 ### Config fields and defaults
 
@@ -803,6 +816,7 @@ declaration order like any other transform.
 | `delete_ops` | `["d", "delete"]` | `op` values that mean delete |
 | `drop_ops` | `["ddl", "truncate"]` | `op` values dropped entirely |
 | `on_missing_image` | `fail` | `fail` or `drop` an event with no usable row image |
+| `key` | `[]` | Key columns; an update whose `before` key differs from its `after` key also deletes the old key |
 
 The defaults span all three CDC vocabularies seen in the wild — `insert` /
 `update` / `delete` / `truncate`, `c` / `u` / `d` / `ddl`, and `c` / `u` / `r` /

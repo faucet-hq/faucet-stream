@@ -44,9 +44,11 @@ pipeline:
 
   # Normalize the postgres-cdc envelope ({op, before, after}) into a flat row
   # plus a `__op` marker. Inserts/updates emit the post-image; deletes emit the
-  # key from the pre-image. DDL/truncate events are dropped.
+  # key from the pre-image. DDL/truncate events are dropped. `key` matches the
+  # sink's: an update that changes `id` also deletes the row under the old id.
   transforms:
     - type: cdc_unwrap
+      key: [id]
 
   sink:
     type: postgres
