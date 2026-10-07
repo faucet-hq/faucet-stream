@@ -551,7 +551,12 @@ repository's catalog test runs it plus a full composition of every pairing:
 
 - credentials are `${param.NAME}` (`secret: true`) or `${env:…}` /
   `${secret:…}` — never a literal value; a param whose name looks like a
-  credential must be marked `secret`, and a secret param has no default;
+  credential must be marked `secret`, and a secret param has no default. The
+  check covers every block of the template (named `sources:`, per-stream
+  overrides, headers), any key spelling (`api_token`, `apiToken`,
+  `X-Api-Key`, `Authorization`), numbers as well as strings, a value written
+  as `Bearer …` / `Basic …` / `Token …`, and a password embedded in a URL
+  (`postgres://user:pw@host`);
 - no private infrastructure or placeholder text (`.internal`, managed-DB
   hostnames, `REPLACE_ME`);
 - a `description`; `name` equal to the file stem; unique stream names; every

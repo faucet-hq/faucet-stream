@@ -262,7 +262,54 @@ const SECRET_KEYS: &[&str] = &[
     "token_secret",
     "json",
     "credentials",
+    "authorization",
+    "cookie",
 ];
+
+/// A key as the secret check compares it: `apiToken` / `X-Api-Key` /
+/// `api_token` all become snake case.
+fn normalize_key(k: &str) -> String {
+    let mut out = String::with_capacity(k.len() + 4);
+    let mut prev_lower = false;
+    for c in k.chars() {
+        if c.is_ascii_uppercase() {
+            if prev_lower {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+            prev_lower = false;
+        } else if c == '-' || c == ' ' {
+            out.push('_');
+            prev_lower = false;
+        } else {
+            out.push(c);
+            prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        }
+    }
+    out
+}
+
+fn is_secret_key(k: &str) -> bool {
+    let lk = normalize_key(k);
+    SECRET_KEYS
+        .iter()
+        .any(|s| lk == *s || lk.ends_with(&format!("_{s}")))
+}
+
+/// A credential written straight into an HTTP header value.
+fn auth_scheme_literal(s: &str) -> bool {
+    ["bearer ", "basic ", "token "].iter().any(|p| {
+        s.get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+            && s.get(p.len()..).is_some_and(|rest| is_literal(rest.trim()))
+    })
+}
+
+/// A value that carries a credential as written, not through a reference
+/// (`${param.x}`, possibly inside a longer value like `Bearer ${param.x}`).
+fn is_literal(s: &str) -> bool {
+    !looks_like_reference(s) && !s.contains("${")
+}
 
 /// A value that is not a credential even though it sits under a secret-ish
 /// key: empty, a `${…}` reference, a JSONPath capture (`$.access_token` in a
@@ -286,13 +333,14 @@ fn walk_secrets(path: &str, v: &Value, findings: &mut Vec<String>) {
                 } else {
                     format!("{path}.{k}")
                 };
-                let lk = k.to_ascii_lowercase();
-                if SECRET_KEYS
-                    .iter()
-                    .any(|s| lk == *s || lk.ends_with(&format!("_{s}")))
-                    && let Value::String(val) = x
-                    && !looks_like_reference(val)
-                {
+                let literal = match x {
+                    Value::String(val) => {
+                        (is_secret_key(k) && is_literal(val)) || auth_scheme_literal(val)
+                    }
+                    Value::Number(_) => is_secret_key(k),
+                    _ => false,
+                };
+                if literal {
                     findings.push(format!(
                         "`{child}` holds a literal value — take credentials as a `secret: true` param (`${{param.NAME}}`); `${{env:}}` / `${{secret:}}` only run for faucet-hq or `--trust`ed templates"
                     ));
@@ -363,13 +411,29 @@ pub fn lint_source(t: &SourceTemplate) -> Vec<String> {
         f.push("missing `description`".into());
     }
     let v = serde_json::to_value(t).unwrap_or(Value::Null);
-    walk_secrets("source", &v["source"], &mut f);
-    walk_secrets("auth", &v["auth"], &mut f);
-    walk_markers("source", &v["source"], &mut f);
-    walk_markers("auth", &v["auth"], &mut f);
-    walk_markers("streams", &v["streams"], &mut f);
+    walk_template(
+        &v,
+        &["source", "sources", "auth", "streams", "transforms"],
+        &mut f,
+    );
     lint_params(&t.params, &mut f);
     f
+}
+
+/// The secret, URL-password and private-marker checks over every block of a
+/// serialized template except its `params:` (linted on their own).
+fn walk_template(v: &Value, marker_keys: &[&str], f: &mut Vec<String>) {
+    let Value::Object(o) = v else { return };
+    for (k, x) in o {
+        if k == "params" || k == "description" {
+            continue;
+        }
+        walk_secrets(k, x, f);
+        walk_url_passwords(k, x, f);
+        if marker_keys.contains(&k.as_str()) {
+            walk_markers(k, x, f);
+        }
+    }
 }
 
 pub fn lint_sink(t: &SinkTemplate) -> Vec<String> {
@@ -383,11 +447,7 @@ pub fn lint_sink(t: &SinkTemplate) -> Vec<String> {
         f.push("missing `description`".into());
     }
     let v = serde_json::to_value(t).unwrap_or(Value::Null);
-    walk_secrets("sink", &v["sink"], &mut f);
-    walk_secrets("auth", &v["auth"], &mut f);
-    walk_markers("sink", &v["sink"], &mut f);
-    walk_markers("auth", &v["auth"], &mut f);
-    walk_markers("per_stream", &v["per_stream"], &mut f);
+    walk_template(&v, &["sink", "auth", "per_stream"], &mut f);
     lint_params(&t.params, &mut f);
     f
 }
@@ -449,10 +509,7 @@ fn walk_url_passwords(path: &str, v: &Value, findings: &mut Vec<String>) {
 
 fn lint_params(params: &crate::params::ParamsSpec, f: &mut Vec<String>) {
     for (name, p) in params {
-        let ln = name.to_ascii_lowercase();
-        let secret_ish = SECRET_KEYS
-            .iter()
-            .any(|s| ln == *s || ln.ends_with(&format!("_{s}")));
+        let secret_ish = is_secret_key(name);
         if secret_ish && !p.secret {
             f.push(format!(
                 "param `{name}` looks like a credential but is not `secret: true`"
@@ -1209,6 +1266,64 @@ per_stream:
         );
         s.source.config["auth"]["config"]["password"] = json!("x");
         assert!(lint_source(&s).is_empty(), "{:?}", lint_source(&s));
+    }
+
+    /// Credentials in named sources, stream overrides, header-style and
+    /// camelCase keys, `Bearer` values, numbers and URL passwords are all
+    /// caught (#789 CLI-66).
+    #[test]
+    fn lint_walks_every_block_and_every_key_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(dir.path());
+        let cat = Catalog::load(dir.path()).unwrap();
+        let base = cat.source("acme").unwrap().clone();
+        let cases: Vec<(&str, Box<dyn Fn(&mut SourceTemplate)>)> = vec![
+            (
+                "apiToken",
+                Box::new(|s| s.source.config["apiToken"] = json!("sk-live-123")),
+            ),
+            (
+                "X-Api-Key",
+                Box::new(|s| s.source.config["headers"] = json!({"X-Api-Key": "k-123456"})),
+            ),
+            (
+                "Authorization",
+                Box::new(|s| {
+                    s.source.config["headers"] = json!({"Authorization": "Bearer abcdef123"})
+                }),
+            ),
+            (
+                "custom",
+                Box::new(|s| s.source.config["headers"] = json!({"custom": "Basic dXNlcjpwYXNz"})),
+            ),
+            (
+                "pin",
+                Box::new(|s| s.source.config["auth"]["config"]["password"] = json!(123456)),
+            ),
+            (
+                "url",
+                Box::new(|s| s.source.config["base_url"] = json!("postgres://u:hunter2@db/x")),
+            ),
+        ];
+        for (what, mutate) in cases {
+            let mut s = base.clone();
+            mutate(&mut s);
+            assert!(!lint_source(&s).is_empty(), "{what} was not caught");
+        }
+        let mut s = base.clone();
+        s.source.config["headers"] = json!({"Authorization": "Bearer ${param.api_token}"});
+        assert!(lint_source(&s).is_empty(), "{:?}", lint_source(&s));
+        let mut v = serde_json::to_value(&base).unwrap();
+        v["sources"] = json!({"other": {"type": "rest", "config": {"token": "sk-live-999"}}});
+        let f = {
+            let mut f = Vec::new();
+            walk_template(&v, &[], &mut f);
+            f.join("\n")
+        };
+        assert!(f.contains("`sources.other.config.token`"), "{f}");
+        assert_eq!(normalize_key("apiToken"), "api_token");
+        assert_eq!(normalize_key("X-Api-Key"), "x_api_key");
+        assert!(!auth_scheme_literal("bearé"));
     }
 
     #[test]
