@@ -755,13 +755,17 @@ mod tests {
         let h = HeaderMap::new();
         let rule = m(json!({"status": [429], "max_wait_secs": 60}));
         assert_eq!(
-            rule.wait(&h, "", Some(Duration::from_secs(30)), Duration::ZERO, 0).unwrap(),
+            rule.wait(&h, "", Some(Duration::from_secs(30)), Duration::ZERO, 0)
+                .unwrap(),
             Duration::from_secs(30)
         );
         let err = rule
             .wait(&h, "", Some(Duration::from_secs(86_400)), Duration::ZERO, 0)
             .unwrap_err();
-        assert!(err.to_string().contains("more than `max_wait_secs` (60s)"), "{err}");
+        assert!(
+            err.to_string().contains("more than `max_wait_secs` (60s)"),
+            "{err}"
+        );
         let fixed = m(json!({"status": [429], "backoff_secs": 7200}));
         assert!(fixed.wait(&h, "", None, Duration::ZERO, 0).is_err());
     }
@@ -774,9 +778,18 @@ mod tests {
             "backoff_from": {"type": "body", "config": {"path": "$.wait", "unit": "minutes"}}
         }));
         let err = rule
-            .wait(&HeaderMap::new(), r#"{"wait": 1e300}"#, None, Duration::ZERO, 0)
+            .wait(
+                &HeaderMap::new(),
+                r#"{"wait": 1e300}"#,
+                None,
+                Duration::ZERO,
+                0,
+            )
             .unwrap_err();
-        assert!(err.to_string().contains("more than `max_wait_secs`"), "{err}");
+        assert!(
+            err.to_string().contains("more than `max_wait_secs`"),
+            "{err}"
+        );
         assert_eq!(relative(f64::INFINITY, 1.0), Some(Duration::MAX));
         assert_eq!(relative(f64::NAN, 1.0), None);
         assert_eq!(relative(-1.0, 1.0), None);

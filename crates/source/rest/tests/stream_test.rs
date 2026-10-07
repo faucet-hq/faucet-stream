@@ -904,7 +904,11 @@ async fn a_200_error_body_mid_pagination_fails_instead_of_ending_green() {
                 page_size_param: None,
             })
     };
-    let err = RestStream::new(config()).unwrap().fetch_all().await.unwrap_err();
+    let err = RestStream::new(config())
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("matched nothing"), "{err}");
     assert!(err.to_string().contains("busy"), "{err}");
     let mut lenient = config();

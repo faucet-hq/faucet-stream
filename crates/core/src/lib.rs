@@ -181,9 +181,9 @@ pub use replication::{
 };
 pub use resilience::{
     BackoffFrom, BackoffKind, CircuitBreaker, CircuitBreakerConfig, DEFAULT_MAX_WAIT_SECS,
-    PoisonAction, PoisonPolicy,
-    ResiliencePolicy, RetryClass, RetryClassSet, RetryMatcher, RetryMetrics, RetryPolicy, WaitUnit,
-    classify, execute_with_policy, execute_with_policy_metered, execute_with_policy_recorded,
+    PoisonAction, PoisonPolicy, ResiliencePolicy, RetryClass, RetryClassSet, RetryMatcher,
+    RetryMetrics, RetryPolicy, WaitUnit, classify, execute_with_policy,
+    execute_with_policy_metered, execute_with_policy_recorded,
 };
 pub use retry::execute_with_retry;
 pub use rollback::{

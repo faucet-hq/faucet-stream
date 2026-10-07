@@ -1094,7 +1094,8 @@ mod tests {
         let body = json!({"data": {"users": {"pageInfo": {"hasNextPage": true}}}});
         let (step, _) = decide_next_page(&body, &pageinfo_pagination(), None);
         assert!(matches!(step, PageStep::Inconsistent(m) if m.contains("no string or number")));
-        let body = json!({"data": {"users": {"pageInfo": {"hasNextPage": true, "endCursor": {"x": 1}}}}});
+        let body =
+            json!({"data": {"users": {"pageInfo": {"hasNextPage": true, "endCursor": {"x": 1}}}}});
         let (step, _) = decide_next_page(&body, &pageinfo_pagination(), None);
         assert!(matches!(step, PageStep::Inconsistent(_)));
         let body = json!({"data": {"users": {"pageInfo": {"hasNextPage": true, "endCursor": 42}}}});

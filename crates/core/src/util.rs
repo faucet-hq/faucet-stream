@@ -629,7 +629,9 @@ mod tests {
         let future = (chrono::Utc::now() + chrono::Duration::seconds(120)).to_rfc2822();
         h.insert(reqwest::header::RETRY_AFTER, future.parse().unwrap());
         let w = retry_after(&h).unwrap();
-        assert!(w > std::time::Duration::from_secs(100) && w <= std::time::Duration::from_secs(120));
+        assert!(
+            w > std::time::Duration::from_secs(100) && w <= std::time::Duration::from_secs(120)
+        );
         h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
         assert_eq!(retry_after(&h), None);
     }
@@ -642,7 +644,10 @@ mod tests {
             FaucetError::RateLimited(d) if d.as_secs() == 5
         ));
         let e = rate_limited(std::time::Duration::from_secs(86_400), max);
-        assert!(matches!(&e, FaucetError::Source(m) if m.contains("86400s")), "{e:?}");
+        assert!(
+            matches!(&e, FaucetError::Source(m) if m.contains("86400s")),
+            "{e:?}"
+        );
         assert!(!e.is_retriable());
     }
 

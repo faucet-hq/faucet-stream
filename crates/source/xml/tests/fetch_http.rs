@@ -243,7 +243,11 @@ async fn page_number_pagination_continues_past_a_short_page_until_empty() {
         .mount(&server)
         .await;
     let records = XmlStream::new(config).fetch_all().await.unwrap();
-    assert_eq!(records.len(), 4, "3 full + 1 short page, then the empty page stops");
+    assert_eq!(
+        records.len(),
+        4,
+        "3 full + 1 short page, then the empty page stops"
+    );
 }
 
 #[tokio::test]

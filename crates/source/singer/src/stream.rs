@@ -303,8 +303,14 @@ mod tests {
                 { "tap_stream_id": "public-orders", "stream": "orders" }
             ]
         });
-        assert_eq!(stream_alias(&catalog, "orders").as_deref(), Some("public-orders"));
-        assert_eq!(stream_alias(&catalog, "public-orders").as_deref(), Some("orders"));
+        assert_eq!(
+            stream_alias(&catalog, "orders").as_deref(),
+            Some("public-orders")
+        );
+        assert_eq!(
+            stream_alias(&catalog, "public-orders").as_deref(),
+            Some("orders")
+        );
         assert_eq!(stream_alias(&catalog, "users"), None);
         assert_eq!(stream_alias(&json!({}), "users"), None);
     }

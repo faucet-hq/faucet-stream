@@ -537,8 +537,7 @@ impl XmlStream {
         context: &HashMap<String, serde_json::Value>,
         next: Option<(&str, &str)>,
     ) -> Result<String, FaucetError> {
-        match self.execute_request_once(params, context, next).await
-        {
+        match self.execute_request_once(params, context, next).await {
             Err(e)
                 if self
                     .auth_provider
@@ -730,8 +729,7 @@ impl XmlStream {
                 .body(render_xml_body(next_body, context, &captured, Some(token)));
         } else if let Some(soap) = &self.config.soap {
             let inner = soap.body_inner.as_deref().unwrap_or("");
-            let envelope =
-                soap.build_envelope(&render_xml_body(inner, context, &captured, None));
+            let envelope = soap.build_envelope(&render_xml_body(inner, context, &captured, None));
             req = req
                 .header("Content-Type", soap.content_type())
                 .body(envelope);
@@ -812,7 +810,11 @@ impl faucet_core::Source for XmlStream {
         _batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         let batch_size = self.config.batch_size;
-        let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
+        let chunk = if batch_size == 0 {
+            usize::MAX
+        } else {
+            batch_size
+        };
 
         Box::pin(async_stream::try_stream! {
             use futures::StreamExt;

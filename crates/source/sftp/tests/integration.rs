@@ -32,7 +32,9 @@ const PASS: &str = "secret";
 /// Files are baked in with `with_copy_to`: the image creates the directory
 /// itself, and copying avoids needing a working *upload* path to test the
 /// *download* one.
-async fn start_sftp_inner(files: &[(String, String)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
+async fn start_sftp_inner(
+    files: &[(String, String)],
+) -> Option<(ContainerAsync<GenericImage>, u16)> {
     let mut image = GenericImage::new("atmoz/sftp", "alpine")
         .with_exposed_port(22.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server listening on"))

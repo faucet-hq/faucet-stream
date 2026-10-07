@@ -610,7 +610,10 @@ async fn a_target_that_stops_reading_fails_the_write_after_flush_timeout() {
         .await
         .expect("must not stall")
         .unwrap_err();
-    assert!(err.to_string().contains("stopped reading its input"), "{err}");
+    assert!(
+        err.to_string().contains("stopped reading its input"),
+        "{err}"
+    );
     assert!(started.elapsed() < Duration::from_secs(15));
 }
 

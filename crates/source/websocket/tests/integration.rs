@@ -564,7 +564,9 @@ async fn a_rejected_handshake_refreshes_the_shared_token() {
 }
 
 /// A server that completes the upgrade, then closes with `code`.
-async fn spawn_accept_then_close(code: u16) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+async fn spawn_accept_then_close(
+    code: u16,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -614,7 +616,11 @@ async fn a_rejecting_close_code_is_fatal() {
     let mut cfg = base_config(&url);
     cfg.reconnect = true;
     cfg.idle_timeout = Some(Duration::from_secs(30));
-    let err = WebsocketSource::new(cfg).unwrap().fetch_all().await.unwrap_err();
+    let err = WebsocketSource::new(cfg)
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("4001"), "{err}");
     assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

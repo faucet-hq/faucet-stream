@@ -220,11 +220,25 @@ mod tests {
             Data::DateTime(calamine::ExcelDateTime::new(serial, kind, is_1904))
         };
         use calamine::ExcelDateTimeType::{DateTime, TimeDelta};
-        assert_eq!(cell_to_value(&date(44_000.0, DateTime, false)), "2020-06-18");
-        assert_eq!(cell_to_value(&date(44_000.5, DateTime, false)), "2020-06-18T12:00:00");
+        assert_eq!(
+            cell_to_value(&date(44_000.0, DateTime, false)),
+            "2020-06-18"
+        );
+        assert_eq!(
+            cell_to_value(&date(44_000.5, DateTime, false)),
+            "2020-06-18T12:00:00"
+        );
         assert_eq!(cell_to_value(&date(0.0, DateTime, true)), "1904-01-01");
-        assert_eq!(cell_to_string(&date(44_000.0, DateTime, false)), "2020-06-18");
-        assert!(cell_to_value(&date(1.5, TimeDelta, false)).as_str().unwrap().starts_with("P"));
+        assert_eq!(
+            cell_to_string(&date(44_000.0, DateTime, false)),
+            "2020-06-18"
+        );
+        assert!(
+            cell_to_value(&date(1.5, TimeDelta, false))
+                .as_str()
+                .unwrap()
+                .starts_with("P")
+        );
         assert_eq!(cell_to_value(&date(1e12, DateTime, false)), "1000000000000");
         assert!(cell_to_value(&Data::DateTimeIso("2020".into())).is_string());
         assert!(cell_to_value(&Data::DurationIso("PT1H".into())).is_string());

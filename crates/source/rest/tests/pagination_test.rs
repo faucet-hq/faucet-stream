@@ -261,7 +261,11 @@ fn offset_continues_on_distinct_pages_without_total_path() {
             .unwrap()
     );
     assert_eq!(state.offset, 5);
-    assert!(!style.advance(&json!([]), &no_headers(), &mut state, 0).unwrap());
+    assert!(
+        !style
+            .advance(&json!([]), &no_headers(), &mut state, 0)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -477,5 +481,9 @@ fn offset_rows_path_advances_by_server_rows_not_child_records() {
     let body = json!({"orders": [{"lines": [1, 2]}, {"lines": [3]}]});
     assert!(style.advance(&body, &no_headers(), &mut state, 3).unwrap());
     assert_eq!(state.offset, 2);
-    assert!(!style.advance(&json!({"orders": []}), &no_headers(), &mut state, 0).unwrap());
+    assert!(
+        !style
+            .advance(&json!({"orders": []}), &no_headers(), &mut state, 0)
+            .unwrap()
+    );
 }

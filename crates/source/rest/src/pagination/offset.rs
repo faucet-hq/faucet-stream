@@ -94,7 +94,16 @@ mod tests {
         assert!(advance(&json!({}), &mut offset, 10, 100, None).unwrap());
         assert_eq!(offset, 10);
         let mut offset = 0usize;
-        assert!(advance(&json!({"total": "n/a"}), &mut offset, 10, 100, Some("$.total")).unwrap());
+        assert!(
+            advance(
+                &json!({"total": "n/a"}),
+                &mut offset,
+                10,
+                100,
+                Some("$.total")
+            )
+            .unwrap()
+        );
         assert!(advance(&json!({}), &mut offset, 10, 100, Some("$.total")).unwrap());
     }
 }

@@ -366,7 +366,13 @@ async fn a_soap_fault_on_http_500_is_handled_once_not_retried() {
         matches!(&err, FaucetError::Source(m) if m.contains("Account & region not found")),
         "got {err:?}"
     );
-    assert!(XmlStream::new(config(false)).fetch_all().await.unwrap().is_empty());
+    assert!(
+        XmlStream::new(config(false))
+            .fetch_all()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -380,9 +386,10 @@ async fn a_non_fault_http_500_is_still_retried() {
         .await;
     Mock::given(method("POST"))
         .and(path("/ws"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(soap_users_response(
-            "<User><Name>Ann</Name></User>",
-        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(soap_users_response("<User><Name>Ann</Name></User>")),
+        )
         .mount(&server)
         .await;
     let config = XmlStreamConfig::new(server.uri(), "/ws")

@@ -1149,7 +1149,10 @@ impl RestStreamConfig {
             rows_path: None, ..
         } = &self.pagination
         {
-            let fans_out = self.record_ancestors.as_ref().is_some_and(|a| !a.is_empty())
+            let fans_out = self
+                .record_ancestors
+                .as_ref()
+                .is_some_and(|a| !a.is_empty())
                 || self
                     .records_path
                     .as_deref()
@@ -1991,7 +1994,10 @@ mod tests {
         );
         c.partitions = two;
         let err = c.validate().unwrap_err();
-        assert!(err.to_string().contains("`async_job` and `requests:`"), "{err}");
+        assert!(
+            err.to_string().contains("`async_job` and `requests:`"),
+            "{err}"
+        );
     }
 
     #[test]

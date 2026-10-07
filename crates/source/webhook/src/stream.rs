@@ -144,7 +144,9 @@ fn server_result(
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(FaucetError::Config(format!("webhook server error: {e}"))),
-        Err(e) => Err(FaucetError::Config(format!("webhook server task failed: {e}"))),
+        Err(e) => Err(FaucetError::Config(format!(
+            "webhook server task failed: {e}"
+        ))),
     }
 }
 
@@ -183,18 +185,18 @@ fn signature_ok(
     signed.extend_from_slice(body);
     let digest: Vec<u8> = match sig.algorithm {
         SignatureAlgorithm::Sha256 => {
-            let Ok(mut mac) = <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(
-                sig.secret.as_bytes(),
-            ) else {
+            let Ok(mut mac) =
+                <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(sig.secret.as_bytes())
+            else {
                 return false;
             };
             mac.update(&signed);
             mac.finalize().into_bytes().to_vec()
         }
         SignatureAlgorithm::Sha512 => {
-            let Ok(mut mac) = <hmac::Hmac<sha2::Sha512> as KeyInit>::new_from_slice(
-                sig.secret.as_bytes(),
-            ) else {
+            let Ok(mut mac) =
+                <hmac::Hmac<sha2::Sha512> as KeyInit>::new_from_slice(sig.secret.as_bytes())
+            else {
                 return false;
             };
             mac.update(&signed);
@@ -202,7 +204,10 @@ fn signature_ok(
         }
     };
     let expected = match sig.encoding {
-        SignatureEncoding::Hex => digest.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        SignatureEncoding::Hex => digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
         SignatureEncoding::Base64 => {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(&digest)
@@ -360,7 +365,10 @@ impl faucet_core::Source for WebhookSource {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                (k.clone(), Value::String(urlencoding::encode(&raw).into_owned()))
+                (
+                    k.clone(),
+                    Value::String(urlencoding::encode(&raw).into_owned()),
+                )
             })
             .collect();
         let resolved_path = faucet_core::util::substitute_context(&self.config.path, &encoded);

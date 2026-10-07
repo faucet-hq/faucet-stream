@@ -220,7 +220,10 @@ pub fn validate_steps(steps: &[DecodeStep]) -> Result<(), FaucetError> {
 /// dot-path segments (namespace-prefix-insensitive). Used by the XML `extract`
 /// decode step to pull a blob (e.g. a base64-encoded file) out of a SOAP body —
 /// e.g. `runReportResponse.runReportReturn.reportBytes`.
-pub(crate) fn xml_extract_text(bytes: &[u8], dot_path: &str) -> Result<Option<String>, FaucetError> {
+pub(crate) fn xml_extract_text(
+    bytes: &[u8],
+    dot_path: &str,
+) -> Result<Option<String>, FaucetError> {
     let want: Vec<String> = dot_path
         .split('.')
         .filter(|s| !s.is_empty())
@@ -865,7 +868,10 @@ mod tests {
                 },
             },
         ];
-        assert_eq!(run_decode(&two_csv_zip(), &steps).await.unwrap()[0]["x"], "2");
+        assert_eq!(
+            run_decode(&two_csv_zip(), &steps).await.unwrap()[0]["x"],
+            "2"
+        );
     }
 
     #[test]
@@ -889,6 +895,11 @@ mod tests {
         assert!(err.to_string().contains("invalid `records_path`"), "{err}");
         let err = validate_steps(&steps).unwrap_err();
         assert!(matches!(err, FaucetError::Config(_)), "{err:?}");
-        assert!(validate_steps(&[DecodeStep::Parse { parse: parse_json() }]).is_ok());
+        assert!(
+            validate_steps(&[DecodeStep::Parse {
+                parse: parse_json()
+            }])
+            .is_ok()
+        );
     }
 }

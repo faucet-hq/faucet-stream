@@ -459,7 +459,10 @@ fn substitute_path(template: &str, ctx: &HashMap<String, Value>) -> Result<Strin
                  request path"
             )));
         }
-        encoded.insert(k.clone(), Value::String(urlencoding::encode(&raw).into_owned()));
+        encoded.insert(
+            k.clone(),
+            Value::String(urlencoding::encode(&raw).into_owned()),
+        );
     }
     Ok(faucet_core::util::substitute_context(template, &encoded))
 }
@@ -740,7 +743,8 @@ impl RestStream {
                 kept.push(record);
                 continue;
             }
-            let out = filter_incremental_path(vec![record], key, start, self.config.on_missing_key)?;
+            let out =
+                filter_incremental_path(vec![record], key, start, self.config.on_missing_key)?;
             missing += out.missing;
             kept.extend(out.records);
         }
@@ -3896,11 +3900,17 @@ mod tests {
     #[test]
     fn records_path_resolution_tells_absent_from_empty() {
         assert!(records_path_resolves(&json!({"items": []}), "$.items[*]"));
-        assert!(records_path_resolves(&json!({"d": {"items": {}}}), "$.d.items.*"));
+        assert!(records_path_resolves(
+            &json!({"d": {"items": {}}}),
+            "$.d.items.*"
+        ));
         assert!(records_path_resolves(&json!({"items": [1]}), "$.items[*]"));
         assert!(records_path_resolves(&json!([]), "$.items[*]"));
         assert!(records_path_resolves(&Value::Null, "$.items[*]"));
-        assert!(!records_path_resolves(&json!({"error": "busy"}), "$.items[*]"));
+        assert!(!records_path_resolves(
+            &json!({"error": "busy"}),
+            "$.items[*]"
+        ));
         assert!(!records_path_resolves(&json!({"error": "busy"}), "$.items"));
         assert!(!records_path_resolves(&json!({"e": 1}), "$.d.items.*"));
     }
@@ -3909,7 +3919,10 @@ mod tests {
     fn a_zero_poll_interval_is_clamped_to_one_second() {
         assert_eq!(poll_cap(0), Duration::from_secs(1));
         assert_eq!(poll_cap(5), Duration::from_secs(5));
-        assert_eq!(next_poll_delay(poll_cap(0), poll_cap(0)), Duration::from_secs(1));
+        assert_eq!(
+            next_poll_delay(poll_cap(0), poll_cap(0)),
+            Duration::from_secs(1)
+        );
     }
     use super::*;
     use serde_json::json;

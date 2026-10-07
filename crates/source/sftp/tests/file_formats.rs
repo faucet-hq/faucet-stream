@@ -23,7 +23,9 @@ const USER: &str = "faucet";
 const PASS: &str = "secret";
 
 /// Seed the server with `files` (name → raw bytes, so binary formats work).
-async fn start_sftp_inner(files: &[(String, Vec<u8>)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
+async fn start_sftp_inner(
+    files: &[(String, Vec<u8>)],
+) -> Option<(ContainerAsync<GenericImage>, u16)> {
     let mut image = GenericImage::new("atmoz/sftp", "alpine")
         .with_exposed_port(22.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server listening on"))

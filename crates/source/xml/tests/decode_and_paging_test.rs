@@ -208,7 +208,10 @@ async fn body_values_are_xml_escaped() {
     ]
     .into_iter()
     .collect();
-    let records = XmlStream::new(config).fetch_with_context(&ctx).await.unwrap();
+    let records = XmlStream::new(config)
+        .fetch_with_context(&ctx)
+        .await
+        .unwrap();
     assert_eq!(records.len(), 2);
 }
 

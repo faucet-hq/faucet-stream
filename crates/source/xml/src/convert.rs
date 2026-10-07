@@ -49,7 +49,10 @@ impl Frame {
             obj.insert("#text".into(), Value::String(text.to_string()));
         }
         let value = if obj.len() == 1 && obj.contains_key("#text") {
-            obj.into_iter().next().map(|(_, v)| v).unwrap_or(Value::Null)
+            obj.into_iter()
+                .next()
+                .map(|(_, v)| v)
+                .unwrap_or(Value::Null)
         } else {
             Value::Object(obj)
         };

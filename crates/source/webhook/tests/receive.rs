@@ -23,7 +23,11 @@ fn sign(secret: &str, msg: &[u8]) -> String {
         .collect()
 }
 
-async fn post_until_up(client: &reqwest::Client, url: &str, req: impl Fn() -> reqwest::RequestBuilder) -> reqwest::Response {
+async fn post_until_up(
+    client: &reqwest::Client,
+    url: &str,
+    req: impl Fn() -> reqwest::RequestBuilder,
+) -> reqwest::Response {
     for _ in 0..100 {
         if let Ok(r) = req().send().await {
             return r;
@@ -41,12 +45,15 @@ async fn signed_requests_are_verified() {
         .listen_addr(addr.clone())
         .max_payloads(1)
         .timeout_secs(10)
-        .signature(serde_json::from_value(json!({
-            "header": "X-Signature",
-            "secret": "s3cret",
-            "prefix": "sha256=",
-            "timestamp_header": "X-Timestamp"
-        })).unwrap());
+        .signature(
+            serde_json::from_value(json!({
+                "header": "X-Signature",
+                "secret": "s3cret",
+                "prefix": "sha256=",
+                "timestamp_header": "X-Timestamp"
+            }))
+            .unwrap(),
+        );
     let source = WebhookSource::new(cfg);
     let run = tokio::spawn(async move { source.fetch_all().await });
     let url = format!("http://{addr}/webhook");
@@ -61,7 +68,13 @@ async fn signed_requests_are_verified() {
     let stale = client
         .post(&url)
         .header("X-Timestamp", (now - 3600).to_string())
-        .header("X-Signature", format!("sha256={}", sign("s3cret", format!("{}.{body}", now - 3600).as_bytes())))
+        .header(
+            "X-Signature",
+            format!(
+                "sha256={}",
+                sign("s3cret", format!("{}.{body}", now - 3600).as_bytes())
+            ),
+        )
         .body(body)
         .send()
         .await
@@ -70,7 +83,13 @@ async fn signed_requests_are_verified() {
     let good = client
         .post(&url)
         .header("X-Timestamp", now.to_string())
-        .header("X-Signature", format!("sha256={}", sign("s3cret", format!("{now}.{body}").as_bytes()).to_uppercase()))
+        .header(
+            "X-Signature",
+            format!(
+                "sha256={}",
+                sign("s3cret", format!("{now}.{body}").as_bytes()).to_uppercase()
+            ),
+        )
         .body(body)
         .send()
         .await
@@ -114,11 +133,18 @@ async fn paths_are_validated_and_context_values_encoded() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("must start with `/`"), "{err}");
-    for bad in ["/a/:id", "/a/*rest", "/a/{x", "/a/x{y}", "/a/{}", "/a b", "/a?b"] {
+    for bad in [
+        "/a/:id", "/a/*rest", "/a/{x", "/a/x{y}", "/a/{}", "/a b", "/a?b",
+    ] {
         let cfg = WebhookSourceConfig::new().path(bad);
         assert!(cfg.validate().is_err(), "{bad}");
     }
-    assert!(WebhookSourceConfig::new().path("/a/{x}/b").validate().is_ok());
+    assert!(
+        WebhookSourceConfig::new()
+            .path("/a/{x}/b")
+            .validate()
+            .is_ok()
+    );
 
     let addr = free_addr();
     let source = WebhookSource::new(
@@ -128,11 +154,16 @@ async fn paths_are_validated_and_context_values_encoded() {
             .max_payloads(1)
             .timeout_secs(10),
     );
-    let ctx: HashMap<String, Value> = [("tenant".to_string(), json!(":a/b"))].into_iter().collect();
+    let ctx: HashMap<String, Value> = [("tenant".to_string(), json!(":a/b"))]
+        .into_iter()
+        .collect();
     let run = tokio::spawn(async move { source.fetch_with_context(&ctx).await });
     let url = format!("http://{addr}/hooks/%3Aa%2Fb");
     let client = reqwest::Client::new();
-    let resp = post_until_up(&client, &url, || client.post(&url).json(&json!({"ok": true}))).await;
+    let resp = post_until_up(&client, &url, || {
+        client.post(&url).json(&json!({"ok": true}))
+    })
+    .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(run.await.unwrap().unwrap().len(), 1);
 }

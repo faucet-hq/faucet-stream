@@ -174,7 +174,10 @@ async fn fetch_all_fails_when_next_cursor_is_absent_but_has_next_is_true() {
 
     let source = GraphqlStream::new(relay_config(&server));
     let err = source.fetch_all().await.expect_err("must not end green");
-    assert!(err.to_string().contains("no string or number cursor"), "{err}");
+    assert!(
+        err.to_string().contains("no string or number cursor"),
+        "{err}"
+    );
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1, "no request is re-sent");
@@ -205,7 +208,11 @@ async fn a_repeated_cursor_with_has_next_true_fails_the_stream() {
     let last = pages.last().unwrap();
     let err = last.as_ref().expect_err("the stream must end in an error");
     assert!(err.to_string().contains("cursor just used"), "{err}");
-    assert!(pages.iter().all(|p| p.as_ref().map_or(true, |p| p.bookmark.is_none())));
+    assert!(
+        pages
+            .iter()
+            .all(|p| p.as_ref().map_or(true, |p| p.bookmark.is_none()))
+    );
 }
 
 /// Parent context values are merged into the GraphQL request `variables` via

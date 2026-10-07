@@ -205,10 +205,16 @@ mod tests {
         assert_eq!(page.records, vec![rec(1)]);
 
         let mut b = PageAssembler::new("public-users", 0, true);
-        assert!(b.stream_mismatch().is_none(), "no records at all is a quiet run");
+        assert!(
+            b.stream_mismatch().is_none(),
+            "no records at all is a quiet run"
+        );
         b.on_record("users", rec(1));
         b.on_record("users", rec(2));
         let msg = b.stream_mismatch().unwrap();
-        assert!(msg.contains("users (2)") && msg.contains("public-users"), "{msg}");
+        assert!(
+            msg.contains("users (2)") && msg.contains("public-users"),
+            "{msg}"
+        );
     }
 }

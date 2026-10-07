@@ -359,6 +359,8 @@ async fn a_429_retry_after_is_honoured() {
     cfg.max_retries = 2;
     let sink = faucet_sink_http::HttpSink::new(cfg);
     let started = std::time::Instant::now();
-    sink.write_batch(&[serde_json::json!({"a": 1})]).await.unwrap();
+    sink.write_batch(&[serde_json::json!({"a": 1})])
+        .await
+        .unwrap();
     assert!(started.elapsed() >= std::time::Duration::from_millis(900));
 }

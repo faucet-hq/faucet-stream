@@ -200,8 +200,13 @@ fn attrs(e: &BytesStart) -> Result<Map<String, Value>, FaucetError> {
         let a = a.map_err(|e| FaucetError::Source(format!("xml: malformed attribute: {e}")))?;
         let v = a
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-            .map_err(|e| FaucetError::Source(format!("xml: attribute `{}`: {e}", a.key.as_ref())))?;
-        m.insert(format!("@{}", local(a.key.as_ref())), Value::String(v.into_owned()));
+            .map_err(|e| {
+                FaucetError::Source(format!("xml: attribute `{}`: {e}", a.key.as_ref()))
+            })?;
+        m.insert(
+            format!("@{}", local(a.key.as_ref())),
+            Value::String(v.into_owned()),
+        );
     }
     Ok(m)
 }
@@ -212,10 +217,12 @@ fn local(name: &str) -> String {
 
 /// Resolve `&name;` (the five XML entities) or a character reference.
 fn reference(r: &quick_xml::events::BytesRef<'_>) -> Result<String, FaucetError> {
-    if let Some(ch) = r
-        .resolve_char_ref()
-        .map_err(|e| FaucetError::Source(format!("xml: invalid character reference `&{};`: {e}", &**r)))?
-    {
+    if let Some(ch) = r.resolve_char_ref().map_err(|e| {
+        FaucetError::Source(format!(
+            "xml: invalid character reference `&{};`: {e}",
+            &**r
+        ))
+    })? {
         return Ok(ch.to_string());
     }
     quick_xml::escape::resolve_predefined_entity(r)
@@ -351,7 +358,10 @@ mod tests {
         let err = to_json(b"<r>&nbsp;</r>").expect_err("undefined");
         assert!(err.to_string().contains("undefined entity"), "{err}");
         let err = to_json(b"<r>&#0;</r>").expect_err("bad char ref");
-        assert!(err.to_string().contains("invalid character reference"), "{err}");
+        assert!(
+            err.to_string().contains("invalid character reference"),
+            "{err}"
+        );
         let err = to_json(br#"<r a="&nbsp;"/>"#).expect_err("attr");
         assert!(err.to_string().contains("attribute `a`"), "{err}");
     }

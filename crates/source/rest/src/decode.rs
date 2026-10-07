@@ -439,7 +439,10 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
             let v = a
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|e| bad(format!("attribute `{}`: {e}", a.key.as_ref())))?;
-            m.insert(format!("@{}", local(a.key.as_ref())), Value::String(v.into_owned()));
+            m.insert(
+                format!("@{}", local(a.key.as_ref())),
+                Value::String(v.into_owned()),
+            );
         }
         Ok(m)
     }
@@ -880,7 +883,8 @@ mod tests {
 
     #[test]
     fn xml_parse_resolves_references_and_refuses_undefined_ones() {
-        let v = xml_to_json(br#"<r><v p:a="A &amp; B">x &lt; &#65;<![CDATA[&z]]></v></r>"#).unwrap();
+        let v =
+            xml_to_json(br#"<r><v p:a="A &amp; B">x &lt; &#65;<![CDATA[&z]]></v></r>"#).unwrap();
         assert_eq!(v["r"]["v"]["@a"], "A & B");
         assert_eq!(v["r"]["v"]["#text"], "x < A&z");
         for (xml, want) in [
@@ -934,7 +938,10 @@ mod tests {
                 },
             },
         ];
-        assert_eq!(run_decode(&two_csv_zip(), &steps).await.unwrap()[0]["x"], "2");
+        assert_eq!(
+            run_decode(&two_csv_zip(), &steps).await.unwrap()[0]["x"],
+            "2"
+        );
     }
 
     #[test]
@@ -958,6 +965,11 @@ mod tests {
         assert!(err.to_string().contains("invalid `records_path`"), "{err}");
         let err = validate_steps(&steps).unwrap_err();
         assert!(matches!(err, FaucetError::Config(_)), "{err:?}");
-        assert!(validate_steps(&[DecodeStep::Parse { parse: parse_json() }]).is_ok());
+        assert!(
+            validate_steps(&[DecodeStep::Parse {
+                parse: parse_json()
+            }])
+            .is_ok()
+        );
     }
 }

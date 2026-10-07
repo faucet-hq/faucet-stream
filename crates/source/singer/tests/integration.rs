@@ -225,7 +225,10 @@ async fn records_for_only_another_stream_fail_before_checkpointing() {
     cfg.stream = "public-s".into();
     let source = SingerSource::new(cfg);
     let sink = UpsertSink::default();
-    let err = faucet_core::Pipeline::new(&source, &sink).run().await.unwrap_err();
+    let err = faucet_core::Pipeline::new(&source, &sink)
+        .run()
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("only for other streams"), "{err}");
 }
 
@@ -237,7 +240,10 @@ async fn the_catalog_alias_of_the_stream_is_accepted() {
     cfg.catalog = Some(json!({"streams": [{"tap_stream_id": "public-s", "stream": "s"}]}));
     let source = SingerSource::new(cfg);
     let sink = UpsertSink::default();
-    faucet_core::Pipeline::new(&source, &sink).run().await.unwrap();
+    faucet_core::Pipeline::new(&source, &sink)
+        .run()
+        .await
+        .unwrap();
     assert_eq!(sink.ids(), vec![1, 2, 3]);
 }
 
@@ -245,14 +251,20 @@ async fn the_catalog_alias_of_the_stream_is_accepted() {
 #[tokio::test]
 async fn an_overlong_tap_line_fails() {
     let dir = tempfile::tempdir().unwrap();
-    let tap = script(&dir, "head -c 5000 /dev/zero | tr '\\0' 'a'; echo; sleep 30");
+    let tap = script(
+        &dir,
+        "head -c 5000 /dev/zero | tr '\\0' 'a'; echo; sleep 30",
+    );
     let mut cfg = SingerSourceConfig::new(tap, "s");
     cfg.max_line_bytes = 100;
     let source = SingerSource::new(cfg);
-    let err = tokio::time::timeout(std::time::Duration::from_secs(20), faucet_core::Source::fetch_all(&source))
-        .await
-        .expect("must not hang")
-        .unwrap_err();
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        faucet_core::Source::fetch_all(&source),
+    )
+    .await
+    .expect("must not hang")
+    .unwrap_err();
     assert!(err.to_string().contains("max_line_bytes (100)"), "{err}");
 }
 
@@ -273,6 +285,9 @@ async fn discovery_times_out_and_redacts_stderr() {
     cfg.idle_timeout_secs = Some(1);
     let started = std::time::Instant::now();
     let err = faucet_source_singer::discover(&cfg).await.unwrap_err();
-    assert!(err.to_string().contains("did not finish within 1s"), "{err}");
+    assert!(
+        err.to_string().contains("did not finish within 1s"),
+        "{err}"
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }

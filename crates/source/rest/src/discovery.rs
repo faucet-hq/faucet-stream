@@ -95,11 +95,13 @@ pub fn next_list_url(response: &Value, list: &DiscoveryList, base: &str) -> Opti
     if next.is_empty() {
         return None;
     }
-    Some(if next.starts_with("http://") || next.starts_with("https://") {
-        next.to_string()
-    } else {
-        format!("{base}/{}", next.trim_start_matches('/'))
-    })
+    Some(
+        if next.starts_with("http://") || next.starts_with("https://") {
+            next.to_string()
+        } else {
+            format!("{base}/{}", next.trim_start_matches('/'))
+        },
+    )
 }
 
 /// A keep-if predicate: keep a listing item when the value at `path` equals
@@ -457,7 +459,12 @@ mod tests {
             next_list_url(&json!({"next": "https://cdn.example.com/p2"}), &list, base).as_deref(),
             Some("https://cdn.example.com/p2")
         );
-        for end in [json!({"next": null}), json!({"next": " "}), json!({}), json!({"next": 2})] {
+        for end in [
+            json!({"next": null}),
+            json!({"next": " "}),
+            json!({}),
+            json!({"next": 2}),
+        ] {
             assert_eq!(next_list_url(&end, &list, base), None);
         }
         let mut no_next = list.clone();

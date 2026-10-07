@@ -108,7 +108,8 @@ impl TargetProcess {
         let stdout_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             loop {
-                let line = match faucet_common_singer::read_capped_line(&mut reader, max_line).await {
+                let line = match faucet_common_singer::read_capped_line(&mut reader, max_line).await
+                {
                     Ok(faucet_common_singer::CappedLine::Line(line)) => line,
                     Ok(faucet_common_singer::CappedLine::TooLong) => {
                         // An oversized line is not a STATE echo: skip it in

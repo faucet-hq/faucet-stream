@@ -25,7 +25,10 @@ pub async fn read_capped_line<R: AsyncBufRead + Unpin>(
 ) -> std::io::Result<CappedLine> {
     let mut buf = Vec::new();
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-    let n = (&mut *reader).take(limit).read_until(b'\n', &mut buf).await?;
+    let n = (&mut *reader)
+        .take(limit)
+        .read_until(b'\n', &mut buf)
+        .await?;
     if n == 0 {
         return Ok(CappedLine::Eof);
     }
@@ -47,13 +50,28 @@ mod tests {
     #[tokio::test]
     async fn lines_are_split_and_capped() {
         let mut r = tokio::io::BufReader::new(&b"ab\r\ncdef\nlast"[..]);
-        assert_eq!(read_capped_line(&mut r, 4).await.unwrap(), CappedLine::Line("ab".into()));
-        assert_eq!(read_capped_line(&mut r, 4).await.unwrap(), CappedLine::Line("cdef".into()));
-        assert_eq!(read_capped_line(&mut r, 4).await.unwrap(), CappedLine::Line("last".into()));
+        assert_eq!(
+            read_capped_line(&mut r, 4).await.unwrap(),
+            CappedLine::Line("ab".into())
+        );
+        assert_eq!(
+            read_capped_line(&mut r, 4).await.unwrap(),
+            CappedLine::Line("cdef".into())
+        );
+        assert_eq!(
+            read_capped_line(&mut r, 4).await.unwrap(),
+            CappedLine::Line("last".into())
+        );
         assert_eq!(read_capped_line(&mut r, 4).await.unwrap(), CappedLine::Eof);
         let mut r = tokio::io::BufReader::new(&b"abcdefgh\n"[..]);
-        assert_eq!(read_capped_line(&mut r, 4).await.unwrap(), CappedLine::TooLong);
+        assert_eq!(
+            read_capped_line(&mut r, 4).await.unwrap(),
+            CappedLine::TooLong
+        );
         let mut r = tokio::io::BufReader::new(&b"abcdefgh"[..]);
-        assert_eq!(read_capped_line(&mut r, 4).await.unwrap(), CappedLine::TooLong);
+        assert_eq!(
+            read_capped_line(&mut r, 4).await.unwrap(),
+            CappedLine::TooLong
+        );
     }
 }

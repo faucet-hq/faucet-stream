@@ -170,14 +170,12 @@ impl WebsocketSource {
         url: &str,
         cred: Option<faucet_core::Credential>,
     ) -> Result<WsStream, FaucetError> {
-        let mut request = url
-            .into_client_request()
-            .map_err(|e| {
-                FaucetError::Config(format!(
-                    "websocket url {}: {e}",
-                    crate::config::envelope_url(url)
-                ))
-            })?;
+        let mut request = url.into_client_request().map_err(|e| {
+            FaucetError::Config(format!(
+                "websocket url {}: {e}",
+                crate::config::envelope_url(url)
+            ))
+        })?;
 
         // Resolve effective auth: provider-first, then inline, or error on Reference.
         let effective_auth = match cred {
