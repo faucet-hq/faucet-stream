@@ -21,7 +21,7 @@ pub async fn write(
     record(state, ctx, action, run_id, config_fingerprint, None, result).await;
 }
 
-/// [`write`] naming what the action was taken on (`template:<id>@<version>`,
+/// [`write()`] naming what the action was taken on (`template:<id>@<version>`,
 /// `connection:<tenant>/<name>`, `mcp:<tool>`, …).
 pub async fn write_target(
     state: &ServerState,
@@ -33,7 +33,7 @@ pub async fn write_target(
     record(state, ctx, action, None, None, Some(target), result).await;
 }
 
-/// [`write`] with every field (run id, fingerprint and target).
+/// [`write()`] with every field (run id, fingerprint and target).
 pub async fn record(
     state: &ServerState,
     ctx: &AuthContext,

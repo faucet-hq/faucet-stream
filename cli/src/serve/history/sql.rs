@@ -28,7 +28,7 @@ pub const SCHEMA_VERSION: u32 = 3;
 
 /// Columns added to a table after it first shipped, with the schema version
 /// that added them. `CREATE TABLE IF NOT EXISTS` never alters an existing
-/// table, so [`migrate`] adds each missing one with `ALTER TABLE`.
+/// table, so the connect-time migration adds each missing one with `ALTER TABLE`.
 pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (1, "faucet_serve_runs", "cancel_requested"),
     (2, "faucet_usage", "tenant"),
