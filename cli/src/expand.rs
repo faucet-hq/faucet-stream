@@ -1588,6 +1588,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
     }
     check_file_sink_paths(&out)?;
     check_truncating_fan_out(&out)?;
+    if cfg.reconcile.is_some() {
+        check_reconcile_scope(&out)?;
+    }
     if cfg.verify.as_ref().is_some_and(|v| v.after_run) {
         for node in out.iter().filter(|n| matches!(n.role, NodeRole::Root)) {
             crate::destination::check_verify_scope(node, &out)?;
@@ -1649,6 +1652,58 @@ fn apply_cdc_image_policy(
     Ok(())
 }
 
+/// The single top-level `reconcile:` count describes one dataset, and each
+/// root invocation is compared with it on its own (#789 CLI-56): a config with
+/// several root invocations — two rows, or one partitioned row — would fail
+/// every one of them against the whole dataset's count.
+fn check_reconcile_scope(nodes: &[ExpandedNode]) -> CliResult<()> {
+    let roots: Vec<&str> = nodes
+        .iter()
+        .filter(|n| matches!(n.role, NodeRole::Root))
+        .map(|n| n.id.as_str())
+        .collect();
+    if let Some(chunk) = roots.iter().find(|id| id.contains("::partition::")) {
+        let row = chunk.split("::partition::").next().unwrap_or(chunk);
+        return Err(CliError::Config(format!(
+            "row '{row}' is partitioned, but `reconcile:` compares one authoritative count with              each invocation's own row count, so every chunk would fail — remove `partition:`              or `reconcile:`"
+        )));
+    }
+    if roots.len() > 1 {
+        return Err(CliError::Config(format!(
+            "`reconcile:` compares one authoritative count with each root invocation's own row              count, but this config has {} root rows ({}) — reconcile a config with a single              root row",
+            roots.len(),
+            roots.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The fan-out ids whose `${id.…}` tokens differ between a node's invocations:
+/// its parent, or its `for_each` and collected discovery rows.
+fn invocation_ids(n: &ExpandedNode) -> Vec<&str> {
+    match &n.role {
+        NodeRole::Child { parent_id, .. } => vec![parent_id.as_str()],
+        NodeRole::Product { dims, collected } => dims
+            .iter()
+            .chain(collected.iter())
+            .map(String::as_str)
+            .collect(),
+        NodeRole::Root | NodeRole::Discovery { .. } => Vec::new(),
+    }
+}
+
+/// Whether `path` carries a token that changes per invocation of `n` (#789
+/// CLI-144): `${now.*}`, `${backfill.*}`, `${partition.*}` and other rows'
+/// tokens are the same for every invocation of one parent.
+fn varies_per_invocation(path: &str, n: &ExpandedNode) -> bool {
+    let ids = invocation_ids(n);
+    path.match_indices("${").any(|(i, _)| {
+        let rest = &path[i + 2..];
+        ids.iter()
+            .any(|id| rest.starts_with(&format!("{id}.")) || rest.starts_with(&format!("{id}}}")))
+    })
+}
+
 fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
     for n in nodes {
         let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
@@ -1658,10 +1713,7 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
         let Some(path) = crate::registry::sink_truncating_path(&n.sink.kind, &n.sink.config) else {
             continue;
         };
-        let per_invocation = path
-            .match_indices("${")
-            .any(|(i, _)| !path[i + 2..].starts_with("now."));
-        if !per_invocation {
+        if !varies_per_invocation(&path, n) {
             let fix = match n.sink.kind.as_str() {
                 "parquet" => "write to a directory destination or set a rollover cap",
                 _ => "set `append: true`",
@@ -1685,19 +1737,22 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
 /// object-store and SFTP sinks given a fixed `path` / `file_name`
 /// ([`crate::registry::sink_shared_destination`]).
 fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
-    fn per_invocation(path: &str) -> bool {
-        path.match_indices("${")
-            .any(|(i, _)| !path[i + 2..].starts_with("now."))
-    }
     let mut seen: HashMap<String, &str> = HashMap::new();
-    for n in nodes {
+    // Discovery rows carry their source as a placeholder sink and write nothing
+    // (#789 CLI-143).
+    let writers = || {
+        nodes
+            .iter()
+            .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
+    };
+    for n in writers() {
         let Some(dest) = crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config)
         else {
             continue;
         };
         let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
         let legacy = matches!(n.sink.kind.as_str(), "jsonl" | "csv" | "parquet");
-        if fans_out && !legacy && !per_invocation(&dest) {
+        if fans_out && !legacy && !varies_per_invocation(&dest, n) {
             return Err(CliError::Config(format!(
                 "row '{}': its {} sink destination '{dest}' is the same for every invocation of \
                  a fan-out row, so concurrent writers would overwrite each other — put a \
@@ -1714,8 +1769,7 @@ fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
             )));
         }
     }
-    let data_paths: HashMap<&str, &str> = nodes
-        .iter()
+    let data_paths: HashMap<&str, &str> = writers()
         .filter(|n| matches!(n.sink.kind.as_str(), "file" | "jsonl" | "csv"))
         .filter_map(|n| Some((n.sink.config.get("path")?.as_str()?, n.id.as_str())))
         .collect();
@@ -4475,6 +4529,49 @@ pipeline:
         ] {
             assert!(expand(&cfg(&yaml(ok.0, ok.1))).is_ok(), "{ok:?}");
         }
+        // A token that is the same for every invocation of one parent does not
+        // make the path per-invocation (#789 CLI-144).
+        for constant in ["${backfill.start}", "${partition.id}"] {
+            let sink = format!("{{ path: \"out/{constant}.jsonl\" }}");
+            let err = expand(&cfg(&yaml("jsonl", &sink)));
+            assert!(
+                err.as_ref()
+                    .is_err_and(|e| e.to_string().contains("runs once per parent record")),
+                "{constant}: {err:?}"
+            );
+        }
+    }
+
+    /// #789 CLI-143: two `fan_out:` rows reading one file are not two writers.
+    #[test]
+    fn discovery_rows_over_one_file_are_not_checked_as_sinks() {
+        let c = cfg(
+            "version: 1\nname: t\npipeline:\n  source: { type: file, config: { path: in.csv } }\n  sink: { type: file, config: { path: out.jsonl } }\nmatrix:\n  - id: regions\n    fan_out: { source: { type: file, config: { path: dims.csv } }, select: region, as: name }\n  - id: kinds\n    fan_out: { source: { type: file, config: { path: dims.csv } }, select: kind, as: name }\n",
+        );
+        let nodes = expand(&c).expect("two discovery rows over one source file are fine");
+        assert_eq!(nodes.len(), 2);
+    }
+
+    /// #789 CLI-56: one authoritative count cannot reconcile several root
+    /// invocations.
+    #[test]
+    fn reconcile_is_refused_with_several_root_invocations() {
+        let base = "version: 1\nname: t\nreconcile:\n  count: { type: csv, config: { path: n.csv } }\npipeline:\n  source: { type: csv, config: { path: p.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n";
+        assert!(expand(&cfg(base)).is_ok());
+        let two = format!(
+            "{base}matrix:\n  - id: a\n  - id: b\n    sink: {{ config: {{ path: o2.jsonl }} }}\n"
+        );
+        let err = expand(&cfg(&two)).unwrap_err().to_string();
+        assert!(err.contains("2 root rows (a, b)"), "{err}");
+        let parted = format!(
+            "{base}matrix:\n  - id: a\n    source: {{ config: {{ path: \"p-${{partition.id}}.csv\" }} }}\n    sink: {{ config: {{ path: \"o-${{partition.id}}.jsonl\" }} }}\n    partition: {{ kind: integer, from: 0, to: 19, chunk_size: 10, bounds: inclusive }}\n"
+        );
+        let err = expand(&cfg(&parted)).unwrap_err().to_string();
+        assert!(err.contains("row 'a' is partitioned"), "{err}");
+        let child = format!(
+            "{base}matrix:\n  - id: a\n  - id: c\n    parent: a\n    sink: {{ config: {{ path: \"o-${{a.id}}.jsonl\" }} }}\n"
+        );
+        assert!(expand(&cfg(&child)).is_ok(), "children are not reconciled");
     }
 }
 
