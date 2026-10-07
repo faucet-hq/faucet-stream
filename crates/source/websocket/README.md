@@ -5,7 +5,7 @@
 [![MSRV](https://img.shields.io/crates/msrv/faucet-source-websocket.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-websocket.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
-**WebSocket** streaming source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Connects to a `ws://` / `wss://` endpoint, optionally sends subscription frames, and streams every incoming message into the pipeline as a record — continuously, page-by-page — until a configured stop condition (`max_messages`, `idle_timeout`) or Ctrl-C ends the run.
+**WebSocket** streaming source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Connects to a `ws://` / `wss://` endpoint, optionally sends subscription frames, and streams every incoming message into the pipeline as a record — continuously, page-by-page — until a configured stop condition (`max_messages`, `idle_timeout`) or the run being cancelled ends it.
 
 Reach for it when you want to tap a live feed — market-data tickers, chat/event streams, IoT telemetry, real-time APIs — and land it in any faucet-stream sink with one declarative config and no glue code. The connection is built once and the receive loop is fully async, so records flow to the sink the moment they arrive rather than waiting for the run to finish.
 
@@ -85,7 +85,8 @@ This connects to the Binance trade stream, captures the first 100 trade messages
 | `ping_interval` | int (seconds) | *(unset)* | If set, send a WebSocket Ping frame on this interval to keep the connection alive through proxies / load balancers. |
 | `reconnect` | bool | `false` | Reconnect on transport error or a non-`1000` close. |
 | `reconnect_backoff` | int (seconds) | `1` | Base wait before the first retry; subsequent retries grow exponentially with jitter, capped. |
-| `reconnect_max_attempts` | int | *(unlimited)* | Cap on *consecutive* failed reconnects (resets on any received message). Unset = unlimited (then `idle_timeout` is the natural cap). The historical spelling `max_reconnect_attempts` is still accepted — the prefix order used to be reversed against the gRPC source, so whichever you learned first was silently dropped on the other (#654). |
+| `reconnect_max_attempts` | int | *(unlimited)* | Cap on *consecutive* failed reconnects (resets on a received data frame — a server that accepts the handshake and closes again still counts). Unset = unlimited (then `idle_timeout` is the natural cap). The historical spelling `max_reconnect_attempts` is still accepted — the prefix order used to be reversed against the gRPC source, so whichever you learned first was silently dropped on the other (#654). |
+| `connect_timeout` | int (seconds) | `30` | Limit on the TCP connect + upgrade handshake and on sending the subscribe frames. Expiry is a connect failure (retried under `reconnect`). |
 | `max_message_bytes` | int | *(tungstenite default)* | Bound the max message/frame size (bytes) to prevent runaway memory. Unset = tungstenite default (64 MiB message / 16 MiB frame). |
 
 ### Termination
@@ -95,7 +96,7 @@ This connects to the Binance trade stream, captures the first 100 trade messages
 | `max_messages` | int | *(unset)* | Stop after this many messages. |
 | `idle_timeout` | int (seconds) | *(unset)* | Stop after this long with no inbound frame. The idle clock keeps ticking across reconnect gaps, so it also caps a connection outage. Reset by **any** inbound frame — data, ping/pong, or a frame dropped by `on_parse_error: skip` — so a live server streaming skippable frames does not trip it. |
 
-> **At least one of `max_messages` / `idle_timeout` must be set** — a source with neither would never stop on its own and is rejected at config-load time. Ctrl-C (SIGINT) always ends the run regardless.
+> **At least one of `max_messages` / `idle_timeout` must be set** — a source with neither would never stop on its own and is rejected at config-load time. The source installs no signal handler: Ctrl-C reaches the host process as usual (`faucet run` exits; `schedule`/`serve` cancel the run at a page boundary).
 
 ### Batching
 
@@ -252,8 +253,9 @@ A run ends on the first of:
 
 - `max_messages` reached,
 - `idle_timeout` elapsed with no inbound frame,
-- Ctrl-C (SIGINT),
-- a clean `1000` close from the server while `reconnect: false`.
+- the run being cancelled by its caller,
+- a clean `1000` close from the server while `reconnect: false`,
+- a `1008` (policy) or `4xxx` (application) close, which fails the run without reconnecting — the server rejected the session.
 
 ## Config loading & schema
 
