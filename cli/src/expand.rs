@@ -125,8 +125,8 @@ pub struct ExpandedNode {
     /// Scoped-cleanup claim (#478): the source's `complete_for` scope, still
     /// carrying any `${parent.*}` / `${now.*}` tokens — the executor resolves
     /// them per invocation, like the connector configs. `Some` only when the
-    /// destination sink also opted in with `cleanup: delete_missing`, so this
-    /// being present already means a cleanup is intended.
+    /// claim sets `on_missing: delete`, so this being present already means a
+    /// cleanup is intended.
     pub cleanup_scope: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// Pipeline-level `_faucet_*` metadata columns (#510), shared by every node;
     /// the executor wraps the sink in a `MetadataSink` decorator when present.
