@@ -13,5 +13,5 @@ pub use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Sink};
 
 #[allow(deprecated)]
 pub use config::ElasticsearchSinkAuth;
-pub use config::{ElasticsearchAuth, ElasticsearchSinkConfig};
+pub use config::{ElasticsearchAuth, ElasticsearchOpType, ElasticsearchSinkConfig};
 pub use sink::ElasticsearchSink;

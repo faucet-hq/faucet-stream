@@ -43,13 +43,30 @@ async fn current_schema_maps_es_field_types() {
     assert_eq!(schema["type"], "object");
     let props = &schema["properties"];
 
-    // Every field is nullable (ES has no NOT NULL).
-    assert_eq!(props["id"], json!({ "type": ["integer", "null"] }));
-    assert_eq!(props["score"], json!({ "type": ["number", "null"] }));
-    assert_eq!(props["active"], json!({ "type": ["boolean", "null"] }));
-    assert_eq!(props["name"], json!({ "type": ["string", "null"] }));
-    assert_eq!(props["body"], json!({ "type": ["string", "null"] }));
-    assert_eq!(props["meta"], json!({ "type": ["object", "null"] }));
+    // Every field is nullable (ES has no NOT NULL) and may hold an array of
+    // its type (ES fields are multi-valued), so array data is not drift
+    // (#789 MSG-50; the old `[base, "null"]` classed every array incompatible).
+    assert_eq!(props["id"], json!({ "type": ["integer", "array", "null"] }));
+    assert_eq!(
+        props["score"],
+        json!({ "type": ["number", "array", "null"] })
+    );
+    assert_eq!(
+        props["active"],
+        json!({ "type": ["boolean", "array", "null"] })
+    );
+    assert_eq!(
+        props["name"],
+        json!({ "type": ["string", "array", "null"] })
+    );
+    assert_eq!(
+        props["body"],
+        json!({ "type": ["string", "array", "null"] })
+    );
+    assert_eq!(
+        props["meta"],
+        json!({ "type": ["object", "array", "null"] })
+    );
 }
 
 #[tokio::test]
@@ -98,6 +115,11 @@ async fn evolve_schema_puts_additions_via_mapping() {
                 from: None,
                 to: json!({ "type": "integer" }),
             },
+            ColumnChange {
+                name: "tags".to_string(),
+                from: None,
+                to: json!({ "type": "array", "items": { "type": "integer" } }),
+            },
         ],
         // Widenings + nullability relaxations are no-ops on ES (left as-is).
         widenings: vec![ColumnChange {
@@ -115,9 +137,14 @@ async fn evolve_schema_puts_additions_via_mapping() {
 
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     let props = &body["properties"];
-    // Additions only — mapped to ES field types.
-    assert_eq!(props["email"], json!({ "type": "keyword" }));
+    // Additions only — mapped to ES field types. Strings get `ignore_above`
+    // and an array maps to its item type, not `object` (#789 MSG-50, MSG-90).
+    assert_eq!(
+        props["email"],
+        json!({ "type": "keyword", "ignore_above": 8191 })
+    );
     assert_eq!(props["age"], json!({ "type": "long" }));
+    assert_eq!(props["tags"], json!({ "type": "long" }));
     // Widenings / relax_nullability never appear in the PUT body.
     assert!(props.get("score").is_none(), "widenings are not applied");
     assert!(

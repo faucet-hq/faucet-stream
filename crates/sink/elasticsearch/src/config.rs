@@ -60,10 +60,53 @@ pub struct ElasticsearchSinkConfig {
     /// last-write-wins.
     #[serde(flatten)]
     pub write: faucet_core::WriteSpec,
+    /// Seconds to wait for a TCP/TLS connection to the cluster. Default `10`.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Seconds one HTTP request (a `_bulk`, `_delete_by_query`, mapping call)
+    /// may take end to end before it fails as retriable. Default `300`, so a
+    /// half-open connection or wedged node cannot hang a run forever.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// The `_bulk` action for `append` writes: `index` (default; overwrites a
+    /// document with the same `_id`) or `create` (required by data streams,
+    /// which reject `index`; a document whose `_id` already exists is a
+    /// per-row error). `upsert` / `delete` / `overwrite` always use `index`.
+    #[serde(default)]
+    pub op_type: ElasticsearchOpType,
+}
+
+/// The `_bulk` action an append write issues.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticsearchOpType {
+    /// `index`: create or replace by `_id`.
+    #[default]
+    Index,
+    /// `create`: create only (data streams).
+    Create,
+}
+
+impl ElasticsearchOpType {
+    /// The `_bulk` action verb.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Create => "create",
+        }
+    }
 }
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_request_timeout_secs() -> u64 {
+    300
 }
 
 impl ElasticsearchSinkConfig {
@@ -76,7 +119,29 @@ impl ElasticsearchSinkConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             id_field: None,
             write: faucet_core::WriteSpec::default(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            request_timeout_secs: default_request_timeout_secs(),
+            op_type: ElasticsearchOpType::default(),
         }
+    }
+
+    /// Refuse a zero timeout and `op_type: create` outside `append`.
+    pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        if self.connect_timeout_secs == 0 || self.request_timeout_secs == 0 {
+            return Err(faucet_core::FaucetError::Config(
+                "elasticsearch sink: connect_timeout_secs and request_timeout_secs must be > 0"
+                    .into(),
+            ));
+        }
+        if self.op_type == ElasticsearchOpType::Create
+            && self.write.write_mode != faucet_core::WriteMode::Append
+        {
+            return Err(faucet_core::FaucetError::Config(format!(
+                "elasticsearch sink: op_type: create applies only to write_mode: append, not {}",
+                self.write.write_mode.as_str()
+            )));
+        }
+        Ok(())
     }
 
     /// Set the authentication method.
@@ -202,6 +267,22 @@ mod tests {
         // canonical `ElasticsearchAuth` type. Removed in 0.4.0 together with
         // the alias itself.
         let _: ElasticsearchSinkAuth = ElasticsearchAuth::None;
+    }
+
+    #[test]
+    fn timeouts_and_op_type_are_validated() {
+        let mut c = ElasticsearchSinkConfig::new("http://localhost:9200", "idx");
+        assert!(c.validate().is_ok());
+        assert_eq!((c.connect_timeout_secs, c.request_timeout_secs), (10, 300));
+        c.op_type = ElasticsearchOpType::Create;
+        assert!(c.validate().is_ok());
+        assert_eq!(c.op_type.as_str(), "create");
+        assert_eq!(ElasticsearchOpType::Index.as_str(), "index");
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        assert!(c.validate().is_err());
+        let mut c = ElasticsearchSinkConfig::new("http://localhost:9200", "idx");
+        c.request_timeout_secs = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]
