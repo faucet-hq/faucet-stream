@@ -11,6 +11,7 @@ keywords = ["oracle", "database", "sql", "sink", "connector"]
 categories.workspace = true
 
 [dependencies]
+chrono.workspace = true
 faucet-core.workspace = true
 faucet-common-oracle.workspace = true
 schemars.workspace = true
