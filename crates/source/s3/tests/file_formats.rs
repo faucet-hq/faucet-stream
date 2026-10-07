@@ -244,10 +244,7 @@ mod containers {
                 ),
                 (
                     "avro/c.avro".into(),
-                    avro(
-                        &[json!({"id": 3, "name": "c", "extra": true})],
-                        AvroCodec::Zstd,
-                    ),
+                    avro(&[json!({"id": 3, "name": "c"})], AvroCodec::Zstd),
                 ),
                 (
                     "avro/d.avro".into(),

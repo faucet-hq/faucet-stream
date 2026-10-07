@@ -217,9 +217,13 @@ source:
 
 **Many files, one shape.** Every file under the prefix is resolved against one
 reader schema: `avro.schema` when set, otherwise **the first file's writer
-schema**. Avro's schema resolution then applies. A later file that added a
-field has it dropped. A field the reader declares with a default is filled for
-files that lack it. Numeric promotions such as `int → long` apply. A file that
+schema**. Avro's schema resolution then applies. Without `avro.schema`, a
+later file that adds a top-level field fails the run naming the field, rather
+than having it silently dropped for the whole run — set `avro.schema` to a
+reader schema that includes it (with a default for the older files). With a
+configured reader schema, writer fields it does not declare are dropped, as
+you asked. A field the reader declares with a default is filled for files that
+lack it. Numeric promotions such as `int → long` apply. A file that
 cannot be resolved fails the run with an error naming both files:
 
 ```text
