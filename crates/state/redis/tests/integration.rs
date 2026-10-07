@@ -22,6 +22,19 @@ async fn start_redis() -> (ContainerAsync<Redis>, String) {
         .await
         .expect("redis port");
     let url = format!("redis://127.0.0.1:{port}");
+    // The forwarded port can accept before Redis does; wait for a PING.
+    let client = redis::Client::open(url.as_str()).expect("redis url");
+    for _ in 0..50 {
+        if let Ok(mut conn) = client.get_multiplexed_async_connection().await
+            && redis::cmd("PING")
+                .query_async::<String>(&mut conn)
+                .await
+                .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     (container, url)
 }
 
@@ -190,4 +203,74 @@ async fn list_by_prefix_and_atomic_batch() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_and_put_is_atomic_across_concurrent_callers() {
+    let (_container, url) = start_redis().await;
+    let store = std::sync::Arc::new(
+        RedisStateStore::connect(&url, "faucet")
+            .await
+            .expect("connect"),
+    );
+    assert!(store.supports_compare_and_put());
+
+    let mut tasks = Vec::new();
+    for i in 0..32 {
+        let s = store.clone();
+        tasks.push(tokio::spawn(async move {
+            s.compare_and_put("lease", None, &json!({ "by": i }))
+                .await
+                .expect("cas")
+        }));
+    }
+    let mut winners = 0;
+    for t in tasks {
+        if t.await.expect("join") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one absent-expected take may win");
+    let held = store.get("lease").await.expect("get").expect("lease held");
+
+    let mut tasks = Vec::new();
+    for i in 0..32 {
+        let (s, held) = (store.clone(), held.clone());
+        tasks.push(tokio::spawn(async move {
+            s.compare_and_put("lease", Some(&held), &json!({ "next": i }))
+                .await
+                .expect("cas")
+        }));
+    }
+    let mut winners = 0;
+    for t in tasks {
+        if t.await.expect("join") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one swap from the held value may win");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_and_put_mismatch_leaves_the_value() {
+    let (_container, url) = start_redis().await;
+    let store = RedisStateStore::connect(&url, "faucet")
+        .await
+        .expect("connect");
+    let a = json!({"a": 1, "b": [1, 2]});
+    let b = json!({"b": 2});
+
+    assert!(store.compare_and_put("k", None, &a).await.unwrap());
+    assert!(!store.compare_and_put("k", None, &b).await.unwrap());
+    assert!(!store.compare_and_put("k", Some(&b), &b).await.unwrap());
+    assert!(
+        !store.compare_and_put("absent", Some(&a), &b).await.unwrap(),
+        "an expected value never matches an absent key"
+    );
+    assert_eq!(store.get("absent").await.unwrap(), None);
+    assert_eq!(store.get("k").await.unwrap(), Some(a.clone()));
+
+    assert!(store.compare_and_put("k", Some(&a), &b).await.unwrap());
+    assert_eq!(store.get("k").await.unwrap(), Some(b));
+    assert!(store.compare_and_put("bad key!", None, &a).await.is_err());
 }

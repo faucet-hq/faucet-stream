@@ -123,6 +123,7 @@ The three `StateStore` methods map directly onto Redis commands on a namespaced 
 - `delete(key)` → `DEL {namespace}:{key}`; deleting a missing key is not an error.
 - `list(prefix)` → `SCAN MATCH {namespace}:{prefix}*`, namespace stripped, sorted — how `faucet state show|export` enumerates a pipeline's keys.
 - `put_batch(entries)` → one `MSET`, so a `faucet state import` lands all-or-nothing (`supports_atomic_batch() == true`).
+- `compare_and_put(key, expected, value)` → reads the key, compares it with `expected` as JSON (`None` = absent), then runs a Lua script that `SET`s only while the stored string is still the one compared (or the key is still absent). Atomic across processes (`supports_compare_and_put() == true`), so two `faucet run` processes sharing this store cannot both take a row's run lease.
 
 Connections use `redis::aio::MultiplexedConnection`, which is cheaply cloneable and safe to share across concurrent tasks — the store clones it per call, so no locking or pooling is needed on the caller's side. The connection is opened once in `connect()` and reused for the lifetime of the store.
 

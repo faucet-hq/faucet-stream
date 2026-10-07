@@ -58,6 +58,23 @@ pub(crate) fn build_redis_key(namespace: &str, key: &str) -> String {
     format!("{namespace}:{key}")
 }
 
+/// Sets `KEYS[1]` to `ARGV[3]` when it holds exactly `ARGV[2]` (`ARGV[1]` =
+/// `1`) or is absent (`ARGV[1]` = `0`); returns 1 when it wrote.
+pub(crate) const COMPARE_AND_SET_LUA: &str = r"
+local cur = redis.call('GET', KEYS[1])
+if ARGV[1] == '0' then
+  if cur then return 0 end
+elseif cur ~= ARGV[2] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[3])
+return 1
+";
+
+/// Retries when the stored string changed between the read and the script but
+/// still decodes to the expected value (an equal value re-written).
+const CAS_ATTEMPTS: usize = 8;
+
 /// The `SCAN MATCH` pattern for keys starting with `prefix`. Neither the
 /// namespace nor a valid key can hold a glob metacharacter, so no escaping.
 pub(crate) fn scan_pattern(namespace: &str, prefix: &str) -> String {
@@ -154,6 +171,61 @@ impl StateStore for RedisStateStore {
         keys.sort();
         keys.dedup();
         Ok(keys)
+    }
+
+    fn supports_compare_and_put(&self) -> bool {
+        true
+    }
+
+    /// Atomic: a Lua script swaps the value only while the stored string is
+    /// still the one this call compared (or the key is still absent).
+    async fn compare_and_put(
+        &self,
+        key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        validate_state_key(key)?;
+        let serialized = serde_json::to_string(value).map_err(|e| {
+            FaucetError::State(format!("failed to serialize state for key '{key}': {e}"))
+        })?;
+        let redis_key = self.redis_key(key);
+        let script = redis::Script::new(COMPARE_AND_SET_LUA);
+        let mut conn = self.conn.clone();
+        for _ in 0..CAS_ATTEMPTS {
+            let raw: Option<String> = conn.get(&redis_key).await.map_err(|e| {
+                FaucetError::State(format!("Redis GET for key '{key}' failed: {e}"))
+            })?;
+            let current = raw
+                .as_deref()
+                .map(|s| {
+                    serde_json::from_str::<Value>(s).map_err(|e| {
+                        FaucetError::State(format!(
+                            "stored value for key '{key}' is not valid JSON: {e}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            if current.as_ref() != expected {
+                return Ok(false);
+            }
+            let mut call = script.key(&redis_key);
+            match &raw {
+                Some(guard) => call.arg("1").arg(guard),
+                None => call.arg("0").arg(""),
+            };
+            let swapped: i64 = call
+                .arg(&serialized)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(|e| {
+                    FaucetError::State(format!("Redis compare-and-set for key '{key}' failed: {e}"))
+                })?;
+            if swapped == 1 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn supports_atomic_batch(&self) -> bool {
