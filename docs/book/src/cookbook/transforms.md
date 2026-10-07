@@ -795,7 +795,7 @@ For each change event it:
   ```yaml
   transforms:
     - type: cdc_unwrap
-      key: [id]
+      config: { key: [id] }
   ```
 
   postgres-cdc carries the old key on such an update under the default

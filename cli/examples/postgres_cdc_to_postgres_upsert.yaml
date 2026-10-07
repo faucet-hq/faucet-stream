@@ -48,7 +48,7 @@ pipeline:
   # sink's: an update that changes `id` also deletes the row under the old id.
   transforms:
     - type: cdc_unwrap
-      key: [id]
+      config: { key: [id] }
 
   sink:
     type: postgres
