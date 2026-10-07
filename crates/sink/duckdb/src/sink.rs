@@ -201,54 +201,129 @@ fn insert_json(
 }
 
 /// Insert records mapping top-level JSON keys onto existing table columns.
+///
+/// A field the table has no column for is added (typed like an auto-created
+/// column) when `create_table` is on, and fails the write otherwise — never
+/// dropped. Offset-bearing ISO strings bound for a tz-less `TIMESTAMP` column
+/// are converted to UTC (DuckDB's text cast would drop the offset).
 fn insert_auto_map(
     conn: &Connection,
     table: &str,
     records: &[Value],
+    create_table: bool,
 ) -> Result<usize, FaucetError> {
     if records.is_empty() {
         return Ok(0);
     }
-
-    // Discover the table's columns (in declared order) via information_schema.
-    // `table` may be schema-qualified, and information_schema keeps the schema and
-    // the name in separate columns — matching `table_name` against the whole
-    // dotted string would find nothing (#456 L3).
-    let (schema, name) = split_table(table);
-    let cols: Vec<String> = match schema {
-        Some(schema) => {
-            let mut cstmt = conn
-                .prepare(
-                    "SELECT column_name FROM information_schema.columns \
-                     WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
-                )
-                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?;
-            cstmt
-                .query_map([schema, name], |row| row.get::<_, String>(0))
-                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
-                .collect::<Result<Vec<String>, _>>()
-        }
-        None => {
-            let mut cstmt = conn
-                .prepare(
-                    "SELECT column_name FROM information_schema.columns \
-                     WHERE table_name = ? ORDER BY ordinal_position",
-                )
-                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?;
-            cstmt
-                .query_map([name], |row| row.get::<_, String>(0))
-                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
-                .collect::<Result<Vec<String>, _>>()
-        }
-    }
-    .map_err(|e| FaucetError::Sink(format!("failed to decode table columns: {e}")))?;
-
+    let (cols, naive_ts) = table_columns(conn, table)?;
     if cols.is_empty() {
         return Err(FaucetError::Sink(format!(
             "table '{table}' has no columns or does not exist"
         )));
     }
+    let missing = missing_fields(records, &cols);
+    if !missing.is_empty() {
+        if !create_table {
+            return Err(FaucetError::Sink(format!(
+                "duckdb: table '{table}' has no column for field(s) {}; add them, drop the \
+                 fields with a transform, or set `create_table: true`",
+                missing.join(", ")
+            )));
+        }
+        let planned = faucet_core::plan_columns(records).unwrap_or_default();
+        for column in planned.iter().filter(|c| missing.contains(&c.name)) {
+            conn.execute_batch(&add_column_sql(table, column))
+                .map_err(|e| FaucetError::Sink(format!("duckdb ADD COLUMN failed: {e}")))?;
+        }
+        return insert_auto_map(conn, table, records, false);
+    }
+    insert_rows(conn, table, records, &cols, &naive_ts)
+}
 
+/// The table's columns (declared order) and its tz-less timestamp columns.
+fn table_columns(
+    conn: &Connection,
+    table: &str,
+) -> Result<(Vec<String>, HashSet<String>), FaucetError> {
+    // `table` may be schema-qualified, and information_schema keeps the schema and
+    // the name in separate columns (#456 L3).
+    let (schema, name) = split_table(table);
+    let (sql, args): (&str, Vec<&str>) = match schema {
+        Some(schema) => (
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+            vec![schema, name],
+        ),
+        None => (
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_name = ? ORDER BY ordinal_position",
+            vec![name],
+        ),
+    };
+    let mut cstmt = conn
+        .prepare(sql)
+        .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?;
+    let rows = cstmt
+        .query_map(duckdb::params_from_iter(args), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
+        .collect::<Result<Vec<(String, String)>, _>>()
+        .map_err(|e| FaucetError::Sink(format!("failed to decode table columns: {e}")))?;
+    let naive_ts = rows
+        .iter()
+        .filter(|(_, ty)| is_naive_timestamp(ty))
+        .map(|(c, _)| c.clone())
+        .collect();
+    Ok((rows.into_iter().map(|(c, _)| c).collect(), naive_ts))
+}
+
+/// A `TIMESTAMP` type without a time zone (`TIMESTAMP`, `TIMESTAMP_NS`, …).
+fn is_naive_timestamp(ty: &str) -> bool {
+    let t = ty.to_ascii_uppercase();
+    (t.starts_with("TIMESTAMP") || t == "DATETIME")
+        && !t.contains("TIME ZONE")
+        && t != "TIMESTAMPTZ"
+}
+
+/// Record fields (first-seen order) that are not columns of the table.
+fn missing_fields(records: &[Value], cols: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in records
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.keys())
+    {
+        if !cols.contains(key) && !out.contains(key) {
+            out.push(key.clone());
+        }
+    }
+    out
+}
+
+/// `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, typed like an auto-created column.
+fn add_column_sql(table: &str, column: &faucet_core::PlannedColumn) -> String {
+    let def =
+        faucet_core::render_columns(std::slice::from_ref(column), quote_ident, duckdb_keyword);
+    format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {def}",
+        quote_table(table)
+    )
+}
+
+/// An ISO 8601 timestamp carrying an offset as UTC wall time; `None` otherwise.
+fn utc_wall_time(s: &str) -> Option<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).ok()?;
+    Some(dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.f").to_string())
+}
+
+fn insert_rows(
+    conn: &Connection,
+    table: &str,
+    records: &[Value],
+    cols: &[String],
+    naive_ts: &HashSet<String>,
+) -> Result<usize, FaucetError> {
     // Records with at least one matching column; the INSERT column set is the
     // union of table columns present in any such record (declared order). A row
     // missing a unioned column binds SQL NULL. Records with no matching key are
@@ -266,7 +341,7 @@ fn insert_auto_map(
             );
             continue;
         }
-        for c in &cols {
+        for c in cols {
             if obj.contains_key(c) {
                 used.insert(c.as_str());
             }
@@ -296,7 +371,14 @@ fn insert_auto_map(
     let mut params: Vec<DuckValue> = Vec::with_capacity(rows.len() * num_cols);
     for obj in &rows {
         for c in &insert_cols {
-            params.push(obj.get(*c).map(json_to_duck).unwrap_or(DuckValue::Null));
+            let value = match obj.get(*c) {
+                Some(Value::String(v)) if naive_ts.contains(c.as_str()) => {
+                    DuckValue::Text(utc_wall_time(v).unwrap_or_else(|| v.clone()))
+                }
+                Some(v) => json_to_duck(v),
+                None => DuckValue::Null,
+            };
+            params.push(value);
         }
     }
 
@@ -336,7 +418,9 @@ fn write_all_blocking(
                 DuckdbColumnMapping::Json { column } => {
                     insert_json(&guard, &config.table_name, column, c)?
                 }
-                DuckdbColumnMapping::AutoMap => insert_auto_map(&guard, &config.table_name, c)?,
+                DuckdbColumnMapping::AutoMap => {
+                    insert_auto_map(&guard, &config.table_name, c, config.create_table)?
+                }
             };
         }
         Ok(total)
@@ -697,6 +781,35 @@ mod schema_qualified_tests {
     /// #456 L3: a schema-qualified target must quote each segment, or it names a
     /// table with a literal dot in it and can never resolve. The ClickHouse sink
     /// already did this; DuckDB used a single `quote_ident`.
+    #[test]
+    fn column_helpers() {
+        assert!(is_naive_timestamp("TIMESTAMP"));
+        assert!(is_naive_timestamp("timestamp_ns"));
+        assert!(is_naive_timestamp("DATETIME"));
+        assert!(!is_naive_timestamp("TIMESTAMP WITH TIME ZONE"));
+        assert!(!is_naive_timestamp("TIMESTAMPTZ"));
+        assert!(!is_naive_timestamp("VARCHAR"));
+        let cols = vec!["id".to_string()];
+        use serde_json::json;
+        let recs = vec![
+            json!({"id": 1, "a": 1}),
+            json!({"a": 2, "b": 1.5}),
+            json!(3),
+        ];
+        assert_eq!(missing_fields(&recs, &cols), vec!["a", "b"]);
+        let planned = faucet_core::plan_columns(&recs[1..2]).unwrap();
+        let b = planned.iter().find(|c| c.name == "b").unwrap();
+        assert_eq!(
+            add_column_sql("s.t", b),
+            "ALTER TABLE \"s\".\"t\" ADD COLUMN IF NOT EXISTS \"b\" DOUBLE"
+        );
+        assert_eq!(
+            utc_wall_time("2024-01-02T03:04:05.5Z").as_deref(),
+            Some("2024-01-02 03:04:05.500")
+        );
+        assert_eq!(utc_wall_time("2024-01-02 03:04:05"), None);
+    }
+
     #[test]
     fn quote_table_quotes_each_segment() {
         assert_eq!(quote_table("events"), "\"events\"");
