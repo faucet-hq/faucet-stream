@@ -5141,6 +5141,7 @@ version = "1.1.0"
 dependencies = [
  "faucet-core",
  "gcloud-auth",
+ "gcloud-gax",
  "gcloud-googleapis",
  "gcloud-pubsub",
  "schemars 1.2.1",
@@ -6322,6 +6323,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "urlencoding",
  "wiremock",
 ]
 
@@ -6807,6 +6809,7 @@ version = "1.4.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "faucet-conformance",
  "faucet-core",
  "futures",
@@ -7016,6 +7019,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-sdk-sqs",
+ "base64 0.22.1",
  "faucet-common-sqs",
  "faucet-conformance",
  "faucet-core",
@@ -13046,8 +13050,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bc42f3a12fd4408ce64d8efef67048a924e543bd35c6591c0447fda9054695f"
 dependencies = [
  "arc-swap",
+ "backon",
  "bytes",
  "combine",
+ "futures-channel",
  "futures-util",
  "itoa",
  "num-bigint 0.4.8",
