@@ -710,6 +710,8 @@ impl faucet_core::Sink for IcebergSink {
 
     /// Apply an additive schema evolution by adding each new column as an
     /// **optional** field in a single `update_schema` transaction commit.
+    /// The open writer is closed (its files stay pending for the next commit)
+    /// and later writes decode against the evolved schema.
     ///
     /// iceberg-rust 0.10.0's `UpdateSchemaAction` exposes `add_column` /
     /// `delete_column` but **no** in-place type-promotion or nullability
@@ -735,6 +737,7 @@ impl faucet_core::Sink for IcebergSink {
         }
         // The table must exist to evolve it; if absent (e.g. a race with table
         // creation), stay inert — the create path lays down the full schema.
+        let mut state = self.state.lock().await;
         let table = match self.load_table_readonly().await? {
             Some(t) => t,
             None => return Ok(()),
@@ -747,9 +750,12 @@ impl faucet_core::Sink for IcebergSink {
             action = action.add_column(AddColumn::optional(&add.name, field_type));
         }
         let tx = action.apply(tx).map_err(evolve_schema_err)?;
-        tx.commit(self.catalog.as_ref())
+        let evolved = tx
+            .commit(self.catalog.as_ref())
             .await
             .map_err(evolve_schema_err)?;
+        Self::close_writer(&mut state).await?;
+        state.table = Some(evolved);
         Ok(())
     }
 

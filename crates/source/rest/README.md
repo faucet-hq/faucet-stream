@@ -118,7 +118,7 @@ the secrets/redaction boundary like any other config string.
 | `pagination` | `PaginationStyle` | `None` | Pagination strategy. See [Pagination](#pagination). |
 | `records_path` | string / null | `null` | JSONPath expression to extract the record array from each response body (e.g. `$.data[*]`). When unset, the whole body is treated as the record set. |
 | `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
-| `max_pages` | int / null | `100` | Hard cap on pages fetched, across **all** pagination styles. `null` removes the cap (rely on the style's own termination). |
+| `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short persists no record-derived or window bookmark (it would skip the unread pages); only a `persist_cursor` bookmark is kept, and a windowed sweep stops at that window. |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
 
 **Body & keyset pagination.** Two styles page without a query param or a response token:
@@ -944,7 +944,7 @@ source:
 
 ## Pagination
 
-The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_pages` is a hard cap across all styles.
+The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_pages` is an optional cap across all styles; a capped pass persists no bookmark that would skip unread pages.
 
 | Style (`type`) | Fields | Stops when |
 |----------------|--------|------------|

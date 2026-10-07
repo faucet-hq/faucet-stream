@@ -357,3 +357,136 @@ async fn lag_counts_unconsumed_messages_across_partitions() {
         "a fresh consumer measures from the stored bookmark"
     );
 }
+
+/// MSG-03: resuming from a bookmark with backlog on two partitions, a run that
+/// stops (`max_messages`) before one partition delivers must keep that
+/// partition at its bookmarked offset — not move it to the high watermark the
+/// assign resolved, which would skip its backlog for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_partition_that_has_not_delivered_keeps_its_bookmark() {
+    let (_container, brokers) = start_kafka().await;
+    let topic = "floor-vs-bookmark";
+    create_topic(&brokers, topic, 2).await;
+    for p in [0, 1] {
+        for i in 0..2 {
+            produce_to_partition(&brokers, topic, p, &format!(r#"{{"id":"p{p}-{i}"}}"#)).await;
+        }
+    }
+
+    let mut cfg = source_config(&brokers, topic, "g-msg03", 1);
+    cfg.auto_offset_reset = OffsetReset::Latest;
+    let source = KafkaSource::new(cfg).await.unwrap();
+    source
+        .apply_start_bookmark(serde_json::json!({
+            "partition_offsets": [
+                {"topic": topic, "partition": 0, "offset": 0},
+                {"topic": topic, "partition": 1, "offset": 0}
+            ]
+        }))
+        .await
+        .unwrap();
+    let (records, bookmark) = source.fetch_all_incremental().await.unwrap();
+    assert_eq!(records.len(), 1);
+    let delivered = records[0]["partition"].as_i64().unwrap();
+    let bookmark = bookmark.expect("bookmark");
+    let offset_of = |partition: i64| {
+        bookmark["partition_offsets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["partition"].as_i64() == Some(partition))
+            .and_then(|p| p["offset"].as_i64())
+    };
+    assert_eq!(offset_of(delivered), Some(1));
+    assert_eq!(
+        offset_of(1 - delivered),
+        Some(0),
+        "the partition that delivered nothing keeps its bookmark, got {bookmark}"
+    );
+}
+
+/// MSG-15: outside member mode nothing is committed to the group, so a later
+/// rebalance used to restart a re-assigned partition at `auto.offset.reset`
+/// and skip what arrived meanwhile. A second member joins (taking a
+/// partition), records land, the member leaves without committing, and the
+/// source — re-assigned both partitions — must still read every record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebalance_mid_run_resumes_reassigned_partitions_from_delivered_offsets() {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+
+    let (_container, brokers) = start_kafka().await;
+    let topic = "rebalance-resume";
+    create_topic(&brokers, topic, 2).await;
+    produce_to_partition(&brokers, topic, 0, r#"{"id":"p0-0"}"#).await;
+    produce_to_partition(&brokers, topic, 1, r#"{"id":"p1-0"}"#).await;
+
+    let group = "g-msg15";
+    let mut cfg = source_config(&brokers, topic, group, 4);
+    cfg.auto_offset_reset = OffsetReset::Latest;
+    cfg.idle_timeout = Some(Duration::from_secs(45));
+    cfg.session_timeout = Duration::from_secs(10);
+    let source = KafkaSource::new(cfg).await.unwrap();
+    source
+        .apply_start_bookmark(serde_json::json!({
+            "partition_offsets": [
+                {"topic": topic, "partition": 0, "offset": 0},
+                {"topic": topic, "partition": 1, "offset": 0}
+            ]
+        }))
+        .await
+        .unwrap();
+    let run = tokio::spawn(async move { source.fetch_all_incremental().await });
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let joiner_brokers = brokers.clone();
+    let joiner = tokio::task::spawn_blocking(move || {
+        let other: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &joiner_brokers)
+            .set("group.id", group)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "latest")
+            .set("session.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        other.subscribe(&[topic]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        while other.assignment().map(|a| a.count()).unwrap_or(0) == 0
+            && std::time::Instant::now() < deadline
+        {
+            let _ = other.poll(Duration::from_millis(200));
+        }
+        other
+    })
+    .await
+    .unwrap();
+    assert!(
+        joiner.assignment().unwrap().count() > 0,
+        "the second member must take a partition"
+    );
+
+    produce_to_partition(&brokers, topic, 0, r#"{"id":"p0-1"}"#).await;
+    produce_to_partition(&brokers, topic, 1, r#"{"id":"p1-1"}"#).await;
+    let joiner = tokio::task::spawn_blocking(move || {
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < until {
+            let _ = joiner.poll(Duration::from_millis(200));
+        }
+        joiner.unsubscribe();
+        joiner
+    })
+    .await
+    .unwrap();
+    drop(joiner);
+
+    let (records, _) = run.await.unwrap().unwrap();
+    let mut ids: Vec<String> = records
+        .iter()
+        .map(|r| r["value"]["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["p0-0", "p0-1", "p1-0", "p1-1"],
+        "no record is skipped when partitions come back after a rebalance"
+    );
+}

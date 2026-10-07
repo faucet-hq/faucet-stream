@@ -19,6 +19,10 @@ Connection fields come from `faucet-common-azure` and are set at the top level:
 | `endpoint` | string | Custom blob endpoint (emulator / sovereign cloud). |
 | `allow_http` | bool | Permit plaintext HTTP (Azurite). |
 | `use_emulator` | bool | Target the Azurite emulator. |
+| `timeout_secs` | int | Seconds one request, body included, may take. Unset (default) = no limit, so a long body read paced by the pipeline is not cut off. |
+| `connect_timeout_secs` | int | Seconds to wait for a connection (default `10`). |
+| `max_retries` | int | Retries of a failed request, including resuming an interrupted body read (default `10`). |
+| `retry_timeout_secs` | int | Seconds after a request first went out during which it may still be retried or resumed (default `600`); keep it within the credential's lifetime. |
 
 Sink-specific fields:
 
@@ -183,6 +187,9 @@ sink:
     max_records_per_file: 1000000
     parquet: { compression: zstd, row_group_size: 131072 }
 ```
+
+
+> **Shared destinations are refused at load.** With `path` set, the CLI refuses two matrix rows writing the same destination and a fan-out row without a per-invocation token (`${parent.id}`) in it: concurrent writers would overwrite each other's parts and prune the rest.
 
 ## Batch atomicity
 

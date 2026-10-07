@@ -88,240 +88,249 @@ impl GrpcStream {
 
         match self.config.rpc_kind {
             RpcKind::Unary => {
-                let channel = self.connect_channel(endpoint).await?;
-                let mut grpc_client = self.configure_client(tonic::client::Grpc::new(channel));
-                grpc_client
-                    .ready()
+                self.unary_call(endpoint, path, output_desc, request_bytes)
                     .await
-                    .map_err(|e| FaucetError::Config(format!("gRPC channel not ready: {e}")))?;
-
-                let codec = DynamicCodec::new(output_desc);
-                let request = self.build_grpc_request(request_bytes).await?;
-
-                let response: tonic::Response<DynamicMessage> = grpc_client
-                    .unary(request, path, codec)
-                    .await
-                    .map_err(|e| FaucetError::Source(format!("gRPC unary call failed: {e}")))?;
-
-                let resp_msg = response.into_inner();
-                let records =
-                    serialize_and_extract(&resp_msg, self.config.records_path.as_deref())?;
-                tracing::info!(records = records.len(), "gRPC unary fetch complete");
-                Ok(records)
             }
             RpcKind::ServerStreaming => {
-                self.fetch_server_streaming_collect(endpoint, path, output_desc, request_bytes)
-                    .await
+                let mut pages = self.server_stream_resolved(
+                    endpoint.to_string(),
+                    path,
+                    output_desc,
+                    request_bytes,
+                    usize::MAX,
+                );
+                let mut all = Vec::new();
+                while let Some(page) = std::future::poll_fn(|cx| pages.as_mut().poll_next(cx)).await
+                {
+                    all.extend(page?.records);
+                }
+                Ok(all)
             }
         }
     }
 
-    /// Drain a server-streaming RPC into a fully-buffered `Vec<Value>`.
-    ///
-    /// Reconnect-on-error and `max_messages` are honoured. The full result
-    /// is collected before returning, so memory is O(stream length). For
-    /// memory-bounded consumption use [`Source::stream_pages`].
-    async fn fetch_server_streaming_collect(
+    /// One unary call. A shared provider's credential rejected with
+    /// `UNAUTHENTICATED` is invalidated and the call retried once.
+    async fn unary_call(
         &self,
         endpoint: &str,
         path: tonic::codegen::http::uri::PathAndQuery,
         output_desc: MessageDescriptor,
         request_bytes: Vec<u8>,
     ) -> Result<Vec<Value>, FaucetError> {
-        let max_messages = self.config.max_messages.unwrap_or(usize::MAX);
-        let mut all: Vec<Value> = Vec::new();
-        let mut messages_seen: usize = 0;
-        let mut attempt: u32 = 0;
-        let initial_backoff = self.config.reconnect_initial_backoff;
-        let max_backoff = self.config.reconnect_max_backoff;
-
+        let mut reauthed = false;
         loop {
-            match self
-                .drive_server_streaming_once(
-                    endpoint,
-                    path.clone(),
-                    output_desc.clone(),
-                    request_bytes.clone(),
-                    max_messages,
-                    messages_seen,
-                    |records| {
-                        all.extend(records);
-                        Ok(())
-                    },
-                )
+            let channel = self.connect_channel(endpoint).await?;
+            let mut grpc_client = self.configure_client(tonic::client::Grpc::new(channel));
+            grpc_client
+                .ready()
                 .await
-            {
-                Ok(consumed) => {
-                    tracing::info!(
-                        records = all.len(),
-                        messages = messages_seen + consumed,
-                        "gRPC server-streaming fetch complete"
-                    );
-                    return Ok(all);
-                }
-                Err(StreamOutcome::Done(consumed)) => {
-                    messages_seen += consumed;
-                    tracing::info!(
-                        records = all.len(),
-                        messages = messages_seen,
-                        "gRPC server-streaming fetch complete (max_messages reached)"
-                    );
-                    return Ok(all);
-                }
-                Err(StreamOutcome::Transient { consumed, error }) => {
-                    messages_seen += consumed;
-                    if self.config.terminate_on_error {
-                        return Err(error);
-                    }
-                    // If this attempt delivered messages before failing, the
-                    // stream recovered and made progress — so this disconnect is
-                    // a fresh transient failure, not a consecutive one. Reset the
-                    // attempt counter and backoff; otherwise a healthy long-lived
-                    // stream is aborted once its *lifetime* reconnects reach
-                    // reconnect_max_attempts, and backoff stays pinned at the cap
-                    // after one early hiccup (audit #146 H8).
-                    if consumed > 0 {
-                        attempt = 0;
-                    }
-                    if let Some(max_attempts) = self.config.reconnect_max_attempts
-                        && attempt >= max_attempts
-                    {
+                .map_err(|e| FaucetError::Source(format!("gRPC channel not ready: {e}")))?;
+
+            let (request, sent) = self.build_grpc_request(request_bytes.clone()).await?;
+            let call = grpc_client.unary(
+                request,
+                path.clone(),
+                DynamicCodec::new(output_desc.clone()),
+            );
+            let response: tonic::Response<DynamicMessage> =
+                match with_timeout(self.config.timeout, call).await {
+                    Some(Ok(r)) => r,
+                    Some(Err(status)) => {
+                        if !reauthed && self.reauth(&status, sent.as_ref()).await? {
+                            reauthed = true;
+                            continue;
+                        }
                         return Err(FaucetError::Source(format!(
-                            "gRPC server-streaming exceeded reconnect_max_attempts={max_attempts}: {error}"
+                            "gRPC unary call failed: {status}"
                         )));
                     }
-                    let backoff = reconnect_delay(initial_backoff, max_backoff, attempt);
-                    attempt += 1;
-                    tracing::warn!(
-                        attempt,
-                        backoff_ms = backoff.as_millis() as u64,
-                        error = %error,
-                        "gRPC server-streaming transient error, reconnecting"
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-            }
+                    None => {
+                        return Err(FaucetError::Source(format!(
+                            "gRPC unary call timed out after {}s",
+                            secs(self.config.timeout)
+                        )));
+                    }
+                };
+
+            let records =
+                serialize_and_extract(&response.into_inner(), self.config.records_path.as_deref())?;
+            tracing::info!(records = records.len(), "gRPC unary fetch complete");
+            return Ok(records);
         }
     }
 
-    /// Open one server-streaming attempt and drain it until the server closes,
-    /// `max_messages` is hit, or a transport/status error occurs.
-    ///
-    /// On clean end-of-stream returns `Ok(consumed_messages)` so the caller can
-    /// stop retrying. On `max_messages` returns `Err(StreamOutcome::Done(...))`
-    /// (a "logical done", not a transient failure). On transient error returns
-    /// `Err(StreamOutcome::Transient { ... })` and the caller may reconnect.
-    #[allow(clippy::too_many_arguments)]
-    async fn drive_server_streaming_once<F>(
+    /// Invalidate the shared provider's credential when the server rejected it
+    /// with `UNAUTHENTICATED`. Returns whether the caller should retry.
+    async fn reauth(
+        &self,
+        status: &tonic::Status,
+        sent: Option<&Credential>,
+    ) -> Result<bool, FaucetError> {
+        match (&self.auth_provider, sent) {
+            (Some(provider), Some(cred)) if status.code() == tonic::Code::Unauthenticated => {
+                provider.invalidate(cred).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Connect, authenticate and start one server-streaming call.
+    async fn open_server_stream(
         &self,
         endpoint: &str,
         path: tonic::codegen::http::uri::PathAndQuery,
         output_desc: MessageDescriptor,
         request_bytes: Vec<u8>,
-        max_messages: usize,
-        already_seen: usize,
-        mut on_records: F,
-    ) -> Result<usize, StreamOutcome>
-    where
-        F: FnMut(Vec<Value>) -> Result<(), FaucetError>,
-    {
-        let channel = match self.connect_channel(endpoint).await {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(StreamOutcome::Transient {
-                    consumed: 0,
-                    error: e,
-                });
-            }
-        };
-
+    ) -> Result<(tonic::Streaming<DynamicMessage>, Option<Credential>), Failure> {
+        let channel = self
+            .connect_channel(endpoint)
+            .await
+            .map_err(Failure::from_connect)?;
         let mut grpc_client = self.configure_client(tonic::client::Grpc::new(channel));
-        if let Err(e) = grpc_client.ready().await {
-            return Err(StreamOutcome::Transient {
-                consumed: 0,
-                error: FaucetError::Source(format!("gRPC channel not ready: {e}")),
-            });
+        grpc_client.ready().await.map_err(|e| {
+            Failure::Retry(FaucetError::Source(format!("gRPC channel not ready: {e}")))
+        })?;
+        let (request, sent) = self
+            .build_grpc_request(request_bytes)
+            .await
+            .map_err(Failure::Fatal)?;
+        let call = grpc_client.server_streaming(request, path, DynamicCodec::new(output_desc));
+        match with_timeout(self.config.timeout, call).await {
+            Some(Ok(response)) => Ok((response.into_inner(), sent)),
+            Some(Err(status)) => Err(Failure::from_status(
+                "gRPC server-streaming start failed",
+                status,
+                sent,
+            )),
+            None => Err(Failure::Retry(FaucetError::Source(format!(
+                "gRPC server-streaming start timed out after {}s",
+                secs(self.config.timeout)
+            )))),
         }
+    }
 
-        let codec = DynamicCodec::new(output_desc);
-        let request = match self.build_grpc_request(request_bytes).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Auth/metadata errors are not transient — propagate directly.
-                return Err(StreamOutcome::Transient {
-                    consumed: 0,
-                    error: e,
-                });
-            }
-        };
-
-        let response = match grpc_client.server_streaming(request, path, codec).await {
-            Ok(r) => r,
-            Err(status) => {
-                return Err(StreamOutcome::Transient {
-                    consumed: 0,
-                    error: FaucetError::Source(format!(
-                        "gRPC server-streaming start failed: {status}"
-                    )),
-                });
-            }
-        };
-
-        let mut streaming = response.into_inner();
+    /// Drive a server-streaming RPC, yielding a page each time `page_chunk`
+    /// records accumulate. Transient failures reconnect with backoff; others
+    /// end the stream with an error.
+    fn server_stream_resolved<'a>(
+        &'a self,
+        endpoint: String,
+        path: tonic::codegen::http::uri::PathAndQuery,
+        output_desc: MessageDescriptor,
+        request_bytes: Vec<u8>,
+        page_chunk: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+        let max_messages = self.config.max_messages.unwrap_or(usize::MAX);
         let records_path = self.config.records_path.as_deref();
-        // On a reconnect a stateless server replays the stream from message 0.
-        // Skip the messages we already emitted before the disconnect so each
-        // is delivered to the consumer exactly once. Disabled (skip = 0) when
-        // the server is known to resume mid-stream on the same request.
-        let skip = if self.config.reconnect_replay_from_start {
-            already_seen
-        } else {
-            0
-        };
-        let mut position: usize = 0; // messages read from this attempt's stream
-        let mut emitted: usize = 0; // messages newly emitted this attempt
-
-        loop {
-            if already_seen + emitted >= max_messages {
-                return Err(StreamOutcome::Done(emitted));
-            }
-            match streaming.message().await {
-                Ok(Some(msg)) => {
-                    position += 1;
-                    if position <= skip {
-                        // Replayed message we already emitted — discard it.
-                        continue;
-                    }
-                    let records = match serialize_and_extract(&msg, records_path) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return Err(StreamOutcome::Transient {
-                                consumed: emitted,
-                                error: e,
-                            });
-                        }
+        Box::pin(async_stream::try_stream! {
+            let mut buffer: Vec<Value> = Vec::new();
+            let mut emitted: usize = 0;
+            let mut attempt: u32 = 0;
+            let mut reauthed = false;
+            loop {
+                let failure = 'attempt: {
+                    let (mut streaming, sent) = match self
+                        .open_server_stream(&endpoint, path.clone(), output_desc.clone(), request_bytes.clone())
+                        .await
+                    {
+                        Ok(opened) => opened,
+                        Err(failure) => break 'attempt failure,
                     };
-                    if let Err(e) = on_records(records) {
-                        return Err(StreamOutcome::Transient {
-                            consumed: emitted,
-                            error: e,
-                        });
+                    let skip = if self.config.reconnect_replay_from_start { emitted } else { 0 };
+                    let mut position: usize = 0;
+                    loop {
+                        if emitted >= max_messages {
+                            if !buffer.is_empty() {
+                                yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                            }
+                            tracing::info!(messages = emitted, "gRPC server-streaming complete (max_messages reached)");
+                            return;
+                        }
+                        let Some(next) = with_timeout(self.config.idle_timeout, streaming.message()).await else {
+                            break 'attempt Failure::Retry(FaucetError::Source(format!(
+                                "gRPC server-streaming received no message for {}s",
+                                secs(self.config.idle_timeout)
+                            )));
+                        };
+                        match next {
+                            Ok(Some(msg)) => {
+                                position += 1;
+                                if position <= skip {
+                                    continue;
+                                }
+                                match serialize_and_extract(&msg, records_path) {
+                                    Ok(records) => buffer.extend(records),
+                                    Err(e) => break 'attempt Failure::Fatal(e),
+                                }
+                                emitted += 1;
+                                attempt = 0;
+                                reauthed = false;
+                                while buffer.len() >= page_chunk {
+                                    let page: Vec<Value> = buffer.drain(..page_chunk).collect();
+                                    yield StreamPage { records: page, bookmark: None };
+                                }
+                            }
+                            Ok(None) => {
+                                if !buffer.is_empty() {
+                                    yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                                }
+                                tracing::info!(messages = emitted, "gRPC server-streaming complete");
+                                return;
+                            }
+                            Err(status) => {
+                                break 'attempt Failure::from_status("gRPC server-streaming recv failed", status, sent);
+                            }
+                        }
                     }
-                    emitted += 1;
-                }
-                Ok(None) => {
-                    return Ok(emitted);
-                }
-                Err(status) => {
-                    return Err(StreamOutcome::Transient {
-                        consumed: emitted,
-                        error: FaucetError::Source(format!(
-                            "gRPC server-streaming recv failed: {status}"
-                        )),
-                    });
+                };
+                match failure {
+                    Failure::Unauthenticated { error, sent } => {
+                        if !reauthed
+                            && let (Some(provider), Some(cred)) = (&self.auth_provider, sent)
+                        {
+                            provider.invalidate(&cred).await?;
+                            reauthed = true;
+                            continue;
+                        }
+                        Err(error)?;
+                        return;
+                    }
+                    Failure::Fatal(error) => {
+                        Err(error)?;
+                        return;
+                    }
+                    Failure::Retry(error) => {
+                        if self.config.terminate_on_error {
+                            Err(error)?;
+                            return;
+                        }
+                        if let Some(max_attempts) = self.config.reconnect_max_attempts
+                            && attempt >= max_attempts
+                        {
+                            Err(FaucetError::Source(format!(
+                                "gRPC server-streaming exceeded reconnect_max_attempts={max_attempts}: {error}"
+                            )))?;
+                            return;
+                        }
+                        let backoff = reconnect_delay(
+                            self.config.reconnect_initial_backoff,
+                            self.config.reconnect_max_backoff,
+                            attempt,
+                        );
+                        attempt += 1;
+                        tracing::warn!(
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            error = %error,
+                            "gRPC server-streaming transient error, reconnecting"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
                 }
             }
-        }
+        })
     }
 
     /// Look up the method's output descriptor and encode the request message.
@@ -361,8 +370,11 @@ impl GrpcStream {
             .tls
             .unwrap_or_else(|| endpoint.starts_with("https"));
 
-        let channel_endpoint = Channel::from_shared(endpoint.to_string())
+        let mut channel_endpoint = Channel::from_shared(endpoint.to_string())
             .map_err(|e| FaucetError::Url(format!("invalid gRPC endpoint: {e}")))?;
+        if let Some(limit) = self.config.connect_timeout {
+            channel_endpoint = channel_endpoint.connect_timeout(limit);
+        }
 
         let channel = if use_tls {
             channel_endpoint
@@ -405,9 +417,12 @@ impl GrpcStream {
     async fn build_grpc_request(
         &self,
         request_bytes: Vec<u8>,
-    ) -> Result<tonic::Request<Vec<u8>>, FaucetError> {
+    ) -> Result<(tonic::Request<Vec<u8>>, Option<Credential>), FaucetError> {
+        let mut sent = None;
         let effective = if let Some(provider) = &self.auth_provider {
-            credential_to_auth(provider.credential().await?)
+            let cred = provider.credential().await?;
+            sent = Some(cred.clone());
+            credential_to_auth(cred)
         } else {
             match &self.config.auth {
                 AuthSpec::Inline(a) => a.clone(),
@@ -423,7 +438,7 @@ impl GrpcStream {
 
         let mut request = tonic::Request::new(request_bytes);
         apply_grpc_auth(&effective, &mut request)?;
-        Ok(request)
+        Ok((request, sent))
     }
 }
 
@@ -542,157 +557,63 @@ impl GrpcStream {
         })
     }
 
-    /// Server-streaming page stream — opens the stream, buffers per
-    /// `config.batch_size`, and yields a page on each fill. Reconnects on
-    /// transient errors unless `terminate_on_error` is set.
+    /// Server-streaming page stream: resolves the call once, then drives it
+    /// through [`Self::server_stream_resolved`] with `config.batch_size` pages.
     fn server_streaming_pages<'a>(
         &'a self,
         context: &'a std::collections::HashMap<String, Value>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
-        let batch_size = self.config.batch_size;
-        let page_chunk = if batch_size == 0 {
+        let page_chunk = if self.config.batch_size == 0 {
             usize::MAX
         } else {
-            batch_size
+            self.config.batch_size
         };
-        let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
-        let max_messages = self.config.max_messages.unwrap_or(usize::MAX);
-        let terminate_on_error = self.config.terminate_on_error;
-        let reconnect_max_attempts = self.config.reconnect_max_attempts;
-        let reconnect_initial_backoff = self.config.reconnect_initial_backoff;
-        let max_backoff = self.config.reconnect_max_backoff;
-
-        Box::pin(async_stream::try_stream! {
-            // Resolve context-substituted strings once per run — reconnects
-            // re-use the same resolved values so a long-lived stream is
-            // stable even if matrix placeholders change between runs.
-            let endpoint = if context.is_empty() {
-                self.config.endpoint.clone()
-            } else {
-                faucet_core::util::substitute_context(&self.config.endpoint, context)
-            };
-            let service_name = if context.is_empty() {
-                self.config.service_name.clone()
-            } else {
-                faucet_core::util::substitute_context(&self.config.service_name, context)
-            };
-            let method_name = if context.is_empty() {
-                self.config.method_name.clone()
-            } else {
-                faucet_core::util::substitute_context(&self.config.method_name, context)
-            };
-            let request: Value = if context.is_empty() {
-                self.config.request.clone()
-            } else {
-                let s = serde_json::to_string(&self.config.request)
-                    .map_err(|e| FaucetError::Config(format!("failed to serialize request: {e}")))?;
-                let s = faucet_core::util::substitute_context_json(&s, context);
-                serde_json::from_str(&s).map_err(|e| FaucetError::Config(format!(
-                    "failed to parse substituted request: {e}"
-                )))?
-            };
-
-            let (output_desc, request_bytes) =
-                self.prepare_call(&service_name, &method_name, &request)?;
-            let path = parse_method_path(&service_name, &method_name)?;
-
-            let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
-            let mut messages_seen: usize = 0;
-            let mut attempt: u32 = 0;
-
-            'reconnect: loop {
-                // Open one streaming attempt and drain it. The closure
-                // appends extracted records into `buffer` so we can keep
-                // emitting pages across reconnects.
-                let outcome = self.drive_server_streaming_once(
-                    &endpoint,
-                    path.clone(),
-                    output_desc.clone(),
-                    request_bytes.clone(),
-                    max_messages,
-                    messages_seen,
-                    |records| {
-                        buffer.extend(records);
-                        Ok(())
-                    },
-                ).await;
-
-                // Flush any complete pages accumulated in the buffer, even
-                // when the attempt ended in a transient error — records
-                // received before the disconnect are still valid.
-                while buffer.len() >= page_chunk {
-                    let drained: Vec<Value> = buffer.drain(..page_chunk).collect();
-                    yield StreamPage { records: drained, bookmark: None };
-                }
-
-                match outcome {
-                    Ok(consumed) => {
-                        messages_seen += consumed;
-                        // Clean end-of-stream — flush the trailing partial
-                        // buffer and stop.
-                        if !buffer.is_empty() {
-                            let final_records = std::mem::take(&mut buffer);
-                            yield StreamPage { records: final_records, bookmark: None };
-                        }
-                        tracing::info!(
-                            messages = messages_seen,
-                            "gRPC server-streaming complete"
-                        );
-                        break 'reconnect;
-                    }
-                    Err(StreamOutcome::Done(consumed)) => {
-                        messages_seen += consumed;
-                        if !buffer.is_empty() {
-                            let final_records = std::mem::take(&mut buffer);
-                            yield StreamPage { records: final_records, bookmark: None };
-                        }
-                        tracing::info!(
-                            messages = messages_seen,
-                            "gRPC server-streaming complete (max_messages reached)"
-                        );
-                        break 'reconnect;
-                    }
-                    Err(StreamOutcome::Transient { consumed, error }) => {
-                        messages_seen += consumed;
-                        if terminate_on_error {
-                            // `?` yields the error and ends the stream; the
-                            // trailing `return` both makes that explicit and
-                            // lets the borrow checker see this branch diverges
-                            // (so `error` is still available below). Replaces a
-                            // fragile `unreachable!()` (#78 LOW).
-                            Err(error)?;
-                            return;
-                        }
-                        // Progress before the disconnect → the stream recovered,
-                        // so reset the attempt counter and backoff (count only
-                        // *consecutive* failures, don't pin backoff at the cap) —
-                        // audit #146 H8.
-                        if consumed > 0 {
-                            attempt = 0;
-                        }
-                        if let Some(max_attempts) = reconnect_max_attempts
-                            && attempt >= max_attempts
-                        {
-                            let final_err = FaucetError::Source(format!(
-                                "gRPC server-streaming exceeded reconnect_max_attempts={max_attempts}: {error}"
-                            ));
-                            Err(final_err)?;
-                            return;
-                        }
-                        let backoff =
-                            reconnect_delay(reconnect_initial_backoff, max_backoff, attempt);
-                        attempt += 1;
-                        tracing::warn!(
-                            attempt,
-                            backoff_ms = backoff.as_millis() as u64,
-                            error = %error,
-                            "gRPC server-streaming transient error, reconnecting"
-                        );
-                        tokio::time::sleep(backoff).await;
-                    }
-                }
+        match self.resolve_call(context) {
+            Ok((endpoint, path, output_desc, request_bytes)) => {
+                self.server_stream_resolved(endpoint, path, output_desc, request_bytes, page_chunk)
             }
-        })
+            Err(e) => Box::pin(async_stream::stream! { yield Err(e); }),
+        }
+    }
+
+    /// Substitute the matrix context into the endpoint, service, method and
+    /// request, and encode the request message.
+    fn resolve_call(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<
+        (
+            String,
+            tonic::codegen::http::uri::PathAndQuery,
+            MessageDescriptor,
+            Vec<u8>,
+        ),
+        FaucetError,
+    > {
+        let sub = |s: &str| {
+            if context.is_empty() {
+                s.to_string()
+            } else {
+                faucet_core::util::substitute_context(s, context)
+            }
+        };
+        let endpoint = sub(&self.config.endpoint);
+        let service_name = sub(&self.config.service_name);
+        let method_name = sub(&self.config.method_name);
+        let request: Value = if context.is_empty() {
+            self.config.request.clone()
+        } else {
+            let s = serde_json::to_string(&self.config.request)
+                .map_err(|e| FaucetError::Config(format!("failed to serialize request: {e}")))?;
+            let s = faucet_core::util::substitute_context_json(&s, context);
+            serde_json::from_str(&s).map_err(|e| {
+                FaucetError::Config(format!("failed to parse substituted request: {e}"))
+            })?
+        };
+        let (output_desc, request_bytes) =
+            self.prepare_call(&service_name, &method_name, &request)?;
+        let path = parse_method_path(&service_name, &method_name)?;
+        Ok((endpoint, path, output_desc, request_bytes))
     }
 }
 
@@ -797,12 +718,66 @@ fn reconnect_delay(base: Duration, cap: Duration, attempt: u32) -> Duration {
     faucet_core::retry::apply_jitter(exp)
 }
 
-/// Outcome of one server-streaming attempt. `Done` is a logical stop signal
-/// (e.g. `max_messages` hit) that should not trigger a reconnect; `Transient`
-/// carries a real error that may be retried subject to the reconnect config.
-enum StreamOutcome {
-    Done(usize),
-    Transient { consumed: usize, error: FaucetError },
+/// Why a server-streaming attempt ended without finishing the stream.
+enum Failure {
+    /// Worth reconnecting: a dropped connection, a stall, or a status the
+    /// server uses for temporary conditions.
+    Retry(FaucetError),
+    /// The shared provider's credential was rejected; `sent` is the
+    /// credential to invalidate before one retry.
+    Unauthenticated {
+        error: FaucetError,
+        sent: Option<Credential>,
+    },
+    /// Retrying cannot help: bad config, auth, decode or request errors.
+    Fatal(FaucetError),
+}
+
+impl Failure {
+    fn from_connect(error: FaucetError) -> Self {
+        match error {
+            FaucetError::Source(_) => Failure::Retry(error),
+            other => Failure::Fatal(other),
+        }
+    }
+
+    fn from_status(context: &str, status: tonic::Status, sent: Option<Credential>) -> Self {
+        let error = FaucetError::Source(format!("{context}: {status}"));
+        match status.code() {
+            tonic::Code::Unauthenticated => Failure::Unauthenticated { error, sent },
+            code if is_transient(code) => Failure::Retry(error),
+            _ => Failure::Fatal(error),
+        }
+    }
+}
+
+/// Status codes a reconnect can cure. Transport failures mid-stream surface as
+/// `UNKNOWN` or `INTERNAL`; decode errors are `DATA_LOSS` and oversized
+/// messages `OUT_OF_RANGE`, both fatal.
+fn is_transient(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Aborted
+            | tonic::Code::Unknown
+            | tonic::Code::Internal
+    )
+}
+
+async fn with_timeout<F: std::future::Future>(
+    limit: Option<Duration>,
+    fut: F,
+) -> Option<F::Output> {
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
+
+fn secs(limit: Option<Duration>) -> u64 {
+    limit.map_or(0, |d| d.as_secs())
 }
 
 // ── Dynamic Codec ───────────────────────────────────────────────────────────
@@ -863,7 +838,7 @@ impl Decoder for DynamicDecoder {
         }
         let bytes = buf.copy_to_bytes(buf.remaining());
         let msg = DynamicMessage::decode(self.desc.clone(), bytes)
-            .map_err(|e| tonic::Status::internal(format!("protobuf decode error: {e}")))?;
+            .map_err(|e| tonic::Status::data_loss(format!("protobuf decode error: {e}")))?;
         Ok(Some(msg))
     }
 }
@@ -1073,10 +1048,11 @@ mod tests {
         let provider: SharedAuthProvider = Arc::new(FixedBearer("MYTOKEN"));
         let stream = make_dummy_stream().with_auth_provider(provider);
         // config.auth is Inline(None) but the provider should inject Bearer.
-        let req = stream
+        let (req, sent) = stream
             .build_grpc_request(vec![])
             .await
             .expect("build request");
+        assert_eq!(sent, Some(Credential::Bearer("MYTOKEN".into())));
         let auth_header = req
             .metadata()
             .get("authorization")
@@ -1093,6 +1069,63 @@ mod tests {
         assert_eq!(
             stream.dataset_uri(),
             "http://localhost:50051/dummy.Svc/Call"
+        );
+    }
+
+    #[test]
+    fn failures_are_classified_by_status_code() {
+        assert!(matches!(
+            Failure::from_status("x", tonic::Status::unavailable("down"), None),
+            Failure::Retry(_)
+        ));
+        assert!(matches!(
+            Failure::from_status("x", tonic::Status::internal("rst"), None),
+            Failure::Retry(_)
+        ));
+        assert!(matches!(
+            Failure::from_status("x", tonic::Status::permission_denied("no"), None),
+            Failure::Fatal(_)
+        ));
+        assert!(matches!(
+            Failure::from_status("x", tonic::Status::data_loss("decode"), None),
+            Failure::Fatal(_)
+        ));
+        assert!(matches!(
+            Failure::from_status(
+                "x",
+                tonic::Status::unauthenticated("revoked"),
+                Some(Credential::Bearer("t".into()))
+            ),
+            Failure::Unauthenticated { sent: Some(_), .. }
+        ));
+        assert!(matches!(
+            Failure::from_connect(FaucetError::Source("refused".into())),
+            Failure::Retry(_)
+        ));
+        assert!(matches!(
+            Failure::from_connect(FaucetError::Url("bad".into())),
+            Failure::Fatal(_)
+        ));
+        assert_eq!(secs(None), 0);
+        assert_eq!(secs(Some(Duration::from_secs(7))), 7);
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_streaming_call_yields_one_error() {
+        use faucet_core::Source;
+        let mut stream = make_dummy_stream();
+        stream.config.rpc_kind = RpcKind::ServerStreaming;
+        let ctx = std::collections::HashMap::new();
+        let mut pages = stream.stream_pages(&ctx, 10);
+        let first = std::future::poll_fn(|cx| pages.as_mut().poll_next(cx)).await;
+        let err = first
+            .expect("one item")
+            .expect_err("service is not in the descriptor");
+        assert!(err.to_string().contains("dummy.Svc"), "{err}");
+        assert!(
+            std::future::poll_fn(|cx| pages.as_mut().poll_next(cx))
+                .await
+                .is_none()
         );
     }
 }

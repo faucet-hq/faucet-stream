@@ -124,28 +124,31 @@ pub struct GrpcStreamConfig {
     )]
     #[schemars(with = "u64")]
     pub reconnect_max_backoff: Duration,
-    /// For [`RpcKind::ServerStreaming`] reconnect: maximum reconnect attempts
-    /// before surfacing the error. `None` (the default) means unlimited
-    /// retries.
+    /// For [`RpcKind::ServerStreaming`] reconnect: maximum consecutive
+    /// reconnect attempts before surfacing the error. Defaults to 10; the
+    /// count resets whenever a stream delivers a message. `null` means
+    /// unlimited retries.
     ///
     /// The historical WebSocket-source spelling `max_reconnect_attempts` is
     /// accepted as an alias (#654 M20) — the prefix used to be reversed
     /// between the two connectors, so a user who learned one spelling had the
     /// other silently ignored and reconnected without a bound.
-    #[serde(default, alias = "max_reconnect_attempts")]
+    #[serde(
+        default = "default_reconnect_max_attempts",
+        alias = "max_reconnect_attempts"
+    )]
     pub reconnect_max_attempts: Option<u32>,
     /// For [`RpcKind::ServerStreaming`] reconnect: whether the server replays
     /// the response stream from the beginning when the identical request is
-    /// re-issued after a disconnect. Defaults to `true`.
+    /// re-issued after a disconnect. Defaults to `false`.
     ///
-    /// Because the request is resolved once per run, a reconnect sends the
-    /// *same* request — a stateless server therefore re-streams from message
-    /// 0. When `true` the source skips the messages it already emitted before
-    /// the disconnect, so consumers see each message once. Set to `false`
-    /// only for servers that resume mid-stream on the same request (rare):
-    /// there, skipping would drop genuinely-new messages, so every received
-    /// message is emitted (at-least-once; duplicates possible).
-    #[serde(default = "default_reconnect_replay_from_start")]
+    /// When `false` every message received after a reconnect is emitted
+    /// (at-least-once: a server that replays produces duplicates). Set it to
+    /// `true` only for a server known to re-stream the same messages in the
+    /// same order from message 0: the source then skips as many messages as it
+    /// already emitted. Against a live feed that sends new events after a
+    /// resubscribe, `true` silently drops that many new messages.
+    #[serde(default)]
     pub reconnect_replay_from_start: bool,
     /// Maximum size, in bytes, of a single inbound (decoded) gRPC message.
     /// `None` (the default) keeps tonic's built-in 4 MiB limit. Raise this
@@ -159,14 +162,54 @@ pub struct GrpcStreamConfig {
     /// needs tuning for a data source, since requests are typically small.
     #[serde(default)]
     pub max_encoding_message_size: Option<usize>,
+    /// Seconds to wait for the TCP/TLS connection to the endpoint. Defaults to
+    /// 10; `null` waits indefinitely.
+    #[serde(
+        default = "default_connect_timeout",
+        with = "faucet_core::config::duration_secs_option"
+    )]
+    #[schemars(with = "Option<u64>")]
+    pub connect_timeout: Option<Duration>,
+    /// Seconds a unary call may take, and how long a server-streaming call may
+    /// take to start (response headers). Defaults to 30; `null` waits
+    /// indefinitely. A timed-out server-streaming start is retried like any
+    /// other transient error.
+    #[serde(
+        default = "default_request_timeout",
+        with = "faucet_core::config::duration_secs_option"
+    )]
+    #[schemars(with = "Option<u64>")]
+    pub timeout: Option<Duration>,
+    /// For [`RpcKind::ServerStreaming`]: seconds to wait for the next message
+    /// before treating the stream as stalled and reconnecting. Defaults to
+    /// 300; `null` waits indefinitely (a half-open connection then hangs the
+    /// run).
+    #[serde(
+        default = "default_idle_timeout",
+        with = "faucet_core::config::duration_secs_option"
+    )]
+    #[schemars(with = "Option<u64>")]
+    pub idle_timeout: Option<Duration>,
 }
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
 }
 
-fn default_reconnect_replay_from_start() -> bool {
-    true
+fn default_reconnect_max_attempts() -> Option<u32> {
+    Some(10)
+}
+
+fn default_connect_timeout() -> Option<Duration> {
+    Some(Duration::from_secs(10))
+}
+
+fn default_request_timeout() -> Option<Duration> {
+    Some(Duration::from_secs(30))
+}
+
+fn default_idle_timeout() -> Option<Duration> {
+    Some(Duration::from_secs(300))
 }
 
 fn default_reconnect_initial_backoff() -> Duration {
@@ -200,10 +243,13 @@ impl GrpcStreamConfig {
             terminate_on_error: false,
             reconnect_initial_backoff: default_reconnect_initial_backoff(),
             reconnect_max_backoff: default_reconnect_max_backoff(),
-            reconnect_max_attempts: None,
-            reconnect_replay_from_start: default_reconnect_replay_from_start(),
+            reconnect_max_attempts: default_reconnect_max_attempts(),
+            reconnect_replay_from_start: false,
             max_decoding_message_size: None,
             max_encoding_message_size: None,
+            connect_timeout: default_connect_timeout(),
+            timeout: default_request_timeout(),
+            idle_timeout: default_idle_timeout(),
         }
     }
 
@@ -283,8 +329,14 @@ impl GrpcStreamConfig {
         self
     }
 
+    /// Retry server-streaming reconnects without limit.
+    pub fn unlimited_reconnects(mut self) -> Self {
+        self.reconnect_max_attempts = None;
+        self
+    }
+
     /// Set whether the server replays the stream from the start on reconnect
-    /// (default `true`). See
+    /// (default `false`). See
     /// [`reconnect_replay_from_start`](Self::reconnect_replay_from_start).
     pub fn reconnect_replay_from_start(mut self, replay: bool) -> Self {
         self.reconnect_replay_from_start = replay;
@@ -300,6 +352,25 @@ impl GrpcStreamConfig {
     /// Set the maximum outbound (encoded) gRPC message size in bytes.
     pub fn max_encoding_message_size(mut self, bytes: usize) -> Self {
         self.max_encoding_message_size = Some(bytes);
+        self
+    }
+
+    /// Set the connect timeout (`None` waits indefinitely).
+    pub fn connect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Set the unary-call / stream-start timeout (`None` waits indefinitely).
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the server-streaming idle timeout between messages (`None` waits
+    /// indefinitely).
+    pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout;
         self
     }
 }
@@ -327,10 +398,13 @@ mod tests {
         assert!(!config.terminate_on_error);
         assert_eq!(config.reconnect_initial_backoff, Duration::from_secs(1));
         assert_eq!(config.reconnect_max_backoff, Duration::from_secs(30));
-        assert!(config.reconnect_max_attempts.is_none());
-        assert!(config.reconnect_replay_from_start);
+        assert_eq!(config.reconnect_max_attempts, Some(10));
+        assert!(!config.reconnect_replay_from_start);
         assert!(config.max_decoding_message_size.is_none());
         assert!(config.max_encoding_message_size.is_none());
+        assert_eq!(config.connect_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(config.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(config.idle_timeout, Some(Duration::from_secs(300)));
     }
 
     #[test]
@@ -341,10 +415,10 @@ mod tests {
             "Tail",
             "proto/descriptor.bin",
         )
-        .reconnect_replay_from_start(false)
+        .reconnect_replay_from_start(true)
         .max_decoding_message_size(16 * 1024 * 1024)
         .max_encoding_message_size(1024);
-        assert!(!config.reconnect_replay_from_start);
+        assert!(config.reconnect_replay_from_start);
         assert_eq!(config.max_decoding_message_size, Some(16 * 1024 * 1024));
         assert_eq!(config.max_encoding_message_size, Some(1024));
     }
@@ -494,9 +568,12 @@ mod tests {
         assert!(!config.terminate_on_error);
         assert_eq!(config.reconnect_initial_backoff, Duration::from_secs(1));
         assert_eq!(config.reconnect_max_backoff, Duration::from_secs(30));
-        assert!(config.reconnect_max_attempts.is_none());
-        assert!(config.reconnect_replay_from_start);
+        assert_eq!(config.reconnect_max_attempts, Some(10));
+        assert!(!config.reconnect_replay_from_start);
         assert!(config.max_decoding_message_size.is_none());
+        assert_eq!(config.connect_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(config.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(config.idle_timeout, Some(Duration::from_secs(300)));
     }
 
     #[test]
@@ -544,5 +621,22 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(historical.reconnect_max_attempts, Some(4));
+    }
+
+    #[test]
+    fn unlimited_reconnects_and_timeouts_round_trip() {
+        let config = GrpcStreamConfig::new("http://h:1", "S", "M", "/tmp/d.bin")
+            .reconnect_max_attempts(3)
+            .unlimited_reconnects()
+            .connect_timeout(None)
+            .timeout(Some(Duration::from_secs(5)))
+            .idle_timeout(None);
+        assert!(config.reconnect_max_attempts.is_none());
+        let back: GrpcStreamConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(back.reconnect_max_attempts.is_none());
+        assert!(back.connect_timeout.is_none());
+        assert_eq!(back.timeout, Some(Duration::from_secs(5)));
+        assert!(back.idle_timeout.is_none());
     }
 }

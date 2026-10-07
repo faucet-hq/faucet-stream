@@ -228,7 +228,9 @@ Connects to the config's source, enumerates the datasets behind it (tables /
 collections / indices / object-store prefixes), and emits a ready-to-run config
 with **one matrix row per dataset** — the input document with its `matrix:`
 block replaced, secrets echoed as raw `${…}` references. The generated config
-passes `faucet validate`. Supported sources: `postgres`, `mysql`, `mssql`,
+passes `faucet validate`: when the sink writes one fixed file (a local file
+path, or a fixed remote `path` / SFTP `file_name`), each row gets its own,
+with the row id in the file name (`./out.jsonl` → `./out.<row>.jsonl`). Supported sources: `postgres`, `mysql`, `mssql`,
 `sqlite`, `mongodb`, `elasticsearch`, `bigquery`, `snowflake`, `s3`, `gcs`,
 `file` (one dataset per file).
 
@@ -285,6 +287,14 @@ harness, so no sink is ever written. Offline by default; `--resolve-secrets`
 opts into the real secrets path. With a `policy:` block or `--policy`, the
 row's [data-flow policy](../cookbook/policies.md) verdict is reported too
 (`policy` in the JSON; a preview never fails on it).
+
+`--live` refuses a source whose read has side effects: CDC sources, `kafka`,
+`webhook` and `websocket` (a read moves or consumes a position), and queue
+sources that acknowledge what they read — `sqs`, `pubsub`, `rabbitmq` and
+`nats` with `jetstream_stream`. A preview never writes, so those messages would
+be removed from the queue and lost. `faucet preview`, `faucet run --dry-run`
+and `faucet run --limit` refuse the queue sources for the same reason, and a
+topology graph refuses them as source nodes. Use `--sample <fixture>` instead.
 
 ### `plan --impact` — change impact analysis (#707)
 

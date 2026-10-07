@@ -357,6 +357,15 @@ fn render_discovered_config(
         .map_err(|e| CliError::Internal(format!("yaml render: {e}")))?;
 
     let row_ids = unique_row_ids(datasets);
+    let shared_sink = shared_sink_spec(&root, sink_template);
+    let destinations: Vec<Option<String>> = datasets
+        .iter()
+        .map(|d| {
+            let (kind, cfg) = shared_sink.as_ref()?;
+            let cfg = row_sink_config(cfg, d.sink_patch.as_ref());
+            crate::registry::sink_shared_destination(kind, &cfg)
+        })
+        .collect();
     let mut doc = String::new();
     doc.push_str(&head);
     if !head.ends_with('\n') {
@@ -371,7 +380,7 @@ fn render_discovered_config(
         doc.push_str("# NOTE: the input config's `matrix:` block was replaced.\n");
     }
     doc.push_str("matrix:\n");
-    for (d, id) in datasets.iter().zip(&row_ids) {
+    for (i, (d, id)) in datasets.iter().zip(&row_ids).enumerate() {
         let est = d
             .estimated_rows
             .map(|n| format!(", ~{n} rows"))
@@ -393,19 +402,73 @@ fn render_discovered_config(
         // Per-dataset sink routing: a `--sink` template ref and/or the
         // descriptor's own `sink_patch` (e.g. `{table_id: account}` so a
         // fan-out lands one table per dataset).
-        if sink_template.is_some() || d.sink_patch.is_some() {
+        // A file-writing sink with one fixed destination would have every
+        // row overwrite the others (and `faucet run` refuses that), so a row
+        // sharing it gets its own destination, tagged with the row id.
+        let shared = destinations[i].as_ref().is_some_and(|dest| {
+            destinations
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && other.as_ref() == Some(dest))
+        });
+        let own_destination = if shared {
+            shared_sink.as_ref().and_then(|(kind, cfg)| {
+                let cfg = row_sink_config(cfg, d.sink_patch.as_ref());
+                crate::registry::sink_destination_patch(kind, &cfg, id)
+            })
+        } else {
+            None
+        };
+        if sink_template.is_some() || d.sink_patch.is_some() || own_destination.is_some() {
             let mut sink = json!({});
             if let Some(s) = sink_template {
                 sink["ref"] = json!(s);
             }
-            if let Some(patch) = &d.sink_patch {
-                sink["config"] = patch.clone();
+            let mut config = d.sink_patch.clone().unwrap_or_else(|| json!({}));
+            if let Some(patch) = own_destination {
+                crate::merge::merge_value(&mut config, patch);
+            }
+            if config.as_object().is_some_and(|m| !m.is_empty()) {
+                sink["config"] = config;
             }
             row["sink"] = sink;
         }
         doc.push_str(&yaml_seq_item(&row)?);
     }
     Ok(doc)
+}
+
+/// The sink template a generated row writes through — the `--sink` template,
+/// else `pipeline.sink` / `pipeline.sinks.default` — as `(kind, config)`.
+fn shared_sink_spec(
+    root: &serde_yaml::Value,
+    sink_template: Option<&str>,
+) -> Option<(String, Value)> {
+    let root: Value = serde_json::to_value(root).ok()?;
+    let pipeline = root.get("pipeline")?;
+    let spec = match sink_template {
+        Some(name) => pipeline
+            .get("sinks")
+            .and_then(|s| s.get(name))
+            .or_else(|| (name == "default").then(|| pipeline.get("sink")).flatten())?,
+        None => pipeline
+            .get("sink")
+            .or_else(|| pipeline.get("sinks").and_then(|s| s.get("default")))?,
+    };
+    let kind = spec.get("type")?.as_str()?.to_string();
+    Some((
+        kind,
+        spec.get("config").cloned().unwrap_or_else(|| json!({})),
+    ))
+}
+
+/// A template's sink config with a row's own sink patch laid over it.
+fn row_sink_config(base: &Value, patch: Option<&Value>) -> Value {
+    let mut cfg = base.clone();
+    if let Some(p) = patch {
+        crate::merge::merge_value(&mut cfg, p.clone());
+    }
+    cfg
 }
 
 #[cfg(test)]
@@ -679,6 +742,52 @@ pipeline:
             nodes[0].source.config["connection_url"], "${env:DATABASE_URL}",
             "connection settings inherited"
         );
+        // #789 FILE-05: one fixed jsonl path would have the rows overwrite each
+        // other, so each row writes its own file.
+        assert_eq!(nodes[0].sink.config["path"], "./out.public_orders.jsonl");
+        assert_eq!(nodes[1].sink.config["path"], "./out.sales_leads.jsonl");
+    }
+
+    #[test]
+    fn render_gives_each_row_its_own_fixed_remote_path() {
+        let raw = r#"
+version: 1
+pipeline:
+  source:
+    type: postgres
+    config: { connection_url: "postgres://x", query: "SELECT 1" }
+  sinks:
+    lake:
+      type: s3
+      config: { bucket: b, prefix: exports/, path: "part-{part}.parquet" }
+"#;
+        let datasets = vec![
+            ds("orders", "table", json!({"query": "SELECT * FROM orders"})),
+            ds("leads", "table", json!({"query": "SELECT * FROM leads"})),
+        ];
+        let doc = render_discovered_config(raw, "default", Some("lake"), &datasets).unwrap();
+        let cfg = crate::config::parse_with_extension(&doc, "yaml").unwrap();
+        let nodes = crate::expand::expand(&cfg).unwrap();
+        assert_eq!(nodes[0].sink.config["path"], "part-{part}.orders.parquet");
+        assert_eq!(nodes[1].sink.config["path"], "part-{part}.leads.parquet");
+        assert_eq!(nodes[1].sink.config["bucket"], "b");
+    }
+
+    #[test]
+    fn render_leaves_a_single_dataset_or_a_unique_destination_alone() {
+        let one = vec![ds("t", "table", json!({"query": "SELECT * FROM t"}))];
+        let doc = render_discovered_config(RAW, "default", None, &one).unwrap();
+        assert!(!doc.contains("sink:\n    config"), "{doc}");
+        assert!(!doc.contains("out.t.jsonl"), "{doc}");
+
+        let appended = RAW.replace("path: ./out.jsonl", "path: ./out.jsonl\n      append: true");
+        let two = vec![
+            ds("a", "table", json!({"query": "SELECT * FROM a"})),
+            ds("b", "table", json!({"query": "SELECT * FROM b"})),
+        ];
+        let doc = render_discovered_config(&appended, "default", None, &two).unwrap();
+        assert!(!doc.contains("out.a.jsonl"), "{doc}");
+        crate::expand::expand(&crate::config::parse_with_extension(&doc, "yaml").unwrap()).unwrap();
     }
 
     #[test]
@@ -812,7 +921,7 @@ mod run_tests {
         let cfg = dir.path().join("conn.yaml");
         std::fs::write(
             &cfg,
-            "version: 1\npipeline:\n  source: { type: csv, config: { path: ./in.csv } }\n  sink: { type: jsonl, config: { path: ./o.jsonl } }\n",
+            "version: 1\npipeline:\n  source: { type: csv, config: { path: ./in.csv } }\n  sink: { type: jsonl, config: { path: ./o.jsonl, append: true } }\n",
         )
         .unwrap();
         let err = run(args(cfg)).await.unwrap_err();

@@ -19,7 +19,10 @@
 
 use crate::config::{MAX_RECEIVE_BATCH, SqsSourceConfig};
 use aws_sdk_sqs::Client;
-use aws_sdk_sqs::types::DeleteMessageBatchRequestEntry;
+use aws_sdk_sqs::types::{
+    ChangeMessageVisibilityBatchRequestEntry, DeleteMessageBatchRequestEntry,
+};
+use faucet_core::lease::LeaseExtender;
 use faucet_core::{FaucetError, Stream, StreamPage};
 use serde_json::Value;
 use std::pin::Pin;
@@ -35,6 +38,57 @@ pub struct SqsSource {
 /// JSON, otherwise the raw body wrapped as a JSON string. Pure.
 pub(crate) fn decode_body(body: &str) -> Value {
     serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()))
+}
+
+/// The informational bookmark every page carries. The broker, not faucet,
+/// tracks the queue position; the bookmark exists so the pipeline flushes the
+/// sink before resuming the generator, which is when the page's messages are
+/// deleted (MSG-07). Pure.
+pub(crate) fn page_bookmark(queue_url: &str, consumed: usize) -> Value {
+    serde_json::json!({ "queue": queue_url, "consumed": consumed })
+}
+
+/// Every receipt handle the source currently holds un-deleted: the page being
+/// assembled plus the yielded pages awaiting deletion. Pure.
+pub(crate) fn held_handles(assembling: &[Option<String>], yielded: &[String]) -> Vec<String> {
+    assembling
+        .iter()
+        .flatten()
+        .cloned()
+        .chain(yielded.iter().cloned())
+        .collect()
+}
+
+/// Renew the visibility timeout of `handles`, chunked to the 10-entry API cap.
+/// Best-effort: a failure is logged and the message may be redelivered.
+async fn extend_visibility(client: Client, queue_url: String, handles: Vec<String>, secs: i32) {
+    for chunk in handles.chunks(MAX_RECEIVE_BATCH as usize) {
+        let entries: Result<Vec<_>, _> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, rh)| {
+                ChangeMessageVisibilityBatchRequestEntry::builder()
+                    .id(i.to_string())
+                    .receipt_handle(rh)
+                    .visibility_timeout(secs)
+                    .build()
+            })
+            .collect();
+        let Ok(entries) = entries else { continue };
+        if let Err(e) = client
+            .change_message_visibility_batch()
+            .queue_url(&queue_url)
+            .set_entries(Some(entries))
+            .send()
+            .await
+        {
+            tracing::warn!(
+                queue = %queue_url,
+                error = %e.into_service_error(),
+                "sqs: visibility renewal failed; held messages may be redelivered"
+            );
+        }
+    }
 }
 
 impl SqsSource {
@@ -141,10 +195,24 @@ impl faucet_core::Source for SqsSource {
             let mut pending: Vec<String> = Vec::new();
             let mut total = 0usize;
             let mut last_activity = Instant::now();
+            let renew_secs = self.config.visibility_extension_secs;
+            let lease = (renew_secs > 0).then(|| {
+                let client = self.client.clone();
+                let queue = self.config.queue_url.clone();
+                LeaseExtender::spawn(
+                    Duration::from_secs(u64::from(renew_secs / 3).max(1)),
+                    move |handles: Vec<String>| {
+                        extend_visibility(client.clone(), queue.clone(), handles, renew_secs as i32)
+                    },
+                )
+            });
 
             loop {
                 if !pending.is_empty() {
                     self.delete_handles(&std::mem::take(&mut pending)).await?;
+                    if let Some(l) = &lease {
+                        l.hold(held_handles(&handles, &pending));
+                    }
                 }
 
                 // Reached the message cap → stop.
@@ -193,16 +261,24 @@ impl faucet_core::Source for SqsSource {
                     handles.push(msg.receipt_handle().map(str::to_string));
                     total += 1;
                 }
+                if let Some(l) = &lease {
+                    l.hold(held_handles(&handles, &pending));
+                }
 
                 // Emit every full page. Its handles are parked, not deleted: the
-                // page is not durable until the consumer resumes us.
+                // page is not durable until the consumer resumes us. The page
+                // carries a bookmark so the pipeline flushes the sink before it
+                // resumes us — otherwise a buffering sink could still hold the
+                // records when they are deleted.
                 while buffer.len() >= chunk {
                     let page: Vec<Value> = buffer.drain(..chunk).collect();
                     let to_delete: Vec<String> =
                         handles.drain(..chunk).flatten().collect();
-                    yield StreamPage { records: page, bookmark: None };
-                    // Resumed ⇒ the page was written downstream; safe to delete.
                     pending.extend(to_delete);
+                    yield StreamPage {
+                        records: page,
+                        bookmark: Some(page_bookmark(&self.config.queue_url, total)),
+                    };
                 }
 
                 if let Some(m) = max
@@ -224,12 +300,16 @@ impl faucet_core::Source for SqsSource {
             // redelivers — the safe direction.
             if !buffer.is_empty() {
                 let to_delete: Vec<String> = handles.into_iter().flatten().collect();
-                yield StreamPage { records: buffer, bookmark: None };
                 pending.extend(to_delete);
+                yield StreamPage {
+                    records: buffer,
+                    bookmark: Some(page_bookmark(&self.config.queue_url, total)),
+                };
             }
             if !pending.is_empty() {
                 self.delete_handles(&pending).await?;
             }
+            drop(lease);
             tracing::info!(
                 queue = %self.config.queue_url,
                 records = total,
@@ -241,6 +321,10 @@ impl faucet_core::Source for SqsSource {
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(SqsSourceConfig))
             .expect("schema serialization")
+    }
+
+    fn consumes_destructively(&self) -> bool {
+        true
     }
 
     fn connector_name(&self) -> &'static str {
@@ -371,5 +455,21 @@ mod tests {
             1,
             "unreachable endpoint → fail probe"
         );
+    }
+
+    #[test]
+    fn every_page_carries_an_informational_bookmark() {
+        assert_eq!(
+            page_bookmark("https://q", 4),
+            serde_json::json!({"queue": "https://q", "consumed": 4})
+        );
+    }
+
+    #[test]
+    fn held_handles_cover_the_assembling_page_and_yielded_pages() {
+        let assembling = vec![Some("a".to_string()), None, Some("b".to_string())];
+        let yielded = vec!["c".to_string()];
+        assert_eq!(held_handles(&assembling, &yielded), vec!["a", "b", "c"]);
+        assert!(held_handles(&[], &[]).is_empty());
     }
 }

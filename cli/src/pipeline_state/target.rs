@@ -209,7 +209,7 @@ mod tests {
 name: orders
 pipeline:
   source: { type: csv, config: { path: in.csv } }
-  sink: { type: jsonl, config: { path: out.jsonl } }
+  sink: { type: jsonl, config: { path: out.jsonl, append: true } }
   state: { type: file, config: { path: ./state } }
 matrix:
   - id: parent
@@ -276,7 +276,7 @@ pipeline:
 name: m
 pipeline:
   source: { type: postgres-cdc, config: { connection_url: "postgres://u@h/d", slot_name: s, publication: p } }
-  sink: { type: jsonl, config: { path: out.jsonl } }
+  sink: { type: jsonl, config: { path: out.jsonl, append: true } }
   state: { type: file, config: { path: ./state } }
 mirror:
   mode: snapshot_then_cdc
@@ -295,7 +295,7 @@ mirror:
             r#"version: 1
 pipeline:
   source: { type: csv, config: { path: in.csv } }
-  sink: { type: jsonl, config: { path: out.jsonl } }
+  sink: { type: jsonl, config: { path: out.jsonl, append: true } }
 "#,
         );
         assert!(PipelineTarget::resolve(&cfg, "bad name").is_err());

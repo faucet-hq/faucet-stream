@@ -336,9 +336,9 @@ types you add after the first run survive every refresh. With
 | `sqlite` | one transaction: `DELETE` + `INSERT … SELECT` from a `SELECT … WHERE 0` clone + `DROP` |
 | `mysql` | `CREATE TABLE staging LIKE target`, then an atomic `RENAME TABLE` swap (MySQL auto-commits DDL, so a transaction can't span it) |
 | `mssql` | one transaction: `DELETE` + `INSERT` (explicit non-IDENTITY column list) from a `SELECT … INTO … WHERE 1=0` clone + `DROP` |
-| `mongodb` | load a `{collection}__faucet_ovw` staging collection, then atomic `renameCollection(dropTarget: true)` (needs the rename privilege; unsupported on sharded collections) |
+| `mongodb` | load a `{collection}__faucet_ovw` staging collection created with the target's options and secondary indexes, then atomic `renameCollection(dropTarget: true)` (needs the rename privilege; unsupported on sharded collections) |
 | `bigquery` | **bucket-free** — load a `LIKE` temp table via the query API, then `BEGIN TRANSACTION; TRUNCATE; INSERT … SELECT; COMMIT` (preserves the target's partitioning/clustering); no GCS staging bucket required |
-| `elasticsearch` | index into a fresh physical index `{index}-faucet-ovw-…` (mappings copied from the current target), then an atomic `POST /_aliases` swap repoints the read alias and the old index is dropped |
+| `elasticsearch` | index into a fresh physical index `{index}-faucet-ovw-…` (mappings copied from the current target) through the marker alias `{index}-faucet-ovw-staging`, so any sink instance can commit; then an atomic `POST /_aliases` swap repoints the read alias and the old index is dropped |
 | `oracle` | load a `CREATE TABLE … AS SELECT * FROM target WHERE 1 = 0` staging table, then one transaction: `DELETE` + `INSERT … SELECT` over the insertable columns + `DROP` (a first run renames staging into place) |
 | `databricks` | load a `CREATE TABLE … LIKE` staging Delta table, then one atomic `INSERT OVERWRITE target SELECT * FROM staging` + `DROP` (a first run renames staging into place) |
 | `file` | files written into a hidden `.faucet-overwrite-*` directory beside the destination, each renamed into place on commit; parts the run did not write are removed |

@@ -37,8 +37,9 @@ mod writer;
 pub use backend::{Area, PartStream, StorageBackend};
 pub use config::WriteConfig;
 pub use layout::{
-    BODY_SUFFIX, NameTemplate, PART_WIDTH, SCRATCH_ROLES, SWAP_PREFIX, TMP_SUFFIX, is_scratch_name,
-    is_swap_dir_name,
+    BODY_SUFFIX, NameTemplate, PART_WIDTH, SCRATCH_ROLES, SWAP_PREFIX, TMP_SUFFIX, UPLOAD_ROLE,
+    is_scratch_name, is_swap_dir_name, is_unfinished_output_key, is_unfinished_output_path,
+    upload_scratch_key,
 };
 pub use local::LocalBackend;
 pub use options::{

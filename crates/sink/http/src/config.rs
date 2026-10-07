@@ -101,6 +101,31 @@ pub struct HttpSinkConfig {
     /// records per request).
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Per-request timeout in seconds. Covers one HTTP request (a stalled peer
+    /// fails the request, so retries and resilience can act), not the whole
+    /// run. `null` disables it. Defaults to `30`.
+    #[serde(
+        with = "faucet_core::config::duration_secs_option",
+        default = "default_request_timeout"
+    )]
+    #[schemars(with = "Option<u64>")]
+    pub timeout: Option<std::time::Duration>,
+    /// Timeout for establishing a connection, in seconds. `null` disables it.
+    /// Defaults to `10`.
+    #[serde(
+        with = "faucet_core::config::duration_secs_option",
+        default = "default_connect_timeout"
+    )]
+    #[schemars(with = "Option<u64>")]
+    pub connect_timeout: Option<std::time::Duration>,
+}
+
+fn default_request_timeout() -> Option<std::time::Duration> {
+    Some(std::time::Duration::from_secs(30))
+}
+
+fn default_connect_timeout() -> Option<std::time::Duration> {
+    Some(std::time::Duration::from_secs(10))
 }
 
 fn default_batch_size() -> usize {
@@ -118,6 +143,8 @@ impl std::fmt::Debug for HttpSinkConfig {
             .field("max_retries", &self.max_retries)
             .field("concurrency", &self.concurrency)
             .field("batch_size", &self.batch_size)
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
             .finish()
     }
 }
@@ -134,6 +161,8 @@ impl HttpSinkConfig {
             max_retries: 0,
             concurrency: 10,
             batch_size: DEFAULT_BATCH_SIZE,
+            timeout: default_request_timeout(),
+            connect_timeout: default_connect_timeout(),
         }
     }
 
@@ -185,6 +214,18 @@ impl HttpSinkConfig {
     /// array, preserving upstream `StreamPage` framing.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Set the per-request timeout (`None` disables it).
+    pub fn timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the connect timeout (`None` disables it).
+    pub fn connect_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 }

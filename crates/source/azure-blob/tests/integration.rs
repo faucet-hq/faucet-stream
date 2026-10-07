@@ -420,3 +420,36 @@ async fn source_concurrency_zero_reads_serially_rather_than_stalling() {
             .expect("concurrency = 0 must read serially, not hang");
     assert_eq!(records.len(), 2);
 }
+
+/// #789 FILE-06: a prefix another faucet sink writes to may hold its scratch
+/// files and the swap area of an uncommitted overwrite run; neither is data.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_skips_a_sinks_unfinished_output() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_azurite().await;
+    create_container(port).await;
+    let store = seed_store(port);
+    put_object(&store, "data/a.jsonl", b"{\"id\":1}\n".to_vec()).await;
+    put_object(&store, "data/a.jsonl.faucet-tmp", b"{\"id\":2}\n".to_vec()).await;
+    put_object(
+        &store,
+        "data/.faucet-overwrite-a.jsonl/a.jsonl",
+        b"{\"id\":3}\n".to_vec(),
+    )
+    .await;
+    put_object(
+        &store,
+        "data/.faucet-overwrite-a.jsonl/.faucet-swap",
+        Vec::new(),
+    )
+    .await;
+
+    let source = AzureBlobSource::new(source_config(port).prefix("data/"))
+        .await
+        .expect("source new");
+    let records = source
+        .fetch_with_context(&HashMap::new())
+        .await
+        .expect("fetch");
+    assert_eq!(records, vec![json!({"id": 1})]);
+}

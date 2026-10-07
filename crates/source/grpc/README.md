@@ -14,7 +14,8 @@ Reach for it when you need to pull data out of an internal gRPC API — a list/g
 - **Dynamic protobuf, zero codegen** — point the source at a `FileDescriptorSet` (`.bin`) produced by `protoc`; it resolves the service/method, maps your JSON `request` onto the protobuf message, and decodes responses back to JSON. No `.proto` compilation into your binary.
 - **Two RPC kinds** — `unary` (one request → one response) and `server_streaming` (one request → a stream of responses). Server-streaming is consumed message-by-message and emitted as records arrive.
 - **Native streaming for server-streaming RPCs** — `stream_pages` flushes a `StreamPage` each time `batch_size` messages accumulate, bounding **both** source-side and sink-side memory for unbounded feeds.
-- **Resilient reconnect** — server-streaming reconnects on transient transport errors with exponential backoff (`reconnect_initial_backoff` → `reconnect_max_backoff`), an optional attempt cap, and replay-prefix skipping so each message is delivered downstream once.
+- **Resilient reconnect** — server-streaming reconnects on transient errors (dropped connections, stalls, `UNAVAILABLE`-class statuses) with exponential backoff (`reconnect_initial_backoff` → `reconnect_max_backoff`) and a finite attempt budget; permanent failures (auth, permissions, decode, bad `records_path`) fail the run at once. Delivery across a reconnect is at-least-once unless you opt into replay-prefix skipping.
+- **Timeouts** — `connect_timeout`, a unary / stream-start `timeout`, and a server-streaming `idle_timeout` between messages, so a stalled peer fails or reconnects instead of hanging.
 - **JSONPath record extraction** — `records_path` (e.g. `$.users[*]`) pulls a repeated field out of each response message; unset returns the whole response as a single record.
 - **Three auth modes** — none, bearer token (`authorization` metadata), or arbitrary ordered metadata key/value pairs (duplicate keys allowed). Bearer/metadata auth also resolves from the CLI's shared `auth:` catalog via `auth: { ref: <name> }`.
 - **TLS auto-detection** — inferred from an `https://` endpoint, or forced on/off with `tls`.
@@ -103,8 +104,11 @@ faucet run pipeline.yaml
 | `terminate_on_error` | bool | `false` | Server-streaming only. `true` propagates a transient stream error on first failure; `false` reconnects with backoff. |
 | `reconnect_initial_backoff` | int (seconds) | `1` | Server-streaming only. Initial reconnect backoff; doubles each failure up to `reconnect_max_backoff`. Must be `> 0`. |
 | `reconnect_max_backoff` | int (seconds) | `30` | Server-streaming only. Upper bound on reconnect backoff. |
-| `reconnect_max_attempts` | int | *(unset)* | Server-streaming only. Max reconnect attempts before surfacing the error. Unset = unlimited. |
-| `reconnect_replay_from_start` | bool | `true` | Server-streaming only. `true` skips the already-emitted prefix when a stateless server replays from message 0 (effectively-once downstream); `false` emits every received message (at-least-once). See [Reconnect](#reconnect-on-transient-errors). |
+| `reconnect_max_attempts` | int \| null | `10` | Server-streaming only. Max consecutive reconnect attempts before surfacing the error; the count resets whenever a message arrives. `null` = unlimited. |
+| `reconnect_replay_from_start` | bool | `false` | Server-streaming only. `false` emits every message received after a reconnect (at-least-once). `true` skips as many messages as were already emitted — only for a server that re-streams the same messages in the same order from message 0; on a live feed it drops new messages. See [Reconnect](#reconnect-on-transient-errors). |
+| `connect_timeout` | int (seconds) \| null | `10` | Time allowed to open the connection. `null` waits indefinitely. |
+| `timeout` | int (seconds) \| null | `30` | Time allowed for a unary call, or for a server-streaming call to start. A timed-out stream start is retried. `null` waits indefinitely. |
+| `idle_timeout` | int (seconds) \| null | `300` | Server-streaming only. Time allowed between messages before the stream is treated as stalled and reopened. `null` waits indefinitely (a half-open connection then hangs the run). |
 
 ### Batching & limits
 
@@ -223,7 +227,7 @@ source:
     batch_size: 500
     reconnect_initial_backoff: 1
     reconnect_max_backoff: 30
-    reconnect_replay_from_start: true
+    idle_timeout: 600                     # the feed may be quiet for minutes
     max_decoding_message_size: 16777216   # 16 MiB
 ```
 
@@ -259,9 +263,11 @@ When `rpc_kind: server_streaming`, the source calls `tonic::client::Grpc::server
 
 #### Reconnect on transient errors
 
-By default, transient stream errors (server disconnects, transport failures) trigger a reconnect with exponential backoff from `reconnect_initial_backoff`, doubling up to `reconnect_max_backoff`; after `reconnect_max_attempts` (when set) the error is surfaced. Set `terminate_on_error: true` to propagate on first failure instead.
+Transient stream errors trigger a reconnect with exponential backoff from `reconnect_initial_backoff`, doubling up to `reconnect_max_backoff`; after `reconnect_max_attempts` consecutive failures (10 by default) the error is surfaced. Transient means a failed connect, a stream start slower than `timeout`, no message within `idle_timeout`, or a status of `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`, `UNKNOWN` or `INTERNAL` (dropped connections surface as the last two). Every other status, an auth or metadata error, a protobuf decode error (`DATA_LOSS`), an oversized message (`OUT_OF_RANGE`) and a `records_path` error fail the run at once. Set `terminate_on_error: true` to fail on the first transient error too.
 
-Reconnect re-sends the *same* request (resolved once per run), so a stateless server re-streams from message 0. With `reconnect_replay_from_start: true` (default) the source tracks how many messages it already emitted and **skips that replayed prefix**, delivering each message once. Set it `false` only for servers that resume mid-stream on an identical request (rare — most resumable feeds need a resume token *in the request*, e.g. an `after_event_id` field you maintain): there, every received message is emitted (at-least-once), so duplicates are possible on replay.
+`UNAUTHENTICATED` with a shared `auth: { ref }` provider invalidates the rejected token and reopens the call once with a fresh one (unary calls too); a second rejection fails the run.
+
+Reconnect re-sends the *same* request (resolved once per run). By default every message the new stream delivers is emitted (at-least-once): a server that replays from message 0 produces duplicates, a live feed loses nothing. Set `reconnect_replay_from_start: true` only for a server known to re-stream the same messages in the same order from message 0; the source then skips as many messages as it already emitted. Against a live feed that sends new events after a resubscribe this drops that many new messages, so it is opt-in. For an exact resume, carry a resume token in the request (e.g. an `after_event_id` field you maintain) and deduplicate downstream with an upsert sink.
 
 > **Resume/state:** this source has no faucet-managed bookmark or `state:` resume. For a resumable feed, drive the cursor through the `request` (e.g. an `after_event_id` your config advances), not via a faucet state store.
 
@@ -344,8 +350,8 @@ Pipeline::new(&stream, &my_sink).run().await?;
 1. `new()` loads and parses the `FileDescriptorSet`, resolves the service/method, and builds the tonic channel **once** (TLS auto-detected from the scheme unless `tls` overrides it).
 2. The JSON `request` is mapped onto the protobuf request message via reflection; any configured `max_encoding_message_size` is applied.
 3. **Unary:** a single response is decoded to JSON; `records_path` (if set) extracts records, otherwise the whole response is one record.
-4. **Server-streaming:** the response stream is consumed message-by-message; each `DynamicMessage` is decoded, JSON-converted, and `records_path`-flattened, with reconnect/backoff and replay-prefix skipping wrapping the consume loop.
-5. Records are framed into `batch_size` pages and streamed to the pipeline; `max_decoding_message_size` bounds each inbound message.
+4. **Server-streaming:** the response stream is consumed message-by-message; each `DynamicMessage` is decoded, JSON-converted, and `records_path`-flattened, with reconnect/backoff wrapping the consume loop.
+5. A page is emitted each time `batch_size` records accumulate, while the stream is still open; `max_decoding_message_size` bounds each inbound message.
 
 ## Lineage dataset URI
 
@@ -367,8 +373,9 @@ This crate has no optional features of its own. Enable it in the CLI/umbrella vi
 | Decode error on a large response | The message exceeds tonic's 4 MiB inbound limit. Raise `max_decoding_message_size`. |
 | `records_path` returns nothing | The JSONPath doesn't match the decoded response shape. Drop `records_path` to inspect the raw response, then target the actual array field (e.g. `$.users[*]`). |
 | Server-streaming run never ends | Expected for an open-ended feed. Bound it with `max_messages`, or cancel the run (the page loop stops at the next boundary). |
-| Reconnect busy-spins / errors immediately | `reconnect_initial_backoff` must be `> 0`. For non-transient failures set `terminate_on_error: true` to fail fast. |
-| Duplicate or missing messages after a reconnect | Match `reconnect_replay_from_start` to the server: `true` for a stateless server that replays from 0, `false` for one that resumes mid-stream on the same request. |
+| Reconnect busy-spins / errors immediately | `reconnect_initial_backoff` must be `> 0`. Permanent failures (auth, permissions, decode) are not retried. |
+| A quiet feed reconnects every few minutes | It went longer than `idle_timeout` without a message; raise it or set `null`. |
+| Duplicate messages after a reconnect | The server replays from message 0 and delivery is at-least-once. Set `reconnect_replay_from_start: true` only if the replay is the same messages in the same order. |
 
 ## See also
 

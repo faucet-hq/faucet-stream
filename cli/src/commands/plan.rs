@@ -139,6 +139,7 @@ async fn load_sample(
         return Ok(Some(read_sample_file(path)?));
     }
     if args.live {
+        refuse_side_effecting_live_read(&node.source.kind)?;
         let source = crate::registry::build_source(
             &node.source.kind,
             node.source.config.clone(),
@@ -146,10 +147,43 @@ async fn load_sample(
             None,
         )
         .await?;
+        if source.consumes_destructively() {
+            return Err(CliError::Config(
+                crate::preview_sample::destructive_read_refusal(&node.source.kind, "plan --live"),
+            ));
+        }
         let records = pull_capped(source.as_ref(), args.limit).await?;
         return Ok(Some(records));
     }
     Ok(None)
+}
+
+/// Source kinds whose read has a side effect `plan --live` must not cause: a
+/// CDC source creates or advances a replication slot / capture position, a
+/// Kafka source joins (and rebalances) the consumer group, and a webhook or
+/// websocket source opens a listener or a live session (#789 MSG-01).
+pub const PLAN_LIVE_REFUSED_KINDS: &[&str] = &[
+    "postgres-cdc",
+    "mysql-cdc",
+    "mongodb-cdc",
+    "mssql-cdc",
+    "oracle-cdc",
+    "kafka",
+    "webhook",
+    "websocket",
+];
+
+/// Refuse a `plan --live` sample from a source kind whose read has side
+/// effects. Pure.
+pub fn refuse_side_effecting_live_read(kind: &str) -> CliResult<()> {
+    if PLAN_LIVE_REFUSED_KINDS.contains(&kind) {
+        return Err(CliError::Config(format!(
+            "plan --live cannot sample a `{kind}` source: reading it has side effects (a \
+             replication slot, a consumer-group rebalance, a listener) that a read-only plan \
+             must not cause; pass an offline `--sample` fixture instead"
+        )));
+    }
+    Ok(())
 }
 
 /// Read a `.jsonl` (one JSON object per line) or `.json` (array) sample file.
@@ -770,5 +804,48 @@ mod tests {
         };
         let err = super::run(args).await.unwrap_err();
         assert!(err.to_string().contains("catalog:"), "{err}");
+    }
+
+    #[cfg(feature = "source-sqs")]
+    #[tokio::test]
+    async fn plan_live_refuses_a_queue_source_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("q.yaml");
+        std::fs::write(
+            &cfg_path,
+            "version: 1\nname: q\npipeline:\n  source:\n    type: sqs\n    config:\n      queue_url: \"http://127.0.0.1:1/000000000000/orders\"\n      region: us-east-1\n      endpoint_url: \"http://127.0.0.1:1\"\n      credentials: { type: access_key, config: { access_key_id: t, secret_access_key: t } }\n      idle_timeout_secs: 1\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+        )
+        .unwrap();
+        let args = PlanArgs {
+            config: Some(cfg_path),
+            row: None,
+            sample: None,
+            live: true,
+            limit: 10,
+            json: false,
+            diff: false,
+            impact: false,
+            depth: 5,
+            resolve_secrets: false,
+            profile: None,
+            policy: None,
+        };
+        let err = super::run(args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("removes messages") && err.contains("plan --live"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn plan_live_refuses_sources_whose_read_has_side_effects() {
+        for kind in PLAN_LIVE_REFUSED_KINDS {
+            let err = refuse_side_effecting_live_read(kind)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(kind), "{err}");
+        }
+        refuse_side_effecting_live_read("rest").unwrap();
+        refuse_side_effecting_live_read("postgres").unwrap();
     }
 }

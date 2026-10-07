@@ -90,6 +90,14 @@ faucet run pipeline.yaml
 | `compression` | enum | `auto` | *(requires the `compression` feature)* Decompression codec — `none`, `gzip`, `zstd`, or `auto`. `auto` detects `.gz` / `.zst` from the object key. |
 | `storage_host` | string | *(unset)* | Endpoint override (integration tests / emulators only, e.g. `http://localhost:4443`). A plaintext `http://` host lists and stats objects over the JSON API, so `fake-gcs-server` works end to end. Production users leave this unset. |
 
+## Faucet sinks' unfinished output
+
+A listing skips what a faucet file sink writing to the same prefix has not
+finished: scratch objects (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`,
+`-seal`, `-prev`, `-upload-<id>`) and everything inside the
+`.faucet-overwrite-*` swap area of an overwrite run that has not committed
+(also left behind by a crashed run). Discovery skips them too.
+
 ## Authentication
 
 `auth` uses the shared `GcsCredentials` enum from [`faucet-common-gcs`](https://crates.io/crates/faucet-common-gcs) (the project-wide `{ type, config }` shape):

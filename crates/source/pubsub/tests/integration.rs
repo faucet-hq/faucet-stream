@@ -18,7 +18,8 @@
 use faucet_common_pubsub::PubsubMessage;
 use faucet_core::{CheckContext, Source};
 use faucet_source_pubsub::{
-    PubsubConnection, PubsubCredentials, PubsubSource, PubsubSourceConfig, ValueFormat,
+    OnDecodeError, PubsubConnection, PubsubCredentials, PubsubSource, PubsubSourceConfig,
+    ValueFormat,
 };
 use gcloud_pubsub::client::{Client, ClientConfig};
 use tokio::sync::{Mutex, MutexGuard};
@@ -249,4 +250,119 @@ async fn source_value_format_bytes() {
     let records = source.fetch_all().await.expect("drain");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["data"], "AQID", "0x010203 → base64");
+}
+
+/// MSG-10: an undecodable message is skipped (acked with its page, so the
+/// next run does not fail at it again) or kept raw, instead of failing every
+/// run.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_decode_error_skips_or_keeps_the_raw_payload() {
+    let emu = emulator().await;
+    let host = emu.host.as_str();
+    let client = setup_client().await;
+    create_topic_sub(&client, "dec-t", "dec-skip").await;
+    let topic = client.topic("dec-t");
+    client
+        .create_subscription(
+            "dec-raw",
+            topic.fully_qualified_name(),
+            Default::default(),
+            None,
+        )
+        .await
+        .expect("second subscription");
+    publish(
+        &client,
+        "dec-t",
+        vec![msg(b"not json", &[], ""), msg(br#"{"a":1}"#, &[], "")],
+    )
+    .await;
+
+    let config = |sub: &str, policy| {
+        let mut cfg = PubsubSourceConfig::new(sub);
+        cfg.connection = conn(host);
+        cfg.idle_termination_secs = Some(10);
+        cfg.on_decode_error = policy;
+        cfg
+    };
+
+    let skip = PubsubSource::new(config("dec-skip", OnDecodeError::Skip))
+        .await
+        .unwrap();
+    let records = skip.fetch_all().await.expect("skip drains");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["data"]["a"], 1);
+    let again = PubsubSource::new(config("dec-skip", OnDecodeError::Fail))
+        .await
+        .unwrap();
+    assert!(
+        again.fetch_all().await.expect("nothing left").is_empty(),
+        "the skipped message was acked, so a later run does not fail at it"
+    );
+
+    let raw = PubsubSource::new(config("dec-raw", OnDecodeError::Raw))
+        .await
+        .unwrap();
+    let records = raw.fetch_all().await.expect("raw drains");
+    assert_eq!(records.len(), 2);
+    let bad = records
+        .iter()
+        .find(|r| r.get("decode_error").is_some())
+        .expect("the undecodable message is kept");
+    assert_eq!(bad["data"], "bm90IGpzb24=");
+}
+
+/// MSG-09: messages held while a page is assembled are not redelivered into
+/// the same run when the page outlives the subscription's 10 s ack deadline —
+/// the source renews it. Without renewal they come back as duplicates.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_messages_are_not_redelivered_while_a_page_is_assembled() {
+    let emu = emulator().await;
+    let host = emu.host.as_str();
+    let client = setup_client().await;
+    let topic = client
+        .create_topic("lease-t", None, None)
+        .await
+        .expect("create topic");
+    for sub in ["lease-renewed", "lease-unrenewed"] {
+        client
+            .create_subscription(
+                sub,
+                topic.fully_qualified_name(),
+                gcloud_pubsub::subscription::SubscriptionConfig {
+                    ack_deadline_seconds: 10,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create subscription");
+    }
+    publish(
+        &client,
+        "lease-t",
+        vec![msg(br#"{"i":1}"#, &[], ""), msg(br#"{"i":2}"#, &[], "")],
+    )
+    .await;
+
+    let config = |sub: &str, renew: u32| {
+        let mut cfg = PubsubSourceConfig::new(sub);
+        cfg.connection = conn(host);
+        cfg.idle_termination_secs = Some(16);
+        cfg.batch_size = 4;
+        cfg.ack_deadline_extension_secs = renew;
+        cfg
+    };
+    let renewed = PubsubSource::new(config("lease-renewed", 30))
+        .await
+        .unwrap();
+    assert_eq!(renewed.fetch_all().await.unwrap().len(), 2);
+
+    let unrenewed = PubsubSource::new(config("lease-unrenewed", 0))
+        .await
+        .unwrap();
+    assert!(
+        unrenewed.fetch_all().await.unwrap().len() > 2,
+        "without renewal the held messages come back (proves the test can fail)"
+    );
 }

@@ -126,6 +126,9 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
     fn supports_exactly_once(&self) -> bool {
         self.inner.supports_exactly_once()
     }
+    fn consumes_destructively(&self) -> bool {
+        self.inner.consumes_destructively()
+    }
 
     fn replay_guarantee(&self) -> crate::idempotency::ReplayGuarantee {
         self.inner.replay_guarantee()
@@ -1109,6 +1112,7 @@ pub(crate) mod source_tests {
 
         // capability passthroughs: defaults for this inner source…
         assert!(!wrapped.supports_exactly_once());
+        assert!(!wrapped.consumes_destructively());
         assert_eq!(
             wrapped.replay_guarantee(),
             crate::idempotency::ReplayGuarantee::NonDeterministic

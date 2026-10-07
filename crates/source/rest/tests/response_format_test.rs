@@ -113,6 +113,42 @@ async fn excel_body_named_and_default_sheet() {
     assert_eq!(recs[0]["v"], 42.0);
 }
 
+/// #789 FILE-07: a date-formatted cell arrives as a date, not its serial.
+#[cfg(feature = "excel")]
+#[tokio::test]
+async fn excel_date_cells_arrive_as_dates() {
+    use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.write_string(0, 0, "day").unwrap();
+    ws.write_string(0, 1, "at").unwrap();
+    ws.write_datetime_with_format(
+        1,
+        0,
+        ExcelDateTime::from_ymd(2023, 3, 15).unwrap(),
+        &Format::new().set_num_format("yyyy-mm-dd"),
+    )
+    .unwrap();
+    ws.write_datetime_with_format(
+        1,
+        1,
+        ExcelDateTime::parse_from_str("2023-03-15 12:30:00").unwrap(),
+        &Format::new().set_num_format("yyyy-mm-dd hh:mm"),
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dates.xlsx"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(wb.save_to_buffer().unwrap()))
+        .mount(&server)
+        .await;
+    let mut c = cfg(&server, "/dates.xlsx");
+    c.response_format = ResponseFormat::Excel;
+    let recs = RestStream::new(c).unwrap().fetch_all().await.unwrap();
+    assert_eq!(recs[0]["day"], "2023-03-15");
+    assert_eq!(recs[0]["at"], "2023-03-15T12:30:00");
+}
+
 #[tokio::test]
 async fn server_error_surfaces() {
     let server = MockServer::start().await;

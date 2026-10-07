@@ -56,9 +56,18 @@ async fn retry_delay(err: &FaucetError, attempt: u32) {
 impl HttpSink {
     /// Create a new HTTP sink from the given configuration.
     pub fn new(config: HttpSinkConfig) -> Self {
+        let mut builder = reqwest::Client::builder();
+        if let Some(t) = config.timeout {
+            builder = builder.timeout(t);
+        }
+        if let Some(t) = config.connect_timeout {
+            builder = builder.connect_timeout(t);
+        }
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: builder
+                .build()
+                .expect("an HTTP client with only timeouts set always builds"),
             auth_provider: None,
         }
     }
@@ -74,21 +83,30 @@ impl HttpSink {
         self
     }
 
-    /// Resolve the effective auth for the current batch. The provider (if any)
-    /// takes precedence; otherwise inline auth is used. A bare
-    /// `AuthSpec::Reference` with no provider is an error.
-    async fn resolve_auth(&self) -> Result<HttpSinkAuth, FaucetError> {
+    /// Resolve the effective auth for the current batch (the provider, if
+    /// any, takes precedence over inline auth; a bare `AuthSpec::Reference`
+    /// with no provider is an error), plus the shared provider's credential it
+    /// came from, so a rejected request can tell the provider which one went
+    /// stale.
+    async fn resolve_auth_and_credential(
+        &self,
+    ) -> Result<(HttpSinkAuth, Option<Credential>), FaucetError> {
         if let Some(provider) = &self.auth_provider {
-            Ok(credential_to_auth(provider.credential().await?))
+            let cred = provider.credential().await?;
+            Ok((credential_to_auth(cred.clone()), Some(cred)))
         } else {
-            match &self.config.auth {
-                AuthSpec::Inline(a) => Ok(a.clone()),
-                AuthSpec::Reference(r) => Err(FaucetError::Auth(format!(
-                    "auth references provider '{}' but no provider was supplied; \
-                     set one via the CLI `auth:` catalog or `with_auth_provider`",
-                    r.name
-                ))),
-            }
+            Ok((self.inline_auth()?, None))
+        }
+    }
+
+    fn inline_auth(&self) -> Result<HttpSinkAuth, FaucetError> {
+        match &self.config.auth {
+            AuthSpec::Inline(a) => Ok(a.clone()),
+            AuthSpec::Reference(r) => Err(FaucetError::Auth(format!(
+                "auth references provider '{}' but no provider was supplied; \
+                 set one via the CLI `auth:` catalog or `with_auth_provider`",
+                r.name
+            ))),
         }
     }
 
@@ -170,6 +188,36 @@ impl HttpSink {
 
         Err(last_error.unwrap_or_else(|| FaucetError::Sink("max retries exhausted".into())))
     }
+
+    /// [`send_with_retry`](Self::send_with_retry), re-authenticating once when
+    /// the server rejects the shared provider's credential `sent` (#789 API-06).
+    /// The provider refreshes once even when concurrent requests all hit the
+    /// same rejection.
+    async fn send(
+        &self,
+        body: &Value,
+        auth: &HttpSinkAuth,
+        sent: Option<&Credential>,
+    ) -> Result<(), FaucetError> {
+        match self.send_with_retry(body, auth).await {
+            Err(e) => match (&self.auth_provider, sent) {
+                (Some(provider), Some(sent))
+                    if faucet_core::rejects_credential(&e, provider.as_ref()) =>
+                {
+                    let name = provider.provider_name();
+                    tracing::warn!(
+                        provider = name,
+                        "the server rejected the shared credential; re-authenticating and \
+                         retrying once"
+                    );
+                    let fresh = credential_to_auth(provider.invalidate(sent).await?);
+                    self.send_with_retry(body, &fresh).await
+                }
+                _ => Err(e),
+            },
+            ok => ok,
+        }
+    }
 }
 
 #[async_trait]
@@ -207,8 +255,8 @@ impl faucet_core::Sink for HttpSink {
         // Resolve auth so authenticated endpoints don't reject the connection
         // before we learn the host is reachable. An unresolvable auth ref is a
         // configuration failure surfaced on this probe.
-        let auth = match self.resolve_auth().await {
-            Ok(a) => a,
+        let auth = match self.resolve_auth_and_credential().await {
+            Ok((a, _)) => a,
             Err(e) => {
                 return Ok(CheckReport::single(Probe::fail_hint(
                     "network",
@@ -254,7 +302,8 @@ impl faucet_core::Sink for HttpSink {
         }
 
         // Resolve auth once per batch (provider-first, then inline).
-        let auth = self.resolve_auth().await?;
+        let (auth, sent) = self.resolve_auth_and_credential().await?;
+        let sent = sent.as_ref();
 
         match &self.config.batch_mode {
             HttpBatchMode::Individual => {
@@ -271,12 +320,12 @@ impl faucet_core::Sink for HttpSink {
                 let mut in_flight = FuturesUnordered::new();
                 let mut iter = records.iter();
                 for record in iter.by_ref().take(concurrency) {
-                    in_flight.push(self.send_with_retry(record, &auth));
+                    in_flight.push(self.send(record, &auth, sent));
                 }
                 while let Some(result) = in_flight.next().await {
                     result?;
                     if let Some(record) = iter.next() {
-                        in_flight.push(self.send_with_retry(record, &auth));
+                        in_flight.push(self.send(record, &auth, sent));
                     }
                 }
 
@@ -297,7 +346,7 @@ impl faucet_core::Sink for HttpSink {
                 let mut total = 0;
                 for chunk in records.chunks(effective_chunk) {
                     let array = Value::Array(chunk.to_vec());
-                    self.send_with_retry(&array, &auth).await?;
+                    self.send(&array, &auth, sent).await?;
                     total += chunk.len();
                 }
                 tracing::debug!(
@@ -354,7 +403,8 @@ impl faucet_core::Sink for HttpSink {
             return Ok(Vec::new());
         }
 
-        let auth = self.resolve_auth().await?;
+        let (auth, sent) = self.resolve_auth_and_credential().await?;
+        let sent = sent.as_ref();
 
         match &self.config.batch_mode {
             HttpBatchMode::Individual => {
@@ -366,14 +416,11 @@ impl faucet_core::Sink for HttpSink {
                 // the unordered completion. The per-record futures are built
                 // eagerly (lazy, not yet polled) so `buffer_unordered` drives a
                 // single concrete future type.
-                let pending: Vec<_> =
-                    records
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, record)| async move {
-                            (idx, self.send_with_retry(record, auth).await)
-                        })
-                        .collect();
+                let pending: Vec<_> = records
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, record)| async move { (idx, self.send(record, auth, sent).await) })
+                    .collect();
                 let mut indexed: Vec<(usize, faucet_core::RowOutcome)> =
                     futures::stream::iter(pending)
                         .buffer_unordered(concurrency)
@@ -406,7 +453,7 @@ impl faucet_core::Sink for HttpSink {
 
                 for chunk in chunks.by_ref() {
                     let array = Value::Array(chunk.to_vec());
-                    match self.send_with_retry(&array, &auth).await {
+                    match self.send(&array, &auth, sent).await {
                         Ok(()) => {
                             // This chunk was delivered to the live endpoint.
                             outcomes.extend(chunk.iter().map(|_| Ok(())));

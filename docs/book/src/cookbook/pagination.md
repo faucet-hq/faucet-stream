@@ -1,8 +1,11 @@
 # Pagination styles (REST source)
 
 The REST source walks multi-page responses automatically. Set `pagination.type`
-to one of the styles below. `max_pages` is a hard cap across all of them, and
-every style has a loop/termination guard so a misbehaving API can't loop forever.
+to one of the styles below. Every style has a loop/termination guard so a
+misbehaving API can't loop forever. `max_pages` is an optional cap across all of
+them (unset by default); a pass the cap cuts short persists no record-derived or
+window bookmark, because that would skip the pages it never read — only a
+`persist_cursor` bookmark, which names the next unread page, is kept.
 
 | Style | Stops when |
 |-------|-----------|
@@ -131,6 +134,8 @@ short-page rule.
 ## Keyset (record-field cursor)
 
 Page by the running **max** (or **min**) of a record field — the pattern accounting journal APIs use (`offset = max(JournalNumber)` of the last page). Stops on a short page.
+
+The cursor is taken from every record a page returns, including ones the incremental filter drops, so a page of only-old rows still moves it. Values compare like replication bookmarks: numbers and numeric strings by value (`"59"` follows `"9"`), timestamps chronologically, other strings as text. A **full** page that leaves the cursor where it was fails the run — more than a page of rows share that value, or the feed isn't ordered by the field — rather than stopping and silently skipping the rest.
 
 ```yaml
 pagination:

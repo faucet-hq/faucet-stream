@@ -1107,6 +1107,86 @@ pub fn sink_truncating_path<'a>(kind: &str, cfg: &'a Value) -> Option<&'a str> {
     }
 }
 
+/// Where a sink on the shared file writer puts a fixed set of file names, as
+/// one comparable string (`file:<path>`, `s3://bucket/key`, `gs://…`,
+/// `az://account/container/key`, `sftp://host:port/dir/name`). Two writers
+/// with the same destination overwrite each other's files and prune the parts
+/// the other wrote, so rows must not share one, and a row that runs once per
+/// parent record needs a per-invocation token in it. `None` when the sink
+/// names every file uniquely per run (a remote sink without `path` /
+/// `file_name`), or for any other kind.
+pub fn sink_shared_destination(kind: &str, cfg: &Value) -> Option<String> {
+    let text = |k: &str| cfg.get(k).and_then(Value::as_str);
+    let prefix = || text("prefix").unwrap_or("");
+    match kind {
+        "file" => text("path").map(|p| format!("file:{p}")),
+        "jsonl" | "csv" | "parquet" => sink_truncating_path(kind, cfg).map(|p| format!("file:{p}")),
+        "s3" => Some(format!(
+            "s3://{}/{}{}",
+            text("bucket")?,
+            prefix(),
+            text("path")?
+        )),
+        "gcs" => Some(format!(
+            "gs://{}/{}{}",
+            text("bucket")?,
+            prefix(),
+            text("path")?
+        )),
+        "azure-blob" => Some(format!(
+            "az://{}/{}/{}{}",
+            text("account").unwrap_or(""),
+            text("container")?,
+            prefix(),
+            text("path")?
+        )),
+        "sftp" => Some(format!(
+            "sftp://{}:{}/{}/{}",
+            text("host")?,
+            cfg.get("port").and_then(Value::as_u64).unwrap_or(22),
+            text("path")?.trim_end_matches('/'),
+            text("file_name")?
+        )),
+        _ => None,
+    }
+}
+
+/// A sink-config patch that gives one row of a fan-out its own destination,
+/// for a sink [`sink_shared_destination`] reports a fixed destination for:
+/// `tag` (a path-safe name such as a row id) goes into the file name before
+/// its first extension (`out/orders.jsonl` → `out/orders.<tag>.jsonl`), or
+/// becomes a subdirectory of a directory destination (`out/` →
+/// `out/<tag>/`). The patch sets the same field the guard reads (`path`,
+/// `destination.path` for `parquet`, `file_name` for `sftp`). `None` when
+/// the sink has no shared destination.
+pub fn sink_destination_patch(kind: &str, cfg: &Value, tag: &str) -> Option<Value> {
+    sink_shared_destination(kind, cfg)?;
+    let tagged = |name: &str| -> String {
+        if let Some(dir) = name.strip_suffix('/') {
+            return format!("{dir}/{tag}/");
+        }
+        let (dir, file) = match name.rfind('/') {
+            Some(i) => name.split_at(i + 1),
+            None => ("", name),
+        };
+        match file.find('.') {
+            Some(i) if i > 0 => format!("{dir}{}.{tag}{}", &file[..i], &file[i..]),
+            _ => format!("{dir}{file}.{tag}"),
+        }
+    };
+    let text = |k: &str| cfg.get(k).and_then(Value::as_str);
+    match kind {
+        "parquet" => {
+            let path = cfg.get("destination")?.get("path")?.as_str()?;
+            let mut destination = cfg.get("destination")?.clone();
+            destination["path"] = Value::String(tagged(path));
+            Some(serde_json::json!({ "destination": destination }))
+        }
+        "sftp" => Some(serde_json::json!({ "file_name": tagged(text("file_name")?) })),
+        _ => Some(serde_json::json!({ "path": tagged(text("path")?) })),
+    }
+}
+
 /// Sinks that support a **scoped/windowed** overwrite (#518) — replacing only
 /// the rows matching a `scope` (a date window) instead of the whole table. A
 /// subset of [`OVERWRITE_SINK_KINDS`]; the others still support full overwrite.
@@ -1205,6 +1285,19 @@ pub fn sink_guarantee(kind: &str) -> faucet_core::SinkGuarantee {
         faucet_core::SinkGuarantee::KeyedUpsert
     } else {
         faucet_core::SinkGuarantee::AtLeastOnce
+    }
+}
+
+/// Config-level mirror of `Source::consumes_destructively` for the built-in
+/// queue sources: reading them acks, deletes or settles messages as the
+/// pipeline moves past each page (`sqs`, `pubsub`, `rabbitmq`, and `nats` in
+/// JetStream mode). Lets graph validation refuse them without building a
+/// connector (#789 MSG-14).
+pub fn source_kind_consumes_destructively(kind: &str, config: &Value) -> bool {
+    match kind {
+        "sqs" | "pubsub" | "rabbitmq" => true,
+        "nats" => config.get("jetstream_stream").is_some_and(|v| !v.is_null()),
+        _ => false,
     }
 }
 
@@ -2665,7 +2758,22 @@ fn unknown(name: &str, kind: &'static str, available: Vec<&'static str>) -> CliE
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use serde_json::json;
+
+    #[test]
+    fn queue_sources_consume_destructively_by_kind() {
+        let empty = serde_json::json!({});
+        for kind in ["sqs", "pubsub", "rabbitmq"] {
+            assert!(source_kind_consumes_destructively(kind, &empty), "{kind}");
+        }
+        assert!(!source_kind_consumes_destructively("nats", &empty));
+        assert!(source_kind_consumes_destructively(
+            "nats",
+            &serde_json::json!({"jetstream_stream": "S"})
+        ));
+        assert!(!source_kind_consumes_destructively("kafka", &empty));
+    }
 
     #[test]
     fn bookmark_schema_and_migration_per_source_kind() {
@@ -3835,6 +3943,94 @@ mod tests {
 mod truncating_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn destination_patch_tags_the_file_name_or_the_directory() {
+        let p = |k: &str, v: Value| sink_destination_patch(k, &v, "orders");
+        assert_eq!(
+            p("jsonl", json!({"path": "out/all.jsonl.gz"})),
+            Some(json!({"path": "out/all.orders.jsonl.gz"}))
+        );
+        assert_eq!(
+            p("file", json!({"path": "out"})),
+            Some(json!({"path": "out.orders"}))
+        );
+        assert_eq!(
+            p("file", json!({"path": ".hidden"})),
+            Some(json!({"path": ".hidden.orders"}))
+        );
+        assert_eq!(
+            p("s3", json!({"bucket": "b", "path": "exports/"})),
+            Some(json!({"path": "exports/orders/"}))
+        );
+        assert_eq!(
+            p(
+                "sftp",
+                json!({"host": "h", "path": "/d", "file_name": "x-{part}.csv"})
+            ),
+            Some(json!({"file_name": "x-{part}.orders.csv"}))
+        );
+        assert_eq!(
+            p(
+                "parquet",
+                json!({"destination": {"type": "local_path", "path": "o/a.parquet"}})
+            ),
+            Some(json!({"destination": {"type": "local_path", "path": "o/a.orders.parquet"}}))
+        );
+        assert_eq!(p("jsonl", json!({"path": "a.jsonl", "append": true})), None);
+        assert_eq!(p("s3", json!({"bucket": "b"})), None);
+    }
+
+    #[test]
+    fn shared_destination_by_kind() {
+        let d = |k: &str, v: Value| sink_shared_destination(k, &v);
+        assert_eq!(
+            d("file", json!({"path": "o/a.jsonl"})).as_deref(),
+            Some("file:o/a.jsonl")
+        );
+        assert_eq!(
+            d("jsonl", json!({"path": "o/a.jsonl"})).as_deref(),
+            Some("file:o/a.jsonl")
+        );
+        assert_eq!(
+            d("jsonl", json!({"path": "o/a.jsonl", "append": true})),
+            None
+        );
+        assert_eq!(
+            d(
+                "s3",
+                json!({"bucket": "b", "prefix": "p/", "path": "x-{part}.csv"})
+            )
+            .as_deref(),
+            Some("s3://b/p/x-{part}.csv")
+        );
+        assert_eq!(d("s3", json!({"bucket": "b", "prefix": "p/"})), None);
+        assert_eq!(
+            d("gcs", json!({"bucket": "b", "path": "x.csv"})).as_deref(),
+            Some("gs://b/x.csv")
+        );
+        assert_eq!(
+            d(
+                "azure-blob",
+                json!({"account": "a", "container": "c", "path": "x.csv"})
+            )
+            .as_deref(),
+            Some("az://a/c/x.csv")
+        );
+        assert_eq!(
+            d(
+                "sftp",
+                json!({"host": "h", "path": "/d/", "file_name": "x.csv"})
+            )
+            .as_deref(),
+            Some("sftp://h:22//d/x.csv")
+        );
+        assert_eq!(
+            d("sftp", json!({"host": "h", "port": 2222, "path": "/d"})),
+            None
+        );
+        assert_eq!(d("postgres", json!({"table": "t"})), None);
+    }
 
     #[test]
     fn truncating_path_by_kind() {

@@ -165,10 +165,23 @@ pub async fn csv_to_ndjson_with_nulls(
     has_headers: bool,
     null_values: &[String],
 ) -> Result<(Vec<u8>, u64), FaucetError> {
+    csv_to_ndjson_with_options(bytes, delimiter, b'"', has_headers, null_values).await
+}
+
+/// [`csv_to_ndjson_with_nulls`] with an explicit quote character, so a
+/// `csv_quote` other than `"` parses exactly as the `Value` path does.
+pub async fn csv_to_ndjson_with_options(
+    bytes: &[u8],
+    delimiter: u8,
+    quote: u8,
+    has_headers: bool,
+    null_values: &[String],
+) -> Result<(Vec<u8>, u64), FaucetError> {
     use futures::StreamExt as _;
     let mut rdr = csv_async::AsyncReaderBuilder::new()
         .has_headers(false)
         .delimiter(delimiter)
+        .quote(quote)
         .flexible(true)
         .create_reader(bytes);
     let mut records = rdr.records();
@@ -220,11 +233,27 @@ pub fn csv_reader_to_ndjson_stream_with_nulls<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    csv_reader_to_ndjson_stream_with_options(reader, delimiter, b'"', has_headers, null_values)
+}
+
+/// [`csv_reader_to_ndjson_stream_with_nulls`] with an explicit quote character,
+/// so a `csv_quote` other than `"` parses exactly as the `Value` path does.
+pub fn csv_reader_to_ndjson_stream_with_options<R>(
+    reader: R,
+    delimiter: u8,
+    quote: u8,
+    has_headers: bool,
+    null_values: Vec<String>,
+) -> impl futures::Stream<Item = Result<Vec<u8>, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     use futures::StreamExt as _;
     async_stream::try_stream! {
         let mut rdr = csv_async::AsyncReaderBuilder::new()
             .has_headers(false)
             .delimiter(delimiter)
+            .quote(quote)
             .flexible(true)
             .create_reader(reader);
         let mut records = rdr.records();
@@ -484,11 +513,30 @@ pub fn parse_excel(
 }
 
 #[cfg(feature = "excel")]
+/// An Excel date/time cell as text: `YYYY-MM-DD` for a whole day, an ISO
+/// timestamp otherwise, an ISO 8601 duration for a time span. The workbook's
+/// 1904 date system is honoured. A serial outside chrono's range keeps the
+/// raw number.
+fn excel_datetime_text(dt: &calamine::ExcelDateTime) -> String {
+    if dt.is_duration() {
+        return dt
+            .as_duration()
+            .map_or_else(|| dt.as_f64().to_string(), |d| d.to_string());
+    }
+    match dt.as_datetime() {
+        Some(t) if t.time() == chrono::NaiveTime::MIN => t.date().to_string(),
+        Some(t) => t.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+        None => dt.as_f64().to_string(),
+    }
+}
+
+#[cfg(feature = "excel")]
 fn cell_to_string(cell: &calamine::Data) -> String {
     use calamine::Data;
     match cell {
         Data::String(s) => s.clone(),
         Data::Empty => String::new(),
+        Data::DateTime(dt) => excel_datetime_text(dt),
         other => other.to_string(),
     }
 }
@@ -504,7 +552,7 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
         Data::Float(f) => serde_json::Number::from_f64(*f)
             .map(Value::Number)
             .unwrap_or(Value::Null),
-        Data::DateTime(dt) => Value::String(dt.to_string()),
+        Data::DateTime(dt) => Value::String(excel_datetime_text(dt)),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::String(s.clone()),
         Data::Error(e) => Value::String(format!("{e:?}")),
     }
@@ -819,6 +867,44 @@ mod tests {
         assert_eq!(recs[0]["id"], "1");
         assert_eq!(recs[0]["name"], "Alice");
         assert_eq!(recs[1]["name"], "Bob");
+    }
+
+    /// A non-default `csv_quote` must parse identically on the native NDJSON
+    /// converters and the `Value` path (#789 API-10).
+    #[tokio::test]
+    async fn a_custom_quote_parses_the_same_on_the_native_and_value_paths() {
+        use futures::StreamExt as _;
+        let csv = b"id,note\n1,'a, b'\n2,'it''s'\n";
+        let dialect = CsvDialect {
+            quote: b'\'',
+            ..Default::default()
+        };
+        let expected = parse_csv_with(csv, dialect).await.unwrap();
+        assert_eq!(expected[0]["note"], "a, b");
+        assert_eq!(expected[1]["note"], "it's");
+
+        let (buffered, rows) = csv_to_ndjson_with_options(csv, b',', b'\'', true, &[])
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+        let streamed: Vec<u8> = csv_reader_to_ndjson_stream_with_options(
+            std::io::Cursor::new(csv.to_vec()),
+            b',',
+            b'\'',
+            true,
+            Vec::new(),
+        )
+        .map(|chunk| chunk.unwrap())
+        .concat()
+        .await;
+        for ndjson in [buffered, streamed] {
+            let parsed: Vec<Value> = String::from_utf8(ndjson)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(parsed, expected);
+        }
     }
 
     /// The native NDJSON converter (#633) must produce byte-identical output to
@@ -1246,5 +1332,28 @@ mod tests {
             assert!(batch.column(2).is_null(0));
             assert!(!batch.column(1).is_null(1));
         }
+    }
+
+    #[cfg(feature = "excel")]
+    #[test]
+    fn excel_date_cells_become_iso_text() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+        let dt = |v, ty| Data::DateTime(ExcelDateTime::new(v, ty, false));
+        assert_eq!(
+            cell_to_value(&dt(45000.0, ExcelDateTimeType::DateTime)),
+            serde_json::json!("2023-03-15")
+        );
+        assert_eq!(
+            cell_to_value(&dt(1.5, ExcelDateTimeType::TimeDelta)),
+            serde_json::json!("PT129600S")
+        );
+        assert_eq!(
+            cell_to_value(&dt(1e12, ExcelDateTimeType::DateTime)),
+            serde_json::json!("1000000000000")
+        );
+        assert_eq!(
+            cell_to_string(&dt(45000.5, ExcelDateTimeType::DateTime)),
+            "2023-03-15T12:00:00"
+        );
     }
 }

@@ -11,6 +11,7 @@ keywords = ["gcs", "gcp", "storage", "etl", "pipeline"]
 categories.workspace = true
 
 [dependencies]
+faucet-common-file.workspace = true
 faucet-core.workspace = true
 faucet-common-gcs.workspace = true
 schemars.workspace = true

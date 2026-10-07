@@ -880,3 +880,30 @@ async fn error_if_exists_and_append_numbering() {
     assert_eq!(w.local_outputs().len(), 1);
     w.discard().await;
 }
+
+/// #789 FILE-06: a store whose uploads go through a temporary name has the
+/// stale ones of this output removed when a run starts; others are kept.
+#[tokio::test]
+async fn a_run_removes_its_own_stale_upload_scratch() {
+    let mem = Arc::new(Mem::default());
+    mem.upload_scratch.store(true, SeqCst);
+    for k in [
+        "pre/o/part-00001.jsonl.faucet-tmp-upload-dead",
+        "pre/o/other.csv.faucet-tmp-upload-live",
+    ] {
+        mem.objects.lock().unwrap().insert(k.into(), b"x".to_vec());
+    }
+    let mut s = per_flush();
+    s.max_records_per_file = Some(1);
+    let w = remote(&mem, Some("o/"), s, 1);
+    w.write_rows(&rows(1)).await.unwrap();
+    w.flush().await.unwrap();
+    w.complete().await.unwrap();
+    assert_eq!(
+        mem.keys(),
+        [
+            "pre/o/other.csv.faucet-tmp-upload-live",
+            "pre/o/part-00001.jsonl"
+        ]
+    );
+}

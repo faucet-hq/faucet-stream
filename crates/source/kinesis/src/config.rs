@@ -70,7 +70,8 @@ pub struct KinesisSourceConfig {
     #[serde(default)]
     pub shard_ids: Vec<String>,
     /// Also consume closed (post-resharding) shards still inside the
-    /// retention window. Default `false` (open shards only).
+    /// retention window that have no bookmark. A bookmarked closed shard is
+    /// always drained, before its children. Default `false`.
     #[serde(default)]
     pub include_closed: bool,
 
@@ -81,7 +82,8 @@ pub struct KinesisSourceConfig {
     /// `GetRecords` `Limit` per request (1–10000). Default 500.
     #[serde(default = "default_records_per_request")]
     pub records_per_request: usize,
-    /// Max shards read concurrently. Default 4.
+    /// Max concurrent `GetRecords` calls; every shard is still read, in turn.
+    /// Default 4.
     #[serde(default = "default_shard_concurrency")]
     pub shard_concurrency: usize,
 

@@ -1639,30 +1639,40 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
     Ok(())
 }
 
-/// Local file sinks must not share a path (#743): two writers renaming onto
-/// one file lose one writer's data. Rows must differ, and a row that runs once
-/// per parent record or discovered tuple needs a per-invocation `${...}` token.
+/// File-writing sinks must not share a destination (#743, #789 FILE-05): two
+/// writers on one fixed set of names overwrite each other's files and prune
+/// the parts the other wrote. Rows must differ, and a row that runs once per
+/// parent record or discovered tuple needs a per-invocation `${...}` token.
+/// Covers the local `file` / `jsonl` / `csv` / `parquet` sinks and the
+/// object-store and SFTP sinks given a fixed `path` / `file_name`
+/// ([`crate::registry::sink_shared_destination`]).
 fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
     fn per_invocation(path: &str) -> bool {
         path.match_indices("${")
             .any(|(i, _)| !path[i + 2..].starts_with("now."))
     }
-    let mut seen: HashMap<&str, &str> = HashMap::new();
-    for n in nodes.iter().filter(|n| n.sink.kind == "file") {
-        let Some(path) = n.sink.config.get("path").and_then(Value::as_str) else {
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for n in nodes {
+        let Some(dest) = crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config)
+        else {
             continue;
         };
         let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
-        if fans_out && !per_invocation(path) {
+        let legacy = matches!(n.sink.kind.as_str(), "jsonl" | "csv" | "parquet");
+        if fans_out && !legacy && !per_invocation(&dest) {
             return Err(CliError::Config(format!(
-                "row '{}': its file sink path '{path}' is the same for every invocation of a                  fan-out row, so concurrent writers would overwrite each other — put a                  per-invocation token (e.g. `${{parent.id}}`) in the path",
-                n.id
+                "row '{}': its {} sink destination '{dest}' is the same for every invocation of \
+                 a fan-out row, so concurrent writers would overwrite each other — put a \
+                 per-invocation token (e.g. `${{parent.id}}`) in the path",
+                n.id, n.sink.kind
             )));
         }
-        if let Some(other) = seen.insert(path, n.id.as_str()) {
+        if let Some(other) = seen.insert(dest.clone(), n.id.as_str()) {
             return Err(CliError::Config(format!(
-                "rows '{other}' and '{}' both write the file sink path '{path}' — give each row                  its own path (a per-row template such as `out/${{stream}}.jsonl` in a sink                  template, or a row-level `sink.config.path` override)",
-                n.id
+                "rows '{other}' and '{}' both write the {} sink destination '{dest}' — give each \
+                 row its own path (a per-row template such as `out/${{stream}}.jsonl` in a sink \
+                 template, or a row-level `sink.config.path` override)",
+                n.id, n.sink.kind
             )));
         }
     }
@@ -2649,7 +2659,7 @@ matrix:
     fn depends_on_is_recorded_and_deduped() {
         let c = cfg(r#"
 version: 1
-pipeline: { source: { type: rest, config: {} }, sink: { type: jsonl, config: { path: ./o } } }
+pipeline: { source: { type: rest, config: {} }, sink: { type: jsonl, config: { path: ./o, append: true } } }
 matrix:
   - { id: dims }
   - { id: staging }
@@ -3399,7 +3409,7 @@ matrix:
 version: 1
 pipeline:
   source: { type: rest, config: {} }
-  sink:   { type: jsonl, config: { path: ./o.jsonl } }
+  sink:   { type: jsonl, config: { path: ./o.jsonl, append: true } }
   dlq:
     sink: { type: jsonl, config: { path: ./base.jsonl } }
 matrix:
@@ -4391,7 +4401,7 @@ mod partition_tests {
 
     fn doc(partition: &str, source: &str) -> String {
         format!(
-            "version: 1\nname: p\npipeline:\n  source:{source}\n  sink:\n    type: jsonl\n    config:\n      path: ./out.jsonl\n{partition}"
+            "version: 1\nname: p\npipeline:\n  source:{source}\n  sink:\n    type: jsonl\n    config:\n      path: ./out-${{partition.index}}.jsonl\n{partition}"
         )
     }
 

@@ -3,7 +3,7 @@
 //! Reads a Delta table's active data files at the latest version (or a pinned
 //! `version` / `timestamp`) and yields each row as a `serde_json::Value`
 //! object. No datafusion: the active file set comes from the Delta log
-//! (`get_files_by_partitions`) and each parquet file is streamed through the async
+//! (`get_active_add_actions_by_partitions`) and each parquet file is streamed through the async
 //! Arrow reader faucet's Parquet source uses. Partition-column values (which
 //! live in the Hive-style path, not the file) are reconstructed and merged
 //! back into every row, typed against the table schema.
@@ -69,10 +69,18 @@ impl DeltaSource {
             faucet_common_delta::arrow_bridge::schema_from_delta(&state.snapshot().arrow_schema())?;
         let partition_cols = state.metadata().partition_columns().to_vec();
 
-        let paths = table
-            .get_files_by_partitions(&[])
-            .await
-            .map_err(|e| FaucetError::Source(format!("delta: could not list table files: {e}")))?;
+        let views: Vec<_> =
+            futures::TryStreamExt::try_collect(table.get_active_add_actions_by_partitions(&[]))
+                .await
+                .map_err(|e| {
+                    FaucetError::Source(format!("delta: could not list table files: {e}"))
+                })?;
+        refuse_deletion_vectors(
+            views
+                .iter()
+                .map(|v| (v.path(), v.deletion_vector_descriptor().is_some())),
+        )?;
+        let paths: Vec<ObjPath> = views.iter().map(|v| v.object_store_path()).collect();
 
         let files = paths
             .into_iter()
@@ -100,6 +108,27 @@ impl DeltaSource {
                 .cloned()
                 .collect(),
         )
+    }
+}
+
+/// Refuse a table whose active files carry deletion vectors: reading such a
+/// file whole would return rows the table has deleted or superseded.
+fn refuse_deletion_vectors<P: std::fmt::Display>(
+    files: impl Iterator<Item = (P, bool)>,
+) -> Result<(), FaucetError> {
+    let marked: Vec<String> = files
+        .filter(|(_, dv)| *dv)
+        .map(|(p, _)| p.to_string())
+        .collect();
+    match marked.first() {
+        None => Ok(()),
+        Some(first) => Err(FaucetError::Source(format!(
+            "delta: {} active file(s) carry deletion vectors (first: {first}), which this \
+             source cannot apply; reading them would return deleted rows. Purge them first \
+             (`REORG TABLE … APPLY (PURGE)`) or disable `delta.enableDeletionVectors` on \
+             the table",
+            marked.len()
+        ))),
     }
 }
 

@@ -24,7 +24,10 @@ pub enum AckMode {
     #[default]
     OnSinkConfirm,
     /// At-most-once: the broker considers a message delivered as soon as it is
-    /// sent (`no_ack`). Fastest, but a crash loses in-flight messages.
+    /// sent (`no_ack`). Fastest, but a crash loses in-flight messages. Cannot
+    /// be combined with `max_messages`: the broker pushes the backlog into the
+    /// client buffer ahead of consumption, so stopping at a count would lose
+    /// everything already pushed.
     Auto,
 }
 
@@ -203,6 +206,16 @@ impl RabbitMqSourceConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
+        if self.ack_mode == AckMode::Auto && self.max_messages.is_some() {
+            return Err(FaucetError::Config(
+                "rabbitmq source: `ack_mode: auto` cannot be combined with `max_messages` — under \
+                 `auto` the broker settles every message it pushes, and it pushes the backlog \
+                 into the client buffer ahead of consumption, so everything buffered past \
+                 `max_messages` would be lost when the run stops; use `ack_mode: \
+                 on_sink_confirm`, or terminate on `idle_timeout_secs` alone"
+                    .into(),
+            ));
+        }
         if self.ack_mode == AckMode::OnSinkConfirm {
             let prefetch = self.effective_prefetch();
             let too_small =
@@ -228,6 +241,19 @@ impl RabbitMqSourceConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn auto_ack_with_max_messages_is_refused() {
+        let mut c = RabbitMqSourceConfig::new("orders");
+        c.ack_mode = AckMode::Auto;
+        c.idle_timeout_secs = Some(5);
+        c.validate().unwrap();
+        c.max_messages = Some(10);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("ack_mode: auto"), "{err}");
+        c.ack_mode = AckMode::OnSinkConfirm;
+        c.validate().unwrap();
+    }
 
     #[test]
     fn minimal_is_valid() {

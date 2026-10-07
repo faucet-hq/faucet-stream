@@ -848,7 +848,7 @@ pipeline:
   sources:
     hibob: { type: rest, config: { base_url: https://api.hibob.com } }
   sinks:
-    wh: { type: jsonl, config: { path: ./o } }
+    wh: { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: people
     source: { ref: hibob, status: active, config: { path: /people } }
@@ -1010,7 +1010,7 @@ pipeline:
   sources:
     api: { type: rest, config: { base_url: https://x } }
   sinks:
-    wh: { type: jsonl, config: { path: ./o } }
+    wh: { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: a
     source: { ref: api, status: available }
@@ -1031,7 +1031,7 @@ pipeline:
   sources:
     api: { type: rest, config: { base_url: https://x } }
   sinks:
-    wh: { type: jsonl, config: { path: ./o } }
+    wh: { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: dims
     source: { ref: api, status: active }
@@ -1084,7 +1084,7 @@ pipeline:
   sources:
     api: { type: rest, config: { base_url: https://x } }
   sinks:
-    wh: { type: jsonl, config: { path: ./o } }
+    wh: { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: dims
     source: { ref: api, status: available }
@@ -1113,7 +1113,7 @@ pipeline:
   sources:
     api: { type: rest, config: { base_url: https://x } }
   sinks:
-    wh: { type: jsonl, config: { path: ./o } }
+    wh: { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: dims
     source: { ref: api, status: draft }
@@ -1178,7 +1178,7 @@ matrix:
 version: 1
 pipeline:
   source: { type: rest, config: { base_url: https://x } }
-  sink:   { type: jsonl, config: { path: ./o } }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
 "#;
         let s = RunSelection {
             select: vec!["row-0".into()],
@@ -1198,7 +1198,7 @@ pipeline:
 version: 1
 pipeline:
   source: { type: rest, config: { base_url: https://x } }
-  sink:   { type: jsonl, config: { path: ./o } }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - { id: a }
   - { id: b }

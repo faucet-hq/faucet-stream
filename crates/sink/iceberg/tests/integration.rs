@@ -498,3 +498,107 @@ async fn evolve_schema_duplicate_column_errors() {
         "got {err}"
     );
 }
+
+async fn read_rows(dir: &TempDir, table: &str) -> Vec<serde_json::Value> {
+    use futures::TryStreamExt;
+    let reader = open_reader_catalog(dir).await;
+    let tid = TableIdent::new(NamespaceIdent::from_strs(["db"]).unwrap(), table.into());
+    let t = reader.load_table(&tid).await.expect("load_table");
+    let batches: Vec<_> = t
+        .scan()
+        .build()
+        .expect("scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("read batches");
+    let mut rows = Vec::new();
+    for b in &batches {
+        rows.extend(faucet_core::columnar::record_batch_to_values(b).unwrap());
+    }
+    rows.sort_by_key(|r| r["id"].as_i64());
+    rows
+}
+
+/// #789 FILE-10: a partitioned table takes writes; each data file carries its
+/// partition value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writes_to_a_partitioned_table_commit() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut cfg = serde_json::to_value(sink_config(&dir, "parts")).unwrap();
+    cfg["partition_spec"] = json!([{"source": "region", "transform": "identity"}]);
+    let sink = IcebergSink::new(serde_json::from_value(cfg).unwrap())
+        .await
+        .expect("IcebergSink::new");
+    let records: Vec<_> = (0i64..6)
+        .map(|i| json!({"id": i, "region": if i % 2 == 0 { "eu" } else { "us" }}))
+        .collect();
+    sink.write_batch(&records).await.expect("write_batch");
+    sink.flush()
+        .await
+        .expect("flush commits a partitioned append");
+
+    let reader = open_reader_catalog(&dir).await;
+    let tid = TableIdent::new(NamespaceIdent::from_strs(["db"]).unwrap(), "parts".into());
+    let table = reader.load_table(&tid).await.unwrap();
+    assert!(!table.metadata().default_partition_spec().is_unpartitioned());
+    let rows = read_rows(&dir, "parts").await;
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[1]["region"], "us");
+}
+
+/// #789 FILE-11: values of a column added by `evolve_schema` mid-run land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn values_of_an_evolved_column_are_written() {
+    use faucet_core::{ColumnChange, SchemaEvolution};
+    let dir = TempDir::new().expect("tempdir");
+    let sink = IcebergSink::new(sink_config(&dir, "evolve_values"))
+        .await
+        .expect("IcebergSink::new");
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+    sink.write_batch(&[json!({"id": 2, "name": "b"})])
+        .await
+        .unwrap();
+
+    sink.evolve_schema(&SchemaEvolution {
+        additions: vec![ColumnChange {
+            name: "email".into(),
+            from: None,
+            to: json!({"type": ["string", "null"]}),
+        }],
+        widenings: vec![],
+        relax_nullability: vec![],
+    })
+    .await
+    .expect("evolve");
+    sink.write_batch(&[json!({"id": 3, "name": "c", "email": "c@x"})])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+
+    let rows = read_rows(&dir, "evolve_values").await;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[1]["email"], serde_json::Value::Null);
+    assert_eq!(rows[2]["email"], "c@x");
+}
+
+/// #789 FILE-12: a fractional value bound for an integer column fails the
+/// write instead of being truncated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fractional_value_in_an_integer_column_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let sink = IcebergSink::new(sink_config(&dir, "ints"))
+        .await
+        .expect("IcebergSink::new");
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    let err = sink
+        .write_batch(&[json!({"id": 10.5})])
+        .await
+        .expect_err("10.5 is not an integer");
+    assert!(err.to_string().contains("'id'"), "{err}");
+}

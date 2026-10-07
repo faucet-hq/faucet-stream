@@ -1,6 +1,8 @@
 //! Iceberg writer pipeline: `RecordBatch` → Parquet data files → `Vec<DataFile>`.
 //!
-//! `TableWriter` wraps a single `DataFileWriter` for a loaded Iceberg table.
+//! `TableWriter` wraps a `DataFileWriter` for a loaded Iceberg table, or, for a
+//! partitioned table, a fan-out writer that splits each batch by the table's
+//! default partition spec and keeps one data-file writer per partition.
 //! File rollover at `target_file_size_mb` is handled internally by the
 //! `RollingFileWriterBuilder`; callers just call `write(batch).await` and
 //! `close().await` when done.
@@ -13,6 +15,7 @@
 
 use arrow::record_batch::RecordBatch;
 use faucet_core::FaucetError;
+use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
 use iceberg::writer::IcebergWriter;
@@ -23,6 +26,8 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::partitioning::PartitioningWriter;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -57,7 +62,20 @@ pub(crate) fn compression_from_str(s: &str) -> Result<Compression, FaucetError> 
 /// one `RecordBatch` per `write()` call and collect all `DataFile`s from
 /// `close()`.
 pub(crate) struct TableWriter {
-    inner: Box<dyn IcebergWriter>,
+    inner: Inner,
+}
+
+type DataBuilder =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+enum Inner {
+    Unpartitioned(Box<dyn IcebergWriter>),
+    Partitioned(Box<Partitioned>),
+}
+
+struct Partitioned {
+    writer: FanoutWriter<DataBuilder>,
+    splitter: RecordBatchPartitionSplitter,
 }
 
 impl TableWriter {
@@ -102,17 +120,31 @@ impl TableWriter {
             name_gen,
         );
 
-        let inner = DataFileWriterBuilder::new(rolling)
-            .build(None)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("iceberg: failed to open writer: {e}")))?;
+        let builder = DataFileWriterBuilder::new(rolling);
+        let spec = table.metadata().default_partition_spec();
+        let inner = if spec.is_unpartitioned() {
+            let writer = builder
+                .build(None)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("iceberg: failed to open writer: {e}")))?;
+            Inner::Unpartitioned(Box::new(writer))
+        } else {
+            let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+                table.metadata().current_schema().clone(),
+                spec.clone(),
+            )
+            .map_err(|e| {
+                FaucetError::Sink(format!(
+                    "iceberg: cannot compute the table's partition values: {e}"
+                ))
+            })?;
+            Inner::Partitioned(Box::new(Partitioned {
+                writer: FanoutWriter::new(builder),
+                splitter,
+            }))
+        };
 
-        Ok(Self {
-            // `DataFileWriterBuilder::build` returns `impl IcebergWriter`, which
-            // we box to erase the concrete type (keeps the public API stable and
-            // avoids a complex generic type parameter on `IcebergSink`).
-            inner: Box::new(inner),
-        })
+        Ok(Self { inner })
     }
 
     /// Write a single `RecordBatch` to the underlying Parquet data file(s).
@@ -120,19 +152,26 @@ impl TableWriter {
     /// File rollover at the configured target size is handled internally by the
     /// `RollingFileWriterBuilder`; callers do not need to manage it.
     pub(crate) async fn write(&mut self, batch: RecordBatch) -> Result<(), FaucetError> {
-        self.inner
-            .write(batch)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("iceberg: write failed: {e}")))
+        let failed = |e: iceberg::Error| FaucetError::Sink(format!("iceberg: write failed: {e}"));
+        match &mut self.inner {
+            Inner::Unpartitioned(writer) => writer.write(batch).await.map_err(failed),
+            Inner::Partitioned(p) => {
+                for (key, part) in p.splitter.split(&batch).map_err(failed)? {
+                    p.writer.write(key, part).await.map_err(failed)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Finalise all open Parquet files and return the accumulated `DataFile`s
     /// that must be committed in a `fast_append` transaction.
-    pub(crate) async fn close(mut self) -> Result<Vec<DataFile>, FaucetError> {
-        self.inner
-            .close()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("iceberg: close failed: {e}")))
+    pub(crate) async fn close(self) -> Result<Vec<DataFile>, FaucetError> {
+        let failed = |e: iceberg::Error| FaucetError::Sink(format!("iceberg: close failed: {e}"));
+        match self.inner {
+            Inner::Unpartitioned(mut writer) => writer.close().await.map_err(failed),
+            Inner::Partitioned(p) => p.writer.close().await.map_err(failed),
+        }
     }
 }
 

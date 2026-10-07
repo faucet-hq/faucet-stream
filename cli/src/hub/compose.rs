@@ -910,6 +910,16 @@ per_stream:
         assert!(jsonl.truncates_per_invocation());
         let bq: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         assert!(!bq.truncates_per_invocation());
+        let fixed: SinkTemplate = serde_yaml::from_str(
+            "kind: sink-template\nname: s3\nsink:\n  type: s3\n  config: { bucket: b }\nper_stream: { path: \"${stream}.jsonl\" }\n",
+        )
+        .unwrap();
+        assert!(fixed.truncates_per_invocation(), "#789 FILE-05");
+        let unique: SinkTemplate = serde_yaml::from_str(
+            "kind: sink-template\nname: s3\nsink:\n  type: s3\n  config: { bucket: b }\nper_stream: { prefix: \"${stream}/\" }\n",
+        )
+        .unwrap();
+        assert!(!unique.truncates_per_invocation());
     }
 
     /// A file sink rewritten on every run *is* a full refresh: the template

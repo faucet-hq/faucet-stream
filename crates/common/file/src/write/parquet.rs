@@ -222,7 +222,15 @@ fn project(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, Fauce
         .iter()
         .map(|f| match batch.column_by_name(f.name()) {
             Some(c) if c.data_type() == f.data_type() => Ok(c.clone()),
-            Some(c) => arrow::compute::cast(c, f.data_type()).map_err(|e| {
+            Some(c) => arrow::compute::cast_with_options(
+                c,
+                f.data_type(),
+                &arrow::compute::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| {
                 FaucetError::Sink(format!(
                     "parquet: column '{}' cannot be converted to {}: {e}",
                     f.name(),
@@ -386,5 +394,36 @@ mod tests {
         )]));
         let e = project(&batch, &bad).unwrap_err();
         assert!(e.to_string().contains("cannot be converted"), "{e}");
+    }
+
+    #[test]
+    fn project_refuses_a_value_the_target_type_cannot_hold() {
+        let batch = faucet_core::columnar::values_to_record_batch_inferred(&[
+            json!({"n": 3_000_000_000_i64, "t": "not a time"}),
+        ])
+        .unwrap();
+        for (field, ty) in [
+            ("n", DataType::Int32),
+            (
+                "t",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            ),
+        ] {
+            let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(field, ty, true)]));
+            let e = project(&batch, &target).unwrap_err();
+            assert!(e.to_string().contains(&format!("'{field}'")), "{e}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_integer_column_refuses_a_fractional_value() {
+        let opts: ParquetOptions = serde_json::from_value(json!({
+            "schema": [{"name": "n", "type": "int32"}]
+        }))
+        .unwrap();
+        let state = ParquetState::new();
+        state.batch_for(&opts, &[json!({"n": 3.0})]).unwrap();
+        let e = state.batch_for(&opts, &[json!({"n": 3.7})]).unwrap_err();
+        assert!(e.to_string().contains("'n'"), "{e}");
     }
 }

@@ -205,6 +205,39 @@ fn check_key_alignment(key: &[String], seen: &[faucet_core::KeyTuple]) -> Result
     Ok(())
 }
 
+/// The `cursor.firstBatch` of a command reply (`listCollections`,
+/// `listIndexes`). A collection has at most 64 indexes, so one batch holds
+/// them all. Pure.
+fn first_batch(reply: &Document) -> Vec<Document> {
+    reply
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get_array("firstBatch").ok())
+        .map(|docs| {
+            docs.iter()
+                .filter_map(|d| d.as_document().cloned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The destination's index specs to recreate on the staging collection:
+/// every index but `_id_` and a clustered index (both come with the
+/// collection itself), without the legacy `ns` field `createIndexes`
+/// refuses. Pure.
+fn staging_index_specs(indexes: Vec<Document>) -> Vec<Document> {
+    indexes
+        .into_iter()
+        .filter(|ix| {
+            ix.get_str("name").ok() != Some("_id_") && !ix.get_bool("clustered").unwrap_or(false)
+        })
+        .map(|mut ix| {
+            ix.remove("ns");
+            ix
+        })
+        .collect()
+}
+
 /// Build the `delete_many` filter selecting documents in `scope` whose key was
 /// **not** written by this run (#478).
 ///
@@ -314,6 +347,44 @@ impl MongoSink {
             client,
             eo_collections_ready: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// Create the staging collection with the destination's options and
+    /// secondary indexes. A no-op when the destination does not exist.
+    async fn clone_destination_shape(&self) -> Result<(), FaucetError> {
+        let db = self.client.database(&self.config.database);
+        let staging = self.staging_collection();
+        let err = |what: &str, e: mongodb::error::Error| {
+            FaucetError::Sink(format!("mongodb overwrite: {what} failed: {e}"))
+        };
+        let listed = db
+            .run_command(bson::doc! {
+                "listCollections": 1,
+                "filter": { "name": &self.config.collection },
+            })
+            .await
+            .map_err(|e| err("listCollections", e))?;
+        let Some(spec) = first_batch(&listed).into_iter().next() else {
+            return Ok(());
+        };
+        let options = spec.get_document("options").cloned().unwrap_or_default();
+        let mut create = bson::doc! { "create": &staging };
+        create.extend(options);
+        db.run_command(create)
+            .await
+            .map_err(|e| err("creating the staging collection", e))?;
+
+        let listed = db
+            .run_command(bson::doc! { "listIndexes": &self.config.collection })
+            .await
+            .map_err(|e| err("listIndexes", e))?;
+        let indexes = staging_index_specs(first_batch(&listed));
+        if !indexes.is_empty() {
+            db.run_command(bson::doc! { "createIndexes": &staging, "indexes": indexes })
+                .await
+                .map_err(|e| err("copying indexes to the staging collection", e))?;
+        }
+        Ok(())
     }
 
     /// Staging collection used while an overwrite run is in flight.
@@ -703,8 +774,11 @@ impl faucet_core::Sink for MongoSink {
         self.config.write.is_overwrite()
     }
 
-    /// Drop any leftover staging collection so the overwrite run starts with an
-    /// empty one (a plain `insert_many` auto-creates it on first write).
+    /// Drop any leftover staging collection, then recreate it with the
+    /// destination's collection options (validator, collation, capped, …) and
+    /// secondary indexes, so the swap in
+    /// [`commit_overwrite`](faucet_core::Sink::commit_overwrite) keeps them. With
+    /// no destination yet the first `insert_many` creates staging.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         let db = self.client.database(&self.config.database);
         // Best-effort drop; a missing namespace is not an error for our purpose.
@@ -715,7 +789,7 @@ impl faucet_core::Sink for MongoSink {
         {
             tracing::debug!(error = %e, "mongodb overwrite: staging drop before begin (ignored)");
         }
-        Ok(())
+        self.clone_destination_shape().await
     }
 
     /// Atomically replace the destination via MongoDB's `renameCollection` with
@@ -1052,6 +1126,26 @@ impl faucet_core::Sink for MongoSink {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn staging_index_specs_skip_id_and_clustered_and_drop_ns() {
+        let specs = staging_index_specs(vec![
+            bson::doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+            bson::doc! { "v": 2, "key": { "_id": 1 }, "name": "clus", "clustered": true },
+            bson::doc! { "v": 2, "key": { "email": 1 }, "name": "email_1", "unique": true, "ns": "d.c" },
+        ]);
+        assert_eq!(
+            specs,
+            vec![bson::doc! { "v": 2, "key": { "email": 1 }, "name": "email_1", "unique": true }]
+        );
+    }
+
+    #[test]
+    fn first_batch_reads_the_cursor_or_nothing() {
+        let reply = bson::doc! { "cursor": { "firstBatch": [ { "name": "a" }, 7 ] }, "ok": 1 };
+        assert_eq!(first_batch(&reply), vec![bson::doc! { "name": "a" }]);
+        assert!(first_batch(&bson::doc! { "ok": 1 }).is_empty());
+    }
 
     // dataset_uri test is skipped: MongoSink::new() requires a live MongoDB
     // connection (Client::with_uri_str connects in new()), and no offline

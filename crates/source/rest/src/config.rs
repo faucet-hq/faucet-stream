@@ -44,7 +44,7 @@ fn default_pagination() -> PaginationStyle {
     PaginationStyle::None
 }
 fn default_max_pages() -> Option<usize> {
-    Some(100)
+    None
 }
 fn default_timeout() -> Option<Duration> {
     Some(Duration::from_secs(30))
@@ -164,9 +164,11 @@ pub struct RestStreamConfig {
     /// single object, which is emitted as one record).
     #[serde(default)]
     pub records_path: Option<String>,
-    /// Hard cap on pages fetched per run, across every pagination style — the
-    /// backstop against a feed that never signals completion. `None` removes
-    /// the cap.
+    /// Optional cap on pages fetched per pass, across every pagination style.
+    /// Unset by default: each pagination style already stops on its own end
+    /// signal and loop guards. When the cap cuts a pass short, only a persisted
+    /// cursor bookmark (`persist_cursor`) is kept — a record-derived or window
+    /// bookmark would skip the unread pages, so none is written.
     #[serde(default = "default_max_pages")]
     pub max_pages: Option<usize>,
     /// Fixed delay between page requests, in seconds — a politeness knob for
@@ -265,7 +267,7 @@ pub struct RestStreamConfig {
     pub schema: Option<Value>,
     /// Maximum number of records to sample when inferring the schema via
     /// [`crate::stream::RestStream::infer_schema`].  `0` means sample all
-    /// available records (up to `max_pages`).  Defaults to `100`.
+    /// available records (up to `max_pages`, when set).  Defaults to `100`.
     #[serde(default = "default_schema_sample_size")]
     pub schema_sample_size: usize,
 
@@ -745,7 +747,7 @@ impl Default for RestStreamConfig {
             body: None,
             pagination: PaginationStyle::None,
             records_path: None,
-            max_pages: Some(100),
+            max_pages: None,
             request_delay: None,
             timeout: Some(Duration::from_secs(30)),
             max_retries: 3,
@@ -1757,7 +1759,7 @@ mod tests {
 
         assert_eq!(cfg.base_url, "https://api.example.com");
         assert_eq!(cfg.method, reqwest::Method::GET);
-        assert_eq!(cfg.max_pages, Some(100));
+        assert_eq!(cfg.max_pages, None);
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.schema_sample_size, 100);
         assert!(matches!(cfg.pagination, PaginationStyle::None));

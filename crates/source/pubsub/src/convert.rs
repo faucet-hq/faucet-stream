@@ -2,7 +2,7 @@
 //! here beyond the plain fields (`data` / `attributes` / `message_id` / …)
 //! read off a message, so this module unit-tests fully offline.
 
-use crate::config::ValueFormat;
+use crate::config::{OnDecodeError, ValueFormat};
 use faucet_core::FaucetError;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -67,6 +67,57 @@ pub(crate) fn message_to_record(
         record.insert("publish_time_millis".to_string(), json!(ms));
     }
     Ok(Value::Object(record))
+}
+
+/// The message's raw parts, as read off a received message.
+pub(crate) struct MessageParts<'a> {
+    pub data: &'a [u8],
+    pub attributes: &'a HashMap<String, String>,
+    pub message_id: &'a str,
+    pub ordering_key: &'a str,
+    pub publish_time_millis: Option<i64>,
+}
+
+/// [`message_to_record`] under the `on_decode_error` policy: `Ok(None)` means
+/// the message is skipped (acked with its page, no record). Pure.
+pub(crate) fn record_with_policy(
+    m: &MessageParts<'_>,
+    format: ValueFormat,
+    attributes_key: &str,
+    on_error: OnDecodeError,
+) -> Result<Option<Value>, FaucetError> {
+    let decoded = message_to_record(
+        m.data,
+        m.attributes,
+        m.message_id,
+        m.ordering_key,
+        m.publish_time_millis,
+        format,
+        attributes_key,
+    );
+    match (decoded, on_error) {
+        (Ok(record), _) => Ok(Some(record)),
+        (Err(e), OnDecodeError::Fail) => Err(e),
+        (Err(e), OnDecodeError::Skip) => {
+            tracing::warn!(error = %e, "pubsub: undecodable message skipped");
+            Ok(None)
+        }
+        (Err(e), OnDecodeError::Raw) => {
+            let mut record = message_to_record(
+                m.data,
+                m.attributes,
+                m.message_id,
+                m.ordering_key,
+                m.publish_time_millis,
+                ValueFormat::Bytes,
+                attributes_key,
+            )?;
+            if let Value::Object(map) = &mut record {
+                map.insert("decode_error".to_string(), json!(e.to_string()));
+            }
+            Ok(Some(record))
+        }
+    }
 }
 
 /// Convert a protobuf `Timestamp` (seconds + nanos) to epoch milliseconds.
@@ -175,5 +226,43 @@ mod tests {
         assert_eq!(timestamp_millis(0, 0), 0);
         // Saturating on overflow rather than panicking.
         assert_eq!(timestamp_millis(i64::MAX, 0), i64::MAX);
+    }
+
+    #[test]
+    fn on_decode_error_fails_skips_or_keeps_the_raw_payload() {
+        let a = attrs(&[]);
+        let m = MessageParts {
+            data: b"not json",
+            attributes: &a,
+            message_id: "m1",
+            ordering_key: "",
+            publish_time_millis: None,
+        };
+        let fail = record_with_policy(&m, ValueFormat::Json, "__attributes", OnDecodeError::Fail);
+        assert!(fail.unwrap_err().to_string().contains("m1"));
+        assert_eq!(
+            record_with_policy(&m, ValueFormat::Json, "__attributes", OnDecodeError::Skip).unwrap(),
+            None
+        );
+        let raw = record_with_policy(&m, ValueFormat::Json, "__attributes", OnDecodeError::Raw)
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw["data"], "bm90IGpzb24=");
+        assert!(
+            raw["decode_error"]
+                .as_str()
+                .unwrap()
+                .contains("not valid JSON")
+        );
+        let ok = MessageParts {
+            data: br#"{"a":1}"#,
+            ..m
+        };
+        assert_eq!(
+            record_with_policy(&ok, ValueFormat::Json, "__attributes", OnDecodeError::Skip)
+                .unwrap()
+                .unwrap()["data"]["a"],
+            1
+        );
     }
 }

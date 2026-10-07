@@ -15,7 +15,7 @@ Reach for it when you want a database query, a CDC stream, a CSV dump, or an API
 - **Local & cloud warehouses** — REST resolves FileIO server-side; the SQL/Glue/HMS catalogs pick an OpenDAL-backed storage factory from the `warehouse` URI scheme (`file://`, `s3://`/`s3a://`, `gs://`).
 - **Atomic snapshot commits** — each `flush()` writes the Parquet footer and registers the new data files in a single `fast_append` transaction. One `StreamPage` becomes exactly one snapshot.
 - **Schema inference on create** — when `create_if_missing` is set and the table is new, the Iceberg schema is inferred from the first Arrow batch (every field becomes a nullable column typed by its first non-null value).
-- **Partitioning on create** — `identity`, `year`, `month`, `day`, `hour`, `void`, plus parameterized `bucket[N]` / `truncate[N]`.
+- **Partitioned tables** — writes to a partitioned table (new or existing) are split by the table's default partition spec, one data file per partition; on create, `identity`, `year`, `month`, `day`, `hour`, `void`, plus parameterized `bucket[N]` / `truncate[N]`.
 - **Parquet codec choice** — `snappy` (default), `zstd`, `gzip`, `lz4`, or `none`, with a soft `target_file_size_mb` rollover.
 - **Effectively-once delivery** — pairs with the CDC sources; the commit token is durably recorded as Iceberg snapshot summary properties (`faucet.commit-scope` / `faucet.commit-token`) inside the same atomic commit.
 - **`faucet doctor` preflight** — probes catalog connectivity and table existence without writing any data.
@@ -284,11 +284,13 @@ See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 `IcebergSink` reports its live table schema via `current_schema()` (the table's current Iceberg schema converted through Arrow to the `infer_schema` JSON shape; a missing table → `None`), so the pipeline-level `schema:` policy can **detect** drift between an incoming page's top-level shape and the real table. The `warn` / `ignore` / `quarantine` / `fail` modes all work against this sink.
 
-**`on_drift: evolve` supports additive columns** ([#255](https://github.com/faucet-hq/faucet-stream/issues/255)). `supports_schema_evolution()` returns `true`: on drift, each **new** column is added as an optional field via `iceberg-rust` 0.10.0's `Transaction::update_schema` action, in a single schema-update commit. Only additions are applied — iceberg-rust 0.10.0's `update_schema` exposes `add_column` (+ `delete_column`) but **no** in-place type promotion or nullability relaxation, so a `widenings` / `relax_nullability` evolution is rejected with a typed error rather than silently ignored. Row-level overwrite/upsert remain separately blocked upstream (#179 / #225). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+**`on_drift: evolve` supports additive columns** ([#255](https://github.com/faucet-hq/faucet-stream/issues/255)). `supports_schema_evolution()` returns `true`: on drift, each **new** column is added as an optional field via `iceberg-rust` 0.10.0's `Transaction::update_schema` action, in a single schema-update commit. The sink's open writer is closed (its files are committed on the next flush) and every later page is written against the evolved schema, so the new column's values land. Only additions are applied — iceberg-rust 0.10.0's `update_schema` exposes `add_column` (+ `delete_column`) but **no** in-place type promotion or nullability relaxation, so a `widenings` / `relax_nullability` evolution is rejected with a typed error rather than silently ignored. Row-level overwrite/upsert remain separately blocked upstream (#179 / #225). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
 
 ## Schema inference
 
 When `create_if_missing: true` and the table is new, the Iceberg schema is inferred from the first Arrow batch: every JSON field becomes a nullable column, typed by its first non-null value. Subsequent batches use the table's existing schema so the writer and table stay in sync. Iceberg assigns **field IDs** sequentially from `1`; IDs are stable once the table exists, so renaming or reordering JSON keys in later runs does not change them.
+
+A fractional number bound for an integer column (`10.5` into a `long`) fails the write naming the column instead of being truncated.
 
 ## Config loading & schema
 

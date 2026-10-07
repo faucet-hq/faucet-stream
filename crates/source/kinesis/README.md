@@ -28,10 +28,10 @@ source:
 | `credentials` | `{ type: default }` | `default` \| `profile` \| `access_key` \| `assume_role` \| `web_identity` — see `faucet-common-kinesis`. |
 | `start_position` | `{ type: trim_horizon }` | `trim_horizon` \| `latest` \| `at_timestamp { timestamp_secs }` \| `at_sequence_number { sequence }` \| `after_sequence_number { sequence }`. `at_timestamp` matches at **second** granularity. |
 | `shard_ids` | `[]` (all) | Explicit shard allowlist. |
-| `include_closed` | `false` | Also drain closed (post-resharding) shards inside the retention window. A fully-drained closed shard counts as *done*, not idle. |
+| `include_closed` | `false` | Also drain closed (post-resharding) shards inside the retention window that have no bookmark. A closed shard **with** a bookmark is always drained. A fully-drained closed shard counts as *done*, not idle. |
 | `poll_interval_ms` | `1000` | Base wait between `GetRecords` per shard; floored at 200 ms (the 5 reads/sec/shard API budget). |
 | `records_per_request` | `500` | `GetRecords` limit (1–10000). |
-| `shard_concurrency` | `4` | Bounded concurrent shard workers. |
+| `shard_concurrency` | `4` | Maximum concurrent `GetRecords` calls. Every eligible shard is read, in turn, even when there are more shards than this. |
 | `idle_termination_secs` / `max_messages` | — | **At least one is required** so a batch run terminates. |
 | `value_format` | `json` | `json` (parse; invalid JSON fails with shard+sequence context) \| `string` (strict UTF-8) \| `bytes` (base64). |
 | `batch_size` | `1000` | Records per emitted page. `0` = one page per drain cycle. |
@@ -56,10 +56,13 @@ State key: `kinesis:<stream_name>`. The bookmark is a per-shard map
 bookmarked shard resumes at `AFTER_SEQUENCE_NUMBER`; unbookmarked shards use
 `start_position`.
 
-**Resharding:** when a parent shard closes mid-run its worker exits cleanly;
-child shards are picked up on the next run's discovery and start from
-`start_position` (persisted parent sequences prevent re-emitting drained
-closed shards when `include_closed: true`).
+**Resharding:** after a split or merge, a closed parent shard that has a
+bookmark is drained before its children start, so its unread tail is never
+dropped and a key's older records (in the parent) are written before its newer
+ones (in the children). A child of a parent that was read starts at
+`TRIM_HORIZON` rather than `start_position`, so nothing written to it after the
+reshard is skipped. With `include_closed: true` unbookmarked closed shards are
+read too, also parents first.
 
 **Delivery is at-least-once.** A restart between a sink write and the bookmark
 persist re-delivers records at the boundary — key downstream on

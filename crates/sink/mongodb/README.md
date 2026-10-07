@@ -344,5 +344,12 @@ are staged into `{collection}__faucet_ovw` and published with an atomic
 failure leaves the previous documents intact. No `key` is needed. Requires the
 `renameCollection` privilege and is unsupported on sharded collections.
 
+The staging collection is created with the destination's options (validator,
+collation, capped size, …) and its secondary indexes (unique, TTL, compound,
+…), so they survive the swap. A unique index is enforced while the run loads,
+so rows that would break it fail the run before anything is replaced. The
+copy needs the `listCollections`, `listIndexes`, `createCollection` and
+`createIndex` privileges.
+
 
 **Leftover staging.** `overwrite_staging_exists()` probes for the `<collection>__faucet_ovw` collection read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.

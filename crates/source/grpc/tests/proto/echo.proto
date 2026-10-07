@@ -16,6 +16,8 @@ service EchoService {
 
 message ListRequest {
   uint32 count = 1;
+  // Milliseconds to wait before answering.
+  uint32 delay_ms = 2;
 }
 
 message ListResponse {
@@ -36,6 +38,12 @@ message TailRequest {
   // (the test fixture remembers nothing across reconnects). Set to 0 to
   // disable the failure injection.
   uint32 fail_after = 2;
+  // gRPC status code the first attempt fails with (0 = UNAVAILABLE).
+  int32 fail_code = 3;
+  // Keep the stream open after the last event instead of closing it.
+  bool hold_open = 4;
+  // Milliseconds to wait before answering the call.
+  uint32 start_delay_ms = 5;
 }
 
 message Event {

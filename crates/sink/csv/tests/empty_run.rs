@@ -77,9 +77,9 @@ async fn append_mode_never_truncates_on_an_empty_run() {
     let path = dir.path().join("out.csv");
     assert!(run(&path, true, rows(2), None).await);
     assert!(run(&path, true, rows(0), None).await);
-    assert_eq!(lines(&path), 2);
+    assert_eq!(lines(&path), 3, "header + 2 rows");
     assert!(run(&path, true, rows(1), None).await);
-    assert_eq!(lines(&path), 3);
+    assert_eq!(lines(&path), 4);
 }
 
 #[cfg(feature = "compression")]

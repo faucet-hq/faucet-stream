@@ -310,6 +310,63 @@ impl Sink for SamplingSink {
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
     }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    fn write_batch_is_replay_safe(&self) -> bool {
+        self.inner.write_batch_is_replay_safe()
+    }
+    fn supports_cleanup(&self) -> bool {
+        self.inner.supports_cleanup()
+    }
+    fn supports_staged_load(&self) -> bool {
+        self.inner.supports_staged_load()
+    }
+    async fn cleanup_scope(
+        &self,
+        scope: &std::collections::BTreeMap<String, Value>,
+        seen: &faucet_core::SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        self.inner.cleanup_scope(scope, seen).await
+    }
+    fn supports_rollback(&self) -> bool {
+        self.inner.supports_rollback()
+    }
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &faucet_core::rollback::RollbackOptions,
+    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+        self.inner.rollback_run(run_id, opts).await
+    }
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.inner.forget_run(run_id).await
+    }
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.inner.rewind_commit_token(scope, token).await
+    }
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.inner.readback_source()
+    }
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
+    }
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
+    async fn check(
+        &self,
+        ctx: &faucet_core::CheckContext,
+    ) -> Result<faucet_core::CheckReport, FaucetError> {
+        self.inner.check(ctx).await
+    }
     // Native byte-passthrough passthrough (#639). Without forwarding these, the
     // wrapper's trait defaults would report "no native load capability", forcing
     // the pipeline onto the `Value` path whenever sampling is active — the exact
@@ -517,6 +574,9 @@ impl Source for SamplingSource {
     }
     fn supports_exactly_once(&self) -> bool {
         self.inner.supports_exactly_once()
+    }
+    fn consumes_destructively(&self) -> bool {
+        self.inner.consumes_destructively()
     }
     fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
         self.inner.replay_guarantee()
@@ -727,6 +787,124 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), vec!["begin", "commit", "abort"]);
     }
 
+    #[tokio::test]
+    async fn sampling_sink_forwards_cleanup_rollback_recorder_and_check() {
+        struct CapSink(Arc<std::sync::Mutex<Vec<&'static str>>>);
+        #[async_trait]
+        impl Sink for CapSink {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+                Ok(Some(true))
+            }
+            fn write_batch_is_replay_safe(&self) -> bool {
+                true
+            }
+            fn supports_cleanup(&self) -> bool {
+                true
+            }
+            fn supports_staged_load(&self) -> bool {
+                true
+            }
+            async fn cleanup_scope(
+                &self,
+                _scope: &std::collections::BTreeMap<String, Value>,
+                _seen: &faucet_core::SeenKeys,
+            ) -> Result<u64, FaucetError> {
+                Ok(7)
+            }
+            fn supports_rollback(&self) -> bool {
+                true
+            }
+            async fn rollback_run(
+                &self,
+                _run_id: &str,
+                _opts: &faucet_core::rollback::RollbackOptions,
+            ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+                self.0.lock().unwrap().push("rollback");
+                Ok(faucet_core::rollback::RollbackOutcome {
+                    deleted: 3,
+                    ..Default::default()
+                })
+            }
+            async fn forget_run(&self, _run_id: &str) -> Result<(), FaucetError> {
+                self.0.lock().unwrap().push("forget");
+                Ok(())
+            }
+            async fn rewind_commit_token(
+                &self,
+                _scope: &str,
+                _token: Option<&str>,
+            ) -> Result<(), FaucetError> {
+                self.0.lock().unwrap().push("rewind");
+                Ok(())
+            }
+            fn readback_source(&self) -> Option<(String, Value)> {
+                Some(("sqlite".into(), json!({"path": "x.db"})))
+            }
+            fn config_schema(&self) -> Value {
+                json!({"title": "cap"})
+            }
+            fn set_roundtrip_recorder(
+                &self,
+                _recorder: Arc<faucet_core::observability::RoundtripRecorder>,
+            ) {
+                self.0.lock().unwrap().push("recorder");
+            }
+            async fn check(
+                &self,
+                _ctx: &faucet_core::CheckContext,
+            ) -> Result<faucet_core::CheckReport, FaucetError> {
+                self.0.lock().unwrap().push("check");
+                Ok(faucet_core::CheckReport::default())
+            }
+        }
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = SamplingSink::new(
+            Box::new(CapSink(Arc::clone(&log))),
+            Arc::new(SampleState::new(2)),
+        );
+        assert_eq!(s.overwrite_staging_exists().await.unwrap(), Some(true));
+        assert!(s.write_batch_is_replay_safe());
+        assert!(s.supports_cleanup());
+        assert!(s.supports_staged_load());
+        assert_eq!(s.write_batch(&[json!({"id": 1})]).await.unwrap(), 1);
+        let seen = faucet_core::SeenKeys::new();
+        assert_eq!(
+            s.cleanup_scope(&Default::default(), &seen).await.unwrap(),
+            7
+        );
+        assert!(s.supports_rollback());
+        let opts = faucet_core::rollback::RollbackOptions {
+            run_id_column: "_faucet_run_id".into(),
+            mode: faucet_core::rollback::RollbackMode::Append,
+            force: false,
+            dry_run: true,
+            later_runs: false,
+        };
+        assert_eq!(s.rollback_run("r1", &opts).await.unwrap().deleted, 3);
+        s.forget_run("r1").await.unwrap();
+        s.rewind_commit_token("p::row", None).await.unwrap();
+        assert_eq!(s.readback_source().unwrap().0, "sqlite");
+        assert_eq!(s.config_schema()["title"], "cap");
+        s.set_roundtrip_recorder(Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Sink,
+                "p",
+                "",
+                "cap",
+            ),
+        ));
+        s.check(&faucet_core::CheckContext::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["rollback", "forget", "rewind", "recorder", "check"]
+        );
+    }
+
     struct TwoRowSource;
     #[async_trait]
     impl faucet_core::Source for TwoRowSource {
@@ -907,6 +1085,7 @@ mod tests {
             .unwrap();
         assert_eq!(bm, Some(json!("bm")));
         assert!(s.supports_exactly_once());
+        assert!(!s.consumes_destructively());
         assert_eq!(
             s.replay_guarantee(),
             faucet_core::ReplayGuarantee::Deterministic

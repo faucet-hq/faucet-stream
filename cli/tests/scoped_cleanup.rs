@@ -157,6 +157,34 @@ async fn deletes_only_stale_rows_inside_the_claimed_scope() {
     );
 }
 
+/// Catalog recording wraps the sink in the lineage `SamplingSink`; cleanup must
+/// still reach the real sink through it (MSG-06).
+#[cfg(feature = "catalog")]
+#[tokio::test]
+async fn cleanup_still_runs_when_the_catalog_samples_the_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("d.sqlite").display()
+    );
+    seed(&db).await;
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "id,contact_id,label\n3,7,keep-me\n").unwrap();
+
+    let mut o = opts("cleanup_catalog");
+    o.catalog = Some(faucet_cli::catalog::CatalogHandle {
+        store: std::sync::Arc::new(faucet_cli::serve::history::memory::MemoryHistory::new(
+            std::time::Duration::from_secs(60),
+        )),
+        run_id: None,
+        sample_records: 10,
+        annotations: Vec::new(),
+    });
+    run(&config_yaml(&csv, &db, true), dir.path(), o).await;
+
+    assert_eq!(rows(&db).await, vec![(3, 7), (10, 8), (11, 8)]);
+}
+
 #[tokio::test]
 async fn an_empty_fetch_clears_the_whole_scope() {
     // THE motivating case: every association for contact 7 was removed upstream,

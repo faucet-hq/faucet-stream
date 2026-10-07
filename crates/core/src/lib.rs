@@ -40,6 +40,7 @@ pub mod file_format;
 pub mod idempotency;
 pub mod join;
 pub mod lag;
+pub mod lease;
 pub mod local_outputs;
 #[cfg(feature = "masking")]
 pub mod masking;
@@ -88,15 +89,15 @@ pub use adaptive::{
 pub use anomaly::AnomalyMethod;
 pub use auth::{
     AuthProvider, AuthReference, AuthSpec, Credential, CredentialPlacement, RequestAuth,
-    SharedAuthProvider,
+    SharedAuthProvider, rejects_credential, send_with_reauth,
 };
 pub use budget::{BudgetKind, BudgetSink, BudgetSpec, BudgetState, BudgetTimer, BudgetVerdict};
 pub use check::{CheckContext, CheckReport, Probe, ProbeStatus};
 pub use cleanup::{CleanupMode, CleanupPolicy, DEFAULT_MAX_KEYS, SeenKeys};
 #[cfg(feature = "arrow")]
 pub use columnar::{
-    ColumnarPage, infer_arrow_schema, record_batch_to_values, values_to_record_batch,
-    values_to_record_batch_inferred,
+    ColumnarPage, check_integral, infer_arrow_schema, record_batch_to_values,
+    values_to_record_batch, values_to_record_batch_inferred,
 };
 pub use create_table::{
     PlannedColumn, missing_target_error, plan_columns, plan_keyed_columns, render_column_defs,

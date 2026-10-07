@@ -158,6 +158,12 @@ impl XmlStream {
     /// configs exactly as before.
     pub fn try_new(config: XmlStreamConfig) -> Result<Self, FaucetError> {
         let mut builder = Client::builder();
+        if let Some(t) = config.timeout {
+            builder = builder.timeout(t);
+        }
+        if let Some(t) = config.connect_timeout {
+            builder = builder.connect_timeout(t);
+        }
         if let Some(tls) = &config.tls {
             tls.validate()?;
             builder = apply_client_tls(builder, tls)?;
@@ -252,9 +258,14 @@ impl XmlStream {
             return Ok(Vec::new());
         }
 
-        let records = match self.effective_records_path() {
-            Some(path) => convert::extract_at_path(&doc, &path),
-            None => vec![doc],
+        let records = match (&self.config.soap, &self.config.records_element_path) {
+            (Some(soap), Some(path)) => {
+                convert::extract_soap_records(&doc, path, soap.path_relative_to_body)?
+            }
+            _ => match self.effective_records_path() {
+                Some(path) => convert::extract_at_path(&doc, &path),
+                None => vec![doc],
+            },
         };
         Ok(records)
     }
@@ -413,7 +424,41 @@ impl XmlStream {
         }
     }
 
+    /// Run one request; when a shared provider's credential is rejected, have
+    /// the provider re-authenticate and run it once more (#789 API-06).
     async fn execute_request(
+        &self,
+        params: &HashMap<String, String>,
+        context: &HashMap<String, serde_json::Value>,
+        body_override: Option<&str>,
+    ) -> Result<String, FaucetError> {
+        match self
+            .execute_request_once(params, context, body_override)
+            .await
+        {
+            Err(e)
+                if self
+                    .auth_provider
+                    .as_ref()
+                    .is_some_and(|p| faucet_core::rejects_credential(&e, p.as_ref())) =>
+            {
+                let provider = self.auth_provider.as_ref().expect("checked above");
+                let name = provider.provider_name();
+                tracing::warn!(
+                    provider = name,
+                    "the server rejected the shared credential; re-authenticating and retrying once"
+                );
+                provider
+                    .invalidate(&faucet_core::Credential::Token(String::new()))
+                    .await?;
+                self.execute_request_once(params, context, body_override)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn execute_request_once(
         &self,
         params: &HashMap<String, String>,
         context: &HashMap<String, serde_json::Value>,

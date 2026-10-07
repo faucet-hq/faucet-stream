@@ -79,6 +79,8 @@ faucet run pipeline.yaml
 | `batch_mode` | `HttpBatchMode` | `Individual` | `Individual` = one POST per record; `Array` = records sent as one JSON-array body. See [Batch modes](#batch-modes). |
 | `concurrency` | int | `10` | Max concurrent in-flight requests in `Individual` mode. No effect in `Array` mode (one POST per chunk, issued sequentially). Clamped to a floor of `1`. |
 | `batch_size` | int | `1000` | Max records per outbound HTTP request in `Array` mode (re-chunks the upstream page). **`0` = "no batching" sentinel** — forwards the whole page as one JSON array. **No effect in `Individual` mode** (each record is already its own request); kept for config-shape parity and validated via `faucet_core::validate_batch_size`. |
+| `timeout` | int / null | `30` | Per-request timeout in seconds — a stalled peer fails the request (so retries and resilience act) instead of hanging the run. `null` disables it. |
+| `connect_timeout` | int / null | `10` | Timeout for establishing a connection, in seconds. `null` disables it. |
 
 ### Reliability
 

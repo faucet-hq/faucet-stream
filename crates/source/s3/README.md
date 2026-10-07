@@ -74,6 +74,14 @@ export AWS_SECRET_ACCESS_KEY=...
 faucet run pipeline.yaml
 ```
 
+## Faucet sinks' unfinished output
+
+A listing skips what a faucet file sink writing to the same prefix has not
+finished: scratch objects (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`,
+`-seal`, `-prev`, `-upload-<id>`) and everything inside the
+`.faucet-overwrite-*` swap area of an overwrite run that has not committed
+(also left behind by a crashed run). Discovery skips them too.
+
 ## Configuration reference
 
 ### Core

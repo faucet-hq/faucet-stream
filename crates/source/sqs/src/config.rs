@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub const MAX_WAIT_TIME_SECONDS: i32 = 20;
 /// SQS hard limit: at most 10 messages per `ReceiveMessage` call.
 pub const MAX_RECEIVE_BATCH: i32 = 10;
+/// SQS ceiling on a message's visibility timeout (12 hours).
+pub const MAX_VISIBILITY_TIMEOUT_SECS: u32 = 43_200;
 
 /// Configuration for [`SqsSource`](crate::SqsSource).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -43,10 +45,21 @@ pub struct SqsSourceConfig {
     /// 1000.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// Visibility timeout, in seconds, the source keeps renewing on every
+    /// message it has received but not yet deleted (while a page is assembled
+    /// and while the sink writes it), so a slow page is not redelivered into
+    /// the same run. Renewed every third of this window. `0` disables renewal
+    /// and leaves the queue's own visibility timeout in charge. Default 60.
+    #[serde(default = "default_visibility_extension_secs")]
+    pub visibility_extension_secs: u32,
 }
 
 fn default_wait_time_seconds() -> i32 {
     10
+}
+fn default_visibility_extension_secs() -> u32 {
+    60
 }
 fn default_batch_size() -> usize {
     faucet_core::DEFAULT_BATCH_SIZE
@@ -64,6 +77,7 @@ impl SqsSourceConfig {
             max_messages: None,
             wait_time_seconds: default_wait_time_seconds(),
             batch_size: default_batch_size(),
+            visibility_extension_secs: default_visibility_extension_secs(),
         }
     }
 
@@ -99,6 +113,20 @@ impl SqsSourceConfig {
                 "sqs source: max_messages must be at least 1".into(),
             ));
         }
+        if self.visibility_extension_secs > MAX_VISIBILITY_TIMEOUT_SECS {
+            return Err(FaucetError::Config(format!(
+                "sqs source: visibility_extension_secs must be 0..={MAX_VISIBILITY_TIMEOUT_SECS} \
+                 (got {})",
+                self.visibility_extension_secs
+            )));
+        }
+        if self.visibility_extension_secs > 0 && self.visibility_extension_secs < 3 {
+            return Err(FaucetError::Config(
+                "sqs source: visibility_extension_secs must be at least 3 (it is renewed every \
+                 third of the window) or 0 to disable renewal"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -120,6 +148,20 @@ mod tests {
         assert_eq!(c.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
         assert!(c.idle_timeout_secs.is_none());
         assert!(c.max_messages.is_none());
+        assert_eq!(c.visibility_extension_secs, 60);
+    }
+
+    #[test]
+    fn visibility_extension_bounds() {
+        let mut c = valid();
+        c.visibility_extension_secs = 0;
+        c.validate().unwrap();
+        c.visibility_extension_secs = 2;
+        assert!(c.validate().is_err());
+        c.visibility_extension_secs = 3;
+        c.validate().unwrap();
+        c.visibility_extension_secs = MAX_VISIBILITY_TIMEOUT_SECS + 1;
+        assert!(c.validate().is_err());
     }
 
     #[test]

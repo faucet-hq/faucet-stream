@@ -58,6 +58,13 @@ pub trait ObjectClient: Send + Sync {
         }
         Ok(())
     }
+    /// Whether [`upload`](Self::upload) writes a temporary object named by
+    /// [`upload_scratch_key`](super::upload_scratch_key) and renames it into
+    /// place, so a crash can leave one behind for the next run to remove.
+    /// Default `false` (an atomic put leaves nothing).
+    fn leaves_upload_scratch(&self) -> bool {
+        false
+    }
     /// Move `from` to `to`, replacing `to`. Default: a server-side copy is
     /// not assumed, so the object is downloaded and re-uploaded, then
     /// `from` deleted; stores with a copy or rename override it.
@@ -152,11 +159,13 @@ pub struct RemoteBackend {
     multipart: Option<Arc<dyn MultipartClient>>,
     base: String,
     swap: String,
+    template: NameTemplate,
     scratch: tempfile::TempDir,
     uploads: usize,
     slots: Arc<tokio::sync::Semaphore>,
     in_flight: std::sync::Mutex<Vec<InFlight>>,
     seq: std::sync::atomic::AtomicU64,
+    scrubbed: tokio::sync::Mutex<[bool; 2]>,
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -195,6 +204,7 @@ impl RemoteBackend {
         )))?;
         Ok(Self {
             swap: format!("{base}{}/", template.swap_dir_name()),
+            template: template.clone(),
             base,
             client,
             multipart: None,
@@ -203,7 +213,30 @@ impl RemoteBackend {
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
             in_flight: std::sync::Mutex::new(Vec::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
+            scrubbed: tokio::sync::Mutex::new([false; 2]),
         })
+    }
+
+    /// Remove the upload scratch a crashed run of this output left in `area`,
+    /// once per area, before the first upload into it — not when the area is
+    /// prepared, so a run needs the store only when it publishes.
+    async fn scrub_upload_scratch(&self, area: Area) -> Result<(), FaucetError> {
+        if !self.client.leaves_upload_scratch() {
+            return Ok(());
+        }
+        let mut done = self.scrubbed.lock().await;
+        let slot = &mut done[usize::from(area == Area::Swap)];
+        if *slot {
+            return Ok(());
+        }
+        let prefix = self.prefix(area).to_string();
+        for name in direct_children(&prefix, self.client.list(&prefix).await?) {
+            if self.template.owns_scratch(&name) {
+                self.client.delete(&format!("{prefix}{name}")).await?;
+            }
+        }
+        *slot = true;
+        Ok(())
     }
 
     /// Keep up to `n` uploads in flight (at least 1). With 1 (the default)
@@ -342,6 +375,10 @@ impl StorageBackend for RemoteBackend {
     }
 
     async fn publish(&self, scratch: &Path, area: Area, name: &str) -> Result<(), FaucetError> {
+        if let Err(e) = self.scrub_upload_scratch(area).await {
+            let _ = std::fs::remove_file(scratch);
+            return Err(e);
+        }
         let key = self.key(area, name);
         if self.uploads <= 1 {
             let result = self.client.upload(scratch, &key).await;
@@ -593,6 +630,7 @@ pub(crate) mod tests {
         pub parts_put: AtomicUsize,
         pub renames: AtomicUsize,
         pub lists: AtomicUsize,
+        pub upload_scratch: AtomicBool,
     }
 
     impl Mem {
@@ -627,6 +665,9 @@ pub(crate) mod tests {
     impl ObjectClient for Mem {
         fn describe(&self, key: &str) -> String {
             format!("mem://{key}")
+        }
+        fn leaves_upload_scratch(&self) -> bool {
+            self.upload_scratch.load(SeqCst)
         }
         async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
             self.lists.fetch_add(1, SeqCst);

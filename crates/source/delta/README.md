@@ -17,6 +17,11 @@ Fabric) write.
 - **Partition-aware** — partition-column values (stored in the Hive-style path,
   not the data files) are reconstructed and merged into every row, typed
   against the table schema.
+- **Deletion vectors are refused** — a table whose active files carry deletion
+  vectors (Delta 3.x `DELETE` / `UPDATE` / `MERGE` with
+  `delta.enableDeletionVectors`) fails the read naming the first such file,
+  because reading those files whole would return deleted rows. Purge them
+  (`REORG TABLE … APPLY (PURGE)`) or disable the table property first.
 
 ## Configuration
 

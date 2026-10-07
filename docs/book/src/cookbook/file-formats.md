@@ -120,6 +120,9 @@ sink:
 - **`json_lines` / `json_array`** are lossless: any JSON value round-trips.
 - **`xlsx`** carries numbers and booleans as themselves. A spreadsheet stores
   every number as a double, so an integral value reads back as an integer.
+  A date-formatted cell reads back as text: `2023-03-15` for a whole day,
+  `2023-03-15T12:30:00` otherwise, an ISO 8601 duration for a time span
+  (workbooks on the 1904 date system included).
 - **`csv` and `xml` are text formats.** Every value comes back a string; a
   number written as `42` reads back as `"42"`. Use a
   [`cast` transform](./transforms.md) if downstream needs the type.
@@ -398,7 +401,9 @@ later becomes a new column and earlier rows get an empty cell;
 `csv: { on_unknown_field: warn | error }` fixes the header from the first page
 instead (drop the field with a warning, or fail). `json_lines: { pretty: true }`
 pretty-prints each record. Two matrix rows writing the same path, or a fan-out
-row without a per-invocation token in its path, are refused at load time. The
+row without a per-invocation token in its path, are refused at load time — for
+the `file` sink and for `jsonl` / `csv` / `parquet` writing one fixed file
+(root rows included). The
 `jsonl`, `csv` and `parquet` sinks stay for existing configs, and the file sink
 matches them option for option — see the
 [crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/sink/file)
@@ -438,6 +443,12 @@ past one that is not there. Without `path` each object gets a fresh name,
 replace. The
 format × option matrix that pins the local sink runs against MinIO,
 fake-gcs-server, Azurite and an SFTP server too.
+
+With a `path` (`file_name` on SFTP) the names are fixed, so the same load-time
+rule as the local file sink applies: two rows may not write the same bucket /
+container / host + `prefix` + `path`, and a fan-out row needs a per-invocation
+token (`${parent.id}`) in the prefix or path — otherwise concurrent writers
+overwrite each other's parts and the last to finish prunes the rest.
 
 ### Run it locally
 

@@ -84,7 +84,26 @@ impl Bookmark {
         positions: &[PartitionOffset],
         consumed: &HashMap<(String, i32), i64>,
     ) -> Self {
+        Self::merged_with_floors(prior, &[], positions, consumed)
+    }
+
+    /// [`Bookmark::merged`] plus `floors`: watermark offsets for assigned
+    /// partitions whose consumer position is not yet concrete. A floor has the
+    /// **lowest** precedence — below the prior bookmark — because librdkafka
+    /// reports no position for a resumed partition until it delivers, so a
+    /// floor over a bookmarked partition would move it to the watermark and
+    /// skip (or, under `earliest`, replay) its backlog. A floor only seeds a
+    /// partition nothing else knows about.
+    pub fn merged_with_floors(
+        prior: Option<&Bookmark>,
+        floors: &[PartitionOffset],
+        positions: &[PartitionOffset],
+        consumed: &HashMap<(String, i32), i64>,
+    ) -> Self {
         let mut map: HashMap<(String, i32), i64> = HashMap::new();
+        for p in floors {
+            map.insert((p.topic.clone(), p.partition), p.offset);
+        }
         if let Some(prior) = prior {
             for p in &prior.partition_offsets {
                 map.insert((p.topic.clone(), p.partition), p.offset);
@@ -271,6 +290,29 @@ mod tests {
             vec![("t", 0, 15), ("t", 1, 30)],
             "p0 takes the position; p1 takes the consumed next-offset"
         );
+    }
+
+    #[test]
+    fn a_watermark_floor_never_overrides_a_bookmarked_partition() {
+        // Resumed partition 1 has not delivered yet, so only a floor (the
+        // high watermark) is known for it: the prior bookmark must win.
+        let prior = Bookmark {
+            partition_offsets: vec![po("t", 0, 10), po("t", 1, 20)],
+        };
+        let floors = vec![po("t", 1, 500), po("t", 2, 900)];
+        let mut consumed = HashMap::new();
+        consumed.insert(("t".to_string(), 0), 12);
+
+        let merged = Bookmark::merged_with_floors(Some(&prior), &floors, &[], &consumed);
+        assert_eq!(
+            offsets_of(&merged),
+            vec![("t", 0, 12), ("t", 1, 20), ("t", 2, 900)],
+            "p1 keeps its bookmark; only the never-seen p2 takes its floor"
+        );
+
+        let positions = vec![po("t", 1, 25)];
+        let merged = Bookmark::merged_with_floors(Some(&prior), &floors, &positions, &consumed);
+        assert_eq!(offsets_of(&merged)[1], ("t", 1, 25));
     }
 
     #[test]

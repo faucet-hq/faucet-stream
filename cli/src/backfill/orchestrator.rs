@@ -877,7 +877,7 @@ version: 1
 name: orders
 pipeline:
   source: { type: rest, config: { url: "https://api.example.com/orders" } }
-  sink:   { type: jsonl, config: { path: ./out.jsonl } }
+  sink:   { type: jsonl, config: { path: ./out.jsonl, append: true } }
 "#,
         );
         let opts = base_opts(time_range("2026-06-01", "2026-06-02", None));
@@ -928,7 +928,7 @@ pipeline:
       type: rest
       config: { url: "https://api.example.com/x?s=${backfill.start}" }
   sinks:
-    default: { type: jsonl, config: { path: ./out.jsonl } }
+    default: { type: jsonl, config: { path: ./out.jsonl, append: true } }
     staging: { type: jsonl, config: { path: ./staging.jsonl } }
 "#,
         );
@@ -949,7 +949,7 @@ pipeline:
   source:
     type: rest
     config: { url: "https://api.example.com/x?s=${backfill.start}" }
-  sink: { type: jsonl, config: { path: ./out.jsonl } }
+  sink: { type: jsonl, config: { path: ./out.jsonl, append: true } }
 matrix:
   - id: a
   - id: b

@@ -21,6 +21,10 @@ Connection fields come from `faucet-common-azure` and are set at the top level:
 | `endpoint` | string | Custom blob endpoint (emulator / sovereign cloud). |
 | `allow_http` | bool | Permit plaintext HTTP (Azurite). |
 | `use_emulator` | bool | Target the Azurite emulator. |
+| `timeout_secs` | int | Seconds one request, body included, may take. Unset (default) = no limit, so a long body read paced by the pipeline is not cut off. |
+| `connect_timeout_secs` | int | Seconds to wait for a connection (default `10`). |
+| `max_retries` | int | Retries of a failed request, including resuming an interrupted body read (default `10`). |
+| `retry_timeout_secs` | int | Seconds after a request first went out during which it may still be retried or resumed (default `600`); keep it within the credential's lifetime. |
 
 Source-specific fields:
 
@@ -35,6 +39,14 @@ Source-specific fields:
 | `verify_length` | bool | `true` | Verify each object's byte count against the `size` Azure reports; a short (truncated) or over-long transfer fails with `FaucetError::Source`. See [Read-integrity verification](#read-integrity-verification). |
 | `verify_checksum` | bool | `false` | **Not supported on Azure Blob** — `true` is rejected at config load. See [Read-integrity verification](#read-integrity-verification). |
 | `compression` | enum | `auto` | `auto` / `gzip` / `zstd` (requires the `compression` feature). |
+
+## Faucet sinks' unfinished output
+
+A listing skips what a faucet file sink writing to the same prefix has not
+finished: scratch objects (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`,
+`-seal`, `-prev`, `-upload-<id>`) and everything inside the
+`.faucet-overwrite-*` swap area of an overwrite run that has not committed
+(also left behind by a crashed run). Discovery skips them too.
 
 ## Read-integrity verification
 

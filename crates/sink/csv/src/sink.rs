@@ -357,6 +357,44 @@ fn unknown_fields(columns: &[String], records: &[Value]) -> Vec<String> {
     out
 }
 
+/// The header row of the file an `append: true` run continues, or `None`
+/// when the file is missing or empty (the run then writes one).
+fn read_existing_header(config: &CsvSinkConfig) -> Result<Option<Vec<String>>, FaucetError> {
+    let path = std::path::Path::new(&config.path);
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > 0 => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(FaucetError::Sink(format!(
+                "failed to inspect CSV file '{}': {e}",
+                config.path
+            )));
+        }
+    }
+    let file = std::fs::File::open(path).map_err(|e| {
+        FaucetError::Sink(format!("failed to open CSV file '{}': {e}", config.path))
+    })?;
+    #[cfg(feature = "compression")]
+    let input =
+        faucet_core::compression::wrap_sync_reader(file, config.compression.resolve(&config.path));
+    #[cfg(not(feature = "compression"))]
+    let input = file;
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(config.delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(input);
+    let mut record = csv::StringRecord::new();
+    let found = reader.read_record(&mut record).map_err(|e| {
+        FaucetError::Sink(format!(
+            "failed to read the header of CSV file '{}' to append to it: {e}",
+            config.path
+        ))
+    })?;
+    Ok(found.then(|| record.iter().map(str::to_string).collect()))
+}
+
 /// Synchronous CSV writing logic, run inside `spawn_blocking`.
 fn write_csv_blocking(
     config: CsvSinkConfig,
@@ -379,7 +417,12 @@ fn write_csv_blocking(
             // (audit #146 H2). (A later flush-segment cannot change the
             // already-written header — that is a separate, documented limitation.)
             let mut columns: Vec<String> = Vec::new();
-            match frozen_columns {
+            let existing_header = if opened_before || !config.append || !config.write_headers {
+                None
+            } else {
+                read_existing_header(&config)?
+            };
+            match frozen_columns.or_else(|| existing_header.clone()) {
                 Some(frozen) => columns = frozen,
                 None => {
                     let mut seen: std::collections::HashSet<&str> =
@@ -445,8 +488,9 @@ fn write_csv_blocking(
                 .delimiter(config.delimiter)
                 .from_writer(inner);
 
-            // Write header row if configured and this is the first open.
-            if config.write_headers && !append {
+            // Write the header on the first open unless the file being appended
+            // to already has one.
+            if config.write_headers && !opened_before && existing_header.is_none() {
                 writer
                     .write_record(&columns)
                     .map_err(|e| FaucetError::Sink(format!("failed to write CSV headers: {e}")))?;

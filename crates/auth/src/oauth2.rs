@@ -167,6 +167,12 @@ pub struct OAuth2RefreshProvider {
     store: Option<Arc<dyn StateStore>>,
     /// Key the rotated refresh token is stored under; stable across runs.
     store_key: String,
+    /// Fingerprint of the configured seed refresh token: the grant a persisted
+    /// token must belong to.
+    seed: String,
+    /// The pre-#789 default key (`token_url` + `client_id` only), checked once
+    /// when the default key holds nothing so the upgrade path can be named.
+    legacy_key: Option<String>,
     state: Mutex<RefreshState>,
 }
 
@@ -192,7 +198,8 @@ impl OAuth2RefreshProvider {
         let refresh_token = required_str(config, "refresh_token")?;
         let token_url = required_str(config, "token_url")?;
         let client_id = required_str(config, "client_id")?;
-        let (store, store_key) = parse_persist(config, &token_url, &client_id)?;
+        let seed = seed_fingerprint(&refresh_token);
+        let (store, store_key, legacy_key) = parse_persist(config, &token_url, &client_id, &seed)?;
         Ok(Self {
             http: crate::auth_http_client(),
             token_url,
@@ -202,6 +209,8 @@ impl OAuth2RefreshProvider {
             scope: optional_str(config, "scope"),
             store,
             store_key,
+            seed,
+            legacy_key,
             state: Mutex::new(RefreshState {
                 refresh_token,
                 ..Default::default()
@@ -215,6 +224,7 @@ impl OAuth2RefreshProvider {
     pub fn with_store(mut self, store: Arc<dyn StateStore>, key: impl Into<String>) -> Self {
         self.store = Some(store);
         self.store_key = key.into();
+        self.legacy_key = None;
         self
     }
 
@@ -229,15 +239,31 @@ impl OAuth2RefreshProvider {
         state.loaded = true;
         let Some(store) = &self.store else { return };
         match store.get(&self.store_key).await {
-            Ok(Some(v)) => {
-                if let Some(tok) = v.get("refresh_token").and_then(Value::as_str)
-                    && !tok.is_empty()
-                {
-                    state.refresh_token = tok.to_string();
+            Ok(Some(v)) => match persisted_token(&v, &self.seed) {
+                PersistedToken::Usable(tok) => {
+                    state.refresh_token = tok;
                     tracing::debug!("oauth2_refresh: loaded persisted refresh token");
                 }
+                PersistedToken::OtherGrant => tracing::warn!(
+                    key = %self.store_key,
+                    "oauth2_refresh: the persisted refresh token belongs to a different grant than \
+                     the configured refresh_token; ignoring it and using the config seed"
+                ),
+                PersistedToken::Empty => {}
+            },
+            Ok(None) => {
+                if let Some(legacy) = &self.legacy_key
+                    && matches!(store.get(legacy).await, Ok(Some(_)))
+                {
+                    tracing::warn!(
+                        legacy_key = %legacy,
+                        "oauth2_refresh: a refresh token persisted under the pre-#789 shared key \
+                         exists but is not adopted, since that key could hold another grant's \
+                         token. If this provider is the only grant for its app, set \
+                         `persist.key: {legacy}` to keep using it"
+                    );
+                }
             }
-            Ok(None) => {}
             Err(e) => tracing::warn!(
                 error = %e,
                 "oauth2_refresh: could not read persisted refresh token; using the config seed"
@@ -250,7 +276,7 @@ impl OAuth2RefreshProvider {
     /// otherwise-successful run over a state-store hiccup is the worse outcome.
     async fn persist(&self, state: &RefreshState) {
         let Some(store) = &self.store else { return };
-        let value = serde_json::json!({ "refresh_token": state.refresh_token });
+        let value = serde_json::json!({ "refresh_token": state.refresh_token, "seed": self.seed });
         if let Err(e) = store.put(&self.store_key, &value).await {
             tracing::warn!(error = %e, "oauth2_refresh: could not persist rotated refresh token");
         }
@@ -282,22 +308,32 @@ impl OAuth2RefreshProvider {
     }
 }
 
-/// Parse the optional `persist:` block. Returns `(store, key)`. When absent, the
-/// provider keeps rotation in memory only (`store = None`). When present, `path`
-/// is the state-store root directory (file-backed via [`FileStateStore`]) and
-/// the key defaults to a stable hash of `token_url + client_id` so several
-/// providers may share one directory without colliding.
+/// `(store, key, legacy_key)` of a `persist:` block.
+type PersistSlot = (Option<Arc<dyn StateStore>>, String, Option<String>);
+
+/// Parse the optional `persist:` block. Returns `(store, key, legacy_key)`. When
+/// absent, the provider keeps rotation in memory only (`store = None`). When
+/// present, `path` is the state-store root directory (file-backed via
+/// [`FileStateStore`]) and the key defaults to a stable hash of `token_url`,
+/// `client_id` **and the seed refresh token** — the grant — so two grants of one
+/// app (one app connected to two accounts) never share a slot. `legacy_key` is
+/// the pre-#789 default (app only), reported but never adopted.
 fn parse_persist(
     config: &Value,
     token_url: &str,
     client_id: &str,
-) -> Result<(Option<Arc<dyn StateStore>>, String), FaucetError> {
+    seed: &str,
+) -> Result<PersistSlot, FaucetError> {
     let default_key = format!(
+        "oauth2_refresh_{:016x}",
+        fnv1a_64(&format!("{token_url}\u{0}{client_id}\u{0}{seed}"))
+    );
+    let legacy_key = format!(
         "oauth2_refresh_{:016x}",
         fnv1a_64(&format!("{token_url}\u{0}{client_id}"))
     );
     let Some(persist) = config.get("persist").filter(|v| !v.is_null()) else {
-        return Ok((None, default_key));
+        return Ok((None, default_key, None));
     };
     let path = persist
         .get("path")
@@ -309,14 +345,48 @@ fn parse_persist(
                     .into(),
             )
         })?;
-    let key = persist
+    let explicit = persist
         .get("key")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(default_key);
+        .map(str::to_string);
     let store: Arc<dyn StateStore> = Arc::new(FileStateStore::new(path));
-    Ok((Some(store), key))
+    Ok(match explicit {
+        Some(key) => (Some(store), key, None),
+        None => (Some(store), default_key, Some(legacy_key)),
+    })
+}
+
+/// Fingerprint of a refresh token that identifies its grant without storing it.
+fn seed_fingerprint(refresh_token: &str) -> String {
+    format!("{:016x}", fnv1a_64(refresh_token))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PersistedToken {
+    /// A token this grant may use.
+    Usable(String),
+    /// A token recorded for a different seed refresh token.
+    OtherGrant,
+    /// Nothing usable stored.
+    Empty,
+}
+
+/// Decide whether a persisted entry belongs to the grant whose seed fingerprint
+/// is `seed`. An entry without a recorded seed predates #789; it is accepted,
+/// since it can only sit under a key chosen for this grant.
+fn persisted_token(entry: &Value, seed: &str) -> PersistedToken {
+    let Some(tok) = entry
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    else {
+        return PersistedToken::Empty;
+    };
+    match entry.get("seed").and_then(Value::as_str) {
+        Some(recorded) if recorded != seed => PersistedToken::OtherGrant,
+        _ => PersistedToken::Usable(tok.to_string()),
+    }
 }
 
 /// FNV-1a 64-bit — a tiny, dependency-free, cross-version-stable hash for the
@@ -589,15 +659,10 @@ mod tests {
             "rt1"
         );
 
-        // Run 2: a *fresh* provider with a now-stale seed must read the persisted
-        // rt1 and authenticate — proving cross-run rotation survival.
-        let stale_seed = serde_json::json!({
-            "token_url": server.uri(),
-            "client_id": "id",
-            "client_secret": "secret",
-            "refresh_token": "STALE_SEED",
-        });
-        let p2 = OAuth2RefreshProvider::from_config(&stale_seed)
+        // Run 2: a *fresh* provider from the same config — whose seed rt0 the
+        // server has already rotated away — must read the persisted rt1 and
+        // authenticate, proving cross-run rotation survival.
+        let p2 = OAuth2RefreshProvider::from_config(&cfg)
             .unwrap()
             .with_store(store.clone(), "k");
         assert_eq!(
@@ -710,14 +775,193 @@ mod tests {
     }
 
     #[test]
-    fn default_persist_key_is_stable_and_identity_scoped() {
-        let (_none, k1) = parse_persist(&serde_json::json!({}), "https://a/token", "id1").unwrap();
-        let (_none2, k1b) =
-            parse_persist(&serde_json::json!({}), "https://a/token", "id1").unwrap();
-        let (_none3, k2) = parse_persist(&serde_json::json!({}), "https://a/token", "id2").unwrap();
-        assert_eq!(k1, k1b, "same identity → same key across calls");
+    fn default_persist_key_is_stable_and_grant_scoped() {
+        let none = serde_json::json!({});
+        let (store, k1, legacy) = parse_persist(&none, "https://a/token", "id1", "s1").unwrap();
+        let (_, k1b, _) = parse_persist(&none, "https://a/token", "id1", "s1").unwrap();
+        let (_, k2, _) = parse_persist(&none, "https://a/token", "id2", "s1").unwrap();
+        let (_, k3, _) = parse_persist(&none, "https://a/token", "id1", "s2").unwrap();
+        assert_eq!(k1, k1b, "same grant → same key across calls");
         assert_ne!(k1, k2, "different client_id → different key");
-        assert!(_none.is_none(), "no persist block → no store");
+        assert_ne!(k1, k3, "a second grant of the same app → different key");
+        assert!(store.is_none(), "no persist block → no store");
+        assert!(legacy.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let (_, _, legacy) = parse_persist(
+            &serde_json::json!({"persist": {"path": path}}),
+            "https://a/token",
+            "id1",
+            "s1",
+        )
+        .unwrap();
+        assert!(legacy.is_some(), "the default key reports the pre-#789 key");
+        let (_, key, legacy) = parse_persist(
+            &serde_json::json!({"persist": {"path": path, "key": "mine"}}),
+            "https://a/token",
+            "id1",
+            "s1",
+        )
+        .unwrap();
+        assert_eq!(key, "mine");
+        assert!(
+            legacy.is_none(),
+            "an explicit key is the user's identity choice"
+        );
+    }
+
+    #[test]
+    fn a_persisted_token_is_used_only_by_its_own_grant() {
+        assert_eq!(
+            persisted_token(
+                &serde_json::json!({"refresh_token": "r", "seed": "s1"}),
+                "s1"
+            ),
+            PersistedToken::Usable("r".into())
+        );
+        assert_eq!(
+            persisted_token(
+                &serde_json::json!({"refresh_token": "r", "seed": "s2"}),
+                "s1"
+            ),
+            PersistedToken::OtherGrant
+        );
+        assert_eq!(
+            persisted_token(&serde_json::json!({"refresh_token": "r"}), "s1"),
+            PersistedToken::Usable("r".into()),
+            "a pre-#789 entry under this grant's own key is accepted"
+        );
+        assert_eq!(
+            persisted_token(&serde_json::json!({"refresh_token": ""}), "s1"),
+            PersistedToken::Empty
+        );
+        assert_eq!(
+            persisted_token(&serde_json::json!({}), "s1"),
+            PersistedToken::Empty
+        );
+    }
+
+    /// Two grants of one app (one app connected to two accounts) persisting
+    /// into one directory keep their own rotated tokens (#789 API-07).
+    #[tokio::test]
+    async fn two_grants_of_one_app_do_not_swap_refresh_tokens() {
+        use wiremock::matchers::body_string_contains;
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        for (seed, rotated, access) in [
+            ("seedA", "rtA1", "A1"),
+            ("seedB", "rtB1", "B1"),
+            ("rtA1", "rtA2", "A2"),
+            ("rtB1", "rtB2", "B2"),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_string_contains(format!("refresh_token={seed}&")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": access,
+                    "expires_in": 3600,
+                    "refresh_token": rotated,
+                })))
+                .mount(&server)
+                .await;
+        }
+        let cfg = |seed: &str| {
+            serde_json::json!({
+                "token_url": server.uri(),
+                "client_id": "same-app",
+                "client_secret": "secret",
+                "refresh_token": seed,
+                "persist": { "path": dir.path().to_str().unwrap() },
+            })
+        };
+
+        for (seed, access) in [("seedA", "A1"), ("seedB", "B1")] {
+            let p = OAuth2RefreshProvider::from_config(&cfg(seed)).unwrap();
+            assert_eq!(
+                p.credential().await.unwrap(),
+                Credential::Bearer(access.into())
+            );
+        }
+        for (seed, access) in [("seedA", "A2"), ("seedB", "B2")] {
+            let p = OAuth2RefreshProvider::from_config(&cfg(seed)).unwrap();
+            assert_eq!(
+                p.credential().await.unwrap(),
+                Credential::Bearer(access.into()),
+                "grant {seed} must authenticate with its own rotated token"
+            );
+        }
+    }
+
+    /// A token persisted under the pre-#789 app-wide key is reported, not
+    /// adopted; naming that key explicitly adopts and upgrades it.
+    #[tokio::test]
+    async fn a_legacy_shared_entry_is_adopted_only_through_an_explicit_key() {
+        use wiremock::matchers::body_string_contains;
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=seed&"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "FROM_SEED",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=legacy-rotated&"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "FROM_LEGACY",
+                "expires_in": 3600,
+                "refresh_token": "next",
+            })))
+            .mount(&server)
+            .await;
+        let path = dir.path().to_str().unwrap().to_string();
+        let legacy_key = format!(
+            "oauth2_refresh_{:016x}",
+            fnv1a_64(&format!("{}\u{0}same-app", server.uri()))
+        );
+        FileStateStore::new(&path)
+            .put(
+                &legacy_key,
+                &serde_json::json!({"refresh_token": "legacy-rotated"}),
+            )
+            .await
+            .unwrap();
+        let base = serde_json::json!({
+            "token_url": server.uri(),
+            "client_id": "same-app",
+            "client_secret": "secret",
+            "refresh_token": "seed",
+        });
+
+        let mut default_cfg = base.clone();
+        default_cfg["persist"] = serde_json::json!({"path": path});
+        let p = OAuth2RefreshProvider::from_config(&default_cfg).unwrap();
+        assert_eq!(
+            p.credential().await.unwrap(),
+            Credential::Bearer("FROM_SEED".into()),
+            "the shared entry may belong to another grant, so the default key leaves it"
+        );
+
+        let mut explicit = base;
+        explicit["persist"] = serde_json::json!({"path": path, "key": legacy_key});
+        let p = OAuth2RefreshProvider::from_config(&explicit).unwrap();
+        assert_eq!(
+            p.credential().await.unwrap(),
+            Credential::Bearer("FROM_LEGACY".into())
+        );
+        let stored = FileStateStore::new(&path)
+            .get(&legacy_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored["refresh_token"], "next");
+        assert_eq!(
+            stored["seed"],
+            seed_fingerprint("seed"),
+            "upgraded with its grant"
+        );
     }
 
     #[tokio::test]
@@ -824,5 +1068,37 @@ mod tests {
             provider.credential().await,
             Err(FaucetError::Auth(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_persisted_token_of_another_grant_or_an_empty_entry_is_not_used() {
+        use faucet_core::MemoryStateStore;
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=seed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "A", "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        let cfg = serde_json::json!({
+            "token_url": server.uri(), "client_id": "id",
+            "client_secret": "s", "refresh_token": "seed",
+        });
+        for entry in [
+            serde_json::json!({"refresh_token": "theirs", "seed": "someone-else"}),
+            serde_json::json!({"refresh_token": ""}),
+        ] {
+            let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+            store.put("k", &entry).await.unwrap();
+            let p = OAuth2RefreshProvider::from_config(&cfg)
+                .unwrap()
+                .with_store(store, "k");
+            assert_eq!(
+                p.credential().await.unwrap(),
+                Credential::Bearer("A".into())
+            );
+        }
     }
 }

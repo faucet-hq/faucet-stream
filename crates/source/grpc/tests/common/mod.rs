@@ -37,7 +37,12 @@ pub struct EchoServer {
 #[tonic::async_trait]
 impl EchoService for EchoServer {
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let count = request.into_inner().count;
+        reject_stale_token(&request)?;
+        let req = request.into_inner();
+        if req.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(req.delay_ms.into())).await;
+        }
+        let count = req.count;
         let items = (0..count)
             .map(|i| Item {
                 id: i,
@@ -53,8 +58,12 @@ impl EchoService for EchoServer {
         &self,
         request: Request<TailRequest>,
     ) -> Result<Response<Self::TailStream>, Status> {
-        let req = request.into_inner();
         let attempt = self.tail_attempts.fetch_add(1, Ordering::SeqCst);
+        reject_stale_token(&request)?;
+        let req = request.into_inner();
+        if req.start_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(req.start_delay_ms.into())).await;
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             let mut emitted: u32 = 0;
@@ -64,9 +73,12 @@ impl EchoService for EchoServer {
                 // events. Subsequent attempts run to completion so the test
                 // can assert the reconnect produced the full record set.
                 if req.fail_after > 0 && attempt == 0 && emitted >= req.fail_after {
-                    let _ = tx
-                        .send(Err(Status::unavailable("simulated disconnect")))
-                        .await;
+                    let status = if req.fail_code == 0 {
+                        Status::unavailable("simulated disconnect")
+                    } else {
+                        Status::new(req.fail_code.into(), "simulated failure")
+                    };
+                    let _ = tx.send(Err(status)).await;
                     return;
                 }
                 let event = Event {
@@ -78,8 +90,25 @@ impl EchoService for EchoServer {
                 }
                 emitted += 1;
             }
+            if req.hold_open {
+                tx.closed().await;
+            }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// The token a refreshing test provider hands out first; the server rejects
+/// it with UNAUTHENTICATED.
+pub const STALE_TOKEN: &str = "Bearer stale";
+
+#[allow(clippy::result_large_err)]
+fn reject_stale_token<T>(request: &Request<T>) -> Result<(), Status> {
+    match request.metadata().get("authorization") {
+        Some(v) if v.to_str().ok() == Some(STALE_TOKEN) => {
+            Err(Status::unauthenticated("token revoked"))
+        }
+        _ => Ok(()),
     }
 }
 

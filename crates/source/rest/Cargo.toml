@@ -77,6 +77,7 @@ futures.workspace = true  # try_join_all for concurrent partitions
 async-trait.workspace = true
 
 [dev-dependencies]
+rust_xlsxwriter.workspace = true
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 tracing-subscriber = "0.3"

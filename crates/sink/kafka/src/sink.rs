@@ -428,15 +428,17 @@ impl Sink for KafkaSink {
             produced += 1;
         }
 
-        // Enqueue the commit-token record (key = scope, value = token). No
-        // headers: this is faucet's own watermark on its own side-topic, not a
-        // user record, so `headers_path` must not reach it.
+        // Enqueue the commit-token record (key = `token_key(prefix, scope)`,
+        // value = token). No headers: this is faucet's own watermark on its own
+        // side-topic, not a user record, so `headers_path` must not reach it.
+        let eo = self.config.exactly_once_spec();
+        let token_key = crate::idempotent::token_key(eo.transactional_id_prefix.as_deref(), scope);
         if let Err(e) = crate::idempotent::enqueue_in_txn(
             &producer,
-            &self.config.exactly_once_spec().commit_token_topic,
+            &eo.commit_token_topic,
             token.as_bytes().to_vec(),
             RecordRouting {
-                key: Some(scope.as_bytes().to_vec()),
+                key: Some(token_key.into_bytes()),
                 ..RecordRouting::default()
             },
             self.config.queue_full_max_retries,

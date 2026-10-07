@@ -43,13 +43,10 @@ pub struct RestStream {
     /// [`Source::apply_start_bookmark`](faucet_core::Source::apply_start_bookmark).
     /// Takes precedence over `config.start_replication_value` when set.
     runtime_start: Arc<AsyncMutex<Option<Value>>>,
-    /// Rendered lower/upper bounds for the current datetime window (#527),
-    /// applied to each request by [`execute_request_once`](Self::execute_request_once)
-    /// alongside any [`replication_bind`](RestStreamConfig::replication_bind). Set
-    /// by the window loop in `stream_pages_inner` before each window's pages;
-    /// empty when no `window:` block is configured. Each entry is
-    /// `(target, name, rendered-value)`.
-    window_binds: Arc<AsyncMutex<Vec<ResolvedBind>>>,
+    /// Passes `max_pages` cut short. The partitioned stream compares it before
+    /// and after its partitions: a truncated partition has unread pages, so no
+    /// consolidated bookmark may be persisted over it.
+    truncated_passes: Arc<std::sync::atomic::AtomicUsize>,
     /// The run clock (#769): the "now" upper bound of datetime window slicing
     /// (#527) and the async-job lookback. Set by the pipeline from `--clock` /
     /// the schedule tick via [`faucet_core::Source::set_run_clock`]; `None` uses `Utc::now()`.
@@ -538,7 +535,7 @@ impl RestStream {
             token_endpoint_cache: TokenEndpointCache::new(),
             auth_provider: None,
             runtime_start: Arc::new(AsyncMutex::new(None)),
-            window_binds: Arc::new(AsyncMutex::new(Vec::new())),
+            truncated_passes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             run_clock: std::sync::Mutex::new(None),
             retry_policy,
             static_headers,
@@ -1242,24 +1239,16 @@ impl RestStream {
                     .or_else(|| self.config.start_replication_value.clone())
             };
 
-            // H13 (audit #146): combining `max_pages` with incremental
-            // replication only makes safe forward progress when the API returns
-            // rows ordered ascending by the replication key. On truncation we
-            // advance the bookmark to the max key seen so far (so the next run
-            // resumes past it — without this the stream would re-read the same
-            // first `max_pages` window forever and never progress); but if the
-            // feed is unordered, unfetched later pages may hold lower keys that
-            // resuming past `running_max` would then drop. Warn loudly so the
-            // requirement is explicit rather than a silent data-loss edge.
             if self.config.max_pages.is_some()
-                && self.config.replication_method == ReplicationMethod::Incremental
-                && self.config.replication_key.is_some()
+                && !self.config.persist_cursor
+                && (self.config.window.is_some()
+                    || (self.config.replication_method == ReplicationMethod::Incremental
+                        && self.config.replication_key.is_some()))
             {
                 tracing::warn!(
-                    "max_pages combined with incremental replication assumes the API returns rows \
-                     ordered ascending by the replication key; an unordered feed can drop unfetched \
-                     lower-key records on resume. Ensure ordering, or remove max_pages for a full \
-                     incremental sweep."
+                    "max_pages is set on an incremental or windowed feed: a pass the cap cuts \
+                     short persists no bookmark, so the next run starts from the same point. \
+                     Raise or remove max_pages for the sweep to make progress."
                 );
             }
 
@@ -1300,21 +1289,20 @@ impl RestStream {
             };
 
             for pass in passes {
-                // Set the window bounds applied to every request in this pass
-                // (an unbounded pass leaves `window_binds` empty).
-                // `execute_request_once` reads `self.window_binds`.
-                if let Some(w) = &pass {
-                    let win = self
+                // The window bounds every request of this pass carries — local to
+                // this stream, so concurrent partitions never see each other's.
+                let pass_window_binds: Vec<ResolvedBind> = match &pass {
+                    Some(w) => self
                         .config
                         .window
                         .as_ref()
-                        .expect("a window pass implies a `window:` block");
-                    *self.window_binds.lock().await = win
+                        .expect("a window pass implies a `window:` block")
                         .render_binds(w)?
                         .into_iter()
                         .map(|(bind, rendered)| ResolvedBind::window(bind, rendered))
-                        .collect();
-                }
+                        .collect(),
+                    None => Vec::new(),
+                };
 
                 // The bookmark this pass persists on its final page: the window's
                 // end (a half-open boundary, so resume neither gaps nor overlaps)
@@ -1337,12 +1325,19 @@ impl RestStream {
                 // #547: the terminal cursor to persist as this run's bookmark.
                 let mut running_cursor: Option<Value> = effective_start.clone();
                 let mut bookmark_emitted = false;
+                let mut truncated = false;
 
                 loop {
                     if let Some(max) = self.config.max_pages
                         && pages_fetched >= max
                     {
-                        tracing::warn!("max pages ({max}) reached");
+                        tracing::warn!(
+                            max_pages = max,
+                            "max_pages reached before the feed signalled its last page"
+                        );
+                        truncated = true;
+                        self.truncated_passes
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
 
@@ -1393,6 +1388,7 @@ impl RestStream {
                                 ctx_ref,
                                 is_first_page,
                                 &body_params,
+                                &pass_window_binds,
                             )
                         },
                     )
@@ -1400,6 +1396,15 @@ impl RestStream {
 
                     let raw_records = self.extract_page(&body)?;
                     let raw_count = raw_records.len();
+
+                    // #554: derive this page's keyset cursor (max/min of the
+                    // configured field) from every record the page returned, before
+                    // the incremental filter drops old ones — a page of only-old
+                    // rows must still move the cursor. A no-op for every
+                    // non-RecordFieldCursor style.
+                    self.config
+                        .pagination
+                        .update_record_cursor(&raw_records, &mut state);
 
                     // #547: track the terminal cursor to persist as the bookmark.
                     if self.config.persist_cursor
@@ -1452,12 +1457,6 @@ impl RestStream {
                         }
                     }
 
-                    // #554: derive this page's keyset cursor (max/min of the
-                    // configured field) so the next request can page by it. A
-                    // no-op for every non-RecordFieldCursor style.
-                    self.config
-                        .pagination
-                        .update_record_cursor(&records, &mut state);
 
                     // Advance pagination state to learn whether there is a next
                     // page BEFORE yielding the current one. This way the bookmark
@@ -1525,30 +1524,35 @@ impl RestStream {
                 }
 
                 // Trailing checkpoint: if the pass loop exited without carrying the
-                // bookmark on a real page (max_pages truncation, or a duplicate-page
-                // stop), emit one empty page carrying the pass bookmark so progress
-                // still persists and the next run resumes from here. (Safe forward
-                // progress under max_pages assumes ascending order by the
-                // replication key — see the warning emitted above, audit #146 H13.)
-                let pass_bookmark = if self.config.persist_cursor {
-                    running_cursor.clone()
-                } else if windowed {
-                    window_bookmark.clone()
-                } else {
-                    running_max.clone()
-                };
+                // bookmark on a real page (a duplicate-page stop, or a `max_pages`
+                // truncation), emit one empty page carrying the pass bookmark so
+                // progress still persists. A truncated pass keeps only a cursor
+                // bookmark — it names the next unread page. A record-derived or
+                // window bookmark would claim the unread pages, so none is kept,
+                // and a windowed sweep stops here rather than letting a later
+                // window's end skip past the rest of this one.
+                let pass_bookmark = pass_bookmark_after(
+                    self.config.persist_cursor,
+                    truncated,
+                    if self.config.persist_cursor {
+                        running_cursor.clone()
+                    } else if windowed {
+                        window_bookmark.clone()
+                    } else {
+                        running_max.clone()
+                    },
+                );
                 if !bookmark_emitted && pass_bookmark.is_some() {
                     yield faucet_core::StreamPage {
                         records: Vec::new(),
                         bookmark: pass_bookmark,
                     };
                 }
+                if truncated && windowed {
+                    break;
+                }
             }
 
-            // Clear the window bounds so a reused source instance starts clean.
-            if windowed {
-                self.window_binds.lock().await.clear();
-            }
         })
     }
 
@@ -1609,8 +1613,9 @@ impl RestStream {
     /// forever), so a *server-side* expiry surfaces only as a 401 on a real
     /// request. The documented contract is "valid until a 401 forces a
     /// refresh" — so on a 401 with an inline cached token we invalidate the
-    /// cache and retry exactly once with a freshly-fetched token (F57). Shared
-    /// auth providers manage their own refresh and are not retried here.
+    /// cache and retry exactly once with a freshly-fetched token (F57). A shared
+    /// provider is re-authenticated the same way on a 401 or on a status it
+    /// declared in `reauth_statuses` (#511, #789 API-06).
     async fn execute_request(
         &self,
         params: &HashMap<String, String>,
@@ -1618,6 +1623,7 @@ impl RestStream {
         path_context: Option<&HashMap<String, Value>>,
         is_first_page: bool,
         body_params: &[(String, Value)],
+        window_binds: &[ResolvedBind],
     ) -> Result<(Value, HeaderMap), FaucetError> {
         match self
             .execute_request_once(
@@ -1626,6 +1632,7 @@ impl RestStream {
                 path_context,
                 is_first_page,
                 body_params,
+                window_binds,
             )
             .await
         {
@@ -1641,17 +1648,18 @@ impl RestStream {
                     path_context,
                     is_first_page,
                     body_params,
+                    window_binds,
                 )
                 .await
             }
-            // #511: a shared provider (e.g. a multi-step flow) whose session
-            // expired mid-run — re-auth on a status it declared in `reauth_on`
-            // and retry once.
+            // A shared provider whose credential the server rejected — a 401, or
+            // a status the provider declared (a multi-step flow's `reauth_on`,
+            // #511) — is re-authenticated and the request retried once.
             Err(FaucetError::HttpStatus { status, .. }) if self.provider_wants_reauth(status) => {
                 if let Some(provider) = &self.auth_provider {
                     tracing::warn!(
                         status,
-                        "shared auth provider requested re-auth on this status; \
+                        "the server rejected the shared credential; \
                          re-authenticating and retrying once"
                     );
                     let _ = provider.invalidate(&Credential::Token(String::new())).await;
@@ -1662,6 +1670,7 @@ impl RestStream {
                     path_context,
                     is_first_page,
                     body_params,
+                    window_binds,
                 )
                 .await
             }
@@ -1669,11 +1678,14 @@ impl RestStream {
         }
     }
 
-    /// `true` when a shared provider declared `status` in its `reauth_statuses`.
+    /// `true` when a shared provider should re-authenticate on `status`: a `401`
+    /// (the server rejected the credential — it may have expired or been revoked
+    /// before its client-side expiry, #789 API-06) or a status the provider
+    /// declared in its `reauth_statuses`.
     fn provider_wants_reauth(&self, status: u16) -> bool {
         self.auth_provider
             .as_ref()
-            .is_some_and(|p| p.reauth_statuses().contains(&status))
+            .is_some_and(|p| status == 401 || p.reauth_statuses().contains(&status))
     }
 
     /// `true` when this source resolves its bearer token from one of the inline
@@ -2280,6 +2292,7 @@ impl RestStream {
         path_context: Option<&HashMap<String, Value>>,
         is_first_page: bool,
         body_params: &[(String, Value)],
+        window_binds: &[ResolvedBind],
     ) -> Result<(Value, HeaderMap), FaucetError> {
         let use_override = url_override.is_some();
 
@@ -2290,7 +2303,7 @@ impl RestStream {
         if let Some(b) = self.resolved_bind().await? {
             binds.push(b);
         }
-        binds.extend(self.window_binds.lock().await.iter().cloned());
+        binds.extend(window_binds.iter().cloned());
 
         let query_btree: std::collections::BTreeMap<String, String> =
             params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -2840,6 +2853,21 @@ fn parse_retry_after(headers: &HeaderMap) -> Duration {
 /// bookmarks in [`Source::stream_pages`] (#535). Numbers compare numerically,
 /// strings lexicographically (the usual timestamp/id bookmark shapes); any
 /// other or heterogeneous pair prefers the newer value.
+/// The bookmark a pass may persist once its page loop has ended. A pass that
+/// `max_pages` cut short keeps only a cursor bookmark, which names the next
+/// unread page; a record-derived or window bookmark would skip it.
+fn pass_bookmark_after(
+    persist_cursor: bool,
+    truncated: bool,
+    bookmark: Option<Value>,
+) -> Option<Value> {
+    if truncated && !persist_cursor {
+        None
+    } else {
+        bookmark
+    }
+}
+
 fn value_max(current: Option<Value>, candidate: Value) -> Option<Value> {
     match current {
         None => Some(candidate),
@@ -3020,6 +3048,9 @@ impl faucet_core::Source for RestStream {
             // the last partition, so the persisted state is the global high-water
             // mark rather than whichever partition happened to finish last.
             let mut max_bookmark: Option<Value> = None;
+            let truncated_before = self
+                .truncated_passes
+                .load(std::sync::atomic::Ordering::SeqCst);
             if concurrency <= 1 {
                 for ctx in &contexts {
                     let mut inner = self.stream_pages_inner(Some(ctx), None, batch_size);
@@ -3068,7 +3099,15 @@ impl faucet_core::Source for RestStream {
                     }
                 }
             }
-            if max_bookmark.is_some() {
+            let truncated_after = self
+                .truncated_passes
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if truncated_after != truncated_before {
+                tracing::warn!(
+                    "a partition stopped at max_pages; persisting no consolidated bookmark so its \
+                     unread pages are read on the next run"
+                );
+            } else if max_bookmark.is_some() {
                 yield faucet_core::StreamPage { records: Vec::new(), bookmark: max_bookmark };
             }
         })
@@ -3157,9 +3196,10 @@ impl faucet_core::Source for RestStream {
                     .bytes_stream()
                     .map_err(std::io::Error::other);
                 let reader = tokio_util::io::StreamReader::new(body);
-                let ndjson_chunks = crate::format::csv_reader_to_ndjson_stream_with_nulls(
+                let ndjson_chunks = crate::format::csv_reader_to_ndjson_stream_with_options(
                     reader,
                     delimiter,
+                    self.config.csv_quote,
                     has_headers,
                     self.config.csv_null_values.clone(),
                 );

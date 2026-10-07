@@ -50,6 +50,8 @@ struct SinkState {
     /// decoded against it. A record that diverges fails the batch (v1: no
     /// schema evolution).
     schema: Option<SchemaRef>,
+    /// `schema` in the workspace's Arrow, for the integer-column check.
+    integral: Option<arrow::datatypes::SchemaRef>,
     /// Fields warned-about as dropped (present in a record, absent from the
     /// locked schema). Deduped to one line per field per run.
     warned_fields: HashSet<String>,
@@ -64,6 +66,7 @@ impl SinkState {
             table: None,
             writer: None,
             schema: None,
+            integral: None,
             warned_fields: HashSet::new(),
             pending: false,
         }
@@ -86,15 +89,29 @@ impl DeltaSink {
         })
     }
 
-    /// Ensure the table + writer + schema are established, inferring the schema
-    /// from `records` on the very first call.
+    /// Ensure the table + writer + schema are established. An existing table's
+    /// own schema is used; the schema is inferred from `records` only when the
+    /// table is created.
     async fn ensure_open(
         &self,
         state: &mut SinkState,
         records: &[Value],
     ) -> Result<(), FaucetError> {
         if state.schema.is_none() {
-            let schema = infer_delta_schema(records, self.config.effective_sample_size())?;
+            if state.table.is_none() {
+                state.table = self.config.connection.open_optional().await?;
+            }
+            let schema = match &state.table {
+                Some(table) => table
+                    .snapshot()
+                    .map_err(|e| FaucetError::Sink(format!("delta: table has no snapshot: {e}")))?
+                    .snapshot()
+                    .arrow_schema(),
+                None => infer_delta_schema(records, self.config.effective_sample_size())?,
+            };
+            state.integral = Some(faucet_common_delta::arrow_bridge::schema_from_delta(
+                &schema,
+            )?);
             state.schema = Some(schema);
         }
         let schema = state.schema.clone().expect("schema set above");
@@ -204,6 +221,10 @@ impl DeltaSink {
             return Ok(0);
         }
         self.ensure_open(state, records).await?;
+        if let Some(integral) = &state.integral {
+            faucet_core::check_integral(records, integral)
+                .map_err(|e| FaucetError::Sink(format!("delta: {e}")))?;
+        }
         let schema = state.schema.clone().expect("schema set");
         let batch = self.encode_batch(&mut state.warned_fields, schema, records)?;
         let rows = batch.num_rows();

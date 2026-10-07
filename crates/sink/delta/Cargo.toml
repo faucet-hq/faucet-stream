@@ -20,7 +20,7 @@ gcs = ["faucet-common-delta/gcs"]
 arrow = ["faucet-core/arrow"]
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["arrow"] }
 faucet-common-delta.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

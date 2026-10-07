@@ -221,3 +221,22 @@ async fn a_malformed_line_is_blamed_on_its_own_file_even_when_prefetched() {
     assert!(msg.contains("b.jsonl"), "must name the file: {msg}");
     assert!(msg.contains("line 1"), "must name the line: {msg}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sinks_upload_scratch_is_not_read() {
+    // #789 FILE-06: an in-flight or orphaned upload of an SFTP sink sits next
+    // to the published file under a scratch name; it is not data.
+    let files = vec![
+        ("a.jsonl".to_string(), "{\"id\":1}\n".to_string()),
+        (
+            "a.jsonl.faucet-tmp-upload-0f3e".to_string(),
+            "{\"id\":2}\n".to_string(),
+        ),
+        ("b.jsonl.faucet-tmp".to_string(), "{\"id\":3}\n".to_string()),
+    ];
+    let Some((_c, port)) = start_sftp(&files).await else {
+        return;
+    };
+    let records = drain(&source(port, SftpFormat::Jsonl, 2, 1_000), 1_000).await;
+    assert_eq!(records, vec![serde_json::json!({"id": 1})]);
+}

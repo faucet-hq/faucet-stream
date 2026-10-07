@@ -7159,7 +7159,7 @@
           "const": "on_sink_confirm"
         },
         {
-          "description": "At-most-once: the broker considers a message delivered as soon as it is\nsent (`no_ack`). Fastest, but a crash loses in-flight messages.",
+          "description": "At-most-once: the broker considers a message delivered as soon as it is\nsent (`no_ack`). Fastest, but a crash loses in-flight messages. Cannot\nbe combined with `max_messages`: the broker pushes the backlog into the\nclient buffer ahead of consumption, so stopping at a count would lose\neverything already pushed.",
           "type": "string",
           "const": "auto"
         }
@@ -14495,7 +14495,7 @@
                       "default": null
                     },
                     "max_pages": {
-                      "description": "Hard cap on pages fetched per run, across every pagination style — the\nbackstop against a feed that never signals completion. `None` removes\nthe cap.",
+                      "description": "Optional cap on pages fetched per pass, across every pagination style.\nUnset by default: each pagination style already stops on its own end\nsignal and loop guards. When the cap cuts a pass short, only a persisted\ncursor bookmark (`persist_cursor`) is kept — a record-derived or window\nbookmark would skip the unread pages, so none is written.",
                       "type": [
                         "integer",
                         "null",
@@ -14503,7 +14503,7 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 100
+                      "default": null
                     },
                     "request_delay": {
                       "description": "Fixed delay between page requests, in seconds — a politeness knob for\nAPIs that rate-limit by request frequency. Applied *in addition* to any\n`Retry-After` honoured by the retry path.",
@@ -14622,7 +14622,7 @@
                       "default": null
                     },
                     "schema_sample_size": {
-                      "description": "Maximum number of records to sample when inferring the schema via\n[`crate::stream::RestStream::infer_schema`].  `0` means sample all\navailable records (up to `max_pages`).  Defaults to `100`.",
+                      "description": "Maximum number of records to sample when inferring the schema via\n[`crate::stream::RestStream::infer_schema`].  `0` means sample all\navailable records (up to `max_pages`, when set).  Defaults to `100`.",
                       "type": [
                         "integer",
                         "string"
@@ -14985,6 +14985,28 @@
                       "items": {
                         "$ref": "#/$defs/source_graphql__RetryMatcher"
                       }
+                    },
+                    "timeout": {
+                      "description": "Per-request timeout in seconds. Covers one HTTP request (a stalled peer\nfails the request, so retries and resilience can act), not the whole\nrun. `null` disables it. Defaults to `30`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "connect_timeout": {
+                      "description": "Timeout for establishing a connection, in seconds. `null` disables it.\nDefaults to `10`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
                     }
                   },
                   "title": "GraphqlStreamConfig",
@@ -15129,6 +15151,28 @@
                         }
                       ],
                       "default": null
+                    },
+                    "timeout": {
+                      "description": "Per-request timeout in seconds. Covers one HTTP request (a stalled peer\nfails the request, so retries and resilience can act), not the whole\nrun. `null` disables it. Defaults to `30`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "connect_timeout": {
+                      "description": "Timeout for establishing a connection, in seconds. `null` disables it.\nDefaults to `10`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
                     }
                   }
                 },
@@ -15264,7 +15308,7 @@
                       "default": 30
                     },
                     "reconnect_max_attempts": {
-                      "description": "For [`RpcKind::ServerStreaming`] reconnect: maximum reconnect attempts\nbefore surfacing the error. `None` (the default) means unlimited\nretries.\n\nThe historical WebSocket-source spelling `max_reconnect_attempts` is\naccepted as an alias (#654 M20) — the prefix used to be reversed\nbetween the two connectors, so a user who learned one spelling had the\nother silently ignored and reconnected without a bound.",
+                      "description": "For [`RpcKind::ServerStreaming`] reconnect: maximum consecutive\nreconnect attempts before surfacing the error. Defaults to 10; the\ncount resets whenever a stream delivers a message. `null` means\nunlimited retries.\n\nThe historical WebSocket-source spelling `max_reconnect_attempts` is\naccepted as an alias (#654 M20) — the prefix used to be reversed\nbetween the two connectors, so a user who learned one spelling had the\nother silently ignored and reconnected without a bound.",
                       "type": [
                         "integer",
                         "null",
@@ -15272,15 +15316,15 @@
                       ],
                       "format": "uint32",
                       "minimum": 0,
-                      "default": null
+                      "default": 10
                     },
                     "reconnect_replay_from_start": {
-                      "description": "For [`RpcKind::ServerStreaming`] reconnect: whether the server replays\nthe response stream from the beginning when the identical request is\nre-issued after a disconnect. Defaults to `true`.\n\nBecause the request is resolved once per run, a reconnect sends the\n*same* request — a stateless server therefore re-streams from message\n0. When `true` the source skips the messages it already emitted before\nthe disconnect, so consumers see each message once. Set to `false`\nonly for servers that resume mid-stream on the same request (rare):\nthere, skipping would drop genuinely-new messages, so every received\nmessage is emitted (at-least-once; duplicates possible).",
+                      "description": "For [`RpcKind::ServerStreaming`] reconnect: whether the server replays\nthe response stream from the beginning when the identical request is\nre-issued after a disconnect. Defaults to `false`.\n\nWhen `false` every message received after a reconnect is emitted\n(at-least-once: a server that replays produces duplicates). Set it to\n`true` only for a server known to re-stream the same messages in the\nsame order from message 0: the source then skips as many messages as it\nalready emitted. Against a live feed that sends new events after a\nresubscribe, `true` silently drops that many new messages.",
                       "type": [
                         "boolean",
                         "string"
                       ],
-                      "default": true
+                      "default": false
                     },
                     "max_decoding_message_size": {
                       "description": "Maximum size, in bytes, of a single inbound (decoded) gRPC message.\n`None` (the default) keeps tonic's built-in 4 MiB limit. Raise this\nfor sources that legitimately return large messages; a too-low limit\nsurfaces as a decode error and aborts the call. Applies to both unary\nand server-streaming RPCs.",
@@ -15303,6 +15347,39 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": null
+                    },
+                    "connect_timeout": {
+                      "description": "Seconds to wait for the TCP/TLS connection to the endpoint. Defaults to\n10; `null` waits indefinitely.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "timeout": {
+                      "description": "Seconds a unary call may take, and how long a server-streaming call may\ntake to start (response headers). Defaults to 30; `null` waits\nindefinitely. A timed-out server-streaming start is retried like any\nother transient error.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "idle_timeout": {
+                      "description": "For [`RpcKind::ServerStreaming`]: seconds to wait for the next message\nbefore treating the stream as stalled and reconnecting. Defaults to\n300; `null` waits indefinitely (a half-open connection then hangs the\nrun).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 300
                     }
                   }
                 },
@@ -16020,6 +16097,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "visibility_extension_secs": {
+                      "description": "Visibility timeout, in seconds, the source keeps renewing on every\nmessage it has received but not yet deleted (while a page is assembled\nand while the sink writes it), so a slow page is not redelivered into\nthe same run. Renewed every third of this window. `0` disables renewal\nand leaves the queue's own visibility timeout in charge. Default 60.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint32",
+                      "minimum": 0,
+                      "default": 60
                     }
                   }
                 },
@@ -16144,6 +16231,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "progress_interval_secs": {
+                      "description": "JetStream only: send an in-progress ack (`+WPI`) every this many\nseconds for every message pulled but not yet acked (while a page is\nassembled and while the sink writes it), resetting the consumer's\n`ack_wait` so a slow page is not redelivered into the same run. Keep\nit below the consumer's `ack_wait` (30 s by default). `0` disables.\nDefault 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
                     }
                   },
                   "title": "NatsSourceConfig",
@@ -17461,6 +17558,21 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "on_decode_error": {
+                      "description": "What to do with a message whose payload does not decode. Default\n`fail`.",
+                      "$ref": "#/$defs/source_pubsub__OnDecodeError",
+                      "default": "fail"
+                    },
+                    "ack_deadline_extension_secs": {
+                      "description": "Ack deadline, in seconds, the source keeps renewing on every message it\nhas pulled but not yet acked (while a page is assembled and while the\nsink writes it), so a slow page is not redelivered into the same run.\nRenewed every 5 s (or every third of the window, if shorter). `0`\ndisables renewal. Range 10–600. Default 60.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint32",
+                      "minimum": 0,
+                      "default": 60
                     }
                   },
                   "title": "PubsubSourceConfig",
@@ -17662,6 +17774,46 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "timeout_secs": {
+                      "description": "Seconds one request (including reading its body) may take. Unset (the\ndefault) means no limit, since a blob body is read at the pace of the\nsink and a total deadline would cut long reads off mid-body.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Seconds to wait for a connection to the storage endpoint. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "max_retries": {
+                      "description": "Retries of a failed request, including resuming an interrupted body\nread. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "retry_timeout_secs": {
+                      "description": "Seconds after a request first went out during which it may still be\nretried or its body resumed. Defaults to 600. Keep it within the\nlifetime of the credential (a SAS token or bearer token), since a\nretry reuses the original request's credentials.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 600
                     },
                     "prefix": {
                       "description": "Object name prefix filter. Ignored when `object_keys` is set.",
@@ -18628,7 +18780,7 @@
                       "default": []
                     },
                     "include_closed": {
-                      "description": "Also consume closed (post-resharding) shards still inside the\nretention window. Default `false` (open shards only).",
+                      "description": "Also consume closed (post-resharding) shards still inside the\nretention window that have no bookmark. A bookmarked closed shard is\nalways drained, before its children. Default `false`.",
                       "type": [
                         "boolean",
                         "string"
@@ -18656,7 +18808,7 @@
                       "default": 500
                     },
                     "shard_concurrency": {
-                      "description": "Max shards read concurrently. Default 4.",
+                      "description": "Max concurrent `GetRecords` calls; every shard is still read, in turn.\nDefault 4.",
                       "type": [
                         "integer",
                         "string"
@@ -20770,6 +20922,46 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "timeout_secs": {
+                      "description": "Seconds one request (including reading its body) may take. Unset (the\ndefault) means no limit, since a blob body is read at the pace of the\nsink and a total deadline would cut long reads off mid-body.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Seconds to wait for a connection to the storage endpoint. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "max_retries": {
+                      "description": "Retries of a failed request, including resuming an interrupted body\nread. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "retry_timeout_secs": {
+                      "description": "Seconds after a request first went out during which it may still be\nretried or its body resumed. Defaults to 600. Keep it within the\nlifetime of the credential (a SAS token or bearer token), since a\nretry reuses the original request's credentials.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 600
                     },
                     "prefix": {
                       "description": "Object name prefix filter. Ignored when `object_keys` is set.",
@@ -24071,6 +24263,28 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "timeout": {
+                      "description": "Per-request timeout in seconds. Covers one HTTP request (a stalled peer\nfails the request, so retries and resilience can act), not the whole\nrun. `null` disables it. Defaults to `30`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "connect_timeout": {
+                      "description": "Timeout for establishing a connection, in seconds. `null` disables it.\nDefaults to `10`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
                     }
                   }
                 },
@@ -25187,6 +25401,46 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "timeout_secs": {
+                      "description": "Seconds one request (including reading its body) may take. Unset (the\ndefault) means no limit, since a blob body is read at the pace of the\nsink and a total deadline would cut long reads off mid-body.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Seconds to wait for a connection to the storage endpoint. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "max_retries": {
+                      "description": "Retries of a failed request, including resuming an interrupted body\nread. Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "retry_timeout_secs": {
+                      "description": "Seconds after a request first went out during which it may still be\nretried or its body resumed. Defaults to 600. Keep it within the\nlifetime of the credential (a SAS token or bearer token), since a\nretry reuses the original request's credentials.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 600
                     },
                     "prefix": {
                       "description": "Object-name prefix for written objects.",
@@ -31147,6 +31401,26 @@
           "const": "skip",
           "description": "Log a warning and resume from the earliest retained change, accepting\nthe loss (e.g. after re-snapshotting the destination).",
           "type": "string"
+        }
+      ]
+    },
+    "source_pubsub__OnDecodeError": {
+      "description": "What to do with a message whose payload does not decode under\n`value_format`.",
+      "oneOf": [
+        {
+          "description": "Fail the run. The message stays unacked, so Pub/Sub redelivers it and\nthe next run fails at it again until it is removed.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Drop the message: it is acked with its page and no record is emitted.",
+          "type": "string",
+          "const": "skip"
+        },
+        {
+          "description": "Emit the record with the payload base64-encoded under `data` and the\ndecode error under `decode_error`.",
+          "type": "string",
+          "const": "raw"
         }
       ]
     }

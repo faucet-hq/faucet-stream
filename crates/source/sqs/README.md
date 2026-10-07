@@ -28,6 +28,7 @@ source:
 | `idle_timeout_secs` / `max_messages` | — | **At least one is required** so a batch run terminates. |
 | `wait_time_seconds` | `10` | Long-poll wait per `ReceiveMessage` (0–20). |
 | `batch_size` | `1000` | Records per emitted page. `0` = one page for the whole drain. |
+| `visibility_extension_secs` | `60` | Visibility timeout renewed (every third of the window) on every message received but not yet deleted, so a slow page is not redelivered into the same run. `0` disables renewal (3–43200 otherwise). |
 
 Each `ReceiveMessage` call requests up to 10 messages (the SQS API cap),
 capped further so it never over-reads past `max_messages`.
@@ -53,13 +54,17 @@ before it has been persisted. Delivery is therefore **at-least-once**: a sink
 error, an abort, or a crash between the write and the delete leaves the messages
 in the queue, and they are redelivered once the visibility window elapses.
 
-There is no resumable bookmark (`bookmark: None` on every page); the queue itself
-is the cursor. Key downstream consumers on a message field (e.g. an upsert sink)
+Every page carries an informational `{queue, consumed}` bookmark so the pipeline
+flushes a buffering sink (file, object-store, Parquet) **before** it resumes the
+source — which is when that page is deleted. It is not a resume position: the
+queue itself is the cursor. Key downstream consumers on a message field (e.g. an upsert sink)
 when replays must converge.
 
-Set `visibility_timeout` on the queue comfortably above the time it takes to
-write one page, or a slow sink will let a message reappear while it is still
-in flight.
+While a message is held — its page being assembled or written — the source
+renews its visibility timeout to `visibility_extension_secs`, so a slow page is
+not redelivered into the same run. With renewal off (`0`), set the queue's
+visibility timeout comfortably above the time it takes to assemble and write
+one page.
 
 ## LocalStack
 

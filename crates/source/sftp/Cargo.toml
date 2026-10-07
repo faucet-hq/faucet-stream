@@ -11,6 +11,7 @@ keywords = ["sftp", "ssh", "file", "etl", "connector"]
 categories.workspace = true
 
 [dependencies]
+faucet-common-file.workspace = true
 faucet-core.workspace = true
 faucet-common-sftp.workspace = true
 schemars.workspace = true

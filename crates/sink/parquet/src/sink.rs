@@ -37,14 +37,13 @@ use crate::schema::infer_schema;
 ///   file's footer unwritten — and on S3 abort the multipart upload — so the
 ///   trailing file is unreadable.
 /// * **Single-file mode** (a fixed `*.parquet` local path with no rollover):
-///   the sink keeps **one** writer open for the whole run. The pipeline calls
-///   `flush()` after every bookmark-carrying page, so closing there would
-///   footer-write the file and the next page would reopen the same path and
-///   *truncate* it — silently losing every page but the last (a critical
-///   data-loss bug for any multi-bookmark source, e.g. all CDC pipelines).
-///   Instead, an intermediate `flush()` only flushes buffered Arrow row groups
-///   to the open writer (no footer, bounding memory) and the footer is written
-///   exactly once when the sink is dropped at end of run.
+///   every `flush()` publishes a complete file at the path (footer written,
+///   fsynced, renamed into place), so the bookmark the pipeline stores after a
+///   flush never names rows that are not on disk. The next page reopens the
+///   file and copies its rows into a new writer before appending, since a
+///   Parquet file cannot be extended in place. Rows written after the last
+///   `flush()` are discarded when the sink is dropped; nothing is finalised in
+///   `Drop`.
 #[deprecated(
     since = "1.3.0",
     note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
@@ -56,8 +55,8 @@ pub struct ParquetSink {
     /// or `None` for S3.
     local_root: Option<PathBuf>,
     /// Computed once at construction: a fixed `*.parquet` local path with no
-    /// rollover thresholds. In this mode one writer stays open for the whole
-    /// run and the footer is written on `Drop`, never on a per-page `flush()`.
+    /// rollover thresholds. In this mode every `flush()` publishes the whole
+    /// file at that path.
     single_file: bool,
     state: Mutex<WriterState>,
     /// Every local file this sink opened, for the local-output retention GC
@@ -93,6 +92,9 @@ struct WriterState {
     /// across chunks (rather than resetting per `encode_batch`) keeps the
     /// warning to one line per dropped field per file instead of one per page.
     warned_fields: std::collections::HashSet<String>,
+    /// Single-file mode: the fixed path holds a file this run published, so the
+    /// next write continues it.
+    published: bool,
 }
 
 impl WriterState {
@@ -103,6 +105,7 @@ impl WriterState {
             rows_in_current_file: 0,
             files_written: 0,
             warned_fields: std::collections::HashSet::new(),
+            published: false,
         }
     }
 }
@@ -209,6 +212,7 @@ impl ParquetSink {
     async fn open_writer(
         &self,
         schema: SchemaRef,
+        continuing: bool,
     ) -> Result<AsyncArrowWriter<Box<dyn AsyncFileWriter>>, FaucetError> {
         let (obj_path, local_path) = self.next_object_path()?;
         // Provenance for the retention GC (#587), recorded before the writer
@@ -216,7 +220,9 @@ impl ParquetSink {
         // is flagged `pre_existing` and never collected. The writer always
         // replaces the whole object, so such a file is `replaced`: previewable,
         // never collected. In rollover mode each part lands here as its own entry.
-        if let Some(local) = &local_path {
+        if let Some(local) = &local_path
+            && !continuing
+        {
             self.outputs.record_open_probing_with(local.clone(), true);
         }
         let writer = ParquetObjectWriter::new(self.store.clone(), obj_path);
@@ -282,6 +288,7 @@ impl ParquetSink {
         if records.is_empty() {
             return Ok(0);
         }
+        self.continue_published(state).await?;
 
         if state.schema.is_none() {
             let schema = match &self.config.schema {
@@ -321,7 +328,7 @@ impl ParquetSink {
         let schema = state.schema.clone().expect("schema set above");
 
         if state.writer.is_none() {
-            state.writer = Some(self.open_writer(schema).await?);
+            state.writer = Some(self.open_writer(schema, false).await?);
         }
 
         let batch_rows = batch.num_rows();
@@ -380,112 +387,114 @@ impl ParquetSink {
         Ok(())
     }
 
-    /// Single-file intermediate flush: push buffered Arrow row groups to the
-    /// open writer **without** writing the footer, so the one writer stays open
-    /// across pages. Bounds memory between bookmark-carrying pages without
-    /// truncating the file. No-op until the first write has opened a writer.
-    async fn flush_open_writer(&self, state: &mut WriterState) -> Result<(), FaucetError> {
-        if let Some(writer) = state.writer.as_mut() {
-            writer
-                .flush()
+    /// Single-file flush: write the footer, fsync the file and its directory.
+    /// The object store renames the finished upload over the fixed path, so a
+    /// reader (or a crash) sees either the previous complete file or this one.
+    async fn publish(&self, state: &mut WriterState) -> Result<(), FaucetError> {
+        let Some(writer) = state.writer.take() else {
+            return Ok(());
+        };
+        writer
+            .close()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("could not close parquet writer: {e}")))?;
+        state.files_written += 1;
+        state.rows_in_current_file = 0;
+        state.schema = None;
+        state.warned_fields.clear();
+        state.published = true;
+        let (_, local) = self.next_object_path()?;
+        if let Some(path) = local {
+            tokio::task::spawn_blocking(move || sync_file_and_dir(&path))
                 .await
-                .map_err(|e| FaucetError::Sink(format!("could not flush parquet writer: {e}")))?;
+                .map_err(|e| FaucetError::Sink(format!("parquet fsync task failed: {e}")))??;
         }
+        Ok(())
+    }
+
+    /// Single-file mode, after a publish: reopen the fixed path with the
+    /// published file's schema and copy its rows into the new writer, so the
+    /// next publish holds every row of the run.
+    async fn continue_published(&self, state: &mut WriterState) -> Result<(), FaucetError> {
+        if !self.single_file || !state.published || state.writer.is_some() {
+            return Ok(());
+        }
+        let path = self
+            .next_object_path()?
+            .1
+            .expect("single-file mode is a local path");
+        let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, FaucetError>>(2);
+        let reader = tokio::task::spawn_blocking(move || {
+            let read_err = |e: &dyn std::fmt::Display| {
+                FaucetError::Sink(format!(
+                    "parquet: could not reread {} to continue it: {e}",
+                    path.display()
+                ))
+            };
+            let opened = std::fs::File::open(&path)
+                .map_err(|e| read_err(&e))
+                .and_then(|f| {
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+                        .map_err(|e| read_err(&e))
+                });
+            let builder = match opened {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = schema_tx.send(Err(e));
+                    return;
+                }
+            };
+            let _ = schema_tx.send(Ok(builder.schema().clone()));
+            match builder.build() {
+                Ok(batches) => {
+                    for batch in batches {
+                        if tx.blocking_send(batch.map_err(|e| read_err(&e))).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(read_err(&e)));
+                }
+            }
+        });
+        let schema = schema_rx
+            .await
+            .map_err(|_| FaucetError::Sink("parquet: reread task ended early".into()))??;
+        let mut writer = self.open_writer(schema.clone(), true).await?;
+        let mut rows = 0;
+        while let Some(batch) = rx.recv().await {
+            let batch = batch?;
+            rows += batch.num_rows();
+            writer
+                .write(&batch)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("parquet write failed: {e}")))?;
+        }
+        reader
+            .await
+            .map_err(|e| FaucetError::Sink(format!("parquet reread task failed: {e}")))?;
+        state.schema = Some(schema);
+        state.writer = Some(writer);
+        state.rows_in_current_file = rows;
         Ok(())
     }
 }
 
-impl Drop for ParquetSink {
-    /// Finalize a still-open single-file writer by writing its footer exactly
-    /// once at end of run. This is the *only* place the single-file footer is
-    /// written — per-page `flush()` deliberately leaves the writer open (see
-    /// the type-level docs) so the file is never reopened/truncated mid-stream.
-    ///
-    /// Rollover / directory / S3 modes close their writer on every `flush()`,
-    /// so by the time the sink is dropped `state.writer` is already `None` and
-    /// this is a no-op for them.
-    fn drop(&mut self) {
-        // Only single-file mode can leave a writer open past the final flush.
-        if !self.single_file {
-            return;
-        }
-        // Take the writer out under the lock without awaiting (the lock is
-        // uncontended at drop — no other handle to `self` exists).
-        let Some(writer) = self.state.get_mut().writer.take() else {
-            return;
-        };
-
-        // Closing is async (the object_store local writer offloads its final
-        // write to a blocking task), so we need a Tokio runtime context. The
-        // pipeline runs the sink on a multi-thread runtime, where
-        // `block_in_place` lets us drive the close to completion on the current
-        // thread. If we are not inside a runtime (or on a single-threaded one
-        // where `block_in_place` would panic), fall back to a transient
-        // runtime so the footer is still written rather than lost.
-        let close = async move {
-            writer
-                .close()
-                .await
-                .map(|_meta| ())
-                .map_err(|e| FaucetError::Sink(format!("could not close parquet writer: {e}")))
-        };
-
-        let result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        // Safe: a multi-thread runtime tolerates a blocking
-                        // section on a worker thread.
-                        tokio::task::block_in_place(|| handle.block_on(close))
-                    }
-                    // current-thread (or any non-multi-thread) runtime:
-                    // `block_in_place` would panic, and we cannot re-enter the
-                    // current runtime with `block_on`. Drive the close on a
-                    // dedicated thread with its own minimal runtime.
-                    _ => close_on_dedicated_thread(close),
-                }
-            }
-            // Dropped outside any runtime: spin up a transient one.
-            Err(_) => close_on_dedicated_thread(close),
-        };
-
-        if let Err(e) = result {
-            tracing::error!(
-                error = %e,
-                "parquet sink: failed to finalize single-file output on drop; the file may be unreadable"
-            );
-        }
+/// fsync `path` and the directory that holds it, so a published file and its
+/// rename survive a crash.
+fn sync_file_and_dir(path: &FsPath) -> Result<(), FaucetError> {
+    let sync = |p: &FsPath| {
+        std::fs::File::open(p)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| FaucetError::Sink(format!("could not fsync {}: {e}", p.display())))
+    };
+    sync(path)?;
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => sync(dir),
+        _ => Ok(()),
     }
-}
-
-/// Drive a future to completion on a freshly-spawned OS thread with its own
-/// single-threaded Tokio runtime. Used by `Drop` when the current context
-/// cannot host a blocking close (no runtime, or a current-thread runtime that
-/// `block_in_place` cannot enter).
-fn close_on_dedicated_thread<F>(fut: F) -> Result<(), FaucetError>
-where
-    F: std::future::Future<Output = Result<(), FaucetError>> + Send + 'static,
-{
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| {
-                        FaucetError::Sink(format!(
-                            "could not build runtime to finalize parquet file: {e}"
-                        ))
-                    })?;
-                rt.block_on(fut)
-            })
-            .join()
-            .unwrap_or_else(|_| {
-                Err(FaucetError::Sink(
-                    "parquet finalize thread panicked".to_string(),
-                ))
-            })
-    })
 }
 
 #[async_trait]
@@ -564,23 +573,23 @@ impl faucet_core::Sink for ParquetSink {
             return Ok(0);
         }
         let mut state = self.state.lock().await;
+        self.continue_published(&mut state).await?;
         self.write_record_batch(&mut state, batch).await
     }
 
     /// Make buffered output durable.
     ///
-    /// In **single-file mode** this only flushes buffered Arrow row groups to
-    /// the open writer (no footer) so the file is never reopened/truncated
-    /// between the per-page flushes the pipeline issues; the footer is written
-    /// once on `Drop` at end of run. In **rollover / directory / S3 mode** this
-    /// closes the in-flight writer (writing the footer / completing the S3
-    /// multipart) — the next page opens a fresh file. Files left without a
-    /// final `flush()`/drop in those modes are unreadable.
+    /// In **single-file mode** this publishes the complete file at the fixed
+    /// path (footer, fsync, atomic replace); the next page continues it. In
+    /// **rollover / directory / S3 mode** this closes the in-flight writer
+    /// (writing the footer / completing the S3 multipart) — the next page
+    /// opens a fresh file. Rows written after the last `flush()` are not
+    /// persisted.
     async fn flush(&self) -> Result<(), FaucetError> {
         let mut state = self.state.lock().await;
         if self.single_file {
-            self.flush_open_writer(&mut state).await?;
-            tracing::debug!("Parquet single-file sink flushed (writer kept open)");
+            self.publish(&mut state).await?;
+            tracing::debug!("Parquet single-file sink published");
         } else {
             self.close_current(&mut state).await?;
             tracing::debug!(files = state.files_written, "Parquet sink flushed");
@@ -1094,8 +1103,7 @@ mod tests {
     /// Regression test for F2 (audit #264): single-file mode must accumulate
     /// ALL pages across the per-page `flush()` calls the pipeline issues — the
     /// file must not be reopened/truncated mid-stream, so only the final page
-    /// would survive. Runs on a multi-thread runtime so the production Drop
-    /// finalize path (`block_in_place`) is exercised.
+    /// would survive.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_file_accumulates_all_pages_across_flushes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1125,8 +1133,6 @@ mod tests {
                 .await
                 .unwrap();
             sink.flush().await.unwrap();
-
-            // Drop here writes the footer exactly once.
         }
 
         let mut ids = read_ids(&path);
@@ -1138,10 +1144,11 @@ mod tests {
         );
     }
 
-    /// Even without any intermediate `flush()`, a single-file sink must produce
-    /// a readable file once dropped (footer written on Drop).
+    /// #789 FILE-01: each `flush()` publishes a complete, readable file while
+    /// the sink is still open, and rows written after the last flush never
+    /// reach the file — `Drop` finalises nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn single_file_finalizes_on_drop_without_explicit_flush() {
+    async fn single_file_publishes_on_flush_and_discards_unflushed_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("out.parquet");
         {
@@ -1149,17 +1156,65 @@ mod tests {
             sink.write_batch(&[json!({"id": 10}), json!({"id": 11})])
                 .await
                 .unwrap();
-            // No flush() — rely on Drop to write the footer.
+            sink.flush().await.unwrap();
+            assert_eq!(read_ids(&path), vec![10, 11], "readable right after flush");
+
+            sink.write_batch(&[json!({"id": 12})]).await.unwrap();
+            sink.flush().await.unwrap();
+            let mut ids = read_ids(&path);
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec![10, 11, 12],
+                "the second publish keeps the first page"
+            );
+
+            sink.write_batch(&[json!({"id": 13})]).await.unwrap();
         }
-        let ids = read_ids(&path);
-        assert_eq!(ids, vec![10, 11]);
+        let mut ids = read_ids(&path);
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![10, 11, 12],
+            "unflushed rows are not finalised on drop"
+        );
+        let stray: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n != "out.parquet")
+            .collect();
+        assert!(stray.is_empty(), "no staging files left: {stray:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_published_file_that_vanished_fails_the_next_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.parquet");
+        let sink = ParquetSink::new(cfg(&path)).await.unwrap();
+        sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+        sink.flush().await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let err = sink.write_batch(&[json!({"id": 2})]).await.unwrap_err();
+        assert!(err.to_string().contains("could not reread"), "{err}");
+    }
+
+    #[test]
+    fn sync_file_and_dir_reports_a_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = sync_file_and_dir(&tmp.path().join("nope.parquet")).unwrap_err();
+        assert!(err.to_string().contains("could not fsync"), "{err}");
+        let f = tmp.path().join("ok");
+        std::fs::write(&f, b"x").unwrap();
+        sync_file_and_dir(&f).unwrap();
+        sync_file_and_dir(std::path::Path::new("/")).unwrap();
     }
 
     /// Columnar fast path (feature `arrow`): a `RecordBatch` written via
     /// `write_batch_columnar` produces the same readable single-file Parquet as
     /// the `Value` path — it goes through the shared `write_record_batch` tail,
-    /// so schema inference (from the batch), lazy writer open, and Drop-finalize
-    /// all behave identically. Proves the parquet sink's half of the
+    /// so schema inference (from the batch), lazy writer open, and publishing
+    /// on flush all behave identically. Proves the parquet sink's half of the
     /// `parquet -> parquet` columnar chain (RFC 0002 / #375).
     #[cfg(feature = "arrow")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1174,7 +1229,6 @@ mod tests {
             let n = sink.write_batch_columnar(&batch).await.unwrap();
             assert_eq!(n, 3, "all rows written via the columnar path");
             sink.flush().await.unwrap();
-            // Drop writes the footer.
         }
         let mut ids = read_ids(&path);
         ids.sort_unstable();
