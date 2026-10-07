@@ -7097,6 +7097,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "calamine",
+ "chrono",
  "csv-async",
  "faucet-conformance",
  "faucet-core",
