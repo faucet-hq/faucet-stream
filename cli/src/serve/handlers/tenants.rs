@@ -338,7 +338,10 @@ async fn store_connection(
         name: name.to_string(),
         provider_type: kind,
         connect_provider: None,
-        sealed: vault.seal(&provider),
+        sealed: vault.seal_for(
+            &provider,
+            &crate::serve::tenants::vault::Vault::connection_context(tenant, name),
+        ),
         status: ConnectionStatus::Active,
         reauth_reason: None,
         created_at: existing.map(|e| e.created_at).unwrap_or(now),

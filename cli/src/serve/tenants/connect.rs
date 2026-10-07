@@ -283,7 +283,9 @@ pub async fn start(
         provider: provider_name.to_string(),
         connection: req.connection,
         redirect: req.redirect,
-        sealed_verifier: rt.require_vault()?.seal_str(&verifier),
+        sealed_verifier: rt
+            .require_vault()?
+            .seal_str_for(&verifier, &format!("connect-session:{oauth_state}")),
         created_by: actor.principal.clone(),
         created_at: now,
         expires_at,
@@ -398,7 +400,10 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
         .get(&session.provider)
         .ok_or_else(|| format!("provider '{}' is no longer configured", session.provider))?;
     let vault = rt.vault.as_ref().ok_or("this server has no vault key")?;
-    let verifier = vault.open_str(&session.sealed_verifier)?;
+    let verifier = vault.open_str_for(
+        &session.sealed_verifier,
+        &format!("connect-session:{}", session.state),
+    )?;
     let tokens = exchange(provider, code, &verifier).await?;
     let refresh_token = tokens
         .get("refresh_token")
@@ -433,7 +438,10 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
         name: session.connection.clone(),
         provider_type: "oauth2_refresh".into(),
         connect_provider: Some(session.provider.clone()),
-        sealed: vault.seal(&spec),
+        sealed: vault.seal_for(
+            &spec,
+            &super::vault::Vault::connection_context(&session.tenant, &session.connection),
+        ),
         status: ConnectionStatus::Active,
         reauth_reason: None,
         created_at,

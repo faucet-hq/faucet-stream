@@ -30,6 +30,12 @@ faucet serve --auth-config auth.yaml --history sqlite:./faucet.db \
   --connect-providers providers.yaml
 ```
 
+The key must be at least 32 bytes (the server refuses a shorter one), and every
+sealed connection is bound to its tenant and name: a sealed row copied onto
+another tenant's record fails to open rather than lending that tenant the
+credentials. A key passed with `--vault-previous-key` only opens existing rows,
+so rotating away from an old (even short) key works.
+
 The vault key seals every stored credential; without it the server refuses to
 store or open connections (`503`). To rotate, start with the new key and pass
 the old one as `--vault-previous-key` until every connection has been

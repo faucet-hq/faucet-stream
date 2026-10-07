@@ -150,12 +150,14 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
 /// with the redaction registry for the life of the process.
 fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, ServeError> {
     let vault = rt.require_vault()?;
-    let mut spec = vault.open(&c.sealed).map_err(|e| {
-        ServeError::Internal(format!(
-            "connection '{}' of tenant '{}': {e}",
-            c.name, c.tenant
-        ))
-    })?;
+    let mut spec = vault
+        .open_for(&c.sealed, &Vault::connection_context(&c.tenant, &c.name))
+        .map_err(|e| {
+            ServeError::Internal(format!(
+                "connection '{}' of tenant '{}': {e}",
+                c.name, c.tenant
+            ))
+        })?;
     if let Some(provider) = c
         .connect_provider
         .as_deref()
@@ -273,7 +275,7 @@ fn state_key_hook(state: ServerState, tenant: String) -> crate::executor::StateK
         let rt = state.tenants();
         let spec_value = serde_json::to_value(spec).unwrap_or(Value::Null);
         let stored = match &rt.vault {
-            Some(v) => Some(v.seal(&spec_value)),
+            Some(v) => Some(v.seal_for(&spec_value, &state_context(&tenant))),
             // Without a vault only a store with no credentials in its spec is
             // kept; any other key is reported, not deleted, on tenant delete.
             None if matches!(spec.kind.as_str(), "file" | "memory") => Some(spec_value.to_string()),
@@ -395,7 +397,12 @@ impl ConnectionTokenStore {
             .vault
             .as_ref()
             .ok_or_else(|| FaucetError::State("no vault key".into()))?;
-        let spec = vault.open(&rec.sealed).map_err(FaucetError::State)?;
+        let spec = vault
+            .open_for(
+                &rec.sealed,
+                &Vault::connection_context(&rec.tenant, &rec.name),
+            )
+            .map_err(FaucetError::State)?;
         Ok(Some((rec, spec)))
     }
 }
@@ -426,7 +433,7 @@ impl StateStore for ConnectionTokenStore {
             .vault
             .as_ref()
             .ok_or_else(|| FaucetError::State("no vault key".into()))?;
-        rec.sealed = vault.seal(&spec);
+        rec.sealed = vault.seal_for(&spec, &Vault::connection_context(&rec.tenant, &rec.name));
         rec.updated_at = Utc::now();
         self.state
             .history()
@@ -565,6 +572,10 @@ pub async fn mark_needs_reauth(state: &ServerState, tenant: &str, name: &str, re
     .await;
 }
 
+fn notifications_context(tenant: &str) -> String {
+    format!("notifications:{tenant}")
+}
+
 /// Store a tenant's `notifications:` list: sealed under the vault key, the
 /// plain list left empty. An empty list needs no vault.
 pub fn seal_notifications(
@@ -578,7 +589,8 @@ pub fn seal_notifications(
         return Ok(());
     }
     let vault = rt.require_vault()?;
-    rec.notifications_sealed = Some(vault.seal(&Value::Array(list)));
+    rec.notifications_sealed =
+        Some(vault.seal_for(&Value::Array(list), &notifications_context(&rec.id)));
     rec.notifications = Vec::new();
     Ok(())
 }
@@ -593,7 +605,7 @@ pub fn open_notifications(rt: &TenantsRuntime, rec: &TenantRecord) -> Result<Vec
         .vault
         .as_ref()
         .ok_or("the tenant's notifications are sealed and this server has no vault key")?;
-    match vault.open(sealed)? {
+    match vault.open_for(sealed, &notifications_context(&rec.id))? {
         Value::Array(list) => Ok(list),
         _ => Err("sealed notifications are not a list".into()),
     }
@@ -751,7 +763,7 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
 
 /// Delete one recorded state key and its markers from the store it lives in.
 async fn delete_state_key(vault: Option<&Vault>, r: &TenantStateRef) -> Result<(), String> {
-    let spec = decode_state_spec(vault, r.spec.as_deref())?;
+    let spec = decode_state_spec(vault, r.spec.as_deref(), &r.tenant)?;
     let store = crate::state::build_state_store(&spec)
         .await
         .map_err(|e| format!("building its state store: {e}"))?;
@@ -776,9 +788,15 @@ async fn delete_state_key(vault: Option<&Vault>, r: &TenantStateRef) -> Result<(
     Ok(())
 }
 
+/// The binding context of a tenant's recorded state-store specs.
+fn state_context(tenant: &str) -> String {
+    format!("state:{tenant}")
+}
+
 fn decode_state_spec(
     vault: Option<&Vault>,
     stored: Option<&str>,
+    tenant: &str,
 ) -> Result<crate::config::StateStoreSpec, String> {
     let Some(stored) = stored else {
         return Err("its state store was not recorded (no vault key when it ran)".into());
@@ -786,7 +804,7 @@ fn decode_state_spec(
     let value = if let Some(sealed) = stored.strip_prefix("sealed:") {
         vault
             .ok_or("its store spec is sealed and this server has no vault key")?
-            .open(sealed)?
+            .open_for(sealed, &state_context(tenant))?
     } else if let Some(plain) = stored.strip_prefix("plain:") {
         serde_json::from_str(plain).map_err(|e| e.to_string())?
     } else {
@@ -798,6 +816,8 @@ fn decode_state_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_VAULT_KEY: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
     fn a_store_error_maps_to_a_serve_error_naming_the_tenant_store() {
@@ -830,7 +850,7 @@ mod tests {
             name: name.into(),
             provider_type: spec["type"].as_str().unwrap_or("static").into(),
             connect_provider: None,
-            sealed: vault.seal(&spec),
+            sealed: vault.seal_for(&spec, &Vault::connection_context(tenant, name)),
             status: ConnectionStatus::Active,
             reauth_reason: None,
             created_at: now,
@@ -842,7 +862,7 @@ mod tests {
     fn state_with_vault() -> (ServerState, Arc<Vault>) {
         let state = crate::serve::test_support::test_state();
         state.set_tenants(TenantsRuntime::new(
-            Some(Vault::new("k", &[]).unwrap()),
+            Some(Vault::new(TEST_VAULT_KEY, &[]).unwrap()),
             Default::default(),
         ));
         let v = state.tenants().vault.clone().unwrap();
@@ -865,7 +885,7 @@ mod tests {
         ));
         t.suspended = false;
         state.history().tenant_upsert(&t).await.unwrap();
-        let v = Vault::new("k", &[]).unwrap();
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
         state
             .history()
             .connection_upsert(&conn(
@@ -901,7 +921,7 @@ mod tests {
         })
         .unwrap();
         state.set_tenants(TenantsRuntime::new(
-            Some(Vault::new("k", &[]).unwrap()),
+            Some(Vault::new(TEST_VAULT_KEY, &[]).unwrap()),
             providers,
         ));
         let v = state.tenants().vault.clone().unwrap();
@@ -1224,37 +1244,47 @@ mod tests {
 
     #[test]
     fn state_specs_decode_or_explain() {
-        let v = Vault::new("k", &[]).unwrap();
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
         let spec = serde_json::json!({"type": "file", "config": {"path": "/tmp/x"}});
-        let sealed = format!("sealed:{}", v.seal(&spec));
+        let sealed = format!("sealed:{}", v.seal_for(&spec, &state_context("t")));
         assert_eq!(
-            decode_state_spec(Some(&v), Some(&sealed)).unwrap().kind,
+            decode_state_spec(Some(&v), Some(&sealed), "t")
+                .unwrap()
+                .kind,
             "file"
         );
         assert!(
-            decode_state_spec(None, Some(&sealed))
+            decode_state_spec(Some(&v), Some(&sealed), "other")
+                .unwrap_err()
+                .contains("another owner")
+        );
+        assert!(
+            decode_state_spec(None, Some(&sealed), "t")
                 .unwrap_err()
                 .contains("no vault key")
         );
         let plain = format!("plain:{spec}");
-        assert_eq!(decode_state_spec(None, Some(&plain)).unwrap().kind, "file");
+        assert_eq!(
+            decode_state_spec(None, Some(&plain), "t").unwrap().kind,
+            "file"
+        );
         assert!(
-            decode_state_spec(None, None)
+            decode_state_spec(None, None, "t")
                 .unwrap_err()
                 .contains("not recorded")
         );
         assert!(
-            decode_state_spec(None, Some("other"))
+            decode_state_spec(None, Some("other"), "t")
                 .unwrap_err()
                 .contains("unrecognized")
         );
         assert!(
-            decode_state_spec(None, Some("plain:{"))
+            decode_state_spec(None, Some("plain:{"), "t")
                 .unwrap_err()
                 .contains("EOF")
         );
         assert!(
-            decode_state_spec(None, Some("plain:{\"x\":1}"))
+            decode_state_spec(None, Some("plain:{\"x\":1}"), "t")
                 .unwrap_err()
                 .contains("stored state spec")
         );

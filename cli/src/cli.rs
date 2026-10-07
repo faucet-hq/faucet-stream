@@ -1992,8 +1992,9 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 86_400)]
     pub approval_expiry_secs: u64,
     /// Key that seals tenant connection credentials at rest (#709,
-    /// AES-256-GCM). Prefer the env var (avoids `ps` leakage). Without it the
-    /// server refuses to store or open tenant connections.
+    /// AES-256-GCM). At least 32 bytes of random key material. Prefer the env
+    /// var (avoids `ps` leakage). Without it the server refuses to store or
+    /// open tenant connections.
     #[arg(long, env = "FAUCET_VAULT_KEY", hide_env_values = true)]
     pub vault_key: Option<String>,
     /// A previous vault key, tried when opening credentials sealed before a
