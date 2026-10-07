@@ -162,7 +162,7 @@ record_ancestors: { event_id: id, event_created: created }
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `timeout` | int (seconds) / null | `30` | Per-request HTTP timeout. |
+| `timeout` | int (seconds) / null | `30` | Per-request HTTP timeout. For a streamed `async_job` result download (JSONL / CSV) it bounds the connect and each idle read instead of the whole body, so a multi-GB export that keeps flowing is never cut off. |
 | `max_retries` | int | `3` | Max retries on transient failures. |
 | `retry_backoff` | int (seconds) | `1` | Base for exponential backoff. Per-attempt sleep is `retry_backoff × 2^attempt`, **capped at 60 s** and scaled by random jitter in `[0.5, 1.5)` (decorrelated across concurrent retries). On `429`, the server's `Retry-After` (delta-seconds **or** an RFC 7231 HTTP-date) is honoured instead; a stated wait over 3600 s fails the run rather than sleeping. |
 | `tolerated_http_errors` | array<int> | `[]` | HTTP status codes treated as an empty page **on the first request only**. Mid-pagination, a tolerated status surfaces as an error instead of silently ending the stream (otherwise a transient failure on page _N_ would drop every later page as a "successful" run). Only safe for genuinely-empty resources. |

@@ -200,7 +200,8 @@ pub struct RestStreamConfig {
         default = "default_timeout"
     )]
     /// Per-request timeout in seconds. Covers one HTTP request, not the whole
-    /// run, so a paginated extract is bounded per page.
+    /// run, so a paginated extract is bounded per page. A streamed `async_job`
+    /// result download is bounded per connect and per idle read instead.
     #[schemars(with = "Option<u64>")]
     pub timeout: Option<Duration>,
     /// Number of retries (after the first attempt) for transient request

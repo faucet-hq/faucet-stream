@@ -32,6 +32,9 @@ use tokio::sync::Mutex as AsyncMutex;
 pub struct RestStream {
     config: RestStreamConfig,
     client: Client,
+    /// Client for streamed result downloads: `timeout` bounds connect and each
+    /// idle read, not the whole body.
+    stream_client: Client,
     /// Shared OAuth2 token cache (only used when `config.auth` is `Auth::OAuth2`).
     token_cache: TokenCache,
     /// Shared token endpoint cache (only used when `config.auth` is `Auth::TokenEndpoint`).
@@ -503,21 +506,30 @@ impl RestStream {
             )));
         }
 
-        let mut builder = Client::builder();
         // Transparently request + decode gzip/brotli/deflate so large JSON APIs
         // (e.g. D365 F&O OData, which compresses ~5-10x) ship compressed bytes
         // instead of raw JSON. reqwest sets the `Accept-Encoding` header and
-        // decompresses the body automatically.
-        builder = builder.gzip(true).brotli(true).deflate(true);
-        if let Some(t) = config.timeout {
-            builder = builder.timeout(t);
-        }
-        // Mutual TLS: attach a client certificate/identity to the shared client
-        // so it is presented on every request — data pages AND any inline auth
-        // token request (both use `self.client`).
+        // decompresses the body automatically. Mutual TLS: the client
+        // certificate is presented on every request — data pages AND any
+        // inline auth token request.
         if let Some(tls) = &config.tls {
             tls.validate()?;
-            builder = apply_client_tls(builder, tls)?;
+        }
+        let new_builder = || -> Result<reqwest::ClientBuilder, FaucetError> {
+            let builder = Client::builder().gzip(true).brotli(true).deflate(true);
+            match &config.tls {
+                Some(tls) => apply_client_tls(builder, tls),
+                None => Ok(builder),
+            }
+        };
+        let mut builder = new_builder()?;
+        // The streaming client bounds connect and each idle read by `timeout`
+        // rather than the whole body, so a multi-GB result download (and sink
+        // back-pressure while consuming it) is not cut at `timeout` (API-24).
+        let mut stream_builder = new_builder()?;
+        if let Some(t) = config.timeout {
+            builder = builder.timeout(t);
+            stream_builder = stream_builder.connect_timeout(t).read_timeout(t);
         }
         // Build the default retry policy from REST's own legacy reliability
         // fields so behavior is unchanged when no policy is injected. The REST
@@ -540,6 +552,7 @@ impl RestStream {
         Ok(Self {
             config,
             client: builder.build()?,
+            stream_client: stream_builder.build()?,
             token_cache: TokenCache::new(),
             token_endpoint_cache: TokenEndpointCache::new(),
             auth_provider: None,
@@ -1780,7 +1793,7 @@ impl RestStream {
             self.roundtrips.get().cloned(),
             || async {
                 let resp = self
-                    .job_request_response_once(op, method, url, headers, query, json)
+                    .job_request_response_once(op, method, url, headers, query, json, false)
                     .await?;
                 let status = resp.status().as_u16();
                 let resp_headers = resp.headers().clone();
@@ -1814,7 +1827,7 @@ impl RestStream {
             self.retry_policy.max_attempts.saturating_sub(1),
             self.retry_policy.base,
             self.roundtrips.get().cloned(),
-            || self.job_request_response_once(op, method, url, headers, query, json),
+            || self.job_request_response_once(op, method, url, headers, query, json, true),
         )
         .await
     }
@@ -1822,6 +1835,7 @@ impl RestStream {
     /// One unretried attempt — the shared request-building core of
     /// [`job_request_bytes`](Self::job_request_bytes) /
     /// [`job_request_response`](Self::job_request_response).
+    #[allow(clippy::too_many_arguments)]
     async fn job_request_response_once(
         &self,
         op: &'static str,
@@ -1830,6 +1844,7 @@ impl RestStream {
         headers: &HashMap<String, String>,
         query: &HashMap<String, String>,
         json: Option<&Value>,
+        streamed: bool,
     ) -> Result<reqwest::Response, FaucetError> {
         let m = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).map_err(|_| {
             FaucetError::Config(format!("async_job: invalid HTTP method '{method}'"))
@@ -1853,7 +1868,12 @@ impl RestStream {
         for (k, v) in headers {
             insert_header(&mut hdrs, k, v)?;
         }
-        let mut req = self.client.request(m, url).headers(hdrs);
+        let client = if streamed {
+            &self.stream_client
+        } else {
+            &self.client
+        };
+        let mut req = client.request(m, url).headers(hdrs);
         if !query.is_empty() {
             let pairs: Vec<(&str, &str)> = query
                 .iter()
