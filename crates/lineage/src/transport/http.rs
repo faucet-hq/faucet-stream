@@ -40,12 +40,12 @@ impl Transport for HttpTransport {
         let resp = req
             .send()
             .await
-            .map_err(|e| FaucetError::Custom(Box::new(e)))?;
+            .map_err(|e| FaucetError::Custom(Box::new(e.without_url())))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(FaucetError::HttpStatus {
                 status: status.as_u16(),
-                url: self.url.clone(),
+                url: faucet_core::util::redact_uri_credentials(&self.url),
                 body: resp.text().await.unwrap_or_default(),
             });
         }
@@ -90,5 +90,28 @@ mod tests {
             .await;
         let t = HttpTransport::new(server.uri(), std::time::Duration::from_secs(5), None).unwrap();
         assert!(t.send(b"{}".to_vec()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn errors_never_carry_url_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let url = server.uri().replace("http://", "http://user:hunter2@");
+        let t = HttpTransport::new(url, std::time::Duration::from_secs(5), None).unwrap();
+        let err = t.send(b"{}".to_vec()).await.unwrap_err().to_string();
+        assert!(err.contains("503"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+
+        let unreachable = HttpTransport::new(
+            "http://user:hunter2@127.0.0.1:1/x".into(),
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        let err = unreachable.send(b"{}".to_vec()).await.unwrap_err();
+        assert!(!format!("{err} {err:?}").contains("hunter2"), "{err:?}");
     }
 }

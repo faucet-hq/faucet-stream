@@ -294,7 +294,7 @@ fn walk_secrets(path: &str, v: &Value, findings: &mut Vec<String>) {
                     && !looks_like_reference(val)
                 {
                     findings.push(format!(
-                        "`{child}` holds a literal value — credentials must be `${{param.NAME}}` / `${{env:NAME}}` / `${{secret:NAME}}`"
+                        "`{child}` holds a literal value — take credentials as a `secret: true` param (`${{param.NAME}}`); `${{env:}}` / `${{secret:}}` only run for faucet-hq or `--trust`ed templates"
                     ));
                 }
                 walk_secrets(&child, x, findings);
@@ -429,7 +429,7 @@ fn walk_url_passwords(path: &str, v: &Value, findings: &mut Vec<String>) {
                 && !pass.contains("${")
             {
                 findings.push(format!(
-                    "`{path}` embeds a literal password in a URL — use `${{param.NAME}}` / `${{env:NAME}}` / `${{secret:NAME}}`"
+                    "`{path}` embeds a literal password in a URL — take it as a `secret: true` param (`${{param.NAME}}`)"
                 ));
             }
         }

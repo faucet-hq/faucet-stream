@@ -8,7 +8,7 @@
 //! racing.
 
 use async_trait::async_trait;
-use faucet_core::{AuthProvider, Credential, FaucetError, FileStateStore, StateStore};
+use faucet_core::{AuthProvider, Credential, FaucetError, StateStore};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -88,18 +88,17 @@ impl OAuth2ClientCredentialsProvider {
     }
 
     async fn fetch(&self) -> Result<TokenResponse, FaucetError> {
-        let resp = self
-            .http
-            .post(&self.token_url)
-            .form(&[
+        let scope = self.scopes.join(" ");
+        let reply = crate::retry::send_token_request(|| {
+            Ok(self.http.post(&self.token_url).form(&[
                 ("grant_type", "client_credentials"),
-                ("client_id", &self.client_id),
-                ("client_secret", &self.client_secret),
-                ("scope", &self.scopes.join(" ")),
-            ])
-            .send()
-            .await?;
-        parse_token_response(resp).await
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("scope", scope.as_str()),
+            ]))
+        })
+        .await?;
+        parse_token_response(reply)
     }
 }
 
@@ -271,15 +270,21 @@ impl OAuth2RefreshProvider {
         }
     }
 
-    /// Persist the current refresh token. A write failure is logged, not
-    /// propagated: the token still works for *this* run, and failing an
-    /// otherwise-successful run over a state-store hiccup is the worse outcome.
-    async fn persist(&self, state: &RefreshState) {
-        let Some(store) = &self.store else { return };
+    /// Persist the current refresh token. A failure is an error: the server
+    /// has already rotated the old token away, so a run that carried on would
+    /// leave the next run holding a revoked token and needing a re-consent.
+    async fn persist(&self, state: &RefreshState) -> Result<(), FaucetError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
         let value = serde_json::json!({ "refresh_token": state.refresh_token, "seed": self.seed });
-        if let Err(e) = store.put(&self.store_key, &value).await {
-            tracing::warn!(error = %e, "oauth2_refresh: could not persist rotated refresh token");
-        }
+        store.put(&self.store_key, &value).await.map_err(|e| {
+            FaucetError::Auth(format!(
+                "oauth2_refresh: could not persist the rotated refresh token ({e}); the \
+                 previous token is already revoked, so stopping rather than leaving the next \
+                 run without a usable token"
+            ))
+        })
     }
 
     /// Refresh using the *current* refresh token and capture rotation in place.
@@ -296,13 +301,18 @@ impl OAuth2RefreshProvider {
         if let Some(scope) = &self.scope {
             form.push(("scope", scope));
         }
-        let resp = self.http.post(&self.token_url).form(&form).send().await?;
-        let body = parse_token_response(resp).await?;
+        let reply =
+            crate::retry::send_token_request(|| Ok(self.http.post(&self.token_url).form(&form)))
+                .await?;
+        let body = parse_token_response(reply)?;
         state.access_token = Some(body.access_token.clone());
         state.expires_at = expiry_instant(body.expires_in, self.expiry_ratio);
         if let Some(rotated) = body.refresh_token {
             state.refresh_token = rotated; // capture rotation centrally
-            self.persist(state).await;
+            if let Err(e) = self.persist(state).await {
+                state.access_token = None;
+                return Err(e);
+            }
         }
         Ok(body.access_token)
     }
@@ -350,7 +360,7 @@ fn parse_persist(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let store: Arc<dyn StateStore> = Arc::new(FileStateStore::new(path));
+    let store: Arc<dyn StateStore> = Arc::new(crate::private_store::PrivateFileStore::new(path));
     Ok(match explicit {
         Some(key) => (Some(store), key, None),
         None => (Some(store), default_key, Some(legacy_key)),
@@ -461,15 +471,15 @@ fn string_array(config: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResponse, FaucetError> {
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
+fn parse_token_response(reply: crate::retry::TokenReply) -> Result<TokenResponse, FaucetError> {
+    if !reply.is_success() {
         return Err(FaucetError::Auth(format!(
-            "OAuth2 token request failed (HTTP {status}): {body}"
+            "OAuth2 token request failed (HTTP {}): {}",
+            reply.status,
+            reply.text()
         )));
     }
-    resp.json::<TokenResponse>().await.map_err(Into::into)
+    serde_json::from_slice(&reply.body).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -720,9 +730,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_store_errors_are_non_fatal() {
-        // A store that fails every read and write must not fail the run: the
-        // provider warns and falls back to the config seed for the fetch.
+    async fn an_idp_503_is_retried_not_fatal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(CountingToken {
+                hits: Arc::new(AtomicUsize::new(0)),
+                token_prefix: "A",
+            })
+            .mount(&server)
+            .await;
+        let p = OAuth2ClientCredentialsProvider::from_config(&serde_json::json!({
+            "token_url": server.uri(), "client_id": "id", "client_secret": "s",
+        }))
+        .unwrap();
+        assert_eq!(
+            p.credential().await.unwrap(),
+            Credential::Bearer("A1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persist_write_failure_fails_the_refresh() {
+        // A failed read degrades to the config seed; a failed write of the
+        // rotated token is an error, so the run never ends holding the only
+        // copy of the live token in memory.
         #[derive(Debug)]
         struct FailingStore;
         #[async_trait]
@@ -755,12 +791,9 @@ mod tests {
         }))
         .unwrap()
         .with_store(store, "k");
-        // Read fails (warned) → falls back to seed; refresh succeeds; write fails
-        // (warned) → still returns a valid credential.
-        assert_eq!(
-            p.credential().await.unwrap(),
-            Credential::Bearer("A1".into())
-        );
+        let err = p.credential().await.unwrap_err().to_string();
+        assert!(err.contains("could not persist"), "{err}");
+        assert!(err.contains("boom-write"), "{err}");
     }
 
     #[test]
@@ -921,7 +954,7 @@ mod tests {
             "oauth2_refresh_{:016x}",
             fnv1a_64(&format!("{}\u{0}same-app", server.uri()))
         );
-        FileStateStore::new(&path)
+        faucet_core::FileStateStore::new(&path)
             .put(
                 &legacy_key,
                 &serde_json::json!({"refresh_token": "legacy-rotated"}),
@@ -951,7 +984,7 @@ mod tests {
             p.credential().await.unwrap(),
             Credential::Bearer("FROM_LEGACY".into())
         );
-        let stored = FileStateStore::new(&path)
+        let stored = faucet_core::FileStateStore::new(&path)
             .get(&legacy_key)
             .await
             .unwrap()

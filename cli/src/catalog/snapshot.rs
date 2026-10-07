@@ -15,7 +15,7 @@
 //!   real per-row effect, and two textually-different files that resolve to the
 //!   same movement show no diff.
 //! - **Secret-safe.** Every secret-sourced value is replaced with a stable
-//!   `<secret:sha256:…>` token before storage (see [`redact_value`]). No secret
+//!   `<secret:hmac:…>` token before storage (see [`redact_value`]). No secret
 //!   material is ever persisted, and a rotated secret surfaces as a changed hash
 //!   ("secret rotated") rather than printing either value.
 
@@ -27,7 +27,7 @@ use crate::serve::history::catalog::{
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -142,7 +142,7 @@ pub async fn record_if_ok(
 }
 
 /// Recursively replace every secret-sourced string in `value` with a stable
-/// `<secret:sha256:…>` token. Non-secret strings pass through verbatim, so real
+/// `<secret:hmac:…>` token. Non-secret strings pass through verbatim, so real
 /// config changes (paths, table names, page sizes) stay visible in the diff.
 pub fn redact_value(value: &Value) -> Value {
     match value {
@@ -159,12 +159,83 @@ pub fn redact_value(value: &Value) -> Value {
     }
 }
 
-/// The stable, non-reversible token a secret value is replaced with. The 12-hex
-/// prefix of sha256 is enough to detect rotation without bloating the snapshot.
+/// The stable, non-reversible token a secret value is replaced with: an
+/// HMAC-SHA256 under the deployment's snapshot key (see [`snapshot_key`]), so
+/// a reader of the catalog store cannot test guesses against it offline. 16
+/// bytes of it detect rotation without bloating the snapshot.
 fn secret_token(secret: &str) -> String {
-    let digest = Sha256::digest(secret.as_bytes());
-    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-    format!("<secret:sha256:{hex}>")
+    use hmac::Mac as _;
+    let mut mac = hmac::Hmac::<Sha256>::new_from_slice(snapshot_key())
+        .expect("HMAC takes a key of any length");
+    mac.update(secret.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("<secret:hmac:{hex}>")
+}
+
+/// The key snapshot tokens are made under: `FAUCET_SNAPSHOT_KEY`, else a
+/// random key kept owner-only in `$XDG_STATE_HOME/faucet/snapshot.key`
+/// (`~/.local/state/…`), created on first use. Instances that share a catalog
+/// store should share `FAUCET_SNAPSHOT_KEY`; with neither available the key
+/// lasts for this process only.
+fn snapshot_key() -> &'static [u8] {
+    static KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        if let Ok(k) = std::env::var("FAUCET_SNAPSHOT_KEY")
+            && !k.is_empty()
+        {
+            return k.into_bytes();
+        }
+        let dir = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/state"))
+            })
+            .map(|d| d.join("faucet"));
+        match dir.map(|d| load_or_create_key(&d.join("snapshot.key"))) {
+            Some(Ok(key)) => key,
+            other => {
+                if let Some(Err(e)) = other {
+                    tracing::warn!(error = %e, "config snapshots: no persistent snapshot key; secret tokens will not compare across processes (set FAUCET_SNAPSHOT_KEY)");
+                }
+                random_key()
+            }
+        }
+    })
+}
+
+fn random_key() -> Vec<u8> {
+    let mut key = uuid::Uuid::new_v4().as_bytes().to_vec();
+    key.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key
+}
+
+fn load_or_create_key(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    if let Ok(existing) = std::fs::read(path)
+        && !existing.is_empty()
+    {
+        return Ok(existing);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let key = random_key();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(mut file) => {
+            file.write_all(&key)?;
+            Ok(key)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::fs::read(path),
+        Err(e) => Err(e),
+    }
 }
 
 // ── Diff ─────────────────────────────────────────────────────────────────────
@@ -335,7 +406,7 @@ fn field_changes(prev: &RowSnapshot, curr: &RowSnapshot) -> Vec<FieldChange> {
 }
 
 fn is_secret_token(s: &str) -> bool {
-    s.starts_with("<secret:sha256:")
+    s.starts_with("<secret:hmac:") || s.starts_with("<secret:sha256:")
 }
 
 /// Serialize a row and flatten every leaf to a `dotted.path -> String` map.
@@ -522,11 +593,32 @@ mod tests {
     }
 
     #[test]
+    fn the_snapshot_key_file_is_created_once_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("faucet/snapshot.key");
+        let first = load_or_create_key(&path).unwrap();
+        assert_eq!(first.len(), 32);
+        assert_eq!(load_or_create_key(&path).unwrap(), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, b"x").unwrap();
+        assert!(load_or_create_key(&blocked.join("k")).is_err());
+        assert!(is_secret_token("<secret:sha256:abc>"));
+        assert_ne!(random_key(), random_key());
+    }
+
+    #[test]
     fn redact_value_replaces_registered_secret_with_stable_token() {
         crate::secrets::registry::register("supersecrettoken");
         let redacted = redact_value(&json!({"auth": "supersecrettoken", "path": "/v1"}));
         let token = redacted["auth"].as_str().unwrap();
-        assert!(token.starts_with("<secret:sha256:"), "{token}");
+        assert!(token.starts_with("<secret:hmac:"), "{token}");
+        assert_eq!(token.len(), "<secret:hmac:>".len() + 32);
         assert_eq!(redacted["path"], json!("/v1"));
         // Stable: same value → same token.
         let again = redact_value(&json!("supersecrettoken"));

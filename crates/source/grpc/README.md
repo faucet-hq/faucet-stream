@@ -87,7 +87,9 @@ faucet run pipeline.yaml
 | `descriptor_set_path` | path | — *(required)* | Path to the compiled `FileDescriptorSet` `.bin` file. |
 | `request` | object | `{}` | Request message as JSON; fields are mapped onto the protobuf request message via the descriptor. Unknown fields fail encoding. |
 | `records_path` | string | *(unset)* | JSONPath extracting records from each response (e.g. `$.users[*]`). When unset, the whole response is returned as a single record. For server-streaming it is applied to **each** message individually. |
-| `tls` | bool | *(auto)* | Force TLS on/off. When unset, auto-detected from an `https://` endpoint. |
+| `tls` | bool | *(auto)* | Force TLS on/off. When unset, auto-detected from an `https://` endpoint. The server certificate is verified against the operating system's trust store and the bundled Mozilla roots. |
+| `ca_cert` | path | *(none)* | PEM file with an extra CA certificate to trust, for a server signed by a private CA. |
+| `domain_name` | string | *(endpoint host)* | Host name the server certificate is verified against, when it differs from the endpoint's host (connecting by IP or through a tunnel). |
 
 ### Auth
 

@@ -996,7 +996,11 @@ pub async fn preview_records(
                 crate::preview_sample::PREVIEW_TIMEOUT,
             )
             .await?;
-            out.push((id.clone(), sample.records));
+            #[cfg(feature = "masking")]
+            let records = crate::preview_sample::mask(sample.records, spec.masking.as_ref())?;
+            #[cfg(not(feature = "masking"))]
+            let records = sample.records;
+            out.push((id.clone(), records));
         }
     }
     if out.is_empty() {

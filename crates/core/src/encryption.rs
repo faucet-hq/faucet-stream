@@ -21,6 +21,10 @@
 //! - The nonce is random per encryption (never reused across writes).
 //! - The GCM tag authenticates the payload: any tampering — a flipped bit,
 //!   truncation, a swapped nonce — fails decryption loudly.
+//! - `format` byte `0x02` (v2) is AES-256-GCM with the payload's identity —
+//!   for a state file, its key — bound in as associated data
+//!   ([`CompiledEncryption::encrypt_bound`]), so a sealed file copied over
+//!   another key's file fails to decrypt. v1 payloads stay readable.
 //!
 //! ## Keys
 //!
@@ -36,7 +40,7 @@
 //! re-sealed with the new key on their next write.
 
 use crate::error::FaucetError;
-use aes_gcm::aead::{Aead, AeadCore, Generate, KeyInit};
+use aes_gcm::aead::{Aead, AeadCore, Generate, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 
 /// The AES-256-GCM nonce array type (12 bytes).
@@ -49,6 +53,10 @@ use sha2::{Digest, Sha256};
 pub const MAGIC: &[u8; 4] = b"FCT1";
 /// Format byte for AES-256-GCM.
 const FORMAT_AES256GCM: u8 = 0x01;
+/// AES-256-GCM with the payload's identity bound in as associated data (v2).
+const FORMAT_AES256GCM_BOUND: u8 = 0x02;
+/// Prefix of a v2 payload's associated data, ahead of its context.
+const BOUND_AAD_PREFIX: &[u8] = b"faucet:FCT1:v2\0";
 /// AES-GCM nonce length in bytes.
 const NONCE_LEN: usize = 12;
 /// Header length: magic + format byte + nonce.
@@ -72,7 +80,7 @@ pub enum EncryptionAlgorithm {
 ///   # previous_keys: ["${env:OLD_STATE_KEY}"]   # rotation: read-only
 ///   # algorithm: aes-256-gcm                     # default
 /// ```
-#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EncryptionSpec {
     /// Key material used to seal new writes (and tried first on reads).
@@ -86,6 +94,19 @@ pub struct EncryptionSpec {
     /// AEAD algorithm. Only `aes-256-gcm` today.
     #[serde(default)]
     pub algorithm: EncryptionAlgorithm,
+}
+
+/// Serializes the algorithm only: key material never leaves the process in a
+/// serialized config (it would land in snapshots, previews or logs). A
+/// serialized spec therefore does not deserialize back — a loud failure,
+/// rather than data sealed under a placeholder key.
+impl Serialize for EncryptionSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut st = serializer.serialize_struct("EncryptionSpec", 1)?;
+        st.serialize_field("algorithm", &self.algorithm)?;
+        st.end()
+    }
 }
 
 impl std::fmt::Debug for EncryptionSpec {
@@ -154,16 +175,34 @@ impl CompiledEncryption {
 
     /// Seal `plaintext` with the current key under a fresh random nonce.
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+        self.seal(plaintext, FORMAT_AES256GCM, &[])
+    }
+
+    /// [`encrypt`](Self::encrypt), binding `context` (the identity of what is
+    /// sealed — a state key, say) as associated data: the payload opens only
+    /// through [`decrypt_bound`](Self::decrypt_bound) with the same context,
+    /// so a sealed file copied over another key's file no longer decrypts.
+    pub fn encrypt_bound(&self, plaintext: &[u8], context: &[u8]) -> Vec<u8> {
+        self.seal(plaintext, FORMAT_AES256GCM_BOUND, &bound_aad(context))
+    }
+
+    fn seal(&self, plaintext: &[u8], format: u8, aad: &[u8]) -> Vec<u8> {
         let nonce = GcmNonce::generate();
         let ciphertext = self
             .write
-            .encrypt(&nonce, plaintext)
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             // AES-GCM encryption only fails on plaintexts beyond 2^36 bytes;
             // faucet payloads (bookmarks, JSON lines) are nowhere near it.
             .expect("AES-GCM encryption of an in-memory payload cannot fail");
         let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
         out.extend_from_slice(MAGIC);
-        out.push(FORMAT_AES256GCM);
+        out.push(format);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
         out
@@ -171,8 +210,19 @@ impl CompiledEncryption {
 
     /// Open a sealed payload, trying the current key and then each previous
     /// key. Every failure is a typed error — a wrong key or tampered file
-    /// must never be silently treated as "no data".
+    /// must never be silently treated as "no data". A context-bound payload
+    /// needs [`decrypt_bound`](Self::decrypt_bound).
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, FaucetError> {
+        self.open(data, None)
+    }
+
+    /// Open a payload sealed by [`encrypt_bound`](Self::encrypt_bound) under
+    /// `context`, or a legacy unbound one.
+    pub fn decrypt_bound(&self, data: &[u8], context: &[u8]) -> Result<Vec<u8>, FaucetError> {
+        self.open(data, Some(context))
+    }
+
+    fn open(&self, data: &[u8], context: Option<&[u8]>) -> Result<Vec<u8>, FaucetError> {
         if !is_encrypted(data) {
             return Err(FaucetError::State(
                 "payload is not faucet-encrypted (missing FCT1 header)".into(),
@@ -184,28 +234,49 @@ impl CompiledEncryption {
             ));
         }
         let format = data[MAGIC.len()];
-        if format != FORMAT_AES256GCM {
-            return Err(FaucetError::State(format!(
-                "unknown encrypted-payload format byte 0x{format:02x} — written by a newer \
-                 faucet version?"
-            )));
-        }
+        let aad = match (format, context) {
+            (FORMAT_AES256GCM, _) => Vec::new(),
+            (FORMAT_AES256GCM_BOUND, Some(context)) => bound_aad(context),
+            (FORMAT_AES256GCM_BOUND, None) => {
+                return Err(FaucetError::State(
+                    "encrypted payload is bound to its identity and must be opened with it".into(),
+                ));
+            }
+            _ => {
+                return Err(FaucetError::State(format!(
+                    "unknown encrypted-payload format byte 0x{format:02x} — written by a newer \
+                     faucet version?"
+                )));
+            }
+        };
         let nonce_bytes: [u8; NONCE_LEN] = data[MAGIC.len() + 1..HEADER_LEN]
             .try_into()
             .expect("slice length checked above");
         let nonce = GcmNonce::from(nonce_bytes);
         let ciphertext = &data[HEADER_LEN..];
         for cipher in &self.read {
-            if let Ok(plaintext) = cipher.decrypt(&nonce, ciphertext) {
+            if let Ok(plaintext) = cipher.decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            ) {
                 return Ok(plaintext);
             }
         }
         Err(FaucetError::State(
-            "decryption failed — wrong or rotated key? (tried the configured key and every \
-             previous_keys entry)"
+            "decryption failed — wrong or rotated key, or a payload sealed for another \
+             identity? (tried the configured key and every previous_keys entry)"
                 .into(),
         ))
     }
+}
+
+fn bound_aad(context: &[u8]) -> Vec<u8> {
+    let mut aad = BOUND_AAD_PREFIX.to_vec();
+    aad.extend_from_slice(context);
+    aad
 }
 
 #[cfg(test)]
@@ -219,6 +290,42 @@ mod tests {
             previous_keys: vec![],
             algorithm: EncryptionAlgorithm::default(),
         }
+    }
+
+    #[test]
+    fn bound_payloads_open_only_under_their_context() {
+        let enc = CompiledEncryption::compile(&spec("k1")).unwrap();
+        let sealed = enc.encrypt_bound(b"bookmark", b"pipeline::a");
+        assert_eq!(sealed[MAGIC.len()], FORMAT_AES256GCM_BOUND);
+        assert_eq!(
+            enc.decrypt_bound(&sealed, b"pipeline::a").unwrap(),
+            b"bookmark"
+        );
+        let err = enc
+            .decrypt_bound(&sealed, b"pipeline::b")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another"), "{err}");
+        let err = enc.decrypt(&sealed).unwrap_err().to_string();
+        assert!(err.contains("bound to its identity"), "{err}");
+        // A v1 payload still opens through the bound reader.
+        let legacy = enc.encrypt(b"old");
+        assert_eq!(enc.decrypt_bound(&legacy, b"pipeline::a").unwrap(), b"old");
+        let mut unknown = legacy.clone();
+        unknown[MAGIC.len()] = 0x7f;
+        assert!(enc.decrypt_bound(&unknown, b"x").is_err());
+    }
+
+    #[test]
+    fn serialization_never_carries_key_material() {
+        let s = EncryptionSpec {
+            key: "top-secret-key".into(),
+            previous_keys: vec!["old-secret-key".into()],
+            algorithm: EncryptionAlgorithm::default(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v, json!({ "algorithm": "aes-256-gcm" }));
+        assert!(serde_json::from_value::<EncryptionSpec>(v).is_err());
     }
 
     #[test]

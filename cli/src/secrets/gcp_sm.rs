@@ -21,7 +21,7 @@ pub struct GcpSmResolver {
 impl GcpSmResolver {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
             creds: OnceCell::new(),
         }
     }
@@ -67,6 +67,7 @@ impl SecretResolver for GcpSmResolver {
     }
 
     async fn resolve(&self, reference: &str) -> CliResult<String> {
+        super::reject_field("gcp-sm", reference)?;
         let token = self.token().await?;
         let url = format!("https://secretmanager.googleapis.com/v1/{reference}:access");
         let resp = self

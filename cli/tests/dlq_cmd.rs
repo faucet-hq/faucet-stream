@@ -39,6 +39,7 @@ fn inspect_args(location: &Path, reason: Option<&str>, json: bool) -> DlqArgs {
     DlqArgs {
         command: DlqCommand::Inspect(DlqInspectArgs {
             encryption_key: vec![],
+            encryption_key_file: vec![],
             location: location.to_string_lossy().into_owned(),
             reason: reason.map(str::to_owned),
             limit: 5,
@@ -79,6 +80,7 @@ async fn discard_human_and_json_render() {
     let archive = DlqArgs {
         command: DlqCommand::Discard(DlqDiscardArgs {
             encryption_key: vec![],
+            encryption_key_file: vec![],
             location: dlq.to_string_lossy().into_owned(),
             reason: Some("quality".into()),
             before: Some("1s".into()),
@@ -90,6 +92,7 @@ async fn discard_human_and_json_render() {
     let delete = DlqArgs {
         command: DlqCommand::Discard(DlqDiscardArgs {
             encryption_key: vec![],
+            encryption_key_file: vec![],
             location: dlq.to_string_lossy().into_owned(),
             reason: None,
             before: None,
@@ -102,6 +105,7 @@ async fn discard_human_and_json_render() {
     let bad = DlqArgs {
         command: DlqCommand::Discard(DlqDiscardArgs {
             encryption_key: vec![],
+            encryption_key_file: vec![],
             location: dlq.to_string_lossy().into_owned(),
             reason: None,
             before: Some("soon".into()),
@@ -116,6 +120,7 @@ fn replay_args(config: PathBuf, from: &Path, dry_run: bool, json: bool) -> DlqAr
     DlqArgs {
         command: DlqCommand::Replay(DlqReplayArgs {
             encryption_key: vec![],
+            encryption_key_file: vec![],
             config: Some(config),
             from: from.to_string_lossy().into_owned(),
             reason: None,

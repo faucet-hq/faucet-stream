@@ -152,6 +152,7 @@ impl SecretResolver for AzureKvResolver {
     }
 
     async fn resolve(&self, reference: &str) -> CliResult<String> {
+        super::reject_field("azure-kv", reference)?;
         // reference = "<vault>/<secret>[/<version>]"
         let mut parts = reference.splitn(3, '/');
 

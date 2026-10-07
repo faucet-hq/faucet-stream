@@ -4745,6 +4745,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "wiremock",
 ]
 
@@ -6416,6 +6417,7 @@ dependencies = [
  "prost-reflect 0.15.3",
  "prost-types 0.13.5",
  "protoc-bin-vendored",
+ "rustls 0.23.40",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -15800,6 +15802,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
+ "rustls-native-certs 0.8.3",
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -15808,6 +15811,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

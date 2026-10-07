@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// PEM values may be inline or pulled in with `${file:…}` / `${secret:…}` /
 /// `${vault:…}`; the PKCS#12 value is a path to a `.p12`/`.pfx` file (its binary
 /// content can't be embedded in a text config).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
 pub struct TlsClientConfig {
     /// PEM-encoded client certificate chain. Pair with `client_key`.
     pub client_cert: Option<String>,
@@ -30,6 +30,19 @@ pub struct TlsClientConfig {
     /// Minimum negotiated TLS version: `"1.2"` or `"1.3"`. Defaults to the
     /// TLS backend's own minimum when unset.
     pub min_version: Option<String>,
+}
+
+impl std::fmt::Debug for TlsClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secret = |v: &Option<String>| v.as_ref().map(|_| "***");
+        f.debug_struct("TlsClientConfig")
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &secret(&self.client_key))
+            .field("client_identity_pkcs12", &self.client_identity_pkcs12)
+            .field("pkcs12_password", &secret(&self.pkcs12_password))
+            .field("min_version", &self.min_version)
+            .finish()
+    }
 }
 
 impl TlsClientConfig {
@@ -73,6 +86,23 @@ impl TlsClientConfig {
 #[cfg(test)]
 mod tests {
     use super::TlsClientConfig;
+
+    #[test]
+    fn debug_never_prints_key_material() {
+        let cfg = TlsClientConfig {
+            client_cert: Some("CERT".into()),
+            client_key: Some("PRIVATE-KEY-PEM".into()),
+            client_identity_pkcs12: None,
+            pkcs12_password: Some("p12-pass".into()),
+            min_version: None,
+        };
+        let text = format!("{cfg:?}");
+        assert!(
+            !text.contains("PRIVATE-KEY-PEM") && !text.contains("p12-pass"),
+            "{text}"
+        );
+        assert!(text.contains("CERT") && text.contains("***"), "{text}");
+    }
 
     fn pem() -> TlsClientConfig {
         TlsClientConfig {

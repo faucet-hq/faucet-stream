@@ -280,7 +280,7 @@ params:
 |---|---|---|
 | `type` | `string` | `string` · `int` · `float` · `bool` |
 | `required` | `false` | The caller must supply a value. Mutually exclusive with `default`. |
-| `default` | — | Value when none is supplied. An ordinary config scalar, so `default: "${env:SINCE}"` resolves. |
+| `default` | — | Value when none is supplied. An ordinary config scalar, so `default: "${env:SINCE}"` resolves. On a typed param it may be text that resolves to the type (`type: int, default: "${env:PORT}"`). |
 | `secret` | `false` | Registered for redaction the instant it is bound — never reaches a log, error, API response, audit record, or the template registry. |
 | `description` | — | Surfaced by `faucet template list`/`show`, `GET /v1/templates`, and the MCP `get_template` tool. |
 | `computed` | — | A **derived** value (see below). Mutually exclusive with `required`, `default`, and `secret`; excluded from the trigger surface. |

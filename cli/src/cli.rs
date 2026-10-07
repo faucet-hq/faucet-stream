@@ -659,7 +659,7 @@ pub struct TemplateTestArgs {
     /// Registry store URL. Omit when the suite's `template:` is a path to a
     /// config file — that form needs no registry, which is what lets a
     /// template be tested before it is ever registered.
-    #[arg(long, env = "FAUCET_TEMPLATE_STORE")]
+    #[arg(long, env = "FAUCET_TEMPLATE_STORE", hide_env_values = true)]
     pub store: Option<String>,
     /// Override the suite's `select:` version selector.
     #[arg(long)]
@@ -688,7 +688,7 @@ pub struct TemplateStoreArgs {
     /// `faucet serve --history` at the same URL to trigger these templates over
     /// HTTP. SQL backends need the matching `serve-history-sqlite` /
     /// `serve-history-postgres` build feature.
-    #[arg(long, env = "FAUCET_TEMPLATE_STORE")]
+    #[arg(long, env = "FAUCET_TEMPLATE_STORE", hide_env_values = true)]
     pub store: String,
     /// Path to a `.env` file to load for `${env:VAR}` interpolation.
     /// Defaults to `.env` in cwd if present.
@@ -1104,6 +1104,12 @@ pub struct HubPairArgs {
     /// Hub for `--overlay` only; overrides `--hub` for it.
     #[arg(long)]
     pub overlay_hub: Option<String>,
+    /// Trust hub templates from this owner (or this exact template id) to
+    /// read the environment, files and secrets on this machine. Templates
+    /// outside `faucet-hq` are refused when they do, unless trusted;
+    /// `--trust '*'` trusts every one. Repeatable.
+    #[arg(long = "trust", value_name = "OWNER|ID")]
+    pub trust: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -1240,9 +1246,18 @@ pub struct DlqInspectArgs {
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
-    /// with the `encryption` feature.
-    #[arg(long = "encryption-key")]
+    /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
+    /// `--encryption-key-file`: an argv value is visible in `ps` and history.
+    #[arg(
+        long = "encryption-key",
+        env = "FAUCET_DLQ_ENCRYPTION_KEY",
+        hide_env_values = true
+    )]
     pub encryption_key: Vec<String>,
+    /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
+    /// after any `--encryption-key`.
+    #[arg(long = "encryption-key-file")]
+    pub encryption_key_file: Vec<std::path::PathBuf>,
     /// Emit a machine-readable JSON summary instead of the human report.
     #[arg(long)]
     pub json: bool,
@@ -1273,9 +1288,18 @@ pub struct DlqReplayArgs {
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
-    /// with the `encryption` feature.
-    #[arg(long = "encryption-key")]
+    /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
+    /// `--encryption-key-file`: an argv value is visible in `ps` and history.
+    #[arg(
+        long = "encryption-key",
+        env = "FAUCET_DLQ_ENCRYPTION_KEY",
+        hide_env_values = true
+    )]
     pub encryption_key: Vec<String>,
+    /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
+    /// after any `--encryption-key`.
+    #[arg(long = "encryption-key-file")]
+    pub encryption_key_file: Vec<std::path::PathBuf>,
     /// (Replay picks up the config's own dlq `encryption` block automatically
     /// when no key is passed.)
     /// Emit a machine-readable JSON result instead of the human summary.
@@ -1627,9 +1651,18 @@ pub struct DlqDiscardArgs {
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
-    /// with the `encryption` feature.
-    #[arg(long = "encryption-key")]
+    /// with the `encryption` feature. Prefer `FAUCET_DLQ_ENCRYPTION_KEY` or
+    /// `--encryption-key-file`: an argv value is visible in `ps` and history.
+    #[arg(
+        long = "encryption-key",
+        env = "FAUCET_DLQ_ENCRYPTION_KEY",
+        hide_env_values = true
+    )]
     pub encryption_key: Vec<String>,
+    /// File holding a DLQ key (trailing whitespace trimmed); repeatable, tried
+    /// after any `--encryption-key`.
+    #[arg(long = "encryption-key-file")]
+    pub encryption_key_file: Vec<std::path::PathBuf>,
     /// Emit a machine-readable JSON result instead of the human summary.
     #[arg(long)]
     pub json: bool,
@@ -1669,6 +1702,15 @@ pub struct DoctorArgs {
     /// a labelled column may reach. Violations are reported and refuse a run.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<PathBuf>,
+    /// Supply a declared param: `--param tenant_id=acme`. Repeatable. With
+    /// `--offline` an unsupplied required param gets a placeholder.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub param: Vec<String>,
+    /// Override an environment variable for this check only:
+    /// `--param-env REGION=eu`, or bare `--param-env TOKEN` to take it from the
+    /// caller's environment. Repeatable.
+    #[arg(long = "param-env", value_name = "NAME[=VALUE]")]
+    pub param_env: Vec<String>,
 }
 
 /// `faucet contract` arguments.
@@ -1789,7 +1831,12 @@ pub struct ServeArgs {
     #[arg(long, env = "FAUCET_SERVE_LISTEN", default_value = "127.0.0.1:8080")]
     pub listen: String,
     /// Bearer token required on /v1/* requests. Prefer the env var (avoids `ps` leakage).
-    #[arg(long, env = "FAUCET_SERVE_AUTH_TOKEN", conflicts_with = "no_auth")]
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_AUTH_TOKEN",
+        hide_env_values = true,
+        conflicts_with = "no_auth"
+    )]
     pub auth_token: Option<String>,
     /// Explicitly disable authentication. Required if no token is set, so an
     /// unauthenticated server is never accidental.
@@ -1810,6 +1857,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "FAUCET_SERVE_READ_TOKEN",
+        hide_env_values = true,
         conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
     )]
     pub read_token: Option<String>,
@@ -1819,6 +1867,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "FAUCET_SERVE_WRITE_TOKEN",
+        hide_env_values = true,
         conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
     )]
     pub write_token: Option<String>,
@@ -1828,6 +1877,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "FAUCET_SERVE_ADMIN_TOKEN",
+        hide_env_values = true,
         conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
     )]
     pub admin_token: Option<String>,
@@ -2052,7 +2102,7 @@ pub struct McpArgs {
     /// `get_template` tools (plus `register_template` / `run_template` with
     /// `--allow-mutations`). Omitted = no template tools are advertised.
     #[cfg(feature = "templates")]
-    #[arg(long, env = "FAUCET_TEMPLATE_STORE")]
+    #[arg(long, env = "FAUCET_TEMPLATE_STORE", hide_env_values = true)]
     pub template_store: Option<String>,
 }
 
@@ -2205,6 +2255,12 @@ pub struct RunArgs {
     /// Hub for `--overlay` only; overrides `--hub` for it.
     #[arg(long)]
     pub overlay_hub: Option<String>,
+    /// Trust hub templates from this owner (or this exact template id) to
+    /// read the environment, files and secrets on this machine. Templates
+    /// outside `faucet-hq` are refused when they do, unless trusted;
+    /// `--trust '*'` trusts every one. Repeatable.
+    #[arg(long = "trust", value_name = "OWNER|ID")]
+    pub trust: Vec<String>,
 }
 
 /// Format for `faucet run`'s end-of-run summary.
@@ -2475,6 +2531,12 @@ pub struct ValidateArgs {
     /// Hub for `--overlay` only; overrides `--hub` for it.
     #[arg(long)]
     pub overlay_hub: Option<String>,
+    /// Trust hub templates from this owner (or this exact template id) to
+    /// read the environment, files and secrets on this machine. Templates
+    /// outside `faucet-hq` are refused when they do, unless trusted;
+    /// `--trust '*'` trusts every one. Repeatable.
+    #[arg(long = "trust", value_name = "OWNER|ID")]
+    pub trust: Vec<String>,
 }
 
 /// `faucet schema` arguments.
@@ -2718,6 +2780,20 @@ pub struct PlanArgs {
     /// a labelled column may reach. Violations are reported and refuse a run.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<PathBuf>,
+    /// Load a dotenv file before reading the config (default: `./.env` if present).
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip loading any dotenv file.
+    #[arg(long)]
+    pub no_env_file: bool,
+    /// Supply a declared param: `--param tenant_id=acme`. Repeatable. Without
+    /// `--live`, an unsupplied required param gets a placeholder.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub param: Vec<String>,
+    /// Override an environment variable for this plan only:
+    /// `--param-env REGION=eu`, or bare `--param-env TOKEN`. Repeatable.
+    #[arg(long = "param-env", value_name = "NAME[=VALUE]")]
+    pub param_env: Vec<String>,
 }
 
 /// `faucet dev` arguments.

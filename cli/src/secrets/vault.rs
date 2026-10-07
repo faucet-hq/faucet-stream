@@ -30,7 +30,7 @@ impl VaultResolver {
             addr: addr.trim_end_matches('/').to_owned(),
             token,
             namespace: std::env::var("VAULT_NAMESPACE").ok(),
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         })
     }
 }
@@ -126,7 +126,7 @@ mod tests {
             addr: server.uri(),
             token: "test-token".into(),
             namespace: None,
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         };
         let v = resolver.resolve("secret/data/app#token").await.unwrap();
         assert_eq!(v, "s3cr3t-value");
@@ -144,7 +144,7 @@ mod tests {
             addr: server.uri(),
             token: "t".into(),
             namespace: None,
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         };
         match resolver.resolve("secret/data/nope#x").await.unwrap_err() {
             CliError::SecretNotFound { .. } => {}
@@ -158,7 +158,7 @@ mod tests {
             addr: "http://x".into(),
             token: "t".into(),
             namespace: None,
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         };
         assert_eq!(r.scheme(), "vault");
     }
@@ -175,7 +175,7 @@ mod tests {
             addr: server.uri(),
             token: "bad".into(),
             namespace: None,
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         };
         match resolver.resolve("secret/data/secured#x").await.unwrap_err() {
             CliError::SecretAuthFailed { scheme, .. } => assert_eq!(scheme, "vault"),
@@ -195,7 +195,7 @@ mod tests {
             addr: server.uri(),
             token: "bad".into(),
             namespace: None,
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         };
         match resolver.resolve("secret/data/secured").await.unwrap_err() {
             CliError::SecretAuthFailed { .. } => {}
@@ -217,7 +217,7 @@ mod tests {
             addr: server.uri(),
             token: "t".into(),
             namespace: None,
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         };
         // No `#field` → the whole `.data.data` map, JSON-serialized.
         let v = resolver.resolve("secret/data/all").await.unwrap();
@@ -241,7 +241,7 @@ mod tests {
             addr: server.uri(),
             token: "t".into(),
             namespace: Some("team-a".into()),
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         };
         // The mock only matches when the namespace header is present.
         let v = resolver.resolve("secret/data/ns#k").await.unwrap();
@@ -320,7 +320,7 @@ mod tests {
             addr: server.uri(),
             token: "t".into(),
             namespace: None,
-            client: reqwest::Client::new(),
+            client: crate::secrets::secret_http_client(),
         };
         // No `#field`: the missing `.data.data` must surface as SecretNotFound,
         // never Ok("null").

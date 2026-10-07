@@ -82,7 +82,23 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
 
     let t_cfg = Instant::now();
     #[cfg_attr(not(feature = "policy"), allow(unused_mut))]
-    let mut cfg = PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
+    let inputs = crate::config::RunInputs {
+        params: crate::params::collect_cli_params(&args.param)?,
+        env: crate::params::collect_env_overrides(&args.param_env)?
+            .into_iter()
+            .collect(),
+        mode: if args.offline && args.param.is_empty() {
+            crate::params::BindMode::Placeholder
+        } else {
+            crate::params::BindMode::Strict
+        },
+    };
+    // `--offline` is credential-free: secret directives stay unresolved.
+    let mut cfg = if args.offline {
+        PipelineConfig::from_path_tolerating_secrets_with(&path, args.profile.as_deref(), &inputs)?
+    } else {
+        PipelineConfig::from_path_async_with(&path, args.profile.as_deref(), &inputs).await?
+    };
     #[cfg(feature = "policy")]
     crate::policy::apply_to_config(&mut cfg, args.policy.as_deref())?;
     #[cfg(not(feature = "policy"))]
@@ -1032,7 +1048,35 @@ pipeline:
             offline: true,
             profile: None,
             policy: None,
+            param: vec![],
+            param_env: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn offline_never_resolves_secrets_and_tolerates_required_params() {
+        // Without credentials an attempted vault fetch fails; offline must not try.
+        let (_d, path) = write_cfg(
+            "version: 1\nparams: { base: { required: true } }\npipeline:\n  source: { type: rest, config: { base_url: \"${param.base}\", auth: { type: bearer, config: { token: \"${vault:secret/x#t}\" } } } }\n  sink: { type: jsonl, config: { path: o } }\n",
+        );
+        super::run(offline_args(path.clone()))
+            .await
+            .expect("offline lint ok");
+        let mut args = offline_args(path);
+        args.param = vec!["base=https://api".into()];
+        args.param_env = vec!["X=1".into()];
+        super::run(args).await.expect("offline lint ok with params");
+    }
+
+    #[tokio::test]
+    async fn online_doctor_requires_required_params() {
+        let (_d, path) = write_cfg(
+            "version: 1\nparams: { base: { required: true } }\npipeline:\n  source: { type: rest, config: { base_url: \"${param.base}\" } }\n  sink: { type: jsonl, config: { path: o } }\n",
+        );
+        let mut args = offline_args(path);
+        args.offline = false;
+        let err = super::run(args).await.unwrap_err().to_string();
+        assert!(err.contains("base"), "{err}");
     }
 
     #[tokio::test]

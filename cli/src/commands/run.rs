@@ -88,13 +88,14 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
     };
 
     let cfg = if let Some((source, sink)) = hub_pair {
-        let sides = crate::hub::resolve_sides(
+        let mut sides = crate::hub::resolve_sides(
             &args.hub,
             args.source_hub.as_deref(),
             args.sink_hub.as_deref(),
             args.overlay_hub.as_deref(),
         )
         .await?;
+        sides.trusted = args.trust.clone();
         let composition =
             crate::hub::compose_across(&source, &sink, args.overlay.as_deref(), &sides).await?;
         tracing::info!(

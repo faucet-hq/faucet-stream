@@ -379,16 +379,110 @@ pub fn build_pipeline_config(env: &HashMap<String, String>) -> CliResult<Pipelin
     })
 }
 
-/// Snapshot `std::env::vars()` and call [`build_pipeline_config`].
+/// Snapshot the process environment and call [`build_pipeline_config`].
+/// Variables that are not UTF-8 are skipped (a `FAUCET_*` one is an error),
+/// and secret-looking `FAUCET_*` values are registered for log redaction.
 pub fn from_process_env() -> CliResult<PipelineConfig> {
-    let env: HashMap<String, String> = std::env::vars().collect();
+    let env = utf8_env(std::env::vars_os())?;
+    register_secret_values(&env);
     build_pipeline_config(&env)
+}
+
+fn utf8_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> CliResult<HashMap<String, String>> {
+    let mut env = HashMap::new();
+    for (k, v) in vars {
+        match (k.into_string(), v.into_string()) {
+            (Ok(k), Ok(v)) => {
+                env.insert(k, v);
+            }
+            (Ok(k), Err(_)) if k.starts_with("FAUCET_") => {
+                return Err(CliError::Config(format!(
+                    "environment variable {k} is not valid UTF-8"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(env)
+}
+
+/// Words that mark a `FAUCET_*` variable as holding a credential.
+const SECRET_NAME_PARTS: &[&str] = &[
+    "PASSWORD",
+    "PASSWD",
+    "SECRET",
+    "TOKEN",
+    "KEY",
+    "CREDENTIAL",
+    "AUTH",
+    "PRIVATE",
+    "CONNECTION_STRING",
+    "DSN",
+];
+
+fn register_secret_values(env: &HashMap<String, String>) {
+    for (k, v) in env {
+        if !k.starts_with("FAUCET_") {
+            continue;
+        }
+        let url_with_userinfo = k.contains("URL")
+            && v.split_once("://")
+                .is_some_and(|(_, rest)| rest.split(['/', '?']).next().unwrap_or("").contains('@'));
+        if url_with_userinfo || SECRET_NAME_PARTS.iter().any(|p| k.contains(p)) {
+            crate::secrets::registry::register(v);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_variables_are_skipped_unless_they_are_faucet_ones() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bad = || std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let env = utf8_env([
+            ("OTHER".into(), bad()),
+            ("FAUCET_SOURCE".into(), "csv".into()),
+        ])
+        .unwrap();
+        assert_eq!(env.get("FAUCET_SOURCE").map(String::as_str), Some("csv"));
+        assert!(!env.contains_key("OTHER"));
+        let err = utf8_env([("FAUCET_SINK".into(), bad())])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FAUCET_SINK"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn secret_looking_faucet_values_are_registered() {
+        let env: HashMap<String, String> = [
+            ("FAUCET_SOURCE_PG_PASSWORD", "pg-pass-4417"),
+            ("FAUCET_SOURCE_PG_TABLE", "orders-table-4417"),
+            ("FAUCET_SINK_PG_DATABASE_URL", "postgres://u:p@db-4417/x"),
+            (
+                "FAUCET_SOURCE_REST_BASE_URL",
+                "https://api-4417.example.com",
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        register_secret_values(&env);
+        let out = crate::secrets::registry::redact(
+            "pg-pass-4417 orders-table-4417 postgres://u:p@db-4417/x https://api-4417.example.com",
+        );
+        assert_eq!(
+            out,
+            "*** orders-table-4417 *** https://api-4417.example.com"
+        );
+    }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

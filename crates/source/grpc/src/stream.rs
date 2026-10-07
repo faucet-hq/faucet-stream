@@ -363,6 +363,22 @@ impl GrpcStream {
         Ok((method.output(), request_bytes))
     }
 
+    /// The TLS client config: system + bundled roots, an optional extra CA,
+    /// and an optional verification host name.
+    async fn client_tls_config(&self) -> Result<tonic::transport::ClientTlsConfig, FaucetError> {
+        let mut tls = tonic::transport::ClientTlsConfig::new().with_enabled_roots();
+        if let Some(path) = &self.config.ca_cert {
+            let pem = tokio::fs::read(path).await.map_err(|e| {
+                FaucetError::Config(format!("cannot read ca_cert '{}': {e}", path.display()))
+            })?;
+            tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
+        }
+        if let Some(name) = &self.config.domain_name {
+            tls = tls.domain_name(name.clone());
+        }
+        Ok(tls)
+    }
+
     /// Connect a tonic `Channel`, honouring the configured TLS mode.
     async fn connect_channel(&self, endpoint: &str) -> Result<Channel, FaucetError> {
         let use_tls = self
@@ -378,7 +394,7 @@ impl GrpcStream {
 
         let channel = if use_tls {
             channel_endpoint
-                .tls_config(tonic::transport::ClientTlsConfig::new())
+                .tls_config(self.client_tls_config().await?)
                 .map_err(|e| FaucetError::Config(format!("TLS config failed: {e}")))?
                 .connect()
                 .await

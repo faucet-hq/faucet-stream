@@ -24,13 +24,14 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
     // binding unless `--param` is given, exactly like a file. A single
     // `report` await at the end keeps the future small (see `run`).
     let cfg = if let (Some(source), Some(sink)) = (&args.source, &args.sink) {
-        let sides = crate::hub::resolve_sides(
+        let mut sides = crate::hub::resolve_sides(
             &args.hub,
             args.source_hub.as_deref(),
             args.sink_hub.as_deref(),
             args.overlay_hub.as_deref(),
         )
         .await?;
+        sides.trusted = args.trust.clone();
         let composition =
             crate::hub::compose_across(source, sink, args.overlay.as_deref(), &sides).await?;
         if args.show_composed {

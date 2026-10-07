@@ -64,12 +64,27 @@ pub const FAILED_DLQ_KIND: &str = if cfg!(feature = "sink-file") {
 };
 
 /// Build a fresh JSON Lines DLQ spec pointing at `path`, inheriting the batching
-/// policy of the original node's DLQ (if any) so replay behaves like the
-/// original run — only the destination changes.
+/// policy and the `encryption` block of the original node's DLQ (if any) so
+/// replay behaves like the original run — only the destination changes.
 pub fn failed_dlq_spec(path: &Path, original: Option<&DlqSpec>) -> DlqSpec {
+    let encryption = original.and_then(|o| o.sink.config.get("encryption").cloned());
+    failed_dlq_spec_sealed(path, original, encryption)
+}
+
+/// [`failed_dlq_spec`] sealing the fresh DLQ with `encryption` (an
+/// `encryption:` block), so re-failed rows are never written in clear.
+pub fn failed_dlq_spec_sealed(
+    path: &Path,
+    original: Option<&DlqSpec>,
+    encryption: Option<Value>,
+) -> DlqSpec {
+    let mut config = json!({ "path": path.to_string_lossy() });
+    if let Some(enc) = encryption {
+        config["encryption"] = enc;
+    }
     let sink = ConnectorSpec {
         kind: FAILED_DLQ_KIND.to_string(),
-        config: json!({ "path": path.to_string_lossy() }),
+        config,
         transforms: None,
         inherit_transforms: true,
         status: None,
@@ -157,6 +172,11 @@ pub fn build_replay_node(
         .and_then(|n| n.dlq.clone());
     let mut node = select_replay_node(nodes, row)?;
 
+    let sealing = decryptor.sealing_value().or_else(|| {
+        original_dlq
+            .as_ref()
+            .and_then(|o| o.sink.config.get("encryption").cloned())
+    });
     let reader = DlqReaderSource::new(from_files, reason, decryptor);
     node.source_override = Some(SourceOverride::new(Box::new(reader)));
 
@@ -183,7 +203,11 @@ pub fn build_replay_node(
     // exactly-once (the reader is not a deterministic-replay source).
     node.state = None;
     node.delivery = DeliveryMode::AtLeastOnce;
-    node.dlq = Some(failed_dlq_spec(failed_dlq, original_dlq.as_ref()));
+    node.dlq = Some(failed_dlq_spec_sealed(
+        failed_dlq,
+        original_dlq.as_ref(),
+        sealing,
+    ));
     Ok(node)
 }
 
@@ -561,6 +585,16 @@ mod tests {
         assert_eq!(spec.sink.config["path"], "failed.jsonl");
         assert_eq!(spec.on_batch_error, OnBatchErrorSpec::DlqAll);
         assert_eq!(spec.max_failures_per_page, Some(5));
+    }
+
+    #[test]
+    fn failed_dlq_spec_keeps_the_original_encryption() {
+        let mut orig = failed_dlq_spec(Path::new("orig.jsonl"), None);
+        orig.sink.config["encryption"] = json!({"key": "k"});
+        let spec = failed_dlq_spec(Path::new("failed.jsonl"), Some(&orig));
+        assert_eq!(spec.sink.config["encryption"], json!({"key": "k"}));
+        let plain = failed_dlq_spec(Path::new("f.jsonl"), None);
+        assert!(plain.sink.config.get("encryption").is_none());
     }
 
     #[test]

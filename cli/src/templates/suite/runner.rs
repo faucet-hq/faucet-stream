@@ -146,7 +146,9 @@ fn name_matches(name: &str, filter: Option<&str>) -> bool {
 /// For a source template this is the **composed** declaration (source + sink
 /// params merged), because that is the surface a trigger binds.
 async fn declared_params(target: &Target<'_>) -> CliResult<crate::params::ParamsSpec> {
-    let doc = effective_document(target).await?;
+    let mut doc = effective_document(target).await?;
+    // Defaults like `${env:PORT}` resolve before binding, as a real run does.
+    crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
     crate::params::declared(&doc)
 }
 
@@ -431,6 +433,8 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
         }
         Target::Document { .. } => {
             let mut doc = effective_document(target).await?;
+            // The env/file/secret pass a local materialization runs first (CLI-121).
+            crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
             crate::params::bind_document(&mut doc, supplied, crate::params::BindMode::Strict)?;
             if let Some(map) = doc.as_object_mut() {
                 map.remove("params");

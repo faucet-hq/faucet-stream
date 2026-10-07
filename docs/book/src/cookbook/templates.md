@@ -61,7 +61,7 @@ Fields per entry:
 |---|---|
 | `type` | `string` (default) · `int` · `float` · `bool` |
 | `required` | The caller must supply a value. Mutually exclusive with `default`. |
-| `default` | Value when the caller supplies none. An ordinary config scalar, so `default: "${env:SINCE}"` works. |
+| `default` | Value when the caller supplies none. An ordinary config scalar, so `default: "${env:SINCE}"` works. On a typed param it may be text that resolves to the type (`type: int, default: "${env:PORT}"`). |
 | `secret` | Registered for redaction the instant it is bound — never reaches a log, an error message, an API response, the audit log, or the registry. |
 | `description` | Shown by `faucet template list` / `show`, `GET /v1/templates`, and the MCP `get_template` tool. |
 | `values` | Closed set of acceptable values. Anything else is rejected at bind time, naming the set. A `default` must be one of them. |

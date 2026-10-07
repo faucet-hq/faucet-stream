@@ -35,6 +35,50 @@ pub fn resolve_link_str(base: &str, link: &str) -> Result<String, FaucetError> {
     Ok(resolved.to_string())
 }
 
+/// Whether a request to `target` may carry the credentials configured for
+/// `base`: true for the same scheme, host and port, or a host in
+/// `trusted_hosts` (exact, or `*.suffix`); false for any other host, so the
+/// request goes out without them. A plain-`http` target from an `https` base is
+/// refused outright — credentials or data would cross the wire in clear.
+pub fn credentials_allowed(
+    base: &str,
+    target: &str,
+    trusted_hosts: &[String],
+) -> Result<bool, FaucetError> {
+    let (Ok(base), Ok(target)) = (Url::parse(base), Url::parse(target)) else {
+        return Ok(false);
+    };
+    if base.scheme() == "https" && target.scheme() != "https" {
+        return Err(FaucetError::Source(format!(
+            "refusing to follow a server-given URL from https to {}://{}: it would downgrade \
+             the connection to cleartext",
+            target.scheme(),
+            target.host_str().unwrap_or_default()
+        )));
+    }
+    if base.scheme() == target.scheme()
+        && base.host_str() == target.host_str()
+        && base.port_or_known_default() == target.port_or_known_default()
+    {
+        return Ok(true);
+    }
+    let Some(host) = target.host_str() else {
+        return Ok(false);
+    };
+    let host = host.to_ascii_lowercase();
+    Ok(trusted_hosts.iter().any(|t| {
+        let t = t.trim().to_ascii_lowercase();
+        match t.strip_prefix("*.") {
+            Some(suffix) => host.len() > suffix.len() && host.ends_with(&format!(".{suffix}")),
+            None => host == t,
+        }
+    }))
+}
+
+/// Header names that carry credentials even when configured as static
+/// headers; dropped from a request to a host that may not receive them.
+pub const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
+
 /// Resolve an async-job URL against the configured `base_url`: absolute URLs
 /// pass through; a root-relative URL whose path already starts with the
 /// base's path prefix is resolved at the origin (so
@@ -66,6 +110,31 @@ pub fn resolve_job_url(base_url: &str, url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_go_only_to_the_base_origin_or_a_trusted_host() {
+        let base = "https://api.example.com/v2";
+        let none: [String; 0] = [];
+        assert!(credentials_allowed(base, "https://api.example.com/v2/p?2", &none).unwrap());
+        assert!(credentials_allowed(base, "https://api.example.com:443/x", &none).unwrap());
+        assert!(!credentials_allowed(base, "https://cdn.example.net/x", &none).unwrap());
+        assert!(!credentials_allowed(base, "https://api.example.com:8443/x", &none).unwrap());
+        assert!(!credentials_allowed(base, "not a url", &none).unwrap());
+        let trusted = [
+            "files.example.net".to_string(),
+            "*.blob.example.org".to_string(),
+        ];
+        assert!(credentials_allowed(base, "https://files.example.net/x", &trusted).unwrap());
+        assert!(credentials_allowed(base, "https://a.blob.example.org/x", &trusted).unwrap());
+        assert!(!credentials_allowed(base, "https://blob.example.org/x", &trusted).unwrap());
+        let err = credentials_allowed(base, "http://api.example.com/v2", &trusted)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("downgrade"), "{err}");
+        assert!(credentials_allowed("http://h/x", "http://h/y", &none).unwrap());
+        assert!(!credentials_allowed("http://h/x", "https://other/y", &none).unwrap());
+        assert!(!credentials_allowed("http://h/x", "data:text/plain,hi", &none).unwrap());
+    }
 
     fn r(base: &str, link: &str) -> String {
         resolve_link_str(base, link).unwrap()

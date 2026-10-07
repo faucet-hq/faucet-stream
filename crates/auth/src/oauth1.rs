@@ -91,6 +91,13 @@ impl OAuth1Provider {
     }
 }
 
+/// A per-request nonce: 122 random bits (so two processes signing with one
+/// token in the same second never collide) prefixed with this provider's
+/// request counter.
+fn random_nonce(counter: u64) -> String {
+    format!("{counter}{}", uuid::Uuid::new_v4().simple())
+}
+
 #[async_trait]
 impl AuthProvider for OAuth1Provider {
     async fn credential(&self) -> Result<Credential, FaucetError> {
@@ -113,7 +120,7 @@ impl AuthProvider for OAuth1Provider {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let counter = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
-        let nonce = format!("{timestamp}{counter}");
+        let nonce = random_nonce(counter);
         let header = self.authorization_header(method, url, query, &nonce, timestamp);
         Ok(Some(Credential::Header {
             name: "Authorization".to_string(),
@@ -209,6 +216,15 @@ mod tests {
             "realm": "ACCT123",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn nonces_are_random_across_providers() {
+        let a = random_nonce(0);
+        let b = random_nonce(0);
+        assert_ne!(a, b, "two fresh providers must not share a first nonce");
+        assert!(a.starts_with('0') && a.len() == 33, "{a}");
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()), "{a}");
     }
 
     #[test]

@@ -14458,6 +14458,13 @@
                         "type": "string"
                       }
                     },
+                    "trusted_hosts": {
+                      "description": "Extra hosts that may receive this source's credentials when a\nserver-given URL (a next-page link, an async-job URL) points at them.\nCredentials — the `auth` block, a shared provider's placements and any\n`Authorization` / `Cookie` header — are otherwise sent only to the\nscheme, host and port of `base_url`; a link elsewhere is fetched without\nthem. An entry is a host (`files.example.com`) or a `*.example.com`\nwildcard. An `https` base never follows a link to plain `http`.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
                     "query_params": {
                       "description": "Static query-string parameters, rendered as `?k=v`. Values honor\n`{placeholder}` context substitution for child sources. Empty by\ndefault.\n\nThe `#[serde(default)]` here is load-bearing: without it this field was\n**required**, so any config omitting it failed to deserialize — while\nits siblings `headers` and `query_params_multi` both defaulted. Several\nshipped examples omitted it and could not run at all, which nothing\ncaught because `faucet validate` did not deserialize connector configs\nuntil #609.",
                       "type": "object",
@@ -15239,11 +15246,27 @@
                       "$ref": "#/$defs/source_grpc__AuthSpec"
                     },
                     "tls": {
-                      "description": "Whether to use TLS (detected from `https://` in endpoint by default).",
+                      "description": "Whether to use TLS (detected from `https://` in endpoint by default).\nThe server certificate is verified against the operating system's\ntrust store and the bundled Mozilla roots, plus [`ca_cert`](Self::ca_cert).",
                       "type": [
                         "boolean",
                         "null",
                         "string"
+                      ]
+                    },
+                    "ca_cert": {
+                      "default": null,
+                      "description": "PEM file with an extra CA certificate to trust — for a server whose\ncertificate is signed by a private CA.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "domain_name": {
+                      "default": null,
+                      "description": "Host name to verify the server certificate against, when it differs\nfrom the endpoint's host (connecting by IP or through a tunnel).",
+                      "type": [
+                        "string",
+                        "null"
                       ]
                     },
                     "records_path": {
