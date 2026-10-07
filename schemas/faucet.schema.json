@@ -4654,6 +4654,13 @@
             "type": {
               "type": "string",
               "const": "Offset"
+            },
+            "rows_path": {
+              "description": "JSONPath whose matches are counted to advance the offset, instead of\nthe extracted record count. Required when `records_path` fans out\nto nested children or `record_ancestors` is set, where the record\ncount is not the number of server rows (API-36). An array counts its\nelements, an object 1, null or no match 0 (which ends pagination).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         },
@@ -5489,7 +5496,7 @@
           "description": "JSON request body (#768) — for status checks that are a `POST` with a\nquery body, such as a GraphQL `node(id:)` lookup. `${job_id}` is\nsubstituted in every string leaf."
         },
         "interval_secs": {
-          "description": "Ceiling on the poll cadence in seconds (default `5`). Polling starts at\n1s and doubles up to this cap, so a job that finishes seconds after\nsubmit is noticed quickly while a long-running one isn't hammered. Set\nit to the slowest acceptable poll rate — it is the maximum gap between\npolls, not a fixed wait.",
+          "description": "Ceiling on the poll cadence in seconds (default `5`). Polling starts at\n1s and doubles up to this cap, so a job that finishes seconds after\nsubmit is noticed quickly while a long-running one isn't hammered. Set\nit to the slowest acceptable poll rate — it is the maximum gap between\npolls, not a fixed wait. Values below 1 are treated as 1, so polls are\nnever sent back-to-back.",
           "type": [
             "integer",
             "string"
@@ -5807,6 +5814,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "next": {
+          "description": "JSONPath to the next listing page's URL (absolute, or a path relative to\n`base_url`) in each response, e.g. `$.next`. Pages are followed until it\nis absent, null, empty or repeats. Without it only the first page is\nread, so set it for a paginated listing.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": true
@@ -5994,11 +6008,11 @@
           "$ref": "#/$defs/source_graphql__OffsetPaginationKind"
         },
         "offset_variable": {
-          "description": "Name of the GraphQL variable that receives the current offset. It is\ninjected as a JSON number (starting at `0`, incremented by `page_size`\nafter each page). Reference it from the query string or as a variable\n(e.g. `${q_offset}` inside the query string).",
+          "description": "Name of the GraphQL variable that receives the current offset. It is\ninjected as a JSON number (starting at `0`, advanced by the number of\nrecords each page returned). Reference it from the query string or as a variable\n(e.g. `${q_offset}` inside the query string).",
           "type": "string"
         },
         "page_size": {
-          "description": "Records requested per page. Used both to advance the offset\n(`offset += page_size`) and, with `stop_when_short`, to detect the final\npage. Must be greater than `0`. This value is **not** injected into the\nrequest — bake the limit into your query (`LIMIT 250 OFFSET ${q_offset}`).",
+          "description": "Records requested per page, used with `stop_when_short` to detect the\nfinal page; the offset advances by the records each page actually\nreturned. Must be greater than `0`. This value is **not** injected into the\nrequest — bake the limit into your query (`LIMIT 250 OFFSET ${q_offset}`).",
           "type": [
             "integer",
             "string"
@@ -6007,12 +6021,12 @@
           "minimum": 0
         },
         "stop_when_short": {
-          "description": "Terminate when a page yields fewer than `page_size` records (default\n`true`). When `false`, pagination continues until a fully empty page (or\n`max_pages`) is reached.",
+          "description": "Terminate when a page yields fewer than `page_size` records (default\n`false`: pagination continues until a fully empty page, an identical\nrepeated page, or `max_pages`). A server that caps the page below\n`page_size` returns short pages mid-stream, so enable this only when the\nAPI is known never to clamp.",
           "type": [
             "boolean",
             "string"
           ],
-          "default": true
+          "default": false
         },
         "substitute_in_query": {
           "description": "Substitute `${offset_variable}` occurrences in the **query string** with\nthe current offset before each request, instead of sending it as a\nGraphQL variable. Required for query languages that embed the offset in a\nstring-literal argument — e.g.\n`reportQuery(query: \"… LIMIT 250 OFFSET ${q_offset}\")`, where a GraphQL\nvariable cannot interpolate into a string literal (#569). Default\n`false` (variable injection, the #550 behavior).",
@@ -14534,7 +14548,7 @@
                       "default": null
                     },
                     "timeout": {
-                      "description": "Per-request timeout in seconds. Covers one HTTP request, not the whole\nrun, so a paginated extract is bounded per page.",
+                      "description": "Per-request timeout in seconds. Covers one HTTP request, not the whole\nrun, so a paginated extract is bounded per page. A streamed `async_job`\nresult download is bounded per connect and per idle read instead.",
                       "type": [
                         "integer",
                         "null",
@@ -14851,6 +14865,13 @@
                         {
                           "type": "null"
                         }
+                      ]
+                    },
+                    "allow_missing_records_path": {
+                      "description": "Accept a response in which `records_path` resolves to nothing (the key\nis absent) as an empty page. Off by default: a missing key usually means\nan error body served with HTTP 200 or a renamed field, and treating it\nas \"no more records\" ends the run green with rows unread. Enable it\nonly for APIs that omit the records key on an empty result.",
+                      "type": [
+                        "boolean",
+                        "string"
                       ]
                     }
                   }
@@ -15414,7 +15435,10 @@
                       "minimum": 0,
                       "default": 300
                     }
-                  }
+                  },
+                  "x-faucet-aliases": [
+                    "max_reconnect_attempts"
+                  ]
                 },
                 true
               ]
@@ -18139,6 +18163,17 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "signature": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_webhook__WebhookSignature"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional HMAC request-signature verification for senders that sign the\nraw body instead of sending a static secret. Unsigned or mis-signed\nrequests are rejected with `401`."
                     }
                   }
                 },
@@ -18270,7 +18305,7 @@
                       "default": 1
                     },
                     "reconnect_max_attempts": {
-                      "description": "Cap on *consecutive* failed reconnects (resets on any received\nmessage). `None` = unlimited (then `idle_timeout` is the natural cap).\n\nSpelled `reconnect_max_attempts` on the wire, matching the gRPC\nsource's `reconnect_*` prefix; the historical `max_reconnect_attempts`\nstays accepted as an alias (#654 M20). The prefix used to be reversed\nbetween the two connectors, so a user who learned one spelling had the\nother silently ignored and reconnected without a bound.",
+                      "description": "Cap on *consecutive* failed reconnects (resets on a received data\nframe — a handshake the server accepts and then closes still counts). `None` = unlimited (then `idle_timeout` is the natural cap).\n\nSpelled `reconnect_max_attempts` on the wire, matching the gRPC\nsource's `reconnect_*` prefix; the historical `max_reconnect_attempts`\nstays accepted as an alias (#654 M20). The prefix used to be reversed\nbetween the two connectors, so a user who learned one spelling had the\nother silently ignored and reconnected without a bound.",
                       "type": [
                         "integer",
                         "null",
@@ -18298,6 +18333,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "connect_timeout": {
+                      "default": 30,
+                      "description": "Seconds allowed for the TCP connect + upgrade handshake and for sending\nthe subscribe frames (default 30). Expiry counts as a connect failure,\nso `reconnect` retries it.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   },
                   "additionalProperties": true
@@ -18489,7 +18534,7 @@
                       "default": true
                     },
                     "idle_timeout_secs": {
-                      "description": "Abort the run if no line arrives from the tap within this many seconds.\n`None` (default) waits indefinitely.",
+                      "description": "Abort the run if no line arrives from the tap within this many seconds\n(default 3600). `null` waits indefinitely — a stalled tap then hangs\nthe run.",
                       "type": [
                         "integer",
                         "null",
@@ -18497,7 +18542,7 @@
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": null
+                      "default": 3600
                     },
                     "on_malformed": {
                       "description": "How to handle a line that is not valid Singer JSON. Default\n[`MalformedPolicy::Skip`].",
@@ -18508,6 +18553,16 @@
                       "description": "Which of faucet's environment variables the tap receives: `true`\n(default) the whole environment, `false` only `PATH`, `HOME`, `LANG`,\n`LC_ALL` and `TMPDIR`, or a list of variable names passed on top of\nthat baseline. Set it to keep faucet's own credentials away from the tap.",
                       "$ref": "#/$defs/source_singer__InheritEnv",
                       "default": true
+                    },
+                    "max_line_bytes": {
+                      "default": 67108864,
+                      "description": "Longest tap output line accepted, in bytes (default 64 MiB). A longer\nline — a huge RECORD, or binary output with no newline — fails the run\ninstead of exhausting memory.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   }
                 },
@@ -23117,7 +23172,7 @@
                     },
                     "flush_timeout_secs": {
                       "default": 600,
-                      "description": "How long a flush waits for the target to echo `STATE` (or to exit, with\n`flush_on: exit`) before failing. Default 600.",
+                      "description": "How long a flush waits for the target to echo `STATE` (or to exit, with\n`flush_on: exit`) before failing, and how long one write may block on a\ntarget that stopped reading its stdin. Default 600.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -24264,15 +24319,22 @@
                     },
                     "method": {
                       "description": "HTTP method (default: POST).",
-                      "type": "string"
+                      "type": "string",
+                      "default": "POST"
                     },
                     "auth": {
-                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
-                      "$ref": "#/$defs/sink_http__AuthSpec"
+                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.\nDefaults to no authentication.",
+                      "$ref": "#/$defs/sink_http__AuthSpec",
+                      "default": {
+                        "type": "none"
+                      }
                     },
                     "batch_mode": {
-                      "description": "How to batch records in requests.",
-                      "$ref": "#/$defs/sink_http__HttpBatchMode"
+                      "description": "How to batch records in requests (default: `Individual`).",
+                      "$ref": "#/$defs/sink_http__HttpBatchMode",
+                      "default": {
+                        "type": "Individual"
+                      }
                     },
                     "max_retries": {
                       "description": "Number of retries on transient failures (default: 0).",
@@ -24281,16 +24343,18 @@
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 0
                     },
                     "concurrency": {
-                      "description": "Maximum number of concurrent requests in Individual mode (default: 10).",
+                      "description": "Maximum number of concurrent requests in Individual mode (default: 10).\nAbove 1 the records of a page are sent in parallel and can reach the\nendpoint out of order — use `1` for a last-write-wins endpoint that\nreceives several updates to one entity per page.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 10
                     },
                     "batch_size": {
                       "description": "Maximum number of records sent per outbound HTTP request. Defaults to\n[`DEFAULT_BATCH_SIZE`] (1000).\n\nInterpretation depends on [`batch_mode`](Self::batch_mode):\n\n- In [`HttpBatchMode::Array`] mode, `write_batch` re-chunks the\n  incoming slice into `batch_size`-row chunks and issues one POST\n  request per chunk, with each request body a JSON array of up to\n  `batch_size` records. `batch_size = 0` is the **\"no batching\"\n  sentinel**: the entire upstream `StreamPage` is forwarded as a\n  single JSON array — useful when the source already chunks to a\n  size the destination endpoint accepts.\n- In [`HttpBatchMode::Individual`] mode the sink already sends one\n  request per record, so `batch_size` has no effect on wire framing;\n  the field is accepted for config-shape parity with other sinks\n  and validated via [`faucet_core::validate_batch_size`] at load\n  time.\n\nRecommended value for HTTP POST endpoints that accept arrays:\nmatch the destination's documented batch limit (commonly 100–1000\nrecords per request).",
@@ -29208,7 +29272,7 @@
           "minimum": 0
         },
         "max_wait_secs": {
-          "description": "Longest wait `backoff_from` may ask for (default 3600). A longer one\nfails the run with an error naming the reset instead of parking it.",
+          "description": "Longest wait a matched response may ask for — from `backoff_from`,\n`backoff_secs` or `Retry-After` (default 3600). A longer one fails the\nrun with an error naming the reset instead of parking it.",
           "type": [
             "integer",
             "null",
@@ -29639,7 +29703,7 @@
           "minimum": 0
         },
         "max_wait_secs": {
-          "description": "Longest wait `backoff_from` may ask for (default 3600). A longer one\nfails the run with an error naming the reset instead of parking it.",
+          "description": "Longest wait a matched response may ask for — from `backoff_from`,\n`backoff_secs` or `Retry-After` (default 3600). A longer one fails the\nrun with an error naming the reset instead of parking it.",
           "type": [
             "integer",
             "null",
@@ -31486,6 +31550,85 @@
           "const": "bytes"
         }
       ]
+    },
+    "source_webhook__SignatureAlgorithm": {
+      "description": "HMAC digest for [`WebhookSignature`].",
+      "oneOf": [
+        {
+          "const": "sha256",
+          "description": "HMAC-SHA256.",
+          "type": "string"
+        },
+        {
+          "const": "sha512",
+          "description": "HMAC-SHA512.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_webhook__SignatureEncoding": {
+      "description": "Text encoding of the signature digest.",
+      "oneOf": [
+        {
+          "const": "hex",
+          "description": "Hexadecimal (case-insensitive).",
+          "type": "string"
+        },
+        {
+          "const": "base64",
+          "description": "Standard base64.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_webhook__WebhookSignature": {
+      "additionalProperties": true,
+      "description": "HMAC signature verification over the raw request body.",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/source_webhook__SignatureAlgorithm",
+          "default": "sha256",
+          "description": "HMAC digest (default `sha256`)."
+        },
+        "encoding": {
+          "$ref": "#/$defs/source_webhook__SignatureEncoding",
+          "default": "hex",
+          "description": "How the digest is written in the header (default `hex`)."
+        },
+        "header": {
+          "description": "Request header carrying the signature (e.g. `X-Hub-Signature-256`).",
+          "type": "string"
+        },
+        "prefix": {
+          "description": "Text before the digest in the header value (e.g. `sha256=`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "description": "The shared signing secret.",
+          "type": "string"
+        },
+        "timestamp_header": {
+          "description": "Header carrying the Unix-seconds timestamp the sender signed. When set,\nthe signed content is `<timestamp>.<body>` and a timestamp more than\n`tolerance_secs` from now is rejected (replay protection).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tolerance_secs": {
+          "default": 300,
+          "description": "Accepted clock difference for `timestamp_header`, in seconds (default 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ]
+        }
+      },
+      "type": "object"
     }
   }
 }
