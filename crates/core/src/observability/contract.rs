@@ -35,10 +35,14 @@ pub fn instrumented_apply_contract(
     };
     let violation_labels = |v: &ContractViolation, mode: &'static str| -> Vec<Label> {
         let mut l = base();
-        l.push(Label::new(
-            "field",
-            SharedString::from(v.field.clone().unwrap_or_default()),
-        ));
+        // An undeclared key comes from the record, so it never becomes a label
+        // value (CORE-48).
+        let field = if v.rule == "extra_field" {
+            SharedString::const_str("<extra>")
+        } else {
+            SharedString::from(v.field.clone().unwrap_or_default())
+        };
+        l.push(Label::new("field", field));
         l.push(Label::new("rule", SharedString::const_str(v.rule)));
         l.push(Label::new("mode", SharedString::const_str(mode)));
         l
@@ -48,19 +52,31 @@ pub fn instrumented_apply_contract(
 
     match &result {
         Ok(outcome) => {
-            for q in &outcome.quarantined {
-                counter!(
-                    "faucet_contract_violations_total",
-                    violation_labels(&q.violation, "quarantine")
-                )
-                .increment(1);
+            // One registry lookup per distinct (field, rule, mode) per page
+            // rather than one per violation (CORE-64).
+            let mut tally: std::collections::HashMap<
+                (Option<&str>, &'static str, &'static str),
+                (u64, &ContractViolation),
+            > = std::collections::HashMap::new();
+            let all = outcome
+                .quarantined
+                .iter()
+                .map(|q| (&q.violation, "quarantine"))
+                .chain(outcome.warned.iter().map(|v| (v, "warn")));
+            for (v, mode) in all {
+                let field = if v.rule == "extra_field" {
+                    None
+                } else {
+                    v.field.as_deref()
+                };
+                tally.entry((field, v.rule, mode)).or_insert((0, v)).0 += 1;
             }
-            for v in &outcome.warned {
+            for ((_, _, mode), (n, v)) in tally {
                 counter!(
                     "faucet_contract_violations_total",
-                    violation_labels(v, "warn")
+                    violation_labels(v, mode)
                 )
-                .increment(1);
+                .increment(n);
             }
         }
         Err(FaucetError::ContractViolation { .. }) => {
@@ -135,6 +151,50 @@ mod tests {
             found,
             "expected faucet_contract_violations_total{{rule=type,mode=warn,field=id}}"
         );
+    }
+
+    #[test]
+    fn extra_field_label_is_constant_and_counts_aggregate() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshotter();
+        let spec: ContractSpec = serde_json::from_value(json!({
+            "version": "1.0.0",
+            "on_breach": "warn",
+            "allow_extra_fields": false,
+            "fields": [{ "name": "id", "type": "integer" }]
+        }))
+        .unwrap();
+        let c = CompiledContract::compile(&spec).unwrap();
+        instrumented_apply_contract(
+            vec![
+                json!({"id": 1, "alice@example.com": 1}),
+                json!({"id": 2, "bob@example.com": 1}),
+            ],
+            &c,
+            &Labels::for_named("test_contract_extra"),
+        )
+        .unwrap();
+        let snapshot = snap.snapshot().into_vec();
+        let mut found = 0;
+        for (key, _, _, v) in &snapshot {
+            if key.key().name() != "faucet_contract_violations_total"
+                || !key
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "pipeline" && l.value() == "test_contract_extra")
+            {
+                continue;
+            }
+            assert!(
+                key.key()
+                    .labels()
+                    .any(|l| l.key() == "field" && l.value() == "<extra>"),
+                "{key:?}"
+            );
+            assert!(matches!(v, DebugValue::Counter(2)), "{v:?}");
+            found += 1;
+        }
+        assert_eq!(found, 1);
     }
 
     #[test]

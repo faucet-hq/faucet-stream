@@ -78,7 +78,11 @@ Per record, the **first breach wins** — fields are checked in declared order
 (presence → null → type → enum → pattern → range → length), then the
 extra-field check. Each breach carries a stable `rule` label: `missing`,
 `null`, `type`, `enum`, `pattern`, `range`, `length`, `extra_field`,
-`not_object`.
+`not_object`. Breach messages name the field, rule and bound but never the
+record's value, so an error that reaches a log or a notification channel does
+not carry unmasked data. In `faucet_contract_violations_total` an
+`extra_field` breach is labelled `field="<extra>"`, since the undeclared key
+comes from the record.
 
 ## Enforcement policies (`on_breach`)
 
