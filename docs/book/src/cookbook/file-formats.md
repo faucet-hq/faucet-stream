@@ -336,7 +336,11 @@ extension is skipped with a warning, or fails the run with `strict: true`.
 
 Incremental mode reads only new files. `by: mtime` reads files modified after
 the newest one the previous run read; `by: name` reads files whose path sorts
-after the last one read. The bookmark advances after each file. Over HTTP, the
+after the last one read. The bookmark advances after each file. `by: mtime` is a
+watermark: a file that arrives later but keeps an older modification time
+(`mv`, `cp -p`, `rsync -t`, archive extraction) is skipped — the run warns and
+names it — so have producers touch files as they publish them, or use
+`by: name`. Over HTTP, the
 `Last-Modified` header is the modification time. JSON Lines, Avro, ORC and
 Parquet stream, and so does CSV (with the `csv:` dialect above); the other
 formats are read whole per file. `parquet: { columns: [...] }` projects a

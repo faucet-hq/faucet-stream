@@ -124,9 +124,27 @@ async fn a_whole_file_sealed_csv_and_gzip_body_is_decrypted() {
     let mut cfg = FileSourceConfig::new(&path);
     cfg.encryption = Some(spec("k"));
     assert_eq!(
-        FileSource::new(cfg).unwrap().fetch_all().await.unwrap(),
+        FileSource::new(cfg.clone())
+            .unwrap()
+            .fetch_all()
+            .await
+            .unwrap(),
         vec![json!({"x": 1})]
     );
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, "{\"x\":1}\n".repeat(10_000).as_bytes()).unwrap();
+    let sealed = enc.encrypt(&gz.finish().unwrap());
+    std::fs::write(&path, &sealed).unwrap();
+    cfg.max_object_bytes = sealed.len() as u64;
+    let err = FileSource::new(cfg.clone())
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
+    cfg.max_object_bytes = 4;
+    let err = FileSource::new(cfg).unwrap().fetch_all().await.unwrap_err();
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
     let p = dir.path().join("s.parquet");
     put_parquet(&p, vec![7], vec![Some("q")]);
     let sealed = enc.encrypt(&std::fs::read(&p).unwrap());

@@ -147,6 +147,13 @@ incremental: { by: mtime }   # or: { by: name }
   new. A rewritten file is read again.
 - `by: name` reads files whose path sorts after the last one read. Use it for
   dated names that are never rewritten.
+- **Producers that preserve timestamps.** `by: mtime` is a watermark: a file
+  that lands *after* a newer file was read but keeps an older modification
+  time — moved in with `mv`, copied with `cp -p` or `rsync -t`, extracted from
+  an archive — sits below the watermark and is never read. The run logs a
+  warning naming such files (it sees their inode change time move past the
+  watermark). Have the producer touch files as it publishes them, or use
+  `by: name` with names that sort in arrival order.
 
 The bookmark advances after each file, and pages never span two files in this
 mode, so an interrupted run resumes at the next unread file. It needs a
@@ -158,13 +165,23 @@ says so.
 `stable_for_secs: N` skips files modified in the last N seconds, leaving them
 for a later run once they settle.
 
+Formats read whole into memory (JSON arrays, XML, Excel, and Avro/ORC/Parquet
+when compressed, remote or encrypted) stop at `max_object_bytes` (default
+2 GiB) once decompressed: a larger file — or a decompression bomb — fails with
+an error naming the file instead of exhausting memory.
+
 ## HTTP
 
 A URL `path` is one file. `headers:` are sent with every request, for example
 `Authorization: "Bearer ${env:TOKEN}"`. Connection errors, `429` and `5xx`
 responses are retried up to `http_retries` times (default 3) with exponential
 backoff that honours `Retry-After`. Any other status fails the run with the
-status and the response body. Requests are counted as `get` / `head` round
+status and the response body. A connection must open within
+`http_connect_timeout_secs` (default 30) and the server must keep sending —
+headers or body — at least once every `http_read_timeout_secs` (default 300):
+a stall before the body starts is retried like a connection error, one
+mid-body fails the file, so a server that accepts and never answers cannot
+hang the run. Requests are counted as `get` / `head` round
 trips on the pipeline's recorder, and 429s, retries and rate-limit waits feed
 the run's throttling metrics.
 

@@ -471,6 +471,53 @@ fn columnar_refusal(verb: &str) -> FaucetError {
     ))
 }
 
+/// Default ceiling on one file's size once decompressed, for formats read
+/// whole into memory (2 GiB).
+pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Read `reader` to the end, failing once it yields more than `max` bytes — so
+/// a decompression bomb fails the file instead of exhausting memory. `what`
+/// names the file in the error.
+pub async fn read_to_end_capped<R>(reader: R, max: u64, what: &str) -> Result<Vec<u8>, FaucetError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    reader
+        .take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| FaucetError::Source(format!("read error for '{what}': {e}")))?;
+    check_object_size(buf.len() as u64, max, what)?;
+    Ok(buf)
+}
+
+/// [`read_to_end_capped`] for a UTF-8 text body.
+pub async fn read_to_string_capped<R>(
+    reader: R,
+    max: u64,
+    what: &str,
+) -> Result<String, FaucetError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let bytes = read_to_end_capped(reader, max, what).await?;
+    String::from_utf8(bytes)
+        .map_err(|e| FaucetError::Source(format!("'{what}' is not valid UTF-8: {e}")))
+}
+
+/// The error for a file past `max_object_bytes`.
+pub fn check_object_size(len: u64, max: u64, what: &str) -> Result<(), FaucetError> {
+    if len > max {
+        return Err(FaucetError::Source(format!(
+            "'{what}' is larger than `max_object_bytes` ({max} bytes) once decompressed; \
+             raise `max_object_bytes` to read it"
+        )));
+    }
+    Ok(())
+}
+
 /// The error a build without the feature reports.
 ///
 /// Named rather than mis-parsed: decoding an Excel workbook as CSV produces
@@ -620,6 +667,33 @@ pub fn cell_text(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod capped_read_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_body_past_the_cap_fails_and_one_at_the_cap_reads() {
+        let body = vec![b'x'; 64];
+        let ok = read_to_end_capped(&body[..], 64, "f").await.unwrap();
+        assert_eq!(ok.len(), 64);
+        let err = read_to_end_capped(&body[..], 63, "big.json.gz")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("big.json.gz"), "{err}");
+        assert!(err.to_string().contains("max_object_bytes"), "{err}");
+        assert_eq!(
+            read_to_string_capped(&b"hi"[..], 8, "t").await.unwrap(),
+            "hi"
+        );
+        assert!(
+            read_to_string_capped(&[0xff, 0xfe][..], 8, "t")
+                .await
+                .is_err()
+        );
+        assert!(check_object_size(5, 4, "x").is_err());
     }
 }
 

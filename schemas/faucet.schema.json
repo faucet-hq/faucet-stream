@@ -20734,6 +20734,16 @@
                       "format": "uint64",
                       "minimum": 0
                     },
+                    "max_object_bytes": {
+                      "description": "Largest file, once decompressed, that a format read whole (JSON array,\nXML, Excel, compressed or remote Avro/ORC/Parquet, encrypted files) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 2147483648
+                    },
                     "strict": {
                       "description": "Refuse (instead of skipping with a warning) a file whose extension\nnames no format under `format: auto`.",
                       "type": [
@@ -20768,6 +20778,26 @@
                       "format": "uint32",
                       "minimum": 0,
                       "default": 3
+                    },
+                    "http_connect_timeout_secs": {
+                      "description": "Seconds to wait for an HTTP connection to open. A timeout is retried.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "http_read_timeout_secs": {
+                      "description": "Seconds an HTTP response may go without sending a byte — waiting for\nthe headers or mid-body. A timeout before the body starts is retried;\none mid-body fails the file.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 300
                     },
                     "csv": {
                       "description": "CSV dialect, used for CSV files.",
