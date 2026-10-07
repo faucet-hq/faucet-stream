@@ -256,12 +256,19 @@ impl Sink for PolicySink {
             .filter(|(i, _)| !quarantined.contains_key(i))
             .map(|(_, r)| r.clone())
             .collect();
-        let mut inner_outcomes = if kept.is_empty() {
+        let inner_outcomes = if kept.is_empty() {
             Vec::new()
         } else {
             self.inner.write_batch_partial(&kept).await?
+        };
+        if inner_outcomes.len() != kept.len() {
+            return Err(crate::dlq::outcome_count_mismatch(
+                self.inner.connector_name(),
+                inner_outcomes.len(),
+                kept.len(),
+            ));
         }
-        .into_iter();
+        let mut inner_outcomes = inner_outcomes.into_iter();
         let outcomes = (0..records.len())
             .map(|i| match quarantined.get(&i) {
                 Some(v) => Err(FaucetError::PolicyViolation {
@@ -269,7 +276,7 @@ impl Sink for PolicySink {
                     column: v.column.clone(),
                     message: v.to_string(),
                 }),
-                None => inner_outcomes.next().unwrap_or(Ok(())),
+                None => inner_outcomes.next().expect("length checked above"),
             })
             .collect();
         Ok(outcomes)
@@ -480,6 +487,45 @@ mod tests {
             ),
             cap,
         )
+    }
+
+    #[tokio::test]
+    async fn a_short_inner_outcome_vector_is_an_error() {
+        struct Short;
+        #[async_trait]
+        impl Sink for Short {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            async fn write_batch_partial(
+                &self,
+                _r: &[Value],
+            ) -> Result<Vec<RowOutcome>, FaucetError> {
+                Ok(Vec::new())
+            }
+        }
+        let facts = SinkFacts {
+            id: "default".into(),
+            kind: "jsonl".into(),
+            attributes: [("residency".to_string(), "us".to_string())].into(),
+        };
+        let s = PolicySink::new(
+            Box::new(Short),
+            policy("quarantine"),
+            facts,
+            PolicyScope {
+                pipeline: "p".into(),
+                row: "r".into(),
+            },
+        );
+        let err = s
+            .write_batch_partial(&[json!({"e": "a@b.io"}), json!({"id": 1})])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("0 per-row outcomes for 1 rows"),
+            "{err}"
+        );
     }
 
     #[test]

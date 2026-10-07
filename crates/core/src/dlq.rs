@@ -485,6 +485,16 @@ impl BatchOutcomeSink {
     }
 }
 
+/// The error for a sink whose `write_batch_partial` returned a different number
+/// of outcomes than rows — a broken trait contract that would otherwise leave
+/// rows neither written nor routed to the DLQ (CORE-58).
+pub(crate) fn outcome_count_mismatch(connector: &str, got: usize, want: usize) -> FaucetError {
+    FaucetError::Sink(format!(
+        "sink `{connector}` returned {got} per-row outcomes for {want} rows; \
+         `write_batch_partial` must return exactly one outcome per input row"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

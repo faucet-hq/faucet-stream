@@ -1757,7 +1757,25 @@ where
                                 Vec<crate::RowOutcome>,
                                 bool,
                             ) = match chunk_outcomes_result {
+                                Ok(o) if o.len() != chunk.len() => {
+                                    outcomes.record(BatchOutcome::Failed);
+                                    return Err(crate::dlq::outcome_count_mismatch(
+                                        sink_name,
+                                        o.len(),
+                                        chunk.len(),
+                                    ));
+                                }
                                 Ok(o) => (o, false),
+                                // A budget refusal or policy failure is not a sink
+                                // failure of the rows: the page must not land in the
+                                // DLQ with the bookmark moving past it (CORE-27).
+                                Err(
+                                    e @ (FaucetError::BudgetExceeded { .. }
+                                    | FaucetError::PolicyViolation { .. }),
+                                ) => {
+                                    outcomes.record(BatchOutcome::Failed);
+                                    return Err(e);
+                                }
                                 Err(e) => match dlq_cfg.on_batch_error {
                                     OnBatchError::Propagate => {
                                         outcomes.record(BatchOutcome::Failed);
@@ -1815,6 +1833,14 @@ where
                                     // `(max_row_attempts - 1) * max_attempts`,
                                     // amplifying duplicate writes (F47).
                                     let retried = match sink.write_batch_partial(&subset).await {
+                                        Ok(r) if r.len() != subset.len() => {
+                                            outcomes.record(BatchOutcome::Failed);
+                                            return Err(crate::dlq::outcome_count_mismatch(
+                                                sink_name,
+                                                r.len(),
+                                                subset.len(),
+                                            ));
+                                        }
                                         Ok(r) => r,
                                         Err(e) => {
                                             outcomes.record(BatchOutcome::Failed);
@@ -1825,8 +1851,8 @@ where
                                     // (the subset was built in `failing` order).
                                     // Consume by value — `FaucetError` is not Clone.
                                     let mut retried = retried.into_iter();
-                                    for &j in failing.iter() {
-                                        chunk_outcomes[j] = retried.next().unwrap_or(Ok(()));
+                                    for (&j, o) in failing.iter().zip(retried.by_ref()) {
+                                        chunk_outcomes[j] = o;
                                     }
                                     attempt += 1;
                                 }
@@ -7096,6 +7122,78 @@ mod tests {
         assert!(sink.written().is_empty());
         assert!(dlq_sink.written().is_empty());
         assert_eq!(store.get("k").await.unwrap(), None);
+    }
+
+    /// CORE-27: a budget refusal under `on_batch_error: dlq_all` stops the run;
+    /// the page is not DLQ'd as sink failures and the bookmark does not move.
+    #[tokio::test]
+    async fn budget_refusal_under_dlq_all_is_not_dlqd() {
+        use crate::dlq::{DlqConfig, OnBatchError};
+        struct RefusingSink;
+        #[async_trait]
+        impl Sink for RefusingSink {
+            async fn write_batch(&self, _r: &[Value]) -> Result<usize, FaucetError> {
+                unreachable!()
+            }
+            async fn write_batch_partial(
+                &self,
+                _r: &[Value],
+            ) -> Result<Vec<crate::RowOutcome>, FaucetError> {
+                Err(FaucetError::BudgetExceeded {
+                    budget: "max_records".into(),
+                    limit: 1,
+                    actual: 2,
+                })
+            }
+            fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+                crate::dlq::BatchAtomicity::Atomic
+            }
+        }
+        let dlq_sink = std::sync::Arc::new(MockSink::new());
+        let store = std::sync::Arc::new(crate::state::MemoryStateStore::new());
+        let mut dlq = DlqConfig::new(dlq_sink.clone());
+        dlq.on_batch_error = OnBatchError::DlqAll;
+        let pages = Box::pin(futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"id": 1}), json!({"id": 2})],
+            bookmark: Some(json!({"cursor": 2})),
+        })]));
+        let opts = RunStreamOptions::new()
+            .with_dlq(dlq)
+            .with_state(store.clone(), "k");
+        let err = run_stream(pages, &RefusingSink, opts).await.unwrap_err();
+        assert!(matches!(err, FaucetError::BudgetExceeded { .. }), "{err:?}");
+        assert!(dlq_sink.written().is_empty());
+        assert_eq!(store.get("k").await.unwrap(), None);
+    }
+
+    /// CORE-58: a sink returning fewer outcomes than rows fails the page.
+    #[tokio::test]
+    async fn short_outcome_vector_fails_the_page() {
+        use crate::dlq::DlqConfig;
+        struct ShortSink;
+        #[async_trait]
+        impl Sink for ShortSink {
+            async fn write_batch(&self, _r: &[Value]) -> Result<usize, FaucetError> {
+                unreachable!()
+            }
+            async fn write_batch_partial(
+                &self,
+                _r: &[Value],
+            ) -> Result<Vec<crate::RowOutcome>, FaucetError> {
+                Ok(vec![Ok(())])
+            }
+        }
+        let dlq_sink = std::sync::Arc::new(MockSink::new());
+        let pages = Box::pin(futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"id": 1}), json!({"id": 2})],
+            bookmark: None,
+        })]));
+        let opts = RunStreamOptions::new().with_dlq(DlqConfig::new(dlq_sink));
+        let err = run_stream(pages, &ShortSink, opts).await.unwrap_err();
+        assert!(
+            err.to_string().contains("1 per-row outcomes for 2 rows"),
+            "{err}"
+        );
     }
 
     // ── #737 batch atomicity + outcomes, #733 source lag ─────────────────────
