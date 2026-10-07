@@ -70,6 +70,7 @@ All fields live under `pipeline.source.config`.
 | `max_connections` | int | `10` | Maximum connections in the `sqlx` pool. |
 | `batch_size` | int | `1000` | Rows per `StreamPage`. **`0` = no batching** — the cursor is fully drained and the entire result set is emitted in a single page (see [Streaming & batching](#streaming--batching)). Values above `MAX_BATCH_SIZE` (1,000,000) are rejected at construction. |
 | `read_timeout_secs` | int | `3600` | Longest the source waits on the server for the next row before the read fails (`0` = forever), so a peer that vanished without closing the connection (a failover, a NAT/LB idle eviction) cannot hang a run. |
+| `json_big_numbers` | `fail` \| `string` | `fail` | A number inside a JSON column that a 64-bit float cannot represent exactly (more than about 17 significant digits, or beyond the 64-bit integer range): `fail` fails the read with an error naming the column and the number's leading digits; `string` emits it as a JSON string holding its exact digits (one warning per column). Checked on the column's text, never after conversion. |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
 
 ## Examples
@@ -174,7 +175,7 @@ Columns are converted to JSON values by probing the row's value with each candid
 
 | PostgreSQL type | JSON shape |
 |-----------------|------------|
-| `json`, `jsonb` | native JSON value |
+| `json`, `jsonb` | native JSON value; a number a 64-bit float cannot hold exactly fails the read, or is kept as an exact string with `json_big_numbers: string` |
 | `text`, `varchar`, `char` | string |
 | `int8` / `bigint` | number (i64) |
 | `int4` / `integer` | number (i32) |

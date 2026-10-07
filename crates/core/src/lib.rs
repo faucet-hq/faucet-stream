@@ -39,6 +39,7 @@ pub mod error;
 pub mod file_format;
 pub mod idempotency;
 pub mod join;
+pub mod json_numbers;
 pub mod lag;
 pub mod lease;
 pub mod local_outputs;
@@ -138,6 +139,7 @@ pub use idempotency::{
 pub use join::{
     HashJoin, JoinConfig, JoinMode, JoinStats, KeyNormalize, OnCollision, OnDuplicate, Projection,
 };
+pub use json_numbers::{JsonBigNumbers, parse_json_exact};
 pub use lag::{LagObserver, SourceLag};
 pub use local_outputs::{LocalOutput, LocalOutputLog, probe_pre_existing};
 pub use metadata::{

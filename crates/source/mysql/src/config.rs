@@ -44,6 +44,13 @@ pub struct MysqlSourceConfig {
     /// waiting forever, and a scheduled or served run stuck in "running".
     #[serde(default = "default_read_timeout_secs")]
     pub read_timeout_secs: u64,
+    /// What to do with a number inside a JSON column that a 64-bit float
+    /// cannot represent exactly (more than about 17 significant digits, or
+    /// beyond the `u64` / `i64` range): `fail` (default) fails the read with
+    /// an error naming the column, `string` emits the number as a JSON string
+    /// holding its exact digits (with one warning per column).
+    #[serde(default)]
+    pub json_big_numbers: faucet_core::JsonBigNumbers,
     /// The session's `net_write_timeout`, in seconds: how long the server
     /// waits for the source to read more of a result before it aborts the
     /// query. The pipeline stops reading while the sink writes a page, so the
@@ -106,6 +113,7 @@ impl MysqlSourceConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             shard: None,
             read_timeout_secs: default_read_timeout_secs(),
+            json_big_numbers: faucet_core::JsonBigNumbers::Fail,
             net_write_timeout_secs: default_read_timeout_secs(),
         }
     }

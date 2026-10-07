@@ -21,6 +21,8 @@ pub struct MysqlSource {
     /// whole-dataset shard) means the full query is streamed. Stored behind a
     /// `Mutex` so `apply_shard(&self, …)` can record it before streaming.
     applied_shard: Mutex<Option<PkShardBounds>>,
+    /// Columns already warned about under `json_big_numbers: string`.
+    json_warned: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Quote a MySQL identifier with backticks (MySQL's default identifier
@@ -69,6 +71,7 @@ impl MysqlSource {
             config,
             pool,
             applied_shard: Mutex::new(None),
+            json_warned: Mutex::new(Default::default()),
         })
     }
 
@@ -128,12 +131,73 @@ impl MysqlSource {
             .collect()
     }
 
+    fn json_context(&self) -> JsonContext<'_> {
+        JsonContext {
+            mode: self.config.json_big_numbers,
+            warned: &self.json_warned,
+        }
+    }
+
     fn shard_wrap(&self, query: String) -> String {
         match &*self.applied_shard.lock().expect("shard mutex poisoned") {
             Some(bounds) => bounds.wrap(&query, quote_ident_mysql),
             None => query,
         }
     }
+}
+
+/// A JSON column read exactly: every number is checked on the column's
+/// text, and one a JSON value cannot hold exactly is refused or kept as an
+/// exact string per `json_big_numbers` (#789 SQL-49).
+fn json_text_to_value(
+    text: &str,
+    column: &str,
+    json: &JsonContext<'_>,
+) -> Result<Value, FaucetError> {
+    use faucet_core::json_numbers::JsonNumberError;
+    match faucet_core::parse_json_exact(text, json.mode) {
+        Ok((value, inexact)) => {
+            if !inexact.is_empty()
+                && json
+                    .warned
+                    .lock()
+                    .expect("json warning mutex poisoned")
+                    .insert(column.to_string())
+            {
+                tracing::warn!(
+                    column,
+                    "MySQL column holds JSON numbers a 64-bit float cannot represent \
+                     exactly; emitting them as strings (json_big_numbers: string)"
+                );
+            }
+            Ok(value)
+        }
+        Err(JsonNumberError::Inexact(found)) => Err(FaucetError::Source(format!(
+            "MySQL column {column} holds a JSON number a 64-bit float cannot represent \
+             exactly ({}); set `json_big_numbers: string` to emit such numbers as exact \
+             strings, or cast the column in the query",
+            found[0].preview()
+        ))),
+        Err(JsonNumberError::Invalid(e)) => Err(FaucetError::Source(format!(
+            "MySQL column {column} holds invalid JSON: {e}"
+        ))),
+    }
+}
+
+/// How JSON columns are read: the `json_big_numbers` mode and the columns
+/// already warned about.
+struct JsonContext<'a> {
+    mode: faucet_core::JsonBigNumbers,
+    warned: &'a Mutex<std::collections::HashSet<String>>,
+}
+
+/// The text of a `JSON` cell (`None` for other types or NULL).
+fn mysql_json_text(raw: sqlx::mysql::MySqlValueRef<'_>) -> Option<String> {
+    use sqlx::{TypeInfo as _, ValueRef as _};
+    if raw.is_null() || !raw.type_info().name().eq_ignore_ascii_case("JSON") {
+        return None;
+    }
+    <String as sqlx::Decode<sqlx::MySql>>::decode(raw).ok()
 }
 
 /// Convert a MySQL row column value to a `serde_json::Value`.
@@ -144,12 +208,21 @@ fn mysql_value_to_json(
     row: &sqlx::mysql::MySqlRow,
     col_name: &str,
     text_columns: &std::collections::HashSet<String>,
-) -> Value {
-    // Try JSON first
-    if let Ok(v) = row.try_get::<Value, _>(col_name) {
-        return v;
+    json: &JsonContext<'_>,
+) -> Result<Value, FaucetError> {
+    if let Ok(raw) = row.try_get_raw(col_name)
+        && let Some(text) = mysql_json_text(raw)
+    {
+        return json_text_to_value(&text, col_name, json);
     }
+    Ok(mysql_scalar_to_json(row, col_name, text_columns))
+}
 
+fn mysql_scalar_to_json(
+    row: &sqlx::mysql::MySqlRow,
+    col_name: &str,
+    text_columns: &std::collections::HashSet<String>,
+) -> Value {
     // Try common scalar types
     if let Ok(v) = row.try_get::<String, _>(col_name) {
         return Value::String(v);
@@ -427,14 +500,15 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
 fn row_to_json(
     row: &sqlx::mysql::MySqlRow,
     text_columns: &std::collections::HashSet<String>,
-) -> Value {
+    json: &JsonContext<'_>,
+) -> Result<Value, FaucetError> {
     let mut map = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name().to_string();
-        let value = mysql_value_to_json(row, &name, text_columns);
+        let value = mysql_value_to_json(row, &name, text_columns, json)?;
         map.insert(name, value);
     }
-    Value::Object(map)
+    Ok(Value::Object(map))
 }
 
 /// sqlx type names of columns MySQL flags BINARY: real binary types, but also
@@ -480,7 +554,10 @@ impl faucet_core::Source for MysqlSource {
 
         let rows = bounded_read(self.config.read_timeout_secs, query.fetch_all(&self.pool)).await?;
 
-        let records: Vec<Value> = rows.iter().map(|r| row_to_json(r, &text_columns)).collect();
+        let records: Vec<Value> = rows
+            .iter()
+            .map(|r| row_to_json(r, &text_columns, &self.json_context()))
+            .collect::<Result<_, _>>()?;
         tracing::info!(rows = records.len(), query = %self.config.query, "MySQL source fetch complete");
         Ok(records)
     }
@@ -517,7 +594,7 @@ impl faucet_core::Source for MysqlSource {
             let mut total = 0usize;
 
             while let Some(row) = bounded_read(self.config.read_timeout_secs, rows.try_next()).await? {
-                buffer.push(row_to_json(&row, &text_columns));
+                buffer.push(row_to_json(&row, &text_columns, &self.json_context())?);
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
@@ -959,6 +1036,7 @@ mod tests {
             config,
             pool,
             applied_shard: Mutex::new(None),
+            json_warned: Mutex::new(Default::default()),
         }
     }
 

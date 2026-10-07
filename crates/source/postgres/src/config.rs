@@ -48,6 +48,13 @@ pub struct PostgresSourceConfig {
     /// waiting forever, and a scheduled or served run stuck in "running".
     #[serde(default = "default_read_timeout_secs")]
     pub read_timeout_secs: u64,
+    /// What to do with a number inside a JSON column that a 64-bit float
+    /// cannot represent exactly (more than about 17 significant digits, or
+    /// beyond the `u64` / `i64` range): `fail` (default) fails the read with
+    /// an error naming the column, `string` emits the number as a JSON string
+    /// holding its exact digits (with one warning per column).
+    #[serde(default)]
+    pub json_big_numbers: faucet_core::JsonBigNumbers,
 }
 
 /// Primary-key range sharding settings for the PostgreSQL source.
@@ -104,6 +111,7 @@ impl PostgresSourceConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             shard: None,
             read_timeout_secs: default_read_timeout_secs(),
+            json_big_numbers: faucet_core::JsonBigNumbers::Fail,
         }
     }
 

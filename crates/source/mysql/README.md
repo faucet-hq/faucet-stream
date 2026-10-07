@@ -71,6 +71,7 @@ faucet run pipeline.yaml
 | `batch_size` | int | `1000` | Rows per emitted `StreamPage`. **`0` = no batching** (drain the whole result set into one page). Values above `MAX_BATCH_SIZE` (1,000,000) are rejected at construction by `faucet_core::validate_batch_size`. |
 | `read_timeout_secs` | int | `3600` | Longest the source waits on the server for the next row before the read fails (`0` = forever), so a peer that vanished without closing the connection cannot hang a run. |
 | `net_write_timeout_secs` | int | `3600` | Sets the session's `net_write_timeout`: how long the server waits for the source to read more of a result. The pipeline stops reading while the sink writes a page, so the server default (60 s) aborts large extracts behind a slow sink with "Lost connection … during query". `0` keeps the server setting. |
+| `json_big_numbers` | `fail` \| `string` | `fail` | A number inside a JSON column that a 64-bit float cannot represent exactly (more than about 17 significant digits, or beyond the 64-bit integer range): `fail` fails the read with an error naming the column and the number's leading digits; `string` emits it as a JSON string holding its exact digits (one warning per column). Checked on the column's text, never after conversion. |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
 
 There is no separate `auth` block — credentials live in `connection_url` (and can be sourced from env or a secrets manager; see [Config loading](#config-loading)).
@@ -191,7 +192,7 @@ Columns are converted to JSON in order of likelihood; an unsupported or `NULL` c
 
 | MySQL type | JSON shape |
 |------------|------------|
-| `json` | native JSON value |
+| `json` | native JSON value; a number a 64-bit float cannot hold exactly (a `DECIMAL` stored in the document) fails the read, or is kept as an exact string with `json_big_numbers: string` |
 | `varchar`, `text`, `char` | string |
 | `bigint` | number (i64) |
 | `int`, `mediumint` | number (i32) |
