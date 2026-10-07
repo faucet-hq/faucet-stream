@@ -1441,6 +1441,42 @@ async fn change_requests_round_trip_and_filter() {
         .change_upsert(&mk("a", ChangeKind::Run, ChangeStatus::Pending, "bob", 30))
         .await
         .unwrap();
+    // Compare-and-set on the status (#789 SERVE-17): a writer that read
+    // `executed` loses; one that read `pending` wins exactly once.
+    let mut moved = mk("a", ChangeKind::Run, ChangeStatus::Approved, "bob", 30);
+    moved.reason = Some("cas".into());
+    assert!(
+        !store
+            .change_transition(&moved, ChangeStatus::Executed)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .change_transition(&moved, ChangeStatus::Pending)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .change_transition(&moved, ChangeStatus::Pending)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .change_get("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("cas")
+    );
+    store
+        .change_upsert(&mk("a", ChangeKind::Run, ChangeStatus::Pending, "bob", 30))
+        .await
+        .unwrap();
     store
         .change_upsert(&mk(
             "b",

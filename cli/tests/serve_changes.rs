@@ -680,3 +680,53 @@ async fn require_approval_turns_submissions_into_change_requests() {
     assert_eq!(rec["name"], "gated-run");
     assert_eq!(std::fs::read_to_string(&output).unwrap().lines().count(), 2);
 }
+
+/// #789 SERVE-38: the approvers' `change_requested` notification is built
+/// from the loaded config, so a documented `${env:…}` webhook URL resolves.
+#[cfg(feature = "notify")]
+#[tokio::test(flavor = "multi_thread")]
+async fn change_requested_notifications_resolve_env_references() {
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let hook = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("change_requested"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&hook)
+        .await;
+    unsafe { std::env::set_var("FAUCET_789_APPROVER_HOOK", format!("{}/hook", hook.uri())) };
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let config = format!(
+        "{}notifications:\n  - name: approvers\n    on: [change_requested]\n    channel:\n      type: webhook\n      config:\n        url: \"${{env:FAUCET_789_APPROVER_HOOK}}\"\n",
+        csv_config(&input, &dir.path().join("o.jsonl"), "notify-me")
+    );
+    let port = free_port();
+    spawn_server(port, dir.path(), vec!["run".into()]).await;
+    let api = Api {
+        base: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::new(),
+    };
+    let (code, resp) = api
+        .post(
+            "bob-tok",
+            "/v1/runs",
+            json!({ "config": config, "reason": "please" }),
+        )
+        .await;
+    assert_eq!(code, 202, "{resp}");
+    for _ in 0..200 {
+        if !hook
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    hook.verify().await;
+}

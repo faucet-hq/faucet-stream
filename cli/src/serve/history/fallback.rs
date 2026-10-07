@@ -477,6 +477,13 @@ impl RunHistory for FallbackHistory {
     ) -> Result<(), HistoryError> {
         strict!(self, p => p.change_upsert(change), f => f.change_upsert(change))
     }
+    async fn change_transition(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        from: crate::serve::changes::ChangeStatus,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.change_transition(change, from), f => f.change_transition(change, from))
+    }
     async fn change_get(
         &self,
         id: &str,
@@ -782,7 +789,15 @@ mod tests {
         let usage = crate::usage::UsageFilter::default();
         assert!(bare.usage_list(&usage).await.unwrap().is_empty());
 
+        let pending = crate::serve::changes::ChangeStatus::Pending;
+        assert!(
+            !bare
+                .change_transition(&change("c0"), pending)
+                .await
+                .unwrap()
+        );
         let fb = FallbackHistory::healthy(Box::new(AlwaysFail), Duration::from_secs(60), "test");
+        assert!(!fb.change_transition(&change("c1"), pending).await.unwrap());
         assert!(fb.change_get("c1").await.unwrap().is_none());
         assert!(
             fb.change_list(&Default::default())

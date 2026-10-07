@@ -1046,6 +1046,24 @@ pub trait RunHistory: Send + Sync {
         ))
     }
 
+    /// Write `change` only if the stored request is still in status `from`
+    /// (compare-and-set on the status). `Ok(false)` = someone else moved it
+    /// first. The default reads then writes, which is not atomic; the built-in
+    /// backends override it.
+    async fn change_transition(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        from: crate::serve::changes::ChangeStatus,
+    ) -> Result<bool, HistoryError> {
+        match self.change_get(&change.id).await? {
+            Some(cur) if cur.status == from => {
+                self.change_upsert(change).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// One change request by id. Default: `None`.
     async fn change_get(
         &self,

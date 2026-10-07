@@ -462,6 +462,7 @@ pub struct Stmts {
     /// Change requests (#703).
     pub change_upsert: String,
     pub change_select: String,
+    pub change_transition: String,
     pub change_delete: String,
     pub usage_delete_run: String,
     pub tenant_upsert: String,
@@ -963,6 +964,9 @@ impl Stmts {
                 expires_at=excluded.expires_at, body=excluded.body"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=$1".into(),
+            change_transition: "UPDATE faucet_serve_changes SET status=$1, expires_at=$2, \
+                body=$3 WHERE id=$4 AND status=$5"
+                .into(),
             change_delete: "DELETE FROM faucet_serve_changes WHERE id=$1".into(),
             usage_delete_run: "DELETE FROM faucet_usage WHERE run_id=$1".into(),
             tenant_upsert: "INSERT INTO faucet_tenants (id, updated_at, body) \
@@ -1374,6 +1378,9 @@ impl Stmts {
                 expires_at=excluded.expires_at, body=excluded.body"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=?".into(),
+            change_transition: "UPDATE faucet_serve_changes SET status=?, expires_at=?, \
+                body=? WHERE id=? AND status=?"
+                .into(),
             change_delete: "DELETE FROM faucet_serve_changes WHERE id=?".into(),
             usage_delete_run: "DELETE FROM faucet_usage WHERE run_id=?".into(),
             tenant_upsert: "INSERT INTO faucet_tenants (id, updated_at, body) \
@@ -3823,6 +3830,25 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
                 Ok(())
+            }
+
+            async fn change_transition(
+                &self,
+                change: &$crate::serve::changes::ChangeRequest,
+                from: $crate::serve::changes::ChangeStatus,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let done = sqlx::query(&self.stmts.change_transition)
+                    .bind(change.status.as_str())
+                    .bind(sql::fmt_ts(change.expires_at))
+                    .bind(sql::encode_json(change, "change request")?)
+                    .bind(&change.id)
+                    .bind(from.as_str())
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(done.rows_affected() == 1)
             }
 
             async fn change_get(

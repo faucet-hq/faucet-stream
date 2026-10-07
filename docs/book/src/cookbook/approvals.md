@@ -83,11 +83,27 @@ something else. A rotated secret or a live probe result is not material.
 
 Otherwise the request executes and becomes `executed` (with `run_id` or the
 template id and version) or, if execution itself errors, `failed` with the
-reason. A run carries the label `change: <id>`.
+reason. A run carries the label `change: <id>` and, unless the requester set
+one, the idempotency key `change:<id>`.
 
 `POST /v1/changes/{id}/reject` with `{ "reason": "..." }` rejects; the
 requester may reject (withdraw) their own. A pending request lapses to
 `expired` after its window (a sweep runs every minute, and reads apply it too).
+
+Every transition out of `pending` is a compare-and-set on the stored status,
+so two approvals that reach the quorum together, or an approval racing a
+rejection or the expiry sweep, cannot both win: the loser gets `409` and
+nothing runs twice. If an execution is interrupted after approval (a crash, a
+store error before `executed` was written), the same sweep finds the request
+still `approved` five minutes later and finishes it: a run is submitted again
+under its `change:<id>` key (so the original run is replayed, never doubled),
+a launch is re-applied (re-launching the live version is a no-op), and a
+registration is marked `failed` — its outcome is unknown, so check the
+template's versions before proposing it again.
+
+A `change_requested` notification is built from the proposed config as it
+loads — `${env:…}` webhook URLs resolve and the `--default-config` base
+applies — exactly as the run would see it.
 
 ## Who may approve
 

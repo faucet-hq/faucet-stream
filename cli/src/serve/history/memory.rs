@@ -746,6 +746,22 @@ impl RunHistory for MemoryHistory {
         Ok(())
     }
 
+    async fn change_transition(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        from: crate::serve::changes::ChangeStatus,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self
+            .changes
+            .lock()
+            .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?;
+        if map.get(&change.id).map(|c| c.status) != Some(from) {
+            return Ok(false);
+        }
+        map.insert(change.id.clone(), change.clone());
+        Ok(true)
+    }
+
     async fn change_get(
         &self,
         id: &str,
