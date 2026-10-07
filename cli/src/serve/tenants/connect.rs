@@ -459,7 +459,14 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
         source_ip: None,
         tenant: Some(session.tenant.clone()),
     };
-    crate::serve::audit::write(state, &actor, "connect.complete", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        state,
+        &actor,
+        "connect.complete",
+        format!("connection:{}/{}", session.tenant, session.connection),
+        "ok",
+    )
+    .await;
     Ok(())
 }
 

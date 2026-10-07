@@ -679,6 +679,26 @@ async fn require_approval_turns_submissions_into_change_requests() {
     assert_eq!(rec["status"], "completed", "{rec}");
     assert_eq!(rec["name"], "gated-run");
     assert_eq!(std::fs::read_to_string(&output).unwrap().lines().count(), 2);
+
+    // The audit log names what each action touched (#789 SERVE-32).
+    let (_, audit) = api.get("admin-tok", "/v1/audit?limit=200").await;
+    let entries = audit["entries"]
+        .as_array()
+        .or_else(|| audit.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["action"] == "template.register" && e["target"] == "template:tpl-gated@1"),
+        "{audit}"
+    );
+    assert!(
+        entries.iter().any(|e| e["action"] == "mcp"
+            && e["target"] == "mcp:run_template"
+            && e["principal"] == "bob"),
+        "{audit}"
+    );
 }
 
 /// #789 SERVE-38: the approvers' `change_requested` notification is built

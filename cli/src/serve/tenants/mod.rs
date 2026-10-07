@@ -674,7 +674,14 @@ pub async fn mark_needs_reauth(state: &ServerState, tenant: &str, name: &str, re
     metrics::refresh_connection_gauges(state).await;
     let mut actor = AuthContext::system("tenants");
     actor.tenant = Some(tenant.to_string());
-    crate::serve::audit::write(state, &actor, "connection.needs_reauth", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        state,
+        &actor,
+        "connection.needs_reauth",
+        format!("connection:{tenant}/{name}"),
+        "ok",
+    )
+    .await;
     notify_tenant(
         state,
         tenant,

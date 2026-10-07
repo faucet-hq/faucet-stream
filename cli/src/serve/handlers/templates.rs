@@ -135,12 +135,13 @@ pub async fn register_template(
         version = record.version,
         "registered pipeline template"
     );
-    crate::serve::audit::write(
+    crate::serve::audit::record(
         &state,
         &actor,
         "template.register",
         None,
         Some(fingerprint),
+        Some(format!("template:{}@{}", record.id, record.version)),
         "ok",
     )
     .await;
@@ -573,7 +574,17 @@ pub async fn delete_template(
         removed,
         "deleted pipeline template version(s)"
     );
-    crate::serve::audit::write(&state, &actor, "template.delete", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        &state,
+        &actor,
+        "template.delete",
+        match target {
+            Some(v) => format!("template:{id}@{v}"),
+            None => format!("template:{id}"),
+        },
+        "ok",
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -627,7 +638,14 @@ pub async fn promote_template(
         version,
         "promoted pipeline template channel"
     );
-    crate::serve::audit::write(&state, &actor, "template.promote", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        &state,
+        &actor,
+        "template.promote",
+        format!("template:{id}@{version}#{}", body.tag.as_str()),
+        "ok",
+    )
+    .await;
     Ok(Json(PromoteResponse {
         id,
         tag: body.tag.as_str().to_string(),
@@ -714,7 +732,14 @@ async fn finish_launch(
         action,
         "pipeline template launch"
     );
-    crate::serve::audit::write(state, actor, action, None, None, "ok").await;
+    crate::serve::audit::write_target(
+        state,
+        actor,
+        action,
+        format!("template:{id}@{}", outcome.version),
+        "ok",
+    )
+    .await;
     Ok(Json(LaunchResponse {
         id: id.to_string(),
         version: outcome.version,
@@ -766,7 +791,7 @@ pub async fn deprecate_template(
         status = status.as_str(),
         "pipeline template deprecation changed"
     );
-    crate::serve::audit::write(&state, &actor, action, None, None, "ok").await;
+    crate::serve::audit::write_target(&state, &actor, action, format!("template:{id}"), "ok").await;
     Ok(Json(
         serde_json::json!({ "id": id, "status": status.as_str() }),
     ))
@@ -805,12 +830,11 @@ pub async fn deprecate_version(
         deprecated = !body.undo,
         "pipeline template version deprecation changed"
     );
-    crate::serve::audit::write(
+    crate::serve::audit::write_target(
         &state,
         &actor,
         "template.version_deprecate",
-        None,
-        None,
+        format!("template:{id}@{version}"),
         "ok",
     )
     .await;
@@ -2490,6 +2514,7 @@ pub async fn sync_templates(
             ],
         )?;
     }
+    let sync_origin = body.origin.clone();
     let results = crate::templates::sync::sync_all(
         &store(&state),
         &file,
@@ -2522,7 +2547,14 @@ pub async fn sync_templates(
         dry_run = body.dry_run,
         "template sync requested"
     );
-    crate::serve::audit::write(&state, &actor, "template.sync", None, None, result).await;
+    crate::serve::audit::write_target(
+        &state,
+        &actor,
+        "template.sync",
+        format!("origin:{}", sync_origin.as_deref().unwrap_or("*")),
+        result,
+    )
+    .await;
     Ok(Json(SyncResponse {
         dry_run: body.dry_run,
         reports,
@@ -2562,6 +2594,13 @@ pub async fn publish_template(
         origin = %report.origin,
         "template published"
     );
-    crate::serve::audit::write(&state, &actor, "template.publish", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        &state,
+        &actor,
+        "template.publish",
+        format!("template:{id}@{}", report.version),
+        "ok",
+    )
+    .await;
     Ok(Json(report))
 }

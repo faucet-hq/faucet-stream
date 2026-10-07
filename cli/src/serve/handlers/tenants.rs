@@ -350,12 +350,11 @@ async fn store_connection(
     };
     history.connection_upsert(&rec).await.map_err(store_err)?;
     tenants::metrics::refresh_connection_gauges(state).await;
-    crate::serve::audit::write(
+    crate::serve::audit::write_target(
         state,
         &for_tenant(actor, tenant),
         "connection.upsert",
-        None,
-        None,
+        format!("connection:{tenant}/{name}"),
         "ok",
     )
     .await;
@@ -426,12 +425,11 @@ pub async fn delete_connection(
         return Err(ServeError::NotFound);
     }
     tenants::metrics::refresh_connection_gauges(&state).await;
-    crate::serve::audit::write(
+    crate::serve::audit::write_target(
         &state,
         &for_tenant(&actor, &tenant),
         "connection.delete",
-        None,
-        None,
+        format!("connection:{tenant}/{name}"),
         "ok",
     )
     .await;

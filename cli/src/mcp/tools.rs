@@ -787,6 +787,16 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
     Ok(pretty(&doc))
 }
 
+#[cfg(feature = "templates")]
+/// Who a lifecycle change is attributed to: the calling principal on
+/// `faucet serve --mcp` (#789 SERVE-32), `mcp` on the local stdio transport.
+fn actor_name(ctx: &McpContext) -> String {
+    ctx.server
+        .as_ref()
+        .map(|s| s.actor.principal.clone())
+        .unwrap_or_else(|| "mcp".to_string())
+}
+
 fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
@@ -917,7 +927,7 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
                 .map(str::to_string),
             tags: tags_arg(args)?,
             launch: args.get("launch").and_then(Value::as_bool).unwrap_or(false),
-            created_by: Some("mcp".to_string()),
+            created_by: Some(actor_name(ctx)),
         },
     )
     .await
@@ -936,7 +946,7 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
         None | Some(Value::Null) => VersionSelector::newest(),
         Some(_) => version_arg(args)?,
     };
-    let outcome = crate::templates::launch(store, id, target, Some("mcp"))
+    let outcome = crate::templates::launch(store, id, target, Some(&actor_name(ctx)))
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
@@ -952,7 +962,7 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
 async fn rollback_template(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let store = template_store(ctx)?;
     let id = str_arg(args, "id")?;
-    let outcome = crate::templates::rollback(store, id, Some("mcp"))
+    let outcome = crate::templates::rollback(store, id, Some(&actor_name(ctx)))
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
@@ -971,7 +981,7 @@ async fn deprecate_template(ctx: &McpContext, args: &Value) -> Result<String, St
         .get("reason")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let status = crate::templates::set_deprecated(store, id, reason, Some("mcp"), !undo)
+    let status = crate::templates::set_deprecated(store, id, reason, Some(&actor_name(ctx)), !undo)
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({ "id": id, "status": status.as_str() })))

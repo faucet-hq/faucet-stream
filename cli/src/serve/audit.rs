@@ -18,6 +18,31 @@ pub async fn write(
     config_fingerprint: Option<String>,
     result: &str,
 ) {
+    record(state, ctx, action, run_id, config_fingerprint, None, result).await;
+}
+
+/// [`write`] naming what the action was taken on (`template:<id>@<version>`,
+/// `connection:<tenant>/<name>`, `mcp:<tool>`, …).
+pub async fn write_target(
+    state: &ServerState,
+    ctx: &AuthContext,
+    action: &str,
+    target: String,
+    result: &str,
+) {
+    record(state, ctx, action, None, None, Some(target), result).await;
+}
+
+/// [`write`] with every field (run id, fingerprint and target).
+pub async fn record(
+    state: &ServerState,
+    ctx: &AuthContext,
+    action: &str,
+    run_id: Option<String>,
+    config_fingerprint: Option<String>,
+    target: Option<String>,
+    result: &str,
+) {
     let entry = AuditEntry {
         id: uuid::Uuid::now_v7().to_string(),
         timestamp: chrono::Utc::now(),
@@ -28,6 +53,7 @@ pub async fn write(
         config_fingerprint,
         source_ip: ctx.source_ip.clone(),
         tenant: ctx.tenant.clone(),
+        target,
         result: result.to_string(),
     };
     if let Err(e) = state.history().record_audit(&entry).await {

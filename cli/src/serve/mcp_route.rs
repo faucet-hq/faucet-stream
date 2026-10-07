@@ -73,8 +73,34 @@ pub async fn handle(
     };
     let response = crate::mcp::handle_message(&ctx, &body).await;
 
-    // Best-effort audit: record the MCP call under the caller's principal/role.
-    crate::serve::audit::write(&state, &actor, "mcp", None, None, "ok").await;
+    // Best-effort audit under the caller's principal/role: a tool call names
+    // the tool and whether it failed (#789 SERVE-32).
+    let tool = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .filter(|v| v.get("method").and_then(|m| m.as_str()) == Some("tools/call"))
+        .and_then(|v| {
+            v.pointer("/params/name")
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+        });
+    match tool {
+        Some(name) => {
+            let failed = response
+                .as_deref()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+                .and_then(|r| r.pointer("/result/isError").and_then(|e| e.as_bool()))
+                .unwrap_or(false);
+            crate::serve::audit::write_target(
+                &state,
+                &actor,
+                "mcp",
+                format!("mcp:{name}"),
+                if failed { "error" } else { "ok" },
+            )
+            .await;
+        }
+        None => crate::serve::audit::write(&state, &actor, "mcp", None, None, "ok").await,
+    }
 
     match response {
         Some(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
@@ -238,11 +264,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.action == "mcp" && e.principal == "tester")
-        );
+        assert!(entries.iter().any(|e| e.action == "mcp"
+            && e.principal == "tester"
+            && e.target.as_deref() == Some("mcp:list_connectors")
+            && e.result == "ok"));
     }
 
     #[tokio::test]

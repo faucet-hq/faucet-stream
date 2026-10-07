@@ -1515,6 +1515,7 @@ mod tests {
                 config_fingerprint: None,
                 source_ip: None,
                 tenant: None,
+                target: None,
                 result: result.into(),
             };
         h.record_audit(&entry(

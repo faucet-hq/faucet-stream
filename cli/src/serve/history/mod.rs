@@ -499,6 +499,10 @@ pub struct AuditEntry {
     /// The tenant the action was taken for (#709).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// What the action was taken on (#789 SERVE-32): `template:<id>@<version>`,
+    /// `connection:<tenant>/<name>`, `mcp:<tool>`, …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// Outcome: `"ok"` (action performed) or `"denied"` (403 — insufficient role).
     pub result: String,
 }

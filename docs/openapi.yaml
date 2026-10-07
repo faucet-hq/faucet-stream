@@ -2831,10 +2831,11 @@ components:
         role: { type: string, enum: [viewer, operator, admin] }
         action: { type: string, description: "e.g. run.submit / run.cancel / run.delete / trigger.fire / <route> (denials)." }
         tenant: { type: string, description: "The tenant the action was taken for (#709)." }
+        target: { type: string, nullable: true, description: "What the action was taken on: template:<id>@<version>, template:<id>, connection:<tenant>/<name>, origin:<name>, mcp:<tool>." }
         run_id: { type: string, nullable: true }
         config_fingerprint: { type: string, nullable: true, description: "sha256 of the merged config (submit actions)." }
         source_ip: { type: string, nullable: true }
-        result: { type: string, enum: [ok, denied] }
+        result: { type: string, description: "ok, denied, or an action-specific outcome (error for a failed MCP tool call)." }
       example:
         id: orders_to_warehouse
         timestamp: '2026-01-01T00:00:00Z'

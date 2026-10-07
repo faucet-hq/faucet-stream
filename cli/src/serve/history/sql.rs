@@ -24,7 +24,7 @@ use std::time::Duration;
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Columns added to a table after it first shipped, with the schema version
 /// that added them. `CREATE TABLE IF NOT EXISTS` never alters an existing
@@ -33,6 +33,7 @@ pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (1, "faucet_serve_runs", "cancel_requested"),
     (2, "faucet_usage", "tenant"),
     (2, "faucet_serve_changes", "tenant"),
+    (3, "faucet_serve_audit", "target"),
 ];
 
 /// DDL that needs the [`ADDED_COLUMNS`] in place (indexes on them).
@@ -289,7 +290,8 @@ pub const DDL: &[&str] = &[
         run_id TEXT,\
         config_fingerprint TEXT,\
         source_ip TEXT,\
-        result TEXT NOT NULL)",
+        result TEXT NOT NULL,\
+        target TEXT)",
     "CREATE INDEX IF NOT EXISTS faucet_serve_audit_ts_idx \
         ON faucet_serve_audit (ts)",
     // The tenant an audited action was taken for (#709) — a companion table
@@ -1172,11 +1174,11 @@ impl Stmts {
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
                 .into(),
             insert_audit: "INSERT INTO faucet_serve_audit \
-                (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result) \
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"
+                (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result, \
+                target) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
                 .into(),
             list_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
-                config_fingerprint, source_ip, result, t.tenant AS tenant \
+                config_fingerprint, source_ip, result, a.target AS target, t.tenant AS tenant \
                 FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
                 WHERE ($1::text IS NULL OR principal = $2::text) \
                 AND ($3::text IS NULL OR action = $4::text) \
@@ -1596,11 +1598,11 @@ impl Stmts {
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
                 .into(),
             insert_audit: "INSERT INTO faucet_serve_audit \
-                (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result) \
-                VALUES (?,?,?,?,?,?,?,?,?)"
+                (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result, \
+                target) VALUES (?,?,?,?,?,?,?,?,?,?)"
                 .into(),
             list_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
-                config_fingerprint, source_ip, result, t.tenant AS tenant \
+                config_fingerprint, source_ip, result, a.target AS target, t.tenant AS tenant \
                 FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
                 WHERE (? IS NULL OR principal = ?) \
                 AND (? IS NULL OR action = ?) \
@@ -3303,6 +3305,7 @@ macro_rules! impl_sql_history {
                     .bind(entry.config_fingerprint.as_deref())
                     .bind(entry.source_ip.as_deref())
                     .bind(&entry.result)
+                    .bind(entry.target.as_deref())
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
@@ -3362,6 +3365,7 @@ macro_rules! impl_sql_history {
                         config_fingerprint: r.try_get("config_fingerprint").map_err(backend)?,
                         source_ip: r.try_get("source_ip").map_err(backend)?,
                         tenant: r.try_get("tenant").map_err(backend)?,
+                        target: r.try_get("target").map_err(backend)?,
                         result: r.try_get("result").map_err(backend)?,
                     });
                 }

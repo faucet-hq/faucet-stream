@@ -288,6 +288,7 @@ mod shard_tests {
                 config_fingerprint: Some("fp".into()),
                 source_ip: Some("127.0.0.1".into()),
                 tenant: None,
+                target: Some(format!("t:{id}")),
                 result: result.into(),
             };
         h.record_audit(&entry("1", "alice", "run.submit", "ok", 3))
@@ -312,6 +313,7 @@ mod shard_tests {
         assert_eq!(all[0].id, "3");
         assert_eq!(all[0].run_id.as_deref(), Some("r-3"));
         assert_eq!(all[0].source_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(all[0].target.as_deref(), Some("t:3"));
 
         // Filters.
         let alice = h
