@@ -128,7 +128,7 @@ column_mapping:
 
 | `tls.type` | Encryption | Use when |
 |-----------|------------|----------|
-| `prefer` | Encrypt if the server supports it (the safe modern default). | General use — the recommended default. |
+| `prefer` | Encrypt; fails against a server that offers no TLS (same as `require`). | General use — the recommended default. |
 | `require` | Require encryption; fail if the server doesn't offer it. | Production where encryption is mandatory. |
 | `trust_server_certificate` | Encrypt but accept the server certificate without validating its chain. | **Dev/test only** — insecure against MITM. |
 | `disable` | No transport encryption. | Trusted local networks only. |
@@ -226,9 +226,12 @@ sink:
 Build with the crate's `staging` feature (CLI: `--features sink-mssql-staging`,
 in `full`). **Azure only** (`az://…`), **CSV only**, and **`write_mode: append`
 only**: `COPY INTO` loads straight into the target table, so `overwrite`, `upsert`
-and `delete` are refused at load time (`faucet validate` reports it). `COPY INTO` maps CSV columns
-by **position**, so the target table's column order must match the staged CSV —
-align the table (or stage a matching column subset). The load SQL/URL generation
+and `delete` are refused at load time (`faucet validate` reports it), as is
+`column_mapping: json_column` (the CSV carries record fields, not one JSON
+column). `COPY INTO` maps CSV fields by position, so the statement names the
+target columns in the staged CSV's header order (the union of the page's keys);
+a page lacking an optional field simply leaves that column out, and a field with
+no column fails the load. The load SQL/URL generation
 is unit-tested; the server-side `COPY INTO` requires a live SQL Server/Synapse +
 Azure storage and is not exercised in CI (same as the other staged-load sinks).
 
@@ -240,13 +243,13 @@ In addition to the default append, the sink can **upsert** (insert-or-update by 
 - **`delete`** — every record's `key` is collected and deleted via `MERGE … WHEN MATCHED THEN DELETE` (T-SQL has no row-constructor `IN ((a,b), …)`), so single- and multi-column keys share one code path.
 - **`delete_marker`** (upsert mode only) — rows whose `field` equals one of `values` are routed to a delete instead of an upsert; the marker field is stripped from the upserted record. This lets a CDC stream carrying an operation flag drive inserts, updates, and deletes from one pipeline.
 
-A row missing or null in a key column fails with a clear `mssql upsert: …` error. With a `dlq:` block configured, the good rows still apply (upserts + deletes) and only the missing/null-key rows are routed to the DLQ per-row; without a DLQ the whole batch fails. Upserts and deletes for a batch always run inside a single `BEGIN TRAN` / `COMMIT TRAN`.
+A row missing or null in a key column fails with a clear `mssql upsert: …` error. With a `dlq:` block configured, the good rows still apply (upserts + deletes) and only the missing/null-key rows are routed to the DLQ per-row; without a DLQ the whole batch fails. Upserts and deletes for a batch always run inside a single `BEGIN TRAN` / `COMMIT TRAN`, applied in page order (a run of upserts, then the following run of deletes, and so on), so a delete followed by an upsert of a key equal under the column collation (`'Bob'` / `'bob'` with a `_CI_` collation) leaves the row in place.
 
 See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) for the full write-mode model.
 
 ## Dead-letter queue (partial failures)
 
-With `isolate_row_failures: true` (default), a batch that fails is rolled back and retried one row at a time: the good rows land and only the offending row is returned as an error for dead-letter routing under the pipeline's `dlq:` block. Transient errors (deadlock, lock-timeout, connection drops) are retried with backoff and otherwise propagated so the pipeline's `on_batch_error` policy decides. Set `isolate_row_failures: false` to fail the whole batch on the first bad row (fewer round-trips, no row isolation).
+With `isolate_row_failures: true` (default), a batch that fails is rolled back and retried one row at a time: the good rows land and only the offending row is returned as an error for dead-letter routing under the pipeline's `dlq:` block. Only errors about the row's data blame a row (conversion/overflow, truncation, `NULL` into `NOT NULL`, constraint/duplicate-key violations, invalid JSON); every other server error — log or filegroup full, missing object, permissions, memory — fails the batch instead of quarantining the whole stream while the bookmark advances. Transient errors (deadlock, lock-timeout, connection drops) are retried with backoff and otherwise propagated so the pipeline's `on_batch_error` policy decides. Set `isolate_row_failures: false` to fail the whole batch on the first bad row (fewer round-trips, no row isolation).
 
 ## Effectively-once delivery
 
@@ -407,10 +410,13 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 ## Overwrite (`write_mode: overwrite`)
 
 Full-refresh: each run atomically **replaces** the whole table. Writes are
-staged into a `SELECT … INTO … WHERE 1=0` clone (`{table}__faucet_ovw`) and
-swapped in one transaction (`DELETE` + `INSERT` over the explicit non-IDENTITY
-column list + `DROP`) only after the run succeeds, so a mid-run failure leaves
-the previous rows intact. No `key` is needed; the target table must already
+staged into a `SELECT … INTO` clone (`{table}__faucet_ovw`, built through a
+`UNION` so it has no `IDENTITY` property and the identity column nullable) and
+swapped in one transaction only after the run succeeds, so a mid-run failure
+leaves the previous rows intact. The swap's column list comes from the target:
+computed and `rowversion` columns are never copied; the identity column is
+copied with `SET IDENTITY_INSERT … ON` where a record supplied it (so identity
+values survive the overwrite) and generated by the target where it did not. No `key` is needed; the target table must already
 exist.
 
 

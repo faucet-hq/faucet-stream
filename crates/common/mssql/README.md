@@ -38,10 +38,12 @@ This is an internal building block. It holds the configuration the MSSQL [source
 
 | Mode | `tiberius` encryption | Notes |
 |------|-----------------------|-------|
-| `prefer` (default) | `On` | Encrypt the connection — the safe modern default. |
+| `prefer` (default) | `Required` | Encrypt the connection; fails against a server that offers no TLS (same as `require` — tiberius cannot fall back to plaintext without panicking). |
 | `require` | `Required` | Fail if the server does not offer TLS. |
-| `trust_server_certificate` | `On` + `trust_cert()` | Accepts self-signed certs. **Insecure against MITM — dev only.** |
+| `trust_server_certificate` | `Required` + `trust_cert()` | Accepts self-signed certs. **Insecure against MITM — dev only.** Cannot be combined with `ca_cert_path` (a config error). |
 | `disable` | `NotSupported` | No transport encryption. |
+
+Pooled connections set TCP keepalive (first probe after 60 s idle, then every 15 s), so a server that vanishes without a reset fails the read instead of hanging a query, a row stream or a control statement.
 
 ### Authentication
 

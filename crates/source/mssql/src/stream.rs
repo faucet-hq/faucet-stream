@@ -224,7 +224,14 @@ fn descriptors_from_catalog(
             flush(current.take(), &mut out);
             current = Some((schema, table, Vec::new()));
         }
-        let mut fragment = faucet_core::sql_type_to_json_schema(&data_type);
+        // DECIMAL/NUMERIC/MONEY are emitted as exact decimal strings.
+        let exact_decimal = ["decimal", "numeric", "money", "smallmoney"]
+            .contains(&data_type.to_ascii_lowercase().as_str());
+        let mut fragment = if exact_decimal {
+            serde_json::json!({ "type": "string" })
+        } else {
+            faucet_core::sql_type_to_json_schema(&data_type)
+        };
         if is_nullable {
             fragment = faucet_core::nullable_type(fragment);
         }
@@ -234,6 +241,27 @@ fn descriptors_from_catalog(
     }
     flush(current, &mut out);
     out
+}
+
+/// The next item of a row stream, failing when none arrives within `idle`:
+/// `statement_timeout_secs` bounds every wait for a row, not only the first.
+async fn next_row<S, T, E>(stream: &mut S, idle: Option<Duration>) -> Result<Option<T>, FaucetError>
+where
+    S: futures::TryStream<Ok = T, Error = E> + Unpin,
+    E: std::fmt::Display,
+{
+    let next = match idle {
+        Some(t) => tokio::time::timeout(t, stream.try_next())
+            .await
+            .map_err(|_| {
+                FaucetError::Source(format!(
+                    "MSSQL row stream: no row within statement_timeout_secs ({}s)",
+                    t.as_secs()
+                ))
+            })?,
+        None => stream.try_next().await,
+    };
+    next.map_err(|e| FaucetError::Source(format!("MSSQL row stream failed: {e}")))
 }
 
 /// Derive a default state-store key from the connection host + a query
@@ -327,11 +355,8 @@ impl Source for MssqlSource {
             let mut running_max: Option<Value> = None;
             let mut total = 0usize;
 
-            while let Some(item) = stream
-                .try_next()
-                .await
-                .map_err(|e| FaucetError::Source(format!("MSSQL row stream failed: {e}")))?
-            {
+            let idle = self.timeout();
+            while let Some(item) = next_row(&mut stream, idle).await? {
                 let QueryItem::Row(row) = item else { continue };
                 buffer.push(row_to_json(&row)?);
                 if buffer.len() >= chunk {
@@ -897,6 +922,22 @@ mod tests {
         assert_eq!(running, None);
     }
 
+    #[tokio::test]
+    async fn next_row_bounds_every_wait() {
+        let mut ready = futures::stream::iter(vec![Ok::<u8, String>(1), Err("boom".into())]);
+        assert_eq!(next_row(&mut ready, None).await.unwrap(), Some(1));
+        let err = next_row(&mut ready, Some(Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert_eq!(next_row(&mut ready, None).await.unwrap(), None);
+        let mut stuck = futures::stream::pending::<Result<u8, String>>();
+        let err = next_row(&mut stuck, Some(Duration::from_millis(10)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no row within"), "{err}");
+    }
+
     #[test]
     fn default_state_key_is_stable_and_valid() {
         let cfg = full_cfg();
@@ -1016,7 +1057,8 @@ mod tests {
         assert_eq!(ds[1].estimated_rows, None, "missing estimate = no field");
         assert_eq!(
             ds[1].schema.as_ref().unwrap()["properties"]["total"]["type"],
-            "number"
+            "string",
+            "decimal is emitted as exact text"
         );
     }
 

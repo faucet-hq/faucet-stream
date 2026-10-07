@@ -401,7 +401,8 @@ async fn discover_enumerates_tables_with_schemas() {
     assert_eq!(schema["properties"]["id"]["type"], "integer");
     assert_eq!(
         schema["properties"]["total"]["type"],
-        serde_json::json!(["number", "null"])
+        serde_json::json!(["string", "null"]),
+        "DECIMAL is emitted as exact text"
     );
     assert_eq!(
         schema["properties"]["note"]["type"],
