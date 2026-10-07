@@ -65,7 +65,15 @@ mod docker {
         let container = Nats::default().start().await.expect("nats container start");
         let host = container.get_host().await.expect("nats host");
         let port = container.get_host_port_ipv4(4222).await.expect("nats port");
-        (container, format!("nats://{host}:{port}"))
+        let url = format!("nats://{host}:{port}");
+        // The mapped port can refuse connections for a moment after start.
+        for _ in 0..50 {
+            if async_nats::connect(&url).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        (container, url)
     }
 
     async fn publish_json(server: &str, subject: &str, count: usize) {
@@ -122,6 +130,65 @@ mod docker {
         assert!(peak < N, "buffered everything into one page");
     }
 
+    /// #789 MSG-39: a binary payload arrives intact under `value_format:
+    /// bytes`, fails loudly under the default instead of turning into U+FFFD
+    /// text, and the dataset URI never carries URL credentials.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn binary_payloads_survive_and_credentials_stay_out_of_lineage() {
+        let (_container, server) = start_nats().await;
+        let run = |format: faucet_source_nats::NatsValueFormat, subject: &'static str| {
+            let server = server.clone();
+            async move {
+                let mut cfg = NatsSourceConfig::new(subject);
+                cfg.connection.servers = vec![server.clone()];
+                cfg.max_messages = Some(1);
+                cfg.idle_timeout_secs = Some(10);
+                cfg.value_format = format;
+                let source = NatsSource::new(cfg).await.expect("source new");
+                let publisher = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let client = async_nats::connect(&server).await.expect("connect");
+                    client
+                        .publish(subject.to_string(), vec![0xff_u8, 0xfe, 0x00].into())
+                        .await
+                        .expect("publish");
+                    client.flush().await.expect("flush");
+                });
+                let ctx = std::collections::HashMap::new();
+                let mut stream = source.stream_pages(&ctx, 10);
+                let mut out = Vec::new();
+                while let Some(page) = stream.next().await {
+                    match page {
+                        Ok(p) => out.extend(p.records),
+                        Err(e) => {
+                            publisher.await.expect("publisher");
+                            return Err(e.to_string());
+                        }
+                    }
+                }
+                publisher.await.expect("publisher");
+                Ok(out)
+            }
+        };
+        let got = run(faucet_source_nats::NatsValueFormat::Bytes, "bin.bytes")
+            .await
+            .unwrap();
+        assert_eq!(got, vec![serde_json::json!("//4A")]);
+        let err = run(faucet_source_nats::NatsValueFormat::Auto, "bin.auto")
+            .await
+            .unwrap_err();
+        assert!(err.contains("value_format: bytes"), "{err}");
+
+        let mut cfg = NatsSourceConfig::new("s");
+        cfg.connection.servers = vec![server.replace("nats://", "nats://user:pw@")];
+        let source = NatsSource::new(cfg).await.expect("source new");
+        let uri = source.dataset_uri();
+        assert!(
+            !uri.contains("pw") && uri.starts_with("nats://") && !uri.contains("nats://nats"),
+            "{uri}"
+        );
+    }
+
     async fn start_jetstream() -> (testcontainers::ContainerAsync<Nats>, String) {
         use testcontainers::ImageExt;
         use testcontainers_modules::nats::NatsServerCmd;
@@ -133,7 +200,15 @@ mod docker {
             .expect("nats jetstream container start");
         let host = container.get_host().await.expect("nats host");
         let port = container.get_host_port_ipv4(4222).await.expect("nats port");
-        (container, format!("nats://{host}:{port}"))
+        let url = format!("nats://{host}:{port}");
+        // The mapped port can refuse connections for a moment after start.
+        for _ in 0..50 {
+            if async_nats::connect(&url).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        (container, url)
     }
 
     async fn drain(source: &NatsSource) -> Vec<serde_json::Value> {

@@ -11,7 +11,7 @@
 //! Both drain until `max_messages` or `idle_timeout_secs` fires, buffering up to
 //! `batch_size` records per [`StreamPage`] so memory stays bounded.
 
-use crate::config::NatsSourceConfig;
+use crate::config::{NatsSourceConfig, NatsValueFormat};
 use async_trait::async_trait;
 use faucet_core::lease::LeaseExtender;
 use faucet_core::{FaucetError, Source, Stream, StreamPage};
@@ -53,12 +53,40 @@ impl NatsSource {
     }
 }
 
-/// Parse a raw NATS payload into a JSON record: valid JSON is passed through,
-/// anything else becomes a JSON string of the (lossy) UTF-8 text.
-fn payload_to_value(payload: &[u8]) -> Value {
-    match serde_json::from_slice::<Value>(payload) {
-        Ok(v) => v,
-        Err(_) => Value::String(String::from_utf8_lossy(payload).into_owned()),
+/// Decode a raw NATS payload per `format`. Never lossy: a payload the format
+/// cannot represent is an error naming the subject (#789 MSG-39).
+fn payload_to_value(
+    payload: &[u8],
+    format: NatsValueFormat,
+    subject: &str,
+) -> Result<Value, FaucetError> {
+    let not_utf8 = |e: std::str::Utf8Error| {
+        FaucetError::Source(format!(
+            "nats: a message on '{subject}' is not valid UTF-8 ({e}); set `value_format: bytes` \
+             to receive binary payloads base64-encoded"
+        ))
+    };
+    match format {
+        NatsValueFormat::Auto => match serde_json::from_slice::<Value>(payload) {
+            Ok(v) => Ok(v),
+            Err(_) => std::str::from_utf8(payload)
+                .map(|s| Value::String(s.to_string()))
+                .map_err(not_utf8),
+        },
+        NatsValueFormat::Json => serde_json::from_slice(payload).map_err(|e| {
+            FaucetError::Source(format!(
+                "nats: a message on '{subject}' is not valid JSON: {e}"
+            ))
+        }),
+        NatsValueFormat::String => std::str::from_utf8(payload)
+            .map(|s| Value::String(s.to_string()))
+            .map_err(not_utf8),
+        NatsValueFormat::Bytes => {
+            use base64::Engine as _;
+            Ok(Value::String(
+                base64::engine::general_purpose::STANDARD.encode(payload),
+            ))
+        }
     }
 }
 
@@ -107,6 +135,7 @@ impl Source for NatsSource {
         let cap = if batch_size == 0 { 1024 } else { batch_size };
         let max_messages = self.config.max_messages.unwrap_or(usize::MAX);
         let idle = self.config.idle_timeout_secs.map(Duration::from_secs);
+        let format = self.config.value_format;
         let poll_fallback = Duration::from_millis(500);
 
         Box::pin(async_stream::try_stream! {
@@ -175,10 +204,17 @@ impl Source for NatsSource {
                         next = tokio::time::timeout(budget, messages.next()) => match next {
                             Ok(Some(Ok(msg))) => {
                                 last_at = Instant::now();
-                                let record = payload_to_value(&msg.payload);
-                                page_msgs.push(msg);
-                                hold(&page_msgs, &to_ack);
-                                Polled::Record(record)
+                                match payload_to_value(&msg.payload, format, &msg.subject) {
+                                    Ok(record) => {
+                                        page_msgs.push(msg);
+                                        hold(&page_msgs, &to_ack);
+                                        Polled::Record(record)
+                                    }
+                                    Err(e) => {
+                                        fatal = Some(e);
+                                        Polled::Idle
+                                    }
+                                }
                             }
                             Ok(Some(Err(e))) => {
                                 fatal = Some(FaucetError::Source(format!("nats jetstream recv: {e}")));
@@ -257,6 +293,7 @@ impl Source for NatsSource {
                 loop {
                     let (budget, deadline) = poll_budget(idle, last_at, poll_fallback);
                     let mut stop = false;
+                    let mut fatal: Option<FaucetError> = None;
 
                     let polled = tokio::select! {
                         biased;
@@ -267,12 +304,22 @@ impl Source for NatsSource {
                         next = tokio::time::timeout(budget, sub.next()) => match next {
                             Ok(Some(msg)) => {
                                 last_at = Instant::now();
-                                Polled::Record(payload_to_value(&msg.payload))
+                                match payload_to_value(&msg.payload, format, &msg.subject) {
+                                    Ok(record) => Polled::Record(record),
+                                    Err(e) => {
+                                        fatal = Some(e);
+                                        Polled::Idle
+                                    }
+                                }
                             }
                             Ok(None) => Polled::Closed,
                             Err(_elapsed) => Polled::Idle,
                         }
                     };
+
+                    if let Some(e) = fatal {
+                        Err(e)?;
+                    }
 
                     match polled {
                         Polled::Record(record) => {
@@ -321,14 +368,7 @@ impl Source for NatsSource {
     }
 
     fn dataset_uri(&self) -> String {
-        let server = self
-            .config
-            .connection
-            .servers
-            .first()
-            .map(String::as_str)
-            .unwrap_or("unknown");
-        format!("nats://{server}?subject={}", self.config.subject)
+        faucet_common_nats::dataset_uri(&self.config.connection.servers, &self.config.subject)
     }
 }
 
@@ -397,23 +437,46 @@ mod tests {
         );
     }
 
+    fn decode(payload: &[u8], format: NatsValueFormat) -> Result<Value, FaucetError> {
+        payload_to_value(payload, format, "s.x")
+    }
+
     #[test]
     fn payload_json_passthrough() {
-        let v = payload_to_value(br#"{"id":1,"name":"a"}"#);
+        let v = decode(br#"{"id":1,"name":"a"}"#, NatsValueFormat::Auto).unwrap();
         assert_eq!(v["id"], 1);
         assert_eq!(v["name"], "a");
     }
 
     #[test]
     fn payload_non_json_becomes_string() {
-        let v = payload_to_value(b"hello world");
+        let v = decode(b"hello world", NatsValueFormat::Auto).unwrap();
         assert_eq!(v, Value::String("hello world".into()));
     }
 
     #[test]
-    fn payload_invalid_utf8_lossy_string() {
-        let v = payload_to_value(&[0xff, 0xfe, 0x00]);
-        assert!(v.is_string());
+    fn binary_payloads_are_never_mangled() {
+        // #789 MSG-39: invalid UTF-8 used to become U+FFFD text.
+        let bin = [0xff, 0xfe, 0x00];
+        let err = decode(&bin, NatsValueFormat::Auto).unwrap_err().to_string();
+        assert!(
+            err.contains("value_format: bytes") && err.contains("s.x"),
+            "{err}"
+        );
+        assert!(decode(&bin, NatsValueFormat::String).is_err());
+        assert_eq!(
+            decode(&bin, NatsValueFormat::Bytes).unwrap(),
+            Value::String("//4A".into())
+        );
+        assert_eq!(
+            decode(b"{\"a\":1}", NatsValueFormat::String).unwrap(),
+            Value::String("{\"a\":1}".into())
+        );
+        assert!(decode(b"plain", NatsValueFormat::Json).is_err());
+        assert_eq!(
+            decode(b"[1]", NatsValueFormat::Json).unwrap(),
+            serde_json::json!([1])
+        );
     }
 
     #[test]

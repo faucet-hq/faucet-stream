@@ -37,7 +37,15 @@ mod docker {
         let container = Nats::default().start().await.expect("nats container start");
         let host = container.get_host().await.expect("nats host");
         let port = container.get_host_port_ipv4(4222).await.expect("nats port");
-        (container, format!("nats://{host}:{port}"))
+        let url = format!("nats://{host}:{port}");
+        // The mapped port can refuse connections for a moment after start.
+        for _ in 0..50 {
+            if async_nats::connect(&url).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        (container, url)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -64,6 +72,14 @@ mod docker {
         cfg.connection.servers = vec![server.clone()];
         let sink = NatsSink::new(cfg).await.expect("sink new");
         faucet_conformance::assert_batch_atomicity_declared(&sink);
+        // #789 MSG-39: lineage never sees URL credentials.
+        let mut with_creds = NatsSinkConfig::new(subject);
+        with_creds.connection.servers = vec![server.replace("nats://", "nats://user:pw@")];
+        let uri = NatsSink::new(with_creds)
+            .await
+            .expect("sink new")
+            .dataset_uri();
+        assert!(!uri.contains("pw") && !uri.contains("nats://nats"), "{uri}");
 
         // Check 10: connector_name is non-empty (metric-cardinality contract).
         faucet_conformance::assert_connector_name_nonempty_value(

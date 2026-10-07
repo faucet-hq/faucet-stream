@@ -77,6 +77,28 @@ pub struct NatsSourceConfig {
     /// Default 10.
     #[serde(default = "default_progress_interval_secs")]
     pub progress_interval_secs: u64,
+
+    /// How a message payload becomes a record: `auto` (default — JSON when
+    /// it parses, else the UTF-8 text), `json`, `string` or `bytes`
+    /// (base64). A payload the format cannot represent fails the run rather
+    /// than being altered (#789 MSG-39).
+    #[serde(default)]
+    pub value_format: NatsValueFormat,
+}
+
+/// How [`NatsSourceConfig::value_format`] decodes a payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NatsValueFormat {
+    /// JSON when the payload parses, else its UTF-8 text; non-UTF-8 fails.
+    #[default]
+    Auto,
+    /// The payload must be JSON.
+    Json,
+    /// The payload as UTF-8 text (invalid UTF-8 fails).
+    String,
+    /// The raw bytes, base64-encoded into a JSON string.
+    Bytes,
 }
 
 fn default_progress_interval_secs() -> u64 {
@@ -97,6 +119,7 @@ impl NatsSourceConfig {
             idle_timeout_secs: Some(5),
             batch_size: DEFAULT_BATCH_SIZE,
             progress_interval_secs: default_progress_interval_secs(),
+            value_format: NatsValueFormat::Auto,
         }
     }
 

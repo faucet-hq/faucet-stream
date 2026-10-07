@@ -24,7 +24,7 @@
 pub mod config;
 pub mod stream;
 
-pub use config::NatsSourceConfig;
+pub use config::{NatsSourceConfig, NatsValueFormat};
 pub use stream::NatsSource;
 
 // Re-export shared config types so downstream users import from one place.
