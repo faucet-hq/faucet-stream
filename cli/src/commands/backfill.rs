@@ -64,7 +64,7 @@ pub async fn run(args: BackfillArgs) -> CliResult<()> {
             execution: cfg.execution.clone(),
             auth,
             resilience,
-            usage: crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
+            usage: crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), path.parent())
                 .map_err(CliError::Config)?,
             range,
             concurrency,

@@ -27867,7 +27867,7 @@
       "type": "object",
       "properties": {
         "pricing_file": {
-          "description": "A YAML/JSON file holding a [`PricingSpec`], merged under the inline\n`pricing:` (inline wins). Relative to the working directory.",
+          "description": "A YAML/JSON file holding a [`PricingSpec`], merged under the inline\n`pricing:` (inline wins). Relative to the config file's directory (the\nworking directory for a config with no file, such as a submitted one).",
           "type": [
             "string",
             "null"

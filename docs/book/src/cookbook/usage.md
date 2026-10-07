@@ -72,6 +72,14 @@ keeps one). The same report is
 `include_records`; `UsageRead`, viewer and up) and the **Usage** page of the
 web console.
 
+At most `--limit` (default 5000) of the newest invocations are read. When the
+window holds more, the report says so (a WARNING line; `truncated: true` in
+JSON) — raise `--limit` or narrow the window. Runs priced in different
+currencies (a server running configs with different `usage.pricing.currency`)
+are never summed together: each row key ends in its currency (`orders [EUR]`),
+`currency` is `mixed`, and the report prints one total per currency
+(`currency_totals` in JSON).
+
 ## Pricing
 
 Estimates use the `usage:` block's pricing table. Every rate has a shipped
@@ -80,7 +88,7 @@ apply to your deployment:
 
 ```yaml
 usage:
-  pricing_file: ./pricing.yaml         # optional, merged under the inline table
+  pricing_file: ./pricing.yaml         # optional, merged under the inline table (relative to the config file)
   pricing:
     currency: EUR
     egress_per_gb: 0.09                # bytes read, when source and sink are not both local files

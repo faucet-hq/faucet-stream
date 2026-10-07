@@ -3243,6 +3243,20 @@ components:
           type: array
           items: { $ref: "#/components/schemas/UsageRow" }
         total: { $ref: "#/components/schemas/UsageRow" }
+        truncated: { type: boolean, description: "The record listing hit `limit`; older invocations in the window are not counted." }
+        currency_totals:
+          type: array
+          description: >
+            Present when the records were priced in more than one currency: each
+            row key ends in `[CUR]`, `currency` is `mixed`, `total` carries no cost,
+            and these are the per-currency totals.
+          items:
+            type: object
+            required: [currency, cost, hosted_equivalent]
+            properties:
+              currency: { type: string }
+              cost: { type: number }
+              hosted_equivalent: { type: number }
     LocalOutput:
       type: object
       description: >

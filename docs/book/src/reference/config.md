@@ -1274,7 +1274,7 @@ USD).
 
 ```yaml
 usage:
-  pricing_file: ./pricing.yaml       # optional; merged under the inline table
+  pricing_file: ./pricing.yaml       # optional; merged under the inline table; relative to the config file
   pricing:
     currency: USD
     egress_per_gb: 0                 # bytes read when source + sink are not both local files

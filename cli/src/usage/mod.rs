@@ -19,8 +19,8 @@ pub mod model;
 pub mod spec;
 
 pub use model::{
-    CostEstimate, CostLine, GroupBy, UsageFilter, UsageRecord, UsageReport, UsageRow, aggregate,
-    estimate,
+    CostEstimate, CostLine, CurrencyTotal, GroupBy, UsageFilter, UsageRecord, UsageReport,
+    UsageRow, aggregate, estimate, listing_truncated,
 };
 pub use spec::{PricingSpec, UsageSpec};
 
@@ -182,7 +182,7 @@ pub fn render_report(rep: &UsageReport) -> String {
     let key_w = rep
         .rows
         .iter()
-        .map(|r| r.key.len())
+        .map(|r| r.key.chars().count())
         .chain(std::iter::once(5))
         .max()
         .unwrap_or(5)
@@ -200,8 +200,9 @@ pub fn render_report(rep: &UsageReport) -> String {
         key_w = key_w
     ));
     let mut line = |r: &UsageRow| {
-        let key = if r.key.len() > key_w {
-            format!("{}…", &r.key[..key_w.saturating_sub(1)])
+        let key = if r.key.chars().count() > key_w {
+            let head: String = r.key.chars().take(key_w.saturating_sub(1)).collect();
+            format!("{head}…")
         } else {
             r.key.clone()
         };
@@ -237,6 +238,23 @@ pub fn render_report(rep: &UsageReport) -> String {
         line(r);
     }
     line(&rep.total);
+    for c in &rep.currency_totals {
+        out.push_str(&format!(
+            "  total {}: est. cost {:.4}, hosted eq. {:.2}\n",
+            c.currency, c.cost, c.hosted_equivalent
+        ));
+    }
+    if !rep.currency_totals.is_empty() {
+        out.push_str(
+            "  WARNING: these runs were priced in different currencies; costs are not summed across them\n",
+        );
+    }
+    if rep.truncated {
+        out.push_str(&format!(
+            "  WARNING: only the newest {} invocation(s) were read; raise --limit to cover the whole window\n",
+            rep.records
+        ));
+    }
     out.push_str(
         "  estimates use the pricing table in `usage.pricing` (defaults = public list prices); \
          `hosted eq.` is what a per-row-priced hosted ELT service would charge for the same rows out\n",
@@ -361,5 +379,40 @@ mod tests {
             assert!(text.contains(needle), "{text}");
             assert!(text.contains('…'), "a 60+ char key is truncated: {text}");
         }
+    }
+
+    #[test]
+    fn a_multibyte_key_is_truncated_on_a_char_boundary() {
+        let long = format!("{}é{}", "p".repeat(58), "q".repeat(20));
+        let r = build_record(
+            RecordIdentity {
+                run_id: "r1",
+                pipeline: &long,
+                row: "row-0",
+                source_kind: "csv",
+                sink_kind: "jsonl",
+                dataset_id: None,
+                dataset_uri: None,
+            },
+            UsageSnapshot::default(),
+            10,
+            false,
+            &PricingSpec::default(),
+            Utc::now(),
+        );
+        let mut rep = aggregate(&[r], GroupBy::Pipeline, "USD");
+        let text = render_report(&rep);
+        assert!(text.contains(&format!("{}é…", "p".repeat(58))), "{text}");
+        assert!(!text.contains("WARNING"), "{text}");
+        rep.truncated = true;
+        rep.currency_totals = vec![CurrencyTotal {
+            currency: "EUR".into(),
+            cost: 1.5,
+            hosted_equivalent: 2.0,
+        }];
+        let text = render_report(&rep);
+        assert!(text.contains("total EUR: est. cost 1.5000"), "{text}");
+        assert!(text.contains("different currencies"), "{text}");
+        assert!(text.contains("only the newest 1 invocation(s)"), "{text}");
     }
 }
