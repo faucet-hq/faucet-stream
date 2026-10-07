@@ -61,6 +61,9 @@ impl EchoService for EchoServer {
         let attempt = self.tail_attempts.fetch_add(1, Ordering::SeqCst);
         reject_stale_token(&request)?;
         let req = request.into_inner();
+        if req.start_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(req.start_delay_ms.into())).await;
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             let mut emitted: u32 = 0;

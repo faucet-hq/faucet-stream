@@ -419,9 +419,10 @@ impl ParquetSink {
         if !self.single_file || !state.published || state.writer.is_some() {
             return Ok(());
         }
-        let (_, Some(path)) = self.next_object_path()? else {
-            return Ok(());
-        };
+        let path = self
+            .next_object_path()?
+            .1
+            .expect("single-file mode is a local path");
         let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, FaucetError>>(2);
         let reader = tokio::task::spawn_blocking(move || {
@@ -1206,6 +1207,7 @@ mod tests {
         let f = tmp.path().join("ok");
         std::fs::write(&f, b"x").unwrap();
         sync_file_and_dir(&f).unwrap();
+        sync_file_and_dir(std::path::Path::new("/")).unwrap();
     }
 
     /// Columnar fast path (feature `arrow`): a `RecordBatch` written via

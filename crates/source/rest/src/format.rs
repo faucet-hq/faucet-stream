@@ -1333,4 +1333,27 @@ mod tests {
             assert!(!batch.column(1).is_null(1));
         }
     }
+
+    #[cfg(feature = "excel")]
+    #[test]
+    fn excel_date_cells_become_iso_text() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+        let dt = |v, ty| Data::DateTime(ExcelDateTime::new(v, ty, false));
+        assert_eq!(
+            cell_to_value(&dt(45000.0, ExcelDateTimeType::DateTime)),
+            serde_json::json!("2023-03-15")
+        );
+        assert_eq!(
+            cell_to_value(&dt(1.5, ExcelDateTimeType::TimeDelta)),
+            serde_json::json!("PT129600S")
+        );
+        assert_eq!(
+            cell_to_value(&dt(1e12, ExcelDateTimeType::DateTime)),
+            serde_json::json!("1000000000000")
+        );
+        assert_eq!(
+            cell_to_string(&dt(45000.5, ExcelDateTimeType::DateTime)),
+            "2023-03-15T12:00:00"
+        );
+    }
 }

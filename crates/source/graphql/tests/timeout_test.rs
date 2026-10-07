@@ -54,3 +54,26 @@ fn timeouts_default_to_thirty_and_ten_seconds() {
     assert_eq!(cfg.timeout, None);
     assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(3)));
 }
+
+#[test]
+fn the_connect_timeout_builder_sets_the_field() {
+    let cfg = GraphqlStreamConfig::new("https://api/graphql", "query { a }")
+        .connect_timeout(Some(Duration::from_secs(4)));
+    assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(4)));
+}
+
+#[tokio::test]
+async fn an_invalid_custom_header_value_is_an_auth_error() {
+    let stream = GraphqlStream::new(
+        GraphqlStreamConfig::new("http://127.0.0.1:1/graphql", "query { a }").auth(
+            faucet_source_graphql::GraphqlAuth::Custom {
+                headers: [("x-key".to_string(), "bad\nvalue".to_string())].into(),
+            },
+        ),
+    );
+    let err = stream.fetch_all().await.unwrap_err();
+    assert!(
+        err.to_string().contains("invalid custom header value"),
+        "{err}"
+    );
+}

@@ -65,3 +65,18 @@ fn a_fan_out_row_on_a_fixed_object_store_path_is_refused() {
     )
     .unwrap();
 }
+
+#[test]
+fn the_hub_treats_a_fixed_remote_path_like_a_truncating_file() {
+    use faucet_cli::hub::spec::SinkTemplate;
+    let fixed: SinkTemplate = serde_yaml::from_str(
+        "kind: sink-template\nname: s3\nsink:\n  type: s3\n  config: { bucket: b }\nper_stream: { path: \"${stream}.jsonl\" }\n",
+    )
+    .unwrap();
+    assert!(fixed.truncates_per_invocation());
+    let unique: SinkTemplate = serde_yaml::from_str(
+        "kind: sink-template\nname: s3\nsink:\n  type: s3\n  config: { bucket: b }\nper_stream: { prefix: \"${stream}/\" }\n",
+    )
+    .unwrap();
+    assert!(!unique.truncates_per_invocation());
+}

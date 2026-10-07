@@ -491,3 +491,37 @@ async fn an_inline_token_rejection_is_not_retried() {
         .expect_err("rejected");
     assert!(err.to_string().contains("token revoked"), "{err}");
 }
+
+/// #789 API-05: a stream that does not start within `timeout` is retried
+/// like any transient failure, then fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_stream_start_times_out() {
+    let server = common::start_server().await;
+    let config = tail(&server, json!({ "count": 1, "start_delay_ms": 5000 }))
+        .timeout(Some(std::time::Duration::from_millis(100)))
+        .reconnect_max_attempts(0);
+    let err = GrpcStream::new(config)
+        .unwrap()
+        .fetch_all()
+        .await
+        .expect_err("the stream never starts in time");
+    assert!(err.to_string().contains("start timed out"), "{err}");
+}
+
+/// Context values are substituted into the call, and `null` timeouts wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_context_call_without_timeouts_streams_every_page() {
+    let server = common::start_server().await;
+    let config = tail(&server, json!({ "count": "{n}" }))
+        .timeout(None)
+        .idle_timeout(None)
+        .with_batch_size(2);
+    let stream = GrpcStream::new(config).unwrap();
+    let ctx = std::collections::HashMap::from([("n".to_string(), json!(3))]);
+    let mut pages = stream.stream_pages(&ctx, 2);
+    let mut total = 0;
+    while let Some(page) = pages.next().await {
+        total += page.unwrap().records.len();
+    }
+    assert_eq!(total, 3);
+}

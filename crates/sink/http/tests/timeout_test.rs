@@ -46,3 +46,16 @@ fn timeouts_default_to_thirty_and_ten_seconds() {
     assert_eq!(cfg.timeout, None);
     assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(3)));
 }
+
+#[test]
+fn the_connect_timeout_builder_and_debug_show_both_timeouts() {
+    let cfg = HttpSinkConfig::new("https://api/ingest")
+        .timeout(None)
+        .connect_timeout(Some(Duration::from_secs(4)));
+    assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(4)));
+    let shown = format!("{cfg:?}");
+    assert!(
+        shown.contains("connect_timeout") && shown.contains("timeout: None"),
+        "{shown}"
+    );
+}

@@ -83,15 +83,10 @@ impl HttpSink {
         self
     }
 
-    /// Resolve the effective auth for the current batch. The provider (if any)
-    /// takes precedence; otherwise inline auth is used. A bare
-    /// `AuthSpec::Reference` with no provider is an error.
-    async fn resolve_auth(&self) -> Result<HttpSinkAuth, FaucetError> {
-        Ok(self.resolve_auth_and_credential().await?.0)
-    }
-
-    /// [`resolve_auth`](Self::resolve_auth) plus the shared provider's credential
-    /// it came from, so a rejected request can tell the provider which one went
+    /// Resolve the effective auth for the current batch (the provider, if
+    /// any, takes precedence over inline auth; a bare `AuthSpec::Reference`
+    /// with no provider is an error), plus the shared provider's credential it
+    /// came from, so a rejected request can tell the provider which one went
     /// stale.
     async fn resolve_auth_and_credential(
         &self,
@@ -209,8 +204,9 @@ impl HttpSink {
                 (Some(provider), Some(sent))
                     if faucet_core::rejects_credential(&e, provider.as_ref()) =>
                 {
+                    let name = provider.provider_name();
                     tracing::warn!(
-                        provider = provider.provider_name(),
+                        provider = name,
                         "the server rejected the shared credential; re-authenticating and \
                          retrying once"
                     );
@@ -259,8 +255,8 @@ impl faucet_core::Sink for HttpSink {
         // Resolve auth so authenticated endpoints don't reject the connection
         // before we learn the host is reachable. An unresolvable auth ref is a
         // configuration failure surfaced on this probe.
-        let auth = match self.resolve_auth().await {
-            Ok(a) => a,
+        let auth = match self.resolve_auth_and_credential().await {
+            Ok((a, _)) => a,
             Err(e) => {
                 return Ok(CheckReport::single(Probe::fail_hint(
                     "network",

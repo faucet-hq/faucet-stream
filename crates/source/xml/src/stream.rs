@@ -443,8 +443,9 @@ impl XmlStream {
                     .is_some_and(|p| faucet_core::rejects_credential(&e, p.as_ref())) =>
             {
                 let provider = self.auth_provider.as_ref().expect("checked above");
+                let name = provider.provider_name();
                 tracing::warn!(
-                    provider = provider.provider_name(),
+                    provider = name,
                     "the server rejected the shared credential; re-authenticating and retrying once"
                 );
                 provider

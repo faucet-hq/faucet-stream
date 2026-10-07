@@ -1069,4 +1069,36 @@ mod tests {
             Err(FaucetError::Auth(_))
         ));
     }
+
+    #[tokio::test]
+    async fn a_persisted_token_of_another_grant_or_an_empty_entry_is_not_used() {
+        use faucet_core::MemoryStateStore;
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=seed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "A", "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        let cfg = serde_json::json!({
+            "token_url": server.uri(), "client_id": "id",
+            "client_secret": "s", "refresh_token": "seed",
+        });
+        for entry in [
+            serde_json::json!({"refresh_token": "theirs", "seed": "someone-else"}),
+            serde_json::json!({"refresh_token": ""}),
+        ] {
+            let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+            store.put("k", &entry).await.unwrap();
+            let p = OAuth2RefreshProvider::from_config(&cfg)
+                .unwrap()
+                .with_store(store, "k");
+            assert_eq!(
+                p.credential().await.unwrap(),
+                Credential::Bearer("A".into())
+            );
+        }
+    }
 }

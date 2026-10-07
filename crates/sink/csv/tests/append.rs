@@ -69,3 +69,43 @@ async fn appending_to_a_gzip_file_reads_its_header() {
     .unwrap();
     assert_eq!(text, "a,b\n1,2\n3,4\n");
 }
+
+#[tokio::test]
+async fn an_unreadable_append_target_fails_naming_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("plain");
+    std::fs::write(&blocker, "x").unwrap();
+    let under_a_file = blocker.join("out.csv");
+    let e = write(
+        CsvSinkConfig::new(under_a_file.to_string_lossy()).append(true),
+        &[json!({"id": 1})],
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("failed to inspect"), "{e}");
+
+    let bad = dir.path().join("bad.csv");
+    std::fs::write(&bad, b"\xff\xfe,\xff\n").unwrap();
+    let e = write(
+        CsvSinkConfig::new(bad.to_string_lossy()).append(true),
+        &[json!({"id": 1})],
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("failed to read the header"), "{e}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = dir.path().join("locked.csv");
+        std::fs::write(&locked, "id\n1\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let e = write(
+            CsvSinkConfig::new(locked.to_string_lossy()).append(true),
+            &[json!({"id": 2})],
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("failed to open"), "{e}");
+    }
+}

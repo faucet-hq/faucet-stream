@@ -47,3 +47,10 @@ fn timeouts_default_to_thirty_and_ten_seconds() {
     assert_eq!(cfg.timeout, None);
     assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(3)));
 }
+
+#[test]
+fn the_connect_timeout_builder_sets_the_field() {
+    let cfg = XmlStreamConfig::new("https://api", "/feed.xml")
+        .connect_timeout(Some(Duration::from_secs(4)));
+    assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(4)));
+}

@@ -350,8 +350,9 @@ where
     let sent = provider.credential().await?;
     match send(Some(sent.clone())).await {
         Err(e) if rejects_credential(&e, provider.as_ref()) => {
+            let name = provider.provider_name();
             tracing::warn!(
-                provider = provider.provider_name(),
+                provider = name,
                 "the server rejected the shared credential; re-authenticating and retrying once"
             );
             let fresh = provider.invalidate(&sent).await?;

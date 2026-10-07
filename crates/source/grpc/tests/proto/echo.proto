@@ -42,6 +42,8 @@ message TailRequest {
   int32 fail_code = 3;
   // Keep the stream open after the last event instead of closing it.
   bool hold_open = 4;
+  // Milliseconds to wait before answering the call.
+  uint32 start_delay_ms = 5;
 }
 
 message Event {
