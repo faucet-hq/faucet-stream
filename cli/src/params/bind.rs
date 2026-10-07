@@ -139,8 +139,21 @@ pub fn resolve(
         }
         let value = match supplied.get(name) {
             Some(raw) => {
+                if p.secret {
+                    // Before any error below can echo the raw value.
+                    crate::secrets::registry::register(&value_to_string(raw));
+                }
                 reject_directives(name, raw)?;
-                let coerced = spec::coerce(name, p.kind, raw)?;
+                let coerced = spec::coerce(name, p.kind, raw).map_err(|e| {
+                    if p.secret {
+                        CliError::Config(format!(
+                            "param '{name}': the supplied value is not a valid {}",
+                            p.kind.as_str()
+                        ))
+                    } else {
+                        e
+                    }
+                })?;
                 // A closed `values:` set is checked here, at bind, so a typo'd
                 // value fails naming the alternatives rather than producing a
                 // config that is merely wrong (#648).
@@ -151,9 +164,13 @@ pub fn resolve(
                         .any(|v| spec::values_match(p.kind, v, &coerced))
                 {
                     let allowed: Vec<String> = p.values.iter().map(value_to_string).collect();
+                    let shown = if p.secret {
+                        "the supplied value".to_string()
+                    } else {
+                        value_to_string(&coerced)
+                    };
                     return Err(CliError::Config(format!(
-                        "param '{name}': {} is not one of the allowed values ({})",
-                        value_to_string(&coerced),
+                        "param '{name}': {shown} is not one of the allowed values ({})",
                         allowed.join(", ")
                     )));
                 }
@@ -906,6 +923,30 @@ mod tests {
             }
             other => panic!("expected UnknownParam, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_malformed_secret_param_is_registered_before_it_is_echoed() {
+        let spec = spec_of("pin: { type: int, secret: true }\n");
+        let err = resolve(
+            &spec,
+            &supplied(&[("pin", json!("not-a-number-s3cr3t"))]),
+            BindMode::Strict,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("s3cr3t"), "{err}");
+        assert!(err.contains("not a valid int"), "{err}");
+        assert_eq!(
+            crate::secrets::registry::redact("x not-a-number-s3cr3t"),
+            "x ***"
+        );
+        let spec = spec_of("region: { secret: true, values: [eu, us] }\n");
+        let err = resolve(&spec, &supplied(&[("region", json!("apac-s3cr3t"))]), BindMode::Strict)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("s3cr3t") && err.contains("the supplied value"), "{err}");
     }
 
     #[test]
