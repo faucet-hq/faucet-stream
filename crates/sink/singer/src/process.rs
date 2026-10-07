@@ -69,6 +69,8 @@ pub struct TargetProcess {
     command: String,
     _config_file: tempfile::NamedTempFile,
     stdout_task: Option<JoinHandle<()>>,
+    /// Longest a write to (or flush of) the target's stdin may block.
+    write_timeout: Duration,
 }
 
 impl TargetProcess {
@@ -102,9 +104,21 @@ impl TargetProcess {
         let stderr = child.stderr.take().expect("stderr is piped");
 
         let (tx, rx) = watch::channel(Echo::default());
+        let max_line = faucet_common_singer::DEFAULT_MAX_LINE_BYTES;
         let stdout_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let line = match faucet_common_singer::read_capped_line(&mut reader, max_line).await {
+                    Ok(faucet_common_singer::CappedLine::Line(line)) => line,
+                    Ok(faucet_common_singer::CappedLine::TooLong) => {
+                        // An oversized line is not a STATE echo: skip it in
+                        // bounded chunks rather than buffer it whole (API-44),
+                        // and keep draining so the target never blocks.
+                        tracing::warn!(target: "faucet_sink_singer::target", "skipping a stdout line longer than {max_line} bytes");
+                        continue;
+                    }
+                    _ => break,
+                };
                 match parse_line(&line) {
                     Ok(SingerMessage::State { value }) => tx.send_modify(|e| {
                         e.states += 1;
@@ -147,6 +161,7 @@ impl TargetProcess {
             command: cfg.target_command.clone(),
             _config_file: config_file,
             stdout_task: Some(stdout_task),
+            write_timeout: Duration::from_secs(cfg.flush_timeout_secs),
         })
     }
 
@@ -157,20 +172,37 @@ impl TargetProcess {
             .stdin
             .as_mut()
             .ok_or_else(|| FaucetError::Sink("singer target stdin is already closed".into()))?;
-        if let Err(e) = stdin.write_all(bytes).await {
-            return Err(self.failure(&format!("closed its stdin ({e})")).await);
+        match tokio::time::timeout(self.write_timeout, stdin.write_all(bytes)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(self.failure(&format!("closed its stdin ({e})")).await),
+            Err(_) => Err(self.stalled().await),
         }
-        Ok(())
     }
 
     /// Push buffered lines through to the target.
     pub async fn flush_stdin(&mut self) -> Result<(), FaucetError> {
-        if let Some(stdin) = self.stdin.as_mut()
-            && let Err(e) = stdin.flush().await
-        {
-            return Err(self.failure(&format!("closed its stdin ({e})")).await);
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(self.write_timeout, stdin.flush()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(self.failure(&format!("closed its stdin ({e})")).await),
+            Err(_) => Err(self.stalled().await),
         }
-        Ok(())
+    }
+
+    /// A target that stopped reading its stdin for `flush_timeout_secs`:
+    /// terminate it and report its stderr tail (API-27).
+    async fn stalled(&mut self) -> FaucetError {
+        let err = FaucetError::Sink(format!(
+            "singer target '{}' stopped reading its input for {}s (flush_timeout_secs); \
+             last stderr:\n{}",
+            self.redactor.redact(&self.command),
+            self.write_timeout.as_secs(),
+            self.stderr_tail()
+        ));
+        self.terminate().await;
+        err
     }
 
     /// Wait until the target echoes flush marker `seq`, it closes stdout, or

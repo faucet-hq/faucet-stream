@@ -79,9 +79,12 @@ bookmark can advance past records that were lost.
 ## Overwrite
 
 `write_mode: overwrite` uses Singer table versions: every record carries the
-run's `version` (a millisecond timestamp shared by every writer of a run), and
-after a fully successful run the sink starts the target once more to send
-`SCHEMA` + `ACTIVATE_VERSION`, telling the target to make that version live and
+run's `version` (a millisecond timestamp shared by every writer of a run — the
+run clock, but never earlier than the wall clock when the run starts, so a
+rerun with a past `--clock` still activates a newer version), and after a
+fully successful run the sink starts the target once more to send
+`ACTIVATE_VERSION` (preceded by `SCHEMA` when a schema is known — configured,
+from the contract, or inferred by that instance; never an empty one), telling the target to make that version live and
 discard rows from earlier versions. A failed or cancelled run sends no
 `ACTIVATE_VERSION`, so the previous version stays live (and the next
 successful overwrite discards the failed run's rows). How a target applies
@@ -105,7 +108,7 @@ is the target's job, so faucet does not treat this sink as key-deduplicating
 | `schema` | object | contract, else inferred | JSON Schema for the `SCHEMA` message |
 | `key_properties` | string[] | `key` under upsert | `SCHEMA` `key_properties` |
 | `flush_on` | `exit` \| `state` | `exit` | See [Durability](#durability--flush_on) |
-| `flush_timeout_secs` | int | `600` | Max wait for the echo / exit at a flush |
+| `flush_timeout_secs` | int | `600` | Max wait for the echo / exit at a flush, and for one write to a target that stopped reading its stdin (the target is then terminated and its stderr tail reported) |
 | `write_mode` | `append` \| `upsert` \| `overwrite` | `append` | See above |
 | `key` | string[] | `[]` | Upsert key (becomes `key_properties`) |
 
