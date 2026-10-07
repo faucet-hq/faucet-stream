@@ -134,8 +134,8 @@ impl KafkaSink {
         extracted: Option<Value>,
     ) -> Result<Option<Value>, FaucetError> {
         match extracted {
-            Some(v) => Ok(Some(v)),
-            None => match self.config.on_key_error {
+            Some(v) if !v.is_null() => Ok(Some(v)),
+            _ => match self.config.on_key_error {
                 OnKeyError::Fail => Err(FaucetError::Sink(
                     "key_path did not resolve and on_key_error=fail".into(),
                 )),
@@ -167,6 +167,9 @@ impl KafkaSink {
                 let msg_timeout_ms = self.config.message_timeout.as_millis();
                 let txn_timeout_ms = msg_timeout_ms.max(60_000);
                 cfg.set("transaction.timeout.ms", txn_timeout_ms.to_string());
+                if let Some(cap) = crate::idempotent::txn_queue_capacity(&self.config) {
+                    cfg.set("queue.buffering.max.messages", cap);
+                }
 
                 let producer: FutureProducer = cfg
                     .create()
@@ -416,8 +419,8 @@ impl Sink for KafkaSink {
                     partition,
                     headers,
                 },
-                self.config.queue_full_max_retries,
                 self.config.queue_full_backoff,
+                self.config.message_timeout,
             )
             .await
             {
@@ -441,8 +444,8 @@ impl Sink for KafkaSink {
                 key: Some(token_key.into_bytes()),
                 ..RecordRouting::default()
             },
-            self.config.queue_full_max_retries,
             self.config.queue_full_backoff,
+            self.config.message_timeout,
         )
         .await
         {

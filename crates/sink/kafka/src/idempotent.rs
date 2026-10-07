@@ -65,14 +65,21 @@ pub(crate) fn producer_client_config(
 
 /// Auto-create the compacted commit-token side-topic if it does not exist.
 /// Idempotent: an "already exists" result is treated as success.
+///
+/// The topic's metadata is read first and creation is attempted only when it
+/// is absent, so a least-privilege principal without `CREATE` can use a
+/// pre-created side-topic (#789 MSG-57).
 pub(crate) async fn ensure_commit_topic(
     config: &KafkaSinkConfig,
     base: &ClientConfig,
 ) -> Result<(), FaucetError> {
+    let eo = config.exactly_once_spec();
+    if commit_topic_exists(base, &eo.commit_token_topic, config.message_timeout).await? {
+        return Ok(());
+    }
     let admin: AdminClient<DefaultClientContext> = base
         .create()
         .map_err(|e| FaucetError::Sink(format!("kafka admin client init: {e}")))?;
-    let eo = config.exactly_once_spec();
     let topic = NewTopic::new(
         &eo.commit_token_topic,
         eo.commit_token_topic_partitions,
@@ -95,6 +102,32 @@ pub(crate) async fn ensure_commit_topic(
         }
     }
     Ok(())
+}
+
+/// Whether `topic` exists on the cluster, read from broker metadata with a
+/// consumer that never auto-creates topics.
+async fn commit_topic_exists(
+    base: &ClientConfig,
+    topic: &str,
+    timeout: Duration,
+) -> Result<bool, FaucetError> {
+    let mut cfg = base.clone();
+    cfg.set("allow.auto.create.topics", "false");
+    let topic = topic.to_string();
+    tokio::task::spawn_blocking(move || {
+        let consumer: BaseConsumer = cfg
+            .create()
+            .map_err(|e| FaucetError::Sink(format!("kafka metadata client init: {e}")))?;
+        let metadata = consumer
+            .fetch_metadata(Some(&topic), timeout)
+            .map_err(|e| FaucetError::Sink(format!("kafka commit-topic metadata: {e}")))?;
+        Ok(metadata
+            .topics()
+            .iter()
+            .any(|t| t.name() == topic && t.error().is_none() && !t.partitions().is_empty()))
+    })
+    .await
+    .map_err(|e| FaucetError::Sink(format!("kafka metadata task: {e}")))?
 }
 
 /// Read the latest committed token for `scope` from the compacted side-topic.
@@ -144,6 +177,75 @@ pub(crate) fn token_key(prefix: Option<&str>, scope: &str) -> String {
     }
 }
 
+/// How long the token reader waits for transactions that were open on the
+/// side-topic when it started to finish. Another scope's open (or zombie)
+/// transaction holds the Last Stable Offset below this scope's newer tokens
+/// until it commits, aborts or times out (`transaction.timeout.ms`, at least
+/// 60 s for faucet's producers).
+pub(crate) fn stable_wait(timeout: Duration) -> Duration {
+    timeout.max(Duration::from_secs(60)) + Duration::from_secs(10)
+}
+
+/// Whether every partition's committed (LSO) high watermark has reached the
+/// log end measured when the read began.
+pub(crate) fn offsets_stable(committed_high: &[i64], log_end: &[i64]) -> bool {
+    committed_high.iter().zip(log_end).all(|(c, e)| c >= e)
+}
+
+/// Wait until the Last Stable Offset of every side-topic partition reaches the
+/// log end offset observed now, then return each partition's `(low, LSO)`.
+///
+/// Under `read_committed` the reader only sees records below the LSO, and an
+/// open transaction from another scope sharing the side-topic holds it there:
+/// reading at that point returns an older token for this scope and the resume
+/// rewrites a committed page (#789 MSG-73). Transactions opened after the
+/// snapshot do not extend the wait.
+fn wait_for_stable_offsets(
+    cfg: &ClientConfig,
+    committed: &BaseConsumer,
+    topic: &str,
+    partitions: &[i32],
+    timeout: Duration,
+) -> Result<Vec<(i64, i64)>, FaucetError> {
+    let mut raw_cfg = cfg.clone();
+    raw_cfg.set("isolation.level", "read_uncommitted");
+    let raw: BaseConsumer = raw_cfg
+        .create()
+        .map_err(|e| FaucetError::Sink(format!("kafka token reader init: {e}")))?;
+    let mut log_end = Vec::with_capacity(partitions.len());
+    for pid in partitions {
+        let (_, high) = raw
+            .fetch_watermarks(topic, *pid, timeout)
+            .map_err(|e| FaucetError::Sink(format!("kafka token reader watermarks: {e}")))?;
+        log_end.push(high);
+    }
+    let deadline = std::time::Instant::now() + stable_wait(timeout);
+    loop {
+        let mut marks = Vec::with_capacity(partitions.len());
+        for pid in partitions {
+            marks.push(
+                committed
+                    .fetch_watermarks(topic, *pid, timeout)
+                    .map_err(|e| {
+                        FaucetError::Sink(format!("kafka token reader watermarks: {e}"))
+                    })?,
+            );
+        }
+        let highs: Vec<i64> = marks.iter().map(|(_, h)| *h).collect();
+        if offsets_stable(&highs, &log_end) {
+            return Ok(marks);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(FaucetError::Sink(format!(
+                "kafka token reader: a transaction on side-topic '{topic}' stayed open for \
+                 {:?}; refusing to read a possibly-stale commit token",
+                stable_wait(timeout)
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn read_last_token_blocking(
     cfg: &ClientConfig,
     topic: &str,
@@ -174,12 +276,13 @@ fn read_last_token_blocking(
     // compacted partition whose log-start offset advanced past 0; either way it is
     // already drained and must never block the loop while we wait on a position
     // that will never be reported (nothing is ever fetched there).
+    let partitions: Vec<i32> = topic_meta.partitions().iter().map(|p| p.id()).collect();
+    let stable = wait_for_stable_offsets(cfg, &consumer, topic, &partitions, timeout)?;
     let mut ends: Vec<(i32, i64, bool)> = Vec::new();
+    for (pid, (low, high)) in partitions.iter().zip(stable) {
+        ends.push((*pid, high, low >= high));
+    }
     for p in topic_meta.partitions() {
-        let (low, high) = consumer
-            .fetch_watermarks(topic, p.id(), timeout)
-            .map_err(|e| FaucetError::Sink(format!("kafka token reader watermarks: {e}")))?;
-        ends.push((p.id(), high, low >= high));
         tpl.add_partition_offset(topic, p.id(), Offset::Beginning)
             .map_err(|e| FaucetError::Sink(format!("kafka token reader tpl: {e}")))?;
     }
@@ -347,15 +450,21 @@ pub(crate) fn fold_token_for_scope(
 /// the delivery future: inside a transaction, delivery only completes at
 /// `commit_transaction`, so awaiting here would deadlock. Errors surface at
 /// commit time.
+///
+/// A whole page plus its token is enqueued before anything is awaited, so a
+/// full queue is expected on a slow cluster: the producer keeps delivering in
+/// the background, and we wait for room for up to `budget` (the configured
+/// `message_timeout`) rather than `max_retries × backoff` (#789 MSG-56).
 pub(crate) async fn enqueue_in_txn(
     producer: &FutureProducer,
     topic: &str,
     value_bytes: Vec<u8>,
     routing: crate::sink::RecordRouting,
-    max_retries: u32,
     backoff: Duration,
+    budget: Duration,
 ) -> Result<(), FaucetError> {
-    let mut attempts: u32 = 0;
+    let started = std::time::Instant::now();
+    let backoff = backoff.max(Duration::from_millis(1));
     loop {
         let mut record: FutureRecord<'_, [u8], [u8]> =
             FutureRecord::to(topic).payload(value_bytes.as_slice());
@@ -371,18 +480,32 @@ pub(crate) async fn enqueue_in_txn(
         match producer.send_result(record) {
             Ok(_delivery_future) => return Ok(()),
             Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _)) => {
-                if attempts >= max_retries {
+                if started.elapsed() >= budget {
                     return Err(FaucetError::Sink(format!(
-                        "kafka send: QueueFull after {max_retries} retries"
+                        "kafka send: producer queue still full after {budget:?}"
                     )));
                 }
-                tracing::warn!(attempts, "kafka send: QueueFull, backing off");
+                tracing::debug!("kafka send: QueueFull inside a transaction, waiting for room");
                 tokio::time::sleep(backoff).await;
-                attempts += 1;
             }
             Err((e, _)) => return Err(FaucetError::Sink(format!("kafka send: {e}"))),
         }
     }
+}
+
+/// The transactional producer's `queue.buffering.max.messages`. A transaction
+/// enqueues a whole page plus its commit token before awaiting anything, so the
+/// queue must not be capped at the sink's `batch_size` the way the
+/// at-least-once producer's is (#789 MSG-56). librdkafka's own default (100k)
+/// is kept as the floor; a user `extra_client_config` value still wins.
+pub(crate) fn txn_queue_capacity(config: &KafkaSinkConfig) -> Option<String> {
+    if config
+        .extra_client_config
+        .contains_key("queue.buffering.max.messages")
+    {
+        return None;
+    }
+    Some(config.batch_size.saturating_add(1).max(100_000).to_string())
 }
 
 /// Abort the current transaction (best-effort, on the blocking pool).
@@ -439,6 +562,36 @@ mod tests {
         assert_eq!(cfg.get("bootstrap.servers"), Some("host:9092"));
         // compression is producer-only — layered by new(), not by the base.
         assert_eq!(cfg.get("compression.type"), None);
+    }
+
+    #[test]
+    fn offsets_are_stable_only_once_every_partition_reaches_the_log_end() {
+        assert!(offsets_stable(&[5, 9], &[5, 9]));
+        assert!(offsets_stable(&[6, 9], &[5, 9]));
+        assert!(!offsets_stable(&[4, 9], &[5, 9]));
+        assert!(offsets_stable(&[], &[]));
+        assert_eq!(stable_wait(Duration::from_secs(5)), Duration::from_secs(70));
+        assert_eq!(
+            stable_wait(Duration::from_secs(120)),
+            Duration::from_secs(130)
+        );
+    }
+
+    #[test]
+    fn txn_queue_is_never_capped_at_the_sink_batch_size() {
+        let mut config: KafkaSinkConfig = serde_json::from_value(serde_json::json!({
+            "brokers": "h:9092",
+            "topic": {"type": "fixed", "name": "t"},
+            "batch_size": 1000
+        }))
+        .unwrap();
+        assert_eq!(txn_queue_capacity(&config).as_deref(), Some("100000"));
+        config.batch_size = 500_000;
+        assert_eq!(txn_queue_capacity(&config).as_deref(), Some("500001"));
+        config
+            .extra_client_config
+            .insert("queue.buffering.max.messages".into(), "10".into());
+        assert_eq!(txn_queue_capacity(&config), None);
     }
 
     #[test]
