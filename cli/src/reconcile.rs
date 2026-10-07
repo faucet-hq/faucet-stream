@@ -177,7 +177,10 @@ mod tests {
     fn several_numeric_fields_need_a_count_field() {
         let recs = vec![json!({"total": 7, "max_id": 99})];
         let err = extract_count(&recs, None).unwrap_err();
-        assert!(err.contains("max_id, total") && err.contains("count_field"), "{err}");
+        assert!(
+            err.contains("max_id, total") && err.contains("count_field"),
+            "{err}"
+        );
         assert_eq!(extract_count(&recs, Some("total")).unwrap(), 7);
         assert_eq!(extract_count(&[json!(12)], None).unwrap(), 12);
     }

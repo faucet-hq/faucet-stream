@@ -350,7 +350,7 @@ pub struct PipelineSpec {
 /// list. `tee` carries `channel_capacity` + optional `fanout`. `merge` has no
 /// extra fields. `join` carries the hash-join configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum NodeSpec {
     /// A data source (0 in, 1 out).
     Source {
@@ -392,7 +392,8 @@ pub enum NodeSpec {
         fanout: Option<usize>,
     },
     /// Fan-in: forward pages from all inputs in arrival order (N in, 1 out).
-    Merge,
+    /// A struct variant so an unknown key on it is refused like on the others.
+    Merge {},
     /// Hash-join two upstreams by key (2 in, 1 out).
     Join(JoinSpec),
 }

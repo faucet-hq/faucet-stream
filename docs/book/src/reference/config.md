@@ -504,18 +504,23 @@ declare an explicit graph of typed nodes (`source` / `transform` / `tee` /
 with `matrix:` — both non-empty is a load-time error. `faucet run` / `validate`
 / `preview` all understand it. See
 [Topology mode](../cookbook/topology.md) for the full grammar, the `join:`
-node, state semantics, and runnable examples.
+node, state semantics, and runnable examples. A node entry accepts only its
+kind's keys — a misspelt key (`confg:`) is a load-time error — and `${vars.*}` /
+`${sources.*}` / `${sinks.*}` resolve inside node overrides and transform nodes
+as they do elsewhere.
 
 **What applies in topology mode.** Each block is scoped to the node where it
 makes sense. The per-page governance passes — `pipeline.masking`,
 `pipeline.quality`, `pipeline.contract`, `schema:` — are enforced per sink node,
 and `resilience:` applies to its writes. `sla:` keeps per-sink-node history under
-`{pipeline}::{node_id}`; `notifications:` reports per sink node; `lineage:` emits
+`{pipeline}::{node_id}` (staleness and volume checks, like `profiling:`, need a
+durable `state:` block, as in matrix mode); `notifications:` reports per sink node; `lineage:` emits
 one job per sink node (`{pipeline}.{node_id}`) whose inputs are every source that
 reaches it; `catalog:` records a dataset per source and per sink plus an edge for
 each pair the graph connects. `budget:`, `metadata_columns:` and `reconcile:`
 apply per sink node too. So do `--dry-run` / `--limit`, `${now.*}` / `--clock`,
-`state:`, and `dlq:`. `verify:` and `rollback:` are refused (a graph sink has no
+`state:`, and `dlq:` (a `--dry-run` counts would-be dead letters without writing them,
+and a preview runs at-least-once). `verify:` and `rollback:` are refused (a graph sink has no
 single source to verify against, and runs are undone per matrix row), and
 `usage:` is accepted but not applied. See the
 [applies-per-node table](../cookbook/topology.md#observability) for the detail.

@@ -999,57 +999,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             )));
         }
 
-        // SLA gate (load-time, #202): validate the spec once per row and
-        // require a `state:` block when staleness / volume-anomaly checks need
-        // persisted history. `min_rows_per_run` alone is stateless and passes
-        // without one.
-        if let Some(sla) = row.sla.as_ref().or(cfg.sla.as_ref()) {
-            sla.validate()
-                .map_err(|e| CliError::Config(format!("sla: {e}")))?;
-            if sla.needs_state() {
-                match state.as_ref() {
-                    None => {
-                        return Err(CliError::Config(format!(
-                            "row '{row_id}': sla.max_staleness_secs / sla.volume_anomaly \
-                             need persisted run history — add a `state:` block \
-                             (min_rows_per_run alone works without one)"
-                        )));
-                    }
-                    Some(s) if s.kind == "memory" => {
-                        tracing::warn!(
-                            row = %row_id,
-                            "sla: the `memory` state store resets on process exit — \
-                             staleness/volume baselines only persist within a single \
-                             `faucet schedule`/`serve` process; use `file`, `redis`, \
-                             or `postgres` for one-shot runs"
-                        );
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-
-        // Profiling gate (#708): validate the spec once per row and require a
-        // `state:` block — the rolling baseline lives there. A memory store
-        // only baselines within one process.
-        if let Some(pf) = row.profiling.as_ref().or(cfg.profiling.as_ref()) {
-            pf.validate()
-                .map_err(|e| CliError::Config(format!("profiling: {e}")))?;
-            match state.as_ref() {
-                None => {
-                    return Err(CliError::Config(format!(
-                        "row '{row_id}': profiling: needs a `state:` block — the rolling                          baseline of column profiles is kept there"
-                    )));
-                }
-                Some(s) if s.kind == "memory" => {
-                    tracing::warn!(
-                        row = %row_id,
-                        "profiling: the `memory` state store resets on process exit — the                          profile baseline only persists within a single `faucet                          schedule`/`serve` process; use `file`, `redis`, or `postgres`                          for one-shot runs"
-                    );
-                }
-                Some(_) => {}
-            }
-        }
+        check_sla_and_profiling(
+            &format!("row '{row_id}'"),
+            row.sla.as_ref().or(cfg.sla.as_ref()),
+            row.profiling.as_ref().or(cfg.profiling.as_ref()),
+            state.as_ref(),
+        )?;
 
         // postgres-cdc gate (#789 SQL-131): the replication slot only advances
         // from a persisted bookmark, so without state every run replays from
@@ -2185,6 +2140,58 @@ fn check_cleanup_completeness(
             },
             ids.first().copied().unwrap_or("parent")
         )));
+    }
+    Ok(())
+}
+
+/// SLA (#202) and profiling (#708) gates, shared by matrix rows and topology
+/// sink nodes (#789 CLI-63): validate each spec and require a `state:` block
+/// when the check needs persisted history (staleness / volume baselines, the
+/// profile baseline). A `memory` store only keeps history within one process.
+pub(crate) fn check_sla_and_profiling(
+    owner: &str,
+    sla: Option<&crate::sla::SlaSpec>,
+    profiling: Option<&faucet_core::ProfilingSpec>,
+    state: Option<&StateStoreSpec>,
+) -> CliResult<()> {
+    let memory_warning = |what: &str| {
+        tracing::warn!(
+            owner,
+            "{what}: the `memory` state store resets on process exit — the baseline only \
+             persists within a single `faucet schedule`/`serve` process; use `file`, `redis`, \
+             or `postgres` for one-shot runs"
+        );
+    };
+    if let Some(sla) = sla {
+        sla.validate()
+            .map_err(|e| CliError::Config(format!("sla: {e}")))?;
+        if sla.needs_state() {
+            match state {
+                None => {
+                    return Err(CliError::Config(format!(
+                        "{owner}: sla.max_staleness_secs / sla.volume_anomaly need persisted \
+                         run history — add a `state:` block (min_rows_per_run alone works \
+                         without one)"
+                    )));
+                }
+                Some(s) if s.kind == "memory" => memory_warning("sla"),
+                Some(_) => {}
+            }
+        }
+    }
+    if let Some(pf) = profiling {
+        pf.validate()
+            .map_err(|e| CliError::Config(format!("profiling: {e}")))?;
+        match state {
+            None => {
+                return Err(CliError::Config(format!(
+                    "{owner}: profiling: needs a `state:` block — the rolling baseline of \
+                     column profiles is kept there"
+                )));
+            }
+            Some(s) if s.kind == "memory" => memory_warning("profiling"),
+            Some(_) => {}
+        }
     }
     Ok(())
 }

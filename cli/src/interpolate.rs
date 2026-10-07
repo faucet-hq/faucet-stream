@@ -454,6 +454,23 @@ pub fn resolve_config_refs(cfg: &mut crate::config::PipelineConfig) -> CliResult
     if let Some(r) = cfg.replication.as_mut() {
         resolve_value_full(&mut r.snapshot.source.config, vars_ref, &snapshot)?;
     }
+    // Topology node overrides and transform-node configs (#789 CLI-62).
+    for node in cfg.pipeline.nodes.values_mut() {
+        match node {
+            crate::config::NodeSpec::Source {
+                config: Some(c), ..
+            }
+            | crate::config::NodeSpec::Sink {
+                config: Some(c), ..
+            } => resolve_value_full(c, vars_ref, &snapshot)?,
+            crate::config::NodeSpec::Transform { transforms } => {
+                for t in transforms.iter_mut() {
+                    resolve_value_full(&mut t.config, vars_ref, &snapshot)?;
+                }
+            }
+            _ => {}
+        }
+    }
     for (i, row) in cfg.matrix.iter_mut().enumerate() {
         let _row_owner = row.id.clone().unwrap_or_else(|| format!("row-{i}"));
         if let Some(p) = row.source.as_mut()
