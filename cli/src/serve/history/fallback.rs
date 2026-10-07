@@ -471,6 +471,9 @@ impl RunHistory for FallbackHistory {
     async fn usage_delete_runs(&self, run_ids: &[String]) -> Result<usize, HistoryError> {
         strict!(self, p => p.usage_delete_runs(run_ids), f => f.usage_delete_runs(run_ids))
     }
+    async fn usage_delete_tenant(&self, tenant: &str) -> Result<usize, HistoryError> {
+        strict!(self, p => p.usage_delete_tenant(tenant), f => f.usage_delete_tenant(tenant))
+    }
     async fn change_upsert(
         &self,
         change: &crate::serve::changes::ChangeRequest,

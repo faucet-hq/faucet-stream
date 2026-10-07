@@ -874,6 +874,13 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     }
 
     // ── Delete cascade ─────────────────────────────────────────────────────
+    #[cfg(feature = "catalog")]
+    {
+        let (_, u) = api
+            .get("admin-tok", "/v1/usage?tenant=acme&include_records=true")
+            .await;
+        assert!(!u["records"].as_array().unwrap().is_empty(), "{u}");
+    }
     let (code, report) = api
         .send(
             reqwest::Method::DELETE,
@@ -888,6 +895,16 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         report["state_keys_deleted"].as_u64().unwrap() >= 1,
         "{report}"
     );
+    // Usage rows are keyed by invocation id; they go with the tenant
+    // (#789 SERVE-30).
+    #[cfg(feature = "catalog")]
+    {
+        assert!(report["usage_records"].as_u64().unwrap() >= 1, "{report}");
+        let (_, u) = api
+            .get("admin-tok", "/v1/usage?tenant=acme&include_records=true")
+            .await;
+        assert!(u["records"].as_array().unwrap().is_empty(), "{u}");
+    }
     let (code, _) = api.get("admin-tok", "/v1/tenants/acme").await;
     assert_eq!(code, 404);
     let (_, page) = api.get("admin-tok", "/v1/runs?tenant=acme").await;

@@ -3,7 +3,7 @@
 //! shared with SQLite via [`impl_sql_history!`](super::sql).
 
 use super::HistoryError;
-use super::sql::{DDL, Dialect, Stmts, classify_backend_error_with_context, impl_sql_history};
+use super::sql::{Dialect, Stmts, classify_backend_error_with_context, impl_sql_history};
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 
@@ -23,11 +23,7 @@ impl PostgresHistory {
             .connect(url)
             .await
             .map_err(|e| classify_backend_error_with_context("Postgres connection failed", e))?;
-        for stmt in DDL {
-            sqlx::query(stmt).execute(&pool).await.map_err(|e| {
-                classify_backend_error_with_context("creating run-history schema", e)
-            })?;
-        }
+        super::sql::migrate!(&pool)?;
         Ok(Self::from_parts(
             pool,
             idem_retention,

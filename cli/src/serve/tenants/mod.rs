@@ -706,7 +706,11 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
     report.usage_records = history
         .usage_delete_runs(&run_ids)
         .await
-        .map_err(store_err)?;
+        .map_err(store_err)?
+        + history
+            .usage_delete_tenant(tenant)
+            .await
+            .map_err(store_err)?;
     for id in &run_ids {
         if matches!(
             history.delete(id).await.map_err(store_err)?,

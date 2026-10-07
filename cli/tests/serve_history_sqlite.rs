@@ -1556,3 +1556,162 @@ async fn trigger_edges_rise_once_rearm_and_retract() {
     a.trigger_edge_retract("drain", second).await.unwrap();
     assert_eq!(a.trigger_edge_rise("drain").await.unwrap(), Some(second));
 }
+
+/// #789 SERVE-33 / SUPPLY-19: a database created by an older binary — without
+/// `cancel_requested`, the tenant columns or a schema version — is migrated
+/// at connect (tenants backfilled from each body), stamped, and a database
+/// stamped by a newer binary is refused at startup.
+#[tokio::test]
+async fn an_old_database_is_migrated_and_a_newer_one_refused() {
+    use sqlx::Connection as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db");
+    let url = format!("sqlite:{}?mode=rwc", path.display());
+    {
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        for stmt in [
+            "CREATE TABLE faucet_serve_runs (run_id TEXT PRIMARY KEY, name TEXT, status TEXT NOT NULL, \
+             submitted_at TEXT NOT NULL, finished_at TEXT, idempotency_key TEXT, owner TEXT, \
+             lease_expires_at TEXT, body TEXT NOT NULL)",
+            "CREATE TABLE faucet_usage (run_id TEXT NOT NULL, row_id TEXT NOT NULL, \
+             pipeline TEXT NOT NULL, recorded_at TEXT NOT NULL, body TEXT NOT NULL, \
+             PRIMARY KEY (run_id, row_id))",
+            "CREATE TABLE faucet_serve_changes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
+             status TEXT NOT NULL, requester TEXT NOT NULL, created_at TEXT NOT NULL, \
+             expires_at TEXT NOT NULL, body TEXT NOT NULL)",
+        ] {
+            sqlx::query(stmt).execute(&mut conn).await.unwrap();
+        }
+        let usage = serde_json::to_value(faucet_cli::usage::UsageRecord {
+            run_id: "inv-1".into(),
+            pipeline: "p".into(),
+            row: "r".into(),
+            source_kind: "csv".into(),
+            sink_kind: "jsonl".into(),
+            dataset_id: None,
+            dataset_uri: None,
+            recorded_at: Utc::now(),
+            duration_ms: 1,
+            failed: false,
+            usage: Default::default(),
+            cost: Default::default(),
+            tenant: Some("acme".into()),
+        })
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO faucet_usage VALUES ('inv-1','r','p','2026-10-01T00:00:00.000000000Z',?)",
+        )
+        .bind(usage.to_string())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO faucet_usage VALUES ('inv-2','r','p','2026-10-01T00:00:00.000000000Z','{}')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let store = SqliteHistory::connect(
+        &format!("sqlite:{}", path.display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i1".into(),
+    )
+    .await
+    .expect("an old database migrates");
+    let rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, Utc::now());
+    store.upsert(&rec).await.unwrap();
+    store
+        .request_cancel("r1")
+        .await
+        .expect("cancel_requested exists");
+    let filter = faucet_cli::usage::UsageFilter {
+        tenant: Some("acme".into()),
+        limit: 10,
+        ..Default::default()
+    };
+    let rows = store.usage_list(&filter).await.unwrap();
+    assert_eq!(rows.len(), 1, "the tenant column was backfilled");
+    assert_eq!(store.usage_delete_tenant("acme").await.unwrap(), 1);
+    drop(store);
+    // Connecting again is a no-op.
+    let again = SqliteHistory::connect(
+        &format!("sqlite:{}", path.display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i2".into(),
+    )
+    .await
+    .expect("idempotent");
+    drop(again);
+
+    {
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("UPDATE faucet_serve_schema SET version='99' WHERE id='schema'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let err = SqliteHistory::connect(
+        &format!("sqlite:{}", path.display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i3".into(),
+    )
+    .await
+    .err()
+    .expect("a newer schema is refused");
+    assert!(
+        faucet_cli::serve::history::sql::schema_too_new(&err),
+        "{err}"
+    );
+    let fatal = faucet_cli::serve::history::connect(
+        &faucet_cli::serve::config::HistoryBackendSpec::Sqlite(format!(
+            "sqlite:{}",
+            path.display()
+        )),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i4",
+    )
+    .await;
+    assert!(fatal.is_err(), "a newer schema is fatal, not a degrade");
+}
+
+/// #789 SERVE-45: failing an orphan is conditional on its lease still being
+/// expired, so an owner that renewed after the scan keeps its run.
+#[tokio::test]
+async fn failing_an_orphan_spares_a_run_whose_lease_was_renewed() {
+    use faucet_cli::serve::history::sql::{Dialect, Stmts};
+    use sqlx::Connection as _;
+    let dir = tempfile::tempdir().unwrap();
+    let owner = store_with(&dir, "orphan.db", Duration::from_secs(3600), "owner").await;
+    let mut rec = RunRecord::queued("live".into(), None, BTreeMap::new(), None, Utc::now());
+    rec.status = RunStatus::Running;
+    owner.upsert(&rec).await.unwrap();
+    let stmts = Stmts::new(Dialect::Sqlite);
+    let mut conn = sqlx::SqliteConnection::connect(&format!(
+        "sqlite:{}",
+        dir.path().join("orphan.db").display()
+    ))
+    .await
+    .unwrap();
+    let now = faucet_cli::serve::history::sql::fmt_ts(Utc::now());
+    let done = sqlx::query(&stmts.fail_orphan)
+        .bind("failed")
+        .bind(&now)
+        .bind("scanner")
+        .bind(&now)
+        .bind("{}")
+        .bind("live")
+        .bind(&now)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(done.rows_affected(), 0, "a live lease is not failed");
+    assert_eq!(
+        owner.get("live").await.unwrap().unwrap().status,
+        RunStatus::Running
+    );
+}

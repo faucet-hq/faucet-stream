@@ -735,6 +735,16 @@ impl RunHistory for MemoryHistory {
         Ok(before - rows.len())
     }
 
+    async fn usage_delete_tenant(&self, tenant: &str) -> Result<usize, HistoryError> {
+        let mut rows = self
+            .usage
+            .lock()
+            .map_err(|_| HistoryError::Backend("usage lock poisoned".into()))?;
+        let before = rows.len();
+        rows.retain(|r| r.tenant.as_deref() != Some(tenant));
+        Ok(before - rows.len())
+    }
+
     async fn change_upsert(
         &self,
         change: &crate::serve::changes::ChangeRequest,

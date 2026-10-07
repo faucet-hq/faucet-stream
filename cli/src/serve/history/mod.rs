@@ -1218,6 +1218,15 @@ pub trait RunHistory: Send + Sync {
         Ok(0)
     }
 
+    /// Delete every usage record carrying `tenant` (tenant deletion, #709).
+    /// Usage rows are keyed by invocation id, not the serve run id, so this —
+    /// not [`usage_delete_runs`](Self::usage_delete_runs) — is what erases a
+    /// tenant's usage. Default: `0`.
+    async fn usage_delete_tenant(&self, tenant: &str) -> Result<usize, HistoryError> {
+        let _ = tenant;
+        Ok(0)
+    }
+
     // ── Cost & usage accounting (#704) ───────────────────────────────────────
     //
     // One row per finished invocation: records, estimated bytes, round trips,
@@ -1476,6 +1485,11 @@ async fn connect_postgres(
         postgres::PostgresHistory::connect(url, idem, lease_ttl, instance_id.to_string())
     })
     .await;
+    if let Err(e) = &result
+        && sql::schema_too_new(e)
+    {
+        return Err(crate::error::CliError::Serve(e.to_string()));
+    }
     Ok(into_history(result, idem, "postgres"))
 }
 
@@ -1504,6 +1518,11 @@ async fn connect_sqlite(
         sqlite::SqliteHistory::connect(url, idem, lease_ttl, instance_id.to_string())
     })
     .await;
+    if let Err(e) = &result
+        && sql::schema_too_new(e)
+    {
+        return Err(crate::error::CliError::Serve(e.to_string()));
+    }
     Ok(into_history(result, idem, "sqlite"))
 }
 
@@ -1710,6 +1729,7 @@ mod tests {
         assert!(h.tenant_state_refs("acme").await.unwrap().is_empty());
         assert!(!h.change_delete("c1").await.unwrap());
         assert_eq!(h.usage_delete_runs(&["r".to_string()]).await.unwrap(), 0);
+        assert_eq!(h.usage_delete_tenant("acme").await.unwrap(), 0);
     }
 
     #[test]

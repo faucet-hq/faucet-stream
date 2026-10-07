@@ -105,6 +105,7 @@
 - [Observability](./operations/observability.md)
 - [Reliability testing](./operations/reliability-testing.md)
 - [Upgrading faucet safely](./operations/upgrading.md)
+- [Backing up the server database](./operations/backup.md)
 - [Performance tuning](./operations/tuning.md)
 - [Troubleshooting with `faucet doctor`](./cookbook/troubleshooting.md)
 - [Troubleshooting & FAQ](./operations/troubleshooting.md)
