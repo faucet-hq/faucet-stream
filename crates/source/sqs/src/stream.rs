@@ -40,6 +40,40 @@ pub(crate) fn decode_body(body: &str) -> Value {
     serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()))
 }
 
+/// Pause after an empty short-poll receive.
+const EMPTY_RECEIVE_BACKOFF: Duration = Duration::from_millis(500);
+
+/// `{ message_id, attributes, payload }` for `include_metadata: true`; string
+/// and number attributes keep their value, binary ones are base64. Pure.
+pub(crate) fn with_metadata(
+    payload: Value,
+    message_id: Option<&str>,
+    attributes: Option<
+        &std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    >,
+) -> Value {
+    use base64::Engine as _;
+    let attrs: serde_json::Map<String, Value> = attributes
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| {
+            let value = match (v.string_value(), v.binary_value()) {
+                (Some(s), _) => Value::String(s.to_string()),
+                (None, Some(b)) => {
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(b.as_ref()))
+                }
+                (None, None) => Value::Null,
+            };
+            (k.clone(), value)
+        })
+        .collect();
+    serde_json::json!({
+        "message_id": message_id,
+        "attributes": attrs,
+        "payload": payload,
+    })
+}
+
 /// The informational bookmark every page carries. The broker, not faucet,
 /// tracks the queue position; the bookmark exists so the pipeline flushes the
 /// sink before resuming the generator, which is when the page's messages are
@@ -180,6 +214,8 @@ impl faucet_core::Source for SqsSource {
             batch_size
         };
 
+        let fifo = faucet_common_sqs::is_fifo(&self.config.queue_url);
+
         Box::pin(async_stream::try_stream! {
             let idle = self.config.idle_timeout_secs.map(Duration::from_secs);
             let max = self.config.max_messages;
@@ -224,12 +260,16 @@ impl faucet_core::Source for SqsSource {
                 let want = remaining
                     .map_or(MAX_RECEIVE_BATCH, |r| r.min(MAX_RECEIVE_BATCH as usize) as i32);
 
-                let resp = self
+                let mut receive = self
                     .client
                     .receive_message()
                     .queue_url(&self.config.queue_url)
                     .max_number_of_messages(want)
-                    .wait_time_seconds(self.config.wait_time_seconds)
+                    .wait_time_seconds(self.config.wait_time_seconds);
+                if self.config.include_metadata {
+                    receive = receive.message_attribute_names("All");
+                }
+                let resp = receive
                     .send()
                     .await
                     .map_err(|e| {
@@ -252,12 +292,22 @@ impl faucet_core::Source for SqsSource {
                         );
                         break;
                     }
+                    // A short poll returns at once when the queue is empty;
+                    // back off instead of spinning (#789 MSG-93).
+                    if self.config.wait_time_seconds == 0 {
+                        tokio::time::sleep(EMPTY_RECEIVE_BACKOFF).await;
+                    }
                     continue;
                 }
                 last_activity = Instant::now();
 
                 for msg in messages {
-                    buffer.push(decode_body(msg.body().unwrap_or("")));
+                    let body = decode_body(msg.body().unwrap_or(""));
+                    buffer.push(if self.config.include_metadata {
+                        with_metadata(body, msg.message_id(), msg.message_attributes())
+                    } else {
+                        body
+                    });
                     handles.push(msg.receipt_handle().map(str::to_string));
                     total += 1;
                 }
@@ -270,10 +320,16 @@ impl faucet_core::Source for SqsSource {
                 // carries a bookmark so the pipeline flushes the sink before it
                 // resumes us — otherwise a buffering sink could still hold the
                 // records when they are deleted.
-                while buffer.len() >= chunk {
-                    let page: Vec<Value> = buffer.drain(..chunk).collect();
+                // A FIFO queue hands out nothing more from a message group while
+                // earlier messages of it are in flight, so a page waiting to
+                // fill would stall a single-group queue: emit (and so delete)
+                // after every receive instead (#789 MSG-48).
+                let page_size = if fifo { buffer.len().max(1) } else { chunk };
+                while buffer.len() >= page_size && !buffer.is_empty() {
+                    let take = page_size.min(buffer.len());
+                    let page: Vec<Value> = buffer.drain(..take).collect();
                     let to_delete: Vec<String> =
-                        handles.drain(..chunk).flatten().collect();
+                        handles.drain(..take).flatten().collect();
                     pending.extend(to_delete);
                     yield StreamPage {
                         records: page,
@@ -375,6 +431,48 @@ impl faucet_core::Source for SqsSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_wraps_the_body_with_id_and_attributes() {
+        use aws_sdk_sqs::primitives::Blob;
+        use aws_sdk_sqs::types::MessageAttributeValue;
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "tenant".to_string(),
+            MessageAttributeValue::builder()
+                .data_type("String")
+                .string_value("t1")
+                .build()
+                .unwrap(),
+        );
+        attrs.insert(
+            "raw".to_string(),
+            MessageAttributeValue::builder()
+                .data_type("Binary")
+                .binary_value(Blob::new(vec![0xff]))
+                .build()
+                .unwrap(),
+        );
+        attrs.insert(
+            "none".to_string(),
+            MessageAttributeValue::builder()
+                .data_type("String")
+                .build()
+                .unwrap(),
+        );
+        assert_eq!(
+            with_metadata(serde_json::json!({"a": 1}), Some("m-1"), Some(&attrs)),
+            serde_json::json!({
+                "message_id": "m-1",
+                "attributes": {"tenant": "t1", "raw": "/w==", "none": null},
+                "payload": {"a": 1}
+            })
+        );
+        assert_eq!(
+            with_metadata(serde_json::json!(1), None, None)["attributes"],
+            serde_json::json!({})
+        );
+    }
     use faucet_core::Source as _;
 
     fn decode(s: &str) -> Value {

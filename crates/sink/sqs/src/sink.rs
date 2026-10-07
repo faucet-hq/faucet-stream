@@ -43,6 +43,52 @@ pub(crate) fn backoff_delay(initial_ms: u64, max_ms: u64, attempt: usize) -> Dur
     faucet_core::retry::apply_jitter(Duration::from_millis(exp.min(max_ms)))
 }
 
+/// The request-size limit SQS enforced before raising it to 1 MiB, still in
+/// force on some SQS-compatible services.
+const LEGACY_BATCH_BYTES: usize = 262_144;
+
+/// Error codes a `SendMessageBatch` request may succeed on when retried.
+const RETRIABLE_CODES: &[&str] = &[
+    "RequestThrottled",
+    "ThrottlingException",
+    "Throttling",
+    "ServiceUnavailable",
+    "InternalError",
+    "InternalFailure",
+    "KmsThrottled",
+];
+
+/// Whether a failed request is worth retrying: a transport failure or
+/// timeout, an HTTP 5xx/429, or a throttling/availability error code. Any
+/// other service error (a missing queue, access denied, a malformed request)
+/// fails at once instead of burning the retry budget (#789 MSG-91). Pure.
+pub(crate) fn retriable_request(status: Option<u16>, code: Option<&str>, transport: bool) -> bool {
+    transport
+        || matches!(status, Some(429) | Some(500..=599))
+        || code.is_some_and(|c| RETRIABLE_CODES.contains(&c))
+}
+
+/// FIFO partial failure: the entries to send again after entry `failed`
+/// failed — it and every later entry of its message group in `chunk`, which
+/// SQS may have accepted ahead of it (#789 MSG-35). Pure.
+pub(crate) fn fifo_resend(chunk: &[Encoded], failed: &HashSet<usize>) -> HashSet<usize> {
+    let mut first: std::collections::HashMap<Option<&str>, usize> = Default::default();
+    for e in chunk {
+        if failed.contains(&e.index) {
+            first.entry(e.group_id.as_deref()).or_insert(e.index);
+        }
+    }
+    chunk
+        .iter()
+        .filter(|e| {
+            first
+                .get(&e.group_id.as_deref())
+                .is_some_and(|&f| e.index >= f)
+        })
+        .map(|e| e.index)
+        .collect()
+}
+
 /// Stringify a top-level record field for use as a `MessageDeduplicationId`.
 /// Missing / null / non-scalar fields are per-record errors.
 pub(crate) fn dedup_id_for(record: &Value, field: &str) -> Result<String, FaucetError> {
@@ -85,6 +131,13 @@ pub(crate) fn chunk_requests(
         out.push(current);
     }
     out
+}
+
+fn clone_outcome(o: &Result<(), FaucetError>) -> Result<(), FaucetError> {
+    match o {
+        Ok(()) => Ok(()),
+        Err(e) => Err(FaucetError::Sink(e.to_string())),
+    }
 }
 
 /// AWS SQS sink. See the crate README for semantics.
@@ -224,6 +277,12 @@ impl SqsSink {
                     if retry_indices.is_empty() {
                         return Ok(outcomes);
                     }
+                    if faucet_common_sqs::is_fifo(&self.config.queue_url) {
+                        retry_indices = fifo_resend(&pending, &retry_indices);
+                        for idx in &retry_indices {
+                            outcomes.remove(idx);
+                        }
+                    }
                     pending.retain(|e| retry_indices.contains(&e.index));
                     attempt += 1;
                     let delay = backoff_delay(
@@ -241,12 +300,21 @@ impl SqsSink {
                     tokio::time::sleep(delay).await;
                 }
                 Err(err) => {
+                    use aws_sdk_sqs::error::ProvideErrorMetadata as _;
                     attempt += 1;
+                    let transport = matches!(
+                        err,
+                        aws_sdk_sqs::error::SdkError::DispatchFailure(_)
+                            | aws_sdk_sqs::error::SdkError::TimeoutError(_)
+                            | aws_sdk_sqs::error::SdkError::ResponseError(_)
+                    );
+                    let status = err.raw_response().map(|r| r.status().as_u16());
+                    let retriable = retriable_request(status, err.code(), transport);
                     let service = err.into_service_error();
-                    if attempt >= retry_cfg.max_attempts {
+                    if !retriable || attempt >= retry_cfg.max_attempts {
                         return Err(FaucetError::Sink(format!(
-                            "sqs: SendMessageBatch to '{}' failed after {} attempt(s): {service}",
-                            self.config.queue_url, retry_cfg.max_attempts
+                            "sqs: SendMessageBatch to '{}' failed after {attempt} attempt(s): {service}",
+                            self.config.queue_url
                         )));
                     }
                     let delay = backoff_delay(
@@ -267,6 +335,31 @@ impl SqsSink {
         }
     }
 
+    /// [`put_chunk`](Self::put_chunk), falling back to 256 KiB requests when
+    /// the queue (or an SQS-compatible service) still enforces the older
+    /// request limit and refuses the batch as too long.
+    async fn put_chunk_sized(
+        &self,
+        chunk: Vec<Encoded>,
+    ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
+        let total: usize = chunk.iter().map(Encoded::request_bytes).sum();
+        let backup = (chunk.len() > 1 && total > LEGACY_BATCH_BYTES).then(|| chunk.clone());
+        match self.put_chunk(chunk).await {
+            Err(e) if backup.is_some() && e.to_string().contains("BatchRequestTooLong") => {
+                let mut merged = BTreeMap::new();
+                for part in chunk_requests(
+                    backup.unwrap_or_default(),
+                    self.config.batch_size,
+                    LEGACY_BATCH_BYTES,
+                ) {
+                    merged.extend(self.put_chunk(part).await?);
+                }
+                Ok(merged)
+            }
+            other => other,
+        }
+    }
+
     /// Ship all encoded entries with bounded request concurrency, merging
     /// per-entry outcomes.
     async fn ship(
@@ -280,11 +373,44 @@ impl SqsSink {
             crate::config::MAX_BATCH_BYTES,
         );
         let mut merged: BTreeMap<usize, Result<(), FaucetError>> = BTreeMap::new();
-        let mut stream =
-            futures::stream::iter(chunks.into_iter().map(|chunk| self.put_chunk(chunk)))
-                .buffer_unordered(self.config.concurrency);
-        while let Some(result) = stream.next().await {
-            merged.extend(result?);
+        // A chunk whose whole request failed reports that error on each of its
+        // entries, so the other chunks' outcomes are kept (#789 MSG-93).
+        let fifo = faucet_common_sqs::is_fifo(&self.config.queue_url);
+        let mut stream = futures::stream::iter(chunks.into_iter().map(|chunk| async move {
+            let indices: Vec<usize> = chunk.iter().map(|e| e.index).collect();
+            let groups: Vec<Option<String>> = chunk.iter().map(|e| e.group_id.clone()).collect();
+            (indices, groups, self.put_chunk_sized(chunk).await)
+        }))
+        .buffered(self.config.effective_concurrency());
+        let mut failed_groups: HashSet<Option<String>> = HashSet::new();
+        while let Some((indices, groups, result)) = stream.next().await {
+            match result {
+                Ok(outcomes) => {
+                    for (idx, group) in indices.iter().zip(&groups) {
+                        if fifo && failed_groups.contains(group) {
+                            merged.insert(
+                                *idx,
+                                Err(FaucetError::Sink(
+                                    "sqs: sent after an earlier message of its FIFO group failed"
+                                        .into(),
+                                )),
+                            );
+                        } else if let Some(o) = outcomes.get(idx) {
+                            if o.is_err() {
+                                failed_groups.insert(group.clone());
+                            }
+                            merged.insert(*idx, clone_outcome(o));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    for (idx, group) in indices.into_iter().zip(groups) {
+                        failed_groups.insert(group);
+                        merged.insert(idx, Err(FaucetError::Sink(msg.clone())));
+                    }
+                }
+            }
         }
         Ok(merged)
     }
@@ -397,6 +523,40 @@ impl faucet_core::Sink for SqsSink {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_transient_request_failures_are_retried() {
+        assert!(retriable_request(None, None, true));
+        assert!(retriable_request(Some(503), None, false));
+        assert!(retriable_request(Some(429), None, false));
+        assert!(retriable_request(
+            Some(400),
+            Some("RequestThrottled"),
+            false
+        ));
+        assert!(!retriable_request(
+            Some(400),
+            Some("AWS.SimpleQueueService.NonExistentQueue"),
+            false
+        ));
+        assert!(!retriable_request(Some(403), Some("AccessDenied"), false));
+        assert!(!retriable_request(None, None, false));
+    }
+
+    #[test]
+    fn a_fifo_failure_resends_the_rest_of_its_group() {
+        let e = |index: usize, g: &str| Encoded {
+            index,
+            body: String::new(),
+            group_id: Some(g.into()),
+            dedup_id: None,
+        };
+        let chunk = vec![e(0, "a"), e(1, "a"), e(2, "b"), e(3, "a"), e(4, "b")];
+        let failed: HashSet<usize> = [1].into();
+        let mut got: Vec<usize> = fifo_resend(&chunk, &failed).into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![1, 3]);
+    }
 
     fn enc(index: usize, bytes: usize) -> Encoded {
         Encoded {
@@ -531,8 +691,12 @@ mod tests {
         assert!(schema["properties"]["queue_url"].is_object());
     }
 
+    // A whole-request failure used to be the outer `Err` of
+    // `write_batch_partial`, discarding the outcomes of chunks that had
+    // already landed; it is now reported on each entry of its chunk
+    // (#789 MSG-93). `write_batch` still fails.
     #[tokio::test]
-    async fn whole_request_failure_propagates_as_outer_err() {
+    async fn whole_request_failure_is_reported_per_entry() {
         use faucet_core::Sink as _;
         let mut cfg = SqsSinkConfig::new("https://q");
         cfg.retry_max_attempts = 1; // fail fast against the unroutable endpoint
@@ -540,10 +704,8 @@ mod tests {
         let sink = offline_sink(cfg).await;
         let err = sink.write_batch(&[json!({"a": 1})]).await.unwrap_err();
         assert!(err.to_string().contains("SendMessageBatch"), "{err}");
-        let err = sink
-            .write_batch_partial(&[json!({"a": 1})])
-            .await
-            .unwrap_err();
+        let outcomes = sink.write_batch_partial(&[json!({"a": 1})]).await.unwrap();
+        let err = outcomes[0].as_ref().unwrap_err();
         assert!(err.to_string().contains("SendMessageBatch"), "{err}");
     }
 

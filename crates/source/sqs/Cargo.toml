@@ -11,6 +11,7 @@ keywords = ["sqs", "aws", "queue", "etl", "connector"]
 categories.workspace = true
 
 [dependencies]
+base64.workspace = true
 faucet-core.workspace = true
 faucet-common-sqs.workspace = true
 serde = { workspace = true, features = ["derive"] }

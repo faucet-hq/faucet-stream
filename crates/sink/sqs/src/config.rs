@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 
 /// SQS hard limit: `SendMessageBatch` accepts at most 10 entries per request.
 pub const MAX_ENTRIES_PER_REQUEST: usize = 10;
-/// SQS hard limit: 256 KiB per message body.
-pub const MAX_MESSAGE_BYTES: usize = 262_144;
-/// SQS hard limit: 256 KiB total payload per `SendMessageBatch` request.
-pub const MAX_BATCH_BYTES: usize = 262_144;
+/// SQS hard limit: 1 MiB per message body. A queue whose
+/// `MaximumMessageSize` is lower rejects larger entries per row.
+pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
+/// SQS hard limit: 1 MiB total payload per `SendMessageBatch` request.
+pub const MAX_BATCH_BYTES: usize = 1_048_576;
 
 /// Configuration for [`SqsSink`](crate::SqsSink).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -51,6 +52,8 @@ pub struct SqsSinkConfig {
     pub batch_size: usize,
 
     /// Bounded concurrent in-flight `SendMessageBatch` requests. Default 4.
+    /// A FIFO queue (`.fifo`) always sends one request at a time, so a
+    /// message group's order is preserved.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     /// Per-record retry for partial failures, grouped (#654 M20). When
@@ -150,6 +153,11 @@ impl SqsSinkConfig {
                 "sqs sink: retry_max_attempts must be at least 1".into(),
             ));
         }
+        if faucet_common_sqs::is_fifo(&self.queue_url) && self.message_group_id.is_none() {
+            return Err(FaucetError::Config(
+                "sqs sink: a FIFO queue (.fifo) requires message_group_id".into(),
+            ));
+        }
         if let Some(field) = &self.message_deduplication_id_field
             && field.is_empty()
         {
@@ -166,6 +174,15 @@ impl SqsSinkConfig {
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         faucet_core::BatchAtomicity::BestEffort
     }
+
+    /// In-flight requests: `concurrency`, or 1 for a FIFO queue (#789 MSG-35).
+    pub fn effective_concurrency(&self) -> usize {
+        if faucet_common_sqs::is_fifo(&self.queue_url) {
+            1
+        } else {
+            self.concurrency
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +197,19 @@ mod tests {
         assert_eq!(c.concurrency, 4);
         assert!(c.message_group_id.is_none());
         assert!(c.message_deduplication_id_field.is_none());
+    }
+
+    #[test]
+    fn fifo_queues_need_a_group_and_send_serially() {
+        let mut c = SqsSinkConfig::new("https://h/1/q.fifo");
+        assert!(c.validate().is_err(), "a FIFO queue needs message_group_id");
+        c.message_group_id = Some("g".into());
+        c.validate().unwrap();
+        assert_eq!(c.effective_concurrency(), 1);
+        assert_eq!(
+            SqsSinkConfig::new("https://h/1/q").effective_concurrency(),
+            4
+        );
     }
 
     #[test]

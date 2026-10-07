@@ -122,3 +122,72 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+/// Records up to the 1 MiB SQS limit are sent (the old 256 KiB cap refused
+/// them, #789 MSG-77), and a FIFO queue receives a page in order with one
+/// request in flight at a time (#789 MSG-35).
+#[tokio::test(flavor = "multi_thread")]
+async fn large_records_and_fifo_order() {
+    use aws_sdk_sqs::types::QueueAttributeName;
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    let std_url = create_queue(&client, "big").await;
+    let fifo_url = client
+        .create_queue()
+        .queue_name("ordered.fifo")
+        .attributes(QueueAttributeName::FifoQueue, "true")
+        .attributes(QueueAttributeName::ContentBasedDeduplication, "true")
+        .send()
+        .await
+        .expect("fifo queue")
+        .queue_url()
+        .unwrap()
+        .to_string();
+    let config = |url: &str| {
+        let mut c = SqsSinkConfig::new(url);
+        c.region = Some("us-east-1".into());
+        c.endpoint_url = Some(endpoint.clone());
+        c.credentials = test_credentials();
+        c
+    };
+
+    // Two 200 KiB records fit one 1 MiB request; a service still enforcing
+    // the old 256 KiB request limit (LocalStack) is answered by re-splitting.
+    let big = serde_json::json!({ "blob": "x".repeat(200 * 1024) });
+    let sink = SqsSink::new(config(&std_url)).await.unwrap();
+    let outcomes = sink.write_batch_partial(&[big.clone(), big]).await.unwrap();
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+
+    let mut fifo = config(&fifo_url);
+    assert!(
+        SqsSink::new(fifo.clone()).await.is_err(),
+        "FIFO needs a group id"
+    );
+    fifo.message_group_id = Some("g".into());
+    let sink = SqsSink::new(fifo).await.unwrap();
+    let rows: Vec<_> = (0..25).map(|i| serde_json::json!({ "i": i })).collect();
+    assert_eq!(sink.write_batch(&rows).await.unwrap(), 25);
+    let mut seen = Vec::new();
+    while seen.len() < 25 {
+        let out = client
+            .receive_message()
+            .queue_url(&fifo_url)
+            .max_number_of_messages(10)
+            .wait_time_seconds(1)
+            .send()
+            .await
+            .unwrap();
+        for m in out.messages() {
+            let v: serde_json::Value = serde_json::from_str(m.body().unwrap()).unwrap();
+            seen.push(v["i"].as_i64().unwrap());
+            client
+                .delete_message()
+                .queue_url(&fifo_url)
+                .receipt_handle(m.receipt_handle().unwrap())
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(seen, (0..25).collect::<Vec<i64>>());
+}
