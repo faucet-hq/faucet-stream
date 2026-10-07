@@ -80,7 +80,7 @@ pub enum EncryptionAlgorithm {
 ///   # previous_keys: ["${env:OLD_STATE_KEY}"]   # rotation: read-only
 ///   # algorithm: aes-256-gcm                     # default
 /// ```
-#[derive(Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EncryptionSpec {
     /// Key material used to seal new writes (and tried first on reads).
@@ -94,19 +94,6 @@ pub struct EncryptionSpec {
     /// AEAD algorithm. Only `aes-256-gcm` today.
     #[serde(default)]
     pub algorithm: EncryptionAlgorithm,
-}
-
-/// Serializes the algorithm only: key material never leaves the process in a
-/// serialized config (it would land in snapshots, previews or logs). A
-/// serialized spec therefore does not deserialize back — a loud failure,
-/// rather than data sealed under a placeholder key.
-impl Serialize for EncryptionSpec {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct as _;
-        let mut st = serializer.serialize_struct("EncryptionSpec", 1)?;
-        st.serialize_field("algorithm", &self.algorithm)?;
-        st.end()
-    }
 }
 
 impl std::fmt::Debug for EncryptionSpec {
@@ -317,15 +304,15 @@ mod tests {
     }
 
     #[test]
-    fn serialization_never_carries_key_material() {
-        let s = EncryptionSpec {
-            key: "top-secret-key".into(),
-            previous_keys: vec!["old-secret-key".into()],
-            algorithm: EncryptionAlgorithm::default(),
-        };
-        let v = serde_json::to_value(&s).unwrap();
-        assert_eq!(v, json!({ "algorithm": "aes-256-gcm" }));
-        assert!(serde_json::from_value::<EncryptionSpec>(v).is_err());
+    fn a_serialized_spec_round_trips() {
+        let spec: EncryptionSpec =
+            serde_json::from_value(serde_json::json!({"key": "k1", "previous_keys": ["k0"]}))
+                .unwrap();
+        let back: EncryptionSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.key, "k1");
+        assert_eq!(back.previous_keys, vec!["k0".to_string()]);
+        assert!(!format!("{spec:?}").contains("k1"));
     }
 
     #[test]
