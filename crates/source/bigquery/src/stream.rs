@@ -54,6 +54,14 @@ pub struct BigQuerySource {
 }
 
 impl BigQuerySource {
+    /// Where schema-tolerant fallback requests go (SQL-172).
+    fn raw_target(&self) -> faucet_common_bigquery::raw::RawTarget<'_> {
+        faucet_common_bigquery::raw::RawTarget {
+            creds: &self.config.auth,
+            host: self.config.api_host.as_deref(),
+        }
+    }
+
     /// Report the bytes a `jobs.query` response says the query scanned
     /// (`totalBytesProcessed`, the figure on-demand pricing bills) as a
     /// `bytes_processed` cost signal (#704).
@@ -133,12 +141,14 @@ impl BigQuerySource {
         let (query, bindings) = self.resolve_query(context);
         let req = self.build_query_request(query, &bindings);
         self.roundtrips.record("query");
-        let initial = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+        let initial = faucet_common_bigquery::raw::tolerant_query(
+            &self.client,
+            self.raw_target(),
+            &self.config.project_id,
+            req,
+        )
+        .await
+        .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
         self.signal_bytes_processed(&initial);
         let job_ref = initial.job_reference.as_ref().ok_or_else(|| {
             FaucetError::Source("BigQuery jobs.query returned no jobReference".into())
@@ -149,12 +159,15 @@ impl BigQuerySource {
         let poll_started = std::time::Instant::now();
         let job = loop {
             self.roundtrips.record("job");
-            let job = self
-                .client
-                .job()
-                .get_job(&self.config.project_id, job_id, job_ref.location.as_deref())
-                .await
-                .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))?;
+            let job = faucet_common_bigquery::raw::tolerant_get_job(
+                &self.client,
+                self.raw_target(),
+                &self.config.project_id,
+                job_id,
+                job_ref.location.as_deref(),
+            )
+            .await
+            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))?;
             if job_finished(job.status.as_ref(), job_id)? {
                 break job;
             }
@@ -325,12 +338,15 @@ impl BigQuerySource {
         let mut out = Vec::with_capacity(refs.len());
         for (i, (dataset_id, table_id)) in refs.iter().enumerate() {
             if i < max_schema_fetches {
-                let table = self
-                    .client
-                    .table()
-                    .get(project, dataset_id, table_id, None)
-                    .await
-                    .map_err(discovery_err)?;
+                let table = faucet_common_bigquery::raw::tolerant_get_table(
+                    &self.client,
+                    self.raw_target(),
+                    project,
+                    dataset_id,
+                    table_id,
+                )
+                .await
+                .map_err(discovery_err)?;
                 let fields = table.schema.fields.unwrap_or_default();
                 out.push(table_descriptor(
                     project,
@@ -585,7 +601,14 @@ impl faucet_core::Source for BigQuerySource {
 
         let probe = async {
             self.roundtrips.record("query");
-            match self.client.job().query(&self.config.project_id, req).await {
+            match faucet_common_bigquery::raw::tolerant_query(
+                &self.client,
+                self.raw_target(),
+                &self.config.project_id,
+                req,
+            )
+            .await
+            {
                 Ok(_) => Ok::<Probe, Probe>(Probe::pass("query", start.elapsed())),
                 Err(e) => Err(Probe::fail_hint(
                     "query",
@@ -616,12 +639,14 @@ impl faucet_core::Source for BigQuerySource {
 
         self.roundtrips.record("query");
 
-        let initial = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+        let initial = faucet_common_bigquery::raw::tolerant_query(
+            &self.client,
+            self.raw_target(),
+            &self.config.project_id,
+            req,
+        )
+        .await
+        .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
 
         self.signal_bytes_processed(&initial);
 
@@ -647,14 +672,17 @@ impl faucet_core::Source for BigQuerySource {
 
             self.roundtrips.record("poll");
 
-            let resp = self
-                .client
-                .job()
-                .get_query_results(&self.config.project_id, &job_id, params)
-                .await
-                .map_err(|e| {
-                    FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}"))
-                })?;
+            let resp = faucet_common_bigquery::raw::tolerant_get_query_results(
+                &self.client,
+                self.raw_target(),
+                &self.config.project_id,
+                &job_id,
+                params,
+            )
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}"))
+            })?;
 
             job_complete = resp.job_complete.unwrap_or(false);
             if !job_complete {
@@ -746,10 +774,7 @@ impl faucet_core::Source for BigQuerySource {
 
             self.roundtrips.record("query");
 
-            let initial = self
-                .client
-                .job()
-                .query(&self.config.project_id, req)
+            let initial = faucet_common_bigquery::raw::tolerant_query(&self.client, self.raw_target(), &self.config.project_id, req)
                 .await
                 .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
 
@@ -791,10 +816,7 @@ impl faucet_core::Source for BigQuerySource {
 
                 self.roundtrips.record("poll");
 
-                let resp = self
-                    .client
-                    .job()
-                    .get_query_results(&self.config.project_id, &job_id, params)
+                let resp = faucet_common_bigquery::raw::tolerant_get_query_results(&self.client, self.raw_target(), &self.config.project_id, &job_id, params)
                     .await
                     .map_err(|e| {
                         FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}"))

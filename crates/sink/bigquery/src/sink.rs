@@ -4,7 +4,7 @@ use crate::config::BigQuerySinkConfig;
 use crate::idempotent;
 use crate::merge;
 use async_trait::async_trait;
-use faucet_common_bigquery::{BigQueryCredentials, build_client};
+use faucet_common_bigquery::build_client;
 use faucet_core::FaucetError;
 use faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL;
 use gcp_bigquery_client::Client;
@@ -31,10 +31,6 @@ const IDEMPOTENT_JOB_TIMEOUT: Duration = Duration::from_secs(120);
 /// Server-side long-poll window per `getQueryResults` completion check —
 /// BigQuery holds the connection open up to this long, so we don't busy-wait.
 const JOB_POLL_LONG_POLL_MS: i32 = 10_000;
-
-/// OAuth scope minted for the `media_load` upload endpoint (which is not covered
-/// by the `gcp_bigquery_client` client's own authenticator surface).
-const BQ_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 
 /// Max wall-clock spent polling a media-upload **load** job to completion.
 /// A bucket-free page load is a single job; this is a generous safety cap so a
@@ -727,57 +723,6 @@ pub(crate) fn upload_client() -> Result<reqwest::Client, FaucetError> {
         .map_err(|e| FaucetError::Sink(format!("BigQuery: cannot build upload client: {e}")))
 }
 
-/// The application-default credentials file: `GOOGLE_APPLICATION_CREDENTIALS`,
-/// else gcloud's well-known location under `home`.
-fn adc_path(gac: Option<String>, home: Option<String>) -> Option<std::path::PathBuf> {
-    gac.map(std::path::PathBuf::from).or_else(|| {
-        home.map(|h| {
-            std::path::PathBuf::from(h).join(".config/gcloud/application_default_credentials.json")
-        })
-    })
-}
-
-/// The `authorized_user` secret in the ADC file, if that is what it holds
-/// (`gcloud auth application-default login`). yup-oauth2's ADC flow only
-/// knows service accounts and instance metadata.
-async fn authorized_user_adc() -> Result<
-    Option<gcp_bigquery_client::yup_oauth2::authorized_user::AuthorizedUserSecret>,
-    FaucetError,
-> {
-    let Some(path) = adc_path(
-        std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok(),
-        std::env::var("HOME").ok(),
-    ) else {
-        return Ok(None);
-    };
-    let Ok(contents) = tokio::fs::read_to_string(&path).await else {
-        return Ok(None);
-    };
-    parse_authorized_user(&contents)
-}
-
-fn parse_authorized_user(
-    contents: &str,
-) -> Result<
-    Option<gcp_bigquery_client::yup_oauth2::authorized_user::AuthorizedUserSecret>,
-    FaucetError,
-> {
-    let is_user = serde_json::from_str::<Value>(contents)
-        .ok()
-        .and_then(|v| {
-            v.get("type")
-                .and_then(Value::as_str)
-                .map(|t| t == "authorized_user")
-        })
-        .unwrap_or(false);
-    if !is_user {
-        return Ok(None);
-    }
-    serde_json::from_str(contents)
-        .map(Some)
-        .map_err(|e| FaucetError::Auth(format!("invalid authorized_user ADC file: {e}")))
-}
-
 impl BigQuerySink {
     /// Create a new BigQuery sink from the given configuration.
     ///
@@ -961,11 +906,12 @@ impl BigQuerySink {
     /// schemaless table); a missing table surfaces as the client's `BQError`.
     async fn fetch_schema_fields(&self) -> Result<Vec<idempotent::FieldSpec>, BQError> {
         let table = retry_control_plane("tables.get (schema)", || {
-            self.client.table().get(
+            faucet_common_bigquery::raw::tolerant_get_table(
+                &self.client,
+                self.raw_target(),
                 &self.config.project_id,
                 &self.config.dataset_id,
                 &self.config.table_id,
-                None,
             )
         })
         .await?;
@@ -993,11 +939,12 @@ impl BigQuerySink {
         infer: impl FnOnce() -> Option<Value>,
     ) -> Result<Option<Value>, FaucetError> {
         let existing = retry_control_plane("tables.get (truncate schema)", || {
-            self.client.table().get(
+            faucet_common_bigquery::raw::tolerant_get_table(
+                &self.client,
+                self.raw_target(),
                 &self.config.project_id,
                 &self.config.dataset_id,
                 table_id,
-                None,
             )
         })
         .await;
@@ -1180,66 +1127,7 @@ impl BigQuerySink {
     /// `gcp_bigquery_client::Client` handles auth for every other call itself.
     /// The token value is never logged.
     async fn access_token(&self) -> Result<String, FaucetError> {
-        use gcp_bigquery_client::yup_oauth2::{
-            self, ApplicationDefaultCredentialsAuthenticator,
-            ApplicationDefaultCredentialsFlowOpts, ServiceAccountAuthenticator,
-            authenticator::ApplicationDefaultCredentialsTypes,
-        };
-
-        let scopes = [BQ_OAUTH_SCOPE];
-        let token = match &self.config.auth {
-            BigQueryCredentials::ServiceAccountKey { json } => {
-                let key = yup_oauth2::parse_service_account_key(json)
-                    .map_err(|e| FaucetError::Auth(format!("invalid service account JSON: {e}")))?;
-                let auth = ServiceAccountAuthenticator::builder(key)
-                    .build()
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery auth failed: {e}")))?;
-                auth.token(&scopes)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
-            }
-            BigQueryCredentials::ServiceAccountKeyPath { path } => {
-                let key = yup_oauth2::read_service_account_key(path)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("read service account key: {e}")))?;
-                let auth = ServiceAccountAuthenticator::builder(key)
-                    .build()
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery auth failed: {e}")))?;
-                auth.token(&scopes)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
-            }
-            BigQueryCredentials::ApplicationDefault
-                if let Some(secret) = authorized_user_adc().await? =>
-            {
-                // `gcloud auth application-default login` credentials: the
-                // REST client accepts them, so the media-load path must too.
-                let auth = yup_oauth2::AuthorizedUserAuthenticator::builder(secret)
-                    .build()
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery ADC auth failed: {e}")))?;
-                auth.token(&scopes)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
-            }
-            BigQueryCredentials::ApplicationDefault => {
-                let opts = ApplicationDefaultCredentialsFlowOpts::default();
-                let auth = match ApplicationDefaultCredentialsAuthenticator::builder(opts).await {
-                    ApplicationDefaultCredentialsTypes::ServiceAccount(b) => b.build().await,
-                    ApplicationDefaultCredentialsTypes::InstanceMetadata(b) => b.build().await,
-                }
-                .map_err(|e| FaucetError::Auth(format!("BigQuery ADC auth failed: {e}")))?;
-                auth.token(&scopes)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
-            }
-        };
-        token
-            .token()
-            .map(str::to_string)
-            .ok_or_else(|| FaucetError::Auth("BigQuery access token had no value".to_string()))
+        faucet_common_bigquery::access_token(&self.config.auth).await
     }
 
     /// Load one page into `table_id` via a bucket-free BigQuery **load job**:
@@ -1336,12 +1224,15 @@ impl BigQuerySink {
         let started = std::time::Instant::now();
         loop {
             self.roundtrips.record("job");
-            let job = self
-                .client
-                .job()
-                .get_job(&self.config.project_id, job_id, location)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))?;
+            let job = faucet_common_bigquery::raw::tolerant_get_job(
+                &self.client,
+                self.raw_target(),
+                &self.config.project_id,
+                job_id,
+                location,
+            )
+            .await
+            .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))?;
             let (state, error_result) = {
                 let status = job.status.as_ref().ok_or_else(|| {
                     FaucetError::Sink(format!(
@@ -1374,6 +1265,14 @@ impl BigQuerySink {
     /// Base URL for the media/resumable **upload** endpoint. Fixed Google host in
     /// production; overridable via `config.upload_base_url` so tests can point the
     /// streaming load at a wiremock server.
+    /// Where schema-tolerant fallback requests go (SQL-172).
+    fn raw_target(&self) -> faucet_common_bigquery::raw::RawTarget<'_> {
+        faucet_common_bigquery::raw::RawTarget {
+            creds: &self.config.auth,
+            host: Some(self.upload_base()),
+        }
+    }
+
     fn upload_base(&self) -> &str {
         self.config
             .upload_base_url
@@ -1700,11 +1599,12 @@ impl BigQuerySink {
         // `Table` type has a non-optional `schema`, so a narrower field mask would
         // yield a response it can't deserialize.
         match retry_control_plane("tables.get (exists)", || {
-            self.client.table().get(
+            faucet_common_bigquery::raw::tolerant_get_table(
+                &self.client,
+                self.raw_target(),
                 &self.config.project_id,
                 &self.config.dataset_id,
                 table_id,
-                None,
             )
         })
         .await
@@ -1868,12 +1768,15 @@ impl BigQuerySink {
         // (returning `Ok` here would advance the bookmark over data that may
         // never have landed, the silent-data-loss failure mode).
         self.roundtrips.record("job");
-        let job = self
-            .client
-            .job()
-            .get_job(&self.config.project_id, &job_id, location.as_deref())
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")))?;
+        let job = faucet_common_bigquery::raw::tolerant_get_job(
+            &self.client,
+            self.raw_target(),
+            &self.config.project_id,
+            &job_id,
+            location.as_deref(),
+        )
+        .await
+        .map_err(|e| FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")))?;
         if let Some(b) = job
             .statistics
             .as_ref()
@@ -2963,38 +2866,18 @@ mod tests {
     }
 
     #[test]
-    fn adc_file_location_and_authorized_user_detection() {
-        assert_eq!(
-            super::adc_path(Some("/k.json".into()), Some("/h".into())),
-            Some(std::path::PathBuf::from("/k.json"))
-        );
-        assert_eq!(
-            super::adc_path(None, Some("/h".into())),
-            Some(std::path::PathBuf::from(
-                "/h/.config/gcloud/application_default_credentials.json"
-            ))
-        );
-        assert_eq!(super::adc_path(None, None), None);
-        let user =
-            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}"#;
-        assert!(super::parse_authorized_user(user).unwrap().is_some());
-        assert!(
-            super::parse_authorized_user(r#"{"type":"service_account"}"#)
-                .unwrap()
-                .is_none()
-        );
-        assert!(super::parse_authorized_user("not json").unwrap().is_none());
-        assert!(super::parse_authorized_user(r#"{"type":"authorized_user"}"#).is_err());
+    fn upload_client_builds() {
         assert!(super::upload_client().is_ok());
     }
 
     use super::{
-        BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema, appends_via_media_load,
-        build_load_job_json, build_load_job_json_fmt, build_load_job_json_full,
-        build_multipart_related, deletes_to_payload, dml_affected_rows, existing_load_schema, gzip,
-        is_direct_overwrite, json_schema_to_load_schema, media_boundary, multipart_boundary,
-        native_batch_columns, records_to_ndjson, scope_to_payload,
+        BigQuerySinkConfig, Job, all_string_schema, appends_via_media_load, build_load_job_json,
+        build_load_job_json_fmt, build_load_job_json_full, build_multipart_related,
+        deletes_to_payload, dml_affected_rows, existing_load_schema, gzip, is_direct_overwrite,
+        json_schema_to_load_schema, media_boundary, multipart_boundary, native_batch_columns,
+        records_to_ndjson, scope_to_payload,
     };
+    use faucet_common_bigquery::BigQueryCredentials;
     use faucet_core::{FaucetError, KeyTuple};
     use serde_json::json;
 

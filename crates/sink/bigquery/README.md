@@ -489,6 +489,13 @@ sink:
 than the trigger for the columnar path. The Storage **Write** API (gRPC
 `AppendRows`) is a separate future enhancement.
 
+## Column types the client does not know
+
+A destination table with a column type the REST client cannot decode (such as
+`RANGE`) no longer fails every schema read: the sink re-reads the table raw
+and treats that column as a `STRING` for drift and typed writes. Writes that
+cast into such a column still fail loudly at BigQuery.
+
 ## Overwrite (`write_mode: overwrite`)
 
 Full-refresh: each run atomically **replaces** the whole table — and it is

@@ -946,3 +946,74 @@ async fn columnar_taken_only_in_read_api_mode() {
     let _batches = read_src.stream_batches(&ctx, 0);
     let _pages = read_src.stream_pages(&ctx, 0);
 }
+
+/// A result whose schema names a type the REST client cannot decode (`RANGE`)
+/// is still read: the raw fallback re-sends the query with the same
+/// `requestId` (so BigQuery returns the same job instead of running it twice)
+/// and decodes the column as a string (SQL-172).
+#[tokio::test]
+async fn a_range_column_is_read_as_a_string() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let body = json!({
+        "jobComplete": true,
+        "schema": {"fields": [
+            {"name": "id", "type": "INTEGER"},
+            {"name": "span", "type": "RANGE", "rangeElementType": {"type": "DATE"}}
+        ]},
+        "jobReference": {"projectId": PROJECT_ID, "jobId": "job-r"},
+        "rows": [{"f": [{"v": "1"}, {"v": "[2024-01-01, 2024-02-01)"}]}],
+    });
+    for p in [
+        format!("/projects/{PROJECT_ID}/queries"),
+        format!("/bigquery/v2/projects/{PROJECT_ID}/queries"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+    }
+    let sa_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        sa_file.path(),
+        dummy_service_account_json(&server.uri()).to_string(),
+    )
+    .unwrap();
+    let client = ClientBuilder::new()
+        .with_auth_base_url(format!("{}{AUTH_SCOPE_BASE}", server.uri()))
+        .with_v2_base_url(server.uri())
+        .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+        .await
+        .expect("client");
+    let mut config = BigQuerySourceConfig::new(
+        PROJECT_ID,
+        BigQueryCredentials::ServiceAccountKeyPath {
+            path: sa_file.path().to_str().unwrap().into(),
+        },
+        "SELECT id, span FROM t",
+    );
+    config.api_host = Some(server.uri());
+    let src = BigQuerySource::from_parts(config, client);
+
+    let rows = src
+        .fetch_all()
+        .await
+        .expect("a RANGE column must not fail the read");
+    assert_eq!(
+        rows,
+        vec![json!({"id": 1, "span": "[2024-01-01, 2024-02-01)"})]
+    );
+
+    let ids: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/queries"))
+        .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap()["requestId"].clone())
+        .collect();
+    assert_eq!(ids.len(), 2, "typed attempt + raw fallback");
+    assert!(ids[0].is_string());
+    assert_eq!(ids[0], ids[1], "the fallback reuses the requestId");
+}

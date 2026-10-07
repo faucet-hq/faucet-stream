@@ -97,13 +97,7 @@ pub async fn write_columnar(
     let job_id = job_ref
         .job_id
         .ok_or_else(|| FaucetError::Sink("BigQuery load job returned no jobId".into()))?;
-    let loaded = await_load_job(
-        client,
-        &config.project_id,
-        &job_id,
-        job_ref.location.as_deref(),
-    )
-    .await;
+    let loaded = await_load_job(client, config, &job_id, job_ref.location.as_deref()).await;
     delete_staged(cfg, &key).await;
     loaded?;
 
@@ -253,7 +247,7 @@ pub async fn write_columnar_media_with_schema(
         FaucetError::Sink("BigQuery media load job returned no jobReference.jobId".into())
     })?;
     let location = job["jobReference"]["location"].as_str();
-    await_load_job(client, &config.project_id, job_id, location).await?;
+    await_load_job(client, config, job_id, location).await?;
 
     tracing::info!(
         table = %format!("{}.{}.{table_id}", config.project_id, config.dataset_id),
@@ -270,17 +264,25 @@ pub async fn write_columnar_media_with_schema(
 /// error in the body — the trap `await_query_complete` also guards).
 async fn await_load_job(
     client: &Client,
-    project_id: &str,
+    config: &BigQuerySinkConfig,
     job_id: &str,
     location: Option<&str>,
 ) -> Result<(), FaucetError> {
     let deadline = std::time::Instant::now() + LOAD_JOB_TIMEOUT;
     loop {
-        let job = client
-            .job()
-            .get_job(project_id, job_id, location)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))?;
+        let target = faucet_common_bigquery::raw::RawTarget {
+            creds: &config.auth,
+            host: config.upload_base_url.as_deref(),
+        };
+        let job = faucet_common_bigquery::raw::tolerant_get_job(
+            client,
+            target,
+            &config.project_id,
+            job_id,
+            location,
+        )
+        .await
+        .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))?;
         let status = job.status.ok_or_else(|| {
             FaucetError::Sink("BigQuery load job returned no status; cannot confirm".into())
         })?;
