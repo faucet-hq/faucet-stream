@@ -1151,6 +1151,42 @@ pub fn sink_shared_destination(kind: &str, cfg: &Value) -> Option<String> {
     }
 }
 
+/// A sink-config patch that gives one row of a fan-out its own destination,
+/// for a sink [`sink_shared_destination`] reports a fixed destination for:
+/// `tag` (a path-safe name such as a row id) goes into the file name before
+/// its first extension (`out/orders.jsonl` → `out/orders.<tag>.jsonl`), or
+/// becomes a subdirectory of a directory destination (`out/` →
+/// `out/<tag>/`). The patch sets the same field the guard reads (`path`,
+/// `destination.path` for `parquet`, `file_name` for `sftp`). `None` when
+/// the sink has no shared destination.
+pub fn sink_destination_patch(kind: &str, cfg: &Value, tag: &str) -> Option<Value> {
+    sink_shared_destination(kind, cfg)?;
+    let tagged = |name: &str| -> String {
+        if let Some(dir) = name.strip_suffix('/') {
+            return format!("{dir}/{tag}/");
+        }
+        let (dir, file) = match name.rfind('/') {
+            Some(i) => name.split_at(i + 1),
+            None => ("", name),
+        };
+        match file.find('.') {
+            Some(i) if i > 0 => format!("{dir}{}.{tag}{}", &file[..i], &file[i..]),
+            _ => format!("{dir}{file}.{tag}"),
+        }
+    };
+    let text = |k: &str| cfg.get(k).and_then(Value::as_str);
+    match kind {
+        "parquet" => {
+            let path = cfg.get("destination")?.get("path")?.as_str()?;
+            let mut destination = cfg.get("destination")?.clone();
+            destination["path"] = Value::String(tagged(path));
+            Some(serde_json::json!({ "destination": destination }))
+        }
+        "sftp" => Some(serde_json::json!({ "file_name": tagged(text("file_name")?) })),
+        _ => Some(serde_json::json!({ "path": tagged(text("path")?) })),
+    }
+}
+
 /// Sinks that support a **scoped/windowed** overwrite (#518) — replacing only
 /// the rows matching a `scope` (a date window) instead of the whole table. A
 /// subset of [`OVERWRITE_SINK_KINDS`]; the others still support full overwrite.
@@ -3907,6 +3943,43 @@ mod tests {
 mod truncating_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn destination_patch_tags_the_file_name_or_the_directory() {
+        let p = |k: &str, v: Value| sink_destination_patch(k, &v, "orders");
+        assert_eq!(
+            p("jsonl", json!({"path": "out/all.jsonl.gz"})),
+            Some(json!({"path": "out/all.orders.jsonl.gz"}))
+        );
+        assert_eq!(
+            p("file", json!({"path": "out"})),
+            Some(json!({"path": "out.orders"}))
+        );
+        assert_eq!(
+            p("file", json!({"path": ".hidden"})),
+            Some(json!({"path": ".hidden.orders"}))
+        );
+        assert_eq!(
+            p("s3", json!({"bucket": "b", "path": "exports/"})),
+            Some(json!({"path": "exports/orders/"}))
+        );
+        assert_eq!(
+            p(
+                "sftp",
+                json!({"host": "h", "path": "/d", "file_name": "x-{part}.csv"})
+            ),
+            Some(json!({"file_name": "x-{part}.orders.csv"}))
+        );
+        assert_eq!(
+            p(
+                "parquet",
+                json!({"destination": {"type": "local_path", "path": "o/a.parquet"}})
+            ),
+            Some(json!({"destination": {"type": "local_path", "path": "o/a.orders.parquet"}}))
+        );
+        assert_eq!(p("jsonl", json!({"path": "a.jsonl", "append": true})), None);
+        assert_eq!(p("s3", json!({"bucket": "b"})), None);
+    }
 
     #[test]
     fn shared_destination_by_kind() {

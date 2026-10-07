@@ -47,17 +47,33 @@ matrix:
     source:
       config:
         query: SELECT * FROM "public"."orders"
+    sink:
+      config:
+        path: ./out.public_orders.jsonl
   # sales.leads (table, ~87 rows)
   #   columns: id integer, active boolean?
   - id: sales_leads
     source:
       config:
         query: SELECT * FROM "sales"."leads"
+    sink:
+      config:
+        path: ./out.sales_leads.jsonl
 ```
 
 Each row deep-merges a per-dataset **config patch** over the connection config;
 introspected column schemas and row estimates appear as comments (`?` marks a
 nullable column).
+
+When the sink writes one fixed file — a `file` / `jsonl` / `csv` / single-file
+`parquet` path, or an `s3` / `gcs` / `azure-blob` sink with a fixed `path`
+(`sftp`: `file_name`) — every row would overwrite the others, and `faucet run`
+refuses rows that share a destination. So each row gets its own: the row id
+goes into the file name before its first extension (`./out.jsonl` →
+`./out.public_orders.jsonl`, `part-{part}.parquet` → `part-{part}.orders.parquet`),
+or becomes a subdirectory of a directory path (`exports/` → `exports/orders/`).
+A sink that already gives every row its own name (an appending `jsonl` / `csv`,
+a remote sink without `path`, a table-per-dataset `sink_patch`) is left as is.
 
 ## Filters and output
 
