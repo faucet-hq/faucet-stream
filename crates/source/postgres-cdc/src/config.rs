@@ -207,10 +207,6 @@ pub enum SlotType {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum CdcTls {
-    /// Follow the `sslmode` / `sslrootcert` of `connection_url` (default);
-    /// plaintext when it sets none.
-    #[default]
-    FromUrl,
     /// No TLS — plaintext.
     Disable,
     /// Require TLS but do not verify the server certificate.
@@ -226,6 +222,10 @@ pub enum CdcTls {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ca_path: Option<String>,
     },
+    /// Follow the `sslmode` / `sslrootcert` of `connection_url` (default);
+    /// plaintext when it sets none.
+    #[default]
+    FromUrl,
 }
 
 impl std::fmt::Debug for PostgresCdcSourceConfig {

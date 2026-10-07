@@ -6652,16 +6652,6 @@
       "description": "TLS configuration for the CDC replication connection.",
       "oneOf": [
         {
-          "description": "Follow the `sslmode` / `sslrootcert` of `connection_url` (default);\nplaintext when it sets none.",
-          "type": "object",
-          "properties": {
-            "mode": {
-              "type": "string",
-              "const": "from_url"
-            }
-          }
-        },
-        {
           "description": "No TLS — plaintext.",
           "type": "object",
           "properties": {
@@ -6710,6 +6700,16 @@
             "mode": {
               "type": "string",
               "const": "verify_full"
+            }
+          }
+        },
+        {
+          "description": "Follow the `sslmode` / `sslrootcert` of `connection_url` (default);\nplaintext when it sets none.",
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "from_url"
             }
           }
         }
