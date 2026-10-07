@@ -2371,6 +2371,25 @@ mod tests {
 
     #[cfg(feature = "source-webhook")]
     #[tokio::test]
+    async fn a_clustered_run_the_store_cannot_hand_back_is_failed_at_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state_clustered();
+        let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+        rec.status = RunStatus::Running;
+        rec.config_body = Some(format!(
+            "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+            dir.path().join("out.jsonl").display()
+        ));
+        state.history().upsert(&rec).await.unwrap();
+        resume_claimed_run(state.clone(), rec);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        state.shutdown_token().cancel();
+        let rec = wait_terminal(&state, "r").await;
+        assert_eq!(rec.status, RunStatus::Failed, "{rec:?}");
+    }
+
+    #[cfg(feature = "source-webhook")]
+    #[tokio::test]
     async fn a_run_that_outlives_its_timeout_is_stopped_and_failed() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::serve::test_support::test_state();

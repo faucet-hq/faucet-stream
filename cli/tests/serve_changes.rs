@@ -521,7 +521,7 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
             "/mcp",
             json!({ "jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {
                 "name": "run_pipeline",
-                "arguments": { "config": "{ not yaml" }
+                "arguments": { "config": "version: 2\n" }
             }}),
         )
         .await;

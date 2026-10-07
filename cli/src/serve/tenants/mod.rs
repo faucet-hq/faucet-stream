@@ -1009,6 +1009,9 @@ mod tests {
             .unwrap()
             .expect("two runs, limit one");
         assert!(msg.contains("across the cluster"), "{msg}");
+        t.limits.max_concurrent_runs = Some(5);
+        state.history().tenant_upsert(&t).await.unwrap();
+        assert!(over_limit(&state, "acme").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1131,6 +1134,35 @@ mod tests {
         }
         let err = open_connection(&state.tenants(), &wrong_owner).unwrap_err();
         assert!(format!("{err:?}").contains("sealed-elsewhere"), "{err:?}");
+    }
+
+    #[test]
+    fn masking_keeps_the_shape_and_hides_every_string_under_a_channel_config() {
+        let masked = mask_notifications(&[serde_json::json!({
+            "on": ["run_failure"],
+            "channel": {"type": "webhook", "config": {"url": "https://h/x", "headers": ["a", 3], "retries": 2}}
+        })]);
+        assert_eq!(
+            masked[0]["channel"]["config"],
+            serde_json::json!({"url": "***", "headers": ["***", 3], "retries": 2})
+        );
+        assert_eq!(masked[0]["on"][0], "run_failure");
+    }
+
+    #[tokio::test]
+    async fn sealed_notifications_without_a_vault_are_skipped() {
+        let state = crate::serve::test_support::test_state();
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let mut t = tenant("acme");
+        t.notifications_sealed =
+            Some(v.seal_for(&serde_json::json!([]), &notifications_context("acme")));
+        state.history().tenant_upsert(&t).await.unwrap();
+        notify_tenant(
+            &state,
+            "acme",
+            crate::notify::NotifyEvent::connection_needs_reauth("acme", "c", "r"),
+        )
+        .await;
     }
 
     #[test]
