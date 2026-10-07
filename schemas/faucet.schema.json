@@ -6642,7 +6642,7 @@
           "const": "permanent"
         },
         {
-          "description": "Auto-dropped by the server when the replication connection closes.",
+          "description": "Refused at config load: dropped with the session that creates it,\nbefore replication starts.",
           "type": "string",
           "const": "temporary"
         }
@@ -15499,6 +15499,21 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "read_timeout_secs": {
+                      "description": "Longest the source waits on the server for the next row (or for a\nwhole result in `fetch_all`), in seconds, before the read fails.\nDefaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle eviction by a NAT or load balancer) otherwise leaves the read\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
+                    },
+                    "json_big_numbers": {
+                      "description": "What to do with a number inside a JSON column that a 64-bit float\ncannot represent exactly (more than about 17 significant digits, or\nbeyond the `u64` / `i64` range): `fail` (default) fails the read with\nan error naming the column, `string` emits the number as a JSON string\nholding its exact digits (with one warning per column).",
+                      "$ref": "#/$defs/source_postgres__JsonBigNumbers",
+                      "default": "fail"
                     }
                   }
                 },
@@ -15562,7 +15577,7 @@
                       "default": true
                     },
                     "slot_type": {
-                      "description": "Whether a newly-created slot is `permanent` (survives disconnect) or\n`temporary` (auto-dropped when the replication connection closes).\n\nDefault `permanent` (back-compatible). **A permanent slot pins WAL on\nthe server until it is consumed or dropped** — an abandoned permanent\nslot fills `pg_wal` and can take the whole instance down. Use\n`temporary` for ephemeral / test runs (note: a temporary slot resets on\nreconnect, so bookmark-based resume across runs requires a permanent\nslot). Drop an unused permanent slot explicitly with\n[`PostgresCdcSource::drop_slot`](crate::PostgresCdcSource::drop_slot).",
+                      "description": "Lifetime of a newly-created slot. Only `permanent` (the default) is\naccepted: a `temporary` slot is dropped with the session that creates\nit, before replication can start on its own connection, so it is\nrefused at config load.\n\n**A permanent slot pins WAL on the server until it is consumed or\ndropped** — an abandoned permanent slot fills `pg_wal` and can take the\nwhole instance down. Drop an unused slot explicitly with\n[`PostgresCdcSource::drop_slot`](crate::PostgresCdcSource::drop_slot).",
                       "$ref": "#/$defs/source_postgres-cdc__SlotType",
                       "default": "permanent"
                     },
@@ -15643,6 +15658,16 @@
                       "minimum": 0,
                       "default": null
                     },
+                    "max_buffered_events": {
+                      "description": "Replication events read ahead while the pipeline is busy writing a\npage. Reading ahead keeps the replication client sending its status\nupdates, so a long sink write does not let the server's\n`wal_sender_timeout` (default 60 s) end the connection. Past this many\nbuffered events reading pauses until the pipeline catches up — keep a\npage write well under `wal_sender_timeout`, or raise it, if a page\nwrite can outlast that much change volume. Default 100 000.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 100000
+                    },
                     "status_update_interval": {
                       "description": "Interval at which Standby Status Update keepalives are sent to the\nserver. Must be shorter than `idle_timeout` and well under the\nserver's `wal_sender_timeout` (default 60 s). Default: 10 s.",
                       "type": [
@@ -15654,7 +15679,7 @@
                       "default": 10
                     },
                     "tcp_keepalive": {
-                      "description": "TCP keepalive for the replication connection. Default: 60 s.",
+                      "description": "Accepted for compatibility and ignored: the replication client sets no\nsocket keepalive (a non-default value logs a warning). A dead\nreplication connection is detected through `status_update_interval`\nand the server's `wal_sender_timeout`. Default: 60 s.",
                       "type": [
                         "integer",
                         "string"
@@ -15752,6 +15777,31 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "read_timeout_secs": {
+                      "description": "Longest the source waits on the server for the next row (or for a\nwhole result in `fetch_all`), in seconds, before the read fails.\nDefaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle eviction by a NAT or load balancer) otherwise leaves the read\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
+                    },
+                    "json_big_numbers": {
+                      "description": "What to do with a number inside a JSON column that a 64-bit float\ncannot represent exactly (more than about 17 significant digits, or\nbeyond the `u64` / `i64` range): `fail` (default) fails the read with\nan error naming the column, `string` emits the number as a JSON string\nholding its exact digits (with one warning per column).",
+                      "$ref": "#/$defs/source_mysql__JsonBigNumbers",
+                      "default": "fail"
+                    },
+                    "net_write_timeout_secs": {
+                      "description": "The session's `net_write_timeout`, in seconds: how long the server\nwaits for the source to read more of a result before it aborts the\nquery. The pipeline stops reading while the sink writes a page, so the\nserver default (60 s) kills large extracts behind a slow sink.\nDefaults to 3600; `0` keeps the server's setting.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
                     }
                   }
                 },
@@ -21697,6 +21747,16 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "write_timeout_secs": {
+                      "description": "Longest a page write may wait on the server, in seconds, before it\nfails. Defaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle-eviction by a NAT or load balancer) otherwise leaves the write\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
                     }
                   },
                   "title": "PostgresSinkConfig",
@@ -22046,6 +22106,16 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "write_timeout_secs": {
+                      "description": "Longest a page write may wait on the server, in seconds, before it\nfails. Defaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle-eviction by a NAT or load balancer) otherwise leaves the write\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
                     }
                   },
                   "title": "MysqlSinkConfig",
@@ -22282,6 +22352,16 @@
                       ],
                       "default": true
                     },
+                    "busy_timeout_secs": {
+                      "description": "How long a write waits for another connection's write lock before\nfailing with `SQLITE_BUSY`, in seconds. Defaults to 60.\n\nSQLite has one writer per database file. When several pipelines (matrix\nrows, mirrored tables) write one file, a long write transaction — a\nlarge page or an overwrite commit — holds the lock; raise this when such\na transaction can last longer.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 60
+                    },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",
                       "$ref": "#/$defs/sink_sqlite__WriteMode",
@@ -22353,7 +22433,7 @@
                   "type": "object",
                   "properties": {
                     "database": {
-                      "description": "Path to the DuckDB database file, or `:memory:`. A `duckdb://` /\n`duckdb:` scheme prefix is accepted and stripped. The target table must\nalready exist.",
+                      "description": "Path to the DuckDB database file, or `:memory:`. A `duckdb://` /\n`duckdb:` scheme prefix is accepted and stripped.",
                       "type": "string"
                     },
                     "table_name": {
@@ -31484,6 +31564,36 @@
           "description": "The raw bytes, base64-encoded into a JSON string.",
           "type": "string",
           "const": "bytes"
+        }
+      ]
+    },
+    "source_postgres__JsonBigNumbers": {
+      "description": "What to do with a number inside a JSON / JSONB column that a 64-bit float\ncannot hold exactly.",
+      "oneOf": [
+        {
+          "description": "Fail the read with an error naming the column (default): no silent\nrounding.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Emit that number as a JSON string holding its exact digits.",
+          "type": "string",
+          "const": "string"
+        }
+      ]
+    },
+    "source_mysql__JsonBigNumbers": {
+      "description": "What to do with a number inside a JSON / JSONB column that a 64-bit float\ncannot hold exactly.",
+      "oneOf": [
+        {
+          "description": "Fail the read with an error naming the column (default): no silent\nrounding.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Emit that number as a JSON string holding its exact digits.",
+          "type": "string",
+          "const": "string"
         }
       ]
     }
