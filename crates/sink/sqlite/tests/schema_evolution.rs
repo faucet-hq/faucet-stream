@@ -70,7 +70,7 @@ async fn current_schema_then_evolve_add_is_idempotent() {
         .expect("properties object");
     assert_eq!(
         props.get("id"),
-        Some(&json!({ "type": ["integer", "null"] })),
+        Some(&json!({ "type": ["integer", "null"], "x-faucet-also-accepts": ["boolean"] })),
         "id INTEGER must surface as a nullable integer; got {schema:?}"
     );
     assert!(!props.contains_key("email"), "email must not exist yet");
@@ -99,7 +99,7 @@ async fn current_schema_then_evolve_add_is_idempotent() {
         .expect("properties object");
     assert_eq!(
         props2.get("email"),
-        Some(&json!({ "type": ["string", "null"] })),
+        Some(&json!({ "type": ["string", "null"], "x-faucet-also-accepts": ["object", "array"] })),
         "email TEXT must now exist as a nullable string; got {schema2:?}"
     );
     assert_eq!(

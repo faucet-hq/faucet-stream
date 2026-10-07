@@ -119,8 +119,8 @@ pub use dlq::{
     dlq_all_is_safe, dlq_all_refusal, unwrap_envelope,
 };
 pub use drift::{
-    ColumnChange, OnDrift, OnIncompatible, SchemaDiff, SchemaDriftPolicy, SchemaDriftSpec,
-    SchemaEvolution, SqlBaseType, adds_null, base_widened, json_schema_base_type,
+    ColumnChange, DRIFT_ALSO_ACCEPTS, OnDrift, OnIncompatible, SchemaDiff, SchemaDriftPolicy,
+    SchemaDriftSpec, SchemaEvolution, SqlBaseType, adds_null, base_widened, json_schema_base_type,
 };
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};

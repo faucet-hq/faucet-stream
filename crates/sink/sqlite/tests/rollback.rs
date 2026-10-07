@@ -107,6 +107,7 @@ fn config(url: &str, write: WriteSpec) -> SqliteSinkConfig {
         batch_size: 1000,
         max_connections: 1,
         create_table: true,
+        busy_timeout_secs: 60,
         write,
     }
 }
@@ -523,7 +524,7 @@ async fn capability_and_readback_follow_the_column_mapping() {
     assert!(sink.supports_rollback());
     let (kind, cfg) = sink.readback_source().expect("readback");
     assert_eq!(kind, "sqlite");
-    assert_eq!(cfg["query"], "SELECT * FROM \"users\"");
+    assert_eq!(cfg["query"], "SELECT * FROM `users`");
     assert_eq!(cfg["database_url"], url);
 
     let mut json_cfg = config(&url, WriteSpec::default());

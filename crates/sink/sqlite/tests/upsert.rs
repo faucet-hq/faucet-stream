@@ -66,6 +66,7 @@ fn upsert_config(url: &str) -> SqliteSinkConfig {
         batch_size: 1000,
         max_connections: 1,
         create_table: true,
+        busy_timeout_secs: 60,
         write: WriteSpec {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
@@ -121,6 +122,7 @@ async fn delete_marker_removes_row() {
         batch_size: 1000,
         max_connections: 1,
         create_table: true,
+        busy_timeout_secs: 60,
         write: WriteSpec {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
@@ -225,6 +227,7 @@ async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
         batch_size: 1000,
         max_connections: 1,
         create_table: true,
+        busy_timeout_secs: 60,
         write: WriteSpec {
             write_mode: WriteMode::Upsert,
             key: vec!["id".into()],
@@ -262,6 +265,7 @@ async fn dlq_and_exactly_once_paths_create_a_fresh_keyed_table() {
             batch_size: 1000,
             max_connections: 1,
             create_table: true,
+            busy_timeout_secs: 60,
             write: WriteSpec {
                 write_mode: WriteMode::Upsert,
                 key: vec!["id".into()],
