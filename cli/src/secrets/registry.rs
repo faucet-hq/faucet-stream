@@ -19,14 +19,33 @@ fn registry() -> &'static RwLock<HashSet<String>> {
     REG.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
-/// Register a resolved secret value so it is scrubbed from future output.
+/// Shortest line of a multi-line secret registered on its own.
+const MIN_LINE_LEN: usize = 8;
+
+/// Register a resolved secret value so it is scrubbed from future output —
+/// along with the forms it takes once escaped (JSON logs, `{:?}` fields) and,
+/// for a multi-line secret such as a PEM key, each line on its own.
 pub fn register(secret: &str) {
-    if secret.len() >= MIN_REDACT_LEN {
-        registry()
-            .write()
-            .expect("secret registry lock poisoned")
-            .insert(secret.to_owned());
+    if secret.len() < MIN_REDACT_LEN {
+        return;
     }
+    let mut forms = vec![secret.to_owned()];
+    let quoted = |s: String| s[1..s.len() - 1].to_owned();
+    if let Ok(json) = serde_json::to_string(secret) {
+        forms.push(quoted(json));
+    }
+    forms.push(quoted(format!("{secret:?}")));
+    if secret.contains(['\n', '\r']) {
+        forms.extend(
+            secret
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.len() >= MIN_LINE_LEN)
+                .map(str::to_owned),
+        );
+    }
+    let mut reg = registry().write().expect("secret registry lock poisoned");
+    reg.extend(forms);
 }
 
 /// Replace every registered secret value in `input` with `***`.
@@ -176,6 +195,24 @@ mod tests {
             redact("Authorization: supersecrettoken"),
             "Authorization: ***"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn escaped_and_per_line_forms_are_redacted() {
+        clear();
+        register("pa\"ss\\word-1");
+        let json = serde_json::json!({ "msg": "pw pa\"ss\\word-1" }).to_string();
+        assert!(!redact(&json).contains("word-1"), "{}", redact(&json));
+        let dbg = format!("{:?}", "pa\"ss\\word-1");
+        assert_eq!(redact(&dbg), "\"***\"");
+        let pem = "-----BEGIN KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEF\nshort\n-----END KEY-----";
+        register(pem);
+        assert!(!redact("line: MIIBVgIBADANBgkqhkiG9w0BAQEF").contains("MIIBVg"));
+        let escaped = serde_json::to_string(pem).unwrap();
+        assert!(!redact(&escaped).contains("MIIBVg"), "{}", redact(&escaped));
+        assert_eq!(redact("short"), "short");
+        clear();
     }
 
     #[test]
