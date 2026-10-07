@@ -73,32 +73,31 @@ impl Vault {
     }
 
     /// Seal `value` bound to `context` (e.g. `connection:<tenant>/<name>`):
-    /// the context travels inside the authenticated ciphertext, so a sealed
-    /// row copied onto another tenant's or connection's record does not open
+    /// the context is the ciphertext's associated data, so a sealed row
+    /// copied onto another tenant's or connection's record does not open
     /// there (#789 SERVE-44).
     pub fn seal_for(&self, value: &Value, context: &str) -> String {
-        let mut env = serde_json::Map::new();
-        env.insert(CTX.into(), Value::String(context.to_string()));
-        env.insert(VAL.into(), value.clone());
-        self.seal(&Value::Object(env))
+        let plain = serde_json::to_vec(value).expect("a JSON value always serializes");
+        base64::engine::general_purpose::STANDARD
+            .encode(self.enc.encrypt_bound(&plain, context.as_bytes()))
     }
 
     /// Open a value sealed by [`Vault::seal_for`] under `context`. A value
-    /// sealed before binding existed (no context) still opens.
+    /// sealed before binding existed (by [`Vault::seal`]) still opens.
     pub fn open_for(&self, sealed: &str, context: &str) -> Result<Value, String> {
-        match self.open(sealed)? {
-            Value::Object(mut env)
-                if env.len() == 2 && env.contains_key(CTX) && env.contains_key(VAL) =>
-            {
-                if env.get(CTX).and_then(Value::as_str) != Some(context) {
-                    return Err(format!(
-                        "sealed value belongs to another owner, not `{context}`"
-                    ));
-                }
-                Ok(env.remove(VAL).unwrap_or(Value::Null))
-            }
-            legacy => Ok(legacy),
-        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(sealed)
+            .map_err(|e| format!("sealed value is not base64: {e}"))?;
+        let plain = self
+            .enc
+            .decrypt_bound(&bytes, context.as_bytes())
+            .map_err(|e| {
+                format!(
+                    "cannot open sealed value (wrong vault key, or it belongs to another owner \
+                     than `{context}`): {e}"
+                )
+            })?;
+        serde_json::from_slice(&plain).map_err(|e| format!("sealed value is not JSON: {e}"))
     }
 
     /// [`Vault::seal_for`] for a string.
@@ -123,9 +122,6 @@ impl Vault {
 /// Minimum vault key length, in bytes.
 pub const MIN_KEY_BYTES: usize = 32;
 
-const CTX: &str = "__faucet_sealed_for";
-const VAL: &str = "__faucet_sealed_value";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +140,16 @@ mod tests {
         );
         let err = v.open_for(&sealed, "connection:globex/api").unwrap_err();
         assert!(err.contains("another owner"), "{err}");
+        assert!(v.open(&sealed).is_err(), "a bound value needs its context");
+        assert!(v.open_for("%%%", "c").unwrap_err().contains("base64"));
+        let not_json =
+            base64::engine::general_purpose::STANDARD.encode(v.enc.encrypt_bound(b"{", b"c"));
+        assert!(v.open_for(&not_json, "c").unwrap_err().contains("not JSON"));
+        let rotated = Vault::new(OLD, &[NEW.into()]).unwrap();
+        assert_eq!(
+            rotated.open_for(&sealed, "connection:acme/api").unwrap()["token"],
+            "t"
+        );
         // A value sealed before binding still opens.
         let legacy = v.seal(&json!({"token": "old"}));
         assert_eq!(v.open_for(&legacy, "anything").unwrap()["token"], "old");
