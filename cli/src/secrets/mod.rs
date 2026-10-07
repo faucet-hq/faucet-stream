@@ -37,6 +37,33 @@ pub trait SecretResolver: Send + Sync {
     async fn resolve(&self, reference: &str) -> CliResult<String>;
 }
 
+/// HTTP client for the secret-manager backends: a hung endpoint fails the
+/// load instead of hanging it.
+#[cfg(any(feature = "secrets-vault", feature = "secrets-gcp-sm"))]
+pub(crate) fn secret_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}
+
+/// Refuse `#field` on a scheme that cannot extract one, instead of letting
+/// the `#…` reach the backend as part of the name.
+pub(crate) fn reject_field(scheme: &str, reference: &str) -> CliResult<()> {
+    if reference.contains('#') {
+        return Err(CliError::SecretFetchFailed {
+            scheme: scheme.into(),
+            reference: reference.into(),
+            source: format!(
+                "`#field` extraction is supported for vault and aws-sm only, not {scheme}"
+            )
+            .into(),
+        });
+    }
+    Ok(())
+}
+
 /// Split a `path#field` reference into `(path, Some(field))` or `(path, None)`.
 #[allow(dead_code)] // used by provider modules added in later tasks
 pub(crate) fn split_field(reference: &str) -> (&str, Option<&str>) {
@@ -643,6 +670,15 @@ matrix:
         assert!(err.contains("not resolved in"), "{err}");
         let err = resolve_secrets(&mut cfg).await.unwrap_err().to_string();
         assert!(err.contains("not resolved in"), "{err}");
+    }
+
+    #[test]
+    fn field_selectors_are_refused_where_unsupported() {
+        assert!(reject_field("gcp-sm", "projects/p/secrets/s/versions/1").is_ok());
+        let err = reject_field("gcp-sm", "projects/p/secrets/s/versions/1#user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vault and aws-sm only"), "{err}");
     }
 
     #[tokio::test]
