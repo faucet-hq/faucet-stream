@@ -73,42 +73,65 @@ impl SqliteSource {
 /// Convert a SQLite row column value to a `serde_json::Value`.
 ///
 /// SQLite has dynamic typing, so the value's own storage class (INTEGER,
-/// REAL, TEXT, BLOB or NULL) decides the JSON shape. A NULL cell must be
-/// checked first: sqlx decodes NULL as `""` when asked for a `String`.
-fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, col_name: &str) -> Value {
-    let Ok(raw) = row.try_get_raw(col_name) else {
+/// REAL, TEXT, BLOB or NULL) decides the JSON shape, except that an INTEGER
+/// 0/1 in a column declared `BOOLEAN`/`BOOL` becomes a JSON boolean (what
+/// `discover()` advertises for it). A NULL cell must be checked first: sqlx
+/// decodes NULL as `""` when asked for a `String`. TEXT is parsed as JSON only
+/// when it holds an object or array, so `'19.90'`, `'00501'` and `'null'` stay
+/// the strings they are.
+fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Value {
+    let Ok(raw) = row.try_get_raw(idx) else {
         return Value::Null;
     };
     if raw.is_null() {
         return Value::Null;
     }
     match raw.type_info().name() {
-        "INTEGER" => row
-            .try_get::<i64, _>(col_name)
-            .map(|v| Value::Number(v.into()))
-            .unwrap_or(Value::Null),
+        "INTEGER" => match row.try_get::<i64, _>(idx) {
+            Ok(v @ (0 | 1)) if declared_boolean(row, idx) => Value::Bool(v == 1),
+            Ok(v) => Value::Number(v.into()),
+            Err(_) => Value::Null,
+        },
         "REAL" => row
-            .try_get::<f64, _>(col_name)
+            .try_get::<f64, _>(idx)
             .ok()
             .and_then(serde_json::Number::from_f64)
             .map(Value::Number)
             .unwrap_or(Value::Null),
         "BLOB" => row
-            .try_get::<Vec<u8>, _>(col_name)
+            .try_get::<Vec<u8>, _>(idx)
             .map(|v| {
                 use base64::Engine as _;
                 Value::String(base64::engine::general_purpose::STANDARD.encode(v))
             })
             .unwrap_or(Value::Null),
-        _ => {
-            if let Ok(v) = row.try_get::<Value, _>(col_name) {
-                return v;
-            }
-            row.try_get::<String, _>(col_name)
-                .map(Value::String)
-                .unwrap_or(Value::Null)
+        _ => row
+            .try_get::<String, _>(idx)
+            .map(text_to_json)
+            .unwrap_or(Value::Null),
+    }
+}
+
+/// Whether the result column is declared `BOOLEAN` / `BOOL`.
+fn declared_boolean(row: &sqlx::sqlite::SqliteRow, idx: usize) -> bool {
+    row.columns().get(idx).is_some_and(|c| {
+        matches!(
+            c.type_info().name().to_ascii_uppercase().as_str(),
+            "BOOLEAN" | "BOOL"
+        )
+    })
+}
+
+/// A TEXT cell as JSON: an embedded JSON object or array is parsed, every
+/// other text stays a string.
+fn text_to_json(text: String) -> Value {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(v @ (Value::Object(_) | Value::Array(_))) = serde_json::from_str(&text) {
+            return v;
         }
     }
+    Value::String(text)
 }
 
 /// Build the effective SQL query and ordered context-bind values for a given
@@ -245,15 +268,22 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
 }
 
 /// Convert a single `SqliteRow` into a JSON object whose keys are the row's
-/// column names.
-fn row_to_json(row: &sqlx::sqlite::SqliteRow) -> Value {
-    let mut map = serde_json::Map::new();
-    for col in row.columns() {
-        let name = col.name().to_string();
-        let value = sqlite_value_to_json(row, &name);
-        map.insert(name, value);
+/// column names. A result with two columns of the same name is refused: a map
+/// keeps only one of them, so the other column's values would vanish.
+fn row_to_json(row: &sqlx::sqlite::SqliteRow) -> Result<Value, FaucetError> {
+    let mut map = serde_json::Map::with_capacity(row.columns().len());
+    for (idx, col) in row.columns().iter().enumerate() {
+        let name = col.name();
+        if map.contains_key(name) {
+            return Err(FaucetError::Source(format!(
+                "SQLite query returns two columns named {name:?}; alias them \
+                 (`SELECT a.{name} AS a_{name}, b.{name} AS b_{name} …`) so neither \
+                 is lost"
+            )));
+        }
+        map.insert(name.to_string(), sqlite_value_to_json(row, idx));
     }
-    Value::Object(map)
+    Ok(Value::Object(map))
 }
 
 #[async_trait]
@@ -271,7 +301,7 @@ impl faucet_core::Source for SqliteSource {
             .await
             .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))?;
 
-        let records: Vec<Value> = rows.iter().map(row_to_json).collect();
+        let records: Vec<Value> = rows.iter().map(row_to_json).collect::<Result<_, _>>()?;
         tracing::info!(
             rows = records.len(),
             query = %self.config.query,
@@ -317,7 +347,7 @@ impl faucet_core::Source for SqliteSource {
                 .await
                 .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))?
             {
-                buffer.push(row_to_json(&row));
+                buffer.push(row_to_json(&row)?);
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
@@ -581,7 +611,7 @@ mod tests {
             .fetch_all(&source.pool)
             .await
             .unwrap();
-        let v = sqlite_value_to_json(&rows[0], "data");
+        let v = sqlite_value_to_json(&rows[0], 0);
         assert_eq!(v, Value::String("AP8=".to_string()), "BLOB must be base64");
     }
 

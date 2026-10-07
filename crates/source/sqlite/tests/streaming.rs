@@ -363,10 +363,79 @@ async fn null_cells_of_every_storage_class_decode_as_null() {
     );
     assert_eq!(
         rows[1],
-        serde_json::json!({"id": 2, "a": "x", "b": 7, "c": 1.5, "d": "AQI=", "e": 1})
+        serde_json::json!({"id": 2, "a": "x", "b": 7, "c": 1.5, "d": "AQI=", "e": true})
     );
     assert_eq!(
         rows[2],
-        serde_json::json!({"id": 3, "a": {"k": 1}, "b": 0, "c": 2.0, "d": "", "e": 0})
+        serde_json::json!({"id": 3, "a": {"k": 1}, "b": 0, "c": 2.0, "d": "", "e": false})
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn text_that_looks_like_a_json_scalar_stays_text() {
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let url = sqlite_url(tmp.path());
+    let pool = sqlx::SqlitePool::connect(&url).await.expect("seed pool");
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, flag BOOLEAN)")
+        .execute(&pool)
+        .await
+        .expect("create");
+    sqlx::query(
+        "INSERT INTO t VALUES (1, '19.90', 2), (2, '00501', 1), (3, 'null', 0), \
+         (4, 'true', NULL), (5, '[1, 2]', NULL), (6, '{bad', NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert");
+    pool.close().await;
+
+    let source = SqliteSource::new(SqliteSourceConfig::new(
+        &url,
+        "SELECT v, flag FROM t ORDER BY id",
+    ))
+    .await
+    .expect("source");
+    let rows = source.fetch_all().await.expect("fetch");
+    let vs: Vec<_> = rows.iter().map(|r| r["v"].clone()).collect();
+    assert_eq!(
+        vs,
+        vec![
+            serde_json::json!("19.90"),
+            serde_json::json!("00501"),
+            serde_json::json!("null"),
+            serde_json::json!("true"),
+            serde_json::json!([1, 2]),
+            serde_json::json!("{bad"),
+        ]
+    );
+    assert_eq!(rows[0]["flag"], serde_json::json!(2), "a non-0/1 value is kept");
+    assert_eq!(rows[1]["flag"], serde_json::json!(true));
+    assert_eq!(rows[2]["flag"], serde_json::json!(false));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_column_names_are_refused() {
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let url = sqlite_url(tmp.path());
+    let pool = sqlx::SqlitePool::connect(&url).await.expect("seed pool");
+    sqlx::query("CREATE TABLE a (id INTEGER); CREATE TABLE b (id INTEGER);")
+        .execute(&pool)
+        .await
+        .expect("create");
+    sqlx::query("INSERT INTO a VALUES (1); INSERT INTO b VALUES (2);")
+        .execute(&pool)
+        .await
+        .expect("insert");
+    pool.close().await;
+
+    let source = SqliteSource::new(SqliteSourceConfig::new(&url, "SELECT * FROM a, b"))
+        .await
+        .expect("source");
+    let err = source.fetch_all().await.expect_err("duplicate names");
+    assert!(err.to_string().contains("two columns named \"id\""), "{err}");
+
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut stream = source.stream_pages(&ctx, 10);
+    let first = stream.next().await.expect("an item");
+    assert!(first.is_err(), "stream must fail on duplicate names too");
 }
