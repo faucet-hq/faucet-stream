@@ -247,3 +247,47 @@ async fn overwrite_first_run_creates_the_collection() {
     assert_eq!(names(&uri, "docs").await, vec!["first"]);
     assert!(!collection_exists(&uri, "docs__faucet_ovw").await);
 }
+
+/// A first overwrite run whose source returns no rows still commits — an
+/// empty collection — instead of failing `renameCollection` with
+/// NamespaceNotFound every run (#789 MSG-52).
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_first_run_with_no_rows_commits_an_empty_collection() {
+    let (_c, uri) = start_mongo().await;
+    let sink = MongoSink::new(overwrite_config(&uri)).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.commit_overwrite()
+        .await
+        .expect("an empty first run commits");
+    assert!(collection_exists(&uri, "docs").await);
+    assert!(names(&uri, "docs").await.is_empty());
+}
+
+/// In append mode a document the server rejects (a duplicate `_id`) fails
+/// alone: the other documents are inserted, including those after it under
+/// `ordered: true`, and re-running does not re-insert committed ones
+/// (#789 MSG-44).
+#[tokio::test(flavor = "multi_thread")]
+async fn append_isolates_a_rejected_document_per_row() {
+    let (_c, uri) = start_mongo().await;
+    insert_docs(&uri, "docs", vec![doc! {"_id": 2, "name": "existing"}]).await;
+    for ordered in [true, false] {
+        let mut cfg = MongoSinkConfig::new(&uri, "testdb", "docs");
+        cfg.ordered = ordered;
+        cfg.batch_size = 2;
+        let sink = MongoSink::new(cfg).await.unwrap();
+        let base = if ordered { 10 } else { 20 };
+        let records = vec![
+            serde_json::json!({"_id": base + 1, "name": "a"}),
+            serde_json::json!({"_id": 2, "name": "dup"}),
+            serde_json::json!({"_id": base + 3, "name": "c"}),
+            serde_json::json!("not an object"),
+        ];
+        let outcomes = sink.write_batch_partial(&records).await.unwrap();
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok(), "{outcomes:?}");
+        assert!(outcomes[1].is_err() && outcomes[3].is_err());
+    }
+    let mut got = names(&uri, "docs").await;
+    got.sort();
+    assert_eq!(got, vec!["a", "a", "c", "c", "existing"]);
+}
