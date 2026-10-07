@@ -37,6 +37,12 @@ sink:
 `delete` writes `DeleteItem`s with only the key attributes. Every mode dedups
 the page by the table key, last write wins — `BatchWriteItem` rejects a request
 that names one key twice, and sequential puts converge to the last anyway.
+Key attributes are written as the table's declared type (from `DescribeTable`):
+a `B` key accepts the base64 string the DynamoDB source emits, an `N` key a JSON
+number or a decimal string (exact, as the source emits numbers beyond `f64`), an
+`S` key a string; any other value fails its row before anything is sent. So a
+table-to-table copy keeps binary and high-precision keys. Non-key attributes keep
+their JSON type (`S` / `N` / `L` / `M`).
 `overwrite` is not supported (no atomic table swap). `dedups_by_key()` is true
 for `upsert` / `delete` with a `key`, so `delivery: exactly_once` is satisfied by
 the keyed-upsert mechanism.
