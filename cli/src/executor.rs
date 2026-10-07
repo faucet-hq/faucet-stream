@@ -2168,7 +2168,11 @@ async fn build_pipeline<'a>(
         pipeline = pipeline.with_state_store(store);
     }
     if let Some(ref dlq_spec) = node.dlq {
-        let dlq_cfg = build_dlq_config(dlq_spec).await?;
+        let dlq_cfg = if opts.dry_run {
+            preview_dlq_config(dlq_spec)
+        } else {
+            build_dlq_config(dlq_spec).await?
+        };
         pipeline = pipeline
             .with_dlq(dlq_cfg)
             .allow_dlq_all_duplicates(dlq_spec.allow_duplicates_on_dlq_all);
@@ -3409,6 +3413,22 @@ fn state_from_override(path: &Path) -> Arc<dyn StateStore> {
 
 /// Translate a [`crate::config::DlqSpec`] from the YAML/JSON config into a
 /// runtime [`DlqConfig`] ready to attach to a [`Pipeline`].
+/// The DLQ a `--dry-run` uses (#789 CLI-49): the configured policy over a
+/// counting sink, so would-be quarantines are counted in the summary and
+/// nothing reaches the real dead-letter destination.
+pub fn preview_dlq_config(spec: &crate::config::DlqSpec) -> DlqConfig {
+    DlqConfig {
+        sink: Arc::new(CountingSink::new()),
+        on_batch_error: match spec.on_batch_error {
+            crate::config::OnBatchErrorSpec::Propagate => OnBatchError::Propagate,
+            crate::config::OnBatchErrorSpec::DlqAll => OnBatchError::DlqAll,
+        },
+        max_failures_per_page: spec.max_failures_per_page,
+        max_failures_total: spec.max_failures_total,
+        include_original_payload: spec.include_original_payload,
+    }
+}
+
 pub async fn build_dlq_config(spec: &crate::config::DlqSpec) -> CliResult<DlqConfig> {
     let config = crate::dlq_replay::plan::dlq_append_config(&spec.sink, "dlq")?;
     // One DLQ sink per destination for the whole run (#789 CLI-03): rows and
@@ -6333,6 +6353,31 @@ matrix:
             !output.exists(),
             "dry-run must not create the real sink file"
         );
+    }
+
+    /// #789 CLI-49: a dry run counts would-be quarantines but writes no
+    /// dead letters.
+    #[cfg(feature = "contract")]
+    #[tokio::test]
+    async fn dry_run_counts_quarantines_without_writing_the_dlq() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        std::fs::write(&input, "status\nopen\nweird\n").unwrap();
+        let dlq = dir.path().join("dlq.jsonl");
+        let yaml = format!(
+            "version: 1\nname: t\npipeline:\n  source: {{ type: csv, config: {{ path: '{}' }} }}\n  sink: {{ type: jsonl, config: {{ path: '{}' }} }}\n  dlq: {{ sink: {{ type: jsonl, config: {{ path: '{}' }} }} }}\n  contract:\n    version: '1'\n    on_breach: quarantine\n    fields:\n      - {{ name: status, type: string, enum: [open] }}\n",
+            input.display(),
+            dir.path().join("out.jsonl").display(),
+            dlq.display()
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let mut o = opts("dry");
+        o.dry_run = true;
+        let summary = run_expanded(expand(&cfg).unwrap(), o).await.unwrap();
+        let inv = &summary.invocations[0];
+        assert!(inv.error.is_none(), "{inv:?}");
+        assert_eq!(inv.metrics.as_ref().unwrap().dlq_count, 1);
+        assert!(!dlq.exists(), "a dry run must not write dead letters");
     }
 
     #[tokio::test]
