@@ -126,6 +126,18 @@ async fn envelope_mode_wraps_record() {
 }
 
 #[tokio::test]
+async fn envelope_url_never_carries_query_credentials() {
+    let url = spawn_pushing_server(vec![r#"{"id":1}"#.into()]).await;
+    let mut cfg = base_config(&format!("{url}/feed?token=s3cret-token"));
+    cfg.envelope = true;
+    cfg.max_messages = Some(1);
+    cfg.idle_timeout = Some(Duration::from_secs(5));
+    let src = WebsocketSource::new(cfg).unwrap();
+    let records = src.fetch_all().await.unwrap();
+    assert_eq!(records[0]["url"], format!("{url}/feed"));
+}
+
+#[tokio::test]
 async fn skip_drops_malformed_json() {
     let url = spawn_pushing_server(vec!["not json".into(), r#"{"id":2}"#.into()]).await;
     let mut cfg = base_config(&url);

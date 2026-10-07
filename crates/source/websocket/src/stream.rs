@@ -217,6 +217,7 @@ impl Source for WebsocketSource {
         _batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         let resolved_url = faucet_core::util::substitute_context(&self.config.url, context);
+        let record_url = crate::config::envelope_url(&resolved_url);
         let batch_size = self.config.batch_size;
         let page_chunk = if batch_size == 0 {
             usize::MAX
@@ -307,7 +308,7 @@ impl Source for WebsocketSource {
                         match decode_frame(format, on_parse_error, payload) {
                             Ok(Some(v)) => {
                                 let now = if envelope { now_unix_ms() } else { 0 };
-                                buffer.push(shape_record(v, envelope, &resolved_url, now));
+                                buffer.push(shape_record(v, envelope, &record_url, now));
                                 reconnect_attempts = 0;
                                 total += 1;
                                 if total >= max_messages {

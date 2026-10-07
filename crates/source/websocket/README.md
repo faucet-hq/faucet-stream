@@ -76,7 +76,7 @@ This connects to the Binance trade stream, captures the first 100 trade messages
 | `subscribe_messages` | string[] | `[]` | Frames sent (in order) immediately after every connect and reconnect. Empty = send nothing. |
 | `message_format` | enum | `json` | How each incoming frame is converted to a record — `json` / `raw_string` / `binary`. See [Message formats](#message-formats). |
 | `on_parse_error` | enum | `fail` | In `json` mode, what to do with a non-JSON frame — `fail` (abort) or `skip` (log + drop). |
-| `envelope` | bool | `false` | `false` emits the record as-is; `true` wraps it as `{ data, received_at, url }`. |
+| `envelope` | bool | `false` | `false` emits the record as-is; `true` wraps it as `{ data, received_at, url }`. `url` is the connection URL with credentials, the query string and the fragment removed, so a `?token=…` never lands in a row. |
 
 ### Reliability
 
