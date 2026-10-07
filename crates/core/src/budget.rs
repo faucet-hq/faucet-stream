@@ -87,10 +87,26 @@ impl BudgetSpec {
         Ok(())
     }
 
+    /// The `allowed_sinks` entry a merge leaves when two non-empty lists have
+    /// nothing in common: it matches no sink, so every row is refused.
+    pub const DENY_ALL_SINKS: &'static str = "!none";
+
     /// The stricter of two budgets: the lower of each ceiling, and the
     /// intersection of the allowed-sink lists (either side's list alone when
-    /// only one names any).
+    /// only one names any). Two lists with nothing in common allow no sink
+    /// ([`Self::DENY_ALL_SINKS`]) — an empty list would mean "any".
     pub fn merge(&self, other: &BudgetSpec) -> BudgetSpec {
+        self.merge_with(other, &|_: &str| None)
+    }
+
+    /// [`Self::merge`], where `kind_of` names the connector kind of a sink
+    /// template: a template on one side survives when the other side allows
+    /// its kind.
+    pub fn merge_with(
+        &self,
+        other: &BudgetSpec,
+        kind_of: &dyn Fn(&str) -> Option<String>,
+    ) -> BudgetSpec {
         fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
             match (a, b) {
                 (Some(x), Some(y)) => Some(x.min(y)),
@@ -105,12 +121,27 @@ impl BudgetSpec {
             (true, true) => Vec::new(),
             (false, true) => self.allowed_sinks.clone(),
             (true, false) => other.allowed_sinks.clone(),
-            (false, false) => self
-                .allowed_sinks
-                .iter()
-                .filter(|s| other.allowed_sinks.contains(s))
-                .cloned()
-                .collect(),
+            (false, false) => {
+                let allows = |list: &[String], entry: &String| {
+                    list.contains(entry)
+                        || kind_of(entry).is_some_and(|k| list.iter().any(|l| *l == k))
+                };
+                let mut both: Vec<String> = Vec::new();
+                for entry in self.allowed_sinks.iter().chain(&other.allowed_sinks) {
+                    if entry != Self::DENY_ALL_SINKS
+                        && allows(&self.allowed_sinks, entry)
+                        && allows(&other.allowed_sinks, entry)
+                        && !both.contains(entry)
+                    {
+                        both.push(entry.clone());
+                    }
+                }
+                if both.is_empty() {
+                    vec![Self::DENY_ALL_SINKS.to_string()]
+                } else {
+                    both
+                }
+            }
         };
         BudgetSpec {
             max_records: min_opt(self.max_records, other.max_records),
@@ -123,6 +154,9 @@ impl BudgetSpec {
     /// Whether a row writing to sink template `sink_ref` of connector `kind`
     /// is allowed.
     pub fn sink_allowed(&self, sink_ref: &str, kind: &str) -> bool {
+        if self.allowed_sinks.iter().any(|s| s == Self::DENY_ALL_SINKS) {
+            return false;
+        }
         self.allowed_sinks.is_empty()
             || self
                 .allowed_sinks
@@ -567,6 +601,45 @@ mod tests {
         }
         .error();
         assert!(e.to_string().contains("max_records"), "{e}");
+    }
+
+    #[test]
+    fn disjoint_sink_lists_merge_to_deny_all_not_any() {
+        let a = BudgetSpec {
+            allowed_sinks: vec!["sandbox".into()],
+            ..Default::default()
+        };
+        let b = BudgetSpec {
+            allowed_sinks: vec!["x".into()],
+            ..Default::default()
+        };
+        let m = a.merge(&b);
+        assert_eq!(m.allowed_sinks, vec![BudgetSpec::DENY_ALL_SINKS]);
+        assert!(!m.sink_allowed("sandbox", "postgres"));
+        assert!(!m.sink_allowed("x", "x"));
+        assert!(m.validate().is_ok());
+        // Merging again keeps it closed.
+        assert!(!m.merge(&a).sink_allowed("sandbox", "postgres"));
+    }
+
+    #[test]
+    fn merge_with_keeps_a_template_whose_kind_the_other_side_allows() {
+        let templates = |name: &str| (name == "sandbox").then(|| "postgres".to_string());
+        let a = BudgetSpec {
+            allowed_sinks: vec!["sandbox".into()],
+            ..Default::default()
+        };
+        let b = BudgetSpec {
+            allowed_sinks: vec!["postgres".into(), "bigquery".into()],
+            ..Default::default()
+        };
+        assert_eq!(a.merge_with(&b, &templates).allowed_sinks, vec!["sandbox"]);
+        assert_eq!(b.merge_with(&a, &templates).allowed_sinks, vec!["sandbox"]);
+        assert_eq!(
+            a.merge(&b).allowed_sinks,
+            vec![BudgetSpec::DENY_ALL_SINKS],
+            "without template knowledge the lists are disjoint"
+        );
     }
 
     #[test]
