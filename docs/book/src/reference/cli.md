@@ -284,7 +284,11 @@ output schema, the sink schema delta (adds / widenings / incompatible via
 `diff_schema` when the sink exposes `current_schema()`; "schemaless — no delta"
 otherwise), and a volume estimate. The data pass runs through the offline
 harness, so no sink is ever written. Offline by default; `--resolve-secrets`
-opts into the real secrets path. With a `policy:` block or `--policy`, the
+opts into the real secrets path, and `--live` implies it (a live pull uses the
+real credentials). Without resolved secrets a sink whose config holds a
+secret directive is not probed. `plan` loads `.env` like `run` (`--env-file` /
+`--no-env-file`) and takes `--param` / `--param-env`; an unsupplied required
+param gets a placeholder unless `--live` is set. With a `policy:` block or `--policy`, the
 row's [data-flow policy](../cookbook/policies.md) verdict is reported too
 (`policy` in the JSON; a preview never fails on it).
 

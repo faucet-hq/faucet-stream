@@ -28,6 +28,10 @@ fn plan_diff_args(config: PathBuf) -> faucet_cli::cli::PlanArgs {
         resolve_secrets: false,
         profile: None,
         policy: None,
+        env_file: None,
+        no_env_file: true,
+        param: vec![],
+        param_env: vec![],
     }
 }
 

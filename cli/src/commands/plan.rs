@@ -330,15 +330,28 @@ pub async fn plan_node(
 
         // Build the sink ONLY to probe it and read its live schema — never to
         // write. `check()` is best-effort; `current_schema()` yields the delta.
-        let sink = crate::registry::build_sink(&node.sink.kind, node.sink.config.clone(), auth)
-            .await
-            .ok();
+        // An unresolved secret directive would be sent as the credential, so
+        // the probe is skipped until secrets are resolved.
+        let mut unresolved = std::collections::BTreeSet::new();
+        crate::secrets::collect_refs(&node.sink.config, &mut unresolved);
+        let sink = if unresolved.is_empty() {
+            crate::registry::build_sink(&node.sink.kind, node.sink.config.clone(), auth)
+                .await
+                .ok()
+        } else {
+            None
+        };
         let sink_schema = match &sink {
             Some(s) => s.current_schema().await.ok().flatten(),
             None => None,
         };
         report.sink_probe = match &sink {
             Some(s) => Some(probe_summary(s.as_ref()).await),
+            None if !unresolved.is_empty() => Some(
+                "sink config holds unresolved secret directives (skipped probe; pass \
+                 --resolve-secrets)"
+                    .to_owned(),
+            ),
             None => Some("sink could not be built (skipped probe)".to_owned()),
         };
         let schema_delta = match &sink_schema {
@@ -391,6 +404,40 @@ pub async fn plan_node(
     Ok(report)
 }
 
+/// Load the config the way `run` does — `.env`, `--param` / `--param-env` —
+/// resolving secret directives only when `resolve`.
+async fn load_plan_config(
+    args: &PlanArgs,
+    resolve: bool,
+) -> CliResult<(std::path::PathBuf, crate::config::PipelineConfig)> {
+    let cwd = std::env::current_dir()?;
+    let env_path =
+        crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
+    crate::env_loader::load_env_file_if_present(env_path.as_deref())?;
+    let path = match &args.config {
+        Some(p) => p.clone(),
+        None => crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?,
+    };
+    let inputs = crate::config::RunInputs {
+        params: crate::params::collect_cli_params(&args.param)?,
+        env: crate::params::collect_env_overrides(&args.param_env)?
+            .into_iter()
+            .collect(),
+        mode: if args.param.is_empty() && !resolve {
+            crate::params::BindMode::Placeholder
+        } else {
+            crate::params::BindMode::Strict
+        },
+    };
+    let profile = args.profile.as_deref();
+    let cfg = if resolve {
+        crate::config::PipelineConfig::from_path_async_with(&path, profile, &inputs).await?
+    } else {
+        crate::config::PipelineConfig::from_path_tolerating_secrets_with(&path, profile, &inputs)?
+    };
+    Ok((path, cfg))
+}
+
 /// Execute the `plan` subcommand.
 pub async fn run(args: PlanArgs) -> CliResult<()> {
     if args.diff {
@@ -407,17 +454,10 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
             ));
         }
     }
-    let cwd = std::env::current_dir()?;
-    let path = match &args.config {
-        Some(p) => p.clone(),
-        None => crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?,
-    };
+    // A live pull connects to the real source, so it needs real credentials
+    // and real param values, never the literal directives or placeholders.
     #[cfg_attr(not(feature = "policy"), allow(unused_mut))]
-    let mut cfg = if args.resolve_secrets {
-        crate::config::PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?
-    } else {
-        crate::config::PipelineConfig::from_path_tolerating_secrets(&path, args.profile.as_deref())?
-    };
+    let (path, mut cfg) = load_plan_config(&args, args.resolve_secrets || args.live).await?;
     #[cfg(feature = "policy")]
     crate::policy::apply_to_config(&mut cfg, args.policy.as_deref())?;
     #[cfg(not(feature = "policy"))]
@@ -618,14 +658,8 @@ fn render_human(r: &PlanReport) {
 #[cfg(feature = "catalog")]
 async fn run_diff(args: PlanArgs) -> CliResult<()> {
     use crate::catalog::snapshot;
-    let cwd = std::env::current_dir()?;
-    let path = match &args.config {
-        Some(p) => p.clone(),
-        None => crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?,
-    };
     // Resolve secrets so the redacted current config matches what `run` stored.
-    let cfg =
-        crate::config::PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
+    let (path, cfg) = load_plan_config(&args, true).await?;
     let spec = cfg.catalog.as_ref().ok_or_else(|| {
         CliError::Config(
             "`faucet plan --diff` needs a `catalog:` block to read the last recorded run \
@@ -692,6 +726,10 @@ mod tests {
             resolve_secrets: false,
             profile: None,
             policy: None,
+            env_file: None,
+            no_env_file: true,
+            param: vec![],
+            param_env: vec![],
         };
         super::run(args).await.expect("plan runs");
         assert!(!out.exists(), "plan must not write to the sink");
@@ -716,6 +754,58 @@ mod tests {
         assert_eq!(report.source, "csv");
         assert_eq!(report.sink, "jsonl");
         assert_eq!(report.write_mode, "append");
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_sink_secret_skips_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("pipe.yaml");
+        std::fs::write(
+            &cfg_path,
+            "version: 1\nparams: { out: { required: true } }\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: \"${param.out}\", encryption: { key: \"${vault:secret/k#v}\" } } }\n",
+        )
+        .unwrap();
+        let args = PlanArgs {
+            config: Some(cfg_path),
+            row: None,
+            sample: None,
+            live: false,
+            limit: 10,
+            json: true,
+            diff: false,
+            impact: false,
+            depth: 5,
+            resolve_secrets: false,
+            profile: None,
+            policy: None,
+            env_file: None,
+            no_env_file: true,
+            param: vec![],
+            param_env: vec![],
+        };
+        let (_, cfg) = load_plan_config(&args, false).await.unwrap();
+        let nodes = expand::expand(&cfg).unwrap();
+        let report = plan_node(
+            &cfg,
+            &nodes[0],
+            &auth_catalog::AuthCatalog::new(),
+            PlanOptions {
+                sample: Some((vec![serde_json::json!({"id": 1})], "fixture".into())),
+                #[cfg(feature = "catalog")]
+                impact: None,
+                #[cfg(not(feature = "catalog"))]
+                _marker: std::marker::PhantomData,
+            },
+        )
+        .await
+        .unwrap();
+        let probe = report.sink_probe.unwrap();
+        assert!(probe.contains("unresolved secret"), "{probe}");
+        // A live pull needs real param values.
+        let mut live = args;
+        live.live = true;
+        let err = load_plan_config(&live, true).await.unwrap_err().to_string();
+        assert!(err.contains("out"), "{err}");
     }
 
     /// `plan --diff` end-to-end over a real sqlite catalog: first run reports
@@ -749,6 +839,10 @@ mod tests {
             resolve_secrets: false,
             profile: None,
             policy: None,
+            env_file: None,
+            no_env_file: true,
+            param: vec![],
+            param_env: vec![],
         };
 
         // 1. Nothing recorded yet → first-run path.
@@ -801,6 +895,10 @@ mod tests {
             resolve_secrets: false,
             profile: None,
             policy: None,
+            env_file: None,
+            no_env_file: true,
+            param: vec![],
+            param_env: vec![],
         };
         let err = super::run(args).await.unwrap_err();
         assert!(err.to_string().contains("catalog:"), "{err}");
@@ -829,6 +927,10 @@ mod tests {
             resolve_secrets: false,
             profile: None,
             policy: None,
+            env_file: None,
+            no_env_file: true,
+            param: vec![],
+            param_env: vec![],
         };
         let err = super::run(args).await.unwrap_err().to_string();
         assert!(

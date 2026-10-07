@@ -2743,6 +2743,20 @@ pub struct PlanArgs {
     /// a labelled column may reach. Violations are reported and refuse a run.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<PathBuf>,
+    /// Load a dotenv file before reading the config (default: `./.env` if present).
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip loading any dotenv file.
+    #[arg(long)]
+    pub no_env_file: bool,
+    /// Supply a declared param: `--param tenant_id=acme`. Repeatable. Without
+    /// `--live`, an unsupplied required param gets a placeholder.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub param: Vec<String>,
+    /// Override an environment variable for this plan only:
+    /// `--param-env REGION=eu`, or bare `--param-env TOKEN`. Repeatable.
+    #[arg(long = "param-env", value_name = "NAME[=VALUE]")]
+    pub param_env: Vec<String>,
 }
 
 /// `faucet dev` arguments.
