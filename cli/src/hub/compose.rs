@@ -362,6 +362,15 @@ pub fn compose(source: &SourceTemplate, sink: &SinkTemplate) -> CliResult<Compos
     )
 }
 
+/// A first-party sink faucet knows the write behaviour of; a plugin sink is
+/// taken at its template's word.
+fn builtin_sink(kind: &str) -> bool {
+    crate::registry_index::RegistryIndex::embedded()
+        .find(kind, Some("sink"))
+        .iter()
+        .any(|e| e.verified)
+}
+
 /// [`compose`] with an explicit capability list (the registry's, or a test's).
 pub fn compose_with(
     source: &SourceTemplate,
@@ -394,6 +403,19 @@ pub fn compose_with(
         }
     }
     let truncates = sink.truncates_per_invocation();
+    if !truncates
+        && aliases
+            .iter()
+            .any(|(from, to)| *from == WriteMode::Overwrite && *to == WriteMode::Append)
+        && builtin_sink(&sink.sink.kind)
+    {
+        return Err(CliError::Config(format!(
+            "sink-template '{}': `write_mode_aliases.overwrite: append` is only a full refresh on \
+             a sink that replaces its output each run; sink '{}' as configured here keeps what \
+             earlier runs wrote, so every overwrite stream would re-append the whole table",
+            sink.name, sink.sink.kind
+        )));
+    }
     let mut plans = Vec::with_capacity(source.streams.len());
     let mut failures = Vec::new();
     for s in &source.streams {
@@ -867,21 +889,14 @@ per_stream:
             .to_string();
         assert!(err.contains("cannot write append"), "{err}");
 
-        // An appending file sink keeps every parent's rows; a root stream may
-        // still use the alias.
+        // An appending file sink keeps every run's rows, so `overwrite:
+        // append` would re-append the whole table each run (#789 CLI-125).
         let mut appending = jsonl.clone();
         appending.sink.config = json!({ "append": true });
-        let c = compose_with(&s, &appending, &[WriteMode::Append]).unwrap();
-        assert_eq!(c.streams[2].chosen, WriteMode::Append);
-        let err = {
-            let mut s = src();
-            s.streams
-                .push(child(WriteChoice::One(WriteMode::Overwrite)));
-            compose_with(&s, &appending, &[WriteMode::Append])
-                .unwrap_err()
-                .to_string()
-        };
-        assert!(err.contains("overwrite via append"), "{err}");
+        let err = compose_with(&s, &appending, &[WriteMode::Append])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("re-append the whole table"), "{err}");
 
         // A native overwrite is grouped by the executor (#552): allowed, and
         // a refused alias falls through to the next listed mode.
@@ -892,6 +907,7 @@ per_stream:
         let c = compose_with(&s, &bq, ALL).unwrap();
         assert_eq!(c.streams[2].chosen, WriteMode::Overwrite);
         let mut aliased = bq.clone();
+        aliased.sink.kind = "acme-warehouse".into();
         aliased
             .write_mode_aliases
             .insert("overwrite".into(), WriteMode::Append);
@@ -950,6 +966,15 @@ per_stream:
                 .to_string()
                 .contains("redundant")
         );
+        // A built-in sink that keeps earlier runs' output (#789 CLI-125).
+        let err = compose_with(&src(), &bq2, &[WriteMode::Append])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("re-append the whole table"), "{err}");
+        // A plugin sink is taken at its template's word.
+        let mut plugin = bq2.clone();
+        plugin.sink.kind = "acme-files".into();
+        assert!(compose_with(&src(), &plugin, &[WriteMode::Append]).is_ok());
         let mut bad: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
         bad.write_mode_aliases
             .insert("overwrite".into(), WriteMode::Delete);

@@ -1097,7 +1097,7 @@ kind: sink-template
 name: files
 params:
   out: { type: string, default: ./out }
-sink: { type: jsonl, config: { append: true } }
+sink: { type: acme-files, config: { append: true } }
 per_stream: { path: "${param.out}/${stream}.jsonl" }
 write_mode_aliases: { overwrite: append }
 "#;
@@ -1152,7 +1152,7 @@ write_mode_aliases: { overwrite: append }
         assert!(r.composed.is_some());
         let r = r.report;
         assert_eq!(r.sink.as_deref(), Some("files"));
-        assert_eq!(r.sink_kind.as_deref(), Some("jsonl"));
+        assert_eq!(r.sink_kind.as_deref(), Some("acme-files"));
         let accounts = row(&r, "accounts").write.clone().unwrap();
         assert_eq!(accounts.resolved, Some(WriteMode::Append));
         assert_eq!(accounts.supported, Some(true));

@@ -132,7 +132,11 @@ The composer records the substitution (`overwrite→append` in `faucet hub
 check`) and validates it against the connector registry: the target mode must
 be one the connector supports, an alias for a natively supported mode is
 refused as redundant, and keyed modes (`upsert`, `delete`) cannot be aliased —
-only a sink that dedups by key can honour them.
+only a sink that dedups by key can honour them. `overwrite: append` is refused
+for a built-in sink that, as configured, keeps what earlier runs wrote (an
+appending file, a queue, an object store with unique names, a warehouse): every
+overwrite stream would re-append the whole table on each run. A plugin sink is
+taken at its template's word.
 
 ### Child streams and truncating sinks
 

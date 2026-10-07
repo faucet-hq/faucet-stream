@@ -173,7 +173,7 @@ streams:
   - name: deals
     source: {{ config: {{ path: "${{param.data_dir}}/deals.csv" }} }}
     primary_keys: [id]
-    write: [overwrite]
+    write: [overwrite, append]
   - name: deal_lines
     parent: deals
     source: {{ config: {{ path: "{d}/lines-${{deals.id}}.csv" }} }}
@@ -200,8 +200,6 @@ sink:
   config: {{ append: true }}
 per_stream:
   path: "${{param.out_dir}}/${{stream}}.jsonl"
-write_mode_aliases:
-  overwrite: append
 "#,
         o = out.display()
     )
@@ -318,10 +316,9 @@ async fn rows_api_describes_every_group_and_resolves_selections() {
         accounts["guarantees"]["delivery_guarantee"],
         "at-least-once"
     );
-    assert_eq!(
-        row(&r, "deals")["write"]["alias_applied"],
-        "overwrite→append"
-    );
+    // An appending sink cannot alias overwrite to append (it would re-append
+    // the whole table each run), so `deals` falls back to its listed append.
+    assert_eq!(row(&r, "deals")["write"]["resolved"], "append");
     let audit = row(&r, "audit");
     assert_eq!(audit["write"]["supported"], false);
     assert!(
