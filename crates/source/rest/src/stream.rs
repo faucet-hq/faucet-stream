@@ -1816,8 +1816,18 @@ impl RestStream {
         // Precedence: static config headers (base) < auth < this request's own
         // headers — so an auth header always wins over a same-named config one.
         let mut hdrs = self.static_headers.clone();
-        for (k, v) in self.metadata_headers(url).await?.iter() {
-            hdrs.insert(k.clone(), v.clone());
+        if crate::url_util::credentials_allowed(
+            &self.config.base_url,
+            url,
+            &self.config.trusted_hosts,
+        )? {
+            for (k, v) in self.metadata_headers(url).await?.iter() {
+                hdrs.insert(k.clone(), v.clone());
+            }
+        } else {
+            for name in crate::url_util::CREDENTIAL_HEADERS {
+                hdrs.remove(name);
+            }
         }
         for (k, v) in headers {
             insert_header(&mut hdrs, k, v)?;
@@ -2369,11 +2379,29 @@ impl RestStream {
         // captured session id in the path, say). No-op when nothing was captured.
         url = substitute_captured(&url, &captured);
 
+        // A server-given URL to another origin is fetched without credentials
+        // (and an https→http hop is refused), so a next-page or job link can
+        // never hand them to a third-party host (#789 API-17).
+        let send_credentials = match url_override {
+            None => true,
+            Some(_) => crate::url_util::credentials_allowed(
+                &base_url,
+                &url,
+                &self.config.trusted_hosts,
+            )?,
+        };
+        if !send_credentials {
+            ra_headers.clear();
+            ra_query.clear();
+            ra_cookies.clear();
+            ra_body.clear();
+        }
+
         // Resolve inline / signed credentials — unless a flow provider already
         // supplied the request auth. A shared provider (from `auth: { ref }` or
         // a library caller) takes precedence over inline; inline OAuth2 /
         // TokenEndpoint resolve to a Bearer token via the per-source cache.
-        let resolved_auth: Option<Auth> = if used_request_auth {
+        let resolved_auth: Option<Auth> = if used_request_auth || !send_credentials {
             None
         } else if let Some(provider) = &self.auth_provider {
             // A per-request signer (OAuth1, #496) signs this exact method + URL +
@@ -2464,6 +2492,11 @@ impl RestStream {
             }
             h
         };
+        if !send_credentials {
+            for name in crate::url_util::CREDENTIAL_HEADERS {
+                headers.remove(name);
+            }
+        }
         if let Some(auth) = &resolved_auth {
             auth.apply(&mut headers)?;
         }
@@ -2550,7 +2583,9 @@ impl RestStream {
 
         // ApiKeyQuery: inject the API key as a query parameter.
         // A next-page link that already echoes the key keeps its single copy.
-        if let AuthSpec::Inline(Auth::ApiKeyQuery { param, value }) = &self.config.auth {
+        if let AuthSpec::Inline(Auth::ApiKeyQuery { param, value }) = &self.config.auth
+            && send_credentials
+        {
             let echoed = use_override
                 && reqwest::Url::parse(&url)
                     .is_ok_and(|u| u.query_pairs().any(|(k, _)| k == param.as_str()));
