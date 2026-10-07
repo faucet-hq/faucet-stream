@@ -90,7 +90,9 @@ async fn append_casts_to_declared_types_and_chunks() {
     assert_eq!(w.len(), 2, "{w:?}");
     assert!(w[0].contains("CAST(v.c0 AS int) AS `id`"));
     assert!(w[0].contains("CAST(v.c1 AS timestamp) AS `ts`"));
-    assert!(w[0].contains("from_json(v.c2, 'struct<a:int>') AS `payload`"));
+    assert!(
+        w[0].contains("from_json(v.c2, 'struct<a:int>', map('mode', 'FAILFAST')) AS `payload`")
+    );
     assert!(w[0].contains(r#"'{"a":1}'"#));
     assert!(w[1].contains("('2', NULL, NULL)"));
 }
@@ -267,6 +269,46 @@ async fn overwrite_swaps_through_a_staging_table() {
         wh.writes(),
         vec!["DROP TABLE IF EXISTS `sales`.`orders__faucet_ovw`"]
     );
+}
+
+/// SQL-135 / SQL-127: the swap leaves out a GENERATED ALWAYS identity, and a
+/// VARIANT column receives the value's JSON text.
+#[tokio::test]
+async fn overwrite_skips_generated_columns_and_variant_keeps_types() {
+    let wh = Warehouse::start().await;
+    wh.on(
+        DESCRIBE,
+        serde_json::json!({
+            "statement_id": "s",
+            "status": {"state": "SUCCEEDED"},
+            "result": {"data_array": [
+                ["id", "bigint", "NO", null, "YES"],
+                ["v", "variant", "YES", null, "NO"],
+            ]}
+        }),
+    );
+    let s = sink(&wh, |c| c.write.write_mode = WriteMode::Overwrite);
+    s.begin_overwrite().await.unwrap();
+    s.write_batch(&[json!({"v": "123"})]).await.unwrap();
+    s.commit_overwrite().await.unwrap();
+    let w = wh.writes();
+    assert!(
+        w.iter()
+            .any(|q| q.contains("parse_json(v.c0)") && q.contains(r#"('"123"')"#)),
+        "{w:?}"
+    );
+    assert!(
+        w.contains(&"INSERT OVERWRITE TABLE `sales`.`orders` (`v`) SELECT `v` FROM `sales`.`orders__faucet_ovw`".to_string()),
+        "{w:?}"
+    );
+}
+
+#[tokio::test]
+async fn poll_interval_zero_is_refused() {
+    let mut c = common::config("http://127.0.0.1:1");
+    c.poll_interval_ms = 0;
+    let err = c.validate().unwrap_err().to_string();
+    assert!(err.contains("poll_interval_ms"), "{err}");
 }
 
 #[tokio::test]

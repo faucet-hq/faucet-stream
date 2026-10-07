@@ -260,6 +260,24 @@ impl StatementRequest {
     }
 }
 
+/// TCP connect timeout of [`http_client`].
+pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle read timeout of [`http_client`]: longer than the 50 s a submit may
+/// wait server-side, so only a stalled connection trips it.
+pub const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The HTTP client the Databricks source and sink use (statements, result
+/// chunks, presigned links, the Files API): connect and idle-read timeouts,
+/// so a half-open connection fails the request instead of hanging the run.
+pub fn http_client() -> Result<reqwest::Client, FaucetError> {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .build()
+        .map_err(|e| FaucetError::Config(format!("databricks: cannot build HTTP client: {e}")))
+}
+
 /// Timing and retry knobs for a [`StatementClient`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatementOptions {

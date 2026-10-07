@@ -35,6 +35,9 @@ pub struct TableColumn {
     pub nullable: bool,
     /// The column's `DEFAULT` expression (`column_default`), if any.
     pub default: Option<String>,
+    /// `GENERATED ALWAYS` (an identity or a generated column): the table
+    /// computes it and refuses an explicit value.
+    pub generated_always: bool,
 }
 
 impl TableColumn {
@@ -44,6 +47,7 @@ impl TableColumn {
             full_type: full_type.into(),
             nullable: true,
             default: None,
+            generated_always: false,
         }
     }
 
@@ -133,6 +137,16 @@ pub fn cell_text(v: &Value) -> Option<String> {
     }
 }
 
+/// [`cell_text`] for a column of `full_type`: a `VARIANT` column receives the
+/// value's JSON text (`parse_json` then restores it with its own type — the
+/// string `"123"` stays a string, and non-JSON text is not rejected).
+pub fn cell_text_for(v: &Value, full_type: &str) -> Option<String> {
+    if full_type.trim().eq_ignore_ascii_case("variant") && !v.is_null() {
+        return Some(v.to_string());
+    }
+    cell_text(v)
+}
+
 fn cell_literal(c: &Option<String>) -> String {
     match c {
         None => "NULL".to_owned(),
@@ -146,7 +160,12 @@ pub fn cast_expr(expr: &str, full_type: &str) -> String {
     if t == "string" {
         expr.to_owned()
     } else if t.starts_with("struct") || t.starts_with("array") || t.starts_with("map") {
-        format!("from_json({expr}, {})", string_literal(full_type.trim()))
+        // FAILFAST: a value that does not fit the type fails the statement
+        // instead of being nulled field by field (PERMISSIVE, the default).
+        format!(
+            "from_json({expr}, {}, map('mode', 'FAILFAST'))",
+            string_literal(full_type.trim())
+        )
     } else if t == "variant" {
         format!("parse_json({expr})")
     } else {
@@ -232,7 +251,9 @@ pub fn describe_sql(catalog: Option<&str>) -> String {
         None => "information_schema.columns".to_owned(),
     };
     format!(
-        "SELECT column_name, full_data_type, is_nullable, column_default FROM {src} \
+        "SELECT column_name, full_data_type, is_nullable, column_default, \
+         CASE WHEN identity_generation = 'ALWAYS' OR is_generated = 'ALWAYS' \
+         THEN 'YES' ELSE 'NO' END FROM {src} \
          WHERE lower(table_schema) = lower(:faucet_schema) AND lower(table_name) = lower(:faucet_table) \
          ORDER BY ordinal_position"
     )
@@ -247,11 +268,13 @@ pub fn columns_from_rows(rows: Vec<Vec<Option<String>>>) -> Vec<TableColumn> {
             let full_type = it.next().flatten().unwrap_or_else(|| "string".into());
             let nullable = !matches!(it.next().flatten().as_deref(), Some("NO"));
             let default = it.next().flatten().filter(|d| !d.trim().is_empty());
+            let generated_always = matches!(it.next().flatten().as_deref(), Some("YES"));
             Some(TableColumn {
                 name,
                 full_type,
                 nullable,
                 default,
+                generated_always,
             })
         })
         .collect()
@@ -367,7 +390,7 @@ pub fn build_matrix(records: &[Value], table: &[TableColumn]) -> Result<Matrix, 
                 .map(|c| {
                     obj.iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case(&c.name))
-                        .and_then(|(_, v)| cell_text(v))
+                        .and_then(|(_, v)| cell_text_for(v, &c.full_type))
                 })
                 .collect()
         })
@@ -678,10 +701,29 @@ pub fn create_like_sql(staging: &TableRef, target: &TableRef) -> String {
     format!("CREATE TABLE {} LIKE {}", staging.sql(), target.sql())
 }
 
-/// The overwrite swap: one Delta commit replaces the target's contents.
-pub fn insert_overwrite_sql(target: &TableRef, staging: &TableRef) -> String {
+/// The overwrite swap: one Delta commit replaces the target's contents. The
+/// column list is the target's, without `GENERATED ALWAYS` columns (identity
+/// or generated), which the target computes and refuses explicit values for.
+pub fn insert_overwrite_sql(
+    target: &TableRef,
+    staging: &TableRef,
+    target_cols: &[TableColumn],
+) -> String {
+    let cols: Vec<&TableColumn> = target_cols.iter().filter(|c| !c.generated_always).collect();
+    if cols.len() == target_cols.len() {
+        return format!(
+            "INSERT OVERWRITE TABLE {} SELECT * FROM {}",
+            target.sql(),
+            staging.sql()
+        );
+    }
+    let list = cols
+        .iter()
+        .map(|c| quote_ident(&c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "INSERT OVERWRITE TABLE {} SELECT * FROM {}",
+        "INSERT OVERWRITE TABLE {} ({list}) SELECT {list} FROM {}",
         target.sql(),
         staging.sql()
     )
@@ -909,15 +951,15 @@ mod tests {
         assert_eq!(cast_expr("x", "decimal(10,2)"), "CAST(x AS decimal(10,2))");
         assert_eq!(
             cast_expr("x", "struct<a:int>"),
-            "from_json(x, 'struct<a:int>')"
+            "from_json(x, 'struct<a:int>', map('mode', 'FAILFAST'))"
         );
         assert_eq!(
             cast_expr("x", "ARRAY<STRING>"),
-            "from_json(x, 'ARRAY<STRING>')"
+            "from_json(x, 'ARRAY<STRING>', map('mode', 'FAILFAST'))"
         );
         assert_eq!(
             cast_expr("x", "map<string,int>"),
-            "from_json(x, 'map<string,int>')"
+            "from_json(x, 'map<string,int>', map('mode', 'FAILFAST'))"
         );
         assert_eq!(cast_expr("x", "variant"), "parse_json(x)");
     }
@@ -971,6 +1013,7 @@ mod tests {
                     full_type: "bigint".into(),
                     nullable: false,
                     default: Some("0".into()),
+                    generated_always: false,
                 },
                 TableColumn::new("e", "int"),
                 TableColumn::new("n", "string"),
@@ -986,6 +1029,7 @@ mod tests {
                 full_type: "INT".into(),
                 nullable: false,
                 default: None,
+                generated_always: false,
             },
             TableColumn::new("amt", "decimal(10,2)"),
             TableColumn::new("f", "float"),
@@ -1191,9 +1235,31 @@ mod tests {
             "CREATE TABLE `main`.`sales`.`orders__faucet_ovw` LIKE `main`.`sales`.`orders`"
         );
         assert_eq!(
-            insert_overwrite_sql(&t(), &s),
+            insert_overwrite_sql(&t(), &s, &[TableColumn::new("a", "int")]),
             "INSERT OVERWRITE TABLE `main`.`sales`.`orders` SELECT * FROM `main`.`sales`.`orders__faucet_ovw`"
         );
+        let mut id = TableColumn::new("id", "bigint");
+        id.generated_always = true;
+        assert_eq!(
+            insert_overwrite_sql(&t(), &s, &[id, TableColumn::new("a", "int")]),
+            "INSERT OVERWRITE TABLE `main`.`sales`.`orders` (`a`) SELECT `a` FROM `main`.`sales`.`orders__faucet_ovw`"
+        );
+        assert_eq!(
+            cell_text_for(&json!("123"), "VARIANT").as_deref(),
+            Some("\"123\"")
+        );
+        assert_eq!(cell_text_for(&json!(5), "variant").as_deref(), Some("5"));
+        assert_eq!(cell_text_for(&Value::Null, "variant"), None);
+        assert_eq!(cell_text_for(&json!("x"), "string").as_deref(), Some("x"));
+        let cols = columns_from_rows(vec![vec![
+            Some("id".into()),
+            Some("bigint".into()),
+            Some("NO".into()),
+            None,
+            Some("YES".into()),
+        ]]);
+        assert!(cols[0].generated_always && !cols[0].nullable);
+        assert!(describe_sql(None).contains("identity_generation = 'ALWAYS'"));
         assert_eq!(
             rename_sql(&s, &t()),
             "ALTER TABLE `main`.`sales`.`orders__faucet_ovw` RENAME TO `main`.`sales`.`orders`"
@@ -1264,6 +1330,7 @@ mod tests {
                 full_type: "int".into(),
                 nullable: false,
                 default: None,
+                generated_always: false,
             },
             TableColumn::new("price", "float"),
             TableColumn::new("amt", "double"),
@@ -1272,6 +1339,7 @@ mod tests {
                 full_type: "string".into(),
                 nullable: false,
                 default: None,
+                generated_always: false,
             },
         ];
         let evo = SchemaEvolution {

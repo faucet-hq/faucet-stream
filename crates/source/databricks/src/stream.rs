@@ -92,7 +92,7 @@ impl DatabricksSource {
         config.validate()?;
         Ok(Self {
             config,
-            client: Client::new(),
+            client: faucet_common_databricks::http_client()?,
             endpoint_base: None,
             auth_provider: None,
             start_bookmark: Mutex::new(None),
@@ -141,6 +141,8 @@ impl DatabricksSource {
             StatementOptions {
                 wait_timeout_secs: self.config.wait_timeout_secs,
                 poll_interval: Duration::from_secs(self.config.poll_interval_secs.max(1)),
+                statement_timeout: (self.config.statement_timeout_secs > 0)
+                    .then(|| Duration::from_secs(self.config.statement_timeout_secs)),
                 ..StatementOptions::default()
             },
             ErrorSide::Source,
@@ -669,6 +671,7 @@ mod tests {
             }],
             wait_timeout_secs: 50,
             poll_interval_secs: 1,
+            statement_timeout_secs: 3600,
             batch_size: 1000,
             arrow_native: false,
             result_disposition: ResultDisposition::default(),
