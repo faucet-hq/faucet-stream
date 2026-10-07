@@ -508,6 +508,7 @@ impl AuthProvider for RevokedThenRefreshed {
 /// A handshake rejected with `401` re-authenticates the shared provider and
 /// connects again with the fresh token.
 #[tokio::test]
+#[allow(clippy::result_large_err)]
 async fn a_rejected_handshake_refreshes_the_shared_token() {
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -70,10 +70,12 @@ type DataBuilder =
 
 enum Inner {
     Unpartitioned(Box<dyn IcebergWriter>),
-    Partitioned {
-        writer: FanoutWriter<DataBuilder>,
-        splitter: RecordBatchPartitionSplitter,
-    },
+    Partitioned(Box<Partitioned>),
+}
+
+struct Partitioned {
+    writer: FanoutWriter<DataBuilder>,
+    splitter: RecordBatchPartitionSplitter,
 }
 
 impl TableWriter {
@@ -136,10 +138,10 @@ impl TableWriter {
                     "iceberg: cannot compute the table's partition values: {e}"
                 ))
             })?;
-            Inner::Partitioned {
+            Inner::Partitioned(Box::new(Partitioned {
                 writer: FanoutWriter::new(builder),
                 splitter,
-            }
+            }))
         };
 
         Ok(Self { inner })
@@ -153,9 +155,9 @@ impl TableWriter {
         let failed = |e: iceberg::Error| FaucetError::Sink(format!("iceberg: write failed: {e}"));
         match &mut self.inner {
             Inner::Unpartitioned(writer) => writer.write(batch).await.map_err(failed),
-            Inner::Partitioned { writer, splitter } => {
-                for (key, part) in splitter.split(&batch).map_err(failed)? {
-                    writer.write(key, part).await.map_err(failed)?;
+            Inner::Partitioned(p) => {
+                for (key, part) in p.splitter.split(&batch).map_err(failed)? {
+                    p.writer.write(key, part).await.map_err(failed)?;
                 }
                 Ok(())
             }
@@ -168,7 +170,7 @@ impl TableWriter {
         let failed = |e: iceberg::Error| FaucetError::Sink(format!("iceberg: close failed: {e}"));
         match self.inner {
             Inner::Unpartitioned(mut writer) => writer.close().await.map_err(failed),
-            Inner::Partitioned { writer, .. } => writer.close().await.map_err(failed),
+            Inner::Partitioned(p) => p.writer.close().await.map_err(failed),
         }
     }
 }

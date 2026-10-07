@@ -308,6 +308,9 @@ impl OAuth2RefreshProvider {
     }
 }
 
+/// `(store, key, legacy_key)` of a `persist:` block.
+type PersistSlot = (Option<Arc<dyn StateStore>>, String, Option<String>);
+
 /// Parse the optional `persist:` block. Returns `(store, key, legacy_key)`. When
 /// absent, the provider keeps rotation in memory only (`store = None`). When
 /// present, `path` is the state-store root directory (file-backed via
@@ -320,7 +323,7 @@ fn parse_persist(
     token_url: &str,
     client_id: &str,
     seed: &str,
-) -> Result<(Option<Arc<dyn StateStore>>, String, Option<String>), FaucetError> {
+) -> Result<PersistSlot, FaucetError> {
     let default_key = format!(
         "oauth2_refresh_{:016x}",
         fnv1a_64(&format!("{token_url}\u{0}{client_id}\u{0}{seed}"))
