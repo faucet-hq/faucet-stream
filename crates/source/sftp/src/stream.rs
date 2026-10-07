@@ -351,7 +351,7 @@ impl SftpSource {
         let shared = format
             .shared()
             .ok_or_else(|| FaucetError::Source(format!("SFTP '{path}': format has no decoder")))?;
-        let records = faucet_core::file_format::decode(&bytes, shared, opts)
+        let records = faucet_core::file_format::decode_owned(bytes, shared, opts)
             .await
             .map_err(|e| FaucetError::Source(format!("SFTP '{path}': {e}")))?;
         Ok(Fetched::Records(records))
@@ -432,12 +432,15 @@ impl faucet_core::Source for SftpSource {
                 let payload = payload?;
                 #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                 let payload = match payload {
-                    Fetched::Container(bytes) => Fetched::Records(
-                        container
-                            .as_mut()
+                    Fetched::Container(bytes) => {
+                        let (d, rows) = container
+                            .take()
                             .expect("a container file implies a container format")
-                            .decode_all(file, faucet_core::FileInput::Bytes(bytes))?,
-                    ),
+                            .decode_all_offloaded(file.to_string(), faucet_core::FileInput::Bytes(bytes))
+                            .await?;
+                        container = Some(d);
+                        Fetched::Records(rows)
+                    }
                     other => other,
                 };
                 match payload {

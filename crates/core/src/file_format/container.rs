@@ -15,9 +15,9 @@
 //! - **ORC** — the first file's (projected) Arrow schema is the reference; a
 //!   file whose schema differs fails with an error naming both files.
 //!
-//! Decoding is synchronous. Call it from a blocking context for large files;
-//! both [`FileInput`] variants stream rather than materialize the decoded
-//! rows.
+//! Decoding is synchronous. From async code use the `*_offloaded` methods,
+//! which run it on a blocking thread; both [`FileInput`] variants stream
+//! rather than materialize the decoded rows.
 
 #![cfg_attr(
     not(any(feature = "file-format-avro", feature = "file-format-orc")),
@@ -103,6 +103,39 @@ impl ContainerDecoder {
             Ok(())
         })?;
         Ok(out)
+    }
+
+    /// [`decode_all`](Self::decode_all) on a blocking thread, so a large
+    /// object does not stall an async worker (CORE-34). Takes and returns the
+    /// decoder because the decode runs on another thread.
+    pub async fn decode_all_offloaded(
+        mut self,
+        name: String,
+        input: FileInput,
+    ) -> Result<(Self, Vec<Value>), FaucetError> {
+        tokio::task::spawn_blocking(move || {
+            let rows = self.decode_all(&name, input)?;
+            Ok((self, rows))
+        })
+        .await
+        .map_err(|e| FaucetError::Source(format!("container decode task failed: {e}")))?
+    }
+
+    /// [`decode_batches`](Self::decode_batches) on a blocking thread.
+    #[cfg(feature = "arrow")]
+    #[allow(clippy::type_complexity)]
+    pub async fn decode_batches_offloaded(
+        mut self,
+        name: String,
+        input: FileInput,
+        batch_size: usize,
+    ) -> Result<(Self, Vec<arrow::array::RecordBatch>), FaucetError> {
+        tokio::task::spawn_blocking(move || {
+            let (_, batches) = self.decode_batches(&name, input, batch_size)?;
+            Ok((self, batches))
+        })
+        .await
+        .map_err(|e| FaucetError::Source(format!("container decode task failed: {e}")))?
     }
 
     /// Decode one whole file into Arrow batches of at most `batch_size` rows.
@@ -338,7 +371,10 @@ where
             })
             .buffered(concurrency.max(1));
         while let Some((name, body)) = fetched.next().await {
-            let (_, batches) = decoder.decode_batches(&name, FileInput::Bytes(body?), batch_size)?;
+            let (d, batches) = decoder
+                .decode_batches_offloaded(name, FileInput::Bytes(body?), batch_size)
+                .await?;
+            decoder = d;
             for batch in batches {
                 yield crate::columnar::ColumnarPage::new(batch, None);
             }
@@ -465,6 +501,30 @@ mod tests {
             3
         );
         assert!(pages[3].as_ref().is_err());
+    }
+
+    #[cfg(all(feature = "file-format-avro", feature = "arrow"))]
+    #[tokio::test]
+    async fn offloaded_decodes_keep_the_anchor() {
+        let d = ContainerDecoder::new(FileFormat::Avro, &FormatOptions::default()).unwrap();
+        let (d, rows) = d
+            .decode_all_offloaded("a".into(), FileInput::Bytes(avro(&[json!({"id": 1})])))
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![json!({"id": 1})]);
+        let (d, batches) = d
+            .decode_batches_offloaded("b".into(), FileInput::Bytes(avro(&[json!({"id": 2})])), 0)
+            .await
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+        let err = d
+            .decode_all_offloaded(
+                "c".into(),
+                FileInput::Bytes(avro(&[json!({"id": 1, "z": 1})])),
+            )
+            .await
+            .expect_err("anchored on a");
+        assert!(err.to_string().contains("`z`"), "{err}");
     }
 
     #[test]

@@ -66,7 +66,11 @@ A repeated header name fails the read — rows are keyed by header, so a
 duplicate would silently drop a column. With `flexible: false` a row with more
 or fewer fields than the header fails naming its line. The object-store and
 REST sources are lenient by default; the `file` source is strict, like the
-`csv` source.
+`csv` source. When lenient, the reader logs how many ragged rows it accepted,
+and a long row whose extra field would land on a header literally named
+`column_<i>` fails rather than overwriting that column. An Excel sheet whose
+header row repeats a label (or leaves a cell blank where `column_<i>` is also a
+real header) fails the same way a CSV does.
 
 ```yaml
 source:
@@ -150,6 +154,11 @@ the shared fidelity corpus, so they stay true as the layer changes:
 The two in bold worth planning around: **XML trims padding**, so quote-and-pad
 alignment does not survive a round trip; and **xlsx returns a big integer as a
 string**, which is visible and correctable, unlike a rounded number.
+
+Reading `json_lines` / `json_array`, a number literal that the parsed record
+cannot hold exactly — an integer beyond 2^64, or a decimal with more
+significant digits than a double keeps — fails the read naming the literal,
+rather than being rounded. Write such values as JSON strings.
 
 ## Streaming and memory
 
