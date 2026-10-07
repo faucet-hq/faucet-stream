@@ -61,8 +61,22 @@ fn slot_lag_bytes(current_wal: u64, slot_confirmed: Option<u64>, local: u64) -> 
 }
 
 impl PostgresCdcSource {
-    pub async fn new(config: PostgresCdcSourceConfig) -> Result<Self, FaucetError> {
+    pub async fn new(mut config: PostgresCdcSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
+        config.tls = config.effective_tls()?;
+        match &config.tls {
+            crate::config::CdcTls::Disable => tracing::warn!(
+                slot = %config.slot_name,
+                "postgres-cdc: the replication connection is plaintext — credentials and every \
+                 row change travel unencrypted; set `sslmode` in connection_url or `tls.mode`"
+            ),
+            crate::config::CdcTls::Require => tracing::warn!(
+                slot = %config.slot_name,
+                "postgres-cdc: TLS without certificate verification (`require`) — use \
+                 `verify_full` to authenticate the server"
+            ),
+            _ => {}
+        }
         let key = state_key(&config.slot_name);
         let initial_lsn = match config.start_lsn.as_deref() {
             Some(s) => parse_lsn(s)?,

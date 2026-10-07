@@ -215,8 +215,8 @@ A persisted bookmark always wins over `start_position` — the latter only appli
 
 | Mode | Description |
 |------|-------------|
-| `{ mode: disable }` | No TLS (default). Credentials and row data travel cleartext. |
-| `{ mode: require }` | Require TLS but do not verify the server certificate. |
+| `{ mode: disable }` | No TLS of faucet's own (default): the URL's `require_ssl` / `verify_ca` / `verify_identity` options still apply. Without them credentials and row data travel cleartext, and a warning is logged. |
+| `{ mode: require }` | Require TLS but do not verify the server certificate (a warning is logged — use `verify_full`). |
 | `{ mode: verify_ca, ca_path: "/path/to/ca.pem" }` | Require TLS and verify the certificate chain. `ca_path` optional (uses system roots if omitted). |
 | `{ mode: verify_full, ca_path: "/path/to/ca.pem" }` | Require TLS and verify both the chain and the hostname. `ca_path` optional. |
 
