@@ -251,6 +251,13 @@ jobs:
         # in-process (bollard) image pull intermittently fails. Only that is
         # retried: any other failure — a flaky test included — fails at once.
         run: scripts/retry-on-image-pull.sh cargo test --workspace --all-features
+      - name: Free disk taken by the workspace test binaries
+        # The next step rebuilds faucet-cli with other features; the runner
+        # runs out of disk if the workspace run's test executables stay.
+        run: |
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x -delete
+          rm -rf target/debug/incremental
+          df -h /
       - name: Run serve-ui and serve-openapi tests in isolation
         # Explicitly target the embedded-console tests with serve-ui so the
         # feature-gated #![cfg(feature = "serve-ui")] gate is exercised and
