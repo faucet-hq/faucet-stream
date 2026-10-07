@@ -7114,6 +7114,7 @@ dependencies = [
  "async-trait",
  "faucet-core",
  "redis",
+ "rustls 0.23.45",
  "serde_json",
  "testcontainers",
  "testcontainers-modules",
@@ -13048,19 +13049,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bc42f3a12fd4408ce64d8efef67048a924e543bd35c6591c0447fda9054695f"
 dependencies = [
  "arc-swap",
+ "backon",
  "bytes",
  "combine",
+ "futures-channel",
  "futures-util",
  "itoa",
  "num-bigint 0.4.8",
  "percent-encoding",
  "pin-project-lite",
+ "rustls 0.23.45",
+ "rustls-native-certs 0.8.3",
  "ryu",
  "sha1_smol",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-util",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

@@ -22,6 +22,14 @@ async fn start_redis() -> (ContainerAsync<Redis>, String) {
         .await
         .expect("redis port");
     let url = format!("redis://127.0.0.1:{port}");
+    // The mapped port can refuse connections for a moment after start.
+    let client = redis::Client::open(url.as_str()).expect("client");
+    for _ in 0..50 {
+        if client.get_multiplexed_async_connection().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     (container, url)
 }
 
@@ -190,4 +198,42 @@ async fn list_by_prefix_and_atomic_batch() {
             .await
             .is_err()
     );
+}
+
+/// #789 SQL-89 / SQL-120: a dropped connection is re-established instead of
+/// failing every later call, and `list` walks every SCAN page.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnects_after_a_dropped_connection_and_lists_every_page() {
+    let (_container, url) = start_redis().await;
+    let store = RedisStateStore::connect(&url, "faucet")
+        .await
+        .expect("connect");
+    store.put("before", &json!(1)).await.expect("put");
+
+    let client = redis::Client::open(url.as_str()).expect("client");
+    let mut admin = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("admin");
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("TYPE")
+        .arg("normal")
+        .arg("SKIPME")
+        .arg("yes")
+        .query_async(&mut admin)
+        .await
+        .expect("client kill");
+    assert!(killed >= 1, "the store's connection must have been killed");
+
+    assert_eq!(store.get("before").await.expect("get after kill"), Some(json!(1)));
+    store.put("after", &json!(2)).await.expect("put after kill");
+
+    let entries: Vec<(String, serde_json::Value)> = (0..1_200)
+        .map(|i| (format!("orders::{i:04}"), json!(i)))
+        .collect();
+    store.put_batch(&entries).await.expect("batch");
+    let listed = store.list("orders::").await.expect("list");
+    assert_eq!(listed.len(), 1_200);
+    assert_eq!(listed[0], "orders::0000");
 }

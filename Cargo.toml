@@ -347,7 +347,7 @@ csv = "1.3"
 csv-async = { version = "1.3", features = ["tokio"] }
 calamine = { version = "0.26", features = ["dates"] }
 rust_xlsxwriter = "0.99"
-redis = { version = "0.29", features = ["tokio-comp", "aio"] }
+redis = { version = "0.29", features = ["tokio-comp", "aio", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 axum = "0.8"
 subtle = "2"
 tower-http = { version = "0.6", features = ["limit", "cors", "trace", "request-id", "util"] }
