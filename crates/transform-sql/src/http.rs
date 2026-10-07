@@ -39,13 +39,27 @@ fn fetch_body(
     let owned_name = name.to_string();
     let url = url.to_string();
     let headers = headers.clone();
-    let handle =
-        std::thread::spawn(move || fetch_body_blocking(&owned_name, &url, method, &headers));
-    match handle.join() {
-        Ok(res) => res,
-        Err(_) => Err(cfg_err(format!(
-            "http relation '{name}': fetch thread panicked"
-        ))),
+    off_worker(move || {
+        let handle =
+            std::thread::spawn(move || fetch_body_blocking(&owned_name, &url, method, &headers));
+        match handle.join() {
+            Ok(res) => res,
+            Err(_) => Err(cfg_err(format!(
+                "http relation '{name}': fetch thread panicked"
+            ))),
+        }
+    })
+}
+
+/// Wait without pinning a tokio worker: on a multi-thread runtime the worker
+/// hands its other tasks off first (`block_in_place`); elsewhere run inline.
+pub(crate) fn off_worker<T>(f: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_thread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
     }
 }
 
@@ -147,6 +161,25 @@ fn kind_of(v: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn off_worker_lets_other_tasks_run_on_the_only_worker() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = flag.clone();
+        tokio::spawn(async move { f2.store(true, std::sync::atomic::Ordering::SeqCst) });
+        let seen = off_worker(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        });
+        assert!(seen, "the spawned task never ran while the fetch waited");
+        assert_eq!(off_worker(|| 7), 7);
+    }
 
     #[test]
     fn selects_array_at_path() {

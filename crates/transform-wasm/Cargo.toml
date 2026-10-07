@@ -18,6 +18,8 @@ serde_json.workspace = true
 schemars.workspace = true
 tracing.workspace = true
 metrics.workspace = true
+# `block_in_place` around module compilation, so cranelift never pins a worker.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 wat.workspace = true
