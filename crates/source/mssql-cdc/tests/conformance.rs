@@ -64,6 +64,15 @@ fn conformance_config_schema_valid() {
 /// up. SQL Server boots far more slowly than Postgres/MySQL: the container is
 /// reported "started" well before the engine accepts connections, so a plain
 /// checkout right after start races the boot and fails. Poll until ready.
+/// A missing test backend: a skip locally, a failure when CI requires the
+/// backends (`FAUCET_REQUIRE_BACKENDS`).
+fn backend_missing(why: &str) {
+    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
+        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
+    }
+    eprintln!("skipping: {why}");
+}
+
 async fn start_mssql_cdc() -> Option<(ContainerAsync<MssqlServer>, u16)> {
     let container = match MssqlServer::default()
         .with_accept_eula()
@@ -75,7 +84,9 @@ async fn start_mssql_cdc() -> Option<(ContainerAsync<MssqlServer>, u16)> {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("skipping mssql-cdc test: could not start SQL Server container: {e}");
+            backend_missing(&format!(
+                "mssql-cdc test: could not start SQL Server container: {e}"
+            ));
             return None;
         }
     };
@@ -84,7 +95,7 @@ async fn start_mssql_cdc() -> Option<(ContainerAsync<MssqlServer>, u16)> {
         .await
         .expect("mssql host port");
     if !wait_until_ready(port).await {
-        eprintln!("skipping mssql-cdc test: SQL Server never accepted connections in time");
+        backend_missing("mssql-cdc test: SQL Server never accepted connections in time");
         return None;
     }
     Some((container, port))

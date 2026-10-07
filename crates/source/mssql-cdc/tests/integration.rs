@@ -37,6 +37,15 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// up. SQL Server boots far more slowly than Postgres/MySQL: the container is
 /// reported "started" well before the engine accepts connections, so a plain
 /// checkout right after start races the boot and fails. Poll until ready.
+/// A missing test backend: a skip locally, a failure when CI requires the
+/// backends (`FAUCET_REQUIRE_BACKENDS`).
+fn backend_missing(why: &str) {
+    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
+        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
+    }
+    eprintln!("skipping: {why}");
+}
+
 async fn start_mssql_cdc() -> Option<(ContainerAsync<MssqlServer>, u16)> {
     let container = match MssqlServer::default()
         .with_accept_eula()
@@ -46,7 +55,9 @@ async fn start_mssql_cdc() -> Option<(ContainerAsync<MssqlServer>, u16)> {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("skipping mssql-cdc test: could not start SQL Server container: {e}");
+            backend_missing(&format!(
+                "mssql-cdc test: could not start SQL Server container: {e}"
+            ));
             return None;
         }
     };
@@ -55,7 +66,7 @@ async fn start_mssql_cdc() -> Option<(ContainerAsync<MssqlServer>, u16)> {
         .await
         .expect("mssql host port");
     if !wait_until_ready(port).await {
-        eprintln!("skipping mssql-cdc test: SQL Server never accepted connections in time");
+        backend_missing("mssql-cdc test: SQL Server never accepted connections in time");
         return None;
     }
     Some((container, port))
@@ -512,4 +523,63 @@ async fn a_bookmark_behind_the_retained_history_fails_unless_skipped() {
     source.apply_start_bookmark(purged).await.unwrap();
     let (records, _) = drain(&source).await;
     assert!(!records.is_empty(), "skip resumes from the earliest change");
+}
+
+/// SQL-55: a transaction touching two captured tables is delivered as one
+/// page, in its own order, with one bookmark covering both instances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a SQL Server (mssql) container; run with `--ignored`."]
+async fn a_transaction_across_two_tables_is_one_page_in_order() {
+    let _serial = SERIAL.lock().await;
+    let Some((_c, port)) = start_mssql_cdc().await else {
+        return;
+    };
+    let (pool, conn) = setup(port, "cdc_multi").await;
+    exec(
+        &pool,
+        "IF OBJECT_ID('dbo.orders') IS NULL \
+           CREATE TABLE dbo.orders (id INT PRIMARY KEY, user_id INT)",
+    )
+    .await;
+    exec(
+        &pool,
+        "IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance = 'dbo_orders') \
+         EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'orders', \
+             @role_name = NULL, @capture_instance = N'dbo_orders'",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    exec(
+        &pool,
+        "BEGIN TRAN; INSERT INTO dbo.orders (id, user_id) VALUES (10, 7); \
+         INSERT INTO dbo.users (id, name) VALUES (7, N'parent'); COMMIT",
+    )
+    .await;
+    wait_for_changes(&pool, 1).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut cfg = build_config(&conn);
+    cfg.capture_instances = vec![CI.to_string(), "dbo_orders".to_string()];
+    let source = MssqlCdcSource::new(cfg).await.expect("source new");
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let mut data_pages = Vec::new();
+    while let Some(page) = pages.next().await {
+        let page = page.expect("page");
+        if !page.records.is_empty() {
+            data_pages.push(page);
+        }
+    }
+    assert_eq!(data_pages.len(), 1, "one transaction, one page");
+    let tables: Vec<&str> = data_pages[0]
+        .records
+        .iter()
+        .map(|r| r["table"].as_str().unwrap())
+        .collect();
+    assert_eq!(tables, vec!["orders", "users"], "commit order is kept");
+    let bm = data_pages[0].bookmark.clone().expect("bookmark");
+    assert_eq!(
+        bm[CI], bm["dbo_orders"],
+        "both instances resume after the commit"
+    );
 }
