@@ -6652,7 +6652,17 @@
       "description": "TLS configuration for the CDC replication connection.",
       "oneOf": [
         {
-          "description": "No TLS — plaintext (default, back-compatible).",
+          "description": "Follow the `sslmode` / `sslrootcert` of `connection_url` (default);\nplaintext when it sets none.",
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "from_url"
+            }
+          }
+        },
+        {
+          "description": "No TLS — plaintext.",
           "type": "object",
           "properties": {
             "mode": {
@@ -15567,10 +15577,10 @@
                       "default": 10
                     },
                     "tls": {
-                      "description": "TLS settings for the replication connection. Default `disable`\n(plaintext) for back-compatibility, but credentials and all WAL data\nthen travel unencrypted — set `require`/`verify_ca`/`verify_full` in\nproduction.",
+                      "description": "TLS settings for the replication connection. Default `from_url`: the\n`sslmode` (and `sslrootcert`) in `connection_url` apply to both the\ncontrol-plane and the replication connection; without one the\nconnection is plaintext and a warning is logged. An explicit mode that\ncontradicts the URL's `sslmode` is refused (#789 SUPPLY-06).",
                       "$ref": "#/$defs/source_postgres-cdc__CdcTls",
                       "default": {
-                        "mode": "disable"
+                        "mode": "from_url"
                       }
                     },
                     "start_lsn": {
@@ -16264,6 +16274,11 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 10
+                    },
+                    "value_format": {
+                      "description": "How a message payload becomes a record: `auto` (default — JSON when\nit parses, else the UTF-8 text), `json`, `string` or `bytes`\n(base64). A payload the format cannot represent fails the run rather\nthan being altered (#789 MSG-39).",
+                      "$ref": "#/$defs/source_nats__NatsValueFormat",
+                      "default": "auto"
                     }
                   },
                   "title": "NatsSourceConfig",
@@ -31444,6 +31459,31 @@
           "description": "Emit the record with the payload base64-encoded under `data` and the\ndecode error under `decode_error`.",
           "type": "string",
           "const": "raw"
+        }
+      ]
+    },
+    "source_nats__NatsValueFormat": {
+      "description": "How [`NatsSourceConfig::value_format`] decodes a payload.",
+      "oneOf": [
+        {
+          "description": "JSON when the payload parses, else its UTF-8 text; non-UTF-8 fails.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "The payload must be JSON.",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "The payload as UTF-8 text (invalid UTF-8 fails).",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "The raw bytes, base64-encoded into a JSON string.",
+          "type": "string",
+          "const": "bytes"
         }
       ]
     }
