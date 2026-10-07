@@ -30,13 +30,30 @@ fn quote_ident_mysql(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+/// The per-connection session setup: raise `net_write_timeout` so a slow sink
+/// (the pipeline stops reading while it writes a page) does not make the
+/// server abort the result stream. `None` keeps the server's setting.
+fn session_setup_sql(net_write_timeout_secs: u64) -> Option<String> {
+    (net_write_timeout_secs > 0)
+        .then(|| format!("SET SESSION net_write_timeout = {net_write_timeout_secs}"))
+}
+
 impl MysqlSource {
     /// Create a new MySQL source. Establishes a connection pool.
     pub async fn new(config: MysqlSourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
 
+        let net_write_timeout = config.net_write_timeout_secs;
         let pool = MySqlPoolOptions::new()
             .max_connections(config.max_connections)
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    if let Some(sql) = session_setup_sql(net_write_timeout) {
+                        sqlx::Executor::execute(conn, sql.as_str()).await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect(&config.connection_url)
             .await
             // Connect-time, so `Config` is deliberate and stays: this runs in
@@ -169,13 +186,12 @@ fn mysql_value_to_json(
     if let Ok(v) = row.try_get::<u8, _>(col_name) {
         return Value::Number(v.into());
     }
+    // `f32` first: sqlx's `f64` also accepts FLOAT, widening it.
+    if let Ok(v) = row.try_get::<f32, _>(col_name) {
+        return float_json(v);
+    }
     if let Ok(v) = row.try_get::<f64, _>(col_name) {
         return serde_json::Number::from_f64(v)
-            .map(Value::Number)
-            .unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<f32, _>(col_name) {
-        return serde_json::Number::from_f64(v as f64)
             .map(Value::Number)
             .unwrap_or(Value::Null);
     }
@@ -195,12 +211,13 @@ fn mysql_value_to_json(
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDate, _>(col_name) {
         return Value::String(v.to_string());
     }
-    if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveTime, _>(col_name) {
-        return Value::String(v.to_string());
+    // TIME is a duration (-838:59:59 … 838:59:59), not a time of day.
+    if let Ok(v) = row.try_get::<sqlx::mysql::types::MySqlTime, _>(col_name) {
+        return Value::String(time_text(&v));
     }
-    // DECIMAL → string, preserving exact precision.
+    // DECIMAL → string, preserving exact precision, never in exponent form.
     if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
-        return Value::String(v.to_string());
+        return Value::String(v.to_plain_string());
     }
     // BLOB / BINARY → base64; a text column with a binary collation arrives
     // as bytes too, but is text (#789 SQL-13).
@@ -209,6 +226,36 @@ fn mysql_value_to_json(
     }
 
     Value::Null
+}
+
+/// A `FLOAT` through its shortest decimal form: `0.1` stays `0.1` instead of
+/// widening to `0.10000000149011612`.
+fn float_json(v: f32) -> Value {
+    v.to_string()
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
+
+/// A `TIME` as `[-]HH:MM:SS[.fff|.ffffff]`, keeping its sign and hours of 24
+/// and more.
+fn time_text(t: &sqlx::mysql::types::MySqlTime) -> String {
+    // `MySqlTime::is_negative` is inverted in sqlx 0.8; ask the sign itself.
+    let sign = if t.sign().is_negative() { "-" } else { "" };
+    let mut out = format!(
+        "{sign}{:02}:{:02}:{:02}",
+        t.hours(),
+        t.minutes(),
+        t.seconds()
+    );
+    match t.microseconds() {
+        0 => {}
+        us if us % 1000 == 0 => out.push_str(&format!(".{:03}", us / 1000)),
+        us => out.push_str(&format!(".{us:06}")),
+    }
+    out
 }
 
 /// A byte-valued cell: text (when the column is text with a binary collation
@@ -224,6 +271,27 @@ fn bytes_to_json(bytes: Vec<u8>, is_text: bool) -> Value {
         bytes
     };
     Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Await a server read, failing it after `secs` seconds (`0` = no limit), so a
+/// peer that vanished without closing the connection cannot hang the run.
+async fn bounded_read<T>(
+    secs: u64,
+    fut: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, FaucetError> {
+    let result = if secs == 0 {
+        fut.await
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(FaucetError::Source(format!(
+                    "MySQL read timed out after {secs}s waiting for the server (read_timeout_secs)"
+                )));
+            }
+        }
+    };
+    result.map_err(|e| FaucetError::Source(format!("MySQL query failed: {e}")))
 }
 
 /// Build the effective SQL query and ordered context-bind values for a given
@@ -410,10 +478,7 @@ impl faucet_core::Source for MysqlSource {
         let text_columns = self.text_columns(&query_str, &bind_values).await;
         let query = bind_params(sqlx::query(&query_str), &bind_values);
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Source(format!("MySQL query failed: {e}")))?;
+        let rows = bounded_read(self.config.read_timeout_secs, query.fetch_all(&self.pool)).await?;
 
         let records: Vec<Value> = rows.iter().map(|r| row_to_json(r, &text_columns)).collect();
         tracing::info!(rows = records.len(), query = %self.config.query, "MySQL source fetch complete");
@@ -451,11 +516,7 @@ impl faucet_core::Source for MysqlSource {
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            while let Some(row) = rows
-                .try_next()
-                .await
-                .map_err(|e| FaucetError::Source(format!("MySQL query failed: {e}")))?
-            {
+            while let Some(row) = bounded_read(self.config.read_timeout_secs, rows.try_next()).await? {
                 buffer.push(row_to_json(&row, &text_columns));
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
@@ -687,6 +748,40 @@ fn key_discovery_error(e: sqlx::Error) -> FaucetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_keeps_sign_and_long_hours() {
+        use sqlx::mysql::types::{MySqlTime, MySqlTimeSign};
+        let t = MySqlTime::new(MySqlTimeSign::Negative, 1, 30, 0, 0).unwrap();
+        assert_eq!(time_text(&t), "-01:30:00");
+        let t = MySqlTime::new(MySqlTimeSign::Positive, 837, 59, 59, 500_000).unwrap();
+        assert_eq!(time_text(&t), "837:59:59.500");
+        let t = MySqlTime::new(MySqlTimeSign::Positive, 30, 0, 0, 123_456).unwrap();
+        assert_eq!(time_text(&t), "30:00:00.123456");
+        assert_eq!(float_json(0.1), serde_json::json!(0.1));
+        assert_eq!(float_json(f32::NAN), Value::Null);
+        assert_eq!(
+            session_setup_sql(120).as_deref(),
+            Some("SET SESSION net_write_timeout = 120")
+        );
+        assert_eq!(session_setup_sql(0), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_read_times_out_and_passes_through() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok::<_, sqlx::Error>(1)
+        };
+        tokio::time::pause();
+        let err = bounded_read(1, slow).await.unwrap_err();
+        assert!(err.to_string().contains("read_timeout_secs"), "{err}");
+        assert_eq!(bounded_read(0, async { Ok::<_, sqlx::Error>(2) }).await.unwrap(), 2);
+        let failed = bounded_read(5, async { Err::<i32, _>(sqlx::Error::RowNotFound) })
+            .await
+            .unwrap_err();
+        assert!(failed.to_string().contains("MySQL query failed"), "{failed}");
+    }
 
     #[test]
     fn byte_cells_decode_as_text_only_for_utf8_text_columns() {

@@ -39,6 +39,15 @@ pub struct PostgresSourceConfig {
     /// it is fully backward compatible. See [`ShardConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<ShardConfig>,
+    /// Longest the source waits on the server for the next row (or for a
+    /// whole result in `fetch_all`), in seconds, before the read fails.
+    /// Defaults to 3600; `0` waits forever.
+    ///
+    /// A peer that disappears without closing the connection (a failover, an
+    /// idle eviction by a NAT or load balancer) otherwise leaves the read
+    /// waiting forever, and a scheduled or served run stuck in "running".
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
 }
 
 /// Primary-key range sharding settings for the PostgreSQL source.
@@ -58,6 +67,10 @@ pub struct ShardConfig {
     /// Integer column to range-partition on. Quoted as an identifier before use,
     /// so it is safe against injection but must name a real output column.
     pub key: String,
+}
+
+fn default_read_timeout_secs() -> u64 {
+    3600
 }
 
 fn default_max_connections() -> u32 {
@@ -90,6 +103,7 @@ impl PostgresSourceConfig {
             max_connections: 10,
             batch_size: DEFAULT_BATCH_SIZE,
             shard: None,
+            read_timeout_secs: default_read_timeout_secs(),
         }
     }
 

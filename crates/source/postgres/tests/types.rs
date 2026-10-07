@@ -92,3 +92,52 @@ async fn types_without_a_native_decode_are_read_as_text() {
     let n = row["n"].as_str().expect("numeric is a string");
     assert_eq!(n.parse::<f64>().unwrap(), 1.5, "{n}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn infinite_dates_reals_and_partitions() {
+    let (_c, url) = start_postgres().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    for sql in [
+        "CREATE TABLE inf (id INT PRIMARY KEY, d DATE, ts TIMESTAMP, tz TIMESTAMPTZ, r REAL)",
+        "INSERT INTO inf VALUES (1, 'infinity', 'infinity', '-infinity', 0.1), \
+         (2, '-infinity', '-infinity', 'infinity', NULL), \
+         (3, '2024-01-02', '2024-01-02 03:04:05', '2024-01-02 03:04:05+00', 'NaN')",
+        "CREATE TABLE parted (id INT, region TEXT) PARTITION BY LIST (region)",
+        "CREATE TABLE parted_eu PARTITION OF parted FOR VALUES IN ('eu')",
+        "CREATE TABLE parted_us PARTITION OF parted FOR VALUES IN ('us')",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect(sql);
+    }
+    pool.close().await;
+
+    let source = PostgresSource::new(PostgresSourceConfig::new(
+        &url,
+        "SELECT d, ts, tz, r FROM inf ORDER BY id",
+    ))
+    .await
+    .expect("source");
+    let rows = source.fetch_all().await.expect("fetch");
+    assert_eq!(
+        rows[0],
+        json!({"d": "infinity", "ts": "infinity", "tz": "-infinity", "r": 0.1})
+    );
+    assert_eq!(
+        rows[1],
+        json!({"d": "-infinity", "ts": "-infinity", "tz": "infinity", "r": null})
+    );
+    assert_eq!(rows[2]["d"], json!("2024-01-02"));
+    assert_eq!(rows[2]["r"], json!("NaN"));
+
+    let names: Vec<String> = source
+        .discover()
+        .await
+        .expect("discover")
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(names.iter().any(|n| n.ends_with("parted")), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.contains("parted_")),
+        "partitions must not be listed beside their parent: {names:?}"
+    );
+}

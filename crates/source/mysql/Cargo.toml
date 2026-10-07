@@ -21,10 +21,11 @@ sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "mysql", "
 base64.workspace = true
 async-stream = { workspace = true }
 futures.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 faucet-conformance.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 serde_json.workspace = true
 schemars.workspace = true
 testcontainers = "0.27"

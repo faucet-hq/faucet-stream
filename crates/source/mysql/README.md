@@ -69,6 +69,8 @@ faucet run pipeline.yaml
 | `query` | string | — *(required)* | The SQL query to execute. May contain `${parent.field}` tokens that are bound as parameters in a matrix run (see [Per-record queries](#per-record-queries-matrix-pipelines)). |
 | `max_connections` | int | `10` | Maximum connections in the sqlx pool. |
 | `batch_size` | int | `1000` | Rows per emitted `StreamPage`. **`0` = no batching** (drain the whole result set into one page). Values above `MAX_BATCH_SIZE` (1,000,000) are rejected at construction by `faucet_core::validate_batch_size`. |
+| `read_timeout_secs` | int | `3600` | Longest the source waits on the server for the next row before the read fails (`0` = forever), so a peer that vanished without closing the connection cannot hang a run. |
+| `net_write_timeout_secs` | int | `3600` | Sets the session's `net_write_timeout`: how long the server waits for the source to read more of a result. The pipeline stops reading while the sink writes a page, so the server default (60 s) aborts large extracts behind a slow sink with "Lost connection … during query". `0` keeps the server setting. |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
 
 There is no separate `auth` block — credentials live in `connection_url` (and can be sourced from env or a secrets manager; see [Config loading](#config-loading)).
@@ -195,11 +197,12 @@ Columns are converted to JSON in order of likelihood; an unsupported or `NULL` c
 | `int`, `mediumint` | number (i32) |
 | `smallint`, `tinyint` | number (i16) |
 | `double` | number (f64) |
-| `float` | number (f32) |
-| `tinyint(1)`, `boolean` | `true`/`false` |
+| `float` | number, through the value's shortest decimal form (`0.1`, not `0.10000000149011612`) |
+| `tinyint(1)`, `boolean` | number `0` / `1` (MySQL stores `BOOLEAN` as `TINYINT(1)` and reports no separate type) |
 | `datetime`, `timestamp` | string (RFC 3339 / ISO-8601) |
-| `date`, `time` | string (ISO-8601) |
-| `decimal`, `numeric` | string (exact precision preserved) |
+| `date` | string (ISO-8601) |
+| `time` | string `[-]HH:MM:SS[.fff]` — a duration: the sign and hours of 24 and more are kept (`-01:30:00`, `838:59:59`) |
+| `decimal`, `numeric` | string, exact and never in exponent form (`0.0000001000`) |
 | `blob`, `binary`, `varbinary` | string (base64) |
 | `char`/`varchar`/`text` with a `_bin` collation or the `BINARY` attribute | string (the text, not base64) |
 
@@ -325,7 +328,7 @@ let result = pipeline.run().await?;
 
 ## How it works
 
-`MysqlSource::new` validates `batch_size`, then builds one `MySqlPool` (`MySqlPoolOptions::max_connections`) and stores it on the struct — every subsequent fetch reuses the pool rather than reconnecting. `stream_pages` opens a sqlx cursor with `Query::fetch` and pulls rows incrementally via `TryStreamExt::try_next`, flushing a `StreamPage` each time the buffer reaches `batch_size`. Each row is turned into a JSON object keyed by column name (`row_to_json`), and per-column decoding (`mysql_value_to_json`) probes the likely sqlx types in order, falling back to `Null`. Connection and query failures surface as `FaucetError::Config` with the underlying sqlx error attached. Throughput is dominated by row width and network round-trips; benchmark with your own schema and `batch_size`.
+`MysqlSource::new` validates `batch_size`, then builds one `MySqlPool` (`MySqlPoolOptions::max_connections`) and stores it on the struct — every subsequent fetch reuses the pool rather than reconnecting. `stream_pages` opens a sqlx cursor with `Query::fetch` and pulls rows incrementally via `TryStreamExt::try_next`, flushing a `StreamPage` each time the buffer reaches `batch_size`. Each row is turned into a JSON object keyed by column name (`row_to_json`), and per-column decoding (`mysql_value_to_json`) probes the likely sqlx types in order, falling back to `Null`. A connection failure at construction surfaces as `FaucetError::Config`, a query failure as `FaucetError::Source`, each with the underlying sqlx error attached. Throughput is dominated by row width and network round-trips; benchmark with your own schema and `batch_size`.
 
 ## Lineage dataset URI
 
@@ -341,7 +344,7 @@ This crate has no optional Cargo features of its own. Enable it in the CLI / umb
 |---------|--------------------|
 | `FaucetError::Config: MySQL connection failed: ...` | Wrong host/port/credentials, the database is unreachable, or the URL scheme isn't `mysql://`. Verify the `connection_url` and that the server accepts the connection. |
 | `FaucetError::Config: batch_size ...` at startup | `batch_size` exceeds `MAX_BATCH_SIZE` (1,000,000). Lower it, or use `0` to disable batching. |
-| `FaucetError::Config: MySQL query failed: ...` | SQL syntax error, missing table/column, or insufficient privileges. Run the query directly against MySQL to confirm. |
+| `FaucetError::Source: MySQL query failed: ...` | SQL syntax error, missing table/column, or insufficient privileges. Run the query directly against MySQL to confirm. |
 | TLS handshake / certificate error | The server requires TLS the client can't negotiate. Adjust the server's TLS settings or supply the right host; `tls-rustls` is built in, so no extra dependency is needed. |
 | A `DECIMAL` or `DATETIME` column arrives as a string | Intentional — `DECIMAL` is stringified to preserve exact precision and temporal types use ISO-8601. Cast downstream if you need a number. |
 | A column comes back as `null` unexpectedly | The column type isn't in the decode list, or the value is genuinely `NULL`. Wrap the column in `CAST(... AS CHAR)` in the query to force a string. |
