@@ -79,6 +79,7 @@ pub fn build_provider(spec: &Value) -> Result<SharedAuthProvider, FaucetError> {
         .and_then(Value::as_str)
         .ok_or_else(|| FaucetError::Config("auth provider: missing `type`".into()))?;
     let config = spec.get("config").cloned().unwrap_or(Value::Null);
+    reject_unknown_keys(kind, &config)?;
 
     match kind {
         "flow" => Ok(Arc::new(FlowProvider::from_config(&config)?)),
@@ -122,6 +123,80 @@ pub fn build_provider(spec: &Value) -> Result<SharedAuthProvider, FaucetError> {
             "auth provider: unknown type `{other}` (expected one of: flow, static, oauth2, oauth2_refresh, token_endpoint, google_service_account, oauth1)"
         ))),
     }
+}
+
+/// The `config` keys each provider type reads (`flow` checks its own).
+fn known_config_keys(kind: &str) -> Option<&'static [&'static str]> {
+    Some(match kind {
+        "static" => &["token", "header", "value", "username", "password"],
+        "oauth2" => &[
+            "token_url",
+            "client_id",
+            "client_secret",
+            "scopes",
+            "expiry_ratio",
+        ],
+        "oauth2_refresh" => &[
+            "token_url",
+            "client_id",
+            "client_secret",
+            "refresh_token",
+            "scope",
+            "expiry_ratio",
+            "persist",
+        ],
+        "token_endpoint" => &[
+            "url",
+            "method",
+            "body",
+            "encoding",
+            "token_path",
+            "expiry_path",
+            "expiry_ratio",
+            "apply_as",
+        ],
+        "google_service_account" => &[
+            "key_file",
+            "key_json",
+            "scopes",
+            "subject",
+            "token_uri",
+            "expiry_ratio",
+        ],
+        "oauth1" => &[
+            "consumer_key",
+            "consumer_secret",
+            "token",
+            "token_secret",
+            "realm",
+            "signature_method",
+        ],
+        _ => return None,
+    })
+}
+
+/// Refuse a key a provider would silently ignore — a misspelt `expiry_path`
+/// would otherwise disable expiry tracking without a word.
+fn reject_unknown_keys(kind: &str, config: &Value) -> Result<(), FaucetError> {
+    let (Some(known), Some(map)) = (known_config_keys(kind), config.as_object()) else {
+        return Ok(());
+    };
+    let unknown = |key: &str, known: &[&str], at: &str| {
+        FaucetError::Config(format!(
+            "auth provider `{kind}`: unknown config key `{at}{key}` (expected one of: {})",
+            known.join(", ")
+        ))
+    };
+    if let Some(key) = map.keys().find(|k| !known.contains(&k.as_str())) {
+        return Err(unknown(key, known, ""));
+    }
+    if let Some(persist) = map.get("persist").and_then(Value::as_object) {
+        const PERSIST: &[&str] = &["path", "key"];
+        if let Some(key) = persist.keys().find(|k| !PERSIST.contains(&k.as_str())) {
+            return Err(unknown(key, PERSIST, "persist."));
+        }
+    }
+    Ok(())
 }
 
 /// Compute the instant at which a token fetched now (with the given
@@ -168,6 +243,37 @@ pub(crate) fn parse_expiry_ratio(config: &Value) -> Result<f64, FaucetError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_provider_config_keys_are_refused() {
+        let spec = |kind: &str, config: serde_json::Value| {
+            serde_json::json!({ "type": kind, "config": config })
+        };
+        let err = super::build_provider(&spec(
+            "token_endpoint",
+            serde_json::json!({ "url": "http://x", "token_path": "$.t", "expiry_pth": "$.e" }),
+        ))
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("unknown config key `expiry_pth`"), "{err}");
+        assert!(err.contains("expiry_path"), "{err}");
+        let err = super::build_provider(&spec(
+            "oauth2_refresh",
+            serde_json::json!({ "token_url": "http://x", "client_id": "i", "client_secret": "s",
+                                "refresh_token": "r", "persist": { "path": "/tmp/x", "dir": "y" } }),
+        ))
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("`persist.dir`"), "{err}");
+        assert!(super::build_provider(&spec("static", serde_json::json!({ "token": "t" }))).is_ok());
+        assert!(
+            super::build_provider(&spec("static", serde_json::json!({ "token": "t", "headers": {} })))
+                .is_err()
+        );
+        assert!(super::reject_unknown_keys("flow", &serde_json::json!({ "anything": 1 })).is_ok());
+    }
+
     #[test]
     fn an_absurd_expiry_means_no_expiry_rather_than_a_panic() {
         assert!(super::expiry_instant(Some(u64::MAX), 1.0).is_none());

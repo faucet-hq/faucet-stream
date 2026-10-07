@@ -17,7 +17,7 @@ The point of this crate is **token sharing**: one provider instance, wrapped in 
 - **Refresh-token rotation capture** — `oauth2_refresh` captures a rotated `refresh_token` from each response in place, so a single active access token plus a rotating refresh token can be shared safely across many connectors.
 - **Secret-safe `Debug`** — every provider's `Debug` impl renders secrets (`client_secret`, refresh token, request body, cached access token) as `***`; only non-secret identifiers stay visible.
 - **Bounded fetch timeout** — providers hold a single-flight mutex across the network call, so the internal HTTP client has a 30 s request timeout: a hung IdP fails and releases the lock instead of wedging every connector that shares the provider.
-- **Validated config at load time** — `expiry_ratio` is checked to be a finite number in `(0, 1]`; unknown provider `type`s and missing required fields surface as `FaucetError::Config` before any run starts.
+- **Validated config at load time** — `expiry_ratio` is checked to be a finite number in `(0, 1]`; unknown provider `type`s, unknown `config` keys (a misspelt `expiry_path` would otherwise silently disable expiry tracking) and missing required fields surface as `FaucetError::Config` before any run starts. Token requests retry a `429`, a `5xx`, a transient OAuth error code and connect/timeout failures up to 4 attempts with jittered backoff, honouring `Retry-After` (capped at 60 s).
 
 ## Installation
 
@@ -417,6 +417,7 @@ It is pulled in by:
 | Symptom | Likely cause & fix |
 |---------|--------------------|
 | `Config: auth provider: unknown type ...` | The `type` isn't one of `static` / `oauth2` / `oauth2_refresh` / `token_endpoint`. Check the spelling. |
+| `Config: auth provider ...: unknown config key ...` | The provider's `config` has a key it does not read; the message lists the accepted keys. |
 | `Config: ... missing 'type'` | The provider spec has no `type` key. Each `auth:` catalog entry needs `{ type, config }`. |
 | `Config: oauth2 auth provider: missing 'client_id'` (or `token_url` / `client_secret` / `refresh_token`) | A required OAuth2 field is absent. All of `token_url`, `client_id`, `client_secret` are required; `oauth2_refresh` also requires `refresh_token`. |
 | `Config: static auth provider: config must contain ...` | The `static` config didn't match `token`, `header`+`value`, or `username`+`password`. Provide exactly one of those shapes. |
