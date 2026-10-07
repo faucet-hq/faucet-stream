@@ -1010,6 +1010,11 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     for h in sync_handles {
         h.abort();
     }
+    // Persist the run-log lines still buffered (#789 SERVE-49).
+    state
+        .log_hub()
+        .shutdown_persistence(Duration::from_secs(10))
+        .await;
     // Flush any buffered OTLP telemetry after in-flight runs drain (no-op without
     // the `otel` feature).
     faucet_core::shutdown_otel();

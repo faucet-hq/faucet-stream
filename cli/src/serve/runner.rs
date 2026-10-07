@@ -692,6 +692,14 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             Err(e) => tracing::error!(run_id, shard_id, error = %e, "finalize_shard failed"),
         }
         maybe_finalize_parent(&state, &run_id).await;
+        // The last of this run's shards on this instance closes its log
+        // buffer: SSE readers get `End`, the tail is persisted and the
+        // buffer is dropped after the drain window (#789 SERVE-35).
+        drop(_shard_guard);
+        if !state.registry().has_run_shards(&run_id) {
+            state.log_hub().finish(&run_id);
+            schedule_log_drop(state.clone(), run_id.clone());
+        }
     });
 }
 

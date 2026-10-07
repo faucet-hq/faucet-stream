@@ -504,6 +504,9 @@ pub fn usage_limit(filter: &crate::usage::UsageFilter) -> usize {
     }
 }
 
+/// How many successive keys a run-log line probes before it is dropped.
+pub const SEQ_PROBES: u64 = 16;
+
 /// A `LIMIT` both dialects accept: a 64-bit signed integer (a caller's
 /// `usize::MAX` "no cap" would overflow it).
 pub fn sql_limit(limit: usize) -> i64 {
@@ -3336,15 +3339,29 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin().await.map_err(backend)?;
                 for l in lines {
-                    sqlx::query(&self.stmts.insert_run_log)
-                        .bind(run_id)
-                        .bind(sql::pad_seq(l.seq))
-                        .bind(&l.ts)
-                        .bind(&l.level)
-                        .bind(&l.line)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(backend)?;
+                    // A key another instance already wrote for this run moves
+                    // to the next free one instead of dropping the line. The
+                    // truncation sentinel is written once, as is.
+                    let attempts = if l.seq == $crate::serve::history::RUN_LOG_TRUNCATED_SEQ {
+                        1
+                    } else {
+                        sql::SEQ_PROBES
+                    };
+                    for bump in 0..attempts {
+                        let written = sqlx::query(&self.stmts.insert_run_log)
+                            .bind(run_id)
+                            .bind(sql::pad_seq(l.seq.saturating_add(bump)))
+                            .bind(&l.ts)
+                            .bind(&l.level)
+                            .bind(&l.line)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?
+                            .rows_affected();
+                        if written == 1 {
+                            break;
+                        }
+                    }
                 }
                 tx.commit().await.map_err(backend)?;
                 Ok(())

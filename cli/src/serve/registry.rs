@@ -165,6 +165,12 @@ impl Registry {
         fired
     }
 
+    /// Whether any shard of `run_id` is still registered on this instance.
+    pub fn has_run_shards(&self, run_id: &str) -> bool {
+        let prefix = format!("{run_id}::");
+        self.tokens.iter().any(|e| e.key().starts_with(&prefix))
+    }
+
     /// Fire every live run and shard token. Returns how many were fired.
     pub fn cancel_all(&self) -> usize {
         let mut fired = 0usize;
@@ -227,6 +233,17 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_run_shards_tracks_the_runs_registered_shards() {
+        let r = Registry::new(4);
+        assert!(!r.has_run_shards("run"));
+        r.register_shard("run", "0", CancellationToken::new());
+        assert!(r.has_run_shards("run"));
+        assert!(!r.has_run_shards("ru"));
+        r.deregister_shard("run", "0");
+        assert!(!r.has_run_shards("run"));
+    }
 
     #[test]
     fn cancel_all_fires_every_run_and_shard_token() {
