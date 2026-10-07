@@ -6151,6 +6151,7 @@ matrix:
             .unwrap();
         // Capability passthroughs (csv defaults).
         assert!(!ov.supports_exactly_once());
+        assert!(!ov.consumes_destructively());
         assert_eq!(
             ov.replay_guarantee(),
             faucet_core::ReplayGuarantee::NonDeterministic
@@ -6688,6 +6689,7 @@ mod bind_and_dlq_tests {
         assert_eq!(src.dataset_uri(), uri);
         assert_eq!(src.state_key(), key);
         assert_eq!(src.state_schema(), schema);
+        assert!(!src.consumes_destructively());
         src.set_run_clock(chrono::Utc::now());
         src.set_roundtrip_recorder(Arc::new(
             faucet_core::observability::RoundtripRecorder::new(

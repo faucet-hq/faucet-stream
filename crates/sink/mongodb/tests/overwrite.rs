@@ -234,3 +234,16 @@ async fn overwrite_keeps_the_destination_indexes_and_options() {
     dup.abort_overwrite().await.unwrap();
     assert_eq!(names(&uri, "docs").await, vec!["new"]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_first_run_creates_the_collection() {
+    let (_c, uri) = start_mongo().await;
+    let sink = MongoSink::new(overwrite_config(&uri)).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[serde_json::json!({"_id": 1, "name": "first"})])
+        .await
+        .unwrap();
+    sink.commit_overwrite().await.unwrap();
+    assert_eq!(names(&uri, "docs").await, vec!["first"]);
+    assert!(!collection_exists(&uri, "docs__faucet_ovw").await);
+}

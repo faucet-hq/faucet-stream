@@ -2526,6 +2526,10 @@ mod tests {
                 "queue"
             }
         }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(rt.block_on(Queue.fetch_all()).unwrap().is_empty());
         let (sink, _) = CollectSink::new();
         let err = Topology::builder()
             .source("q", Box::new(Queue))

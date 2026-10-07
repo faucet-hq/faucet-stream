@@ -806,6 +806,37 @@ mod tests {
         assert!(err.to_string().contains("catalog:"), "{err}");
     }
 
+    #[cfg(feature = "source-sqs")]
+    #[tokio::test]
+    async fn plan_live_refuses_a_queue_source_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("q.yaml");
+        std::fs::write(
+            &cfg_path,
+            "version: 1\nname: q\npipeline:\n  source:\n    type: sqs\n    config:\n      queue_url: \"http://127.0.0.1:1/000000000000/orders\"\n      region: us-east-1\n      endpoint_url: \"http://127.0.0.1:1\"\n      credentials: { type: access_key, config: { access_key_id: t, secret_access_key: t } }\n      idle_timeout_secs: 1\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+        )
+        .unwrap();
+        let args = PlanArgs {
+            config: Some(cfg_path),
+            row: None,
+            sample: None,
+            live: true,
+            limit: 10,
+            json: false,
+            diff: false,
+            impact: false,
+            depth: 5,
+            resolve_secrets: false,
+            profile: None,
+            policy: None,
+        };
+        let err = super::run(args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("removes messages") && err.contains("plan --live"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn plan_live_refuses_sources_whose_read_has_side_effects() {
         for kind in PLAN_LIVE_REFUSED_KINDS {

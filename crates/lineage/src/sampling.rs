@@ -869,6 +869,7 @@ mod tests {
         assert!(s.write_batch_is_replay_safe());
         assert!(s.supports_cleanup());
         assert!(s.supports_staged_load());
+        assert_eq!(s.write_batch(&[json!({"id": 1})]).await.unwrap(), 1);
         let seen = faucet_core::SeenKeys::new();
         assert_eq!(
             s.cleanup_scope(&Default::default(), &seen).await.unwrap(),
@@ -1084,6 +1085,7 @@ mod tests {
             .unwrap();
         assert_eq!(bm, Some(json!("bm")));
         assert!(s.supports_exactly_once());
+        assert!(!s.consumes_destructively());
         assert_eq!(
             s.replay_guarantee(),
             faucet_core::ReplayGuarantee::Deterministic

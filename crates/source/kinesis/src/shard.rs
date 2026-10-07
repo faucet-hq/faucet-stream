@@ -169,9 +169,10 @@ pub(crate) async fn run_shard(
             return true;
         };
 
-        let Ok(permit) = permits.acquire().await else {
-            return false;
-        };
+        let permit = permits
+            .acquire()
+            .await
+            .expect("the shard permit semaphore is never closed");
         let response = client
             .get_records()
             .shard_iterator(&current)

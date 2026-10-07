@@ -12,6 +12,7 @@
 //! fire-and-forget (no bookmark) and 4/5 are sink-only.
 
 use faucet_conformance::{assert_config_schema_valid_value, assert_errors_not_panics};
+use faucet_core::Source as _;
 use faucet_source_nats::{NatsSource, NatsSourceConfig};
 
 // ── Check 1: config schema (offline) ────────────────────────────────────────
@@ -36,7 +37,18 @@ async fn conformance_errors_not_panics() {
         .expect("lazy construction succeeds");
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty(&source);
+    assert!(!source.consumes_destructively(), "core NATS acks nothing");
     assert_errors_not_panics(&source).await;
+
+    let mut js = NatsSourceConfig::new("events.>");
+    js.connection.servers = vec!["nats://127.0.0.1:1".into()];
+    js.idle_timeout_secs = Some(1);
+    js.jetstream_stream = Some("EVENTS".into());
+    js.jetstream_consumer = Some("faucet".into());
+    let js = NatsSource::new(js)
+        .await
+        .expect("lazy construction succeeds");
+    assert!(js.consumes_destructively(), "JetStream acks what it reads");
 }
 
 // ── Check 2: bounded-memory streaming (Docker) ───────────────────────────────

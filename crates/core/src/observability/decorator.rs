@@ -1112,6 +1112,7 @@ pub(crate) mod source_tests {
 
         // capability passthroughs: defaults for this inner source…
         assert!(!wrapped.supports_exactly_once());
+        assert!(!wrapped.consumes_destructively());
         assert_eq!(
             wrapped.replay_guarantee(),
             crate::idempotency::ReplayGuarantee::NonDeterministic

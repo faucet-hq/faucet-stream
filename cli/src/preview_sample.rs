@@ -189,14 +189,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_source_that_consumes_destructively_is_refused_before_any_read() {
-        struct Queue;
+        struct Queue(std::sync::atomic::AtomicUsize);
         #[faucet_core::async_trait]
         impl Source for Queue {
             async fn fetch_with_context(
                 &self,
                 _: &HashMap<String, Value>,
             ) -> Result<Vec<Value>, FaucetError> {
-                panic!("a refused preview must not read");
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
             }
             fn consumes_destructively(&self) -> bool {
                 true
@@ -205,10 +206,15 @@ mod tests {
                 "sqs"
             }
         }
-        let err = sample(&Queue, &[], 10, PREVIEW_TIMEOUT).await.unwrap_err();
+        let queue = Queue(Default::default());
+        let err = sample(&queue, &[], 10, PREVIEW_TIMEOUT).await.unwrap_err();
         assert!(
             err.to_string().contains("`sqs` source removes messages"),
             "{err}"
         );
+        let reads = || queue.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads(), 0, "a refused preview must not read");
+        queue.fetch_all().await.unwrap();
+        assert_eq!(reads(), 1);
     }
 }

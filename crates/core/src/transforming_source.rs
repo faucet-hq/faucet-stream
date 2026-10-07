@@ -871,6 +871,7 @@ mod tests {
         // Exactly-once capabilities must survive the transform wrap — the
         // pipeline's mechanism selection reads them through this layer.
         assert!(wrapped.supports_exactly_once());
+        assert!(!wrapped.consumes_destructively());
         assert_eq!(
             wrapped.replay_guarantee(),
             crate::idempotency::ReplayGuarantee::Deterministic

@@ -608,6 +608,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.connector_name(), "rabbitmq");
+        assert!(s.consumes_destructively());
         assert_eq!(s.dataset_uri(), "amqp://127.0.0.1:5672/%2f?queue=orders");
         assert!(s.config_schema().is_object());
     }
