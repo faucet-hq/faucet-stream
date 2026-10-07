@@ -659,7 +659,7 @@ pub struct TemplateTestArgs {
     /// Registry store URL. Omit when the suite's `template:` is a path to a
     /// config file — that form needs no registry, which is what lets a
     /// template be tested before it is ever registered.
-    #[arg(long, env = "FAUCET_TEMPLATE_STORE")]
+    #[arg(long, env = "FAUCET_TEMPLATE_STORE", hide_env_values = true)]
     pub store: Option<String>,
     /// Override the suite's `select:` version selector.
     #[arg(long)]
@@ -688,7 +688,7 @@ pub struct TemplateStoreArgs {
     /// `faucet serve --history` at the same URL to trigger these templates over
     /// HTTP. SQL backends need the matching `serve-history-sqlite` /
     /// `serve-history-postgres` build feature.
-    #[arg(long, env = "FAUCET_TEMPLATE_STORE")]
+    #[arg(long, env = "FAUCET_TEMPLATE_STORE", hide_env_values = true)]
     pub store: String,
     /// Path to a `.env` file to load for `${env:VAR}` interpolation.
     /// Defaults to `.env` in cwd if present.
@@ -1789,7 +1789,7 @@ pub struct ServeArgs {
     #[arg(long, env = "FAUCET_SERVE_LISTEN", default_value = "127.0.0.1:8080")]
     pub listen: String,
     /// Bearer token required on /v1/* requests. Prefer the env var (avoids `ps` leakage).
-    #[arg(long, env = "FAUCET_SERVE_AUTH_TOKEN", conflicts_with = "no_auth")]
+    #[arg(long, env = "FAUCET_SERVE_AUTH_TOKEN", hide_env_values = true, conflicts_with = "no_auth")]
     pub auth_token: Option<String>,
     /// Explicitly disable authentication. Required if no token is set, so an
     /// unauthenticated server is never accidental.
@@ -1810,6 +1810,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "FAUCET_SERVE_READ_TOKEN",
+        hide_env_values = true,
         conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
     )]
     pub read_token: Option<String>,
@@ -1819,6 +1820,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "FAUCET_SERVE_WRITE_TOKEN",
+        hide_env_values = true,
         conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
     )]
     pub write_token: Option<String>,
@@ -1828,6 +1830,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "FAUCET_SERVE_ADMIN_TOKEN",
+        hide_env_values = true,
         conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
     )]
     pub admin_token: Option<String>,
@@ -2050,7 +2053,7 @@ pub struct McpArgs {
     /// `get_template` tools (plus `register_template` / `run_template` with
     /// `--allow-mutations`). Omitted = no template tools are advertised.
     #[cfg(feature = "templates")]
-    #[arg(long, env = "FAUCET_TEMPLATE_STORE")]
+    #[arg(long, env = "FAUCET_TEMPLATE_STORE", hide_env_values = true)]
     pub template_store: Option<String>,
 }
 
