@@ -94,7 +94,7 @@ faucet run pipeline.yaml
 | `type` | `config` | Use when |
 |--------|----------|----------|
 | `key_pair` | `{ user: <string>, private_key_pem: <PEM string> }` | You have an RSA key pair registered on the Snowflake user. The sink mints an RS256 JWT locally (1-hour expiry, public-key SHA-256 fingerprint in the `iss` claim). |
-| `oauth` | `{ token: <string> }` | You have an OAuth2 bearer token from an external IdP. Sent as `Snowflake Token="…"`. |
+| `oauth` | `{ token: <string> }` | You have an OAuth2 bearer token from an external IdP. Sent as `Authorization: Bearer …` with `X-Snowflake-Authorization-Token-Type: OAUTH`. |
 
 ```yaml
 # Key-pair JWT (PEM inlined from disk via the file: directive)
@@ -306,7 +306,7 @@ To drive it end-to-end, pair it with any source via `Pipeline::new(source, sink)
 2. `write_batch()` splits records into `batch_size` chunks (or one chunk when `batch_size = 0`). For each chunk it builds an `INSERT` using `PARSE_JSON(?)` + `FLATTEN` and sends the chunk's JSON array as a **bound `TEXT` parameter**, parsing and inserting every row in one statement without interpolating data into the SQL text.
 3. **Field-to-column mapping:** each record's top-level keys project into matching table columns — `INSERT INTO "db"."schema"."tbl" ("col1","col2") SELECT value:"col1"::string, value:"col2"::string FROM TABLE(FLATTEN(input => PARSE_JSON(?)))`. The `::string` cast strips the VARIANT's JSON quotes so Snowflake coerces each scalar into the destination column's type on insert (text → number / boolean / timestamp, etc.). The column set comes from the **first record**; a key absent from a later record is inserted as `NULL`. Target columns should be **scalar** — a key targeting a `VARIANT`/`OBJECT`/`ARRAY` column is stringified, not stored as structured JSON. Both column identifiers and JSON path keys are quote-escaped, so record keys cannot inject SQL.
 4. The statement targets the fully-qualified `"database"."schema"."table"` with quoted identifiers.
-5. Auth headers are generated per request: an RS256 JWT (1-hour expiry, public-key fingerprint in `iss`) for `key_pair`, or `Snowflake Token="…"` for `oauth`.
+5. Auth headers are generated per request: an RS256 JWT (1-hour expiry, public-key fingerprint in `iss`) for `key_pair`, or `Bearer …` for `oauth`.
 6. Success is confirmed by the `090001` response code; an HTTP 202 enters the [async-execution poll loop](#asynchronous-execution).
 
 ## Lineage dataset URI

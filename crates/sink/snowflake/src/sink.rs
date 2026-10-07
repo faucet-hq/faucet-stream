@@ -935,7 +935,7 @@ mod tests {
         );
         let sink = SnowflakeSink::new(config).unwrap();
         let (header, token_type) = sink.auth_header().await.unwrap();
-        assert_eq!(header, "Snowflake Token=\"my-token\"");
+        assert_eq!(header, "Bearer my-token");
         assert_eq!(token_type, "OAUTH");
     }
 

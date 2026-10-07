@@ -104,7 +104,7 @@ async fn fetch_all_returns_first_partition_when_no_partitions() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v2/statements"))
-        .and(header("Authorization", "Snowflake Token=\"t\""))
+        .and(header("Authorization", "Bearer t"))
         .and(header("X-Snowflake-Authorization-Token-Type", "OAUTH"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": "090001",

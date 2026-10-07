@@ -98,7 +98,7 @@ faucet run pipeline.yaml
 
 | `type` | `config` | Use when |
 |--------|----------|----------|
-| `oauth` | `{ token: <string> }` | You have an OAuth bearer token from Snowflake or an external IdP. Sent as `Authorization: Snowflake Token="..."` with `X-Snowflake-Authorization-Token-Type: OAUTH`. |
+| `oauth` | `{ token: <string> }` | You have an OAuth bearer token from Snowflake or an external IdP. Sent as `Authorization: Bearer ...` with `X-Snowflake-Authorization-Token-Type: OAUTH`. |
 | `key_pair` | `{ user: <string>, private_key_pem: <pem> }` | You authenticate with an RSA key pair registered on the Snowflake user. A fresh RS256 JWT (1-hour expiry) is minted per request and sent as `Authorization: Bearer <jwt>` with `X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT`. |
 
 ### OAuth bearer token
@@ -263,7 +263,7 @@ println!("got {} rows", rows.len());
 ## How it works
 
 1. `new()` builds the reusable HTTPS client and derives the API base URL from `account`.
-2. `POST /api/v2/statements` submits the SQL with `statement_timeout` as the body `timeout`, the session `warehouse` / `database` / `schema` / `role`, and any positional bindings (typed from their JSON values). The `Authorization` header is minted per request — a fresh RS256 JWT for key-pair auth, or the OAuth bearer token wrapped as `Snowflake Token="..."`.
+2. `POST /api/v2/statements` submits the SQL with `statement_timeout` as the body `timeout`, the session `warehouse` / `database` / `schema` / `role`, and any positional bindings (typed from their JSON values). The `Authorization` header is minted per request — a fresh RS256 JWT for key-pair auth, or the OAuth token sent as `Bearer ...`.
 3. If the statement is still running, Snowflake returns `202 Accepted` with a handle; the source polls the handle until the result is ready or `poll_timeout` elapses.
 4. Result partitions are walked via `?partition=N`; each cell is decoded by its column metadata into a typed JSON value (full precision preserved for large `NUMBER`s).
 5. Rows are re-framed into `batch_size` pages and streamed to the pipeline.

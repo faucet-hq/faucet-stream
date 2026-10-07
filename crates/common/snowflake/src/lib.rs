@@ -8,8 +8,8 @@
 //!
 //! - [`SnowflakeAuth`] — JWT key-pair or OAuth bearer authentication.
 //! - [`authorization_header`] — produces the `Authorization` header value the
-//!   Snowflake SQL REST API expects (JWT for `KeyPair`, `Snowflake Token=...`
-//!   for `OAuth`).
+//!   Snowflake SQL REST API expects (`Bearer <jwt>` for `KeyPair`,
+//!   `Bearer <token>` for `OAuth`).
 //! - [`snowflake_token_type`] — the matching `X-Snowflake-Authorization-Token-Type`
 //!   header value (`KEYPAIR_JWT` for `KeyPair`, `OAUTH` for `OAuth`).
 //!
@@ -62,20 +62,20 @@ impl std::fmt::Debug for SnowflakeAuth {
 /// Build the `Authorization` header value for a Snowflake SQL REST API request.
 ///
 /// For `KeyPair`, generates a fresh JWT signed with the configured RSA key
-/// (issuer/subject set to `{ACCOUNT_UPPER}.{USER_UPPER}`, 1-hour expiry) and
-/// wraps it as `Bearer {jwt}`. For `OAuth`, wraps the token as
-/// `Snowflake Token="{token}"`.
+/// (issuer/subject set to `{ACCOUNT}.{USER}`, see [`jwt_account`], 1-hour
+/// expiry) and wraps it as `Bearer {jwt}`. For `OAuth`, wraps the token as
+/// `Bearer {token}` — the SQL API pairs it with
+/// `X-Snowflake-Authorization-Token-Type: OAUTH`.
 ///
 /// `account` is the Snowflake account identifier from the source/sink config
-/// (e.g. `"xy12345.us-east-1"`); only its uppercase form is used in the JWT
-/// claims.
+/// (e.g. `"xy12345.us-east-1"`), the same value that names the host.
 pub fn authorization_header(auth: &SnowflakeAuth, account: &str) -> Result<String, FaucetError> {
     match auth {
         SnowflakeAuth::KeyPair {
             user,
             private_key_pem,
         } => {
-            let account_upper = account.to_uppercase();
+            let account_upper = jwt_account(account);
             let user_upper = user.to_uppercase();
             let qualified_user = format!("{account_upper}.{user_upper}");
 
@@ -108,8 +108,23 @@ pub fn authorization_header(auth: &SnowflakeAuth, account: &str) -> Result<Strin
 
             Ok(format!("Bearer {token}"))
         }
-        SnowflakeAuth::OAuth { token } => Ok(format!("Snowflake Token=\"{token}\"")),
+        SnowflakeAuth::OAuth { token } => Ok(format!("Bearer {token}")),
     }
+}
+
+/// The account part of a key-pair JWT's `iss`/`sub` claims.
+///
+/// Snowflake wants the account locator without its region or cloud suffix
+/// (`xy12345.us-east-1` → `XY12345`), and for a `.global` identifier only the
+/// part before the first hyphen; the organization form (`org-acct`) passes
+/// through. The result is upper-cased.
+pub fn jwt_account(account: &str) -> String {
+    let base = if account.contains(".global") {
+        account.split('-').next().unwrap_or(account)
+    } else {
+        account.split('.').next().unwrap_or(account)
+    };
+    base.to_uppercase()
 }
 
 /// Compute the Snowflake public-key fingerprint (`SHA256:<base64>`) from a
@@ -227,12 +242,37 @@ mod tests {
     }
 
     #[test]
-    fn oauth_authorization_header_uses_snowflake_token_scheme() {
+    fn oauth_authorization_header_uses_bearer_scheme() {
         let auth = SnowflakeAuth::OAuth {
             token: "my-token".into(),
         };
         let header = authorization_header(&auth, "acct").unwrap();
-        assert_eq!(header, "Snowflake Token=\"my-token\"");
+        assert_eq!(header, "Bearer my-token");
+    }
+
+    #[test]
+    fn jwt_account_strips_region_and_global_suffixes() {
+        assert_eq!(jwt_account("xy12345.us-east-1"), "XY12345");
+        assert_eq!(jwt_account("xy12345.us-east-2.aws"), "XY12345");
+        assert_eq!(jwt_account("myorg-myacct"), "MYORG-MYACCT");
+        assert_eq!(jwt_account("xy12345-abcdef.global"), "XY12345");
+        assert_eq!(jwt_account("acct"), "ACCT");
+    }
+
+    #[test]
+    fn key_pair_jwt_claims_use_the_locator_without_region() {
+        use base64::Engine as _;
+        let auth = SnowflakeAuth::KeyPair {
+            user: "u".into(),
+            private_key_pem: TEST_RSA_PKCS8_PEM.into(),
+        };
+        let header = authorization_header(&auth, "xy12345.us-east-1").unwrap();
+        let jwt = header.strip_prefix("Bearer ").unwrap();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(jwt.split('.').nth(1).unwrap())
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(claims["sub"], "XY12345.U");
     }
 
     #[test]
