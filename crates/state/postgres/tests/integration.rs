@@ -166,3 +166,20 @@ async fn list_by_prefix_and_atomic_batch() {
     );
     assert_eq!(store.get("o_x::d").await.unwrap(), None);
 }
+
+/// #789 SQL-165: a value holding U+0000 (an opaque cursor) persists and reads
+/// back unchanged, alone and in a batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn values_containing_nul_round_trip() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStateStore::connect(&url).await.expect("connect");
+    store.ensure_table().await.expect("ensure_table");
+    let v = json!({"cursor": "abc\u{0}def"});
+    store.put("nul", &v).await.expect("put with NUL");
+    assert_eq!(store.get("nul").await.expect("get"), Some(v.clone()));
+    store
+        .put_batch(&[("nul2".into(), v.clone())])
+        .await
+        .expect("batch with NUL");
+    assert_eq!(store.get("nul2").await.expect("get"), Some(v));
+}
