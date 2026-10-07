@@ -31,7 +31,17 @@ again), `skip` acks it with its page and emits nothing, `raw` emits it with the
 payload base64-encoded under `data` and the error under `decode_error`.
 
 At least one of `idle_termination_secs` / `max_messages` **must** be set so a
-batch run terminates (mirrors the Kafka / Kinesis sources).
+batch run terminates (mirrors the Kafka / Kinesis sources). A pull never asks
+for more than the run still needs, so `max_messages` leaves no pulled tail
+leased until its ack deadline; when the idle window closes while a pull is in
+flight, a response that still arrives is nacked for immediate redelivery.
+
+An explicit `emulator_host` points this client at the emulator without
+touching the process environment (other pipelines in the same `faucet serve`
+keep talking to real Pub/Sub); the `PUBSUB_EMULATOR_HOST` variable is still
+honoured when the field is unset. Every RPC has a deadline and the gRPC
+connection sends keepalive pings, so a silently dropped connection fails the
+run instead of hanging it.
 
 ### Credentials
 

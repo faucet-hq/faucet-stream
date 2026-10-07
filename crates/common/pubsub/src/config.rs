@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// snake_case discriminators) — the consistent auth wire shape shared by
 /// every faucet connector:
 /// `{ type: service_account_json_file, config: { path: "/run/secrets/sa.json" } }`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum PubsubCredentials {
     /// Application Default Credentials — honours
@@ -34,6 +34,24 @@ pub enum PubsubCredentials {
     /// bearer tokens — the SDK otherwise tries to fetch ADC tokens at startup
     /// and fails in environments without GCP credentials.
     Anonymous,
+}
+
+/// Never prints an inline service-account key (#789 MSG-89).
+impl std::fmt::Debug for PubsubCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplicationDefault => f.write_str("ApplicationDefault"),
+            Self::ServiceAccountJsonFile { path } => f
+                .debug_struct("ServiceAccountJsonFile")
+                .field("path", path)
+                .finish(),
+            Self::ServiceAccountJsonInline { .. } => f
+                .debug_struct("ServiceAccountJsonInline")
+                .field("json", &"***")
+                .finish(),
+            Self::Anonymous => f.write_str("Anonymous"),
+        }
+    }
 }
 
 /// Connection settings shared by the Pub/Sub source and sink. Flattened into
@@ -61,13 +79,19 @@ pub struct PubsubConnection {
 }
 
 impl PubsubConnection {
-    /// Effective emulator host: the explicit config value, else the
-    /// `PUBSUB_EMULATOR_HOST` environment variable. `None` = real Pub/Sub.
+    /// Effective emulator host: the explicit config value (which wins), else
+    /// the `PUBSUB_EMULATOR_HOST` environment variable. `None` = real Pub/Sub.
     pub fn effective_emulator_host(&self) -> Option<String> {
-        self.emulator_host
-            .clone()
-            .or_else(|| std::env::var("PUBSUB_EMULATOR_HOST").ok())
-            .filter(|h| !h.trim().is_empty())
+        self.explicit_emulator_host().or_else(|| {
+            std::env::var("PUBSUB_EMULATOR_HOST")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+        })
+    }
+
+    /// The configured `emulator_host`, ignoring the environment.
+    pub fn explicit_emulator_host(&self) -> Option<String> {
+        self.emulator_host.clone().filter(|h| !h.trim().is_empty())
     }
 }
 
@@ -75,6 +99,32 @@ impl PubsubConnection {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn debug_never_prints_an_inline_key() {
+        let c = PubsubCredentials::ServiceAccountJsonInline {
+            json: "{\"private_key\":\"SECRET\"}".into(),
+        };
+        let d = format!("{c:?}");
+        assert!(!d.contains("SECRET") && d.contains("***"), "{d}");
+        assert_eq!(format!("{:?}", PubsubCredentials::Anonymous), "Anonymous");
+        assert_eq!(
+            format!("{:?}", PubsubCredentials::ApplicationDefault),
+            "ApplicationDefault"
+        );
+        assert!(
+            format!(
+                "{:?}",
+                PubsubCredentials::ServiceAccountJsonFile { path: "/p".into() }
+            )
+            .contains("/p")
+        );
+        let conn = PubsubConnection {
+            emulator_host: Some(" ".into()),
+            ..Default::default()
+        };
+        assert_eq!(conn.explicit_emulator_host(), None);
+    }
 
     #[test]
     fn credentials_default_is_adc() {

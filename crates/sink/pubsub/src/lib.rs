@@ -11,7 +11,9 @@
 //!
 //! **Delivery is at-least-once** — Pub/Sub provides no primitive that composes
 //! with faucet's exactly-once watermark model, so this sink does not advertise
-//! idempotent writes. De-duplicate downstream on `message_id` if needed.
+//! idempotent writes. De-duplicate downstream on a business key carried in
+//! the payload or an attribute — the server assigns a fresh `message_id` to
+//! every publish, so a re-sent record never shares its id.
 
 mod config;
 mod encode;
