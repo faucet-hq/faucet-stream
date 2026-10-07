@@ -200,6 +200,12 @@ impl Watcher for ObjectArrivalWatcher {
         });
         let fired_at = chrono::Utc::now().to_rfc3339();
         let mut fired = false;
+        // A fire a retry cannot fix (a config that does not load for this
+        // object) is skipped past and reported, so one bad object cannot
+        // stall the prefix (#789 SERVE-21); a transient one stops the poll
+        // and is retried. Either way the poll reports the error, so the
+        // supervisor backs off and marks the watcher unhealthy.
+        let mut problem: Option<String> = None;
 
         match self.mode {
             ArrivalMode::PerObject => {
@@ -215,9 +221,21 @@ impl Watcher for ObjectArrivalWatcher {
                             self.cursor.commit(&o);
                             fired = true;
                         }
-                        FireOutcome::Dropped(_) => break, // backpressure: stop; retry next poll
-                        FireOutcome::Error(_) | FireOutcome::Failed(_) => break,
-                        _ => {}
+                        FireOutcome::Failed(e) => {
+                            tracing::error!(
+                                trigger = self.compiled.name(),
+                                object = %o.key,
+                                error = %e,
+                                "object skipped: its run cannot start"
+                            );
+                            self.cursor.commit(&o);
+                            problem = Some(format!("object '{}' skipped: {e}", o.key));
+                        }
+                        FireOutcome::Error(e) => {
+                            problem = Some(format!("object '{}': {e}", o.key));
+                            break;
+                        }
+                        _ => break, // dropped (backpressure): retry next poll
                     }
                 }
             }
@@ -235,11 +253,27 @@ impl Watcher for ObjectArrivalWatcher {
                         }
                         fired = true;
                     }
-                    _ => {} // dropped/error: cursor unchanged, retry next poll
+                    FireOutcome::Failed(e) => {
+                        tracing::error!(
+                            trigger = self.compiled.name(),
+                            objects = new.len(),
+                            error = %e,
+                            "batch skipped: its run cannot start"
+                        );
+                        for o in &new {
+                            self.cursor.commit(o);
+                        }
+                        problem = Some(format!("batch of {} skipped: {e}", new.len()));
+                    }
+                    FireOutcome::Error(e) => problem = Some(e),
+                    _ => {} // dropped: cursor unchanged, retry next poll
                 }
             }
         }
-        Ok(fired)
+        match problem {
+            Some(e) => Err(e),
+            None => Ok(fired),
+        }
     }
 }
 

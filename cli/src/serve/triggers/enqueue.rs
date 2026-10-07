@@ -130,7 +130,6 @@ pub async fn fire(
                 tracing::warn!(trigger = compiled.name(), tenant = %t, error = %e, "tenant fire failed; retrying");
                 FireOutcome::Error(e)
             }
-            (None, FireOutcome::Failed(e)) => FireOutcome::Error(e),
             (_, other) => other,
         };
         outcomes.push(outcome);

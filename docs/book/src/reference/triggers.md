@@ -125,6 +125,15 @@ string (`size: ${trigger.size}` gives `"42"`). Mapping keys are not substituted.
 its cursor; only keys seen in subsequent polls are treated as new. Set `start_at: beginning` to
 fire for all objects currently in the prefix (use `mode: batch` to coalesce them into one run).
 
+**A fire that cannot start:** when an object's run is refused for a reason a
+retry cannot fix (its substituted config does not load, a policy or validation
+refusal), the object is skipped — the cursor moves past it, an `ERROR` log names
+it — and the objects after it still fire. A transient failure (the queue is
+full, the history store is unreachable) stops the poll and retries the same
+object next time. Either way the poll counts as failed: the watcher backs off,
+`faucet_serve_trigger_errors_total` counts it, and after repeated failures the
+watcher reports `healthy: false` with the `last_error`.
+
 ### `webhook`
 
 Exposes `POST /v1/triggers/{name}` on the `faucet serve` listener. The
@@ -318,7 +327,9 @@ See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-s
 }
 ```
 
-A degraded watcher (crashed and backing off) sets its `healthy` flag to `false`
+A watcher whose client cannot be built at startup (an object-store or queue
+client error) is reported `healthy: false` with the reason in `last_error`
+straight away — it never polls. A degraded watcher (crashed and backing off) sets its `healthy` flag to `false`
 but does **not** flip the top-level `status` to `not_ready` — the server keeps
 accepting runs from the other trigger paths.
 
