@@ -18,6 +18,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// How many volume points a dataset keeps (older ones are pruned on write).
 pub const STATS_RETAIN: usize = 500;
@@ -141,7 +142,7 @@ pub struct RowSnapshot {
 pub struct ConnectorSnapshot {
     pub kind: String,
     /// Resolved config with every secret-sourced value replaced by a stable
-    /// `<secret:sha256:…>` token — no secret material is ever persisted.
+    /// `<secret:hmac:…>` token — no secret material is ever persisted.
     pub config: Value,
 }
 
@@ -322,7 +323,7 @@ pub struct CatalogListFilter {
     /// Case-insensitive substring match on the dataset URI.
     pub q: Option<String>,
     pub limit: usize,
-    /// Dataset id of the last element of the previous page.
+    /// The previous page's `next_cursor` (its last row's `last_seen~id`).
     pub cursor: Option<String>,
 }
 
@@ -388,6 +389,75 @@ pub fn profile_view(mut history: Vec<CatalogProfileRecord>) -> Option<CatalogPro
     history.truncate(PROFILE_DETAIL_LIMIT);
     let latest = history.first()?.clone();
     Some(CatalogProfile { latest, history })
+}
+
+/// What purging one namespace (a tenant's `{tenant}::` pipeline prefix) out
+/// of the catalog removes (#789 SERVE-51).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogPurgePlan {
+    /// `(src_id, dst_id)` of every edge a purged pipeline recorded.
+    pub edges: Vec<(String, String)>,
+    /// Datasets no remaining edge touches: removed with their schema
+    /// timeline, volume points and profiles.
+    pub datasets: Vec<String>,
+    /// Datasets another pipeline still touches whose last-run attribution
+    /// named a purged pipeline: re-attributed to the newest remaining edge as
+    /// `(pipeline, run id)`.
+    pub reattribute: BTreeMap<String, (String, String)>,
+}
+
+/// What a catalog purge removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogPurgeReport {
+    pub datasets: usize,
+    pub edges: usize,
+    pub config_snapshots: usize,
+}
+
+/// Plan the removal of every edge recorded under a pipeline starting with
+/// `prefix`, and of the datasets left without any edge. A dataset another
+/// pipeline still reads or writes is kept (it is shared), re-attributed when
+/// its last writer was purged.
+pub fn plan_purge(
+    edges: &[CatalogLineageEdge],
+    datasets: &BTreeMap<String, (String, String)>,
+    prefix: &str,
+    purged_runs: &std::collections::HashSet<String>,
+) -> CatalogPurgePlan {
+    let (gone, kept): (Vec<&CatalogLineageEdge>, Vec<&CatalogLineageEdge>) =
+        edges.iter().partition(|e| e.pipeline.starts_with(prefix));
+    let mut plan = CatalogPurgePlan {
+        edges: gone
+            .iter()
+            .map(|e| (e.src_id.clone(), e.dst_id.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    let touched: std::collections::BTreeSet<&str> = gone
+        .iter()
+        .flat_map(|e| [e.src_id.as_str(), e.dst_id.as_str()])
+        .collect();
+    for id in touched {
+        let newest = kept
+            .iter()
+            .filter(|e| e.src_id == id || e.dst_id == id)
+            .max_by(|a, b| a.last_seen.cmp(&b.last_seen));
+        match newest {
+            None => plan.datasets.push(id.to_string()),
+            Some(edge) => {
+                let stale = datasets.get(id).is_some_and(|(pipeline, run)| {
+                    pipeline.starts_with(prefix) || purged_runs.contains(run)
+                });
+                if stale {
+                    plan.reattribute.insert(
+                        id.to_string(),
+                        (edge.pipeline.clone(), edge.last_run_id.clone()),
+                    );
+                }
+            }
+        }
+    }
+    plan
 }
 
 /// Stable dataset id: the first 16 hex chars of sha256(uri). Short enough for
@@ -593,9 +663,11 @@ pub fn apply_edge(
     } else {
         source.records
     };
-    if update.column_lineage.is_some() {
-        edge.column_lineage = update.column_lineage.clone();
-    }
+    // The latest run's facet, or none: an opaque run (flatten, explode, a SQL
+    // or WASM transform) means the old field map no longer describes the
+    // edge, and impact analysis must read "unknown", never the stale map
+    // (#789 SERVE-40).
+    edge.column_lineage = update.column_lineage.clone();
     edge
 }
 
@@ -612,14 +684,26 @@ pub fn filter_datasets(
         all.retain(|d| d.uri.to_lowercase().contains(&q));
     }
     all.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then_with(|| b.id.cmp(&a.id)));
-    if let Some(cursor) = &filter.cursor
-        && let Some(pos) = all.iter().position(|d| &d.id == cursor)
-    {
-        all.drain(..=pos);
+    // Keyset paging on the sort key itself (#789 SERVE-50): `last_seen` moves
+    // with every run, so a position in the list is not stable between pages.
+    match filter.cursor.as_deref().map(decode_cursor) {
+        Some(Some((ts, id))) => all.retain(|d| (d.last_seen, d.id.as_str()) < (ts, id.as_str())),
+        Some(None) => {
+            // A pre-keyset cursor (a bare id): position once, and an unknown
+            // one ends the listing instead of restarting it.
+            let cursor = filter.cursor.as_deref().unwrap_or_default();
+            match all.iter().position(|d| d.id == cursor) {
+                Some(pos) => {
+                    all.drain(..=pos);
+                }
+                None => all.clear(),
+            }
+        }
+        None => {}
     }
     let limit = filter.limit.max(1);
     let next_cursor = if all.len() > limit {
-        Some(all[limit - 1].id.clone())
+        Some(encode_cursor(&all[limit - 1]))
     } else {
         None
     };
@@ -628,6 +712,23 @@ pub fn filter_datasets(
         datasets: all,
         next_cursor,
     }
+}
+
+/// The dataset-list cursor: the last row's sort key, `<last_seen>~<id>`.
+pub fn encode_cursor(d: &CatalogDataset) -> String {
+    format!(
+        "{}~{}",
+        d.last_seen
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        d.id
+    )
+}
+
+/// Parse a dataset-list cursor; `None` for anything else (a legacy bare id).
+pub fn decode_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
+    let (ts, id) = cursor.rsplit_once('~')?;
+    let ts = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+    Some((ts, id.to_string()))
 }
 
 /// Slice the edge graph for the lineage read: with no root, return everything;
@@ -850,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_accumulates_and_keeps_last_column_lineage() {
+    fn edge_accumulates_and_takes_the_latest_column_lineage() {
         let mut u = update("a://1", "b://2", 5);
         u.column_lineage = Some(json!({"fields": {"x": {}}}));
         let e = apply_edge(None, &u, &u.sources[0]);
@@ -858,14 +959,15 @@ mod tests {
         assert_eq!(e.last_records, 5);
         assert!(e.column_lineage.is_some());
 
-        // A later opaque run keeps the previous column lineage.
+        // A later opaque run clears it: the old field map no longer holds
+        // (#789 SERVE-40).
         let mut u2 = update("a://1", "b://2", 9);
         u2.run_id = "r2".into();
         let e2 = apply_edge(Some(&e), &u2, &u2.sources[0]);
         assert_eq!(e2.runs, 2);
         assert_eq!(e2.last_records, 9);
         assert_eq!(e2.last_run_id, "r2");
-        assert!(e2.column_lineage.is_some(), "opaque run keeps prior facet");
+        assert!(e2.column_lineage.is_none(), "an opaque run drops the facet");
     }
 
     fn ds(id_uri: &str, kind: &str, last_seen: DateTime<Utc>) -> CatalogDataset {
@@ -943,6 +1045,58 @@ mod tests {
         );
         assert_eq!(page2.datasets.len(), 1);
         assert!(page2.next_cursor.is_none());
+    }
+
+    #[test]
+    fn the_cursor_survives_rows_that_move_between_pages() {
+        let t0 = Utc::now();
+        let mut all = vec![
+            ds("csv://a", "csv", t0),
+            ds("csv://b", "csv", t0 + chrono::Duration::seconds(1)),
+            ds("csv://c", "csv", t0 + chrono::Duration::seconds(2)),
+        ];
+        let page = filter_datasets(
+            all.clone(),
+            &CatalogListFilter {
+                limit: 1,
+                ..Default::default()
+            },
+        );
+        let cursor = page.next_cursor.unwrap();
+        assert!(cursor.contains('~'), "{cursor}");
+        // `b` runs again and jumps to the top; the next page still continues
+        // after `c` instead of repeating or skipping.
+        all[1].last_seen = t0 + chrono::Duration::seconds(5);
+        let next = filter_datasets(
+            all.clone(),
+            &CatalogListFilter {
+                limit: 5,
+                cursor: Some(cursor),
+                ..Default::default()
+            },
+        );
+        let ids: Vec<_> = next.datasets.iter().map(|d| d.id.clone()).collect();
+        assert_eq!(ids, vec![dataset_id("csv://a")]);
+        // A legacy bare-id cursor still positions; an unknown one ends the list.
+        let legacy = filter_datasets(
+            all.clone(),
+            &CatalogListFilter {
+                limit: 5,
+                cursor: Some(all[2].id.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(legacy.datasets.len(), 1);
+        let unknown = filter_datasets(
+            all,
+            &CatalogListFilter {
+                limit: 5,
+                cursor: Some("nope".into()),
+                ..Default::default()
+            },
+        );
+        assert!(unknown.datasets.is_empty());
+        assert!(decode_cursor("2026-01-01T00:00:00Z").is_none());
     }
 
     fn edge(src: &str, dst: &str) -> CatalogLineageEdge {

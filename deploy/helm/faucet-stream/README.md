@@ -104,9 +104,11 @@ serve:
   replicaCount: 2
   auth:
     mode: token           # token | none | rbac
+  cluster:
+    enabled: true
   history:
     backend: postgres     # memory | sqlite | postgres
-    url: postgres://faucet:pass@pg:5432/faucet
+    existingSecret: faucet-history   # key FAUCET_SERVE_HISTORY = postgres://…
 ```
 
 - **Auth**: `token` (bearer; the chart mints a stable random token into a Secret,
@@ -114,7 +116,15 @@ serve:
   externally), or `rbac` (inline `auth.rbacConfig` principals → mounted file).
 - **History**: `memory` (ephemeral), `sqlite` (needs `persistence.enabled` for
   durability), or `postgres` (required for `cluster.enabled` multi-instance
-  failover).
+  failover). The URL reaches the pod as the `FAUCET_SERVE_HISTORY` env var,
+  never on the command line: a postgres `url` is stored in a chart-managed
+  Secret, or point `history.existingSecret` / `history.existingSecretKey` at
+  your own Secret so the password never sits in Helm values.
+- **Replicas**: `replicaCount > 1` or `autoscaling.enabled` is refused at
+  render time unless `history.backend: postgres` and `cluster.enabled: true` —
+  with per-pod history each replica has its own runs and idempotency keys, so
+  a `GET`/cancel lands on the wrong pod and a retried keyed submission can run
+  twice.
 - **Reusable pipeline definition**: set `pipelineConfig` and it's passed as the
   serve `--default-config` — a workspace default merged under every submitted
   run, so clients only POST overrides. (faucet has no HTTP "register template"

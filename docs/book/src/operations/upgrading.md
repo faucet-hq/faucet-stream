@@ -81,6 +81,14 @@ faucet state export orders.yaml -o before-upgrade.json
 faucet state import orders.yaml before-upgrade.json --overwrite --yes
 ```
 
+### The `faucet serve` history database
+
+The run-history database (`--history`) carries a schema version. An upgraded
+server migrates it in place at startup (adding columns, never dropping any);
+an older server pointed at a database a newer one migrated refuses to start
+and names both versions. Take a backup before upgrading a server so a rollback
+has something to restore — see [Backing up the server database](./backup.md).
+
 ## Clusters (`faucet serve --cluster`)
 
 Members of one cluster share the state store, and during a rolling upgrade

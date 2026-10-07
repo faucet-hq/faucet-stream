@@ -149,6 +149,35 @@ pub async fn submit_gated(
     Ok(SubmitOutcome::Accepted(submit(state, req, actor).await?))
 }
 
+/// The 409 message of an idempotency key reused with a different payload.
+pub(crate) const IDEMPOTENCY_CONFLICT: &str = "idempotency key reused with a different payload";
+
+/// Refuse a write that would bypass `--require-approval run` (#789
+/// SERVE-18): verify repair and DLQ replay write to a sink outside the run
+/// queue, so under approval they must be proposed as a `run` change instead.
+pub(crate) fn refuse_unapproved_write(state: &ServerState, what: &str) -> Result<(), ServeError> {
+    if state.requires_approval(crate::serve::changes::ChangeKind::Run) {
+        return Err(ServeError::Forbidden(format!(
+            "this server requires an approved change request for runs (--require-approval run); \
+             {what} writes to the destination, so propose the run through POST /v1/changes \
+             (or use dry_run)"
+        )));
+    }
+    Ok(())
+}
+
+/// A run slot for work that executes inline in the request (verify, DLQ
+/// replay), so it counts against `--max-concurrent-runs` like a queued run.
+pub(crate) fn inline_permit(
+    state: &ServerState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ServeError> {
+    state.semaphore().try_acquire_owned().map_err(|_| {
+        ServeError::TooManyRequests(
+            "every run slot is busy (--max-concurrent-runs); retry when a run finishes".into(),
+        )
+    })
+}
+
 /// Fold a request-level budget (#703) into the config document, so the
 /// stored body (what a cluster peer re-runs) carries it too. The config's own
 /// `budget:` and the request's merge, the stricter of each ceiling winning.
@@ -328,7 +357,35 @@ pub struct SubmitResponse {
 /// execution inputs from the persisted record (re-resolving config with this
 /// instance's own env/credentials), acquires a permit, and runs the shared tail.
 pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
+    resume_claimed(state, rec, None);
+}
+
+/// [`resume_claimed_run`] with the run slot the claim loop already took, so a
+/// claimed run never waits on (or is over-claimed past) the semaphore
+/// (#789 SERVE-46).
+pub fn resume_claimed_run_with_permit(
+    state: ServerState,
+    rec: RunRecord,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    resume_claimed(state, rec, Some(permit));
+}
+
+fn resume_claimed(
+    state: ServerState,
+    rec: RunRecord,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) {
+    // In flight from the moment it is claimed, so a shutdown drain waits for
+    // it while it is still loading its config (#789 SERVE-48).
+    state.registry().mark_running_unqueued();
+    metrics::set_run_gauges(&state);
+    let guard = InFlightGuard {
+        state: state.clone(),
+        run_id: rec.run_id.clone(),
+    };
     tokio::spawn(async move {
+        let guard = guard;
         let run_id = rec.run_id.clone();
         let Some(body) = rec.config_body.as_deref() else {
             tracing::error!(run_id, "claimed run has no stored config; failing it");
@@ -403,13 +460,14 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             }
         }
 
-        // The claim loop only claims up to available_permits and is the sole
-        // permit consumer, so this acquire returns immediately.
-        let _permit = state
-            .semaphore()
-            .acquire_owned()
-            .await
-            .expect("semaphore not closed");
+        let _permit = match permit {
+            Some(p) => p,
+            None => state
+                .semaphore()
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed"),
+        };
         // Register a local cancel token so a cross-instance cancel (the claim loop
         // calling registry.cancel) reaches this run.
         let run_token = CancellationToken::new();
@@ -423,7 +481,7 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             rec.timeout_secs,
             rec.clock.clone(),
             rec.concurrency,
-            false,
+            Some(guard),
         )
         .await;
     });
@@ -634,6 +692,14 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             Err(e) => tracing::error!(run_id, shard_id, error = %e, "finalize_shard failed"),
         }
         maybe_finalize_parent(&state, &run_id).await;
+        // The last of this run's shards on this instance closes its log
+        // buffer: SSE readers get `End`, the tail is persisted and the
+        // buffer is dropped after the drain window (#789 SERVE-35).
+        drop(_shard_guard);
+        if !state.registry().has_run_shards(&run_id) {
+            state.log_hub().finish(&run_id);
+            schedule_log_drop(state.clone(), run_id.clone());
+        }
     });
 }
 
@@ -775,29 +841,23 @@ async fn execute_shard(
             // Fired by the claim loop for a remote cancel. Flush within the grace
             // window; a cooperative cancel returns Ok(partial), so the shard is
             // Cancelled — but a flush that FAILS must surface, not be masked.
-            match tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await {
-                Ok(failed @ Terminal::Failed { .. }) => failed,
-                Ok(_) | Err(_) => Terminal::Cancelled,
-            }
+            Terminal::cancelled()
+                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
         _ = server_shutdown.cancelled() => {
             coop.cancel();
-            match tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await {
-                Ok(failed @ Terminal::Failed { .. }) => failed,
-                Ok(_) | Err(_) => Terminal::ShutdownFailed,
-            }
+            Terminal::shutdown_failed()
+                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
         _ = &mut timeout_fut => {
             coop.cancel();
-            match tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await {
-                Ok(failed @ Terminal::Failed { .. }) => failed,
-                Ok(_) | Err(_) => Terminal::Timeout { secs: timeout_secs.unwrap_or(0) },
-            }
+            Terminal::timeout(timeout_secs.unwrap_or(0))
+                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
     };
     match terminal {
         Terminal::Completed { .. } => ShardOutcome::Completed,
-        Terminal::Cancelled => ShardOutcome::Cancelled,
+        Terminal::Cancelled { .. } => ShardOutcome::Cancelled,
         _ => ShardOutcome::Failed,
     }
 }
@@ -937,12 +997,16 @@ pub async fn submit(
     req: SubmitRequest,
     actor: AuthContext,
 ) -> Result<SubmitResponse, ServeError> {
+    // A draining server takes no new work (#789 SERVE-25).
+    if state.is_draining() {
+        return Err(ServeError::Draining);
+    }
     // `0` is rejected rather than clamped: under the house sentinel it reads as
     // "unlimited", but here it would mean "no connections" — far enough apart
     // that guessing either way would be wrong (#610).
     if req.concurrency == Some(0) {
         return Err(ServeError::Unprocessable {
-            message: "concurrency must be greater than 0 — it is a connection/fetch count,                       not a `0 = unlimited` sentinel"
+            message: "concurrency must be greater than 0 — it is a connection/fetch count, not a `0 = unlimited` sentinel"
                 .into(),
             details: None,
         });
@@ -1062,9 +1126,7 @@ pub async fn submit(
                 return replay_response(&state, &actor, &existing).await;
             }
             Claim::Conflict => {
-                return Err(ServeError::Conflict(
-                    "idempotency key reused with a different payload".into(),
-                ));
+                return Err(ServeError::Conflict(IDEMPOTENCY_CONFLICT.into()));
             }
         }
         // A `Fresh` claim is recorded BEFORE the record upsert below. The memory
@@ -1117,6 +1179,12 @@ pub async fn submit(
         rec.timeout_secs = req.timeout_secs;
         rec.clock = req.clock.clone();
         rec.concurrency = req.concurrency;
+        // The tenant link goes first (#789 SERVE-29): once the record exists
+        // a peer may claim and run it, so nothing may fail after that.
+        if let Err(e) = link_tenant_run(&state, &rec).await {
+            release_orphaned_claim(&state, &req, &run_id).await;
+            return Err(e);
+        }
         if let Err(e) = state.history().upsert(&rec).await {
             // The record write that should follow a `Fresh` claim failed — release
             // the orphaned claim so a replay starts fresh instead of 404-ing for
@@ -1124,7 +1192,22 @@ pub async fn submit(
             release_orphaned_claim(&state, &req, &run_id).await;
             return Err(ServeError::Internal(e.to_string()));
         }
-        link_tenant_run(&state, &rec).await?;
+        // The admission lock is per instance, so two instances can both have
+        // admitted the last slot: re-count with the record in place and back
+        // out (#789 SERVE-43). Racing submitters may both back out — the safe
+        // direction; either retries.
+        #[cfg(feature = "tenants")]
+        if let Some(t) = rec.tenant.as_deref()
+            && let Some(msg) = crate::serve::tenants::over_limit(&state, t).await?
+            && state
+                .history()
+                .cancel_pending(&run_id)
+                .await
+                .unwrap_or(false)
+        {
+            release_orphaned_claim(&state, &req, &run_id).await;
+            return Err(ServeError::TooManyRequests(msg));
+        }
         // Release the local queue reservation (cluster runs are bounded by the
         // claim loop + semaphore, not the submit-side queue).
         drop(reservation);
@@ -1145,12 +1228,15 @@ pub async fn submit(
         });
     }
 
+    if let Err(e) = link_tenant_run(&state, &rec).await {
+        release_orphaned_claim(&state, &req, &run_id).await;
+        return Err(e);
+    }
     if let Err(e) = state.history().upsert(&rec).await {
         // See the cluster path above: release the orphaned claim (F21).
         release_orphaned_claim(&state, &req, &run_id).await;
         return Err(ServeError::Internal(e.to_string()));
     }
-    link_tenant_run(&state, &rec).await?;
 
     let run_token = CancellationToken::new();
     state.registry().register(run_id.clone(), run_token.clone());
@@ -1315,9 +1401,7 @@ async fn replay_response(
         .map_err(|e| ServeError::Internal(e.to_string()))?
         .ok_or(ServeError::NotFound)?;
     if !actor.sees_tenant(rec.tenant.as_deref()) {
-        return Err(ServeError::Conflict(
-            "idempotency key reused with a different payload".into(),
-        ));
+        return Err(ServeError::Conflict(IDEMPOTENCY_CONFLICT.into()));
     }
     Ok(SubmitResponse {
         run_id: rec.run_id,
@@ -1410,14 +1494,78 @@ enum Terminal {
         records: u64,
         invs: Vec<InvocationRecord>,
     },
+    /// The interrupted variants keep what the pipeline wrote before it
+    /// stopped (#789 SERVE-28): rows landed even though the run did not finish.
     Timeout {
         secs: u64,
+        records: u64,
+        invs: Vec<InvocationRecord>,
     },
-    Cancelled,
-    ShutdownFailed,
+    Cancelled {
+        records: u64,
+        invs: Vec<InvocationRecord>,
+    },
+    ShutdownFailed {
+        records: u64,
+        invs: Vec<InvocationRecord>,
+    },
 }
 
 impl Terminal {
+    fn cancelled() -> Self {
+        Terminal::Cancelled {
+            records: 0,
+            invs: Vec::new(),
+        }
+    }
+
+    fn shutdown_failed() -> Self {
+        Terminal::ShutdownFailed {
+            records: 0,
+            invs: Vec::new(),
+        }
+    }
+
+    fn timeout(secs: u64) -> Self {
+        Terminal::Timeout {
+            secs,
+            records: 0,
+            invs: Vec::new(),
+        }
+    }
+
+    /// An interrupted run's terminal state, carrying what the pipeline wrote
+    /// before it stopped at a page boundary.
+    fn with_partial(self, written: u64, done: Vec<InvocationRecord>) -> Self {
+        match self {
+            Terminal::Timeout { secs, .. } => Terminal::Timeout {
+                secs,
+                records: written,
+                invs: done,
+            },
+            Terminal::Cancelled { .. } => Terminal::Cancelled {
+                records: written,
+                invs: done,
+            },
+            Terminal::ShutdownFailed { .. } => Terminal::ShutdownFailed {
+                records: written,
+                invs: done,
+            },
+            other => other,
+        }
+    }
+
+    /// After a cancel trigger: a flush failure surfaces as itself, a
+    /// cooperative stop keeps its partial counts under the trigger's status,
+    /// and a run that never answered within the grace keeps nothing.
+    fn after_interrupt(self, finished: Option<Terminal>) -> Self {
+        match finished {
+            Some(failed @ Terminal::Failed { .. }) => failed,
+            Some(Terminal::Completed { records, invs }) => self.with_partial(records, invs),
+            _ => self,
+        }
+    }
+
     /// (status, metric reason label, records, invocations, error message)
     fn into_parts(
         self,
@@ -1437,19 +1585,25 @@ impl Terminal {
                 records,
                 invs,
             } => (RunStatus::Failed, "error", records, invs, Some(reason)),
-            Terminal::Timeout { secs } => (
+            Terminal::Timeout {
+                secs,
+                records,
+                invs,
+            } => (
                 RunStatus::Failed,
                 "timeout",
-                0,
-                Vec::new(),
+                records,
+                invs,
                 Some(format!("run exceeded timeout_secs ({secs}s)")),
             ),
-            Terminal::Cancelled => (RunStatus::Cancelled, "cancelled", 0, Vec::new(), None),
-            Terminal::ShutdownFailed => (
+            Terminal::Cancelled { records, invs } => {
+                (RunStatus::Cancelled, "cancelled", records, invs, None)
+            }
+            Terminal::ShutdownFailed { records, invs } => (
                 RunStatus::Failed,
                 "server_shutdown",
-                0,
-                Vec::new(),
+                records,
+                invs,
                 Some("server shutdown before the run finished".into()),
             ),
         }
@@ -1564,11 +1718,12 @@ fn spawn_run(
         let _permit = tokio::select! {
             biased;
             _ = run_token.cancelled() => {
-                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::Cancelled).await;
+                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::cancelled()).await;
                 return;
             }
             _ = server_shutdown.cancelled() => {
-                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::ShutdownFailed).await;
+                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::shutdown_failed())
+                    .await;
                 return;
             }
             permit = state.semaphore().acquire_owned() => permit.expect("semaphore not closed"),
@@ -1582,7 +1737,7 @@ fn spawn_run(
             req.timeout_secs,
             req.clock,
             req.concurrency,
-            true,
+            None,
         )
         .await;
         // `_permit` drops here.
@@ -1604,26 +1759,29 @@ async fn execute_run(
     timeout_secs: Option<u64>,
     clock_flag: Option<String>,
     concurrency: Option<usize>,
-    from_queue: bool,
+    claimed: Option<InFlightGuard>,
 ) {
     let server_shutdown = state.shutdown_token();
     let auth_result = loaded.auth_catalog();
     let LoadedSubmission { cfg, nodes, tenant } = loaded;
     let state_scope = tenant.as_ref().map(|t| t.state_scope()).unwrap_or_default();
+    #[cfg(feature = "catalog")]
+    let catalog_tenant = tenant.as_ref().map(|t| t.values.id.clone());
     let budget = run_budget(&cfg, tenant.as_deref());
 
     // Queued → running. From here the guard guarantees `mark_finished` (and a
     // gauge refresh) on EVERY exit, including early returns and panics.
     // A submit-path run consumed a local queue slot (Queued→Running); a cluster
     // claim-path run never did (#228) — only bump in_flight for it.
-    if from_queue {
-        state.registry().mark_running();
-    } else {
-        state.registry().mark_running_unqueued();
-    }
-    let _guard = InFlightGuard {
-        state: state.clone(),
-        run_id: run_id.clone(),
+    let _guard = match claimed {
+        Some(g) => g,
+        None => {
+            state.registry().mark_running();
+            InFlightGuard {
+                state: state.clone(),
+                run_id: run_id.clone(),
+            }
+        }
     };
     let started = Utc::now();
     if let Ok(Some(mut rec)) = state.history().get(&run_id).await {
@@ -1781,6 +1939,7 @@ async fn execute_run(
             run_id: Some(run_id.clone()),
             sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
             annotations: Vec::new(),
+            tenant: catalog_tenant.clone(),
         }),
         usage,
         budget,
@@ -1800,6 +1959,7 @@ async fn execute_run(
             run_id: Some(run_id.clone()),
             sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
             annotations: Vec::new(),
+            tenant: catalog_tenant.clone(),
         },
         cfg.name.clone().unwrap_or_else(|| "serve".to_string()),
         crate::catalog::snapshot::on_error_str(&cfg.execution).to_string(),
@@ -1876,6 +2036,7 @@ async fn execute_run(
         _ = &mut timeout_fut => Trigger::Timeout(timeout_secs.unwrap_or(0)),
     };
 
+    let shutting_down = matches!(trigger, Trigger::Shutdown);
     let terminal = match trigger {
         Trigger::Done(t) => t,
         triggered => {
@@ -1885,9 +2046,9 @@ async fn execute_run(
             // genuinely stuck mid-write) so a hung run can't wedge shutdown.
             coop.cancel();
             let trigger_terminal = match triggered {
-                Trigger::Cancel => Terminal::Cancelled,
-                Trigger::Shutdown => Terminal::ShutdownFailed,
-                Trigger::Timeout(secs) => Terminal::Timeout { secs },
+                Trigger::Cancel => Terminal::cancelled(),
+                Trigger::Shutdown => Terminal::shutdown_failed(),
+                Trigger::Timeout(secs) => Terminal::timeout(secs),
                 Trigger::Done(_) => unreachable!("matched in the outer arm"),
             };
             // A cooperative cancel makes `run_stream` flush and return Ok(partial),
@@ -1895,19 +2056,49 @@ async fn execute_run(
             // correct status for that path. But if the flush itself FAILS within
             // the grace window, surface that real failure — never mask it behind
             // the trigger label, which would hide a data error / partial write.
-            match tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await {
-                Ok(failed @ Terminal::Failed { .. }) => failed,
-                Ok(_) | Err(_) => trigger_terminal,
-            }
+            trigger_terminal
+                .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
     };
 
+    // A clustered instance shutting down hands an unfinished run back to the
+    // cluster rather than failing it (#789 SERVE-25): a peer claims it and
+    // resumes from its bookmark (at-least-once, as any failover is).
+    if shutting_down
+        && state.cluster().enabled()
+        && matches!(terminal, Terminal::ShutdownFailed { .. })
+        && release_for_peer(&state, &run_id).await
+    {
+        state.log_hub().finish(&run_id);
+        schedule_log_drop(state.clone(), run_id.clone());
+        return;
+    }
     finalize(&state, &run_id, started, terminal).await;
     // Signal `/logs` readers the run is done, then drop the buffer after a
     // drain window so a late fetcher can still replay it (spec §12).
     state.log_hub().finish(&run_id);
     schedule_log_drop(state.clone(), run_id.clone());
     // `_guard` drops here → mark_finished + gauge refresh.
+}
+
+/// Requeue a run this instance owns as `pending` for a peer. `false` when it
+/// could not be released (the caller then fails it as before).
+async fn release_for_peer(state: &ServerState, run_id: &str) -> bool {
+    let rec = match state.history().get(run_id).await {
+        Ok(Some(r)) => r,
+        _ => return false,
+    };
+    match state.history().release_owned(&rec).await {
+        Ok(true) => {
+            tracing::info!(%run_id, "shutdown: run handed back to the cluster as pending");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::warn!(%run_id, error = %e, "shutdown: could not requeue the run");
+            false
+        }
+    }
 }
 
 /// Write the authoritative terminal record + the run-finished metric.
@@ -2098,8 +2289,134 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_runs_keep_what_they_wrote() {
+        let inv: InvocationRecord = serde_json::from_value(serde_json::json!({
+            "row_id": "r", "parent_record_key": null, "records_written": 7, "error": null
+        }))
+        .unwrap();
+        let done = || Terminal::Completed {
+            records: 7,
+            invs: vec![inv.clone()],
+        };
+        for (t, status) in [
+            (Terminal::cancelled(), RunStatus::Cancelled),
+            (Terminal::shutdown_failed(), RunStatus::Failed),
+            (Terminal::timeout(3), RunStatus::Failed),
+        ] {
+            let (s, _, records, invs, _) = t.after_interrupt(Some(done())).into_parts();
+            assert_eq!((s, records, invs.len()), (status, 7, 1));
+        }
+        let (_, _, records, _, _) = Terminal::cancelled().after_interrupt(None).into_parts();
+        assert_eq!(records, 0, "a run that never answered keeps nothing");
+        let failed = Terminal::Failed {
+            reason: "flush".into(),
+            records: 1,
+            invs: Vec::new(),
+        };
+        let (s, reason, ..) = Terminal::cancelled()
+            .after_interrupt(Some(failed))
+            .into_parts();
+        assert_eq!((s, reason), (RunStatus::Failed, "error"));
+        let (_, _, records, ..) = done().with_partial(1, Vec::new()).into_parts();
+        assert_eq!(records, 7, "only interrupted variants take partial counts");
+    }
+
+    #[tokio::test]
+    async fn a_draining_server_refuses_submissions() {
+        let state = crate::serve::test_support::test_state();
+        assert!(!state.is_draining());
+        state.set_draining();
+        let req: SubmitRequest =
+            serde_json::from_value(serde_json::json!({ "config": "version: 1\n" })).unwrap();
+        let err = submit(state, req, AuthContext::system("t"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Draining), "{err:?}");
+    }
+
+    async fn wait_terminal(state: &ServerState, run_id: &str) -> RunRecord {
+        for _ in 0..200 {
+            if let Some(r) = state.history().get(run_id).await.unwrap()
+                && r.status.is_terminal()
+            {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("run {run_id} never finished");
+    }
+
+    #[tokio::test]
+    async fn an_inline_action_is_refused_while_every_run_slot_is_busy() {
+        let state = crate::serve::test_support::test_state();
+        let held = state.semaphore().acquire_many_owned(4).await.unwrap();
+        assert!(matches!(
+            inline_permit(&state),
+            Err(ServeError::TooManyRequests(_))
+        ));
+        drop(held);
+        assert!(inline_permit(&state).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_queued_run_is_failed_by_a_shutdown_before_it_starts() {
+        let state = crate::serve::test_support::test_state();
+        let _held = state.semaphore().acquire_many_owned(4).await.unwrap();
+        let req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": "version: 1\npipeline:\n  source: { type: csv, config: { path: x.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n"
+        }))
+        .unwrap();
+        let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        state.shutdown_token().cancel();
+        let rec = wait_terminal(&state, &resp.run_id).await;
+        assert_eq!(rec.status, RunStatus::Failed, "{rec:?}");
+    }
+
+    #[cfg(feature = "source-webhook")]
+    #[tokio::test]
+    async fn a_clustered_run_the_store_cannot_hand_back_is_failed_at_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state_clustered();
+        let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+        rec.status = RunStatus::Running;
+        rec.config_body = Some(format!(
+            "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+            dir.path().join("out.jsonl").display()
+        ));
+        state.history().upsert(&rec).await.unwrap();
+        resume_claimed_run(state.clone(), rec);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        state.shutdown_token().cancel();
+        let rec = wait_terminal(&state, "r").await;
+        assert_eq!(rec.status, RunStatus::Failed, "{rec:?}");
+    }
+
+    #[cfg(feature = "source-webhook")]
+    #[tokio::test]
+    async fn a_run_that_outlives_its_timeout_is_stopped_and_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": format!(
+                "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                dir.path().join("out.jsonl").display()
+            ),
+            "timeout_secs": 1,
+        }))
+        .unwrap();
+        let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
+        let rec = wait_terminal(&state, &resp.run_id).await;
+        assert_eq!(rec.status, RunStatus::Failed, "{rec:?}");
+        assert!(
+            rec.error.as_deref().unwrap_or_default().contains("1s"),
+            "{rec:?}"
+        );
+    }
+
+    #[test]
     fn timeout_maps_to_failed_with_timeout_reason() {
-        let (status, reason, _, _, error) = Terminal::Timeout { secs: 30 }.into_parts();
+        let (status, reason, _, _, error) = Terminal::timeout(30).into_parts();
         assert_eq!(status, RunStatus::Failed);
         assert_eq!(reason, "timeout");
         assert!(error.unwrap().contains("30s"));
@@ -2528,6 +2845,13 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         async fn sqlite_state(dir: &std::path::Path) -> ServerState {
+            sqlite_state_with(dir, crate::serve::cluster::ClusterConfig::disabled()).await
+        }
+
+        async fn sqlite_state_with(
+            dir: &std::path::Path,
+            cluster: crate::serve::cluster::ClusterConfig,
+        ) -> ServerState {
             let url = format!("sqlite://{}/h.db", dir.display());
             let history = Arc::new(
                 SqliteHistory::connect(
@@ -2563,7 +2887,7 @@ mod tests {
                 no_env_file: false,
                 log_level: "info".into(),
                 ui_enabled: true,
-                cluster: crate::serve::cluster::ClusterConfig::disabled(),
+                cluster,
                 triggers_path: None,
                 templates_sync_path: None,
                 policy_path: None,
@@ -2923,6 +3247,98 @@ mod tests {
             }
             assert_eq!(status, RunStatus::Completed, "shard ran → parent completed");
             assert!(output.exists(), "shard wrote its output");
+        }
+
+        #[cfg(feature = "source-webhook")]
+        fn waiting_yaml(dir: &std::path::Path) -> String {
+            format!(
+                "version: 1\npipeline:\n  \
+                 source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  \
+                 sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                dir.join("out.jsonl").display()
+            )
+        }
+
+        #[cfg(feature = "source-webhook")]
+        #[tokio::test]
+        async fn a_shard_stops_cleanly_on_a_remote_cancel_a_timeout_or_a_shutdown() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = sqlite_state(dir.path()).await;
+            let yaml = waiting_yaml(dir.path());
+            let run = |coop: CancellationToken, timeout: Option<u64>| {
+                let state = state.clone();
+                let yaml = yaml.clone();
+                async move {
+                    execute_shard(
+                        &state,
+                        loaded(&yaml).await,
+                        "r",
+                        "0",
+                        ShardSpec::whole(),
+                        coop,
+                        timeout,
+                        None,
+                        None,
+                        Utc::now(),
+                    )
+                    .await
+                }
+            };
+            let coop = CancellationToken::new();
+            let fire = coop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                fire.cancel();
+            });
+            assert_ne!(run(coop, None).await, ShardOutcome::Failed);
+            assert_eq!(
+                run(CancellationToken::new(), Some(1)).await,
+                ShardOutcome::Failed
+            );
+            let shutdown = state.shutdown_token();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                shutdown.cancel();
+            });
+            assert_eq!(
+                run(CancellationToken::new(), None).await,
+                ShardOutcome::Failed
+            );
+        }
+
+        #[cfg(feature = "source-webhook")]
+        #[tokio::test]
+        async fn a_clustered_shutdown_hands_a_claimed_run_back_as_pending() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cluster = crate::serve::cluster::ClusterConfig::disabled();
+            cluster.enabled = true;
+            let state = sqlite_state_with(dir.path(), cluster).await;
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Pending;
+            rec.config_body = Some(waiting_yaml(dir.path()));
+            state.history().upsert(&rec).await.unwrap();
+            let claimed = state.history().claim_pending(1).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            resume_claimed_run(state.clone(), claimed.into_iter().next().unwrap());
+            let mut status = RunStatus::Pending;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                status = state.history().get("r").await.unwrap().unwrap().status;
+                if status == RunStatus::Running {
+                    break;
+                }
+            }
+            assert_eq!(status, RunStatus::Running);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            state.shutdown_token().cancel();
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                status = state.history().get("r").await.unwrap().unwrap().status;
+                if status == RunStatus::Pending {
+                    break;
+                }
+            }
+            assert_eq!(status, RunStatus::Pending, "handed back to the cluster");
         }
 
         #[tokio::test]

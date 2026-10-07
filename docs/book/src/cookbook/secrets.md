@@ -173,7 +173,8 @@ pipeline:
 ## The `#field` JSON extractor
 
 Both Vault and AWS Secrets Manager support storing multiple values as a JSON
-object inside one secret. The `#field` selector lets you extract a single key:
+object inside one secret. The `#field` selector lets you extract a single key
+(GCP Secret Manager and Azure Key Vault references refuse `#`):
 
 ```yaml
 # Secret at prod/db contains: {"host": "db.example.com", "password": "s3cr3t"}
@@ -269,9 +270,13 @@ boundary. In particular:
 ## Secrets in the `auth:` catalog and `vars:` block
 
 Secret directives are resolved **everywhere** config interpolation runs:
-connector configs, transforms, state, dlq, matrix rows, the
-`replication.snapshot.source` config, the top-level **`auth:`**
-shared-provider catalog, and the top-level **`vars:`** block.
+connector configs (including topology `nodes`, the mirror snapshot source and
+table overrides, and the `verify` / `reconcile` read-back connectors),
+transforms, state, dlq, matrix rows, `pipeline.masking`, `lineage`,
+`notifications`, `catalog`, `observability`, the top-level **`auth:`**
+shared-provider catalog, and the top-level **`vars:`** block. A secret
+directive anywhere else fails the load, rather than reaching a consumer as the
+literal `${vault:…}` text.
 
 Putting a secret in the shared `auth:` catalog is often the cleanest option — a
 single bearer token resolved once and shared across every matrix row that

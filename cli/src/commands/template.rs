@@ -591,6 +591,7 @@ async fn promote(args: TemplatePromoteArgs) -> CliResult<()> {
 /// How to use a just-registered template: only a pipeline or a source
 /// template is triggered directly; a sink or a deployment joins a source's run.
 fn trigger_hint(kind: crate::hub::TemplateKind, id: &str, store: &str, params: &str) -> String {
+    let store = faucet_core::redact_uri_credentials(store);
     use crate::hub::TemplateKind::*;
     match kind {
         Pipeline => format!("trigger it with:\n  faucet template run {id} --store {store}{params}"),
@@ -683,12 +684,13 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     let doc: serde_json::Value = serde_json::from_str(&materialized.body)
         .map_err(|e| CliError::Internal(format!("re-parsing materialized template: {e}")))?;
     let mut cfg = crate::config::PipelineConfig::from_value(doc)?;
-    crate::secrets::resolve_secrets(&mut cfg).await?;
-
     if args.dry_run && args.common.json {
-        println!("{}", to_pretty(&cfg)?);
+        // Secret-manager directives stay unresolved, and any value bound from
+        // the environment or a secret param is masked.
+        println!("{}", crate::secrets::registry::redact(&to_pretty(&cfg)?));
         return Ok(());
     }
+    crate::secrets::resolve_secrets(&mut cfg).await?;
 
     // Run through the identical path as `faucet run`, so observability,
     // lineage, notifications, the catalog, SLA evaluation, and row selection all
@@ -737,6 +739,7 @@ async fn rows(args: crate::cli::TemplateRowsArgs) -> CliResult<()> {
             overlay: overlay_choice(args.overlay.as_deref(), &args.overlay_version)?,
             selection: selection.as_ref(),
             state: !args.no_state,
+            tenant: None,
         },
     )
     .await?;
@@ -1114,6 +1117,18 @@ pipeline:
         .unwrap_err()
         .to_string();
         assert!(err.contains("not-registered"), "{err}");
+    }
+
+    #[test]
+    fn the_register_hint_never_prints_store_credentials() {
+        let hint = trigger_hint(
+            crate::hub::TemplateKind::Pipeline,
+            "p",
+            "postgres://faucet:hunter2pw@db/templates",
+            "",
+        );
+        assert!(!hint.contains("hunter2pw"), "{hint}");
+        assert!(hint.contains("postgres://db/templates"), "{hint}");
     }
 
     #[test]

@@ -102,7 +102,8 @@ triggers:
 ```
 
 The `dedupe_header` field is optional but strongly recommended for external
-callers. When set, the named header's value becomes the idempotency key —
+callers. When set, the named header's value becomes the idempotency key
+(as `trig:<trigger-name>:<value>`, so two triggers receiving one event id both run) —
 if the caller retries with the same key, they get back the original run_id
 rather than a new run.
 

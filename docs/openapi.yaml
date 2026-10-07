@@ -2438,9 +2438,10 @@ paths:
     get:
       summary: Readiness probe (unauthenticated)
       description: >
-        503 when the history backend is degraded or the run queue is full.
-        Always returns a JSON body with `status`, `history_ok`, `queue_ok`, and
-        a `cluster` object (`enabled` bool + `instances` live-member count).
+        503 when the history backend is degraded, the run queue is full, or the
+        server is shutting down (`draining`). Always returns a JSON body with
+        `status`, `history_ok`, `queue_ok`, `draining`, and a `cluster` object
+        (`enabled` bool + `instances` live-member count).
       operationId: readyz
       security: []
       responses:
@@ -2454,6 +2455,7 @@ paths:
                   status: { type: string, example: ready }
                   history_ok: { type: boolean }
                   queue_ok: { type: boolean }
+                  draining: { type: boolean, description: "true once shutdown began; new work is refused." }
                   cluster:
                     type: object
                     properties:
@@ -2477,6 +2479,7 @@ paths:
                   status: { type: string, example: not_ready }
                   history_ok: { type: boolean }
                   queue_ok: { type: boolean }
+                  draining: { type: boolean }
                   cluster:
                     type: object
                     properties:
@@ -2558,12 +2561,15 @@ components:
         active_runs: { type: integer }
     TenantDeleteReport:
       type: object
-      required: [runs, usage_records, change_requests, state_keys_deleted]
+      required: [runs, usage_records, change_requests, state_keys_deleted, catalog_datasets, catalog_edges, catalog_config_snapshots]
       properties:
         runs: { type: integer }
         usage_records: { type: integer }
         change_requests: { type: integer }
         state_keys_deleted: { type: integer }
+        catalog_datasets: { type: integer, description: "Catalog datasets only this tenant's runs touched." }
+        catalog_edges: { type: integer, description: "Catalog lineage edges this tenant's runs recorded." }
+        catalog_config_snapshots: { type: integer }
         state_keys_not_deleted: { type: array, items: { type: string }, description: "Keys left in place, with why." }
     FanoutResponse:
       type: object
@@ -2828,10 +2834,11 @@ components:
         role: { type: string, enum: [viewer, operator, admin] }
         action: { type: string, description: "e.g. run.submit / run.cancel / run.delete / trigger.fire / <route> (denials)." }
         tenant: { type: string, description: "The tenant the action was taken for (#709)." }
+        target: { type: string, nullable: true, description: "What the action was taken on: template:<id>@<version>, template:<id>, connection:<tenant>/<name>, origin:<name>, mcp:<tool>." }
         run_id: { type: string, nullable: true }
         config_fingerprint: { type: string, nullable: true, description: "sha256 of the merged config (submit actions)." }
         source_ip: { type: string, nullable: true }
-        result: { type: string, enum: [ok, denied] }
+        result: { type: string, description: "ok, denied, or an action-specific outcome (error for a failed MCP tool call)." }
       example:
         id: orders_to_warehouse
         timestamp: '2026-01-01T00:00:00Z'

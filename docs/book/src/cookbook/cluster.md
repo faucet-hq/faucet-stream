@@ -122,12 +122,18 @@ populated:
   "status": "ready",
   "history_ok": true,
   "queue_ok": true,
+  "draining": false,
   "cluster": {
     "enabled": true,
     "instances": 3
   }
 }
 ```
+
+A member that received `SIGTERM` reports `"draining": true` (and `503`),
+refuses new submissions, and hands any run still unfinished at the end of its
+grace window back as `pending` for another member — a rolling deploy does not
+turn long runs into failures.
 
 `instances` is the count of live cluster members (those whose membership
 heartbeat has not yet expired). A single-instance deployment returns `1`;

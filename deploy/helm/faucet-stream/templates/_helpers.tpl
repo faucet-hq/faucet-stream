@@ -53,6 +53,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default (printf "%s-env" (include "faucet-stream.fullname" .)) .Values.secret.name -}}
 {{- end -}}
 
+{{- define "faucet-stream.historySecretName" -}}
+{{- printf "%s-serve-history" (include "faucet-stream.fullname" .) -}}
+{{- end -}}
+
 {{- define "faucet-stream.authSecretName" -}}
 {{- printf "%s-serve-auth" (include "faucet-stream.fullname" .) -}}
 {{- end -}}

@@ -499,6 +499,10 @@ pub struct AuditEntry {
     /// The tenant the action was taken for (#709).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// What the action was taken on (#789 SERVE-32): `template:<id>@<version>`,
+    /// `connection:<tenant>/<name>`, `mcp:<tool>`, …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// Outcome: `"ok"` (action performed) or `"denied"` (403 — insufficient role).
     pub result: String,
 }
@@ -620,6 +624,16 @@ pub trait RunHistory: Send + Sync {
     /// the run. Returns `true` if the write landed, `false` if another instance
     /// reclaimed it (the caller should discard its result). Default: delegate to
     /// `upsert` (memory/single-process always owns its runs).
+    /// Hand a run this instance owns back to the cluster (#789 SERVE-25): a
+    /// still-running record becomes `pending` with no owner, for a peer to
+    /// claim, instead of failing because this instance is shutting down.
+    /// `false` = not released (not owned here, already terminal, or a backend
+    /// without cluster support — the default).
+    async fn release_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        let _ = rec;
+        Ok(false)
+    }
+
     async fn finalize_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
         self.upsert(rec).await.map(|_| true)
     }
@@ -946,6 +960,20 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
+    /// Remove everything the catalog recorded for pipelines whose name starts
+    /// with `prefix` (a tenant's `{tenant}::` namespace) and for the runs in
+    /// `runs`: their lineage edges, config snapshots, profiles and volume
+    /// points, plus every dataset no other pipeline touches (#789 SERVE-51).
+    /// Default: nothing recorded, nothing removed.
+    async fn catalog_purge(
+        &self,
+        prefix: &str,
+        runs: &[String],
+    ) -> Result<catalog::CatalogPurgeReport, HistoryError> {
+        let _ = (prefix, runs);
+        Ok(catalog::CatalogPurgeReport::default())
+    }
+
     /// Record the latest resolved+expanded config snapshot for a pipeline
     /// (#374). Latest-wins per pipeline (upsert). Best-effort at the call site —
     /// recording never fails a run. Default: no-op.
@@ -1046,6 +1074,24 @@ pub trait RunHistory: Send + Sync {
         ))
     }
 
+    /// Write `change` only if the stored request is still in status `from`
+    /// (compare-and-set on the status). `Ok(false)` = someone else moved it
+    /// first. The default reads then writes, which is not atomic; the built-in
+    /// backends override it.
+    async fn change_transition(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        from: crate::serve::changes::ChangeStatus,
+    ) -> Result<bool, HistoryError> {
+        match self.change_get(&change.id).await? {
+            Some(cur) if cur.status == from => {
+                self.change_upsert(change).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// One change request by id. Default: `None`.
     async fn change_get(
         &self,
@@ -1111,6 +1157,27 @@ pub trait RunHistory: Send + Sync {
         Err(HistoryError::Backend(
             "this run-history backend does not support tenant connections".into(),
         ))
+    }
+
+    /// Replace a connection only if its stored `updated_at` still equals
+    /// `expected_updated_at` — the compare-and-set two holders of one rotated
+    /// refresh token write through (#789 SERVE-16). `false` when the record
+    /// changed or is gone. Default: read, compare, upsert (not atomic).
+    async fn connection_replace(
+        &self,
+        connection: &tenants::ConnectionRecord,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, HistoryError> {
+        match self
+            .connection_get(&connection.tenant, &connection.name)
+            .await?
+        {
+            Some(cur) if cur.updated_at == expected_updated_at => {
+                self.connection_upsert(connection).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// One connection. Default: `None`.
@@ -1197,6 +1264,15 @@ pub trait RunHistory: Send + Sync {
     /// Returns how many were deleted. Default: `0`.
     async fn usage_delete_runs(&self, run_ids: &[String]) -> Result<usize, HistoryError> {
         let _ = run_ids;
+        Ok(0)
+    }
+
+    /// Delete every usage record carrying `tenant` (tenant deletion, #709).
+    /// Usage rows are keyed by invocation id, not the serve run id, so this —
+    /// not [`usage_delete_runs`](Self::usage_delete_runs) — is what erases a
+    /// tenant's usage. Default: `0`.
+    async fn usage_delete_tenant(&self, tenant: &str) -> Result<usize, HistoryError> {
+        let _ = tenant;
         Ok(0)
     }
 
@@ -1458,6 +1534,11 @@ async fn connect_postgres(
         postgres::PostgresHistory::connect(url, idem, lease_ttl, instance_id.to_string())
     })
     .await;
+    if let Err(e) = &result
+        && sql::schema_too_new(e)
+    {
+        return Err(crate::error::CliError::Serve(e.to_string()));
+    }
     Ok(into_history(result, idem, "postgres"))
 }
 
@@ -1486,6 +1567,11 @@ async fn connect_sqlite(
         sqlite::SqliteHistory::connect(url, idem, lease_ttl, instance_id.to_string())
     })
     .await;
+    if let Err(e) = &result
+        && sql::schema_too_new(e)
+    {
+        return Err(crate::error::CliError::Serve(e.to_string()));
+    }
     Ok(into_history(result, idem, "sqlite"))
 }
 
@@ -1643,6 +1729,7 @@ mod tests {
             labels: BTreeMap::new(),
             limits: Default::default(),
             notifications: Vec::new(),
+            notifications_sealed: None,
             suspended: false,
             created_at: now,
             updated_at: now,
@@ -1691,6 +1778,15 @@ mod tests {
         assert!(h.tenant_state_refs("acme").await.unwrap().is_empty());
         assert!(!h.change_delete("c1").await.unwrap());
         assert_eq!(h.usage_delete_runs(&["r".to_string()]).await.unwrap(), 0);
+        assert_eq!(h.usage_delete_tenant("acme").await.unwrap(), 0);
+        let rec = RunRecord::queued(
+            "r".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(!h.release_owned(&rec).await.unwrap());
     }
 
     #[test]

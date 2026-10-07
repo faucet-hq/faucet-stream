@@ -30,6 +30,12 @@ faucet serve --auth-config auth.yaml --history sqlite:./faucet.db \
   --connect-providers providers.yaml
 ```
 
+The key must be at least 32 bytes (the server refuses a shorter one), and every
+sealed connection is bound to its tenant and name: a sealed row copied onto
+another tenant's record fails to open rather than lending that tenant the
+credentials. A key passed with `--vault-previous-key` only opens existing rows,
+so rotating away from an old (even short) key works.
+
 The vault key seals every stored credential; without it the server refuses to
 store or open connections (`503`). To rotate, start with the new key and pass
 the old one as `--vault-previous-key` until every connection has been
@@ -56,9 +62,9 @@ curl -X POST localhost:8080/v1/tenants -H "Authorization: Bearer $ADMIN" \
 |---|---|
 | `id` | A slug: `^[a-z0-9][a-z0-9_-]{0,62}$`. The first segment of the tenant's state keys. |
 | `name`, `labels` | What `${tenant.name}` and `${tenant.labels.<key>}` read. |
-| `limits.max_concurrent_runs` | Runs queued or running at once; the next submission is a `429`. |
+| `limits.max_concurrent_runs` | Runs queued or running at once; the next submission is a `429`. In a cluster the count is re-checked against the shared history once the run is recorded, so two instances admitting the last slot at once both back out (`429`, retry) rather than exceed it. |
 | `limits.max_records_per_run`, `max_bytes_per_run`, `max_duration_secs` | Joined into every run's [budget](./usage.md#run-budgets): a noisy tenant stops at the page boundary. |
-| `notifications` | The config `notifications:` shape, for tenant-level events (`connection_needs_reauth`). |
+| `notifications` | The config `notifications:` shape, for tenant-level events (`connection_needs_reauth`). Webhook URLs, routing keys and HMAC secrets are credentials: the list is sealed under the vault key (a non-empty list needs `--vault-key`), and responses show every value under a rule's `channel.config` as `***`. |
 
 `PATCH /v1/tenants/{tenant}` updates any field; `{"suspended": true}` refuses
 the tenant's runs (`409`) until it is resumed.
@@ -196,8 +202,11 @@ curl -X POST localhost:8080/v1/templates/crm-contacts/fanout \
 tenant runs as itself; the response has one entry per tenant —
 `submitted` (with `run_id`), `pending_approval`, `skipped` (a missing or
 revoked connection, a suspended tenant, a tenant at its limit — with the
-reason) or `failed`. An `idempotency_key` is suffixed `:<tenant>`, and every
-run carries a `fanout` label with the fan-out's id.
+reason) or `failed` (including an `idempotency_key` reused with a different
+body). An `idempotency_key` is suffixed `:<tenant>`, and every run carries a
+`fanout` label with the fan-out's id — derived from the key when one is given,
+so retrying a keyed fan-out after a lost response answers with the same
+`fanout_id` and every tenant's original `run_id`.
 
 A fan-out body is a trigger body, so it takes a `selection` too — every tenant
 runs the same subset of the template's streams:
@@ -260,10 +269,14 @@ tenants starts two runs, and a key never reveals another tenant's run.
 
 ```bash
 curl -X DELETE localhost:8080/v1/tenants/acme -H "Authorization: Bearer $ADMIN"
-# → {"runs": 42, "usage_records": 42, "change_requests": 1, "state_keys_deleted": 3}
+# → {"runs": 42, "usage_records": 42, "change_requests": 1, "state_keys_deleted": 3,
+#    "catalog_datasets": 2, "catalog_edges": 1, "catalog_config_snapshots": 1}
 ```
 
-Deletes the tenant's run records, usage records, change requests, every
+Deletes the tenant's run records, usage records, change requests, its
+Data Movement Catalog rows (a tenant run records its datasets, lineage and
+config snapshot under the `<tenant>::<pipeline>` name, like its state keys;
+a dataset another pipeline also reads or writes is kept), every
 state key its runs used (recorded as each run starts, with its store spec
 sealed under the vault key) and their markers, its connections and pending
 connect sessions. It is refused while a run is queued or running. Destination

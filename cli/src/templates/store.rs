@@ -71,7 +71,8 @@ pub struct MaterializedConfig {
     /// Bound param values with `secret: true` entries replaced by `"***"` — the
     /// only form safe to echo, audit, or persist.
     pub params_redacted: BTreeMap<String, Value>,
-    /// True when at least one bound param was declared `secret: true`.
+    /// True when the caller supplied the value of a `secret: true` param (a
+    /// secret bound from its default does not count — it can be deferred).
     pub used_secret_params: bool,
     /// The sink template composed in (a source-template run), with its version.
     pub sink_id: Option<String>,
@@ -810,7 +811,7 @@ pub async fn materialize(
         name: record.name.clone(),
         body,
         params_redacted: bound.redacted(),
-        used_secret_params: bound.has_secrets(),
+        used_secret_params: bound.has_supplied_secrets(),
         sink_id: None,
         sink_version: None,
         streams: Vec::new(),
@@ -1078,7 +1079,7 @@ async fn materialize_pair_selected(
         name: Some(composition.name),
         body,
         params_redacted: bound.redacted(),
-        used_secret_params: bound.has_secrets(),
+        used_secret_params: bound.has_supplied_secrets(),
         sink_id: Some(sink_rec.id.clone()),
         sink_version: Some(sink_rec.version),
         streams: composition.streams,
@@ -1110,6 +1111,7 @@ fn bind_document_for_run(
     env_overrides: &BTreeMap<String, String>,
     mode: Materialize,
 ) -> CliResult<(String, params::BoundParams)> {
+    check_env_overrides(&doc, env_overrides)?;
     if mode == Materialize::Local {
         let overlay: crate::interpolate::EnvOverlay = env_overrides
             .iter()
@@ -1129,6 +1131,58 @@ fn bind_document_for_run(
     let body = serde_json::to_string(&doc)
         .map_err(|e| CliError::Internal(format!("re-serializing template body: {e}")))?;
     Ok((body, bound))
+}
+
+/// An `env` override only replaces a variable the template itself reads
+/// (`${env:NAME}` / `${secret:NAME}`), and its value is a literal: a `${`
+/// in it would become a live directive when the body is interpolated again.
+fn check_env_overrides(doc: &Value, overrides: &BTreeMap<String, String>) -> CliResult<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    fn collect(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            Value::String(s) => {
+                for (_, d) in crate::interpolate::iter_directives(s) {
+                    if let crate::interpolate::Directive::LoadTime {
+                        prefix: "env" | "secret",
+                        body,
+                    } = d
+                    {
+                        let name: String = body
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect();
+                        out.insert(name);
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| collect(x, out)),
+            Value::Object(o) => o.values().for_each(|x| collect(x, out)),
+            _ => {}
+        }
+    }
+    let mut read = std::collections::BTreeSet::new();
+    collect(doc, &mut read);
+    for (k, v) in overrides {
+        if v.contains("${") {
+            return Err(CliError::Config(format!(
+                "env override `{k}` contains `${{`; override values are literal text"
+            )));
+        }
+        if !read.contains(k) {
+            return Err(CliError::Config(format!(
+                "env override `{k}` names a variable this template does not read \
+                 (it reads: {})",
+                if read.is_empty() {
+                    "none".to_string()
+                } else {
+                    read.iter().cloned().collect::<Vec<_>>().join(", ")
+                }
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Connect a template store from a URL: `memory`, `sqlite:<path>`, or a
@@ -1747,6 +1801,42 @@ pipeline:
         assert_eq!(doc["pipeline"]["source"]["config"]["path"], "/from-request");
         assert_eq!(std::env::var("FAUCET_TPL_REGION").unwrap(), "from-process");
         unsafe { std::env::remove_var("FAUCET_TPL_REGION") };
+
+        for (k, v, want) in [
+            ("FAUCET_TPL_REGION", "x/${env:HOME}", "literal text"),
+            (
+                "HOME",
+                "elsewhere",
+                "does not read (it reads: FAUCET_TPL_REGION)",
+            ),
+        ] {
+            let overrides: BTreeMap<String, String> = [(k.to_string(), v.to_string())].into();
+            let err = materialize(
+                &s,
+                "env-template",
+                1,
+                &SuppliedParams::new(),
+                &overrides,
+                Materialize::Persisted,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+        }
+    }
+
+    #[test]
+    fn env_override_check_lists_none_when_the_template_reads_nothing() {
+        let overrides: BTreeMap<String, String> = [("A".to_string(), "v".to_string())].into();
+        let err = check_env_overrides(&json!({"x": "plain"}), &overrides).unwrap_err();
+        assert!(err.to_string().contains("(it reads: none)"), "{err}");
+        assert!(
+            check_env_overrides(
+                &json!({"x": ["${secret:A}", 1], "y": "${vars.z}"}),
+                &overrides
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

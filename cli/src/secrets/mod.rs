@@ -37,6 +37,37 @@ pub trait SecretResolver: Send + Sync {
     async fn resolve(&self, reference: &str) -> CliResult<String>;
 }
 
+/// HTTP client for the secret-manager backends: a hung endpoint fails the
+/// load instead of hanging it.
+#[cfg(any(feature = "secrets-vault", feature = "secrets-gcp-sm"))]
+pub(crate) fn secret_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}
+
+/// Refuse `#field` on a scheme that cannot extract one, instead of letting
+/// the `#…` reach the backend as part of the name.
+#[cfg_attr(
+    not(any(feature = "secrets-gcp-sm", feature = "secrets-azure-kv")),
+    allow(dead_code)
+)]
+pub(crate) fn reject_field(scheme: &str, reference: &str) -> CliResult<()> {
+    if reference.contains('#') {
+        return Err(CliError::SecretFetchFailed {
+            scheme: scheme.into(),
+            reference: reference.into(),
+            source: format!(
+                "`#field` extraction is supported for vault and aws-sm only, not {scheme}"
+            )
+            .into(),
+        });
+    }
+    Ok(())
+}
+
 /// Split a `path#field` reference into `(path, Some(field))` or `(path, None)`.
 #[allow(dead_code)] // used by provider modules added in later tasks
 pub(crate) fn split_field(reference: &str) -> (&str, Option<&str>) {
@@ -233,6 +264,54 @@ fn visit_config_values<F: FnMut(&Value)>(cfg: &PipelineConfig, mut f: F) {
             f(&d.sink.config);
         }
     }
+    let _ = visit_typed_blocks(cfg, |v| {
+        f(v);
+        Ok(())
+    });
+}
+
+/// Run `f` over the serialized form of every typed config block that can
+/// carry a credential and is not a plain `Value` walked above (CLI-42).
+fn visit_typed_blocks(
+    cfg: &PipelineConfig,
+    mut f: impl FnMut(&Value) -> CliResult<()>,
+) -> CliResult<()> {
+    let mut each = |v: serde_json::Result<Value>| match v {
+        Ok(v) => f(&v),
+        Err(_) => Ok(()),
+    };
+    each(serde_json::to_value(&cfg.pipeline.nodes))?;
+    each(serde_json::to_value(&cfg.observability))?;
+    each(serde_json::to_value(&cfg.replication))?;
+    each(serde_json::to_value(&cfg.verify))?;
+    each(serde_json::to_value(&cfg.reconcile))?;
+    #[cfg(feature = "masking")]
+    each(serde_json::to_value(&cfg.pipeline.masking))?;
+    #[cfg(feature = "lineage")]
+    each(serde_json::to_value(&cfg.lineage))?;
+    #[cfg(feature = "catalog")]
+    each(serde_json::to_value(&cfg.catalog))?;
+    #[cfg(feature = "notify")]
+    each(serde_json::to_value(&cfg.notifications))?;
+    Ok(())
+}
+
+/// Resolve `f` over `slot`'s serialized form, writing it back only when `f`
+/// changed something.
+fn walk_typed<T: serde::Serialize + serde::de::DeserializeOwned>(
+    slot: &mut T,
+    what: &str,
+    f: &mut impl FnMut(&mut Value) -> CliResult<()>,
+) -> CliResult<()> {
+    let mut v = serde_json::to_value(&*slot)
+        .map_err(|e| CliError::Internal(format!("serializing `{what}` for secrets: {e}")))?;
+    let before = v.clone();
+    f(&mut v)?;
+    if v != before {
+        *slot = serde_json::from_value(v)
+            .map_err(|e| CliError::Config(format!("`{what}` after secret resolution: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Apply a mutating, fallible closure to every config `Value` location.
@@ -301,7 +380,42 @@ fn visit_config_values_mut<F: FnMut(&mut Value) -> CliResult<()>>(
             f(&mut d.sink.config)?;
         }
     }
+    walk_typed(&mut cfg.pipeline.nodes, "pipeline.nodes", &mut f)?;
+    walk_typed(&mut cfg.observability, "observability", &mut f)?;
+    walk_typed(&mut cfg.replication, "mirror", &mut f)?;
+    walk_typed(&mut cfg.verify, "verify", &mut f)?;
+    walk_typed(&mut cfg.reconcile, "reconcile", &mut f)?;
+    #[cfg(feature = "masking")]
+    walk_typed(&mut cfg.pipeline.masking, "pipeline.masking", &mut f)?;
+    #[cfg(feature = "lineage")]
+    walk_typed(&mut cfg.lineage, "lineage", &mut f)?;
+    #[cfg(feature = "catalog")]
+    walk_typed(&mut cfg.catalog, "catalog", &mut f)?;
+    #[cfg(feature = "notify")]
+    walk_typed(&mut cfg.notifications, "notifications", &mut f)?;
     Ok(())
+}
+
+/// Refuse a config that still holds a secret-manager directive after
+/// resolution: it sits somewhere the resolver does not reach, and the literal
+/// `${vault:…}` would otherwise be sent as the credential.
+fn refuse_unresolved(cfg: &PipelineConfig) -> CliResult<()> {
+    let Ok(mut doc) = serde_json::to_value(cfg) else {
+        return Ok(());
+    };
+    if let Some(map) = doc.as_object_mut() {
+        // A param default is bound into the body before this pass.
+        map.remove(crate::params::PARAMS_KEY);
+    }
+    let mut left = BTreeSet::new();
+    collect_refs(&doc, &mut left);
+    match left.into_iter().next() {
+        None => Ok(()),
+        Some((scheme, reference)) => Err(CliError::Config(format!(
+            "secret directive `${{{scheme}:{reference}}}` is in a config block secrets are \
+             not resolved in; move the value into a connector, auth, vars or param location"
+        ))),
+    }
 }
 
 /// Collect every unique secret reference across the whole config.
@@ -349,7 +463,7 @@ pub fn ensure_no_secret_directives(cfg: &PipelineConfig) -> CliResult<()> {
 pub async fn resolve_secrets(cfg: &mut PipelineConfig) -> CliResult<()> {
     let refs = scan_config(cfg);
     if refs.is_empty() {
-        return Ok(());
+        return refuse_unresolved(cfg);
     }
     let mut set = ResolverSet::default();
     let schemes: BTreeSet<&str> = refs.iter().map(|(s, _)| s.as_str()).collect();
@@ -364,10 +478,11 @@ pub async fn resolve_secrets(cfg: &mut PipelineConfig) -> CliResult<()> {
 pub async fn resolve_secrets_with(cfg: &mut PipelineConfig, set: &ResolverSet) -> CliResult<()> {
     let refs = scan_config(cfg);
     if refs.is_empty() {
-        return Ok(());
+        return refuse_unresolved(cfg);
     }
     let cache = fetch_all(&refs, set).await?;
-    visit_config_values_mut(cfg, |v| substitute(v, &cache))
+    visit_config_values_mut(cfg, |v| substitute(v, &cache))?;
+    refuse_unresolved(cfg)
 }
 
 /// Resolve every secret directive in an arbitrary document in place — for
@@ -516,6 +631,67 @@ pipeline:
         resolve_secrets_with(&mut cfg, &set).await.unwrap();
         let token = &cfg.pipeline.source.as_ref().unwrap().config["auth"]["config"]["token"];
         assert_eq!(token, "RESOLVED");
+    }
+
+    #[tokio::test]
+    async fn typed_blocks_resolve_and_an_unreachable_directive_is_refused() {
+        let mut set = ResolverSet::default();
+        set.insert(Arc::new(FakeResolver {
+            scheme: "vault",
+            value: "RESOLVED".into(),
+        }));
+        let cfg_yaml = r#"
+version: 1
+pipeline:
+  source: { type: rest, config: { base_url: https://x } }
+  sink:   { type: jsonl, config: { path: ./o.jsonl } }
+  masking:
+    key: "${vault:secret/data/mask#k}"
+    rules: [ { name: e, match: { fields: [email] }, action: { type: hash } } ]
+lineage:
+  namespace: ns
+  transport: { type: http, config: { url: "https://lineage/api", auth: { type: bearer, config: { token: "${vault:secret/data/ol#t}" } } } }
+"#;
+        let mut cfg = PipelineConfig::from_text(cfg_yaml, std::path::Path::new("p.yaml")).unwrap();
+        assert_eq!(scan_config(&cfg).len(), 2);
+        resolve_secrets_with(&mut cfg, &set).await.unwrap();
+        assert_eq!(
+            cfg.pipeline.masking.as_ref().unwrap().key.as_deref(),
+            Some("RESOLVED")
+        );
+        let lineage = serde_json::to_string(&cfg.lineage).unwrap();
+        assert!(
+            lineage.contains("RESOLVED") && !lineage.contains("vault"),
+            "{lineage}"
+        );
+
+        let stray = r#"
+version: 1
+pipeline:
+  source: { type: rest, config: { base_url: https://x } }
+  sink:   { type: jsonl, config: { path: ./o.jsonl } }
+execution: { max_concurrent: 1 }
+matrix:
+  - id: a
+    tags: ["${vault:secret/data/x#y}"]
+"#;
+        let mut cfg = PipelineConfig::from_text(stray, std::path::Path::new("p.yaml")).unwrap();
+        let err = resolve_secrets_with(&mut cfg, &set)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not resolved in"), "{err}");
+        let err = resolve_secrets(&mut cfg).await.unwrap_err().to_string();
+        assert!(err.contains("not resolved in"), "{err}");
+    }
+
+    #[test]
+    fn field_selectors_are_refused_where_unsupported() {
+        assert!(reject_field("gcp-sm", "projects/p/secrets/s/versions/1").is_ok());
+        let err = reject_field("gcp-sm", "projects/p/secrets/s/versions/1#user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vault and aws-sm only"), "{err}");
     }
 
     #[tokio::test]

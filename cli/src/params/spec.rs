@@ -163,6 +163,17 @@ fn default_matches(kind: ParamType, value: &Value) -> bool {
     }
 }
 
+/// A default may also be text that an interpolation resolves to the declared
+/// type (`default: "${env:PORT}"` on an `int`): still a directive when the
+/// config is registered, `"8080"` once the env pass has run. It is coerced at
+/// bind time like a supplied value.
+fn default_ok(kind: ParamType, value: &Value) -> bool {
+    default_matches(kind, value)
+        || value
+            .as_str()
+            .is_some_and(|s| s.contains("${") || coerce("_", kind, value).is_ok())
+}
+
 /// Fail-fast validation of a whole `params:` block, run at every entry point
 /// that touches params (config load, template registration, trigger).
 pub fn validate(spec: &ParamsSpec) -> CliResult<()> {
@@ -200,7 +211,7 @@ pub fn validate(spec: &ParamsSpec) -> CliResult<()> {
                     "param '{name}': `default: null` is not a value — omit `default` instead"
                 )));
             }
-            if !default_matches(p.kind, d) {
+            if !default_ok(p.kind, d) {
                 return Err(CliError::Config(format!(
                     "param '{name}': default {d} is not a valid {} value",
                     p.kind.as_str()
@@ -560,6 +571,15 @@ mod tests {
         assert!(!values_match(ParamType::Int, &json!(1), &json!(2)));
         // Uncoercible on both sides falls back to structural equality.
         assert!(values_match(ParamType::Int, &json!("x"), &json!("x")));
+    }
+
+    #[test]
+    fn a_typed_default_may_be_an_interpolation_or_its_resolved_text() {
+        for d in [json!("${env:PORT}"), json!("8080"), json!(8080)] {
+            validate(&spec_of("n", json!({"type": "int", "default": d}))).unwrap();
+        }
+        validate(&spec_of("b", json!({"type": "bool", "default": "true"}))).unwrap();
+        assert!(validate(&spec_of("b", json!({"type": "bool", "default": "maybe"}))).is_err());
     }
 
     #[test]

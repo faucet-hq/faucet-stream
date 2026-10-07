@@ -161,9 +161,10 @@ impl TokenEndpointCache {
         )
         .await?;
 
-        let expires_at = expires_in.map(|secs| {
+        let expires_at = expires_in.and_then(|secs| {
             let effective = (secs as f64 * expiry_ratio) as u64;
-            tokio::time::Instant::now() + std::time::Duration::from_secs(effective)
+            // An absurd lifetime overflows `Instant`; treat it as "no expiry".
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(effective))
         });
 
         *guard = Some(CachedToken {
@@ -204,7 +205,7 @@ pub async fn fetch_token_from_endpoint(
 }
 
 /// How many times a transient token-endpoint failure is retried before giving up.
-const TOKEN_MAX_ATTEMPTS: u32 = 4;
+pub(crate) const TOKEN_MAX_ATTEMPTS: u32 = 4;
 /// Base backoff before the first retry; doubled each subsequent attempt.
 const TOKEN_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -224,7 +225,7 @@ const TRANSIENT_OAUTH_ERROR_CODES: &[&str] =
 /// [`TRANSIENT_OAUTH_ERROR_CODES`] — classification never greps
 /// `error_description` text, which is not API and can mention an error code
 /// without meaning it.
-fn is_transient_token_status(code: u16, body: &str) -> bool {
+pub(crate) fn is_transient_token_status(code: u16, body: &str) -> bool {
     if code == 429 || (500..600).contains(&code) {
         return true;
     }
@@ -317,7 +318,7 @@ async fn fetch_token(
 /// `execute_with_retry`) because transience here is classified from the typed
 /// OAuth error code in the response body, which core's `FaucetError`-shaped
 /// runner cannot observe.
-async fn token_backoff(attempt: u32) {
+pub(crate) async fn token_backoff(attempt: u32) {
     let delay = faucet_core::retry::backoff_with_jitter(TOKEN_RETRY_BASE, attempt);
     tokio::time::sleep(delay).await;
 }
@@ -778,6 +779,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token, "ftok");
+    }
+
+    #[tokio::test]
+    async fn an_absurd_expires_in_is_cached_without_expiry() {
+        use wiremock::matchers::method as m;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(m("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token": "t", "expires_in": u64::MAX})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache = TokenEndpointCache::new();
+        for _ in 0..2 {
+            let token = cache
+                .get_or_refresh_with_encoding(
+                    &Client::new(),
+                    &server.uri(),
+                    &reqwest::Method::POST,
+                    &HeaderMap::new(),
+                    None,
+                    "$.access_token",
+                    Some("$.expires_in"),
+                    1.0,
+                    TokenBodyEncoding::Json,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(token, "t");
+        }
     }
 
     #[tokio::test]

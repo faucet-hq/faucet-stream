@@ -68,15 +68,7 @@ spec:
             - --auth-config=/etc/faucet-auth/rbac.yaml
             {{- end }}
             {{- end }}
-            {{- if ne .Values.serve.history.backend "memory" }}
-            {{- $histUrl := .Values.serve.history.url }}
-            {{- if and (eq .Values.serve.history.backend "sqlite") (not $histUrl) }}
-            {{- $histUrl = printf "sqlite://%s/history.db" $mountPath }}
-            {{- end }}
-            {{- if $histUrl }}
-            - --history={{ $histUrl }}
-            {{- end }}
-            {{- end }}
+
             {{- if not .Values.serve.ui.enabled }}
             - --no-ui
             {{- end }}
@@ -110,6 +102,25 @@ spec:
               value: {{ .Values.serve.preview.rows | quote }}
             - name: FAUCET_SERVE_PREVIEW_MAX_ROWS
               value: {{ .Values.serve.preview.maxRows | quote }}
+            {{- /* The history URL travels as FAUCET_SERVE_HISTORY, never on the
+                   command line: a postgres DSN carries a password (#789 SUPPLY-07). */}}
+            {{- if ne .Values.serve.history.backend "memory" }}
+            {{- if or .Values.serve.history.existingSecret .Values.serve.history.url }}
+            {{- if or .Values.serve.history.existingSecret (eq .Values.serve.history.backend "postgres") }}
+            - name: FAUCET_SERVE_HISTORY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.serve.history.existingSecret | default (include "faucet-stream.historySecretName" .) }}
+                  key: {{ .Values.serve.history.existingSecretKey }}
+            {{- else }}
+            - name: FAUCET_SERVE_HISTORY
+              value: {{ .Values.serve.history.url | quote }}
+            {{- end }}
+            {{- else if eq .Values.serve.history.backend "sqlite" }}
+            - name: FAUCET_SERVE_HISTORY
+              value: {{ printf "sqlite://%s/history.db" $mountPath | quote }}
+            {{- end }}
+            {{- end }}
             {{- if eq .Values.serve.auth.mode "token" }}
             - name: FAUCET_SERVE_AUTH_TOKEN
               valueFrom:

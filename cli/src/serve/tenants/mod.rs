@@ -150,12 +150,14 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
 /// with the redaction registry for the life of the process.
 fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, ServeError> {
     let vault = rt.require_vault()?;
-    let mut spec = vault.open(&c.sealed).map_err(|e| {
-        ServeError::Internal(format!(
-            "connection '{}' of tenant '{}': {e}",
-            c.name, c.tenant
-        ))
-    })?;
+    let mut spec = vault
+        .open_for(&c.sealed, &Vault::connection_context(&c.tenant, &c.name))
+        .map_err(|e| {
+            ServeError::Internal(format!(
+                "connection '{}' of tenant '{}': {e}",
+                c.name, c.tenant
+            ))
+        })?;
     if let Some(provider) = c
         .connect_provider
         .as_deref()
@@ -197,11 +199,18 @@ fn is_secret_key(key: &str) -> bool {
     .any(|needle| k.contains(needle))
 }
 
+/// The shortest tenant-supplied string registered for redaction (#789
+/// SERVE-24): the redaction set is process-wide, so a short "secret" such
+/// as `https` would mask that word in every tenant's and admin's output.
+pub const MIN_TENANT_SECRET_LEN: usize = 12;
+
 /// Register every credential-looking string in a provider spec for redaction.
 pub fn register_secrets(value: &Value) {
     fn walk(v: &Value, secret: bool) {
         match v {
-            Value::String(s) if secret && !s.is_empty() => crate::secrets::registry::register(s),
+            Value::String(s) if secret && s.len() >= MIN_TENANT_SECRET_LEN => {
+                crate::secrets::registry::register(s)
+            }
             Value::Object(m) => m
                 .iter()
                 .for_each(|(k, v)| walk(v, secret || is_secret_key(k))),
@@ -237,16 +246,56 @@ fn catalog_builder(state: ServerState, tenant: String, names: BTreeSet<String>) 
 /// A connection's provider: an `oauth2_refresh` one persists every rotated
 /// refresh token back into the sealed connection, and every one is watched
 /// for a revoked grant.
+///
+/// Runs that overlap on this instance share one provider per stored
+/// connection version (#789 SERVE-16), so its single-flight refresh rotates
+/// the token once instead of every run refreshing with the same old token.
 fn connection_provider(
     state: &ServerState,
     tenant: &str,
     name: &str,
     spec: &Value,
 ) -> Result<SharedAuthProvider, FaucetError> {
+    use sha2::{Digest, Sha256};
+    static SHARED: std::sync::LazyLock<DashMap<String, std::sync::Weak<ReauthWatch>>> =
+        std::sync::LazyLock::new(DashMap::new);
+    let digest = Sha256::digest(spec.to_string().as_bytes());
+    let key = format!(
+        "{tenant}/{name}/{}",
+        digest
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    if let Some(shared) = SHARED.get(&key).and_then(|w| w.upgrade()) {
+        return Ok(shared);
+    }
+    SHARED.retain(|_, w| w.strong_count() > 0);
+    let inner = build_connection_inner(state, tenant, name, spec)?;
+    let watch = Arc::new(ReauthWatch {
+        statuses: inner.reauth_statuses().to_vec(),
+        inner: std::sync::RwLock::new(inner),
+        refreshes: spec.get("type").and_then(Value::as_str) == Some("oauth2_refresh"),
+        state: state.clone(),
+        tenant: tenant.to_string(),
+        name: name.to_string(),
+        fired: AtomicBool::new(false),
+    });
+    SHARED.insert(key, Arc::downgrade(&watch));
+    Ok(watch)
+}
+
+fn build_connection_inner(
+    state: &ServerState,
+    tenant: &str,
+    name: &str,
+    spec: &Value,
+) -> Result<SharedAuthProvider, FaucetError> {
     let kind = spec.get("type").and_then(Value::as_str).unwrap_or_default();
-    let inner: SharedAuthProvider = if kind == "oauth2_refresh" {
+    if kind == "oauth2_refresh" {
         let config = spec.get("config").cloned().unwrap_or(Value::Null);
-        Arc::new(
+        Ok(Arc::new(
             faucet_auth::OAuth2RefreshProvider::from_config(&config)?.with_store(
                 Arc::new(ConnectionTokenStore {
                     state: state.clone(),
@@ -255,17 +304,10 @@ fn connection_provider(
                 }),
                 "refresh_token",
             ),
-        )
+        ))
     } else {
-        faucet_auth::build_provider(spec)?
-    };
-    Ok(Arc::new(ReauthWatch {
-        inner,
-        state: state.clone(),
-        tenant: tenant.to_string(),
-        name: name.to_string(),
-        fired: AtomicBool::new(false),
-    }))
+        faucet_auth::build_provider(spec)
+    }
 }
 
 fn state_key_hook(state: ServerState, tenant: String) -> crate::executor::StateKeyHook {
@@ -273,7 +315,7 @@ fn state_key_hook(state: ServerState, tenant: String) -> crate::executor::StateK
         let rt = state.tenants();
         let spec_value = serde_json::to_value(spec).unwrap_or(Value::Null);
         let stored = match &rt.vault {
-            Some(v) => Some(v.seal(&spec_value)),
+            Some(v) => Some(v.seal_for(&spec_value, &state_context(&tenant))),
             // Without a vault only a store with no credentials in its spec is
             // kept; any other key is reported, not deleted, on tenant delete.
             None if matches!(spec.kind.as_str(), "file" | "memory") => Some(spec_value.to_string()),
@@ -342,6 +384,24 @@ pub async fn admit(
     Ok(Admission { _guard: guard })
 }
 
+/// Whether `tenant` is past its `max_concurrent_runs` now that a new run is
+/// recorded (the cluster re-check after admission). `Some(message)` when it is.
+pub async fn over_limit(state: &ServerState, tenant: &str) -> Result<Option<String>, ServeError> {
+    let rec = get_tenant(state, tenant).await?;
+    let Some(max) = rec.limits.max_concurrent_runs else {
+        return Ok(None);
+    };
+    let active = active_runs(state, tenant, max as usize + 1).await?;
+    if active > max as usize {
+        metrics::record_limit_rejection(tenant, "max_concurrent_runs");
+        return Ok(Some(format!(
+            "tenant '{tenant}' already has {max} run(s) queued or running across the cluster \
+             (limit max_concurrent_runs = {max})"
+        )));
+    }
+    Ok(None)
+}
+
 /// Runs for `tenant` that are queued, pending, running or sharded, counted
 /// up to `cap`.
 pub async fn active_runs(
@@ -380,6 +440,37 @@ impl std::fmt::Debug for ConnectionTokenStore {
 }
 
 impl ConnectionTokenStore {
+    /// `rec` re-sealed with the refresh token in `value`; `None` when `value`
+    /// carries none.
+    fn rotated(
+        &self,
+        mut rec: ConnectionRecord,
+        mut spec: Value,
+        value: &Value,
+    ) -> Result<Option<ConnectionRecord>, FaucetError> {
+        let Some(token) = value.get("refresh_token").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        crate::secrets::registry::register(token);
+        if let Some(cfg) = spec.get_mut("config").and_then(Value::as_object_mut) {
+            let old = cfg.insert("refresh_token".into(), Value::String(token.to_string()));
+            // The rotated-away token is revoked; stop paying to scrub it.
+            if let Some(Value::String(old)) = old
+                && old != token
+            {
+                crate::secrets::registry::unregister(&old);
+            }
+        }
+        let rt = self.state.tenants();
+        let vault = rt
+            .vault
+            .as_ref()
+            .ok_or_else(|| FaucetError::State("no vault key".into()))?;
+        rec.sealed = vault.seal_for(&spec, &Vault::connection_context(&rec.tenant, &rec.name));
+        rec.updated_at = Utc::now();
+        Ok(Some(rec))
+    }
+
     async fn load(&self) -> Result<Option<(ConnectionRecord, Value)>, FaucetError> {
         let Some(rec) = self
             .state
@@ -395,7 +486,12 @@ impl ConnectionTokenStore {
             .vault
             .as_ref()
             .ok_or_else(|| FaucetError::State("no vault key".into()))?;
-        let spec = vault.open(&rec.sealed).map_err(FaucetError::State)?;
+        let spec = vault
+            .open_for(
+                &rec.sealed,
+                &Vault::connection_context(&rec.tenant, &rec.name),
+            )
+            .map_err(FaucetError::State)?;
         Ok(Some((rec, spec)))
     }
 }
@@ -411,26 +507,46 @@ impl StateStore for ConnectionTokenStore {
     }
 
     async fn put(&self, _key: &str, value: &Value) -> Result<(), FaucetError> {
-        let Some(token) = value.get("refresh_token").and_then(Value::as_str) else {
+        let Some((rec, spec)) = self.load().await? else {
             return Ok(());
         };
-        let Some((mut rec, mut spec)) = self.load().await? else {
+        let Some(next) = self.rotated(rec, spec, value)? else {
             return Ok(());
         };
-        crate::secrets::registry::register(token);
-        if let Some(cfg) = spec.get_mut("config").and_then(Value::as_object_mut) {
-            cfg.insert("refresh_token".into(), Value::String(token.to_string()));
-        }
-        let rt = self.state.tenants();
-        let vault = rt
-            .vault
-            .as_ref()
-            .ok_or_else(|| FaucetError::State("no vault key".into()))?;
-        rec.sealed = vault.seal(&spec);
-        rec.updated_at = Utc::now();
         self.state
             .history()
-            .connection_upsert(&rec)
+            .connection_upsert(&next)
+            .await
+            .map_err(|e| FaucetError::State(e.to_string()))
+    }
+
+    fn supports_compare_and_put(&self) -> bool {
+        true
+    }
+
+    async fn compare_and_put(
+        &self,
+        _key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        let Some((rec, spec)) = self.load().await? else {
+            return Ok(false);
+        };
+        let stored = spec
+            .pointer("/config/refresh_token")
+            .and_then(Value::as_str);
+        let wanted = expected.and_then(|v| v.get("refresh_token").and_then(Value::as_str));
+        if stored != wanted {
+            return Ok(false);
+        }
+        let since = rec.updated_at;
+        let Some(next) = self.rotated(rec, spec, value)? else {
+            return Ok(false);
+        };
+        self.state
+            .history()
+            .connection_replace(&next, since)
             .await
             .map_err(|e| FaucetError::State(e.to_string()))
     }
@@ -452,8 +568,15 @@ pub fn is_revoked(err: &FaucetError) -> bool {
 
 /// Wraps a connection's provider: a revoked grant marks the connection
 /// `needs_reauth` (once per provider instance) and notifies the tenant.
+///
+/// Before declaring a refresh grant revoked it re-reads the stored
+/// connection and tries once more with what is there (#789 SERVE-16):
+/// another run or instance may have rotated the refresh token, which makes
+/// the old one `invalid_grant` without the grant being gone.
 struct ReauthWatch {
-    inner: SharedAuthProvider,
+    inner: std::sync::RwLock<SharedAuthProvider>,
+    statuses: Vec<u16>,
+    refreshes: bool,
     state: ServerState,
     tenant: String,
     name: String,
@@ -465,12 +588,42 @@ impl std::fmt::Debug for ReauthWatch {
         f.debug_struct("ReauthWatch")
             .field("tenant", &self.tenant)
             .field("name", &self.name)
-            .field("inner", &self.inner)
+            .field("inner", &self.current())
             .finish()
     }
 }
 
 impl ReauthWatch {
+    fn current(&self) -> SharedAuthProvider {
+        Arc::clone(&self.inner.read().expect("reauth watch lock poisoned"))
+    }
+
+    /// Swap in a provider built from the stored connection. `false` when
+    /// there is nothing newer to try.
+    async fn reload(&self) -> bool {
+        if !self.refreshes {
+            return false;
+        }
+        let Ok(Some(rec)) = self
+            .state
+            .history()
+            .connection_get(&self.tenant, &self.name)
+            .await
+        else {
+            return false;
+        };
+        let Ok(spec) = open_connection(&self.state.tenants(), &rec) else {
+            return false;
+        };
+        match build_connection_inner(&self.state, &self.tenant, &self.name, &spec) {
+            Ok(p) => {
+                *self.inner.write().expect("reauth watch lock poisoned") = p;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     async fn observe<T>(&self, r: Result<T, FaucetError>) -> Result<T, FaucetError> {
         if let Err(e) = &r
             && is_revoked(e)
@@ -483,14 +636,30 @@ impl ReauthWatch {
     }
 }
 
+/// Call `$op` on the current provider; on a revoked grant reload from the
+/// store and call it once more before reporting.
+macro_rules! with_reload {
+    ($self:ident, |$p:ident| $op:expr) => {{
+        let $p = $self.current();
+        let first = $op;
+        match first {
+            Err(e) if is_revoked(&e) && $self.reload().await => {
+                let $p = $self.current();
+                $self.observe($op).await
+            }
+            other => $self.observe(other).await,
+        }
+    }};
+}
+
 #[faucet_core::async_trait]
 impl AuthProvider for ReauthWatch {
     async fn credential(&self) -> Result<Credential, FaucetError> {
-        self.observe(self.inner.credential().await).await
+        with_reload!(self, |p| p.credential().await)
     }
 
     async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
-        self.observe(self.inner.invalidate(stale).await).await
+        with_reload!(self, |p| p.invalidate(stale).await)
     }
 
     async fn sign_request(
@@ -499,8 +668,7 @@ impl AuthProvider for ReauthWatch {
         url: &str,
         query: &BTreeMap<String, String>,
     ) -> Result<Option<Credential>, FaucetError> {
-        self.observe(self.inner.sign_request(method, url, query).await)
-            .await
+        with_reload!(self, |p| p.sign_request(method, url, query).await)
     }
 
     async fn request_auth(
@@ -509,16 +677,17 @@ impl AuthProvider for ReauthWatch {
         url: &str,
         query: &BTreeMap<String, String>,
     ) -> Result<faucet_core::RequestAuth, FaucetError> {
-        self.observe(self.inner.request_auth(method, url, query).await)
-            .await
+        with_reload!(self, |p| p.request_auth(method, url, query).await)
     }
 
     fn reauth_statuses(&self) -> &[u16] {
-        self.inner.reauth_statuses()
+        // The provider kind never changes on reload, so the first one's
+        // statuses hold.
+        &self.statuses
     }
 
     fn provider_name(&self) -> &'static str {
-        self.inner.provider_name()
+        self.current().provider_name()
     }
 }
 
@@ -556,7 +725,14 @@ pub async fn mark_needs_reauth(state: &ServerState, tenant: &str, name: &str, re
     metrics::refresh_connection_gauges(state).await;
     let mut actor = AuthContext::system("tenants");
     actor.tenant = Some(tenant.to_string());
-    crate::serve::audit::write(state, &actor, "connection.needs_reauth", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        state,
+        &actor,
+        "connection.needs_reauth",
+        format!("connection:{tenant}/{name}"),
+        "ok",
+    )
+    .await;
     notify_tenant(
         state,
         tenant,
@@ -565,13 +741,81 @@ pub async fn mark_needs_reauth(state: &ServerState, tenant: &str, name: &str, re
     .await;
 }
 
+fn notifications_context(tenant: &str) -> String {
+    format!("notifications:{tenant}")
+}
+
+/// Store a tenant's `notifications:` list: sealed under the vault key, the
+/// plain list left empty. An empty list needs no vault.
+pub fn seal_notifications(
+    rt: &TenantsRuntime,
+    rec: &mut TenantRecord,
+    list: Vec<Value>,
+) -> Result<(), ServeError> {
+    if list.is_empty() {
+        rec.notifications = Vec::new();
+        rec.notifications_sealed = None;
+        return Ok(());
+    }
+    let vault = rt.require_vault()?;
+    rec.notifications_sealed =
+        Some(vault.seal_for(&Value::Array(list), &notifications_context(&rec.id)));
+    rec.notifications = Vec::new();
+    Ok(())
+}
+
+/// A tenant's `notifications:` list in clear (a record written before
+/// sealing keeps its plain list).
+pub fn open_notifications(rt: &TenantsRuntime, rec: &TenantRecord) -> Result<Vec<Value>, String> {
+    let Some(sealed) = &rec.notifications_sealed else {
+        return Ok(rec.notifications.clone());
+    };
+    let vault = rt
+        .vault
+        .as_ref()
+        .ok_or("the tenant's notifications are sealed and this server has no vault key")?;
+    match vault.open_for(sealed, &notifications_context(&rec.id))? {
+        Value::Array(list) => Ok(list),
+        _ => Err("sealed notifications are not a list".into()),
+    }
+}
+
+/// The `notifications:` list as an API response shows it: rule structure
+/// kept, every string under a channel's `config` masked.
+pub fn mask_notifications(list: &[Value]) -> Vec<Value> {
+    fn mask(v: &mut Value) {
+        match v {
+            Value::String(s) => *s = "***".into(),
+            Value::Array(a) => a.iter_mut().for_each(mask),
+            Value::Object(o) => o.values_mut().for_each(mask),
+            _ => {}
+        }
+    }
+    list.iter()
+        .cloned()
+        .map(|mut rule| {
+            if let Some(cfg) = rule.pointer_mut("/channel/config") {
+                mask(cfg);
+            }
+            rule
+        })
+        .collect()
+}
+
 /// Emit an event through a tenant's own `notifications:` rules.
 pub async fn notify_tenant(state: &ServerState, tenant: &str, event: crate::notify::NotifyEvent) {
     let Ok(Some(rec)) = state.history().tenant_get(tenant).await else {
         return;
     };
+    let list = match open_notifications(&state.tenants(), &rec) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(tenant, error = %e, "tenant notifications skipped");
+            return;
+        }
+    };
     let specs: Vec<crate::notify::NotificationSpec> =
-        match serde_json::from_value(Value::Array(rec.notifications.clone())) {
+        match serde_json::from_value(Value::Array(list)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(tenant, error = %e, "tenant notifications are malformed; skipped");
@@ -602,6 +846,12 @@ pub struct DeleteReport {
     pub usage_records: usize,
     pub change_requests: usize,
     pub state_keys_deleted: usize,
+    /// Data Movement Catalog rows recorded by the tenant's runs (#789
+    /// SERVE-51): datasets only the tenant touched, lineage edges and config
+    /// snapshots.
+    pub catalog_datasets: usize,
+    pub catalog_edges: usize,
+    pub catalog_config_snapshots: usize,
     /// State keys that could not be deleted, with why. The tenant is deleted
     /// anyway; these keys are left for the operator.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -609,7 +859,8 @@ pub struct DeleteReport {
 }
 
 /// Delete a tenant and everything it owns in faucet: its runs, usage
-/// records, change requests, state keys, connections and connect sessions.
+/// records, change requests, catalog rows, state keys, connections and
+/// connect sessions.
 /// Destination data is never touched. Refused while a run is active.
 pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteReport, ServeError> {
     get_tenant(state, tenant).await?;
@@ -643,7 +894,11 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
     report.usage_records = history
         .usage_delete_runs(&run_ids)
         .await
-        .map_err(store_err)?;
+        .map_err(store_err)?
+        + history
+            .usage_delete_tenant(tenant)
+            .await
+            .map_err(store_err)?;
     for id in &run_ids {
         if matches!(
             history.delete(id).await.map_err(store_err)?,
@@ -652,6 +907,14 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
             report.runs += 1;
         }
     }
+
+    let purged = history
+        .catalog_purge(&format!("{tenant}::"), &run_ids)
+        .await
+        .map_err(store_err)?;
+    report.catalog_datasets = purged.datasets;
+    report.catalog_edges = purged.edges;
+    report.catalog_config_snapshots = purged.config_snapshots;
 
     let changes = history
         .change_list(&crate::serve::changes::ChangeListFilter {
@@ -684,7 +947,7 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
 
 /// Delete one recorded state key and its markers from the store it lives in.
 async fn delete_state_key(vault: Option<&Vault>, r: &TenantStateRef) -> Result<(), String> {
-    let spec = decode_state_spec(vault, r.spec.as_deref())?;
+    let spec = decode_state_spec(vault, r.spec.as_deref(), &r.tenant)?;
     let store = crate::state::build_state_store(&spec)
         .await
         .map_err(|e| format!("building its state store: {e}"))?;
@@ -709,9 +972,15 @@ async fn delete_state_key(vault: Option<&Vault>, r: &TenantStateRef) -> Result<(
     Ok(())
 }
 
+/// The binding context of a tenant's recorded state-store specs.
+fn state_context(tenant: &str) -> String {
+    format!("state:{tenant}")
+}
+
 fn decode_state_spec(
     vault: Option<&Vault>,
     stored: Option<&str>,
+    tenant: &str,
 ) -> Result<crate::config::StateStoreSpec, String> {
     let Some(stored) = stored else {
         return Err("its state store was not recorded (no vault key when it ran)".into());
@@ -719,7 +988,7 @@ fn decode_state_spec(
     let value = if let Some(sealed) = stored.strip_prefix("sealed:") {
         vault
             .ok_or("its store spec is sealed and this server has no vault key")?
-            .open(sealed)?
+            .open_for(sealed, &state_context(tenant))?
     } else if let Some(plain) = stored.strip_prefix("plain:") {
         serde_json::from_str(plain).map_err(|e| e.to_string())?
     } else {
@@ -731,6 +1000,8 @@ fn decode_state_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_VAULT_KEY: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
     fn a_store_error_maps_to_a_serve_error_naming_the_tenant_store() {
@@ -748,6 +1019,7 @@ mod tests {
             labels: BTreeMap::new(),
             limits: Default::default(),
             notifications: Vec::new(),
+            notifications_sealed: None,
             suspended: false,
             created_at: now,
             updated_at: now,
@@ -762,7 +1034,7 @@ mod tests {
             name: name.into(),
             provider_type: spec["type"].as_str().unwrap_or("static").into(),
             connect_provider: None,
-            sealed: vault.seal(&spec),
+            sealed: vault.seal_for(&spec, &Vault::connection_context(tenant, name)),
             status: ConnectionStatus::Active,
             reauth_reason: None,
             created_at: now,
@@ -774,11 +1046,213 @@ mod tests {
     fn state_with_vault() -> (ServerState, Arc<Vault>) {
         let state = crate::serve::test_support::test_state();
         state.set_tenants(TenantsRuntime::new(
-            Some(Vault::new("k", &[]).unwrap()),
+            Some(Vault::new(TEST_VAULT_KEY, &[]).unwrap()),
             Default::default(),
         ));
         let v = state.tenants().vault.clone().unwrap();
         (state, v)
+    }
+
+    #[tokio::test]
+    async fn over_limit_counts_runs_already_recorded_across_the_cluster() {
+        let (state, _) = state_with_vault();
+        let mut t = tenant("acme");
+        state.history().tenant_upsert(&t).await.unwrap();
+        assert!(
+            over_limit(&state, "acme").await.unwrap().is_none(),
+            "no limit"
+        );
+        t.limits.max_concurrent_runs = Some(1);
+        state.history().tenant_upsert(&t).await.unwrap();
+        for id in ["r1", "r2"] {
+            let mut rec = RunRecord::queued(id.into(), None, Default::default(), None, Utc::now());
+            rec.tenant = Some("acme".into());
+            state.history().upsert(&rec).await.unwrap();
+            state.history().tenant_run_link(id, "acme").await.unwrap();
+        }
+        let msg = over_limit(&state, "acme")
+            .await
+            .unwrap()
+            .expect("two runs, limit one");
+        assert!(msg.contains("across the cluster"), "{msg}");
+        t.limits.max_concurrent_runs = Some(5);
+        state.history().tenant_upsert(&t).await.unwrap();
+        assert!(over_limit(&state, "acme").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_token_rotated_elsewhere_is_reloaded_instead_of_marking_reauth() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let idp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=r0"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"error": "invalid_grant"})),
+            )
+            .mount(&idp)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=r1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-1", "refresh_token": "r2", "expires_in": 3600
+            })))
+            .mount(&idp)
+            .await;
+        let (state, v) = state_with_vault();
+        state
+            .history()
+            .tenant_upsert(&tenant("acme"))
+            .await
+            .unwrap();
+        let spec = |rt: &str| {
+            serde_json::json!({"type": "oauth2_refresh", "config": {
+                "token_url": format!("{}/token", idp.uri()),
+                "client_id": "c", "client_secret": "s", "refresh_token": rt
+            }})
+        };
+        state
+            .history()
+            .connection_upsert(&conn(&v, "acme", "crm", spec("r0")))
+            .await
+            .unwrap();
+        let p = connection_provider(&state, "acme", "crm", &spec("r0")).unwrap();
+        let again = connection_provider(&state, "acme", "crm", &spec("r0")).unwrap();
+        assert!(
+            Arc::ptr_eq(&p, &again),
+            "overlapping runs share one provider"
+        );
+        // Another instance rotated the token to r1 meanwhile.
+        state
+            .history()
+            .connection_upsert(&conn(&v, "acme", "crm", spec("r1")))
+            .await
+            .unwrap();
+        let cred = p.credential().await.expect("reloaded and refreshed");
+        assert!(
+            matches!(cred, Credential::Bearer(ref t) if t == "at-1"),
+            "{cred:?}"
+        );
+        let rec = state
+            .history()
+            .connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, ConnectionStatus::Active);
+        assert!(format!("{p:?}").contains("ReauthWatch"));
+        assert!(p.reauth_statuses().len() <= 2);
+        assert!(!p.provider_name().is_empty());
+
+        // A static connection has nothing to reload: revoked stays revoked.
+        let st = connection_provider(
+            &state,
+            "acme",
+            "static",
+            &serde_json::json!({"type": "static", "config": {"token": "x"}}),
+        )
+        .unwrap();
+        assert!(st.credential().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_grant_marks_reauth_when_the_stored_connection_cannot_be_reloaded() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let idp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("{\"error\":\"invalid_grant\"}"),
+            )
+            .mount(&idp)
+            .await;
+        let (state, v) = state_with_vault();
+        state
+            .history()
+            .tenant_upsert(&tenant("acme"))
+            .await
+            .unwrap();
+        let spec = serde_json::json!({"type": "oauth2_refresh", "config": {
+            "token_url": format!("{}/token", idp.uri()), "client_id": "c",
+            "client_secret": "s", "refresh_token": "rt"}});
+        let mut wrong_owner = conn(&v, "acme", "sealed-elsewhere", spec.clone());
+        wrong_owner.sealed = v.seal_for(&spec, &Vault::connection_context("other", "x"));
+        state
+            .history()
+            .connection_upsert(&wrong_owner)
+            .await
+            .unwrap();
+        let unbuildable = conn(
+            &v,
+            "acme",
+            "unbuildable",
+            serde_json::json!({"type": "nonsense", "config": {}}),
+        );
+        state
+            .history()
+            .connection_upsert(&unbuildable)
+            .await
+            .unwrap();
+        for name in ["missing", "sealed-elsewhere", "unbuildable"] {
+            let p = connection_provider(&state, "acme", name, &spec).unwrap();
+            assert!(p.credential().await.is_err(), "{name}");
+        }
+        let err = open_connection(&state.tenants(), &wrong_owner).unwrap_err();
+        assert!(format!("{err:?}").contains("sealed-elsewhere"), "{err:?}");
+    }
+
+    #[test]
+    fn masking_keeps_the_shape_and_hides_every_string_under_a_channel_config() {
+        let masked = mask_notifications(&[serde_json::json!({
+            "on": ["run_failure"],
+            "channel": {"type": "webhook", "config": {"url": "https://h/x", "headers": ["a", 3], "retries": 2}}
+        })]);
+        assert_eq!(
+            masked[0]["channel"]["config"],
+            serde_json::json!({"url": "***", "headers": ["***", 3], "retries": 2})
+        );
+        assert_eq!(masked[0]["on"][0], "run_failure");
+    }
+
+    #[tokio::test]
+    async fn sealed_notifications_without_a_vault_are_skipped() {
+        let state = crate::serve::test_support::test_state();
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let mut t = tenant("acme");
+        t.notifications_sealed =
+            Some(v.seal_for(&serde_json::json!([]), &notifications_context("acme")));
+        state.history().tenant_upsert(&t).await.unwrap();
+        notify_tenant(
+            &state,
+            "acme",
+            crate::notify::NotifyEvent::connection_needs_reauth("acme", "c", "r"),
+        )
+        .await;
+    }
+
+    #[test]
+    fn sealed_notifications_open_only_with_the_vault_and_as_a_list() {
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let mut rec = tenant("acme");
+        rec.notifications = vec![serde_json::json!({"plain": true})];
+        let none = TenantsRuntime::new(None, Default::default());
+        assert_eq!(open_notifications(&none, &rec).unwrap(), rec.notifications);
+        rec.notifications_sealed = Some(v.seal_for(
+            &serde_json::json!({"not": "a list"}),
+            &notifications_context("acme"),
+        ));
+        assert!(
+            open_notifications(&none, &rec)
+                .unwrap_err()
+                .contains("no vault key")
+        );
+        let with = TenantsRuntime::new(Some(v), Default::default());
+        assert!(
+            open_notifications(&with, &rec)
+                .unwrap_err()
+                .contains("not a list")
+        );
     }
 
     #[tokio::test]
@@ -797,7 +1271,7 @@ mod tests {
         ));
         t.suspended = false;
         state.history().tenant_upsert(&t).await.unwrap();
-        let v = Vault::new("k", &[]).unwrap();
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
         state
             .history()
             .connection_upsert(&conn(
@@ -833,7 +1307,7 @@ mod tests {
         })
         .unwrap();
         state.set_tenants(TenantsRuntime::new(
-            Some(Vault::new("k", &[]).unwrap()),
+            Some(Vault::new(TEST_VAULT_KEY, &[]).unwrap()),
             providers,
         ));
         let v = state.tenants().vault.clone().unwrap();
@@ -967,6 +1441,51 @@ mod tests {
         );
         store.delete("k").await.unwrap();
         assert!(format!("{store:?}").contains("crm"));
+    }
+
+    #[tokio::test]
+    async fn the_token_store_compare_and_sets_the_rotated_token() {
+        // #789 SERVE-16: a rotated token replaces only the one it was
+        // refreshed from; a writer that lost the race leaves the newer one.
+        let (state, v) = state_with_vault();
+        let store = ConnectionTokenStore {
+            state: state.clone(),
+            tenant: "acme".into(),
+            name: "crm".into(),
+        };
+        assert!(store.supports_compare_and_put());
+        let rt = |t: &str| serde_json::json!({"refresh_token": t});
+        assert!(!store.compare_and_put("k", None, &rt("x")).await.unwrap());
+        state
+            .history()
+            .connection_upsert(&conn(
+                &v,
+                "acme",
+                "crm",
+                serde_json::json!({"type": "oauth2_refresh", "config": {"refresh_token": "rt1"}}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compare_and_put("k", Some(&rt("rt1")), &rt("rt2"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compare_and_put("k", Some(&rt("rt1")), &rt("rt9"))
+                .await
+                .unwrap(),
+            "rt1 was already rotated away"
+        );
+        assert!(
+            !store
+                .compare_and_put("k", Some(&rt("rt2")), &serde_json::json!({"other": 1}))
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get("k").await.unwrap(), Some(rt("rt2")));
     }
 
     #[tokio::test]
@@ -1152,41 +1671,58 @@ mod tests {
         assert!(!out.contains("pw-very-secret-2"), "{out}");
         assert!(out.contains("visible-client"), "{out}");
         assert!(out.contains("https://idp.example/token"), "{out}");
+        // A short tenant "secret" is not registered, so it cannot mask a
+        // common word for everyone.
+        register_secrets(&serde_json::json!({"config": {"token": "https"}}));
+        assert_eq!(
+            crate::secrets::registry::redact("https://x").into_owned(),
+            "https://x"
+        );
     }
 
     #[test]
     fn state_specs_decode_or_explain() {
-        let v = Vault::new("k", &[]).unwrap();
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
         let spec = serde_json::json!({"type": "file", "config": {"path": "/tmp/x"}});
-        let sealed = format!("sealed:{}", v.seal(&spec));
+        let sealed = format!("sealed:{}", v.seal_for(&spec, &state_context("t")));
         assert_eq!(
-            decode_state_spec(Some(&v), Some(&sealed)).unwrap().kind,
+            decode_state_spec(Some(&v), Some(&sealed), "t")
+                .unwrap()
+                .kind,
             "file"
         );
         assert!(
-            decode_state_spec(None, Some(&sealed))
+            decode_state_spec(Some(&v), Some(&sealed), "other")
+                .unwrap_err()
+                .contains("another owner")
+        );
+        assert!(
+            decode_state_spec(None, Some(&sealed), "t")
                 .unwrap_err()
                 .contains("no vault key")
         );
         let plain = format!("plain:{spec}");
-        assert_eq!(decode_state_spec(None, Some(&plain)).unwrap().kind, "file");
+        assert_eq!(
+            decode_state_spec(None, Some(&plain), "t").unwrap().kind,
+            "file"
+        );
         assert!(
-            decode_state_spec(None, None)
+            decode_state_spec(None, None, "t")
                 .unwrap_err()
                 .contains("not recorded")
         );
         assert!(
-            decode_state_spec(None, Some("other"))
+            decode_state_spec(None, Some("other"), "t")
                 .unwrap_err()
                 .contains("unrecognized")
         );
         assert!(
-            decode_state_spec(None, Some("plain:{"))
+            decode_state_spec(None, Some("plain:{"), "t")
                 .unwrap_err()
                 .contains("EOF")
         );
         assert!(
-            decode_state_spec(None, Some("plain:{\"x\":1}"))
+            decode_state_spec(None, Some("plain:{\"x\":1}"), "t")
                 .unwrap_err()
                 .contains("stored state spec")
         );

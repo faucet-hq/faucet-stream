@@ -78,13 +78,25 @@ pub enum MssqlTlsMode {
 }
 
 /// Parsed parts of a `mssql://` connection URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConnectionParts {
     pub host: String,
     pub port: u16,
     pub database: Option<String>,
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for ConnectionParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionParts")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 impl MssqlConnectionConfig {
@@ -243,5 +255,17 @@ mod tests {
         assert_eq!(quote_ident_mssql("dbo.events").unwrap(), "[dbo.events]");
         assert_eq!(quote_ident_mssql("we[i]rd").unwrap(), "[we[i]]rd]");
         assert!(quote_ident_mssql("bad\0name").is_err());
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn connection_parts_debug_masks_the_password() {
+        let parts = parse_connection_url("mssql://sa:S3CRET-1@h:1433/db").unwrap();
+        let dbg = format!("{parts:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

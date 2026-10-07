@@ -27,6 +27,7 @@ fn free_port() -> u16 {
 const AUTH_CONFIG: &str = "principals:\n\
     \x20 - { name: alice, token: admin-tok, role: admin }\n\
     \x20 - { name: bob, token: op-tok, role: operator }\n\
+    \x20 - { name: carol, token: view-tok, role: viewer }\n\
     \x20 - { name: acme-app, token: acme-tok, role: operator, tenant: acme }\n";
 
 fn serve_args(
@@ -78,7 +79,7 @@ fn serve_args(
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
-        vault_key: Some("test-vault-key".into()),
+        vault_key: Some("test-vault-key-0123456789abcdef0123".into()),
         vault_previous_key: Vec::new(),
         connect_providers: Some(providers),
         allow_subprocess_connectors: false,
@@ -400,6 +401,46 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     assert_eq!(acme_runs.len(), 2, "{page}");
     assert!(acme_runs.iter().all(|r| r["tenant"] == "acme"));
 
+    // A retried keyed fan-out replays every tenant's run (#789 SERVE-36).
+    let keyed = json!({"tenants": "all", "idempotency_key": "fan-1"});
+    let (_, first) = api
+        .post(
+            "op-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            keyed.clone(),
+        )
+        .await;
+    let (_, again) = api
+        .post("op-tok", &format!("/v1/templates/{id}/fanout"), keyed)
+        .await;
+    assert_eq!(first["fanout_id"], again["fanout_id"], "{again}");
+    for (a, b) in first["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(again["results"].as_array().unwrap())
+    {
+        assert_eq!(b["status"], "submitted", "{again}");
+        assert_eq!(a["run_id"], b["run_id"], "{again}");
+        api.wait_run(a["run_id"].as_str().unwrap()).await;
+    }
+    // The same key with another payload is a failure, not a skip.
+    let (_, other) = api
+        .post(
+            "op-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            json!({"tenants": "all", "idempotency_key": "fan-1", "labels": {"x": "y"}}),
+        )
+        .await;
+    assert!(
+        other["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["status"] == "failed"),
+        "{other}"
+    );
+
     // ── Tenant-scoped principal ────────────────────────────────────────────
     let (_, mine) = api.get("acme-tok", "/v1/runs").await;
     assert!(
@@ -420,6 +461,15 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     let (code, tenants) = api.get("acme-tok", "/v1/tenants").await;
     assert_eq!(code, 200);
     assert_eq!(tenants.as_array().unwrap().len(), 1);
+    // The rows endpoint shows a tenant its own state and runs, read under
+    // its namespace and filtered by tenant (#789 SERVE-31).
+    let (code, rows) = api
+        .get("acme-tok", &format!("/v1/templates/{id}/rows"))
+        .await;
+    assert_eq!(code, 200, "{rows}");
+    let row_state = &rows["rows"][0]["state"];
+    assert!(row_state["last_success"].is_string(), "{rows}");
+    assert!(!rows.to_string().contains("state omitted"), "{rows}");
     let (code, _) = api.get("acme-tok", "/v1/audit").await;
     assert_eq!(code, 403);
     // An operator-level route outside the tenant's scope is refused for the
@@ -873,6 +923,26 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     }
 
     // ── Delete cascade ─────────────────────────────────────────────────────
+    #[cfg(feature = "catalog")]
+    let acme_edges = |lineage: &serde_json::Value| -> usize {
+        lineage["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["pipeline"].as_str().unwrap_or("").starts_with("acme::"))
+            .count()
+    };
+    #[cfg(feature = "catalog")]
+    {
+        let (_, u) = api
+            .get("admin-tok", "/v1/usage?tenant=acme&include_records=true")
+            .await;
+        assert!(!u["records"].as_array().unwrap().is_empty(), "{u}");
+        // A tenant run's catalog rows are recorded under its namespace
+        // (#789 SERVE-51).
+        let (_, lineage) = api.get("admin-tok", "/v1/catalog/lineage").await;
+        assert!(acme_edges(&lineage) >= 1, "{lineage}");
+    }
     let (code, report) = api
         .send(
             reqwest::Method::DELETE,
@@ -887,6 +957,23 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         report["state_keys_deleted"].as_u64().unwrap() >= 1,
         "{report}"
     );
+    // Usage rows are keyed by invocation id; they go with the tenant
+    // (#789 SERVE-30).
+    #[cfg(feature = "catalog")]
+    {
+        assert!(report["usage_records"].as_u64().unwrap() >= 1, "{report}");
+        let (_, u) = api
+            .get("admin-tok", "/v1/usage?tenant=acme&include_records=true")
+            .await;
+        assert!(u["records"].as_array().unwrap().is_empty(), "{u}");
+        assert!(report["catalog_edges"].as_u64().unwrap() >= 1, "{report}");
+        assert!(
+            report["catalog_datasets"].as_u64().unwrap() >= 1,
+            "{report}"
+        );
+        let (_, lineage) = api.get("admin-tok", "/v1/catalog/lineage").await;
+        assert_eq!(acme_edges(&lineage), 0, "{lineage}");
+    }
     let (code, _) = api.get("admin-tok", "/v1/tenants/acme").await;
     assert_eq!(code, 404);
     let (_, page) = api.get("admin-tok", "/v1/runs?tenant=acme").await;
@@ -1095,4 +1182,135 @@ async fn a_tenant_over_its_concurrency_limit_is_refused_with_429() {
         .post("admin-tok", &format!("/v1/runs/{run_id}/cancel"), json!({}))
         .await;
     assert!(code == 202 || code == 200, "cancel returned {code}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_notification_secrets_are_sealed_and_masked_and_run_credentials_are_hidden() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("h.db");
+    let api = spawn(
+        dir.path(),
+        Some(format!("sqlite:{}", db.display())),
+        "http://127.0.0.1:9",
+    )
+    .await;
+    let rule = json!({"name": "ops", "on": ["connection_needs_reauth"],
+        "channel": {"type": "webhook", "config": {
+            "url": "https://hooks.example/abc-secret-path", "hmac_secret": "hmac-s3cret"}}});
+    let (code, t) = api
+        .post(
+            "admin-tok",
+            "/v1/tenants",
+            json!({"id": "acme", "notifications": [rule]}),
+        )
+        .await;
+    assert_eq!(code, 201, "{t}");
+    for tok in ["admin-tok", "view-tok"] {
+        let (code, t) = api.get(tok, "/v1/tenants/acme").await;
+        assert_eq!(code, 200, "{t}");
+        let text = t.to_string();
+        assert!(
+            !text.contains("abc-secret-path") && !text.contains("hmac-s3cret"),
+            "{text}"
+        );
+        assert_eq!(
+            t["notifications"][0]["channel"]["config"]["hmac_secret"],
+            "***"
+        );
+        assert_eq!(t["notifications"][0]["name"], "ops");
+        assert!(t.get("notifications_sealed").is_none(), "{t}");
+    }
+    // A tenant principal may not override a template's environment (SERVE-23).
+    let (code, r) = api
+        .post(
+            "acme-tok",
+            "/v1/tenants/acme/templates/any/runs",
+            json!({"env": {"API_HOST": "elsewhere"}}),
+        )
+        .await;
+    assert_eq!(code, 403, "{r}");
+    let (_, list) = api.get("view-tok", "/v1/tenants").await;
+    assert!(!list.to_string().contains("hmac-s3cret"));
+    let (code, _) = api
+        .send(
+            reqwest::Method::PATCH,
+            "admin-tok",
+            "/v1/tenants/acme",
+            Some(json!({"notifications": [{"name": "bad"}]})),
+        )
+        .await;
+    assert_eq!(code, 400);
+    // A run whose tenant mapping cannot be written is not recorded at all
+    // (#789 SERVE-29): no stranded `queued` record behind a 500.
+    {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db.display()))
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE faucet_tenant_runs")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+    let cfg = format!(
+        "version: 1\nname: linkfail\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: http://127.0.0.1:9\n      path: /x\n  sink:\n    type: jsonl\n    config:\n      path: {}/l.jsonl\n",
+        dir.path().display()
+    );
+    let (code, r) = api
+        .post("op-tok", "/v1/tenants/acme/runs", json!({ "config": cfg }))
+        .await;
+    assert_eq!(code, 500, "{r}");
+    let (_, page) = api.get("admin-tok", "/v1/runs").await;
+    assert!(
+        !page.to_string().contains("linkfail"),
+        "no record was written: {page}"
+    );
+    drop(api);
+    let conn = rusqlite_free_read(&db, "acme");
+    assert!(
+        !conn.contains("hmac-s3cret") && !conn.contains("abc-secret-path"),
+        "{conn}"
+    );
+
+    let api = spawn(dir.path(), None, "http://127.0.0.1:9").await;
+    let cfg = format!(
+        "version: 1\nname: cb\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: http://127.0.0.1:9\n      path: /x\n  sink:\n    type: jsonl\n    config:\n      path: {}/o.jsonl\n",
+        dir.path().display()
+    );
+    let (code, sub) = api
+        .post(
+            "op-tok",
+            "/v1/runs",
+            json!({"config": cfg, "callback": {"url": "https://user:pw@cb.example/done",
+                "headers": {"Authorization": "Bearer cb-token"}}}),
+        )
+        .await;
+    assert_eq!(code, 202, "{sub}");
+    let id = sub["run_id"].as_str().unwrap();
+    api.wait_run(id).await;
+    for tok in ["view-tok", "admin-tok"] {
+        let (_, rec) = api.get(tok, &format!("/v1/runs/{id}")).await;
+        let text = rec.to_string();
+        assert!(
+            !text.contains("cb-token") && !text.contains("pw@"),
+            "{text}"
+        );
+        assert_eq!(rec["callback"]["headers"]["Authorization"], "***");
+        let (_, page) = api.get(tok, "/v1/runs").await;
+        assert!(!page.to_string().contains("cb-token"));
+    }
+}
+
+/// Every row of the SQLite tenants table as text, read without the server.
+fn rusqlite_free_read(db: &std::path::Path, needle_tenant: &str) -> String {
+    let mut bytes = std::fs::read(db).unwrap();
+    if let Ok(wal) = std::fs::read(db.with_extension("db-wal")) {
+        bytes.extend(wal);
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        text.contains(needle_tenant),
+        "tenant row missing from the database"
+    );
+    text
 }

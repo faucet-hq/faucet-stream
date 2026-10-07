@@ -65,6 +65,9 @@ impl MysqlCdcSource {
         config.validate()?;
 
         let opts = build_opts(&config)?;
+        if let Some(warning) = tls_warning(&opts) {
+            tracing::warn!(server_id = config.server_id, "mysql-cdc: {warning}");
+        }
         let key = state_key(config.server_id);
 
         // Preflight: open + query + drop a throwaway connection.
@@ -960,6 +963,22 @@ fn build_opts(config: &MysqlCdcSourceConfig) -> Result<Opts, FaucetError> {
     Ok(OptsBuilder::from_opts(base).ssl_opts(ssl).into())
 }
 
+/// What is weak about the replication connection's TLS, if anything
+/// (#789 SUPPLY-06).
+fn tls_warning(opts: &Opts) -> Option<&'static str> {
+    match opts.ssl_opts() {
+        None => Some(
+            "the replication connection is plaintext — credentials and every row change travel \
+             unencrypted; set `tls.mode` or `require_ssl=true` in connection_url",
+        ),
+        Some(ssl) if ssl.accept_invalid_certs() => Some(
+            "TLS without certificate verification (`require`) — use `verify_full` to \
+             authenticate the server",
+        ),
+        Some(_) => None,
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Preflight helpers
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1550,6 +1569,31 @@ mod tests {
         }))
         .unwrap();
         assert!(build_opts(&config).is_ok());
+    }
+
+    #[test]
+    fn weak_tls_is_reported_and_the_url_ssl_mode_is_kept() {
+        let opts = |url: &str, tls: Value| {
+            build_opts(
+                &serde_json::from_value(json!({
+                    "connection_url": url, "server_id": 7, "tls": tls
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let plain = opts("mysql://r:p@h:3306/db", json!({"mode": "disable"}));
+        assert!(tls_warning(&plain).unwrap().contains("plaintext"));
+        let required = opts("mysql://r:p@h:3306/db", json!({"mode": "require"}));
+        assert!(tls_warning(&required).unwrap().contains("verification"));
+        let verified = opts("mysql://r:p@h:3306/db", json!({"mode": "verify_full"}));
+        assert!(tls_warning(&verified).is_none());
+        // An omitted `tls:` keeps what the URL asks for.
+        let from_url = opts(
+            "mysql://r:p@h:3306/db?require_ssl=true",
+            json!({"mode": "disable"}),
+        );
+        assert!(tls_warning(&from_url).is_none());
     }
 
     #[test]

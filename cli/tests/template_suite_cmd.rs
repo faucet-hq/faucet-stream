@@ -185,3 +185,38 @@ fn schema_template_test_prints_the_suite_schema() {
         .success()
         .stdout(contains("\"suite\""));
 }
+
+/// A file-based suite resolves `${env:}` in the template (a typed param's
+/// default included) before binding, like a real run (CLI-121).
+#[test]
+fn a_file_suite_resolves_env_defaults_before_binding() {
+    let dir = TempDir::new().unwrap();
+    let template = dir.path().join("tpl.yaml");
+    fs::write(
+        &template,
+        r#"
+version: 1
+params:
+  page: { type: int, default: "${env:FAUCET_SUITE_TEST_PAGE}" }
+pipeline:
+  source: { type: csv, config: { path: "./in.csv", batch_size: "${param.page}" } }
+  sink:   { type: jsonl, config: { path: ./out.jsonl } }
+"#,
+    )
+    .unwrap();
+    let suite = dir.path().join("suite.yaml");
+    fs::write(
+        &suite,
+        format!(
+            "version: 1\ntemplate: {}\nsuite:\n  cases:\n    - name: defaults\n",
+            template.display()
+        ),
+    )
+    .unwrap();
+    faucet()
+        .env("FAUCET_SUITE_TEST_PAGE", "250")
+        .arg(&suite)
+        .assert()
+        .success()
+        .stdout(contains("1 case(s): 1 passed, 0 failed"));
+}

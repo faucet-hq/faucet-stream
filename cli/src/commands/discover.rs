@@ -385,11 +385,17 @@ fn render_discovered_config(
             .estimated_rows
             .map(|n| format!(", ~{n} rows"))
             .unwrap_or_default();
-        doc.push_str(&format!("  # {} ({}{})\n", d.name, d.kind, est));
+        doc.push_str(&format!(
+            "  # {} ({}{})\n",
+            comment_safe(&d.name),
+            comment_safe(&d.kind),
+            est
+        ));
         if let Some(summary) = d.schema.as_ref().and_then(|s| schema_summary(s, 12)) {
-            doc.push_str(&format!("  #   columns: {summary}\n"));
+            doc.push_str(&format!("  #   columns: {}\n", comment_safe(&summary)));
         }
-        let mut row = json!({ "id": id, "source": { "config": d.config_patch } });
+        let mut row =
+            json!({ "id": id, "source": { "config": inert_directives(d.config_patch.clone()) } });
         // Cost hint for `execution.schedule: lpt` (#644). Discovery is the one
         // place that knows both halves, so it is where the estimate belongs —
         // the executor just ranks by it.
@@ -424,7 +430,11 @@ fn render_discovered_config(
             if let Some(s) = sink_template {
                 sink["ref"] = json!(s);
             }
-            let mut config = d.sink_patch.clone().unwrap_or_else(|| json!({}));
+            let mut config = d
+                .sink_patch
+                .clone()
+                .map(inert_directives)
+                .unwrap_or_else(|| json!({}));
             if let Some(patch) = own_destination {
                 crate::merge::merge_value(&mut config, patch);
             }
@@ -436,6 +446,31 @@ fn render_discovered_config(
         doc.push_str(&yaml_seq_item(&row)?);
     }
     Ok(doc)
+}
+
+/// Dataset metadata as YAML-comment text: a newline (or any control
+/// character) would end the comment and let a dataset name inject config.
+fn comment_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Escape every `${` in values (and keys) that came from the discovered
+/// datasets to `$${`, so a dataset named `${file:…}` is written as text, never
+/// as a live directive when the generated config is run.
+fn inert_directives(v: Value) -> Value {
+    let esc = |s: String| s.replace("${", "$${");
+    match v {
+        Value::String(s) => Value::String(esc(s)),
+        Value::Array(items) => Value::Array(items.into_iter().map(inert_directives).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (esc(k), inert_directives(v)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// The sink template a generated row writes through — the `--sink` template,
@@ -601,6 +636,29 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn hostile_dataset_metadata_cannot_inject_config_or_directives() {
+        let datasets = vec![
+            ds(
+                "evil\nmatrix: []\n#",
+                "table",
+                json!({"prefix": "${file:/etc/passwd}", "${env:HOME}": "x"}),
+            )
+            .with_schema(json!({
+                "type": "object",
+                "properties": {"a\nb: 1": {"type": "integer"}}
+            })),
+        ];
+        let doc = render_discovered_config(RAW, "default", None, &datasets).unwrap();
+        assert!(doc.contains("# evil matrix: [] # (table)"), "{doc}");
+        assert!(doc.contains("$${file:/etc/passwd}"), "{doc}");
+        assert!(doc.contains("$${env:HOME}"), "{doc}");
+        let cfg = crate::config::parse_with_extension(&doc, "yaml").unwrap();
+        let nodes = crate::expand::expand(&cfg).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].source.config["prefix"], "${file:/etc/passwd}");
+    }
 
     fn ds(name: &str, kind: &str, patch: Value) -> DatasetDescriptor {
         DatasetDescriptor::new(name, kind, patch)

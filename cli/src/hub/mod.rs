@@ -243,6 +243,9 @@ pub struct HubSides {
     pub source: Vec<ResolvedHub>,
     pub sink: Vec<ResolvedHub>,
     pub overlay: Vec<ResolvedHub>,
+    /// Owners or template ids (`--trust`) whose hub templates may read the
+    /// operator's environment, files or secrets; `*` trusts every one.
+    pub trusted: Vec<String>,
 }
 
 /// A side's own `--source-hub` / `--sink-hub` / `--overlay-hub` wins;
@@ -273,6 +276,7 @@ pub async fn resolve_sides(
         source: side(source_hub, &shared).await?,
         sink: side(sink_hub, &shared).await?,
         overlay: side(overlay_hub, &shared).await?,
+        trusted: Vec::new(),
     })
 }
 
@@ -349,15 +353,87 @@ pub async fn compose_across(
     let (sink_file, sink_hub) = locate_in(sink, &sides.sink, catalog::SINK_DIR).await?;
     let s = parse_source_file(&source_file)?;
     let k = parse_sink_file(&sink_file)?;
+    if source_hub.is_some() {
+        refuse_untrusted_directives(&source_file, &s.id(), s.is_official(), &sides.trusted)?;
+    }
+    if sink_hub.is_some() {
+        refuse_untrusted_directives(&sink_file, &k.id(), k.is_official(), &sides.trusted)?;
+    }
     let mut c = compose(&s, &k)?;
     c.source_hub = source_hub;
     c.sink_hub = sink_hub;
     if let Some(o) = overlay {
         let (file, hub) = locate_in(o, &sides.overlay, DEPLOYMENT_DIR).await?;
-        c = c.apply_overlay(&parse_deployment_file(&file)?)?;
+        let d = parse_deployment_file(&file)?;
+        if hub.is_some() {
+            let official = d.owner.as_deref() == Some(spec::OFFICIAL_OWNER);
+            refuse_untrusted_directives(&file, &d.id(), official, &sides.trusted)?;
+        }
+        c = c.apply_overlay(&d)?;
         c.overlay_hub = hub;
     }
     Ok(c)
+}
+
+/// Directive schemes that read the operator's environment, files or secrets.
+const OPERATOR_DIRECTIVES: &[&str] = &[
+    "env", "file", "secret", "vault", "aws-sm", "gcp-sm", "azure-kv",
+];
+
+/// A hub template not maintained by the hub itself (`faucet-hq`) may not read
+/// the operator's environment, files or secrets — a community template could
+/// otherwise send `~/.aws/credentials` to a URL it controls. Credentials reach
+/// such a template through its params (`--param` / `--param-env`), or the
+/// operator trusts it with `--trust <owner|id>`.
+fn refuse_untrusted_directives(
+    path: &Path,
+    id: &str,
+    official: bool,
+    trusted: &[String],
+) -> CliResult<()> {
+    let owner = id.split_once('/').map(|(o, _)| o);
+    if official
+        || trusted
+            .iter()
+            .any(|t| t == "*" || t == id || Some(t.as_str()) == owner)
+    {
+        return Ok(());
+    }
+    let doc = parse_untyped(&read(path)?, path)?;
+    let mut found = None;
+    visit_strings(&doc, &mut |s| {
+        if found.is_none() {
+            found = crate::interpolate::iter_directives(s).find_map(|(token, dir)| match dir {
+                crate::interpolate::Directive::LoadTime { prefix, .. }
+                    if OPERATOR_DIRECTIVES.contains(&prefix) =>
+                {
+                    Some(token.to_string())
+                }
+                _ => None,
+            });
+        }
+    });
+    match found {
+        None => Ok(()),
+        Some(token) => Err(CliError::Config(format!(
+            "hub template '{id}' uses `{token}`, which reads this machine's environment, files \
+             or secrets; a community template may not do that unless you trust it. Supply the \
+             value with --param / --param-env, or pass --trust {} after reviewing it",
+            owner.unwrap_or(id)
+        ))),
+    }
+}
+
+fn visit_strings(v: &Value, f: &mut impl FnMut(&str)) {
+    match v {
+        Value::String(s) => f(s),
+        Value::Array(items) => items.iter().for_each(|i| visit_strings(i, f)),
+        Value::Object(map) => map.iter().for_each(|(k, v)| {
+            f(k);
+            visit_strings(v, f);
+        }),
+        _ => {}
+    }
 }
 
 /// Resolve one hub location to a local directory.

@@ -47,6 +47,20 @@ pub struct CatalogHandle {
     /// Dataset annotations from the `catalog.datasets:` block (#707), merged
     /// into each matching dataset after its observation is recorded.
     pub annotations: Vec<spec::DatasetAnnotationSpec>,
+    /// The tenant a `faucet serve` run belongs to (#709). Its catalog rows
+    /// are recorded under `{tenant}::{pipeline}`, the same namespace its
+    /// state keys use, so deleting the tenant can purge them (#789 SERVE-51).
+    pub tenant: Option<String>,
+}
+
+impl CatalogHandle {
+    /// The pipeline name catalog rows are recorded under.
+    pub fn scoped_pipeline(&self, pipeline: &str) -> String {
+        match &self.tenant {
+            Some(t) => format!("{t}::{pipeline}"),
+            None => pipeline.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Debug for CatalogHandle {
@@ -78,6 +92,7 @@ pub async fn connect_from_spec(spec: &CatalogSpec) -> CliResult<CatalogHandle> {
         run_id: None,
         sample_records: spec.sample_records,
         annotations: spec.datasets.clone(),
+        tenant: None,
     })
 }
 
@@ -99,6 +114,16 @@ fn parse_url(url: &str) -> CliResult<HistoryBackendSpec> {
 /// Persist one run's catalog update. Monitoring must never take down the run
 /// it observes: any backend error is logged once per call and swallowed.
 pub async fn record(handle: &CatalogHandle, update: &CatalogUpdate) {
+    let scoped;
+    let update = if handle.tenant.is_some() {
+        scoped = CatalogUpdate {
+            pipeline: handle.scoped_pipeline(&update.pipeline),
+            ..update.clone()
+        };
+        &scoped
+    } else {
+        update
+    };
     if let Err(e) = handle.store.catalog_record(update).await {
         tracing::warn!(
             pipeline = %update.pipeline,
@@ -144,6 +169,16 @@ pub async fn record_profile(
     dataset_id: &str,
     record: &crate::serve::history::catalog::CatalogProfileRecord,
 ) {
+    let scoped;
+    let record = if handle.tenant.is_some() {
+        scoped = crate::serve::history::catalog::CatalogProfileRecord {
+            pipeline: handle.scoped_pipeline(&record.pipeline),
+            ..record.clone()
+        };
+        &scoped
+    } else {
+        record
+    };
     if let Err(e) = handle
         .store
         .catalog_record_profile(dataset_id, record)
@@ -161,6 +196,16 @@ pub async fn record_profile(
 /// Persist the latest resolved+expanded config snapshot for `faucet plan --diff`
 /// (#374). Best-effort, same never-fails-the-run contract as [`record`].
 pub async fn record_config_snapshot(handle: &CatalogHandle, snapshot: &ConfigSnapshot) {
+    let scoped;
+    let snapshot = if handle.tenant.is_some() {
+        scoped = ConfigSnapshot {
+            pipeline: handle.scoped_pipeline(&snapshot.pipeline),
+            ..snapshot.clone()
+        };
+        &scoped
+    } else {
+        snapshot
+    };
     if let Err(e) = handle.store.catalog_record_config_snapshot(snapshot).await {
         tracing::warn!(
             pipeline = %snapshot.pipeline,
@@ -229,5 +274,90 @@ mod tests {
         let dbg = format!("{handle:?}");
         assert!(dbg.contains("sample_records: 7"), "{dbg}");
         assert!(dbg.contains(".."), "non-exhaustive marker expected: {dbg}");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_handle_records_under_its_namespace() {
+        use crate::serve::history::catalog::{
+            CatalogProfileRecord, DatasetObservation, DatasetRole, dataset_id,
+        };
+        let mut handle = connect_from_spec(&CatalogSpec {
+            url: "memory".into(),
+            sample_records: 7,
+            datasets: Vec::new(),
+        })
+        .await
+        .unwrap();
+        handle.tenant = Some("acme".into());
+        assert_eq!(handle.scoped_pipeline("p"), "acme::p");
+        let obs = |uri: &str, role| DatasetObservation {
+            uri: uri.into(),
+            kind: "csv".into(),
+            role,
+            schema: None,
+            records: 1,
+        };
+        record(
+            &handle,
+            &CatalogUpdate {
+                run_id: "r".into(),
+                pipeline: "p".into(),
+                row: "default".into(),
+                recorded_at: chrono::Utc::now(),
+                sources: vec![obs("csv://in", DatasetRole::Source)],
+                sink: obs("csv://out", DatasetRole::Sink),
+                column_lineage: None,
+            },
+        )
+        .await;
+        let edges = handle.store.catalog_lineage(None, 3).await.unwrap();
+        assert_eq!(edges[0].pipeline, "acme::p");
+        let mut profiler = faucet_core::Profiler::new(faucet_core::ProfilingSpec::default());
+        profiler.observe_page(&[serde_json::json!({"a": 1})]);
+        record_profile(
+            &handle,
+            &dataset_id("csv://out"),
+            &CatalogProfileRecord {
+                run_id: "r".into(),
+                pipeline: "p".into(),
+                row: "default".into(),
+                recorded_at: chrono::Utc::now(),
+                profile: profiler.finish(),
+                drift: Vec::new(),
+                baseline_runs: 0,
+            },
+        )
+        .await;
+        let profiles = handle
+            .store
+            .catalog_profile_history(&dataset_id("csv://out"), 5)
+            .await
+            .unwrap();
+        assert_eq!(profiles[0].pipeline, "acme::p");
+        record_config_snapshot(
+            &handle,
+            &ConfigSnapshot {
+                pipeline: "p".into(),
+                recorded_at: chrono::Utc::now(),
+                faucet_version: "t".into(),
+                rows: Default::default(),
+            },
+        )
+        .await;
+        let store = &handle.store;
+        assert!(
+            store
+                .catalog_last_config_snapshot("p")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .catalog_last_config_snapshot("acme::p")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

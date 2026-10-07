@@ -33,6 +33,18 @@ pub fn destructive_read_refusal(kind: &str, command: &str) -> String {
     )
 }
 
+/// Apply every rule of a config's `masking:` policy to previewed records — a
+/// preview has no destination, so `applies_to` scoping does not narrow it,
+/// as in `faucet test`.
+#[cfg(feature = "masking")]
+pub fn mask(records: Vec<Value>, spec: Option<&faucet_core::MaskingSpec>) -> CliResult<Vec<Value>> {
+    let Some(spec) = spec else {
+        return Ok(records);
+    };
+    let compiled = faucet_core::CompiledMasking::compile(spec)?;
+    Ok(faucet_core::apply_masking(records, &compiled).records)
+}
+
 /// Read pages from `source`, transform each, and stop once `limit` records
 /// are collected or `timeout` passes. A source error ends the preview with
 /// that error. A source that consumes destructively is refused before any
@@ -76,6 +88,20 @@ pub async fn sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "masking")]
+    #[test]
+    fn mask_applies_every_rule_and_passes_through_without_a_policy() {
+        let spec: faucet_core::MaskingSpec = serde_json::from_value(serde_json::json!({
+            "rules": [{ "name": "e", "match": { "fields": ["email"] },
+                        "action": { "type": "redact" }, "applies_to": ["nowhere"] }]
+        }))
+        .unwrap();
+        let rows = vec![serde_json::json!({"email": "a@b.co", "id": 1})];
+        let masked = mask(rows.clone(), Some(&spec)).unwrap();
+        assert_eq!(masked[0]["email"], "***");
+        assert_eq!(mask(rows.clone(), None).unwrap(), rows);
+    }
     use faucet_core::{FaucetError, StreamPage};
     use futures::Stream;
     use serde_json::json;

@@ -701,10 +701,15 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
     )
     .await
     .map_err(|e| e.to_string())?;
+    #[cfg(feature = "masking")]
+    let records = crate::preview_sample::mask(sample.records, first_root.masking.as_ref())
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "masking"))]
+    let records = sample.records;
     let mut doc = json!({
         "row": first_root.id,
-        "count": sample.records.len(),
-        "records": sample.records,
+        "count": records.len(),
+        "records": records,
     });
     if sample.timed_out {
         doc["timed_out"] = Value::Bool(true);
@@ -742,6 +747,30 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
         return Ok(report);
     }
 
+    if let Some(server) = &ctx.server {
+        let mut req = json!({
+            "config": text,
+            "config_format": args.get("config_format").cloned().unwrap_or(json!("yaml")),
+        });
+        for key in ["name", "labels", "timeout_secs", "clock", "selection"] {
+            if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
+                req[key] = v.clone();
+            }
+        }
+        let req: crate::serve::runner::SubmitRequest =
+            serde_json::from_value(req).map_err(|e| format!("invalid arguments: {e}"))?;
+        let outcome =
+            crate::serve::runner::submit_gated(server.state.clone(), req, server.actor.clone())
+                .await
+                .map_err(|e| e.api_error().error.message)?;
+        return Ok(pretty(&match outcome {
+            crate::serve::runner::SubmitOutcome::Accepted(r) => json!(r),
+            crate::serve::runner::SubmitOutcome::PendingApproval(c) => {
+                crate::serve::runner::pending_approval_body(&c)
+            }
+        }));
+    }
+
     let summary = crate::run_from_yaml_str_selected(text, selection.as_ref())
         .await
         .map_err(|e| e.to_string())?;
@@ -761,6 +790,16 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
         ));
     }
     Ok(pretty(&doc))
+}
+
+#[cfg(feature = "templates")]
+/// Who a lifecycle change is attributed to: the calling principal on
+/// `faucet serve --mcp` (#789 SERVE-32), `mcp` on the local stdio transport.
+fn actor_name(ctx: &McpContext) -> String {
+    ctx.server
+        .as_ref()
+        .map(|s| s.actor.principal.clone())
+        .unwrap_or_else(|| "mcp".to_string())
 }
 
 fn pretty(v: &Value) -> String {
@@ -893,7 +932,7 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
                 .map(str::to_string),
             tags: tags_arg(args)?,
             launch: args.get("launch").and_then(Value::as_bool).unwrap_or(false),
-            created_by: Some("mcp".to_string()),
+            created_by: Some(actor_name(ctx)),
         },
     )
     .await
@@ -912,7 +951,7 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
         None | Some(Value::Null) => VersionSelector::newest(),
         Some(_) => version_arg(args)?,
     };
-    let outcome = crate::templates::launch(store, id, target, Some("mcp"))
+    let outcome = crate::templates::launch(store, id, target, Some(&actor_name(ctx)))
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
@@ -928,7 +967,7 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
 async fn rollback_template(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let store = template_store(ctx)?;
     let id = str_arg(args, "id")?;
-    let outcome = crate::templates::rollback(store, id, Some("mcp"))
+    let outcome = crate::templates::rollback(store, id, Some(&actor_name(ctx)))
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
@@ -947,7 +986,7 @@ async fn deprecate_template(ctx: &McpContext, args: &Value) -> Result<String, St
         .get("reason")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let status = crate::templates::set_deprecated(store, id, reason, Some("mcp"), !undo)
+    let status = crate::templates::set_deprecated(store, id, reason, Some(&actor_name(ctx)), !undo)
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({ "id": id, "status": status.as_str() })))
@@ -974,6 +1013,10 @@ async fn list_template_rows(ctx: &McpContext, args: &Value) -> Result<String, St
         None => None,
     };
     let selection = selection_arg(args)?;
+    let tenant = match ctx.server.as_ref().and_then(|s| s.actor.tenant.as_deref()) {
+        Some(t) => Some(crate::templates::rows::tenant_values(store, t).await),
+        None => None,
+    };
     let report = crate::templates::rows::list_rows(
         store,
         crate::templates::rows::RowsQuery {
@@ -983,6 +1026,7 @@ async fn list_template_rows(ctx: &McpContext, args: &Value) -> Result<String, St
             overlay: None,
             selection: selection.as_ref(),
             state: true,
+            tenant: tenant.as_ref(),
         },
     )
     .await
@@ -1040,6 +1084,9 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         },
     };
     let selection = selection_arg(args)?;
+    if !dry_run && let Some(server) = &ctx.server {
+        return run_template_on_server(server, id, version, supplied, env, sink, selection).await;
+    }
     let materialized = crate::templates::materialize_for_run_selected(
         store,
         id,
@@ -1113,6 +1160,54 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         ));
     }
     Ok(pretty(&doc))
+}
+
+/// `run_template` on `faucet serve --mcp`: the same path as
+/// `POST /v1/templates/{id}/runs`, as the calling principal.
+#[cfg(feature = "templates")]
+async fn run_template_on_server(
+    server: &crate::mcp::ChangeProposer,
+    id: &str,
+    version: u32,
+    supplied: crate::params::SuppliedParams,
+    env: std::collections::BTreeMap<String, String>,
+    sink: crate::templates::SinkChoice,
+    selection: Option<crate::select::SelectionRequest>,
+) -> Result<String, String> {
+    use crate::serve::handlers::templates::{
+        OverlayRef, TriggerBody, TriggerOutcome, trigger_template_outcome,
+    };
+    use crate::serve::history::templates::VersionSelector;
+    let (overlay, overlay_version) = match sink.overlay {
+        Some(crate::templates::OverlayChoice::Registered { id, version }) => {
+            (Some(OverlayRef::Id(id)), Some(version))
+        }
+        Some(crate::templates::OverlayChoice::Inline(v)) => (Some(OverlayRef::Inline(v)), None),
+        None => (None, None),
+    };
+    let body = TriggerBody {
+        params: supplied.into_iter().collect(),
+        env,
+        version: Some(VersionSelector::Pinned(version)),
+        sink: sink.id,
+        sink_version: Some(sink.version),
+        overlay,
+        overlay_version,
+        selection,
+        ..Default::default()
+    };
+    let outcome = trigger_template_outcome(
+        server.state.clone(),
+        server.actor.clone(),
+        id.to_string(),
+        body,
+    )
+    .await
+    .map_err(|e| e.api_error().error.message)?;
+    Ok(pretty(&match outcome {
+        TriggerOutcome::Run(r) => json!(r),
+        TriggerOutcome::PendingApproval(c) => crate::serve::runner::pending_approval_body(&c),
+    }))
 }
 
 #[cfg(test)]
@@ -1446,6 +1541,27 @@ mod tests {
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"count\": 1"));
         assert!(text.contains("alice"));
+    }
+
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn preview_applies_the_masking_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = csv_config(dir.path());
+        cfg.push_str(
+            "  masking:\n    rules:\n      - name: names\n        match: {fields: [name]}\n        \
+             action: {type: redact}\n        applies_to: [elsewhere]\n",
+        );
+        let out = call_tool(
+            &ctx(false),
+            "preview",
+            &json!({ "config": cfg, "limit": 2 }),
+        )
+        .await;
+        assert_eq!(out["isError"], false, "{out}");
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("alice") && !text.contains("bob"), "{text}");
+        assert!(text.contains("\"***\""), "{text}");
     }
 
     #[tokio::test]

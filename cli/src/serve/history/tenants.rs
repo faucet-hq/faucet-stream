@@ -129,6 +129,11 @@ pub struct TenantRecord {
     /// depend on the `notify` feature; validated when the tenant is written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notifications: Vec<serde_json::Value>,
+    /// The `notifications:` list sealed under the vault key (webhook URLs,
+    /// routing keys and HMAC secrets are credentials). When set, the plain
+    /// list above is empty in storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications_sealed: Option<String>,
     /// A suspended tenant's runs are refused until it is resumed.
     #[serde(default)]
     pub suspended: bool,

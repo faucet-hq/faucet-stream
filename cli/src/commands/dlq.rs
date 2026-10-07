@@ -17,6 +17,29 @@ fn to_json<T: serde::Serialize>(value: &T) -> CliResult<String> {
         .map_err(|e| CliError::Internal(format!("serializing JSON output: {e}")))
 }
 
+/// The DLQ keys from `--encryption-key` / `FAUCET_DLQ_ENCRYPTION_KEY` and
+/// `--encryption-key-file`, each registered for log redaction.
+fn dlq_keys(keys: &[String], files: &[std::path::PathBuf]) -> CliResult<Vec<String>> {
+    let mut out = keys.to_vec();
+    for path in files {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            CliError::Config(format!(
+                "reading --encryption-key-file {}: {e}",
+                path.display()
+            ))
+        })?;
+        out.push(text.trim_end().to_string());
+    }
+    for key in &out {
+        crate::secrets::registry::register(key);
+    }
+    Ok(out)
+}
+
+fn decryptor(keys: &[String], files: &[std::path::PathBuf]) -> CliResult<DlqDecryptor> {
+    Ok(DlqDecryptor::from_keys(&dlq_keys(keys, files)?)?)
+}
+
 /// Dispatch a `faucet dlq` subcommand.
 pub async fn run(args: DlqArgs) -> CliResult<()> {
     match args.command {
@@ -27,7 +50,7 @@ pub async fn run(args: DlqArgs) -> CliResult<()> {
 }
 
 fn inspect(args: DlqInspectArgs) -> CliResult<()> {
-    let dec = DlqDecryptor::from_keys(&args.encryption_key)?;
+    let dec = decryptor(&args.encryption_key, &args.encryption_key_file)?;
     let summary = dlq_replay::inspect(&args.location, args.reason.as_deref(), args.limit, &dec)?;
     if args.json {
         println!("{}", to_json(&summary)?);
@@ -106,7 +129,7 @@ async fn replay(args: DlqReplayArgs) -> CliResult<()> {
             execution: cfg.execution.clone(),
             auth,
             clock: Utc::now().fixed_offset(),
-            decryptor: DlqDecryptor::from_keys(&args.encryption_key)?,
+            decryptor: decryptor(&args.encryption_key, &args.encryption_key_file)?,
         },
     )
     .await?;
@@ -138,7 +161,7 @@ fn discard(args: DlqDiscardArgs) -> CliResult<()> {
         Some(s) => Some(parse_before(s, Utc::now())?),
         None => None,
     };
-    let dec = DlqDecryptor::from_keys(&args.encryption_key)?;
+    let dec = decryptor(&args.encryption_key, &args.encryption_key_file)?;
     let outcome = dlq_replay::discard(
         &args.location,
         args.reason.as_deref(),

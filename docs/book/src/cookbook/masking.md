@@ -231,6 +231,9 @@ covers value detectors (email + Luhn-valid card), keyed-hash determinism, and
 name-pattern + explicit-field + nested-path masking. See the
 [Testing pipelines](./testing.md) cookbook page for the spec grammar.
 
+`faucet preview` masks the records it prints the same way: a preview has no
+destination either, so every rule applies regardless of `applies_to`.
+
 ## Observability
 
 - `faucet_masking_fields_total{pipeline,row,rule,action,detector}` — one

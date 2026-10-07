@@ -142,3 +142,86 @@ async fn cancel_stops_unstarted_shards_and_the_run_ends_cancelled() {
     let p = ghost.shard_progress("big").await.unwrap();
     assert_eq!((p.completed, p.cancelled, p.pending), (1, 2, 0));
 }
+
+/// A source-sharded run submitted to a cluster runs every shard and ends
+/// `completed`, its log stream closing once the last local shard finishes.
+#[cfg(all(feature = "source-sqlite", feature = "sink-jsonl"))]
+#[tokio::test]
+async fn a_sharded_run_completes_across_its_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("src.db");
+    {
+        use sqlx::Connection as _;
+        let mut conn =
+            sqlx::SqliteConnection::connect(&format!("sqlite:{}?mode=rwc", db.display()))
+                .await
+                .unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        for i in 1..=20 {
+            sqlx::query("INSERT INTO t VALUES (?, 'x')")
+                .bind(i)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+    }
+    let url = format!("sqlite:{}", dir.path().join("h.db").display());
+    let port = free_port();
+    let mut config = faucet_cli::serve::ServeConfig::from_args(args(port, url)).unwrap();
+    config.log_level = "warn".into();
+    tokio::spawn(async move {
+        let _ = faucet_cli::serve::run_server(config, Default::default()).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    for _ in 0..1200 {
+        if client
+            .get(format!("{base}/healthz"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let out = dir.path().join("out-{shard}.jsonl");
+    let yaml = format!(
+        "version: 1\nname: sharded\nshard: {{ count: 2 }}\npipeline:\n  \
+         source: {{ type: sqlite, config: {{ database_url: \"sqlite:{}\", query: \"SELECT id, v FROM t\", shard: {{ key: id }} }} }}\n  \
+         sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+        db.display(),
+        out.display()
+    );
+    let resp: serde_json::Value = client
+        .post(format!("{base}/v1/runs"))
+        .json(&serde_json::json!({ "config": yaml }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = resp["run_id"].as_str().expect("run id").to_string();
+    let mut status = serde_json::Value::Null;
+    for _ in 0..400 {
+        let body: serde_json::Value = client
+            .get(format!("{base}/v1/runs/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        status = body["status"].clone();
+        if matches!(status.as_str(), Some("completed" | "failed" | "cancelled")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, "completed");
+}

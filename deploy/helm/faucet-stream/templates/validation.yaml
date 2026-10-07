@@ -27,3 +27,15 @@
 {{- if and .Values.serve.enabled (lt (int .Values.serve.preview.maxRows) 0) -}}
 {{- fail (printf "serve.preview.maxRows must be 0 (no ceiling) or a positive number of rows (got %v)." .Values.serve.preview.maxRows) -}}
 {{- end -}}
+{{- /* #789 SUPPLY-08: replicas share nothing unless the history is Postgres —
+       memory and per-pod SQLite give each pod its own runs and idempotency keys. */ -}}
+{{- $multi := or (gt (int .Values.serve.replicaCount) 1) .Values.serve.autoscaling.enabled -}}
+{{- if and .Values.serve.enabled $multi (ne .Values.serve.history.backend "postgres") -}}
+{{- fail "serve.replicaCount > 1 or serve.autoscaling.enabled requires serve.history.backend=postgres (a shared history): with memory or a per-pod SQLite file each replica has its own run records and idempotency keys, so GET/cancel 404 on the other pods and a retried keyed submission can run twice." -}}
+{{- end -}}
+{{- if and .Values.serve.enabled $multi (not .Values.serve.cluster.enabled) -}}
+{{- fail "serve.replicaCount > 1 or serve.autoscaling.enabled requires serve.cluster.enabled=true, so runs are claimed and failed over across replicas instead of running only on the pod that received them." -}}
+{{- end -}}
+{{- if and .Values.serve.enabled (eq .Values.serve.history.backend "postgres") (not .Values.serve.history.url) (not .Values.serve.history.existingSecret) -}}
+{{- fail "serve.history.backend=postgres requires serve.history.url or serve.history.existingSecret." -}}
+{{- end -}}

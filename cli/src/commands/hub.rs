@@ -27,13 +27,15 @@ fn pretty<T: serde::Serialize>(v: &T) -> CliResult<String> {
 
 /// The hubs each side of a `compose` / `check` pairing is looked up in.
 async fn pair_sides(p: &crate::cli::HubPairArgs) -> CliResult<hub::HubSides> {
-    hub::resolve_sides(
+    let mut sides = hub::resolve_sides(
         &p.hub,
         p.source_hub.as_deref(),
         p.sink_hub.as_deref(),
         p.overlay_hub.as_deref(),
     )
-    .await
+    .await?;
+    sides.trusted = p.trust.clone();
+    Ok(sides)
 }
 
 /// `faucet hub compose --source X --sink Y [--out F] [--json]` — print (or
@@ -443,6 +445,7 @@ async fn rows(a: crate::cli::HubRowsArgs) -> CliResult<()> {
         selection: selection.as_ref(),
         state,
         history: Default::default(),
+        tenant: None,
     };
     let as_path = std::path::Path::new(&a.source);
     let is_pipeline = as_path.is_file()
@@ -528,6 +531,7 @@ mod tests {
             source_hub: None,
             sink_hub: None,
             overlay_hub: None,
+            trust: vec![],
         }
     }
 

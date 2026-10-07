@@ -33,6 +33,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Keyless signing + build provenance (#789 SUPPLY-05).
+      id-token: write
+      attestations: write
     # release-plz publishes one GitHub release per crate tag, but the images
     # should build ONCE per app release. Gate to the faucet-cli release (or a
     # manual dispatch) so a `faucet-source-*` / `faucet-sink-*` crate tag does
@@ -89,6 +92,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push (${{ matrix.profile }})
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -101,7 +105,27 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha,scope=faucet-${{ matrix.profile }}
           cache-to: type=gha,mode=max,scope=faucet-${{ matrix.profile }}
-          provenance: false
+          # SLSA provenance and an SBOM travel with the image (#789 SUPPLY-05).
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        if: github.event_name == 'release' || inputs.push
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign the image (keyless)
+        if: github.event_name == 'release' || inputs.push
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${{ steps.img.outputs.name }}@${DIGEST}"
+
+      - name: Attest build provenance
+        if: github.event_name == 'release' || inputs.push
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.img.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   # Publish the Helm chart as an OCI artifact on GHCR and attach a
   # Dockerfile+chart deploy bundle to the release. Gated to the faucet-cli

@@ -43,7 +43,7 @@ hub-remote = ["dep:reqwest"]
 # run-history backends — add `serve-history-sqlite` / `serve-history-postgres`
 # for persistence) and `lineage` (record sampling + column-lineage
 # derivation). Not in `default`; included in `full`.
-catalog = ["serve", "lineage"]
+catalog = ["serve", "lineage", "dep:hmac"]
 
 # Data-quality checks (`quality:` config block). `quality-jsonschema` adds the
 # `json_schema` record check via a JSON Schema validator. Forwarded to

@@ -296,7 +296,7 @@ fn apply_cdc_tls(opts: PgConnectOptions, tls: &crate::config::CdcTls) -> PgConne
     use crate::config::CdcTls;
     use sqlx::postgres::PgSslMode;
     match tls {
-        CdcTls::Disable => opts.ssl_mode(PgSslMode::Disable),
+        CdcTls::FromUrl | CdcTls::Disable => opts.ssl_mode(PgSslMode::Disable),
         CdcTls::Require => opts.ssl_mode(PgSslMode::Require),
         CdcTls::VerifyCa { ca_path } => {
             let o = opts.ssl_mode(PgSslMode::VerifyCa);
@@ -321,7 +321,7 @@ fn tls_config(tls: &crate::config::CdcTls) -> TlsConfig {
     use crate::config::CdcTls;
     use std::path::PathBuf;
     match tls {
-        CdcTls::Disable => TlsConfig::disabled(),
+        CdcTls::FromUrl | CdcTls::Disable => TlsConfig::disabled(),
         CdcTls::Require => TlsConfig::require(),
         CdcTls::VerifyCa { ca_path } => TlsConfig::verify_ca(ca_path.clone().map(PathBuf::from)),
         CdcTls::VerifyFull { ca_path } => {

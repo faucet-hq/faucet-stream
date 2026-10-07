@@ -115,12 +115,38 @@ fn parse_query(raw: Option<&str>) -> BTreeMap<String, String> {
     if let Some(q) = raw {
         for pair in q.split('&').filter(|s| !s.is_empty()) {
             let mut it = pair.splitn(2, '=');
-            let k = it.next().unwrap_or_default().to_string();
-            let v = it.next().unwrap_or_default().to_string();
+            let k = form_decode(it.next().unwrap_or_default());
+            let v = form_decode(it.next().unwrap_or_default());
             m.insert(k, v);
         }
     }
     m
+}
+
+/// `application/x-www-form-urlencoded` decoding: `+` is a space, `%XX` a
+/// byte; a malformed escape is kept as written.
+fn form_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| (b as char).to_digit(16);
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 2;
+                    }
+                    _ => out.push(b'%'),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -133,5 +159,18 @@ mod tests {
         assert_eq!(q.get("mode").map(String::as_str), Some("full"));
         assert_eq!(q.get("tenant").map(String::as_str), Some("acme"));
         assert!(parse_query(None).is_empty());
+    }
+
+    #[test]
+    fn decodes_percent_escapes_and_plus() {
+        let q = parse_query(Some(
+            "path=in%2F2026&n=a+b&k%3D=%E2%82%AC&bad=%zz&tail=%4&u=%éx",
+        ));
+        assert_eq!(q["path"], "in/2026");
+        assert_eq!(q["n"], "a b");
+        assert_eq!(q["k="], "€");
+        assert_eq!(q["bad"], "%zz");
+        assert_eq!(q["tail"], "%4");
+        assert_eq!(q["u"], "%éx");
     }
 }

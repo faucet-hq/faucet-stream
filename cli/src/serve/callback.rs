@@ -192,18 +192,40 @@ impl CallbackSpec {
     }
 }
 
-/// Whether `host` is a link-local address (IPv4 `169.254.0.0/16`, IPv6
-/// `fe80::/10`) — the range cloud instance-metadata services live on.
+/// The server's `--callback-allow-host` list, consulted again at delivery.
+static ALLOW_HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record the server's callback allowlist (once, at startup).
+pub fn set_allow_hosts(hosts: Vec<String>) {
+    let _ = ALLOW_HOSTS.set(hosts);
+}
+
+fn allowlisted(host: &str) -> bool {
+    ALLOW_HOSTS
+        .get()
+        .is_some_and(|hosts| hosts.iter().any(|h| h == host))
+}
+
+/// Whether an address is link-local (IPv4 `169.254.0.0/16`, IPv6
+/// `fe80::/10`) — the range cloud instance-metadata services live on —
+/// including an IPv4-mapped IPv6 form of one.
+fn is_link_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_link_local(),
+            // `Ipv6Addr::is_unicast_link_local` is unstable; check fe80::/10.
+            None => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        },
+    }
+}
+
+/// Whether `host` is a link-local address or a well-known metadata name.
 fn is_link_local(host: &str) -> bool {
     // Strip an IPv6 literal's brackets if the caller passed them.
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     match bare.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => v4.is_link_local(),
-        Ok(std::net::IpAddr::V6(v6)) => {
-            // `Ipv6Addr::is_unicast_link_local` is unstable; check fe80::/10.
-            let seg = v6.segments()[0];
-            (seg & 0xffc0) == 0xfe80
-        }
+        Ok(ip) => is_link_local_ip(ip),
         // Not an IP literal. The well-known metadata hostnames resolve into the
         // link-local range, so refuse them by name too rather than relying on
         // resolution at request time.
@@ -271,10 +293,51 @@ pub async fn fire(rec: &RunRecord) {
     }
 }
 
+/// Resolve the callback host and refuse it when any address is link-local
+/// (#789 SERVE-41): a DNS name or a redirector can point anywhere, so the
+/// submit-time check of the host text is not enough. Returns the addresses
+/// to pin the connection to, so a second lookup cannot answer differently.
+async fn checked_addrs(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, String> {
+    let host = url.host_str().ok_or("callback.url has no host")?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    if allowlisted(host) {
+        return Ok(Vec::new());
+    }
+    if is_link_local(host) {
+        return Err(format!("callback host `{host}` is link-local; refused"));
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(Vec::new());
+    }
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((bare, port))
+        .await
+        .map_err(|e| format!("resolving callback host `{host}`: {e}"))?
+        .collect();
+    if let Some(bad) = addrs.iter().find(|a| is_link_local_ip(a.ip())) {
+        return Err(format!(
+            "callback host `{host}` resolves to the link-local address {}; refused",
+            bad.ip()
+        ));
+    }
+    Ok(addrs)
+}
+
 /// One bounded, retried delivery attempt sequence.
 async fn deliver(spec: &CallbackSpec, body: &Value) -> Result<(), String> {
-    let client = reqwest::Client::builder()
+    let url =
+        reqwest::Url::parse(&spec.url).map_err(|e| format!("callback.url is not valid: {e}"))?;
+    let pinned = checked_addrs(&url).await?;
+    let mut builder = reqwest::Client::builder()
         .timeout(ATTEMPT_TIMEOUT)
+        // A redirect would leave the checked host.
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(host) = url.host_str()
+        && !pinned.is_empty()
+    {
+        builder = builder.resolve_to_addrs(host, &pinned);
+    }
+    let client = builder
         .build()
         .map_err(|e| format!("building callback client: {e}"))?;
     let method = reqwest::Method::from_bytes(spec.method.as_bytes())
@@ -323,6 +386,40 @@ mod tests {
             extra_fields: BTreeMap::new(),
             on: Vec::new(),
         }
+    }
+
+    #[test]
+    fn mapped_ipv6_metadata_addresses_are_refused() {
+        for u in [
+            "http://[::ffff:169.254.169.254]/latest",
+            "http://[::ffff:a9fe:a9fe]/x",
+            "http://[fe80::1]/x",
+        ] {
+            let err = spec(u).validate(&[]).expect_err(u);
+            assert!(err.contains("link-local"), "{err}");
+        }
+        assert!(!is_link_local("[::ffff:10.0.0.1]"));
+    }
+
+    #[tokio::test]
+    async fn delivery_resolves_and_checks_every_address() {
+        let ok = checked_addrs(&reqwest::Url::parse("http://localhost:9/x").unwrap())
+            .await
+            .unwrap();
+        assert!(!ok.is_empty());
+        assert!(ok.iter().all(|a| a.port() == 9));
+        let literal = checked_addrs(&reqwest::Url::parse("http://127.0.0.1:9/").unwrap())
+            .await
+            .unwrap();
+        assert!(literal.is_empty(), "an IP literal needs no pinning");
+        let err = checked_addrs(&reqwest::Url::parse("http://169.254.169.254/").unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.contains("link-local"), "{err}");
+        let err = checked_addrs(&reqwest::Url::parse("http://no-such-host.invalid/").unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.contains("resolving"), "{err}");
     }
 
     #[test]

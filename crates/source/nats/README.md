@@ -5,7 +5,10 @@ A [NATS](https://nats.io) source for [`faucet-stream`](https://crates.io/crates/
 Subscribes to a subject (core NATS, with `*`/`>` wildcards and optional queue
 groups) or pulls from a durable JetStream consumer, drains until `max_messages`
 or `idle_timeout_secs` fires, and yields each message payload as a JSON record —
-valid JSON passes through, anything else becomes a JSON string.
+by default valid JSON passes through and other UTF-8 text becomes a JSON string;
+`value_format: bytes` base64-encodes binary payloads. A payload the format
+cannot represent (binary under the default) fails the run rather than being
+altered.
 
 Core NATS is fire-and-forget at-least-once, so runs carry **no bookmark** and
 are not resumable/exactly-once. In JetStream mode each page's messages are
@@ -31,6 +34,7 @@ in alongside these fields:
 | `idle_timeout_secs` | `Option<u64>`    | —       | stop after this many seconds with no new message.                  |
 | `batch_size`        | `usize`          | `1000`  | records per emitted page (`0` = one page for the whole run window).|
 | `progress_interval_secs` | `u64`       | `10`    | JetStream only: in-progress ack (`+WPI`) every N s for every message pulled but not yet acked, so a slow page is not redelivered into the same run. Keep it below the consumer's `ack_wait`. `0` disables. |
+| `value_format`      | `auto` \| `json` \| `string` \| `bytes` | `auto` | how a payload becomes a record: `auto` (JSON, else UTF-8 text), `json` (must parse), `string` (UTF-8 text), `bytes` (base64). Non-UTF-8 under `auto` / `string` fails the run. |
 
 At least one of `max_messages` / `idle_timeout_secs` must be set so the run
 terminates.

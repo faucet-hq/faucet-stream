@@ -28,7 +28,7 @@ pub enum TokenBodyEncoding {
 }
 
 /// Supported authentication methods.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum Auth {
     None,
@@ -110,6 +110,24 @@ pub enum Auth {
     Custom {
         headers: HashMap<String, String>,
     },
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(
+            f,
+            "Auth",
+            self,
+            &[
+                "token",
+                "password",
+                "value",
+                "client_secret",
+                "body",
+                "headers",
+            ],
+        )
+    }
 }
 
 impl Auth {
@@ -349,13 +367,16 @@ mod tests {
     #[test]
     fn auth_debug_format() {
         let auth = Auth::None;
-        assert_eq!(format!("{auth:?}"), "None");
+        assert_eq!(format!("{auth:?}"), r#"Auth({"type":"none"})"#);
 
         let auth = Auth::Bearer {
             token: "tok".into(),
         };
         let debug = format!("{auth:?}");
-        assert!(debug.contains("Bearer"));
+        assert!(
+            debug.contains("bearer") && !debug.contains("tok\""),
+            "{debug}"
+        );
     }
 
     #[test]
@@ -367,5 +388,34 @@ mod tests {
         let mut h = HeaderMap::new();
         cloned.apply(&mut h).unwrap();
         assert_eq!(h.get("authorization").unwrap(), "Bearer token");
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: Auth = serde_json::from_str(
+            r#"{"type":"basic","config":{"username":"u","password":"S3CRET-1"}}"#,
+        )
+        .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: Auth = serde_json::from_str(
+            r#"{"type":"api_key","config":{"header":"X-K","value":"S3CRET-2"}}"#,
+        )
+        .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: Auth =
+            serde_json::from_str(r#"{"type":"custom","config":{"headers":{"X-A":"S3CRET-3"}}}"#)
+                .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: Auth = serde_json::from_str(r#"{"type":"oauth2","config":{"token_url":"http://t","client_id":"c","client_secret":"S3CRET-4","scopes":[]}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

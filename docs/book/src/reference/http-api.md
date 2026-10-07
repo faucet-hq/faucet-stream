@@ -221,7 +221,7 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `POST` | `/v1/runs/{id}/cancel` | `202` / `200` | Request cancel (202) or no-op if terminal (200) |
 | `GET` | `/v1/runs/{id}/logs` | `200` | Stream the run's logs (`text/event-stream`), or read persisted logs with `?format=jsonl\|text` |
 | `POST` | `/v1/backfill` | `202` | Submit a windowed backfill: one tracked run per window unit (operator) |
-| `GET` | `/v1/audit` | `200` | Read the audit log — **admin only** (RBAC). Filters: `principal`, `action`, `since`, `until`, `limit` |
+| `GET` | `/v1/audit` | `200` | Read the audit log — **admin only** (RBAC). Filters: `principal`, `action`, `since`, `until`, `limit`. Each entry's `target` names what was touched (`template:<id>@<version>`, `connection:<tenant>/<name>`, `origin:<name>`, `mcp:<tool>`); an MCP tool call is one entry per call, under the calling principal, `result: error` when the tool failed |
 | `POST` | `/v1/reload` | `200` / `422` | Hot-reload the `--default-config` merge base — **admin only** (RBAC). No-op (`reloaded:false`) if no default-config; `422` (old config kept) if the new one is invalid |
 | `GET` | `/v1/catalog/datasets` | `200` | List catalogued datasets (`kind`, `q`, `limit`, `cursor`) — requires the `catalog` build feature |
 | `GET` | `/v1/catalog/datasets/{id}` | `200` | One dataset's detail: schema timeline, volume, edges |
@@ -370,7 +370,10 @@ is the last `run_id` from the previous page.
 ```
 
 `status` is one of `queued`, `running`, `completed`, `failed`, `cancelled`.
-`elapsed_secs` is filled live for running runs. Each invocation carries
+`elapsed_secs` is filled live for running runs. A run's completion `callback`
+comes back with every header value as `***` and URL credentials stripped, and
+the stored `config_body` (cluster runs) is returned to admins only — it can
+hold inline credentials. Each invocation carries
 `batches` — how its sink writes ended (`committed` / `dlq_partial` / `dlq_all` /
 `failed`, #737) — and, for a source with a head, `source_lag` at the end of the
 invocation (`bytes` / `events` / `seconds`, #733).
@@ -437,6 +440,10 @@ it automatically). Viewer-readable under RBAC; requires a build with the
 
 - `GET /v1/catalog/datasets?kind=&q=&limit=&cursor=` — paginated dataset list,
   ordered `(last_seen DESC, id DESC)`; `q` is a case-insensitive URI substring.
+  `next_cursor` is the last row's sort key (`<last_seen>~<id>`), so paging
+  continues after that row even when a dataset's `last_seen` moves between
+  requests (a dataset that runs again mid-listing moves ahead of the cursor and
+  shows up on a fresh listing, not twice).
 - `GET /v1/catalog/datasets/{id}` — the dataset plus its deduplicated schema
   timeline (each version with a `diff` vs the previous), recent per-run volume
   points, upstream/downstream lineage edges, and — once a `profiling:`
@@ -775,7 +782,9 @@ identity (`status`, `tags`, `default_selected`), hierarchy (`parent`,
 `children`, `depends_on`, `depth`, `per_parent_record`), `write` (resolved
 against `sink` when given, with `supported` / `unsupported_reason`), `read`,
 `guarantees`, `shape`, `params_used`, and the `faucet status` view as `state`
-when the state store is readable (`?state=false` skips it). Any selector
+when the state store is readable (`?state=false` skips it; for a
+tenant-scoped principal it is the tenant's own state — its `<tenant>::`
+state keys — and only its own runs). Any selector
 parameter (`select`, `only`, `skip`, `tags`, `status` comma-joined;
 `include_parents`) resolves that selection without running anything: rows gain
 `selected` / `pulled_in` / `blocked` / `excluded`, and the body gains `run_set`
@@ -1071,6 +1080,12 @@ no-op an hour later):
 | `extra_fields` key collides with a faucet-emitted field | Would let a submission spoof the `status`/`event` a receiver keys off. |
 | `on` contains a non-terminal status | |
 | Supplied on `POST /v1/backfill` | One backfill POST fans out into N unit runs, so a single callback has no single run to describe. Poll the unit runs by their `backfill` label instead. |
+
+The link-local check holds at delivery too: an IPv4-mapped IPv6 literal
+(`[::ffff:169.254.169.254]`) is refused, a host name is resolved and refused
+when any address it resolves to is link-local (the connection is then pinned
+to the checked addresses, so a second DNS answer cannot redirect it), and a
+redirect response is never followed — a `3xx` counts as a failed delivery.
 
 **Egress posture.** This guard closes the metadata hole; it is not a general
 egress control. A caller who can submit a run can already point a `rest` source

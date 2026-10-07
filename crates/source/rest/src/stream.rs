@@ -14,6 +14,9 @@ use faucet_core::replication::{
 };
 use faucet_core::schema;
 use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, SharedAuthProvider};
+
+/// faucet-auth's `FLOW_SESSION_KEY`: the captured key naming a flow session.
+const FLOW_SESSION_KEY: &str = "__session__";
 use futures_core::Stream;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -1625,6 +1628,7 @@ impl RestStream {
         body_params: &[(String, Value)],
         window_binds: &[ResolvedBind],
     ) -> Result<(Value, HeaderMap), FaucetError> {
+        let mut sent: Option<Credential> = None;
         match self
             .execute_request_once(
                 params,
@@ -1633,6 +1637,7 @@ impl RestStream {
                 is_first_page,
                 body_params,
                 window_binds,
+                &mut sent,
             )
             .await
         {
@@ -1649,6 +1654,7 @@ impl RestStream {
                     is_first_page,
                     body_params,
                     window_binds,
+                    &mut None,
                 )
                 .await
             }
@@ -1662,7 +1668,8 @@ impl RestStream {
                         "the server rejected the shared credential; \
                          re-authenticating and retrying once"
                     );
-                    let _ = provider.invalidate(&Credential::Token(String::new())).await;
+                    let stale = sent.take().unwrap_or(Credential::Token(String::new()));
+                    let _ = provider.invalidate(&stale).await;
                 }
                 self.execute_request_once(
                     params,
@@ -1671,6 +1678,7 @@ impl RestStream {
                     is_first_page,
                     body_params,
                     window_binds,
+                    &mut None,
                 )
                 .await
             }
@@ -1816,8 +1824,18 @@ impl RestStream {
         // Precedence: static config headers (base) < auth < this request's own
         // headers — so an auth header always wins over a same-named config one.
         let mut hdrs = self.static_headers.clone();
-        for (k, v) in self.metadata_headers(url).await?.iter() {
-            hdrs.insert(k.clone(), v.clone());
+        if crate::url_util::credentials_allowed(
+            &self.config.base_url,
+            url,
+            &self.config.trusted_hosts,
+        )? {
+            for (k, v) in self.metadata_headers(url).await?.iter() {
+                hdrs.insert(k.clone(), v.clone());
+            }
+        } else {
+            for name in crate::url_util::CREDENTIAL_HEADERS {
+                hdrs.remove(name);
+            }
         }
         for (k, v) in headers {
             insert_header(&mut hdrs, k, v)?;
@@ -2285,6 +2303,7 @@ impl RestStream {
     ///   are **not** appended (Link header pagination encodes them in the URL).
     /// - When `path_context` is `Some`, `{key}` placeholders in `config.path`
     ///   are substituted with values from the context map (partition support).
+    #[allow(clippy::too_many_arguments)]
     async fn execute_request_once(
         &self,
         params: &HashMap<String, String>,
@@ -2293,6 +2312,7 @@ impl RestStream {
         is_first_page: bool,
         body_params: &[(String, Value)],
         window_binds: &[ResolvedBind],
+        sent: &mut Option<Credential>,
     ) -> Result<(Value, HeaderMap), FaucetError> {
         let use_override = url_override.is_some();
 
@@ -2326,6 +2346,13 @@ impl RestStream {
                 .await?;
             if !ra.is_empty() {
                 used_request_auth = true;
+                // What a flow provider's `invalidate` compares against (#789 API-21).
+                *sent = Some(Credential::Token(
+                    ra.captured
+                        .get(FLOW_SESSION_KEY)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
                 if let Some(b) = ra.base_url {
                     base_url = b;
                 }
@@ -2369,11 +2396,27 @@ impl RestStream {
         // captured session id in the path, say). No-op when nothing was captured.
         url = substitute_captured(&url, &captured);
 
+        // A server-given URL to another origin is fetched without credentials
+        // (and an https→http hop is refused), so a next-page or job link can
+        // never hand them to a third-party host (#789 API-17).
+        let send_credentials = match url_override {
+            None => true,
+            Some(_) => {
+                crate::url_util::credentials_allowed(&base_url, &url, &self.config.trusted_hosts)?
+            }
+        };
+        if !send_credentials {
+            ra_headers.clear();
+            ra_query.clear();
+            ra_cookies.clear();
+            ra_body.clear();
+        }
+
         // Resolve inline / signed credentials — unless a flow provider already
         // supplied the request auth. A shared provider (from `auth: { ref }` or
         // a library caller) takes precedence over inline; inline OAuth2 /
         // TokenEndpoint resolve to a Bearer token via the per-source cache.
-        let resolved_auth: Option<Auth> = if used_request_auth {
+        let resolved_auth: Option<Auth> = if used_request_auth || !send_credentials {
             None
         } else if let Some(provider) = &self.auth_provider {
             // A per-request signer (OAuth1, #496) signs this exact method + URL +
@@ -2386,6 +2429,7 @@ impl RestStream {
                 Some(cred) => cred,
                 None => provider.credential().await?,
             };
+            *sent = Some(cred.clone());
             Some(credential_to_auth(cred))
         } else {
             match &self.config.auth {
@@ -2464,6 +2508,11 @@ impl RestStream {
             }
             h
         };
+        if !send_credentials {
+            for name in crate::url_util::CREDENTIAL_HEADERS {
+                headers.remove(name);
+            }
+        }
         if let Some(auth) = &resolved_auth {
             auth.apply(&mut headers)?;
         }
@@ -2550,7 +2599,9 @@ impl RestStream {
 
         // ApiKeyQuery: inject the API key as a query parameter.
         // A next-page link that already echoes the key keeps its single copy.
-        if let AuthSpec::Inline(Auth::ApiKeyQuery { param, value }) = &self.config.auth {
+        if let AuthSpec::Inline(Auth::ApiKeyQuery { param, value }) = &self.config.auth
+            && send_credentials
+        {
             let echoed = use_override
                 && reqwest::Url::parse(&url)
                     .is_ok_and(|u| u.query_pairs().any(|(k, _)| k == param.as_str()));

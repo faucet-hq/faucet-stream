@@ -81,6 +81,16 @@ even on a mutation-enabled server.
 | `register_template` | **yes** | Register a template document as a new version — `kind: source-template`, `kind: sink-template`, or `kind: pipeline`. Inert by default — pass `launch: true` to make it live. |
 | `run_template` | **yes** | Run a template with given `params` / `env`, at a version or named channel (default `stable` — the launched version). A source template also takes `sink` (a registered sink template) + `sink_version`, and optionally `overlay` (a registered deployment id or an inline mapping) + `overlay_version`. `dry_run: true` materializes + validates only and reports the per-stream write-mode plan. `selection` runs a subset of the streams / rows (the dry run reports the `run_set`). |
 
+On `faucet serve --mcp`, `run_pipeline` and `run_template` submit through the
+server exactly as `POST /v1/runs` / `POST /v1/templates/{id}/runs` do, as the
+calling principal — the approval gate, the server `--policy`, the
+`--default-config`, the run queue and the run record all apply — and answer
+with the `run_id` (or the pending change request). Poll it with
+`GET /v1/runs/{id}`. On stdio they run the pipeline in the MCP process and
+report its counts. A `run_template` `env` override names a variable the
+template reads (`${env:NAME}` / `${secret:NAME}`) and is literal text: a value
+containing `${` is refused, and a tenant-scoped principal may not pass `env`.
+
 The four template tools appear **only when a registry is wired** — `faucet serve
 --mcp` uses its own `--history` backend; `faucet mcp` needs
 `--template-store <url>`. Without one they are not advertised at all, so an agent

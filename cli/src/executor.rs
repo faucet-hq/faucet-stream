@@ -4677,6 +4677,7 @@ mod tests {
             run_id: None,
             sample_records: 10,
             annotations: Vec::new(),
+            tenant: None,
         };
 
         std::fs::write(&input, "id,name\n1,alice\n2,bob\n").unwrap();
@@ -4822,6 +4823,7 @@ mod tests {
             run_id: None,
             sample_records: 10,
             annotations: Vec::new(),
+            tenant: None,
         };
         let summary = run_expanded(nodes, opts_with_catalog("cat-fail", handle))
             .await

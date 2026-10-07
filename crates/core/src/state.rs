@@ -69,6 +69,32 @@ pub trait StateStore: Send + Sync {
         ))
     }
 
+    /// Whether [`compare_and_put`](Self::compare_and_put) is atomic.
+    fn supports_compare_and_put(&self) -> bool {
+        false
+    }
+
+    /// Store `value` under `key` only when the entry still equals `expected`
+    /// (`None` = no entry). Returns whether it was written. Two holders of one
+    /// value (a rotated credential, say) use it so the second writer does not
+    /// clobber the first.
+    ///
+    /// The default reads, compares and writes — not atomic across processes;
+    /// stores that can do better override it and
+    /// [`supports_compare_and_put`](Self::supports_compare_and_put).
+    async fn compare_and_put(
+        &self,
+        key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        if self.get(key).await?.as_ref() != expected {
+            return Ok(false);
+        }
+        self.put(key, value).await?;
+        Ok(true)
+    }
+
     /// Whether [`put_batch`](Self::put_batch) commits all-or-nothing.
     fn supports_atomic_batch(&self) -> bool {
         false
@@ -349,6 +375,25 @@ impl StateStore for MemoryStateStore {
         Ok(keys)
     }
 
+    fn supports_compare_and_put(&self) -> bool {
+        true
+    }
+
+    async fn compare_and_put(
+        &self,
+        key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        validate_state_key(key)?;
+        let mut map = self.inner.lock().await;
+        if map.get(key) != expected {
+            return Ok(false);
+        }
+        map.insert(key.to_owned(), value.clone());
+        Ok(true)
+    }
+
     fn supports_atomic_batch(&self) -> bool {
         true
     }
@@ -491,7 +536,7 @@ impl StateStore for FileStateStore {
                 #[cfg(feature = "encryption")]
                 let bytes: Vec<u8> = if crate::encryption::is_encrypted(&bytes) {
                     match &self.encryption {
-                        Some(enc) => enc.decrypt(&bytes).map_err(|e| {
+                        Some(enc) => enc.decrypt_bound(&bytes, key.as_bytes()).map_err(|e| {
                             // Wrong/rotated key must be a loud, typed error —
                             // treating it as "no bookmark" would silently
                             // trigger a full re-sync.
@@ -550,7 +595,7 @@ impl StateStore for FileStateStore {
         })?;
         #[cfg(feature = "encryption")]
         let bytes = match &self.encryption {
-            Some(enc) => enc.encrypt(&bytes),
+            Some(enc) => enc.encrypt_bound(&bytes, key.as_bytes()),
             None => bytes,
         };
         let final_path = self.entry_path(key);
@@ -771,6 +816,28 @@ mod tests {
     }
 
     // ── MemoryStateStore ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn compare_and_put_writes_only_over_the_expected_value() {
+        let mem = MemoryStateStore::new();
+        assert!(mem.supports_compare_and_put());
+        let a = serde_json::json!({"v": 1});
+        let b = serde_json::json!({"v": 2});
+        assert!(mem.compare_and_put("k", None, &a).await.unwrap());
+        assert!(!mem.compare_and_put("k", None, &b).await.unwrap());
+        assert!(!mem.compare_and_put("k", Some(&b), &b).await.unwrap());
+        assert!(mem.compare_and_put("k", Some(&a), &b).await.unwrap());
+        assert_eq!(mem.get("k").await.unwrap(), Some(b.clone()));
+        assert!(mem.compare_and_put("bad key!", None, &a).await.is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileStateStore::new(dir.path());
+        assert!(!file.supports_compare_and_put());
+        assert!(file.compare_and_put("k", None, &a).await.unwrap());
+        assert!(!file.compare_and_put("k", Some(&b), &b).await.unwrap());
+        assert!(file.compare_and_put("k", Some(&a), &b).await.unwrap());
+        assert_eq!(file.get("k").await.unwrap(), Some(b));
+    }
 
     #[tokio::test]
     async fn memory_get_returns_none_for_missing_key() {

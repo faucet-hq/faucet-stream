@@ -202,6 +202,36 @@ async fn webhook_trigger_enqueues_exactly_one_run() {
         "idempotency must dedupe the replay — got {} runs",
         page2.runs.len()
     );
+
+    // The same event id delivered to a second webhook trigger runs that
+    // trigger's pipeline too: keys are namespaced by trigger (#789 SERVE-37).
+    let out2 = dir.path().join("out2.jsonl");
+    let inline2 = inline_pipeline(csv.to_str().unwrap(), out2.to_str().unwrap());
+    let file2: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: hook2\n    type: webhook\n    dedupe_header: Idempotency-Key\n    config: {}\n",
+        serde_json::to_string(&inline2).unwrap()
+    ))
+    .unwrap();
+    let compiled2 = CompiledTriggers::compile(file2).unwrap();
+    let event3 = faucet_cli::serve::triggers::context::TriggerEvent::Webhook {
+        method: "POST".into(),
+        body: "{}".into(),
+        headers: Default::default(),
+        query: Default::default(),
+        idem: "evt-1".into(),
+    };
+    let outcome =
+        faucet_cli::serve::triggers::enqueue::fire(&state, &compiled2.triggers[0], event3, &now)
+            .await;
+    assert!(
+        matches!(
+            outcome,
+            faucet_cli::serve::triggers::enqueue::FireOutcome::Enqueued(_)
+        ),
+        "expected Enqueued, got {outcome:?}"
+    );
+    wait_for_runs(&state, 2).await;
+    assert!(out2.exists(), "the second trigger's pipeline ran");
 }
 
 fn webhook_event(query: &[(&str, &str)]) -> faucet_cli::serve::triggers::context::TriggerEvent {
@@ -862,5 +892,122 @@ async fn webhook_debounce_coalesces_second_fire() {
         http_run_count(&base, token).await,
         1,
         "debounce must coalesce the second fire — exactly one run expected"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn webhook_query_values_are_percent_decoded() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+    let triggers = write_triggers_file(
+        dir.path(),
+        "hook",
+        &csv,
+        std::path::Path::new("${trigger.query.out}"),
+        "",
+    );
+    let token = "test-token";
+    let port = free_port();
+    let base = spawn_serve_with_triggers(port, Some(token), &triggers).await;
+    let target = dir.path().join("sub dir").join("out.jsonl");
+    let encoded: String = target
+        .to_str()
+        .unwrap()
+        .replace('%', "%25")
+        .replace('/', "%2F")
+        .replace(' ', "+");
+    let ok = reqwest::Client::new()
+        .post(format!("{base}/v1/triggers/hook?out={encoded}"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 202);
+    for _ in 0..400 {
+        if target.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(target.exists(), "the decoded path was written");
+}
+
+/// #789 SERVE-21: an object whose run cannot start is skipped and reported —
+/// the objects after it still fire, and the poll returns the error so the
+/// supervisor backs off and marks the watcher unhealthy.
+#[cfg(feature = "triggers-object-store")]
+#[tokio::test]
+async fn a_bad_object_is_skipped_and_reported_instead_of_blocking_the_prefix() {
+    use faucet_cli::serve::triggers::object_arrival::ObjectArrivalWatcher;
+    use faucet_cli::serve::triggers::watcher::Watcher;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as OPath;
+    use object_store::{ObjectStore, ObjectStoreExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    // The object key is the delivery mode: `bogus` does not parse.
+    let mut inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
+    inline["delivery"] = serde_json::json!("${trigger.object_key}");
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b }}\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let store = InMemory::new();
+    store
+        .put(&OPath::from("bogus"), b"{}".to_vec().into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    store
+        .put(&OPath::from("at_least_once"), b"{}".to_vec().into())
+        .await
+        .unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(store);
+    let mut watcher = ObjectArrivalWatcher::new(
+        Arc::new(compiled.triggers[0].clone()),
+        store,
+        "b".into(),
+        None,
+        faucet_cli::serve::triggers::spec::ArrivalMode::PerObject,
+        Duration::from_secs(30),
+        faucet_cli::serve::triggers::spec::StartAt::Beginning,
+        chrono::Utc::now(),
+    );
+    let err = watcher.poll(&state).await.unwrap_err();
+    assert!(err.contains("'bogus' skipped"), "{err}");
+    wait_for_runs(&state, 1).await;
+    assert!(out.exists(), "the object after the bad one still ran");
+    assert!(!watcher.poll(&state).await.unwrap(), "nothing left to fire");
+}
+
+/// #789 SERVE-34: a watcher whose client cannot be built is reported
+/// unhealthy with the reason instead of staying green.
+#[tokio::test]
+async fn an_unbuildable_watcher_is_reported_unhealthy() {
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(
+        "version: 1\ntriggers:\n  - name: broken\n    type: webhook\n    config: { version: 1 }\n",
+    )
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    assert!(state.triggers().snapshot()[0].healthy);
+    faucet_cli::serve::triggers::mark_unbuildable(
+        state.triggers(),
+        "broken",
+        "object store: bad endpoint".into(),
+    );
+    let row = state.triggers().snapshot().remove(0);
+    assert!(!row.healthy, "{row:?}");
+    assert_eq!(
+        row.last_error.as_deref(),
+        Some("object store: bad endpoint")
     );
 }

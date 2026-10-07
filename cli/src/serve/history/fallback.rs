@@ -260,6 +260,9 @@ impl RunHistory for FallbackHistory {
     async fn reclaim_orphans(&self, max_attempts: u32) -> Result<ReclaimReport, HistoryError> {
         via!(self, p => p.reclaim_orphans(max_attempts), f => f.reclaim_orphans(max_attempts))
     }
+    async fn release_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        strict!(self, p => p.release_owned(rec), f => f.release_owned(rec))
+    }
     async fn finalize_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
         via!(self, p => p.finalize_owned(rec), f => f.finalize_owned(rec))
     }
@@ -422,6 +425,13 @@ impl RunHistory for FallbackHistory {
     ) -> Result<(), HistoryError> {
         strict!(self, p => p.connection_upsert(connection), f => f.connection_upsert(connection))
     }
+    async fn connection_replace(
+        &self,
+        connection: &super::tenants::ConnectionRecord,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.connection_replace(connection, expected_updated_at), f => f.connection_replace(connection, expected_updated_at))
+    }
     async fn connection_get(
         &self,
         tenant: &str,
@@ -471,11 +481,28 @@ impl RunHistory for FallbackHistory {
     async fn usage_delete_runs(&self, run_ids: &[String]) -> Result<usize, HistoryError> {
         strict!(self, p => p.usage_delete_runs(run_ids), f => f.usage_delete_runs(run_ids))
     }
+    async fn catalog_purge(
+        &self,
+        prefix: &str,
+        runs: &[String],
+    ) -> Result<crate::serve::history::catalog::CatalogPurgeReport, HistoryError> {
+        strict!(self, p => p.catalog_purge(prefix, runs), f => f.catalog_purge(prefix, runs))
+    }
+    async fn usage_delete_tenant(&self, tenant: &str) -> Result<usize, HistoryError> {
+        strict!(self, p => p.usage_delete_tenant(tenant), f => f.usage_delete_tenant(tenant))
+    }
     async fn change_upsert(
         &self,
         change: &crate::serve::changes::ChangeRequest,
     ) -> Result<(), HistoryError> {
         strict!(self, p => p.change_upsert(change), f => f.change_upsert(change))
+    }
+    async fn change_transition(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        from: crate::serve::changes::ChangeStatus,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.change_transition(change, from), f => f.change_transition(change, from))
     }
     async fn change_get(
         &self,
@@ -782,7 +809,23 @@ mod tests {
         let usage = crate::usage::UsageFilter::default();
         assert!(bare.usage_list(&usage).await.unwrap().is_empty());
 
+        let pending = crate::serve::changes::ChangeStatus::Pending;
+        assert!(
+            !bare
+                .change_transition(&change("c0"), pending)
+                .await
+                .unwrap()
+        );
         let fb = FallbackHistory::healthy(Box::new(AlwaysFail), Duration::from_secs(60), "test");
+        assert!(!fb.change_transition(&change("c1"), pending).await.unwrap());
+        let run = RunRecord::queued(
+            "r0".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(!fb.release_owned(&run).await.unwrap());
         assert!(fb.change_get("c1").await.unwrap().is_none());
         assert!(
             fb.change_list(&Default::default())

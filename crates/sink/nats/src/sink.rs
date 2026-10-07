@@ -108,18 +108,11 @@ impl Sink for NatsSink {
     }
 
     fn dataset_uri(&self) -> String {
-        let server = self
-            .config
-            .connection
-            .servers
-            .first()
-            .map(String::as_str)
-            .unwrap_or("unknown");
         let subject = match &self.config.subject_field {
             Some(f) => format!("(from_field:{f})"),
             None => self.config.subject.clone(),
         };
-        format!("nats://{server}?subject={subject}")
+        faucet_common_nats::dataset_uri(&self.config.connection.servers, &subject)
     }
 }
 

@@ -83,11 +83,27 @@ something else. A rotated secret or a live probe result is not material.
 
 Otherwise the request executes and becomes `executed` (with `run_id` or the
 template id and version) or, if execution itself errors, `failed` with the
-reason. A run carries the label `change: <id>`.
+reason. A run carries the label `change: <id>` and, unless the requester set
+one, the idempotency key `change:<id>`.
 
 `POST /v1/changes/{id}/reject` with `{ "reason": "..." }` rejects; the
 requester may reject (withdraw) their own. A pending request lapses to
 `expired` after its window (a sweep runs every minute, and reads apply it too).
+
+Every transition out of `pending` is a compare-and-set on the stored status,
+so two approvals that reach the quorum together, or an approval racing a
+rejection or the expiry sweep, cannot both win: the loser gets `409` and
+nothing runs twice. If an execution is interrupted after approval (a crash, a
+store error before `executed` was written), the same sweep finds the request
+still `approved` five minutes later and finishes it: a run is submitted again
+under its `change:<id>` key (so the original run is replayed, never doubled),
+a launch is re-applied (re-launching the live version is a no-op), and a
+registration is marked `failed` — its outcome is unknown, so check the
+template's versions before proposing it again.
+
+A `change_requested` notification is built from the proposed config as it
+loads — `${env:…}` webhook URLs resolve and the `--default-config` base
+applies — exactly as the run would see it.
 
 ## Who may approve
 
@@ -130,9 +146,19 @@ faucet serve --auth-config auth.yaml --require-approval run,template_launch
 ```
 
 - `run`: `POST /v1/runs` and template triggers answer with a pending change
-  request instead of starting a run; `POST /v1/backfill` is refused (propose
-  each window as a `run` change); the MCP `run_pipeline` tool points the agent
-  at `propose_run`.
+  request instead of starting a run; `POST /v1/backfill`, a `POST /v1/verify`
+  with `repair` and a `POST /v1/dlq/replay` (each writes to the destination;
+  their `dry_run` forms still answer) are refused with `403` (propose the run
+  as a `run` change); the MCP `run_pipeline` tool points the agent at
+  `propose_run`, and the MCP `run_template` tool answers with the pending
+  change request, as `POST /v1/templates/{id}/runs` does.
+- A trigger declared in the server's `--triggers` file is a **standing
+  approval**: whoever controls that file (the server operator) approved the
+  pipeline it names, so its fires — object arrivals, queue edges, schedule
+  ticks and `POST /v1/triggers/{name}` — run without a change request. A
+  fire per event would otherwise file one request per file or tick, and a
+  rejected one would lose the event. Leave a pipeline out of `--triggers` if
+  every run of it needs review.
 - `template_register` / `template_launch`: those kinds must come through
   `POST /v1/changes`. `POST /v1/templates` (both kinds when it also launches or
   assigns channels), `/launch`, `/rollback`, `/tags` and a non-dry-run

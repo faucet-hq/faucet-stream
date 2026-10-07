@@ -11,7 +11,7 @@ use std::time::Duration;
 ///
 /// Use a `Vec<MetadataEntry>` rather than a map because gRPC allows duplicate
 /// keys and order is occasionally observable.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(extend("x-faucet-aliases" = ["max_reconnect_attempts"]))]
 #[serde(deny_unknown_fields)]
 pub struct MetadataEntry {
@@ -23,8 +23,14 @@ pub struct MetadataEntry {
     pub value: String,
 }
 
+impl std::fmt::Debug for MetadataEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "MetadataEntry", self, &["value"])
+    }
+}
+
 /// Authentication for gRPC endpoints.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum GrpcAuth {
     /// No authentication.
@@ -34,6 +40,12 @@ pub enum GrpcAuth {
     Bearer { token: String },
     /// Custom metadata key-value pairs.
     Metadata { entries: Vec<MetadataEntry> },
+}
+
+impl std::fmt::Debug for GrpcAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "GrpcAuth", self, &["token", "value"])
+    }
 }
 
 /// Kind of gRPC RPC to invoke.
@@ -71,7 +83,17 @@ pub struct GrpcStreamConfig {
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
     pub auth: AuthSpec<GrpcAuth>,
     /// Whether to use TLS (detected from `https://` in endpoint by default).
+    /// The server certificate is verified against the operating system's
+    /// trust store and the bundled Mozilla roots, plus [`ca_cert`](Self::ca_cert).
     pub tls: Option<bool>,
+    /// PEM file with an extra CA certificate to trust — for a server whose
+    /// certificate is signed by a private CA.
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
+    /// Host name to verify the server certificate against, when it differs
+    /// from the endpoint's host (connecting by IP or through a tunnel).
+    #[serde(default)]
+    pub domain_name: Option<String>,
     /// JSONPath to extract records from the response.
     /// If not set, the entire response is returned as a single record.
     pub records_path: Option<String>,
@@ -236,6 +258,8 @@ impl GrpcStreamConfig {
             descriptor_set_path: descriptor_set_path.into(),
             auth: AuthSpec::Inline(GrpcAuth::None),
             tls: None,
+            ca_cert: None,
+            domain_name: None,
             records_path: None,
             batch_size: DEFAULT_BATCH_SIZE,
             rpc_kind: RpcKind::Unary,
@@ -268,6 +292,19 @@ impl GrpcStreamConfig {
     /// Set the TLS mode explicitly.
     pub fn tls(mut self, tls: bool) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Trust the CA certificate in this PEM file (in addition to the system
+    /// and bundled roots).
+    pub fn ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_cert = Some(path.into());
+        self
+    }
+
+    /// Verify the server certificate against `name` instead of the endpoint's host.
+    pub fn domain_name(mut self, name: impl Into<String>) -> Self {
+        self.domain_name = Some(name.into());
         self
     }
 
@@ -638,5 +675,24 @@ mod tests {
         assert!(back.connect_timeout.is_none());
         assert_eq!(back.timeout, Some(Duration::from_secs(5)));
         assert!(back.idle_timeout.is_none());
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: GrpcAuth =
+            serde_json::from_str(r#"{"type":"bearer","config":{"token":"S3CRET-1"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: GrpcAuth = serde_json::from_str(
+            r#"{"type":"metadata","config":{"entries":[{"key":"x-api-key","value":"S3CRET-2"}]}}"#,
+        )
+        .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

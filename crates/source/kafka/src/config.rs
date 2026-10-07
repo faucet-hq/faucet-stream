@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KafkaSourceConfig {
     /// Comma-separated bootstrap server list, e.g. `"broker1:9092,broker2:9092"`.
@@ -81,6 +81,17 @@ pub struct KafkaSourceConfig {
     /// sink confirms the write.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+}
+
+impl std::fmt::Debug for KafkaSourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(
+            f,
+            "KafkaSourceConfig",
+            self,
+            &["password", "key_password", "extra_client_config"],
+        )
+    }
 }
 
 fn default_poll_timeout() -> Duration {
@@ -291,5 +302,17 @@ mod tests {
         });
         let parsed: KafkaSourceConfig = serde_json::from_value(j).unwrap();
         assert_eq!(parsed.batch_size, 250);
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: KafkaSourceConfig = serde_json::from_str(r#"{"brokers":"b:9092","topics":["t"],"group_id":"g","auth":{"type":"sasl_plain","config":{"username":"u","password":"S3CRET-1"}},"extra_client_config":{"sasl.password":"S3CRET-2"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

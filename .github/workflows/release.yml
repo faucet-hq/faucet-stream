@@ -190,9 +190,13 @@ jobs:
       # ── Dry run ───────────────────────────────────────────────────────
       - name: Release (dry run)
         if: ${{ inputs.dry_run }}
+        # Inputs reach the script as environment variables, never spliced
+        # into its text (#789 SUPPLY-10).
+        env:
+          SCOPE: ${{ inputs.scope }}
+          BUMP: ${{ inputs.bump }}
+          CUSTOM_CRATES: ${{ inputs.custom_crates }}
         run: |
-          SCOPE="${{ inputs.scope }}"
-          BUMP="${{ inputs.bump }}"
 
           read -ra all_crates <<< "$ordered_all"
           read -ra connectors <<< "$ordered_connectors"
@@ -203,7 +207,7 @@ jobs:
             connectors) selected=("${connectors[@]}") ;;
             umbrella)   selected=(faucet-stream) ;;
             custom)
-              IFS=',' read -ra selected <<< "${{ inputs.custom_crates }}"
+              IFS=',' read -ra selected <<< "$CUSTOM_CRATES"
               selected=("${selected[@]// /}")  # trim whitespace
               ;;
           esac
@@ -243,10 +247,11 @@ jobs:
         if: ${{ !inputs.dry_run }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          SCOPE: ${{ inputs.scope }}
+          BUMP: ${{ inputs.bump }}
+          CUSTOM_CRATES: ${{ inputs.custom_crates }}
         run: |
           set -uo pipefail
-          SCOPE="${{ inputs.scope }}"
-          BUMP="${{ inputs.bump }}"
 
           read -ra all_crates <<< "$ordered_all"
           read -ra connectors <<< "$ordered_connectors"
@@ -257,7 +262,7 @@ jobs:
             connectors) selected=("${connectors[@]}") ;;
             umbrella)   selected=(faucet-stream) ;;
             custom)
-              IFS=',' read -ra selected <<< "${{ inputs.custom_crates }}"
+              IFS=',' read -ra selected <<< "$CUSTOM_CRATES"
               selected=("${selected[@]// /}")
               ;;
           esac

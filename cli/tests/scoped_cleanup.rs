@@ -179,6 +179,7 @@ async fn cleanup_still_runs_when_the_catalog_samples_the_sink() {
         run_id: None,
         sample_records: 10,
         annotations: Vec::new(),
+        tenant: None,
     });
     run(&config_yaml(&csv, &db, true), dir.path(), o).await;
 

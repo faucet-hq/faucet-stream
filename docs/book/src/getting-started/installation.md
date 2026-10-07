@@ -28,6 +28,26 @@ curl -LsSf https://github.com/faucet-hq/faucet-stream/releases/latest/download/f
 (e.g. `faucet-cli-aarch64-apple-darwin.tar.xz`), verify it against the
 published `.sha256` checksum, and put `faucet` on your `PATH`.
 
+**Verify provenance.** The checksum is published next to the archive, so it
+only catches a corrupt download. To check that an archive (or the shell
+installer) was built by this repository's release workflow, verify its
+[build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
+with the GitHub CLI:
+
+```bash
+gh attestation verify faucet-cli-aarch64-apple-darwin.tar.xz --repo faucet-hq/faucet-stream
+```
+
+Container images on GHCR carry provenance and an SBOM, and are signed with
+Sigstore keyless signing:
+
+```bash
+gh attestation verify oci://ghcr.io/faucet-hq/faucet-stream:full --repo faucet-hq/faucet-stream
+cosign verify ghcr.io/faucet-hq/faucet-stream:full \
+  --certificate-identity-regexp '^https://github.com/faucet-hq/faucet-stream/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
 The prebuilt binary includes the CLI **default** feature set (every first-party
 connector, transforms, quality checks, contracts, masking, compression) plus
 `serve` (with the embedded web console), `schedule`, `lineage`, and `templates`

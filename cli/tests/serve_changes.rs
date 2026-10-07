@@ -475,6 +475,82 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
         .await;
     assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
     assert_eq!(list[0]["id"], proposed["change_id"]);
+    // On the server transport `run_pipeline` is a tracked run in the queue,
+    // not an in-request execution (#789 SERVE-20).
+    let mcp_out = dir.path().join("mcp-out.jsonl");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {
+                "name": "run_pipeline",
+                "arguments": { "config": csv_config(&input, &mcp_out, "via-mcp") }
+            }}),
+        )
+        .await;
+    assert!(!r["result"]["isError"].as_bool().unwrap_or(false), "{r}");
+    let sub: Value =
+        serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let rec = api.wait_run(sub["run_id"].as_str().unwrap()).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+    assert_eq!(
+        std::fs::read_to_string(&mcp_out).unwrap().lines().count(),
+        3
+    );
+
+    // A named run keeps its name; a config the server cannot load is a tool
+    // error; a template run is a tracked run too.
+    let named_out = dir.path().join("named-out.jsonl");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {
+                "name": "run_pipeline",
+                "arguments": { "config": csv_config(&input, &named_out, "x"), "name": "mcp-named" }
+            }}),
+        )
+        .await;
+    let sub: Value =
+        serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let rec = api.wait_run(sub["run_id"].as_str().unwrap()).await;
+    assert_eq!(rec["name"], "mcp-named", "{rec}");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {
+                "name": "run_pipeline",
+                "arguments": { "config": "version: 2\n" }
+            }}),
+        )
+        .await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let tpl_out = dir.path().join("tpl-out.jsonl");
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({ "config": format!("kind: pipeline\n{}", csv_config(&input, &tpl_out, "tpl-mcp")),
+                    "id": "tpl-mcp", "launch": true }),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {
+                "name": "run_template", "arguments": { "id": "tpl-mcp" }
+            }}),
+        )
+        .await;
+    assert!(!r["result"]["isError"].as_bool().unwrap_or(false), "{r}");
+    let sub: Value =
+        serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let rec = api.wait_run(sub["run_id"].as_str().unwrap()).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+
     // A proposal whose config cannot be planned comes back as a tool error
     // carrying the server error's `code: message` rendering.
     let (_, bad) = api
@@ -600,6 +676,52 @@ async fn require_approval_turns_submissions_into_change_requests() {
         "{r}"
     );
 
+    // Verify repair and DLQ replay write to the sink outside the queue, so
+    // they are refused under the gate too (#789 SERVE-18).
+    let (code, r) = api
+        .post(
+            "bob-tok",
+            "/v1/verify",
+            json!({ "config": config, "repair": true, "allow_delete": true }),
+        )
+        .await;
+    assert_eq!(code, 403, "{r}");
+    let (code, r) = api
+        .post(
+            "bob-tok",
+            "/v1/dlq/replay",
+            json!({ "config": config, "from": dir.path().join("dlq.jsonl").display().to_string() }),
+        )
+        .await;
+    assert_eq!(code, 403, "{r}");
+    assert!(!output.exists());
+
+    // MCP `run_template` submits through the server, so it becomes a change
+    // request instead of running in the request task (#789 SERVE-20).
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({ "config": format!("kind: pipeline\n{}", csv_config(&input, &output, "tpl-gated")),
+                    "id": "tpl-gated", "launch": true }),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (_, r) = api
+        .post(
+            "bob-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "run_template", "arguments": { "id": "tpl-gated" }
+            }}),
+        )
+        .await;
+    let text = r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("pending_approval"), "{r}");
+    assert!(!output.exists());
+
     // Approval runs it.
     let (code, executed) = api
         .post("admin-tok", &format!("/v1/changes/{id}/approve"), json!({}))
@@ -610,4 +732,74 @@ async fn require_approval_turns_submissions_into_change_requests() {
     assert_eq!(rec["status"], "completed", "{rec}");
     assert_eq!(rec["name"], "gated-run");
     assert_eq!(std::fs::read_to_string(&output).unwrap().lines().count(), 2);
+
+    // The audit log names what each action touched (#789 SERVE-32).
+    let (_, audit) = api.get("admin-tok", "/v1/audit?limit=200").await;
+    let entries = audit["entries"]
+        .as_array()
+        .or_else(|| audit.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["action"] == "template.register" && e["target"] == "template:tpl-gated@1"),
+        "{audit}"
+    );
+    assert!(
+        entries.iter().any(|e| e["action"] == "mcp"
+            && e["target"] == "mcp:run_template"
+            && e["principal"] == "bob"),
+        "{audit}"
+    );
+}
+
+/// #789 SERVE-38: the approvers' `change_requested` notification is built
+/// from the loaded config, so a documented `${env:…}` webhook URL resolves.
+#[cfg(feature = "notify")]
+#[tokio::test(flavor = "multi_thread")]
+async fn change_requested_notifications_resolve_env_references() {
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let hook = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("change_requested"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&hook)
+        .await;
+    unsafe { std::env::set_var("FAUCET_789_APPROVER_HOOK", format!("{}/hook", hook.uri())) };
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let config = format!(
+        "{}notifications:\n  - name: approvers\n    on: [change_requested]\n    channel:\n      type: webhook\n      config:\n        url: \"${{env:FAUCET_789_APPROVER_HOOK}}\"\n",
+        csv_config(&input, &dir.path().join("o.jsonl"), "notify-me")
+    );
+    let port = free_port();
+    spawn_server(port, dir.path(), vec!["run".into()]).await;
+    let api = Api {
+        base: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::new(),
+    };
+    let (code, resp) = api
+        .post(
+            "bob-tok",
+            "/v1/runs",
+            json!({ "config": config, "reason": "please" }),
+        )
+        .await;
+    assert_eq!(code, 202, "{resp}");
+    for _ in 0..200 {
+        if !hook
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    hook.verify().await;
 }

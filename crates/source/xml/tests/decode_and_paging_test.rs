@@ -129,3 +129,43 @@ async fn body_cursor_stops_when_no_token() {
         .unwrap();
     assert_eq!(records.len(), 1);
 }
+
+/// An XML document inside the response keeps its attributes when parsed.
+#[tokio::test]
+async fn decode_pipeline_parses_xml_with_attributes() {
+    let server = MockServer::start().await;
+    let inner = r#"<rows><row id="1" kind="a"/><row id="2" kind="b"/></rows>"#;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(inner);
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("<r><payload>{b64}</payload></r>")),
+        )
+        .mount(&server)
+        .await;
+    let mut config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<q/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "payload".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Xml,
+                    records_path: None,
+                    delimiter: None,
+                    has_headers: true,
+                    sheet: None,
+                    header_row: 0,
+                },
+            },
+        ]);
+    config.batch_size = 0;
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    let text = serde_json::to_string(&records).unwrap();
+    for needle in ["\"@id\":\"1\"", "\"@kind\":\"b\""] {
+        assert!(text.contains(needle), "{needle} in {text}");
+    }
+}

@@ -177,15 +177,16 @@ impl GoogleServiceAccountProvider {
 
     async fn fetch(&self) -> Result<TokenResponse, FaucetError> {
         let assertion = self.assertion(jsonwebtoken::get_current_timestamp())?;
-        let resp = self
-            .http
-            .post(&self.token_uri)
-            .form(&[("grant_type", JWT_BEARER_GRANT), ("assertion", &assertion)])
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+        let reply = crate::retry::send_token_request(|| {
+            Ok(self
+                .http
+                .post(&self.token_uri)
+                .form(&[("grant_type", JWT_BEARER_GRANT), ("assertion", &assertion)]))
+        })
+        .await?;
+        if !reply.is_success() {
+            let status = reply.status;
+            let body = reply.text();
             return Err(FaucetError::Auth(format!(
                 "google_service_account token request failed (HTTP {status}): {body} \
                  (service account {}, subject {}, scopes {})",
@@ -194,7 +195,7 @@ impl GoogleServiceAccountProvider {
                 self.scopes.join(" ")
             )));
         }
-        resp.json::<TokenResponse>().await.map_err(Into::into)
+        serde_json::from_slice::<TokenResponse>(&reply.body).map_err(Into::into)
     }
 
     async fn refresh(&self, state: &mut CachedToken) -> Result<String, FaucetError> {

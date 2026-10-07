@@ -7,7 +7,7 @@ use crate::config::{LineageConfig, Transport};
 use crate::event::*;
 use crate::lifecycle::{InferredSchema, RunLifecycle};
 use crate::transport::{Transport as TransportTrait, file::FileTransport, http::HttpTransport};
-use faucet_core::FaucetError;
+use faucet_core::{FaucetError, redact_uri_credentials};
 use metrics::{counter, histogram};
 use std::sync::Arc;
 
@@ -129,7 +129,7 @@ impl LineageEmitter {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                let mut ds = Dataset::new(r.namespace.clone(), r.name.clone());
+                let mut ds = Dataset::new(r.namespace.clone(), redact_uri_credentials(&r.name));
                 if terminal
                     && self.cfg.include_schema_facet
                     && let Some(Some(s)) = ctx.input_schemas.get(i)
@@ -141,7 +141,10 @@ impl LineageEmitter {
             .collect();
 
         // Output dataset (+ schema + column lineage on terminal events).
-        let mut output = Dataset::new(ctx.output.namespace.clone(), ctx.output.name.clone());
+        let mut output = Dataset::new(
+            ctx.output.namespace.clone(),
+            redact_uri_credentials(&ctx.output.name),
+        );
         if terminal
             && self.cfg.include_schema_facet
             && let Some(s) = &ctx.output_schema
@@ -158,7 +161,11 @@ impl LineageEmitter {
             && let Some(cl) = &ctx.column_lineage
             && let [only] = ctx.inputs.as_slice()
         {
-            output.facets.column_lineage = Some(column_facet(cl, &only.namespace, &only.name));
+            output.facets.column_lineage = Some(column_facet(
+                cl,
+                &only.namespace,
+                &redact_uri_credentials(&only.name),
+            ));
         }
 
         RunEvent {
@@ -293,6 +300,26 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
         assert_eq!(v["eventType"], "START");
         assert_eq!(v["inputs"][0]["name"], "postgres://h/db");
+    }
+
+    #[tokio::test]
+    async fn dataset_names_never_carry_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ol.jsonl");
+        let mut c = cfg(path.clone());
+        c.include_column_lineage = true;
+        let em = LineageEmitter::new(c).unwrap();
+        let mut ctx = lifecycle();
+        ctx.inputs[0].name = "nats://user:s3cret@broker:4222/orders".into();
+        ctx.output.name = "https://h/ingest?token=abc".into();
+        ctx.column_lineage = crate::column::derive(&["a".to_string()], &[]);
+        ctx.finished_at = Some(Utc::now());
+        em.emit(EventType::Complete, &ctx).await;
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("s3cret"), "{body}");
+        assert!(!body.contains("abc"), "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(v["inputs"][0]["name"], "nats://broker:4222/orders");
     }
 
     #[tokio::test]

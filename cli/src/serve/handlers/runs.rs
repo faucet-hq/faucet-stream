@@ -13,11 +13,12 @@ use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Scrub any resolved secret that reached a run's error fields before the record
-/// is serialized into an HTTP response. The serve log subscriber's redaction
-/// writer only covers tracing/log output — API response bodies are a separate
-/// egress and must be scrubbed here.
-fn redact_record(rec: &mut RunRecord) {
+/// Scrub what a run record must not hand back over HTTP: resolved secrets in
+/// its error fields (the log redaction writer covers tracing output only),
+/// the completion callback's header values and URL credentials, and — for
+/// anyone but an admin — the stored config body, which can hold inline
+/// credentials.
+pub(crate) fn redact_record(rec: &mut RunRecord, actor: &AuthContext) {
     if let Some(e) = &rec.error {
         rec.error = Some(crate::secrets::registry::redact(e).into_owned());
     }
@@ -25,6 +26,15 @@ fn redact_record(rec: &mut RunRecord) {
         if let Some(e) = &inv.error {
             inv.error = Some(crate::secrets::registry::redact(e).into_owned());
         }
+    }
+    if let Some(cb) = &mut rec.callback {
+        cb.url = faucet_core::util::redact_uri_credentials(&cb.url);
+        for v in cb.headers.values_mut() {
+            *v = "***".to_string();
+        }
+    }
+    if actor.role != crate::serve::rbac::Role::Admin || actor.tenant.is_some() {
+        rec.config_body = None;
     }
 }
 
@@ -101,7 +111,7 @@ pub async fn get_run(
             .ok()
             .map(|d| d.as_secs_f64());
     }
-    redact_record(&mut rec);
+    redact_record(&mut rec, &actor);
     Ok(Json(rec))
 }
 
@@ -297,12 +307,29 @@ pub async fn list_runs(
         .map_err(|e| ServeError::Internal(e.to_string()))?;
     let mut runs = page.runs;
     for rec in &mut runs {
-        redact_record(rec);
+        redact_record(rec, &actor);
     }
     Ok(Json(ListResponse {
         runs,
         next_cursor: page.next_cursor,
     }))
+}
+
+/// The state-key prefix a serve run's markers live under: the config's
+/// `name` (else `serve`, as the runner names it), behind the tenant
+/// namespace for a tenant run.
+fn rollback_pipeline_name(loaded: &crate::serve::load::LoadedSubmission) -> String {
+    let base = loaded
+        .cfg
+        .name
+        .clone()
+        .unwrap_or_else(|| "serve".to_string());
+    loaded
+        .tenant
+        .as_ref()
+        .map(|t| t.state_scope())
+        .unwrap_or_default()
+        .prefix(&base)
 }
 
 /// `POST /v1/runs/{id}/rollback` request body (#706).
@@ -402,23 +429,16 @@ pub async fn rollback_run(
             });
         }
     };
-    let loaded = crate::serve::load::load_submission(
-        &config,
-        format,
-        state.default_base().as_ref(),
-        crate::serve::runner::server_policy(&state).as_deref(),
-        origin,
-    )
-    .await?;
+    // Load as the run was executed: under its tenant (connections, state
+    // namespace) when it had one (#789 SERVE-27).
+    let loaded =
+        crate::serve::runner::load_for(&state, &config, format, rec.tenant.as_deref(), origin)
+            .await?;
     loaded.require_matrix()?;
-    let auth = crate::auth_catalog::build_auth_catalog(loaded.cfg.auth.as_ref())
+    let auth = loaded
+        .auth_catalog()
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
-    let pipeline_name = loaded
-        .cfg
-        .name
-        .clone()
-        .or(rec.name.clone())
-        .unwrap_or_else(|| "pipeline".to_string());
+    let pipeline_name = rollback_pipeline_name(&loaded);
     let (node, store, marker) = crate::rollback::locate(
         &loaded.nodes,
         &pipeline_name,

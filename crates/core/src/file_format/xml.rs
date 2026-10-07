@@ -196,7 +196,7 @@ fn pop(stack: &mut Vec<Frame>, detail: &str) -> Result<Frame, FaucetError> {
 
 fn attrs(e: &BytesStart) -> Map<String, Value> {
     let mut m = Map::new();
-    for a in e.attributes().flatten() {
+    for a in e.attributes().with_checks(false).flatten() {
         let k = local(a.key.as_ref());
         if let Ok(v) = a.unescape_value() {
             m.insert(format!("@{k}"), Value::String(v.to_string()));
@@ -318,6 +318,17 @@ mod tests {
             decode(xml, "row").expect("decode"),
             vec![json!({"id": "1", "n": "a"}), json!({"id": "2", "n": "b"})]
         );
+    }
+
+    #[test]
+    fn attributes_are_read_without_the_quadratic_duplicate_check() {
+        // RUSTSEC-2026-0194: the duplicate-name check is quadratic in the
+        // attribute count, so it is off; a repeated name keeps its last value.
+        let many: String = (0..5_000).map(|i| format!(" a{i}=\"{i}\"")).collect();
+        let xml = format!("<rows><row{many} id=\"1\" id=\"2\"/></rows>");
+        let rows = decode(xml.as_bytes(), "row").expect("decode");
+        assert_eq!(rows[0]["@id"], json!("2"));
+        assert_eq!(rows[0]["@a4999"], json!("4999"));
     }
 
     fn nested(depth: usize) -> Vec<u8> {

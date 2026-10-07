@@ -20,9 +20,203 @@ use super::{HistoryError, RunRecord, RunStatus, Transience};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
+/// The schema version this binary writes (#789 SERVE-33 / SUPPLY-19), kept
+/// in `faucet_serve_schema`. A database stamped with a newer version is
+/// refused at startup instead of being written by code that does not know
+/// its columns.
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// Columns added to a table after it first shipped, with the schema version
+/// that added them. `CREATE TABLE IF NOT EXISTS` never alters an existing
+/// table, so the connect-time migration adds each missing one with `ALTER TABLE`.
+pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
+    (1, "faucet_serve_runs", "cancel_requested"),
+    (2, "faucet_usage", "tenant"),
+    (2, "faucet_serve_changes", "tenant"),
+    (3, "faucet_serve_audit", "target"),
+];
+
+/// DDL that needs the [`ADDED_COLUMNS`] in place (indexes on them).
+pub const POST_MIGRATION_DDL: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS faucet_usage_tenant_idx \
+        ON faucet_usage (tenant, recorded_at)",
+    "CREATE INDEX IF NOT EXISTS faucet_serve_changes_tenant_idx \
+        ON faucet_serve_changes (tenant, created_at)",
+];
+
+/// The marker [`schema_too_new`] recognises.
+const SCHEMA_TOO_NEW: &str = "is newer than this faucet binary";
+
+/// Whether a connect error is a database written by a newer binary — fatal
+/// at startup rather than a reason to degrade to memory.
+pub fn schema_too_new(e: &HistoryError) -> bool {
+    e.to_string().contains(SCHEMA_TOO_NEW)
+}
+
+/// The refusal for a database stamped `found` (> [`SCHEMA_VERSION`]).
+pub fn newer_schema_error(found: u32) -> HistoryError {
+    HistoryError::Backend(format!(
+        "the run-history database schema (v{found}) {SCHEMA_TOO_NEW} (v{SCHEMA_VERSION}); \
+         upgrade faucet, or point --history at another database"
+    ))
+}
+
+/// Bring a database up to [`SCHEMA_VERSION`]: create every table, add the
+/// columns later versions introduced, backfill the tenant columns from each
+/// row's body, create their indexes and stamp the version. Idempotent and
+/// safe to run from several instances at once (a lost `ALTER TABLE` race is
+/// re-probed).
+macro_rules! migrate {
+    ($pool:expr) => {{
+        use sqlx::Row as _;
+        use $crate::serve::history::sql::{
+            ADDED_COLUMNS, DDL, POST_MIGRATION_DDL, SCHEMA_VERSION,
+            classify_backend_error_with_context as ctx,
+        };
+        async {
+            for stmt in DDL {
+                sqlx::query(stmt)
+                    .execute($pool)
+                    .await
+                    .map_err(|e| ctx("creating run-history schema", e))?;
+            }
+            let found: Option<String> =
+                sqlx::query("SELECT version FROM faucet_serve_schema WHERE id='schema'")
+                    .fetch_optional($pool)
+                    .await
+                    .map_err(|e| ctx("reading the run-history schema version", e))?
+                    .map(|r| r.try_get::<String, _>("version"))
+                    .transpose()
+                    .map_err(|e| ctx("reading the run-history schema version", e))?;
+            let found: u32 = found.and_then(|v| v.parse().ok()).unwrap_or(0);
+            if found > SCHEMA_VERSION {
+                return Err($crate::serve::history::sql::newer_schema_error(found));
+            }
+            for (_, table, column) in ADDED_COLUMNS {
+                let probe = format!("SELECT {column} FROM {table} WHERE 1=0");
+                if sqlx::query(&probe).fetch_optional($pool).await.is_ok() {
+                    continue;
+                }
+                let alter = format!("ALTER TABLE {table} ADD COLUMN {column} TEXT");
+                if let Err(e) = sqlx::query(&alter).execute($pool).await
+                    && sqlx::query(&probe).fetch_optional($pool).await.is_err()
+                {
+                    return Err(ctx(&format!("adding {table}.{column}"), e));
+                }
+            }
+            if found < 2 {
+                let rows = sqlx::query(
+                    "SELECT run_id, row_id, body FROM faucet_usage WHERE tenant IS NULL",
+                )
+                .fetch_all($pool)
+                .await
+                .map_err(|e| ctx("backfilling usage tenants", e))?;
+                for row in rows {
+                    let body: String = row.try_get("body").unwrap_or_default();
+                    let Some(t) = $crate::serve::history::sql::body_tenant(&body) else {
+                        continue;
+                    };
+                    let run_id: String = row.try_get("run_id").unwrap_or_default();
+                    let row_id: String = row.try_get("row_id").unwrap_or_default();
+                    sqlx::query(&format!(
+                        "UPDATE faucet_usage SET tenant={} WHERE run_id={} AND row_id={}",
+                        $crate::serve::history::sql::bind_mark(&*$pool, 1),
+                        $crate::serve::history::sql::bind_mark(&*$pool, 2),
+                        $crate::serve::history::sql::bind_mark(&*$pool, 3),
+                    ))
+                    .bind(t)
+                    .bind(run_id)
+                    .bind(row_id)
+                    .execute($pool)
+                    .await
+                    .map_err(|e| ctx("backfilling usage tenants", e))?;
+                }
+                let rows =
+                    sqlx::query("SELECT id, body FROM faucet_serve_changes WHERE tenant IS NULL")
+                        .fetch_all($pool)
+                        .await
+                        .map_err(|e| ctx("backfilling change tenants", e))?;
+                for row in rows {
+                    let body: String = row.try_get("body").unwrap_or_default();
+                    let Some(t) = $crate::serve::history::sql::body_tenant(&body) else {
+                        continue;
+                    };
+                    let id: String = row.try_get("id").unwrap_or_default();
+                    sqlx::query(&format!(
+                        "UPDATE faucet_serve_changes SET tenant={} WHERE id={}",
+                        $crate::serve::history::sql::bind_mark(&*$pool, 1),
+                        $crate::serve::history::sql::bind_mark(&*$pool, 2),
+                    ))
+                    .bind(t)
+                    .bind(id)
+                    .execute($pool)
+                    .await
+                    .map_err(|e| ctx("backfilling change tenants", e))?;
+                }
+            }
+            for stmt in POST_MIGRATION_DDL {
+                sqlx::query(stmt)
+                    .execute($pool)
+                    .await
+                    .map_err(|e| ctx("creating run-history schema", e))?;
+            }
+            if found < SCHEMA_VERSION {
+                sqlx::query(&format!(
+                    "INSERT INTO faucet_serve_schema (id, version) VALUES ('schema', {}) \
+                     ON CONFLICT (id) DO UPDATE SET version=excluded.version",
+                    $crate::serve::history::sql::bind_mark(&*$pool, 1)
+                ))
+                .bind(SCHEMA_VERSION.to_string())
+                .execute($pool)
+                .await
+                .map_err(|e| ctx("stamping the run-history schema version", e))?;
+            }
+            Ok::<(), $crate::serve::history::HistoryError>(())
+        }
+        .await
+    }};
+}
+pub(crate) use migrate;
+
+/// The `tenant` a stored JSON body carries, if any.
+pub fn body_tenant(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("tenant")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The positional placeholder of a pool's dialect.
+pub trait BindMark {
+    fn mark(&self, n: usize) -> String;
+}
+
+#[cfg(feature = "serve-history-postgres")]
+impl BindMark for sqlx::PgPool {
+    fn mark(&self, n: usize) -> String {
+        format!("${n}")
+    }
+}
+
+#[cfg(feature = "serve-history-sqlite")]
+impl BindMark for sqlx::SqlitePool {
+    fn mark(&self, _n: usize) -> String {
+        "?".to_string()
+    }
+}
+
+/// [`BindMark::mark`] as a function (macro-friendly).
+pub fn bind_mark<P: BindMark + ?Sized>(pool: &P, n: usize) -> String {
+    pool.mark(n)
+}
+
 /// DDL run at connect time. Valid verbatim on both Postgres and SQLite (only
 /// `TEXT` columns, `IF NOT EXISTS`, and standard indexes).
 pub const DDL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS faucet_serve_schema (\
+        id TEXT PRIMARY KEY,\
+        version TEXT NOT NULL)",
     // `owner` is the id of the serve instance that owns the run; `lease_expires_at`
     // is the RFC3339 instant past which that ownership is presumed dead. Together
     // they fence orphan recovery: an instance only fails a non-terminal run whose
@@ -96,7 +290,8 @@ pub const DDL: &[&str] = &[
         run_id TEXT,\
         config_fingerprint TEXT,\
         source_ip TEXT,\
-        result TEXT NOT NULL)",
+        result TEXT NOT NULL,\
+        target TEXT)",
     "CREATE INDEX IF NOT EXISTS faucet_serve_audit_ts_idx \
         ON faucet_serve_audit (ts)",
     // The tenant an audited action was taken for (#709) — a companion table
@@ -243,6 +438,7 @@ pub const DDL: &[&str] = &[
         row_id TEXT NOT NULL,\
         pipeline TEXT NOT NULL,\
         recorded_at TEXT NOT NULL,\
+        tenant TEXT,\
         body TEXT NOT NULL,\
         PRIMARY KEY (run_id, row_id))",
     "CREATE INDEX IF NOT EXISTS faucet_usage_recorded_idx \
@@ -260,6 +456,7 @@ pub const DDL: &[&str] = &[
         requester TEXT NOT NULL,\
         created_at TEXT NOT NULL,\
         expires_at TEXT NOT NULL,\
+        tenant TEXT,\
         body TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS faucet_serve_changes_status_idx \
         ON faucet_serve_changes (status, created_at)",
@@ -309,6 +506,15 @@ pub fn usage_limit(filter: &crate::usage::UsageFilter) -> usize {
     }
 }
 
+/// How many successive keys a run-log line probes before it is dropped.
+pub const SEQ_PROBES: u64 = 16;
+
+/// A `LIMIT` both dialects accept: a 64-bit signed integer (a caller's
+/// `usize::MAX` "no cap" would overflow it).
+pub fn sql_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
 /// The change-request listing cap for `filter`.
 pub fn change_limit(filter: &crate::serve::changes::ChangeListFilter) -> usize {
     if filter.limit > 0 {
@@ -341,6 +547,10 @@ pub struct Stmts {
     /// Select non-terminal runs whose owning instance's lease has expired (or
     /// is unset) — the orphans this instance may safely fail. Param: `now`.
     pub select_orphans: String,
+    /// Fail one orphan only if its lease is still expired (#789 SERVE-45):
+    /// an owner that renewed between the scan and this write keeps its run.
+    /// Params: status, finished_at, owner, lease, body, run_id, now.
+    pub fail_orphan: String,
     /// Extend the lease of this instance's own non-terminal runs (heartbeat).
     /// Params: `new_lease_expiry`, `instance_id`.
     pub renew_leases: String,
@@ -366,6 +576,8 @@ pub struct Stmts {
     pub reclaim_fail: String,
     /// Finalize a run owned by this instance (terminal status update).
     pub finalize_owned: String,
+    /// Requeue a run its owner gives up on at shutdown. Params: body, run_id, owner.
+    pub release_owned: String,
     /// Cancel a pending run directly (transition pending → cancelled).
     pub cancel_pending: String,
     /// Request cancellation of an in-flight run owned by another instance.
@@ -462,8 +674,10 @@ pub struct Stmts {
     /// Change requests (#703).
     pub change_upsert: String,
     pub change_select: String,
+    pub change_transition: String,
     pub change_delete: String,
     pub usage_delete_run: String,
+    pub usage_delete_tenant: String,
     pub tenant_upsert: String,
     pub tenant_select: String,
     pub tenant_list: String,
@@ -473,6 +687,9 @@ pub struct Stmts {
     pub tenant_delete_runs: String,
     pub tenant_delete_state_refs: String,
     pub connection_upsert: String,
+    /// Compare-and-set a connection on its stored `updated_at`. Params:
+    /// status, updated_at, body, tenant, name, expected updated_at.
+    pub connection_replace: String,
     pub connection_select: String,
     pub connection_list: String,
     pub connection_delete: String,
@@ -519,6 +736,21 @@ pub struct Stmts {
     pub catalog_upsert_config_snapshot: String,
     /// The latest config snapshot body for a pipeline. Param: pipeline.
     pub catalog_select_config_snapshot: String,
+    /// Catalog purge (#789 SERVE-51): one lineage edge. Params: src_id, dst_id.
+    pub catalog_delete_edge: String,
+    /// The dataset row, its schema timeline, volume points and profiles.
+    /// Param: dataset_id (each).
+    pub catalog_delete_dataset: String,
+    pub catalog_delete_dataset_versions: String,
+    pub catalog_delete_dataset_stats: String,
+    pub catalog_delete_dataset_profiles: String,
+    /// Volume points and profiles one run recorded. Param: run_id (each).
+    pub catalog_delete_run_stats: String,
+    pub catalog_delete_run_profiles: String,
+    /// Every config-snapshot pipeline name.
+    pub catalog_select_snapshot_pipelines: String,
+    /// One config snapshot. Param: pipeline.
+    pub catalog_delete_config_snapshot: String,
     // ── Pipeline templates (#444) ────────────────────────────────────────────
     /// Highest existing version for a template id (0 when new). Param: id.
     pub template_max_version: String,
@@ -660,15 +892,58 @@ impl Stmts {
             binds.push(pipeline.clone());
             clauses.push(format!("pipeline={}", self.placeholder(binds.len())));
         }
+        if let Some(tenant) = &filter.tenant {
+            binds.push(tenant.clone());
+            clauses.push(format!("tenant={}", self.placeholder(binds.len())));
+        }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
         sql.push_str(" ORDER BY recorded_at DESC, run_id ASC, row_id ASC");
-        // The tenant lives in the body, so a tenant filter runs on the decoded
-        // rows; the cap is applied after it rather than here.
-        if filter.tenant.is_none() {
-            sql.push_str(&format!(" LIMIT {}", usage_limit(filter)));
+        sql.push_str(&format!(" LIMIT {}", sql_limit(usage_limit(filter))));
+        (sql, binds)
+    }
+
+    /// Build the catalog dataset listing query (#789 SERVE-50): the kind
+    /// filter, the keyset cursor and (without a substring filter, which runs
+    /// on the decoded rows) one row past the page are pushed into SQL, so a
+    /// page does not load the whole never-purged table. The Rust pass in
+    /// `catalog::filter_datasets` re-applies every clause.
+    pub fn catalog_dataset_query(
+        &self,
+        filter: &crate::serve::history::catalog::CatalogListFilter,
+    ) -> (String, Vec<String>) {
+        let mut sql = self.catalog_select_datasets.clone();
+        let mut binds: Vec<String> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(kind) = &filter.kind {
+            binds.push(kind.clone());
+            clauses.push(format!("kind={}", self.placeholder(binds.len())));
+        }
+        if let Some((ts, id)) = filter
+            .cursor
+            .as_deref()
+            .and_then(crate::serve::history::catalog::decode_cursor)
+        {
+            let ts = fmt_ts(ts);
+            binds.push(ts.clone());
+            let a = self.placeholder(binds.len());
+            binds.push(ts);
+            let b = self.placeholder(binds.len());
+            binds.push(id);
+            let c = self.placeholder(binds.len());
+            clauses.push(format!(
+                "(last_seen < {a} OR (last_seen = {b} AND id < {c}))"
+            ));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY last_seen DESC, id DESC");
+        if filter.q.is_none() && filter.cursor.as_deref().is_none_or(|c| c.contains('~')) {
+            sql.push_str(&format!(" LIMIT {}", sql_limit(filter.limit.max(1) + 1)));
         }
         (sql, binds)
     }
@@ -695,14 +970,16 @@ impl Stmts {
             binds.push(requester.clone());
             clauses.push(format!("requester={}", self.placeholder(binds.len())));
         }
+        if let Some(tenant) = &filter.tenant {
+            binds.push(tenant.clone());
+            clauses.push(format!("tenant={}", self.placeholder(binds.len())));
+        }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
         sql.push_str(" ORDER BY created_at DESC, id ASC");
-        if filter.tenant.is_none() {
-            sql.push_str(&format!(" LIMIT {}", change_limit(filter)));
-        }
+        sql.push_str(&format!(" LIMIT {}", sql_limit(change_limit(filter))));
         (sql, binds)
     }
 
@@ -751,6 +1028,11 @@ impl Stmts {
                 WHERE status IN ('queued','running') \
                 AND (lease_expires_at IS NULL OR lease_expires_at < $1)"
                 .into(),
+            fail_orphan: "UPDATE faucet_serve_runs SET status=$1, finished_at=$2, owner=$3, \
+                lease_expires_at=$4, body=$5 WHERE run_id=$6 \
+                AND status IN ('queued','running') \
+                AND (lease_expires_at IS NULL OR lease_expires_at < $7)"
+                .into(),
             renew_leases: "UPDATE faucet_serve_runs SET lease_expires_at = $1 \
                 WHERE owner = $2 AND status IN ('queued','running')"
                 .into(),
@@ -793,6 +1075,10 @@ impl Stmts {
             // record, so a stale zombie execution that shares the same owner (a
             // lease-lapse re-claim by the same instance) can never overwrite the
             // terminal record written by the live execution. First finalizer wins.
+            release_owned: "UPDATE faucet_serve_runs \
+                SET status = 'pending', owner = NULL, lease_expires_at = NULL, body = $1 \
+                WHERE run_id = $2 AND owner = $3 AND status = 'running'"
+                .into(),
             finalize_owned: "UPDATE faucet_serve_runs \
                 SET status = $1, finished_at = $2, lease_expires_at = $3, body = $4 \
                 WHERE run_id = $5 AND owner = $6 \
@@ -906,11 +1192,11 @@ impl Stmts {
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
                 .into(),
             insert_audit: "INSERT INTO faucet_serve_audit \
-                (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result) \
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"
+                (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result, \
+                target) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
                 .into(),
             list_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
-                config_fingerprint, source_ip, result, t.tenant AS tenant \
+                config_fingerprint, source_ip, result, a.target AS target, t.tenant AS tenant \
                 FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
                 WHERE ($1::text IS NULL OR principal = $2::text) \
                 AND ($3::text IS NULL OR action = $4::text) \
@@ -952,19 +1238,23 @@ impl Stmts {
                 SET deleted_at=$2, body=$3 WHERE id=$1"
                 .into(),
             usage_insert: "INSERT INTO faucet_usage \
-                (run_id, row_id, pipeline, recorded_at, body) VALUES ($1,$2,$3,$4,$5) \
+                (run_id, row_id, pipeline, recorded_at, body, tenant) VALUES ($1,$2,$3,$4,$5,$6) \
                 ON CONFLICT (run_id, row_id) DO NOTHING"
                 .into(),
             change_upsert: "INSERT INTO faucet_serve_changes \
-                (id, kind, status, requester, created_at, expires_at, body) \
-                VALUES ($1,$2,$3,$4,$5,$6,$7) \
+                (id, kind, status, requester, created_at, expires_at, body, tenant) \
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
                 ON CONFLICT (id) DO UPDATE SET kind=excluded.kind, status=excluded.status, \
                 requester=excluded.requester, created_at=excluded.created_at, \
-                expires_at=excluded.expires_at, body=excluded.body"
+                expires_at=excluded.expires_at, body=excluded.body, tenant=excluded.tenant"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=$1".into(),
+            change_transition: "UPDATE faucet_serve_changes SET status=$1, expires_at=$2, \
+                body=$3 WHERE id=$4 AND status=$5"
+                .into(),
             change_delete: "DELETE FROM faucet_serve_changes WHERE id=$1".into(),
             usage_delete_run: "DELETE FROM faucet_usage WHERE run_id=$1".into(),
+            usage_delete_tenant: "DELETE FROM faucet_usage WHERE tenant=$1".into(),
             tenant_upsert: "INSERT INTO faucet_tenants (id, updated_at, body) \
                 VALUES ($1,$2,$3) \
                 ON CONFLICT (id) DO UPDATE SET updated_at=excluded.updated_at, body=excluded.body"
@@ -977,6 +1267,9 @@ impl Stmts {
             tenant_delete_sessions: "DELETE FROM faucet_connect_sessions WHERE tenant=$1".into(),
             tenant_delete_runs: "DELETE FROM faucet_tenant_runs WHERE tenant=$1".into(),
             tenant_delete_state_refs: "DELETE FROM faucet_tenant_state_refs WHERE tenant=$1"
+                .into(),
+            connection_replace: "UPDATE faucet_tenant_connections SET status=$1, updated_at=$2, \
+                body=$3 WHERE tenant=$4 AND name=$5 AND updated_at=$6"
                 .into(),
             connection_upsert: "INSERT INTO faucet_tenant_connections \
                 (tenant, name, status, updated_at, body) VALUES ($1,$2,$3,$4,$5) \
@@ -1064,6 +1357,21 @@ impl Stmts {
                 .into(),
             catalog_select_config_snapshot:
                 "SELECT body FROM faucet_config_snapshots WHERE pipeline=$1".into(),
+            catalog_delete_edge: "DELETE FROM faucet_catalog_edges WHERE src_id=$1 AND dst_id=$2"
+                .into(),
+            catalog_delete_dataset: "DELETE FROM faucet_catalog_datasets WHERE id=$1".into(),
+            catalog_delete_dataset_versions:
+                "DELETE FROM faucet_catalog_schema_versions WHERE dataset_id=$1".into(),
+            catalog_delete_dataset_stats: "DELETE FROM faucet_catalog_stats WHERE dataset_id=$1"
+                .into(),
+            catalog_delete_dataset_profiles:
+                "DELETE FROM faucet_catalog_profiles WHERE dataset_id=$1".into(),
+            catalog_delete_run_stats: "DELETE FROM faucet_catalog_stats WHERE run_id=$1".into(),
+            catalog_delete_run_profiles: "DELETE FROM faucet_catalog_profiles WHERE run_id=$1"
+                .into(),
+            catalog_select_snapshot_pipelines: "SELECT pipeline FROM faucet_config_snapshots".into(),
+            catalog_delete_config_snapshot:
+                "DELETE FROM faucet_config_snapshots WHERE pipeline=$1".into(),
             template_max_version: "SELECT COALESCE(MAX(CAST(version AS BIGINT)), 0) AS v \
                 FROM faucet_templates WHERE id=$1"
                 .into(),
@@ -1168,6 +1476,11 @@ impl Stmts {
                 WHERE status IN ('queued','running') \
                 AND (lease_expires_at IS NULL OR lease_expires_at < ?)"
                 .into(),
+            fail_orphan: "UPDATE faucet_serve_runs SET status=?, finished_at=?, owner=?, \
+                lease_expires_at=?, body=? WHERE run_id=? \
+                AND status IN ('queued','running') \
+                AND (lease_expires_at IS NULL OR lease_expires_at < ?)"
+                .into(),
             renew_leases: "UPDATE faucet_serve_runs SET lease_expires_at = ? \
                 WHERE owner = ? AND status IN ('queued','running')"
                 .into(),
@@ -1204,6 +1517,10 @@ impl Stmts {
                 AND (lease_expires_at IS NULL OR lease_expires_at < ?)"
                 .into(),
             // Status-fenced (audit #321 L5): first finalizer wins.
+            release_owned: "UPDATE faucet_serve_runs \
+                SET status = 'pending', owner = NULL, lease_expires_at = NULL, body = ? \
+                WHERE run_id = ? AND owner = ? AND status = 'running'"
+                .into(),
             finalize_owned: "UPDATE faucet_serve_runs \
                 SET status = ?, finished_at = ?, lease_expires_at = ?, body = ? \
                 WHERE run_id = ? AND owner = ? \
@@ -1317,11 +1634,11 @@ impl Stmts {
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
                 .into(),
             insert_audit: "INSERT INTO faucet_serve_audit \
-                (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result) \
-                VALUES (?,?,?,?,?,?,?,?,?)"
+                (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result, \
+                target) VALUES (?,?,?,?,?,?,?,?,?,?)"
                 .into(),
             list_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
-                config_fingerprint, source_ip, result, t.tenant AS tenant \
+                config_fingerprint, source_ip, result, a.target AS target, t.tenant AS tenant \
                 FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
                 WHERE (? IS NULL OR principal = ?) \
                 AND (? IS NULL OR action = ?) \
@@ -1363,19 +1680,23 @@ impl Stmts {
                 SET deleted_at=?2, body=?3 WHERE id=?1"
                 .into(),
             usage_insert: "INSERT INTO faucet_usage \
-                (run_id, row_id, pipeline, recorded_at, body) VALUES (?,?,?,?,?) \
+                (run_id, row_id, pipeline, recorded_at, body, tenant) VALUES (?,?,?,?,?,?) \
                 ON CONFLICT (run_id, row_id) DO NOTHING"
                 .into(),
             change_upsert: "INSERT INTO faucet_serve_changes \
-                (id, kind, status, requester, created_at, expires_at, body) \
-                VALUES (?,?,?,?,?,?,?) \
+                (id, kind, status, requester, created_at, expires_at, body, tenant) \
+                VALUES (?,?,?,?,?,?,?,?) \
                 ON CONFLICT (id) DO UPDATE SET kind=excluded.kind, status=excluded.status, \
                 requester=excluded.requester, created_at=excluded.created_at, \
-                expires_at=excluded.expires_at, body=excluded.body"
+                expires_at=excluded.expires_at, body=excluded.body, tenant=excluded.tenant"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=?".into(),
+            change_transition: "UPDATE faucet_serve_changes SET status=?, expires_at=?, \
+                body=? WHERE id=? AND status=?"
+                .into(),
             change_delete: "DELETE FROM faucet_serve_changes WHERE id=?".into(),
             usage_delete_run: "DELETE FROM faucet_usage WHERE run_id=?".into(),
+            usage_delete_tenant: "DELETE FROM faucet_usage WHERE tenant=?".into(),
             tenant_upsert: "INSERT INTO faucet_tenants (id, updated_at, body) \
                 VALUES (?,?,?) \
                 ON CONFLICT (id) DO UPDATE SET updated_at=excluded.updated_at, body=excluded.body"
@@ -1388,6 +1709,9 @@ impl Stmts {
             tenant_delete_sessions: "DELETE FROM faucet_connect_sessions WHERE tenant=?".into(),
             tenant_delete_runs: "DELETE FROM faucet_tenant_runs WHERE tenant=?".into(),
             tenant_delete_state_refs: "DELETE FROM faucet_tenant_state_refs WHERE tenant=?"
+                .into(),
+            connection_replace: "UPDATE faucet_tenant_connections SET status=?, updated_at=?, \
+                body=? WHERE tenant=? AND name=? AND updated_at=?"
                 .into(),
             connection_upsert: "INSERT INTO faucet_tenant_connections \
                 (tenant, name, status, updated_at, body) VALUES (?,?,?,?,?) \
@@ -1475,6 +1799,21 @@ impl Stmts {
                 .into(),
             catalog_select_config_snapshot:
                 "SELECT body FROM faucet_config_snapshots WHERE pipeline=?".into(),
+            catalog_delete_edge: "DELETE FROM faucet_catalog_edges WHERE src_id=? AND dst_id=?"
+                .into(),
+            catalog_delete_dataset: "DELETE FROM faucet_catalog_datasets WHERE id=?".into(),
+            catalog_delete_dataset_versions:
+                "DELETE FROM faucet_catalog_schema_versions WHERE dataset_id=?".into(),
+            catalog_delete_dataset_stats: "DELETE FROM faucet_catalog_stats WHERE dataset_id=?"
+                .into(),
+            catalog_delete_dataset_profiles:
+                "DELETE FROM faucet_catalog_profiles WHERE dataset_id=?".into(),
+            catalog_delete_run_stats: "DELETE FROM faucet_catalog_stats WHERE run_id=?".into(),
+            catalog_delete_run_profiles: "DELETE FROM faucet_catalog_profiles WHERE run_id=?"
+                .into(),
+            catalog_select_snapshot_pipelines: "SELECT pipeline FROM faucet_config_snapshots".into(),
+            catalog_delete_config_snapshot:
+                "DELETE FROM faucet_config_snapshots WHERE pipeline=?".into(),
             template_max_version: "SELECT COALESCE(MAX(CAST(version AS INTEGER)), 0) AS v \
                 FROM faucet_templates WHERE id=?"
                 .into(),
@@ -2241,8 +2580,20 @@ macro_rules! impl_sql_history {
                     {
                         rec.elapsed_secs = (now - started).to_std().ok().map(|d| d.as_secs_f64());
                     }
-                    self.upsert(&rec).await?;
-                    count += 1;
+                    let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                    let failed = sqlx::query(&self.stmts.fail_orphan)
+                        .bind(rec.status.as_str())
+                        .bind(rec.finished_at.map(sql::fmt_ts))
+                        .bind(&self.instance_id)
+                        .bind(&lease)
+                        .bind(sql::encode_body(&rec)?)
+                        .bind(&rec.run_id)
+                        .bind(sql::fmt_ts(now))
+                        .execute(&self.pool)
+                        .await
+                        .map_err(backend)?
+                        .rows_affected();
+                    count += failed as usize;
                 }
                 Ok(count)
             }
@@ -2388,6 +2739,25 @@ macro_rules! impl_sql_history {
                     }
                 }
                 Ok(report)
+            }
+
+            async fn release_owned(
+                &self,
+                rec: &$crate::serve::history::RunRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let mut rec = rec.clone();
+                rec.status = $crate::serve::history::RunStatus::Pending;
+                rec.started_at = None;
+                let n = sqlx::query(&self.stmts.release_owned)
+                    .bind(sql::encode_body(&rec)?)
+                    .bind(&rec.run_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?
+                    .rows_affected();
+                Ok(n == 1)
             }
 
             async fn finalize_owned(
@@ -2989,6 +3359,7 @@ macro_rules! impl_sql_history {
                     .bind(entry.config_fingerprint.as_deref())
                     .bind(entry.source_ip.as_deref())
                     .bind(&entry.result)
+                    .bind(entry.target.as_deref())
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
@@ -3048,6 +3419,7 @@ macro_rules! impl_sql_history {
                         config_fingerprint: r.try_get("config_fingerprint").map_err(backend)?,
                         source_ip: r.try_get("source_ip").map_err(backend)?,
                         tenant: r.try_get("tenant").map_err(backend)?,
+                        target: r.try_get("target").map_err(backend)?,
                         result: r.try_get("result").map_err(backend)?,
                     });
                 }
@@ -3068,15 +3440,29 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin().await.map_err(backend)?;
                 for l in lines {
-                    sqlx::query(&self.stmts.insert_run_log)
-                        .bind(run_id)
-                        .bind(sql::pad_seq(l.seq))
-                        .bind(&l.ts)
-                        .bind(&l.level)
-                        .bind(&l.line)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(backend)?;
+                    // A key another instance already wrote for this run moves
+                    // to the next free one instead of dropping the line. The
+                    // truncation sentinel is written once, as is.
+                    let attempts = if l.seq == $crate::serve::history::RUN_LOG_TRUNCATED_SEQ {
+                        1
+                    } else {
+                        sql::SEQ_PROBES
+                    };
+                    for bump in 0..attempts {
+                        let written = sqlx::query(&self.stmts.insert_run_log)
+                            .bind(run_id)
+                            .bind(sql::pad_seq(l.seq.saturating_add(bump)))
+                            .bind(&l.ts)
+                            .bind(&l.level)
+                            .bind(&l.line)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?
+                            .rows_affected();
+                        if written == 1 {
+                            break;
+                        }
+                    }
                 }
                 tx.commit().await.map_err(backend)?;
                 Ok(())
@@ -3281,10 +3667,12 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::catalog;
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let rows = sqlx::query(&self.stmts.catalog_select_datasets)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(backend)?;
+                let (sql_text, binds) = self.stmts.catalog_dataset_query(filter);
+                let mut query = sqlx::query(&sql_text);
+                for bind in &binds {
+                    query = query.bind(bind);
+                }
+                let rows = query.fetch_all(&self.pool).await.map_err(backend)?;
                 let mut all = Vec::with_capacity(rows.len());
                 for r in &rows {
                     let body: String = r.try_get("body").map_err(backend)?;
@@ -3427,6 +3815,114 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::catalog;
                 let edges = self.catalog_all_edges().await?;
                 Ok(catalog::lineage_slice(edges, root, depth))
+            }
+
+            async fn catalog_purge(
+                &self,
+                prefix: &str,
+                runs: &[String],
+            ) -> Result<
+                $crate::serve::history::catalog::CatalogPurgeReport,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::catalog;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let edges = self.catalog_all_edges().await?;
+                let mut attribution = std::collections::BTreeMap::new();
+                for r in sqlx::query(&self.stmts.catalog_select_datasets)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(backend)?
+                {
+                    let body: String = r.try_get("body").map_err(backend)?;
+                    let d: catalog::CatalogDataset = sql::decode_json(&body, "catalog dataset")?;
+                    attribution.insert(d.id.clone(), (d.pipeline, d.last_run_id));
+                }
+                let purged: std::collections::HashSet<String> = runs.iter().cloned().collect();
+                let plan = catalog::plan_purge(&edges, &attribution, prefix, &purged);
+                let mut tx = self.pool.begin().await.map_err(backend)?;
+                for (src, dst) in &plan.edges {
+                    sqlx::query(&self.stmts.catalog_delete_edge)
+                        .bind(src)
+                        .bind(dst)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                }
+                for id in &plan.datasets {
+                    for stmt in [
+                        &self.stmts.catalog_delete_dataset,
+                        &self.stmts.catalog_delete_dataset_versions,
+                        &self.stmts.catalog_delete_dataset_stats,
+                        &self.stmts.catalog_delete_dataset_profiles,
+                    ] {
+                        sqlx::query(stmt)
+                            .bind(id)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                    }
+                }
+                for (id, (pipeline, run)) in &plan.reattribute {
+                    let Some(row) = sqlx::query(&self.stmts.catalog_select_dataset)
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(backend)?
+                    else {
+                        continue;
+                    };
+                    let body: String = row.try_get("body").map_err(backend)?;
+                    let mut ds: catalog::CatalogDataset =
+                        sql::decode_json(&body, "catalog dataset")?;
+                    ds.pipeline = pipeline.clone();
+                    ds.last_run_id = run.clone();
+                    sqlx::query(&self.stmts.catalog_upsert_dataset)
+                        .bind(&ds.id)
+                        .bind(&ds.uri)
+                        .bind(&ds.kind)
+                        .bind(sql::fmt_ts(ds.last_seen))
+                        .bind(sql::encode_json(&ds, "catalog dataset")?)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                }
+                for run in runs {
+                    for stmt in [
+                        &self.stmts.catalog_delete_run_stats,
+                        &self.stmts.catalog_delete_run_profiles,
+                    ] {
+                        sqlx::query(stmt)
+                            .bind(run)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                    }
+                }
+                let mut config_snapshots = 0;
+                for r in sqlx::query(&self.stmts.catalog_select_snapshot_pipelines)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                {
+                    let pipeline: String = r.try_get("pipeline").map_err(backend)?;
+                    if pipeline.starts_with(prefix) {
+                        sqlx::query(&self.stmts.catalog_delete_config_snapshot)
+                            .bind(&pipeline)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                        config_snapshots += 1;
+                    }
+                }
+                tx.commit().await.map_err(backend)?;
+                Ok(catalog::CatalogPurgeReport {
+                    datasets: plan.datasets.len(),
+                    edges: plan.edges.len(),
+                    config_snapshots,
+                })
             }
 
             async fn catalog_record_config_snapshot(
@@ -3660,6 +4156,26 @@ macro_rules! impl_sql_history {
                 Ok(n > 0)
             }
 
+            async fn connection_replace(
+                &self,
+                connection: &$crate::serve::history::tenants::ConnectionRecord,
+                expected_updated_at: chrono::DateTime<chrono::Utc>,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let done = sqlx::query(&self.stmts.connection_replace)
+                    .bind(connection.status.as_str())
+                    .bind(sql::fmt_ts(connection.updated_at))
+                    .bind(sql::encode_json(connection, "connection")?)
+                    .bind(&connection.tenant)
+                    .bind(&connection.name)
+                    .bind(sql::fmt_ts(expected_updated_at))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(done.rows_affected() == 1)
+            }
+
             async fn connection_upsert(
                 &self,
                 connection: &$crate::serve::history::tenants::ConnectionRecord,
@@ -3805,6 +4321,19 @@ macro_rules! impl_sql_history {
                 Ok(total)
             }
 
+            async fn usage_delete_tenant(
+                &self,
+                tenant: &str,
+            ) -> Result<usize, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                Ok(sqlx::query(&self.stmts.usage_delete_tenant)
+                    .bind(tenant)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected() as usize)
+            }
+
             async fn change_upsert(
                 &self,
                 change: &$crate::serve::changes::ChangeRequest,
@@ -3819,10 +4348,30 @@ macro_rules! impl_sql_history {
                     .bind(sql::fmt_ts(change.created_at))
                     .bind(sql::fmt_ts(change.expires_at))
                     .bind(sql::encode_json(change, "change request")?)
+                    .bind(change.tenant.as_deref())
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
                 Ok(())
+            }
+
+            async fn change_transition(
+                &self,
+                change: &$crate::serve::changes::ChangeRequest,
+                from: $crate::serve::changes::ChangeStatus,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let done = sqlx::query(&self.stmts.change_transition)
+                    .bind(change.status.as_str())
+                    .bind(sql::fmt_ts(change.expires_at))
+                    .bind(sql::encode_json(change, "change request")?)
+                    .bind(&change.id)
+                    .bind(from.as_str())
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(done.rows_affected() == 1)
             }
 
             async fn change_get(
@@ -3890,6 +4439,7 @@ macro_rules! impl_sql_history {
                     .bind(&record.pipeline)
                     .bind(sql::fmt_ts(record.recorded_at))
                     .bind(sql::encode_json(record, "usage record")?)
+                    .bind(record.tenant.as_deref())
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;

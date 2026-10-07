@@ -179,7 +179,8 @@ pub fn spawn_watchers(
                     active += 1;
                 }
                 Err(e) => {
-                    tracing::error!(trigger = t.name(), error = %e, "failed to build object store; skipping watcher")
+                    tracing::error!(trigger = t.name(), error = %e, "failed to build object store; skipping watcher");
+                    mark_unbuildable(&health, t.name(), format!("object store: {e}"));
                 }
             },
             #[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
@@ -204,7 +205,8 @@ pub fn spawn_watchers(
                     active += 1;
                 }
                 Err(e) => {
-                    tracing::error!(trigger = t.name(), error = %e, "failed to build queue probe; skipping watcher")
+                    tracing::error!(trigger = t.name(), error = %e, "failed to build queue probe; skipping watcher");
+                    mark_unbuildable(&health, t.name(), format!("queue probe: {e}"));
                 }
             },
             // Backends not compiled in were already rejected by `compile`, but the
@@ -231,7 +233,8 @@ pub fn spawn_watchers(
                         active += 1;
                     }
                     Err(e) => {
-                        tracing::error!(trigger = t.name(), error = %e, "invalid schedule; skipping watcher")
+                        tracing::error!(trigger = t.name(), error = %e, "invalid schedule; skipping watcher");
+                        mark_unbuildable(&health, t.name(), format!("schedule: {e}"));
                     }
                 }
             }
@@ -241,6 +244,14 @@ pub fn spawn_watchers(
     }
     metrics::active(active);
     handles
+}
+
+/// A watcher that could not be built never polls, so it must not keep the
+/// healthy row it was seeded with (#789 SERVE-34): `/readyz` and
+/// `faucet_serve_trigger_healthy` report it down with the reason.
+pub fn mark_unbuildable(health: &health::TriggersHandle, name: &str, error: String) {
+    health.record_err(name, error, 1);
+    metrics::healthy(name, false);
 }
 
 // Bring the compiled types into the public surface for `server.rs`.

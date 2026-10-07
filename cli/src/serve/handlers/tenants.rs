@@ -88,7 +88,10 @@ pub struct TenantView {
     pub active_runs: usize,
 }
 
-async fn view(state: &ServerState, tenant: TenantRecord) -> Result<TenantView, ServeError> {
+async fn view(state: &ServerState, mut tenant: TenantRecord) -> Result<TenantView, ServeError> {
+    let plain = tenants::open_notifications(&state.tenants(), &tenant).unwrap_or_default();
+    tenant.notifications = tenants::mask_notifications(&plain);
+    tenant.notifications_sealed = None;
     let connections = state
         .history()
         .connection_list(&tenant.id)
@@ -147,17 +150,19 @@ pub async fn create_tenant(
         )));
     }
     let now = Utc::now();
-    let rec = TenantRecord {
+    let mut rec = TenantRecord {
         id: body.id,
         name: body.name,
         labels: body.labels,
         limits: body.limits,
-        notifications: body.notifications,
+        notifications: Vec::new(),
+        notifications_sealed: None,
         suspended: false,
         created_at: now,
         updated_at: now,
         created_by: actor.principal.clone(),
     };
+    tenants::seal_notifications(&state.tenants(), &mut rec, body.notifications)?;
     history.tenant_upsert(&rec).await.map_err(store_err)?;
     crate::serve::audit::write(
         &state,
@@ -225,8 +230,8 @@ pub async fn patch_tenant(
     if let Some(l) = body.limits {
         rec.limits = l;
     }
-    if let Some(n) = body.notifications {
-        rec.notifications = n;
+    if let Some(n) = &body.notifications {
+        tenants::validate_notifications(n).map_err(ServeError::BadConfig)?;
     }
     let action = match body.suspended {
         Some(true) if !rec.suspended => "tenant.suspend",
@@ -236,7 +241,10 @@ pub async fn patch_tenant(
     if let Some(s) = body.suspended {
         rec.suspended = s;
     }
-    check_fields(&rec.limits, &rec.notifications)?;
+    rec.limits.validate().map_err(ServeError::BadConfig)?;
+    if let Some(n) = body.notifications {
+        tenants::seal_notifications(&state.tenants(), &mut rec, n)?;
+    }
     rec.updated_at = Utc::now();
     state
         .history()
@@ -330,7 +338,10 @@ async fn store_connection(
         name: name.to_string(),
         provider_type: kind,
         connect_provider: None,
-        sealed: vault.seal(&provider),
+        sealed: vault.seal_for(
+            &provider,
+            &crate::serve::tenants::vault::Vault::connection_context(tenant, name),
+        ),
         status: ConnectionStatus::Active,
         reauth_reason: None,
         created_at: existing.map(|e| e.created_at).unwrap_or(now),
@@ -339,12 +350,11 @@ async fn store_connection(
     };
     history.connection_upsert(&rec).await.map_err(store_err)?;
     tenants::metrics::refresh_connection_gauges(state).await;
-    crate::serve::audit::write(
+    crate::serve::audit::write_target(
         state,
         &for_tenant(actor, tenant),
         "connection.upsert",
-        None,
-        None,
+        format!("connection:{tenant}/{name}"),
         "ok",
     )
     .await;
@@ -415,12 +425,11 @@ pub async fn delete_connection(
         return Err(ServeError::NotFound);
     }
     tenants::metrics::refresh_connection_gauges(&state).await;
-    crate::serve::audit::write(
+    crate::serve::audit::write_target(
         &state,
         &for_tenant(&actor, &tenant),
         "connection.delete",
-        None,
-        None,
+        format!("connection:{tenant}/{name}"),
         "ok",
     )
     .await;
@@ -601,7 +610,28 @@ pub struct FanoutResponse {
 /// than a real failure: a missing or revoked connection, a suspended tenant,
 /// or a tenant at its concurrency limit.
 fn is_skip(e: &ServeError) -> bool {
-    matches!(e, ServeError::Conflict(_) | ServeError::TooManyRequests(_))
+    match e {
+        // A reused idempotency key with another payload is a caller error,
+        // not a tenant to skip (#789 SERVE-36).
+        ServeError::Conflict(m) => m != crate::serve::runner::IDEMPOTENCY_CONFLICT,
+        ServeError::TooManyRequests(_) => true,
+        _ => false,
+    }
+}
+
+/// The fan-out id: derived from the caller's idempotency key when one is
+/// given, so a retried fan-out replays every tenant's run instead of
+/// conflicting on a fresh label.
+fn fanout_id_for(body: &FanoutBody) -> String {
+    use sha2::{Digest, Sha256};
+    match &body.trigger.idempotency_key {
+        Some(k) => {
+            let digest = Sha256::digest(k.as_bytes());
+            let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+            format!("key-{hex}")
+        }
+        None => uuid::Uuid::now_v7().to_string(),
+    }
 }
 
 /// Trigger a template once per tenant, at most `concurrency` at a time.
@@ -683,7 +713,7 @@ pub async fn fanout_template(
     Path(id): Path<String>,
     Json(body): Json<FanoutBody>,
 ) -> Result<Json<FanoutResponse>, ServeError> {
-    let fanout_id = uuid::Uuid::now_v7().to_string();
+    let fanout_id = fanout_id_for(&body);
     let results = fan_out(&state, &actor, &id, body, &fanout_id).await?;
     crate::serve::audit::write(
         &state,

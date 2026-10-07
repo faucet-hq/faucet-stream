@@ -66,6 +66,11 @@ pub async fn verify(
         state.caller_origin(),
     )
     .await?;
+    if req.repair && !req.dry_run {
+        crate::serve::runner::refuse_unapproved_write(&state, "verify repair")?;
+        crate::serve::runner::policy_gate(&state, &actor, &loaded).await?;
+    }
+    let _permit = crate::serve::runner::inline_permit(&state)?;
     let auth = build_auth_catalog(loaded.cfg.auth.as_ref()).map_err(cli_to_serve)?;
     let pipeline_name = loaded
         .cfg

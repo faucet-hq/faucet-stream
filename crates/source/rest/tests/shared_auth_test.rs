@@ -210,3 +210,115 @@ async fn a_revoked_shared_token_is_refreshed_and_the_request_retried() {
     let records = stream.fetch_all().await.unwrap();
     assert_eq!(records.len(), 1);
 }
+
+/// A strict compare-and-swap provider (like token_endpoint): it refreshes only
+/// when `invalidate` names the credential it currently hands out (#789 API-21).
+#[derive(Debug, Default)]
+struct StrictCas {
+    token: std::sync::Mutex<u32>,
+    stale_seen: std::sync::Mutex<Vec<Credential>>,
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for StrictCas {
+    async fn credential(&self) -> Result<Credential, FaucetError> {
+        Ok(Credential::Bearer(format!(
+            "t{}",
+            self.token.lock().unwrap()
+        )))
+    }
+    async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
+        self.stale_seen.lock().unwrap().push(stale.clone());
+        let mut t = self.token.lock().unwrap();
+        if *stale == Credential::Bearer(format!("t{t}")) {
+            *t += 1;
+        }
+        Ok(Credential::Bearer(format!("t{t}")))
+    }
+    fn provider_name(&self) -> &'static str {
+        "strict-cas"
+    }
+}
+
+#[tokio::test]
+async fn invalidate_receives_the_credential_that_was_sent() {
+    let server = MockServer::start().await;
+    mount_rejecting_t0(
+        &server,
+        "GET",
+        "/items",
+        ResponseTemplate::new(200).set_body_json(json!([{"id": 1}])),
+    )
+    .await;
+    let provider = Arc::new(StrictCas::default());
+    let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/items"))
+        .unwrap()
+        .with_auth_provider(provider.clone());
+    assert_eq!(stream.fetch_all().await.unwrap().len(), 1);
+    assert_eq!(
+        *provider.stale_seen.lock().unwrap(),
+        vec![Credential::Bearer("t0".into())]
+    );
+}
+
+/// A flow-style provider on session `s`; `invalidate` records what it was told.
+#[derive(Debug, Default)]
+struct SessionProvider {
+    session: std::sync::Mutex<u32>,
+    stale_seen: std::sync::Mutex<Vec<Credential>>,
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for SessionProvider {
+    async fn credential(&self) -> Result<Credential, FaucetError> {
+        Ok(Credential::Token(String::new()))
+    }
+    async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
+        self.stale_seen.lock().unwrap().push(stale.clone());
+        *self.session.lock().unwrap() += 1;
+        Ok(Credential::Token(String::new()))
+    }
+    async fn request_auth(
+        &self,
+        _method: &str,
+        _url: &str,
+        _query: &std::collections::BTreeMap<String, String>,
+    ) -> Result<RequestAuth, FaucetError> {
+        let s = *self.session.lock().unwrap();
+        let mut captured = std::collections::BTreeMap::new();
+        captured.insert("__session__".to_string(), s.to_string());
+        Ok(RequestAuth::new()
+            .with_captured(captured)
+            .with_placement(CredentialPlacement::Header {
+                name: "X-Session".into(),
+                value: format!("s{s}"),
+            }))
+    }
+    fn provider_name(&self) -> &'static str {
+        "session"
+    }
+}
+
+#[tokio::test]
+async fn a_flow_style_provider_is_told_which_session_was_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(header("x-session", "s0"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(header("x-session", "s1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id": 1}])))
+        .mount(&server)
+        .await;
+    let provider = Arc::new(SessionProvider::default());
+    let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/items"))
+        .unwrap()
+        .with_auth_provider(provider.clone());
+    assert_eq!(stream.fetch_all().await.unwrap().len(), 1);
+    assert_eq!(
+        *provider.stale_seen.lock().unwrap(),
+        vec![Credential::Token("0".into())]
+    );
+}

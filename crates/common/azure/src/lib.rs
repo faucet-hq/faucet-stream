@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// snake_case discriminators) — the consistent auth wire shape shared by every
 /// faucet connector, e.g.
 /// `{ type: account_key, config: { account_key: "…" } }`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum AzureCredentials {
     /// Shared storage-account access key (the primary/secondary key).
@@ -65,6 +65,22 @@ pub enum AzureCredentials {
     /// identity, Azure CLI), honouring `AZURE_*` env vars. This is the default.
     #[default]
     Default,
+}
+
+impl std::fmt::Debug for AzureCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(
+            f,
+            "AzureCredentials",
+            self,
+            &[
+                "account_key",
+                "sas_token",
+                "connection_string",
+                "client_secret",
+            ],
+        )
+    }
 }
 
 impl AzureCredentials {
@@ -533,5 +549,22 @@ mod tests {
         assert_eq!(retry.retry_timeout, Duration::from_secs(30));
         build_store(&tuned.clone().account("acct")).unwrap();
         build_store(&AzureConnection::new("c").account("acct")).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: AzureCredentials =
+            serde_json::from_str(r#"{"type":"account_key","config":{"account_key":"S3CRET-1"}}"#)
+                .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: AzureCredentials = serde_json::from_str(r#"{"type":"service_principal","config":{"client_id":"c","client_secret":"S3CRET-2","tenant_id":"t"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

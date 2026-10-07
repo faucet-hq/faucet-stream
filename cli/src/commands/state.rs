@@ -80,10 +80,13 @@ pub async fn run(args: StateArgs) -> CliResult<()> {
             let (_, target, _) = load(a.config.as_deref(), &a.load).await?;
             let stores = Stores::build(&target, None).await?;
             let export = ops::export(&target, &stores, Utc::now()).await?;
-            let text = crate::secrets::registry::redact(&to_pretty(&export)?).into_owned();
+            // Verbatim: value-based redaction would also mask env-sourced values
+            // that bookmarks legitimately hold (a topic name), and an import would
+            // then restore the altered state. A written export is owner-only.
+            let text = to_pretty(&export)?;
             match &a.output {
                 Some(path) => {
-                    std::fs::write(path, format!("{text}\n"))?;
+                    write_private(path, format!("{text}\n").as_bytes())?;
                     eprintln!(
                         "exported {} key(s) of pipeline {} to {}",
                         export.keys.len(),
@@ -135,6 +138,26 @@ pub async fn run(args: StateArgs) -> CliResult<()> {
             }
         }
     }
+}
+
+/// Write `bytes` to `path`, readable only by its owner on Unix.
+fn write_private(path: &Path, bytes: &[u8]) -> CliResult<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 /// Load the config named by `config` (or discovered) into its target.

@@ -2717,19 +2717,42 @@ fn decode<T: DeserializeOwned>(kind: &'static str, name: &str, config: Value) ->
 /// at-rest redaction — this only scrubs error *output*.
 fn scrub_config_error(msg: &str) -> String {
     const MAX_CHARS: usize = 200;
+    const KEY_PREFIXES: [&str; 3] = ["unknown field ", "missing field ", "duplicate field "];
+    let chars: Vec<char> = msg.chars().collect();
     let mut out = String::with_capacity(msg.len());
-    let mut in_quote = false;
-    for c in msg.chars() {
-        if c == '"' {
-            if !in_quote {
-                out.push_str("\"<redacted>\"");
+    let mut i = 0;
+    // Serde echoes the offending value before `, expected …`; what follows
+    // names types and variants, never input.
+    let mut in_expected = false;
+    while i < chars.len() {
+        if !in_expected && chars[i..].starts_with(&[',', ' ', 'e', 'x', 'p', 'e', 'c', 't']) {
+            in_expected = true;
+        }
+        let c = chars[i];
+        if !in_expected && c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += if chars[i] == '\\' { 2 } else { 1 };
             }
-            in_quote = !in_quote;
+            i += 1;
+            out.push_str("\"<redacted>\"");
             continue;
         }
-        if !in_quote {
-            out.push(c);
+        if !in_expected && c == '`' {
+            let close = chars[i + 1..]
+                .iter()
+                .position(|&ch| ch == '`')
+                .map_or(chars.len(), |p| i + 1 + p);
+            if KEY_PREFIXES.iter().any(|p| out.ends_with(p)) {
+                out.extend(&chars[i..(close + 1).min(chars.len())]);
+            } else {
+                out.push_str("`<redacted>`");
+            }
+            i = close + 1;
+            continue;
         }
+        out.push(c);
+        i += 1;
     }
     if out.chars().count() > MAX_CHARS {
         let truncated: String = out.chars().take(MAX_CHARS).collect();
@@ -3074,6 +3097,31 @@ mod tests {
         // Structural context outside the quotes is preserved.
         assert!(scrubbed.contains("invalid type"), "{scrubbed}");
         assert!(scrubbed.contains("expected a sequence"), "{scrubbed}");
+    }
+
+    #[test]
+    fn scrub_config_error_handles_escapes_backticks_and_keeps_keys() {
+        let msg = r#"invalid type: string "pa\"ss-tail-secret", expected a sequence"#;
+        let scrubbed = scrub_config_error(msg);
+        assert!(!scrubbed.contains("tail-secret"), "{scrubbed}");
+        let msg = "invalid type: integer `48213907`, expected a string at line 1 column 3";
+        let scrubbed = scrub_config_error(msg);
+        assert!(!scrubbed.contains("48213907"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("expected a string at line 1"),
+            "{scrubbed}"
+        );
+        let msg = "unknown variant `hunter2`, expected one of `bearer`, `basic`";
+        let scrubbed = scrub_config_error(msg);
+        assert!(!scrubbed.contains("hunter2"), "{scrubbed}");
+        assert!(scrubbed.contains("`bearer`"), "{scrubbed}");
+        let msg = "unknown field `tokn`, expected `token`";
+        assert_eq!(scrub_config_error(msg), msg);
+        assert_eq!(
+            scrub_config_error("missing field `url`"),
+            "missing field `url`"
+        );
+        assert!(scrub_config_error("unterminated `abc").contains("<redacted>"));
     }
 
     #[test]

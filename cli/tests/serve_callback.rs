@@ -359,3 +359,67 @@ async fn backfill_refuses_a_callback_rather_than_dropping_it() {
         "error should explain the fan-out: {err}"
     );
 }
+
+/// #789 SERVE-41: a callback is delivered to a DNS name through the
+/// resolved (and checked) address, and a redirect is not followed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn callbacks_resolve_names_and_never_follow_redirects() {
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/cb"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/elsewhere", receiver.uri())),
+        )
+        .mount(&receiver)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/elsewhere"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&receiver)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/by-name"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+    let port = free_port();
+    spawn_server(port).await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "id,name\n1,alice\n").unwrap();
+    let client = reqwest::Client::new();
+    let by_name = receiver.uri().replace("127.0.0.1", "localhost");
+    for (url, out) in [
+        (format!("{}/cb", receiver.uri()), "o1.jsonl"),
+        (format!("{by_name}/by-name"), "o2.jsonl"),
+    ] {
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/v1/runs"))
+            .json(&json!({
+                "config": ok_yaml(&input, &dir.path().join(out)),
+                "callback": { "url": url }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+    }
+    for _ in 0..200 {
+        let reqs = receiver.received_requests().await.unwrap_or_default();
+        if reqs.iter().any(|r| r.url.path() == "/by-name")
+            && reqs.iter().any(|r| r.url.path() == "/cb")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reqs = receiver.received_requests().await.unwrap_or_default();
+    assert!(
+        reqs.iter().any(|r| r.url.path() == "/by-name"),
+        "delivered by name"
+    );
+    receiver.verify().await;
+}

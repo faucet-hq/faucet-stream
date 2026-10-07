@@ -57,6 +57,13 @@ pub type SuppliedParams = BTreeMap<String, Value>;
 pub struct BoundParams {
     pub values: BTreeMap<String, Value>,
     pub secret_names: BTreeSet<String>,
+    /// The secret params whose value the caller supplied (and computed params
+    /// derived from one). A secret that came from its `default` is not here:
+    /// its `${env:…}` default can be deferred to the executing instance.
+    pub supplied_secret_names: BTreeSet<String>,
+    /// Params whose value came from the caller — supplied, or computed from a
+    /// supplied param. Their text may never form a new directive.
+    pub caller_supplied: BTreeSet<String>,
 }
 
 impl BoundParams {
@@ -80,6 +87,12 @@ impl BoundParams {
     /// guard in the template-trigger path).
     pub fn has_secrets(&self) -> bool {
         !self.secret_names.is_empty()
+    }
+
+    /// Whether a caller-supplied value of a secret param was bound — what a
+    /// persisted (clustered / approval) body cannot carry.
+    pub fn has_supplied_secrets(&self) -> bool {
+        !self.supplied_secret_names.is_empty()
     }
 }
 
@@ -136,8 +149,21 @@ pub fn resolve(
         }
         let value = match supplied.get(name) {
             Some(raw) => {
+                if p.secret {
+                    // Before any error below can echo the raw value.
+                    crate::secrets::registry::register(&value_to_string(raw));
+                }
                 reject_directives(name, raw)?;
-                let coerced = spec::coerce(name, p.kind, raw)?;
+                let coerced = spec::coerce(name, p.kind, raw).map_err(|e| {
+                    if p.secret {
+                        CliError::Config(format!(
+                            "param '{name}': the supplied value is not a valid {}",
+                            p.kind.as_str()
+                        ))
+                    } else {
+                        e
+                    }
+                })?;
                 // A closed `values:` set is checked here, at bind, so a typo'd
                 // value fails naming the alternatives rather than producing a
                 // config that is merely wrong (#648).
@@ -148,9 +174,13 @@ pub fn resolve(
                         .any(|v| spec::values_match(p.kind, v, &coerced))
                 {
                     let allowed: Vec<String> = p.values.iter().map(value_to_string).collect();
+                    let shown = if p.secret {
+                        "the supplied value".to_string()
+                    } else {
+                        value_to_string(&coerced)
+                    };
                     return Err(CliError::Config(format!(
-                        "param '{name}': {} is not one of the allowed values ({})",
-                        value_to_string(&coerced),
+                        "param '{name}': {shown} is not one of the allowed values ({})",
                         allowed.join(", ")
                     )));
                 }
@@ -172,11 +202,17 @@ pub fn resolve(
                 },
             },
         };
+        if supplied.contains_key(name) {
+            bound.caller_supplied.insert(name.clone());
+        }
         if p.secret {
             // Register before the value can reach any log line, error string, or
             // API body. `register` no-ops below the registry's minimum length.
             crate::secrets::registry::register(&value_to_string(&value));
             bound.secret_names.insert(name.clone());
+            if supplied.contains_key(name) {
+                bound.supplied_secret_names.insert(name.clone());
+            }
         }
         bound.values.insert(name.clone(), value);
     }
@@ -211,6 +247,17 @@ fn resolve_computed(spec: &ParamsSpec, bound: &mut BoundParams) -> CliResult<()>
             let refs = referenced_params(&expr);
             if refs.iter().all(|r| bound.values.contains_key(r)) {
                 let value = eval_computed_expr(&name, &expr, &bound.values)?;
+                // Derived from a secret, the computed value is one too.
+                if refs.iter().any(|r| bound.secret_names.contains(r)) {
+                    crate::secrets::registry::register(&value);
+                    bound.secret_names.insert(name.clone());
+                }
+                if refs.iter().any(|r| bound.supplied_secret_names.contains(r)) {
+                    bound.supplied_secret_names.insert(name.clone());
+                }
+                if refs.iter().any(|r| bound.caller_supplied.contains(r)) {
+                    bound.caller_supplied.insert(name.clone());
+                }
                 bound.values.insert(name, Value::String(value));
                 progressed = true;
             } else {
@@ -374,7 +421,8 @@ pub fn bind_document(
     // it back byte-identical — the block is part of the config and is persisted
     // with a registered template.
     let stashed = doc.get_mut(PARAMS_KEY).map(std::mem::take);
-    let result = substitute(doc, &bound.values);
+    let inert = inert_values(&bound);
+    let result = substitute(doc, &bound.values, inert.as_ref());
     if let (Some(block), Some(map)) = (stashed, doc.as_object_mut()) {
         map.insert(PARAMS_KEY.to_string(), block);
     }
@@ -398,20 +446,50 @@ fn reject_directives(name: &str, raw: &Value) -> CliResult<()> {
     Ok(())
 }
 
-/// Substitute `${param.NAME}` throughout `v`.
-fn substitute(v: &mut Value, bound: &BTreeMap<String, Value>) -> CliResult<()> {
+/// The bound values with every caller-supplied value replaced by text that
+/// cannot take part in a directive, or `None` when the caller supplied nothing.
+fn inert_values(bound: &BoundParams) -> Option<BTreeMap<String, Value>> {
+    if bound.caller_supplied.is_empty() {
+        return None;
+    }
+    Some(
+        bound
+            .values
+            .iter()
+            .map(|(k, v)| {
+                let v = if bound.caller_supplied.contains(k) {
+                    Value::String("_".into())
+                } else {
+                    v.clone()
+                };
+                (k.clone(), v)
+            })
+            .collect(),
+    )
+}
+
+/// Substitute `${param.NAME}` throughout `v`. With `inert` set, refuse any
+/// directive that exists only because of caller-supplied text (CLI-37).
+fn substitute(
+    v: &mut Value,
+    bound: &BTreeMap<String, Value>,
+    inert: Option<&BTreeMap<String, Value>>,
+) -> CliResult<()> {
     if let Value::String(s) = v {
-        let replaced = match whole_token(s, bound)? {
+        let replaced = match whole_token(s, bound, bound)? {
             Some(typed) => typed,
-            None => Value::String(rewrite_text(s, bound)?),
+            None => Value::String(rewrite_text(s, bound, bound)?),
         };
+        if let (Some(inert), Value::String(out)) = (inert, &replaced) {
+            refuse_new_directives(s, out, bound, inert)?;
+        }
         *v = replaced;
         return Ok(());
     }
     match v {
         Value::Array(items) => {
             for item in items.iter_mut() {
-                substitute(item, bound)?;
+                substitute(item, bound, inert)?;
             }
         }
         Value::Object(map) => {
@@ -419,8 +497,12 @@ fn substitute(v: &mut Value, bound: &BTreeMap<String, Value>) -> CliResult<()> {
             // map so a rewritten key is honoured — mirrors `interpolate_value`.
             let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
             for (key, mut val) in entries {
-                substitute(&mut val, bound)?;
-                map.insert(rewrite_text(&key, bound)?, val);
+                substitute(&mut val, bound, inert)?;
+                let new_key = rewrite_text(&key, bound, bound)?;
+                if let Some(inert) = inert {
+                    refuse_new_directives(&key, &new_key, bound, inert)?;
+                }
+                map.insert(new_key, val);
             }
         }
         _ => {}
@@ -428,10 +510,45 @@ fn substitute(v: &mut Value, bound: &BTreeMap<String, Value>) -> CliResult<()> {
     Ok(())
 }
 
+/// Compare the directives in `out` with those the same text yields when every
+/// caller-supplied value is inert; any extra one was assembled from caller text.
+fn refuse_new_directives(
+    src: &str,
+    out: &str,
+    bound: &BTreeMap<String, Value>,
+    inert: &BTreeMap<String, Value>,
+) -> CliResult<()> {
+    let baseline = match whole_token(src, inert, bound)? {
+        Some(v) => value_to_string(&v),
+        None => rewrite_text(src, inert, bound)?,
+    };
+    let mut allowed: Vec<&str> = iter_directives(&baseline).map(|(t, _)| t).collect();
+    for (token, _) in iter_directives(out) {
+        match allowed.iter().position(|a| *a == token) {
+            Some(i) => {
+                allowed.swap_remove(i);
+            }
+            None => {
+                return Err(CliError::Config(
+                    "a param value combines with the text around it into an interpolation \
+                     directive (`${…}`). Param values are literal data and may not assemble a \
+                     directive"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// If `s` is *exactly* one `${param.NAME}` token, return that param's value with
 /// its declared type intact. Anything else (extra text, several tokens, an
 /// escaped `$${param.x}`) returns `None` for textual rewriting.
-fn whole_token(s: &str, bound: &BTreeMap<String, Value>) -> CliResult<Option<Value>> {
+fn whole_token(
+    s: &str,
+    bound: &BTreeMap<String, Value>,
+    maps: &BTreeMap<String, Value>,
+) -> CliResult<Option<Value>> {
     let mut tokens = iter_directives(s);
     let Some((token, dir)) = tokens.next() else {
         return Ok(None);
@@ -446,14 +563,18 @@ fn whole_token(s: &str, bound: &BTreeMap<String, Value>) -> CliResult<Option<Val
         Directive::LoadTime {
             prefix: "map",
             body,
-        } => Ok(Some(Value::String(resolve_map(token, body, bound)?))),
+        } => Ok(Some(Value::String(resolve_map(token, body, maps)?))),
         _ => Ok(None),
     }
 }
 
 /// Textual rewrite: every `${param.NAME}` becomes the stringified value; every
 /// other directive survives verbatim for its own resolution stage.
-fn rewrite_text(s: &str, bound: &BTreeMap<String, Value>) -> CliResult<String> {
+fn rewrite_text(
+    s: &str,
+    bound: &BTreeMap<String, Value>,
+    maps: &BTreeMap<String, Value>,
+) -> CliResult<String> {
     rewrite(s, |body| match classify_directive(body) {
         Directive::Deferred { id, path } if id == PARAM_ID => {
             let token = format!("${{{body}}}");
@@ -464,7 +585,7 @@ fn rewrite_text(s: &str, bound: &BTreeMap<String, Value>) -> CliResult<String> {
             body: map_body,
         } => {
             let token = format!("${{{body}}}");
-            Ok(Some(resolve_map(&token, map_body, bound)?))
+            Ok(Some(resolve_map(&token, map_body, maps)?))
         }
         _ => Ok(None),
     })
@@ -826,6 +947,37 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn a_malformed_secret_param_is_registered_before_it_is_echoed() {
+        let spec = spec_of("pin: { type: int, secret: true }\n");
+        let err = resolve(
+            &spec,
+            &supplied(&[("pin", json!("not-a-number-s3cr3t"))]),
+            BindMode::Strict,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("s3cr3t"), "{err}");
+        assert!(err.contains("not a valid int"), "{err}");
+        assert_eq!(
+            crate::secrets::registry::redact("x not-a-number-s3cr3t"),
+            "x ***"
+        );
+        let spec = spec_of("region: { secret: true, values: [eu, us] }\n");
+        let err = resolve(
+            &spec,
+            &supplied(&[("region", json!("apac-s3cr3t"))]),
+            BindMode::Strict,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !err.contains("s3cr3t") && err.contains("the supplied value"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn supplied_value_may_not_carry_a_directive() {
         let spec = spec_of("t: { required: true }\n");
         let err = resolve(
@@ -836,6 +988,65 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("literal data"), "{err}");
+    }
+
+    #[test]
+    fn adjacent_supplied_params_cannot_assemble_a_directive() {
+        let mut doc = json!({
+            "params": { "a": {}, "b": {} },
+            "url": "${param.a}${param.b}"
+        });
+        let err = bind_document(
+            &mut doc,
+            &supplied(&[("a", json!("x$")), ("b", json!("{vault:secret/x}"))]),
+            BindMode::Strict,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("may not assemble a directive"), "{err}");
+    }
+
+    #[test]
+    fn supplied_param_before_literal_braces_cannot_assemble_a_directive() {
+        let mut doc = json!({
+            "params": { "a": {} },
+            "headers": { "${param.a}{env:HOME}": "v" }
+        });
+        let err = bind_document(&mut doc, &supplied(&[("a", json!("$"))]), BindMode::Strict)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may not assemble a directive"), "{err}");
+    }
+
+    #[test]
+    fn computed_param_joining_caller_values_cannot_assemble_a_directive() {
+        let mut doc = json!({
+            "params": {
+                "a": {}, "b": {},
+                "joined": { "computed": "${param.a}${param.b}" }
+            },
+            "url": "${param.joined}"
+        });
+        let err = bind_document(
+            &mut doc,
+            &supplied(&[("a", json!("$")), ("b", json!("{file:/etc/passwd}"))]),
+            BindMode::Strict,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("may not assemble a directive"), "{err}");
+    }
+
+    #[test]
+    fn author_directives_survive_alongside_supplied_params() {
+        let mut doc = json!({
+            "params": { "a": {}, "host": { "default": "${env:HOST}" } },
+            "url": "${param.host}/${env:PATH_PART}/${param.a}",
+            "plain": "${param.host}"
+        });
+        bind_document(&mut doc, &supplied(&[("a", json!("x"))]), BindMode::Strict).unwrap();
+        assert_eq!(doc["url"], json!("${env:HOST}/${env:PATH_PART}/x"));
+        assert_eq!(doc["plain"], json!("${env:HOST}"));
     }
 
     #[test]
@@ -968,6 +1179,52 @@ mod tests {
         assert_eq!(doc["pipeline"]["headers"]["X-Tenant"], "v");
         assert_eq!(doc["pipeline"]["list"][0], json!(2));
         assert_eq!(doc["pipeline"]["list"][1], json!("n=2"));
+    }
+
+    #[test]
+    fn a_computed_param_derived_from_a_secret_is_secret_too() {
+        let spec = spec_of(
+            "api_token: { required: true, secret: true }\n\
+             auth_header: { computed: \"Bearer ${param.api_token}\" }\n\
+             upper: { computed: \"[${param.auth_header}]\" }\n\
+             region: { default: eu }\n\
+             path: { computed: \"/${param.region}\" }\n",
+        );
+        let bound = resolve(
+            &spec,
+            &supplied(&[("api_token", json!("tok-derived-secret-123"))]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        let red = bound.redacted();
+        assert_eq!(red["auth_header"], json!("***"));
+        assert_eq!(red["upper"], json!("***"));
+        assert_eq!(red["path"], json!("/eu"));
+        assert!(bound.supplied_secret_names.contains("upper"));
+        assert!(!bound.secret_names.contains("path"));
+        assert_eq!(
+            crate::secrets::registry::redact("h=Bearer tok-derived-secret-123"),
+            "h=***"
+        );
+    }
+
+    #[test]
+    fn a_secret_bound_from_its_default_is_not_a_supplied_secret() {
+        let spec = spec_of(
+            "token: { secret: true, default: \"from-default-value\" }\n\
+             hdr: { computed: \"x ${param.token}\" }\n",
+        );
+        let bound = resolve(&spec, &SuppliedParams::new(), BindMode::Strict).unwrap();
+        assert!(bound.has_secrets());
+        assert!(!bound.has_supplied_secrets());
+        assert_eq!(bound.redacted()["hdr"], json!("***"));
+        let bound = resolve(
+            &spec,
+            &supplied(&[("token", json!("caller-value-long"))]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        assert!(bound.has_supplied_secrets());
     }
 
     #[test]

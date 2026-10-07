@@ -1,0 +1,48 @@
+# Daily RustSec advisory scan (#789 SUPPLY-03). The `Supply chain` CI job gates
+# merges; this catches advisories published between merges and files an issue
+# so someone triages them (fix the dependency, or add a dated `ignore` entry
+# with a reason to deny.toml).
+name: Advisories
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: cargo deny check advisories
+        id: deny
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+      - name: Open or update the tracking issue
+        if: steps.deny.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="RustSec advisory needs triage"
+          body="The daily advisory scan failed: ${RUN_URL}
+
+          Fix the dependency (bump to a fixed release) or add a dated \`ignore\` entry with a reason to \`deny.toml\`."
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label bug --label tier-1 --body "$body"
+          fi
+      - name: Fail when advisories are open
+        if: steps.deny.outcome == 'failure'
+        run: exit 1

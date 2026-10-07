@@ -417,3 +417,47 @@ async fn verify_and_rollback_endpoints_with_rbac() {
     assert!(actions.contains(&"verify"), "{audit}");
     assert!(actions.contains(&"run.rollback"), "{audit}");
 }
+
+/// #789 SERVE-27: a run whose config has no `name:` executed under the
+/// runner's `serve` name, so rollback must look its marker up there too.
+#[tokio::test(flavor = "multi_thread")]
+async fn rollback_finds_a_run_whose_config_has_no_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!("sqlite://{}?mode=rwc", dir.path().join("src.db").display());
+    let dst = format!("sqlite://{}?mode=rwc", dir.path().join("dst.db").display());
+    exec(&src, "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT)").await;
+    exec(&src, "INSERT INTO src VALUES (1, 'one'), (2, 'two')").await;
+    exec(
+        &dst,
+        "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    let state = dir.path().join("state");
+    let cfg = config_yaml(&src, &dst, &state, "rollback: {}").replace("name: mirror\n", "");
+    let port = free_port();
+    spawn_server(port, dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let submitted: Value = client
+        .post(format!("{base}/v1/runs"))
+        .bearer_auth("op-tok")
+        .json(&json!({ "config": cfg, "name": "display-name" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = submitted["run_id"].as_str().unwrap().to_string();
+    let rec = wait_terminal(&client, &base, &run_id).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+    let undone = client
+        .post(format!("{base}/v1/runs/{run_id}/rollback"))
+        .bearer_auth("admin-tok")
+        .json(&json!({ "config": cfg }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(undone.status(), 200, "{}", undone.text().await.unwrap());
+    assert_eq!(count(&dst, "SELECT count(*) FROM dst").await, 0);
+}

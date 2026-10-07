@@ -818,11 +818,16 @@ pub async fn read_state(
     doc: &Value,
     fallback_name: &str,
     history: (Vec<crate::status::HistoryRun>, Vec<String>),
+    tenant: Option<&crate::tenant_tokens::TenantValues>,
 ) -> Result<crate::status::StatusReport, String> {
     let mut doc = doc.clone();
     crate::interpolate::interpolate_value(&mut doc).map_err(|e| format!("state omitted: {e}"))?;
     crate::params::bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict)
         .map_err(|e| format!("state omitted: the config needs params to name its state ({e})"))?;
+    if let Some(t) = tenant {
+        crate::tenant_tokens::bind_document(&mut doc, Some(t))
+            .map_err(|e| format!("state omitted: {e}"))?;
+    }
     let mut cfg = PipelineConfig::from_value(doc).map_err(|e| format!("state omitted: {e}"))?;
     crate::secrets::resolve_secrets(&mut cfg)
         .await
@@ -831,6 +836,11 @@ pub async fn read_state(
         .name
         .clone()
         .unwrap_or_else(|| fallback_name.to_string());
+    // A tenant's runs key their state `{tenant}::{pipeline}::…`.
+    let name = match tenant {
+        Some(t) => format!("{}::{name}", t.id),
+        None => name,
+    };
     let target = crate::pipeline_state::PipelineTarget::resolve(&cfg, &name)
         .map_err(|e| format!("state omitted: {e}"))?;
     let stores = crate::pipeline_state::ops::Stores::build(&target, None)
@@ -870,6 +880,8 @@ pub struct ListOptions<'a> {
     /// Runs a run-history store recorded for the pipeline (newest first) and
     /// the ids still in flight — the status report's history input.
     pub history: (Vec<crate::status::HistoryRun>, Vec<String>),
+    /// Read the state a tenant's runs keep (#709) instead of the shared one.
+    pub tenant: Option<&'a crate::tenant_tokens::TenantValues>,
 }
 
 /// The full listing of a source template.
@@ -889,7 +901,7 @@ pub async fn list_source(
     }
     if opts.state {
         match composed {
-            Some(doc) => match read_state(&doc, &src.id(), opts.history).await {
+            Some(doc) => match read_state(&doc, &src.id(), opts.history, opts.tenant).await {
                 Ok(status) => attach_state(&mut report, &status),
                 Err(note) => report.notes.push(note),
             },
@@ -929,7 +941,7 @@ pub async fn list_pipeline(
         );
     }
     if opts.state && report.selectable {
-        match read_state(doc, fallback_name, opts.history).await {
+        match read_state(doc, fallback_name, opts.history, opts.tenant).await {
             Ok(status) => attach_state(&mut report, &status),
             Err(note) => report.notes.push(note),
         }
@@ -1373,6 +1385,27 @@ matrix:
         );
         let off = run(IncludeParents::Off).await;
         assert!(off.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_tenant_reads_its_own_state_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = pipe(dir.path());
+        doc["pipeline"]["state"]["config"]["path"] =
+            json!(format!("{}/${{tenant.id}}", dir.path().display()));
+        let acme = crate::tenant_tokens::TenantValues {
+            id: "acme".into(),
+            name: None,
+            labels: Default::default(),
+        };
+        let report = read_state(&doc, "x", Default::default(), Some(&acme))
+            .await
+            .unwrap();
+        assert_eq!(report.pipeline, "acme::shop");
+        let err = read_state(&doc, "x", Default::default(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("tenant"), "{err}");
     }
 
     #[tokio::test]

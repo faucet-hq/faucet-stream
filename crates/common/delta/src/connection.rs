@@ -13,7 +13,7 @@ use crate::credentials::DeltaCredentials;
 /// Location + credentials for a Delta table. Flattened (`#[serde(flatten)]`)
 /// into both the source and sink config so the same three keys appear at the
 /// connector-config top level.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeltaConnection {
     /// Delta table location URI: `file:///abs/path`, `s3://bucket/key`,
     /// `abfss://…`, `gs://bucket/key`. A bare local path is accepted and
@@ -30,6 +30,24 @@ pub struct DeltaConnection {
     /// keys.
     #[serde(default)]
     pub storage_options: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for DeltaConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(
+            f,
+            "DeltaConnection",
+            self,
+            &[
+                "secret_access_key",
+                "session_token",
+                "access_key",
+                "sas_token",
+                "service_account_key",
+                "storage_options",
+            ],
+        )
+    }
 }
 
 impl DeltaConnection {
@@ -280,5 +298,17 @@ mod missing_table_tests {
         assert!(is_missing_table(&deltalake::DeltaTableError::NotATable(
             "no log".into()
         )));
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: DeltaConnection = serde_json::from_str(r#"{"table_uri":"s3://b/t","credentials":{"type":"aws","config":{"secret_access_key":"S3CRET-1"}},"storage_options":{"AWS_SECRET_ACCESS_KEY":"S3CRET-2"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

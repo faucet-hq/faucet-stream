@@ -38,10 +38,21 @@ fn merge_props(
 
 /// A `StorageFactory` that injects faucet's configured `catalog.properties`
 /// into the `StorageConfig` before delegating to an OpenDAL-backed factory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct OpendalPropInjector {
     inner: OpenDalStorageFactory,
     props: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for OpendalPropInjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut keys: Vec<&String> = self.props.keys().collect();
+        keys.sort();
+        f.debug_struct("OpendalPropInjector")
+            .field("inner", &self.inner)
+            .field("props", &keys)
+            .finish()
+    }
 }
 
 impl OpendalPropInjector {
@@ -105,6 +116,24 @@ pub fn select_storage_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injector_debug_shows_property_names_only() {
+        let props = HashMap::from([("s3.secret-access-key".to_string(), "S3CRET-1".to_string())]);
+        let dbg = format!(
+            "{:?}",
+            OpendalPropInjector::new(
+                OpenDalStorageFactory::S3 {
+                    customized_credential_load: None,
+                },
+                props,
+            )
+        );
+        assert!(
+            !dbg.contains("S3CRET") && dbg.contains("s3.secret-access-key"),
+            "{dbg}"
+        );
+    }
 
     #[test]
     fn merge_props_overlay_wins() {

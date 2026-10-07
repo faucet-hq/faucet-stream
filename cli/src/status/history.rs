@@ -51,9 +51,20 @@ pub async fn read(
     store: &dyn RunHistory,
     pipeline: &str,
 ) -> Result<(Vec<HistoryRun>, Vec<String>), String> {
+    read_scoped(store, pipeline, None).await
+}
+
+/// Read the recent runs recorded under `pipeline`; with `tenant`, only that
+/// tenant's runs (#789 SERVE-31).
+pub async fn read_scoped(
+    store: &dyn RunHistory,
+    pipeline: &str,
+    tenant: Option<&str>,
+) -> Result<(Vec<HistoryRun>, Vec<String>), String> {
     let page = store
         .list(&ListFilter {
             limit: HISTORY_LIMIT,
+            tenant: tenant.map(str::to_string),
             ..Default::default()
         })
         .await

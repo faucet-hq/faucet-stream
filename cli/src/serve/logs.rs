@@ -58,6 +58,8 @@ enum PersistMsg {
     End {
         run_id: String,
     },
+    /// Flush every run's pending lines and stop (server shutdown).
+    Shutdown,
 }
 
 /// A single captured log line, tagged with a monotonic sequence number so a late
@@ -142,6 +144,8 @@ pub struct LogHub {
     /// durable history backend is configured (#529). `None` → ephemeral-only
     /// behavior, unchanged.
     persist: Arc<OnceLock<mpsc::Sender<PersistMsg>>>,
+    /// The persistence writer task, awaited by [`LogHub::shutdown_persistence`].
+    writer: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl LogHub {
@@ -171,7 +175,26 @@ impl LogHub {
         if self.persist.set(tx).is_err() {
             return; // already enabled
         }
-        tokio::spawn(persist_writer(rx, history, max_lines_per_run.max(1)));
+        let handle = tokio::spawn(persist_writer(rx, history, max_lines_per_run.max(1)));
+        *self.writer.lock().expect("log writer lock poisoned") = Some(handle);
+    }
+
+    /// Flush every run's buffered log lines to the durable store and stop the
+    /// writer, waiting at most `grace` (#789 SERVE-49). Called when the server
+    /// shuts down, so the tail of runs that ended during the drain is kept.
+    pub async fn shutdown_persistence(&self, grace: std::time::Duration) {
+        let Some(tx) = self.persist.get() else {
+            return;
+        };
+        if tx.send(PersistMsg::Shutdown).await.is_err() {
+            return;
+        }
+        let handle = self.writer.lock().expect("log writer lock poisoned").take();
+        if let Some(h) = handle
+            && tokio::time::timeout(grace, h).await.is_err()
+        {
+            tracing::warn!("persisting the last run-log lines timed out at shutdown");
+        }
     }
 
     /// Capture a line for a run: push to the ephemeral ring (SSE) and, when
@@ -183,7 +206,7 @@ impl LogHub {
             && tx
                 .try_send(PersistMsg::Line {
                     run_id: run_id.to_string(),
-                    seq,
+                    seq: persist_seq(seq),
                     ts,
                     level: level.to_string(),
                     line,
@@ -237,6 +260,16 @@ impl LogHub {
     pub fn drop_run(&self, run_id: &str) {
         self.inner.remove(run_id);
     }
+}
+
+/// The durable ordering key of a captured line (#789 SERVE-35): capture time
+/// in microseconds, with the in-process sequence in the low 12 bits. Several
+/// instances log one run (shards, failover re-runs), and a per-process
+/// counter alone collided across them; a time-based key interleaves their
+/// lines in order, and the insert moves past any key still taken.
+pub fn persist_seq(local: u64) -> u64 {
+    let micros = chrono::Utc::now().timestamp_micros().max(0) as u64;
+    (micros << 12) | (local & 0xFFF)
 }
 
 /// Per-run persistence state held by the writer task.
@@ -310,20 +343,30 @@ async fn persist_writer(
             }
             PersistMsg::End { run_id } => {
                 if let Some(mut st) = runs.remove(&run_id) {
-                    flush(&history, &run_id, &mut st).await;
-                    if st.truncated {
-                        // Record a single sentinel so `list_run_logs` reports the gap.
-                        let marker = [RunLogLine {
-                            seq: RUN_LOG_TRUNCATED_SEQ,
-                            ts: String::new(),
-                            level: "WARN".to_string(),
-                            line: "log truncated: per-run cap reached".to_string(),
-                        }];
-                        if let Err(e) = history.record_run_logs(&run_id, &marker).await {
-                            tracing::warn!(run_id, error = %e, "persisting run-log truncation marker failed");
-                        }
-                    }
+                    close(&history, &run_id, &mut st).await;
                 }
+            }
+            PersistMsg::Shutdown => {
+                for (run_id, mut st) in runs.drain() {
+                    close(&history, &run_id, &mut st).await;
+                }
+                break;
+            }
+        }
+    }
+
+    async fn close(history: &Arc<dyn RunHistory>, run_id: &str, st: &mut RunPersistState) {
+        flush(history, run_id, st).await;
+        if st.truncated {
+            // Record a single sentinel so `list_run_logs` reports the gap.
+            let marker = [RunLogLine {
+                seq: RUN_LOG_TRUNCATED_SEQ,
+                ts: String::new(),
+                level: "WARN".to_string(),
+                line: "log truncated: per-run cap reached".to_string(),
+            }];
+            if let Err(e) = history.record_run_logs(run_id, &marker).await {
+                tracing::warn!(run_id, error = %e, "persisting run-log truncation marker failed");
             }
         }
     }

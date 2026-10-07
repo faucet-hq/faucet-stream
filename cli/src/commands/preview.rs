@@ -76,6 +76,9 @@ pub async fn run(args: PreviewArgs) -> CliResult<()> {
             crate::preview_sample::PREVIEW_TIMEOUT.as_secs()
         );
     }
+    #[cfg(feature = "masking")]
+    let limited = crate::preview_sample::mask(sample.records, first_root.masking.as_ref())?;
+    #[cfg(not(feature = "masking"))]
     let limited = sample.records;
     let sink = StdoutSink::new(
         StdoutSinkConfig::new()

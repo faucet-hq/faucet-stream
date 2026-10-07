@@ -12,7 +12,7 @@ use std::time::Duration;
 /// Only [`brokers`](Self::brokers) and [`topic`](Self::topic) are required;
 /// everything else has a safe default (`acks: all` + `idempotent: true`).
 /// Validated at config load by [`validate`](Self::validate).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KafkaSinkConfig {
     /// Comma-separated `host:port` bootstrap brokers, passed straight through
@@ -227,6 +227,17 @@ pub struct KafkaSinkConfig {
     /// cannot break EOS.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_client_config: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for KafkaSinkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(
+            f,
+            "KafkaSinkConfig",
+            self,
+            &["password", "key_password", "extra_client_config"],
+        )
+    }
 }
 
 /// Where each message's destination topic comes from.
@@ -776,5 +787,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: KafkaSinkConfig = serde_json::from_str(r#"{"brokers":"b:9092","topic":{"type":"fixed","name":"t"},"auth":{"type":"sasl_plain","config":{"username":"u","password":"S3CRET-1"}},"extra_client_config":{"sasl.password":"S3CRET-2"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

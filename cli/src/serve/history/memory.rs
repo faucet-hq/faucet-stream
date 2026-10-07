@@ -580,6 +580,53 @@ impl RunHistory for MemoryHistory {
         Ok(catalog::lineage_slice(edges, root, depth))
     }
 
+    async fn catalog_purge(
+        &self,
+        prefix: &str,
+        runs: &[String],
+    ) -> Result<catalog::CatalogPurgeReport, HistoryError> {
+        let mut cat = self
+            .catalog
+            .lock()
+            .map_err(|_| HistoryError::Backend("catalog lock poisoned".into()))?;
+        let runs: std::collections::HashSet<String> = runs.iter().cloned().collect();
+        let edges: Vec<CatalogLineageEdge> = cat.edges.values().cloned().collect();
+        let attribution = cat
+            .datasets
+            .iter()
+            .map(|(id, d)| (id.clone(), (d.pipeline.clone(), d.last_run_id.clone())))
+            .collect();
+        let plan = catalog::plan_purge(&edges, &attribution, prefix, &runs);
+        for key in &plan.edges {
+            cat.edges.remove(key);
+        }
+        for id in &plan.datasets {
+            cat.datasets.remove(id);
+            cat.schema_versions.remove(id);
+            cat.stats.remove(id);
+            cat.profiles.remove(id);
+        }
+        for (id, (pipeline, run)) in &plan.reattribute {
+            if let Some(d) = cat.datasets.get_mut(id) {
+                d.pipeline = pipeline.clone();
+                d.last_run_id = run.clone();
+            }
+        }
+        for points in cat.stats.values_mut() {
+            points.retain(|p| !runs.contains(&p.run_id));
+        }
+        for list in cat.profiles.values_mut() {
+            list.retain(|r| !r.pipeline.starts_with(prefix) && !runs.contains(&r.run_id));
+        }
+        let before = cat.config_snapshots.len();
+        cat.config_snapshots.retain(|p, _| !p.starts_with(prefix));
+        Ok(catalog::CatalogPurgeReport {
+            datasets: plan.datasets.len(),
+            edges: plan.edges.len(),
+            config_snapshots: before - cat.config_snapshots.len(),
+        })
+    }
+
     async fn catalog_record_config_snapshot(
         &self,
         snapshot: &catalog::ConfigSnapshot,
@@ -639,6 +686,22 @@ impl RunHistory for MemoryHistory {
             connection.clone(),
         );
         Ok(())
+    }
+
+    async fn connection_replace(
+        &self,
+        connection: &tenants::ConnectionRecord,
+        expected_updated_at: chrono::DateTime<Utc>,
+    ) -> Result<bool, HistoryError> {
+        let mut state = self.tenant_state()?;
+        let key = (connection.tenant.clone(), connection.name.clone());
+        match state.connections.get(&key) {
+            Some(cur) if cur.updated_at == expected_updated_at => {
+                state.connections.insert(key, connection.clone());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn connection_get(
@@ -735,6 +798,16 @@ impl RunHistory for MemoryHistory {
         Ok(before - rows.len())
     }
 
+    async fn usage_delete_tenant(&self, tenant: &str) -> Result<usize, HistoryError> {
+        let mut rows = self
+            .usage
+            .lock()
+            .map_err(|_| HistoryError::Backend("usage lock poisoned".into()))?;
+        let before = rows.len();
+        rows.retain(|r| r.tenant.as_deref() != Some(tenant));
+        Ok(before - rows.len())
+    }
+
     async fn change_upsert(
         &self,
         change: &crate::serve::changes::ChangeRequest,
@@ -744,6 +817,22 @@ impl RunHistory for MemoryHistory {
             .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?
             .insert(change.id.clone(), change.clone());
         Ok(())
+    }
+
+    async fn change_transition(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        from: crate::serve::changes::ChangeStatus,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self
+            .changes
+            .lock()
+            .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?;
+        if map.get(&change.id).map(|c| c.status) != Some(from) {
+            return Ok(false);
+        }
+        map.insert(change.id.clone(), change.clone());
+        Ok(true)
     }
 
     async fn change_get(
@@ -1489,6 +1578,7 @@ mod tests {
                 config_fingerprint: None,
                 source_ip: None,
                 tenant: None,
+                target: None,
                 result: result.into(),
             };
         h.record_audit(&entry(

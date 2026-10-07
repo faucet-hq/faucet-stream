@@ -123,7 +123,8 @@ Each fetch cycle drains pending changes and stops once the stream has been idle 
 
 | `mode` | Extra config | Description |
 |--------|--------------|-------------|
-| `disable` | *(none)* | Plaintext — **default**, back-compatible. Credentials and WAL travel unencrypted. |
+| `from_url` | *(none)* | **Default.** Use the `sslmode` / `sslrootcert` of `connection_url` for both the control-plane and the replication connection (`allow` / `prefer` mean plaintext for the stream). Without an `sslmode` the connection is plaintext and a warning is logged. |
+| `disable` | *(none)* | Plaintext. Credentials and WAL travel unencrypted (a warning is logged). |
 | `require` | *(none)* | Require TLS, but do not verify the server certificate. |
 | `verify_ca` | `ca_path?` | Require TLS and verify the certificate chain against `ca_path` (or the system roots when omitted). |
 | `verify_full` | `ca_path?` | Require TLS and verify both the certificate chain **and** the hostname. |
@@ -135,7 +136,7 @@ tls:
   ca_path: /etc/ssl/certs/rds-ca.pem
 ```
 
-> Use `require` or a `verify_*` mode in any production / cross-network deployment — `disable` sends database credentials and all WAL data in the clear.
+> Use `verify_full` (or `?sslmode=verify-full` in the URL) in any production / cross-network deployment — `disable` sends database credentials and all WAL data in the clear, and `require` does not authenticate the server. An explicit `tls.mode` that contradicts the URL's `sslmode` is refused at startup.
 
 ## Output record schema
 

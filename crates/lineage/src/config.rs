@@ -85,10 +85,16 @@ pub enum Transport {
 
 /// HTTP transport auth. Same `{ type, config: { … } }` shape as connector auth
 /// (e.g. `{ type: bearer, config: { token: … } }`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum HttpAuth {
     Bearer { token: String },
+}
+
+impl std::fmt::Debug for HttpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "HttpAuth", self, &["token"])
+    }
 }
 
 /// Parent-job linkage (Airflow, Dagster, …).
@@ -212,5 +218,18 @@ mod tests {
     #[test]
     fn schema_generates() {
         let _ = schemars::schema_for!(LineageConfig);
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: HttpAuth =
+            serde_json::from_str(r#"{"type":"bearer","config":{"token":"S3CRET-1"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

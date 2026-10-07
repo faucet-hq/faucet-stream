@@ -150,7 +150,8 @@ that hits its `timeout_secs` and the server-shutdown drain.
 Cancellation is **flush-completing**: the pipeline stops at its next page
 boundary and flushes the sink, so a buffered sink (e.g. Parquet, whose footer is
 only written on flush) commits the rows written so far rather than orphaning the
-whole file (#146 H16). The run is then marked `cancelled` — there is no
+whole file (#146 H16). The run is then marked `cancelled`, with the records and
+invocations it wrote before stopping — there is no
 cross-process resume, so re-submit to continue. A run still stuck *mid-write*
 after a bounded flush grace is hard-dropped (its buffered output may be lost),
 so a hung run can't wedge shutdown.
@@ -234,12 +235,21 @@ a recovered run is marked failed, not continued — re-submit to retry.
 
 ## Graceful shutdown
 
-`SIGTERM`/`SIGINT` stops accepting new connections, drains in-flight runs up to
-`--shutdown-grace-secs` (default 60), then cancels the remainder (marked failed).
+On `SIGTERM`/`SIGINT` the server starts **draining**: `/readyz` turns `503`
+(`"draining": true`) so a load balancer stops routing to it, and every new
+submission — runs, template triggers, webhook fires — is refused with `503`,
+code `draining`, and `Retry-After: 5`. In-flight runs get
+`--shutdown-grace-secs` (default 60) to finish; the remainder are cancelled
+cooperatively. On a single instance they are marked failed (`server_shutdown`);
+in cluster mode they are handed back as `pending` for a peer to claim, which
+resumes them from their bookmark (at-least-once, like any failover). A
+cancelled, timed-out or shutdown-interrupted run keeps the record counts and
+invocations it reached, so its record shows the rows that did land.
 
 ## Health & observability
 
 - `/healthz` — liveness (always 200 while serving).
-- `/readyz` — 503 when history is degraded or the queue is full.
+- `/readyz` — 503 when history is degraded, the queue is full, or the server
+  is draining.
 - `/metrics` — Prometheus, including `faucet_serve_*` series. `/metrics` is
   unauthenticated; restrict it at the network layer if its labels are sensitive.

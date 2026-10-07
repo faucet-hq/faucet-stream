@@ -67,7 +67,9 @@ one; only non-additive changes flow, and a dataset nothing it reads changed
 is dropped along with everything past it. An edge with **no** column lineage
 — an opaque transform (`flatten`, `explode`, `keys_case`, `sql`, `wasm`,
 custom), or an edge recorded before column lineage existed — makes that
-dataset and everything past it `unknown`, never a false `none`.
+dataset and everything past it `unknown`, never a false `none`. An edge keeps
+only its latest run's column lineage: once a pipeline's chain turns opaque,
+its earlier field map is dropped rather than trusted.
 
 **Contracts**: when a downstream pipeline's last recorded config declares a
 [data contract](./contracts.md) over an affected column, the dataset

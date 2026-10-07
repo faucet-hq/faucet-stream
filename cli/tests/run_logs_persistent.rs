@@ -193,3 +193,44 @@ async fn loghub_without_persistence_is_ephemeral() {
         "nothing persisted without enable_persistence"
     );
 }
+
+/// #789 SERVE-49: lines of a run that has not ended are written when the
+/// server shuts the writer down, instead of being lost with the task.
+#[tokio::test]
+async fn shutdown_persists_lines_of_runs_still_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let h: Arc<dyn RunHistory> = Arc::new(store(&dir, "hub4.db").await);
+    let hub = faucet_cli::serve::logs::LogHub::new();
+    hub.enable_persistence(Arc::clone(&h), 2);
+    for i in 0..3 {
+        hub.capture("open-run", "INFO", now_ts(), format!("tail {i}"));
+    }
+    hub.shutdown_persistence(Duration::from_secs(5)).await;
+    let page = h.list_run_logs("open-run", None, 100).await.unwrap();
+    assert_eq!(page.lines.len(), 2, "{page:?}");
+    assert!(page.truncated, "the cap marker is written at shutdown too");
+    // A second shutdown, and one on a hub without persistence, are no-ops.
+    hub.shutdown_persistence(Duration::from_secs(1)).await;
+    faucet_cli::serve::logs::LogHub::new()
+        .shutdown_persistence(Duration::from_secs(1))
+        .await;
+}
+
+/// #789 SERVE-35: two instances writing the same run's logs with the same
+/// key both keep their line, and the time-based key orders them.
+#[tokio::test]
+async fn colliding_log_keys_keep_both_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = store(&dir, "collide.db").await;
+    let a = faucet_cli::serve::logs::persist_seq(1);
+    h.record_run_logs("r", &[log_line(a, "t", "from instance a")])
+        .await
+        .unwrap();
+    h.record_run_logs("r", &[log_line(a, "t", "from instance b")])
+        .await
+        .unwrap();
+    let page = h.list_run_logs("r", None, 10).await.unwrap();
+    assert_eq!(page.lines.len(), 2, "{page:?}");
+    let later = faucet_cli::serve::logs::persist_seq(0);
+    assert!(later > a >> 12 << 12, "keys grow with time");
+}

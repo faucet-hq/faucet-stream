@@ -78,10 +78,11 @@ pub struct PostgresCdcSourceConfig {
     #[serde(default = "default_slot_acquire_retries")]
     pub slot_acquire_retries: u32,
 
-    /// TLS settings for the replication connection. Default `disable`
-    /// (plaintext) for back-compatibility, but credentials and all WAL data
-    /// then travel unencrypted — set `require`/`verify_ca`/`verify_full` in
-    /// production.
+    /// TLS settings for the replication connection. Default `from_url`: the
+    /// `sslmode` (and `sslrootcert`) in `connection_url` apply to both the
+    /// control-plane and the replication connection; without one the
+    /// connection is plaintext and a warning is logged. An explicit mode that
+    /// contradicts the URL's `sslmode` is refused (#789 SUPPLY-06).
     #[serde(default)]
     pub tls: CdcTls,
 
@@ -206,8 +207,7 @@ pub enum SlotType {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum CdcTls {
-    /// No TLS — plaintext (default, back-compatible).
-    #[default]
+    /// No TLS — plaintext.
     Disable,
     /// Require TLS but do not verify the server certificate.
     Require,
@@ -222,6 +222,10 @@ pub enum CdcTls {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ca_path: Option<String>,
     },
+    /// Follow the `sslmode` / `sslrootcert` of `connection_url` (default);
+    /// plaintext when it sets none.
+    #[default]
+    FromUrl,
 }
 
 impl std::fmt::Debug for PostgresCdcSourceConfig {
@@ -260,6 +264,29 @@ impl PostgresCdcSourceConfig {
         self
     }
 
+    /// The TLS mode the connections use: `tls`, reconciled with the
+    /// `sslmode` / `sslrootcert` in `connection_url`. Never `FromUrl`.
+    pub fn effective_tls(&self) -> Result<CdcTls, FaucetError> {
+        let from_url = url_tls(&self.connection_url)?;
+        Ok(match (&self.tls, from_url) {
+            (CdcTls::FromUrl, url) => url.unwrap_or(CdcTls::Disable),
+            (explicit, None) => explicit.clone(),
+            (explicit, Some(url)) if explicit.kind() == url.kind() => match (explicit, url) {
+                (CdcTls::VerifyCa { ca_path: None }, u)
+                | (CdcTls::VerifyFull { ca_path: None }, u) => u,
+                (e, _) => e.clone(),
+            },
+            (explicit, Some(url)) => {
+                return Err(FaucetError::Config(format!(
+                    "postgres-cdc: `tls.mode: {}` contradicts `sslmode={}` in connection_url; \
+                     drop one of them",
+                    explicit.kind(),
+                    url.kind()
+                )));
+            }
+        })
+    }
+
     /// Validate fail-fast invariants. Called from `PostgresCdcSource::new`.
     pub fn validate(&self) -> Result<(), FaucetError> {
         if self.connection_url.trim().is_empty() {
@@ -295,6 +322,55 @@ impl PostgresCdcSourceConfig {
         }
         Ok(())
     }
+}
+
+impl CdcTls {
+    fn kind(&self) -> &'static str {
+        match self {
+            CdcTls::FromUrl => "from_url",
+            CdcTls::Disable => "disable",
+            CdcTls::Require => "require",
+            CdcTls::VerifyCa { .. } => "verify_ca",
+            CdcTls::VerifyFull { .. } => "verify_full",
+        }
+    }
+}
+
+/// The TLS mode a libpq-style connection string asks for, from its `sslmode`
+/// and `sslrootcert` (URL query or `key=value` form). `allow` / `prefer`
+/// accept plaintext, which is what the replication stream then uses.
+fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
+    let params: Vec<(String, String)> = if conn.contains("://") {
+        match url::Url::parse(conn) {
+            Ok(u) => u.query_pairs().into_owned().collect(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        conn.split_whitespace()
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.trim_matches('\'').to_string()))
+            .collect()
+    };
+    let get = |key: &str| {
+        params
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let ca_path = get("sslrootcert");
+    Ok(match get("sslmode").as_deref() {
+        None => None,
+        Some("disable" | "allow" | "prefer") => Some(CdcTls::Disable),
+        Some("require") => Some(CdcTls::Require),
+        Some("verify-ca" | "verify_ca") => Some(CdcTls::VerifyCa { ca_path }),
+        Some("verify-full" | "verify_full") => Some(CdcTls::VerifyFull { ca_path }),
+        Some(other) => {
+            return Err(FaucetError::Config(format!(
+                "postgres-cdc: unknown sslmode '{other}' in connection_url"
+            )));
+        }
+    })
 }
 
 fn validate_slot_name(name: &str) -> Result<(), FaucetError> {
@@ -343,6 +419,90 @@ mod tests {
             batch_size: DEFAULT_BATCH_SIZE,
             slot_acquire_retries: default_slot_acquire_retries(),
         }
+    }
+
+    #[test]
+    fn tls_follows_the_url_sslmode_unless_explicit() {
+        // #789 SUPPLY-06: an omitted `tls:` no longer forces plaintext over
+        // the URL's `sslmode`.
+        let with = |url: &str, tls: CdcTls| PostgresCdcSourceConfig {
+            connection_url: url.into(),
+            tls,
+            ..minimal()
+        };
+        let eff = |url: &str, tls: CdcTls| with(url, tls).effective_tls();
+        assert_eq!(
+            eff(
+                "postgres://u:p@h/db?sslmode=verify-full&sslrootcert=/ca.pem",
+                CdcTls::FromUrl
+            )
+            .unwrap(),
+            CdcTls::VerifyFull {
+                ca_path: Some("/ca.pem".into())
+            }
+        );
+        assert_eq!(
+            eff("postgres://u:p@h/db", CdcTls::FromUrl).unwrap(),
+            CdcTls::Disable
+        );
+        assert_eq!(
+            eff("host=h sslmode=require", CdcTls::FromUrl).unwrap(),
+            CdcTls::Require
+        );
+        assert_eq!(
+            eff("postgres://h/db?sslmode=prefer", CdcTls::FromUrl).unwrap(),
+            CdcTls::Disable
+        );
+        assert_eq!(
+            eff("postgres://h/db?sslmode=verify-ca", CdcTls::FromUrl).unwrap(),
+            CdcTls::VerifyCa { ca_path: None }
+        );
+        assert_eq!(
+            eff("postgres://h/db", CdcTls::Require).unwrap(),
+            CdcTls::Require
+        );
+        assert_eq!(
+            eff(
+                "postgres://h/db?sslmode=verify-full&sslrootcert=/u.pem",
+                CdcTls::VerifyFull { ca_path: None }
+            )
+            .unwrap(),
+            CdcTls::VerifyFull {
+                ca_path: Some("/u.pem".into())
+            }
+        );
+        assert_eq!(
+            eff(
+                "postgres://h/db?sslmode=verify-full&sslrootcert=/u.pem",
+                CdcTls::VerifyFull {
+                    ca_path: Some("/mine.pem".into())
+                }
+            )
+            .unwrap(),
+            CdcTls::VerifyFull {
+                ca_path: Some("/mine.pem".into())
+            }
+        );
+        let err = eff("postgres://h/db?sslmode=verify-full", CdcTls::Disable)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contradicts"), "{err}");
+        let err = eff("postgres://h/db?sslmode=bogus", CdcTls::FromUrl)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown sslmode"), "{err}");
+        assert_eq!(eff("not a url", CdcTls::FromUrl).unwrap(), CdcTls::Disable);
+        assert_eq!(
+            eff("postgres://[bad", CdcTls::FromUrl).unwrap(),
+            CdcTls::Disable
+        );
+        let default: PostgresCdcSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_url": "postgres://u:p@localhost/db",
+            "slot_name": "faucet_slot",
+            "publication_name": "faucet_pub",
+        }))
+        .unwrap();
+        assert_eq!(default.tls, CdcTls::FromUrl);
     }
 
     #[test]

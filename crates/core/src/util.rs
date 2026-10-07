@@ -243,6 +243,52 @@ fn json_escape_string(s: &str) -> String {
     escaped
 }
 
+/// `Debug`-format `value` through its `Serialize` form, with the value of every
+/// object entry whose key is in `secret_keys` masked as `"***"` — at any
+/// depth; an object or array under such a key keeps its shape (header names
+/// stay visible) with every leaf masked. `null` is left as is.
+///
+/// For connector config and credential types whose derived `Debug` would
+/// print secrets (#789 SUPPLY-17). Serialization failures print the type
+/// name only.
+pub fn fmt_redacted<T: serde::Serialize + ?Sized>(
+    f: &mut std::fmt::Formatter<'_>,
+    name: &str,
+    value: &T,
+    secret_keys: &[&str],
+) -> std::fmt::Result {
+    fn mask_all(v: &mut Value) {
+        match v {
+            Value::Null => {}
+            Value::Object(map) => map.values_mut().for_each(mask_all),
+            Value::Array(items) => items.iter_mut().for_each(mask_all),
+            other => *other = Value::String("***".into()),
+        }
+    }
+    fn mask(v: &mut Value, keys: &[&str]) {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map.iter_mut() {
+                    if keys.contains(&k.as_str()) {
+                        mask_all(child);
+                    } else {
+                        mask(child, keys);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|i| mask(i, keys)),
+            _ => {}
+        }
+    }
+    match serde_json::to_value(value) {
+        Ok(mut v) => {
+            mask(&mut v, secret_keys);
+            write!(f, "{name}({v})")
+        }
+        Err(_) => write!(f, "{name}(..)"),
+    }
+}
+
 /// Strip credentials from a connection string so it can be used as a lineage
 /// dataset URI without leaking secrets. Handles two shapes, best-effort:
 ///
@@ -275,7 +321,10 @@ pub fn redact_uri_credentials(uri: &str) -> String {
                     let host = &tail[at + 1..];
                     let host_end = host.find(['/', '?', '#']).unwrap_or(host.len());
                     let host = &host[..host_end];
-                    !host.is_empty() && !host.contains('@') && is_host_shaped(host)
+                    !host.is_empty()
+                        && !host.contains('@')
+                        && is_host_shaped(host)
+                        && is_userinfo_shaped(&tail[..at])
                 }
             })
             .map(|(at, _)| at);
@@ -291,22 +340,75 @@ pub fn redact_uri_credentials(uri: &str) -> String {
     //    password/pwd (audit #321 M11): a leaked `?api_key=…` or SAS `?sig=…`
     //    was previously passed through verbatim into lineage / catalog output.
     if out.contains('=') {
-        out = out
-            .split_inclusive([';', '&', '?'])
-            .map(|seg| {
-                // Preserve any trailing delimiter the split kept on the segment.
-                let (body, delim) = match seg.char_indices().next_back() {
-                    Some((i, ';' | '&' | '?')) => (&seg[..i], &seg[i..]),
-                    _ => (seg, ""),
+        out = redact_secret_kv_values(&out);
+    }
+    out
+}
+
+/// Whether the text before a candidate userinfo `@` can be userinfo. Inside
+/// the authority anything goes; text that crosses a `/`, `?` or `#` is only
+/// userinfo when it starts `user:` with a password that is not a bare port
+/// number, so `s3://bucket/data@2024/x` keeps its path.
+fn is_userinfo_shaped(candidate: &str) -> bool {
+    let Some(first_delim) = candidate.find(['/', '?', '#']) else {
+        return true;
+    };
+    let head = &candidate[..first_delim];
+    if head.contains('@') {
+        return false;
+    }
+    match head.split_once(':') {
+        Some((_, pass_head)) => {
+            pass_head.is_empty() || !pass_head.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Replace the value of every secret `key=value` pair with `***`. A value
+/// runs to its format's field terminator — `;` in a keyword (ADO.NET / JDBC)
+/// string, `&` in a URL query — so `Password=a&b;` hides all of `a&b`; a
+/// quoted value runs to its closing quote first.
+fn redact_secret_kv_values(s: &str) -> String {
+    let keyword_form = s.contains(';');
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    let mut prev: Option<char> = None;
+    loop {
+        let seg_end = rest.find([';', '&', '?']).unwrap_or(rest.len());
+        let seg = &rest[..seg_end];
+        match seg.find('=') {
+            Some(eq) if is_secret_kv_key(&seg[..eq]) => {
+                let term = match prev {
+                    Some(';') => ';',
+                    Some(_) => '&',
+                    None if keyword_form => ';',
+                    None => '&',
                 };
-                match body.find('=') {
-                    Some(eq) if is_secret_kv_key(&body[..eq]) => {
-                        format!("{}=***{delim}", &body[..eq])
-                    }
-                    _ => seg.to_string(),
-                }
-            })
-            .collect::<String>();
+                let vstart = eq + 1;
+                let value = &rest[vstart..];
+                let scan_from = match value.chars().next() {
+                    Some(q @ ('"' | '\'')) => value[1..].find(q).map(|i| i + 2).unwrap_or(0),
+                    _ => 0,
+                };
+                let vend = value[scan_from..]
+                    .find(term)
+                    .map(|i| vstart + scan_from + i)
+                    .unwrap_or(rest.len());
+                out.push_str(&rest[..vstart]);
+                out.push_str("***");
+                rest = &rest[vend..];
+            }
+            _ => {
+                out.push_str(seg);
+                rest = &rest[seg_end..];
+            }
+        }
+        let mut chars = rest.chars();
+        let Some(c) = chars.next() else { break };
+        out.push(c);
+        prev = Some(c);
+        rest = chars.as_str();
     }
     out
 }
@@ -458,6 +560,46 @@ mod snake_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fmt_redacted_masks_secret_keys_at_any_depth() {
+        struct Show<'a>(&'a Value);
+        impl std::fmt::Debug for Show<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                super::fmt_redacted(f, "Cfg", self.0, &["password", "headers"])
+            }
+        }
+        let v = serde_json::json!({
+            "user": "u",
+            "password": "hunter22",
+            "nested": [{"password": 7, "headers": {"X-Key": "k1", "list": ["a"]}}],
+            "headers": null,
+        });
+        let out = format!("{:?}", Show(&v));
+        assert!(out.starts_with("Cfg("), "{out}");
+        for secret in ["hunter22", "k1", "\"a\"", ":7"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(
+            out.contains("X-Key") && out.contains("\"user\":\"u\""),
+            "{out}"
+        );
+        assert!(out.contains("\"headers\":null"), "{out}");
+
+        struct Bad;
+        impl serde::Serialize for Bad {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("no"))
+            }
+        }
+        struct ShowBad;
+        impl std::fmt::Debug for ShowBad {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                super::fmt_redacted(f, "Bad", &Bad, &[])
+            }
+        }
+        assert_eq!(format!("{ShowBad:?}"), "Bad(..)");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -877,6 +1019,51 @@ mod tests {
             redact_uri_credentials("mysql://u:a/b?c@d@127.0.0.1:3306/app"),
             "mysql://127.0.0.1:3306/app"
         );
+    }
+
+    #[test]
+    fn redact_keeps_an_at_sign_in_an_object_path() {
+        assert_eq!(
+            redact_uri_credentials("s3://bucket/data@2024/x.parquet"),
+            "s3://bucket/data@2024/x.parquet"
+        );
+        assert_eq!(
+            redact_uri_credentials("http://host:8080/p@2024/x"),
+            "http://host:8080/p@2024/x"
+        );
+        assert_eq!(
+            redact_uri_credentials("s3://user:pw@bucket/data@2024/x"),
+            "s3://bucket/data@2024/x"
+        );
+        assert_eq!(
+            redact_uri_credentials("postgres://u:/pw@host/db"),
+            "postgres://host/db"
+        );
+    }
+
+    #[test]
+    fn redact_hides_the_whole_value_up_to_the_field_terminator() {
+        assert_eq!(
+            redact_uri_credentials("Server=h;Password=a&b?c;Database=d"),
+            "Server=h;Password=***;Database=d"
+        );
+        assert_eq!(
+            redact_uri_credentials("Password=a&b;Database=d"),
+            "Password=***;Database=d"
+        );
+        assert_eq!(
+            redact_uri_credentials("Server=h;Password=\"a;b\";Database=d"),
+            "Server=h;Password=***;Database=d"
+        );
+        assert_eq!(
+            redact_uri_credentials("https://h/?password=a;b&x=1"),
+            "https://h/?password=***&x=1"
+        );
+        assert_eq!(
+            redact_uri_credentials("jdbc:sqlserver://h;password=p&q;db=x"),
+            "jdbc:sqlserver://h;password=***;db=x"
+        );
+        assert_eq!(redact_uri_credentials("token="), "token=***");
     }
 
     #[test]

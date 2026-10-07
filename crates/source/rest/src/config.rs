@@ -125,6 +125,15 @@ pub struct RestStreamConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(with = "std::collections::HashMap<String, String>")]
     pub headers: HashMap<String, String>,
+    /// Extra hosts that may receive this source's credentials when a
+    /// server-given URL (a next-page link, an async-job URL) points at them.
+    /// Credentials — the `auth` block, a shared provider's placements and any
+    /// `Authorization` / `Cookie` header — are otherwise sent only to the
+    /// scheme, host and port of `base_url`; a link elsewhere is fetched without
+    /// them. An entry is a host (`files.example.com`) or a `*.example.com`
+    /// wildcard. An `https` base never follows a link to plain `http`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_hosts: Vec<String>,
     /// Static query-string parameters, rendered as `?k=v`. Values honor
     /// `{placeholder}` context substitution for child sources. Empty by
     /// default.
@@ -742,6 +751,7 @@ impl Default for RestStreamConfig {
             auth: AuthSpec::Inline(Auth::None),
             drop_key_prefixes: Vec::new(),
             headers: HashMap::new(),
+            trusted_hosts: Vec::new(),
             query_params: HashMap::new(),
             query_params_multi: HashMap::new(),
             body: None,
@@ -1202,6 +1212,13 @@ impl RestStreamConfig {
 
     pub fn query(mut self, k: &str, v: &str) -> Self {
         self.query_params.insert(k.into(), v.into());
+        self
+    }
+
+    /// Allow `host` (or a `*.example.com` wildcard) to receive this source's
+    /// credentials when a server-given URL points at it.
+    pub fn trusted_host(mut self, host: &str) -> Self {
+        self.trusted_hosts.push(host.to_string());
         self
     }
 

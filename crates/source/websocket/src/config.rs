@@ -122,7 +122,7 @@ fn default_batch_size() -> usize {
 }
 
 /// Authentication for the WebSocket upgrade request.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum WebsocketAuth {
     /// No authentication (default).
@@ -132,6 +132,12 @@ pub enum WebsocketAuth {
     Bearer { token: String },
     /// Arbitrary request headers.
     Custom { headers: BTreeMap<String, String> },
+}
+
+impl std::fmt::Debug for WebsocketAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_core::util::fmt_redacted(f, "WebsocketAuth", self, &["token", "headers"])
+    }
 }
 
 /// How each incoming frame is converted into a record.
@@ -221,6 +227,15 @@ pub(crate) fn decode_frame(
             Ok(Some(Value::String(encoded)))
         }
     }
+}
+
+/// The connection URL as written into an envelope: credentials redacted and
+/// the query string and fragment dropped, since a URL token is the only way
+/// some APIs take credentials and the envelope lands in every row.
+pub(crate) fn envelope_url(url: &str) -> String {
+    let redacted = faucet_core::redact_uri_credentials(url);
+    let end = redacted.find(['?', '#']).unwrap_or(redacted.len());
+    redacted[..end].to_string()
 }
 
 /// Wrap (or not) the decoded value into the emitted record shape.
@@ -375,6 +390,11 @@ mod helper_tests {
 
     #[test]
     fn shape_raw_passthrough() {
+        assert_eq!(
+            envelope_url("wss://user:pw@stream.example.com/feed?token=abc#x"),
+            "wss://stream.example.com/feed"
+        );
+        assert_eq!(envelope_url("wss://h/feed"), "wss://h/feed");
         let v = shape_record(json!({"a": 1}), false, "wss://x", 123);
         assert_eq!(v, json!({"a": 1}));
     }
@@ -411,5 +431,23 @@ mod helper_tests {
         }))
         .unwrap();
         assert_eq!(aliased.reconnect_backoff, Duration::from_secs(9));
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let v: WebsocketAuth =
+            serde_json::from_str(r#"{"type":"bearer","config":{"token":"S3CRET-1"}}"#).unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+        let v: WebsocketAuth =
+            serde_json::from_str(r#"{"type":"custom","config":{"headers":{"X":"S3CRET-2"}}}"#)
+                .unwrap();
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
     }
 }

@@ -1441,6 +1441,42 @@ async fn change_requests_round_trip_and_filter() {
         .change_upsert(&mk("a", ChangeKind::Run, ChangeStatus::Pending, "bob", 30))
         .await
         .unwrap();
+    // Compare-and-set on the status (#789 SERVE-17): a writer that read
+    // `executed` loses; one that read `pending` wins exactly once.
+    let mut moved = mk("a", ChangeKind::Run, ChangeStatus::Approved, "bob", 30);
+    moved.reason = Some("cas".into());
+    assert!(
+        !store
+            .change_transition(&moved, ChangeStatus::Executed)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .change_transition(&moved, ChangeStatus::Pending)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .change_transition(&moved, ChangeStatus::Pending)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .change_get("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("cas")
+    );
+    store
+        .change_upsert(&mk("a", ChangeKind::Run, ChangeStatus::Pending, "bob", 30))
+        .await
+        .unwrap();
     store
         .change_upsert(&mk(
             "b",
@@ -1519,4 +1555,457 @@ async fn trigger_edges_rise_once_rearm_and_retract() {
     );
     a.trigger_edge_retract("drain", second).await.unwrap();
     assert_eq!(a.trigger_edge_rise("drain").await.unwrap(), Some(second));
+}
+
+/// #789 SERVE-33 / SUPPLY-19: a database created by an older binary — without
+/// `cancel_requested`, the tenant columns or a schema version — is migrated
+/// at connect (tenants backfilled from each body), stamped, and a database
+/// stamped by a newer binary is refused at startup.
+#[tokio::test]
+async fn an_old_database_is_migrated_and_a_newer_one_refused() {
+    use sqlx::Connection as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db");
+    let url = format!("sqlite:{}?mode=rwc", path.display());
+    {
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        for stmt in [
+            "CREATE TABLE faucet_serve_runs (run_id TEXT PRIMARY KEY, name TEXT, status TEXT NOT NULL, \
+             submitted_at TEXT NOT NULL, finished_at TEXT, idempotency_key TEXT, owner TEXT, \
+             lease_expires_at TEXT, body TEXT NOT NULL)",
+            "CREATE TABLE faucet_usage (run_id TEXT NOT NULL, row_id TEXT NOT NULL, \
+             pipeline TEXT NOT NULL, recorded_at TEXT NOT NULL, body TEXT NOT NULL, \
+             PRIMARY KEY (run_id, row_id))",
+            "CREATE TABLE faucet_serve_changes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
+             status TEXT NOT NULL, requester TEXT NOT NULL, created_at TEXT NOT NULL, \
+             expires_at TEXT NOT NULL, body TEXT NOT NULL)",
+        ] {
+            sqlx::query(stmt).execute(&mut conn).await.unwrap();
+        }
+        let usage = serde_json::to_value(faucet_cli::usage::UsageRecord {
+            run_id: "inv-1".into(),
+            pipeline: "p".into(),
+            row: "r".into(),
+            source_kind: "csv".into(),
+            sink_kind: "jsonl".into(),
+            dataset_id: None,
+            dataset_uri: None,
+            recorded_at: Utc::now(),
+            duration_ms: 1,
+            failed: false,
+            usage: Default::default(),
+            cost: Default::default(),
+            tenant: Some("acme".into()),
+        })
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO faucet_usage VALUES ('inv-1','r','p','2026-10-01T00:00:00.000000000Z',?)",
+        )
+        .bind(usage.to_string())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO faucet_usage VALUES ('inv-2','r','p','2026-10-01T00:00:00.000000000Z','{}')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        for (id, body) in [("chg-a", r#"{"tenant":"acme"}"#), ("chg-b", "{}")] {
+            sqlx::query(
+                "INSERT INTO faucet_serve_changes VALUES (?,'run','pending','u','2026-10-01T00:00:00Z','2099-01-01T00:00:00Z',?)",
+            )
+            .bind(id)
+            .bind(body)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        conn.close().await.unwrap();
+    }
+    let store = SqliteHistory::connect(
+        &format!("sqlite:{}", path.display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i1".into(),
+    )
+    .await
+    .expect("an old database migrates");
+    let rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, Utc::now());
+    store.upsert(&rec).await.unwrap();
+    store
+        .request_cancel("r1")
+        .await
+        .expect("cancel_requested exists");
+    let filter = faucet_cli::usage::UsageFilter {
+        tenant: Some("acme".into()),
+        limit: 10,
+        ..Default::default()
+    };
+    let rows = store.usage_list(&filter).await.unwrap();
+    assert_eq!(rows.len(), 1, "the tenant column was backfilled");
+    assert_eq!(store.usage_delete_tenant("acme").await.unwrap(), 1);
+    drop(store);
+    {
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        let tenants: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, tenant FROM faucet_serve_changes ORDER BY id")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            tenants,
+            vec![
+                ("chg-a".into(), Some("acme".into())),
+                ("chg-b".into(), None)
+            ],
+            "change tenants were backfilled from each body"
+        );
+        conn.close().await.unwrap();
+    }
+    // Connecting again is a no-op.
+    let again = SqliteHistory::connect(
+        &format!("sqlite:{}", path.display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i2".into(),
+    )
+    .await
+    .expect("idempotent");
+    drop(again);
+
+    {
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("UPDATE faucet_serve_schema SET version='99' WHERE id='schema'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let err = SqliteHistory::connect(
+        &format!("sqlite:{}", path.display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i3".into(),
+    )
+    .await
+    .err()
+    .expect("a newer schema is refused");
+    assert!(
+        faucet_cli::serve::history::sql::schema_too_new(&err),
+        "{err}"
+    );
+    let fatal = faucet_cli::serve::history::connect(
+        &faucet_cli::serve::config::HistoryBackendSpec::Sqlite(format!(
+            "sqlite:{}",
+            path.display()
+        )),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i4",
+    )
+    .await;
+    assert!(fatal.is_err(), "a newer schema is fatal, not a degrade");
+}
+
+/// #789 SERVE-45: failing an orphan is conditional on its lease still being
+/// expired, so an owner that renewed after the scan keeps its run.
+#[tokio::test]
+async fn failing_an_orphan_spares_a_run_whose_lease_was_renewed() {
+    use faucet_cli::serve::history::sql::{Dialect, Stmts};
+    use sqlx::Connection as _;
+    let dir = tempfile::tempdir().unwrap();
+    let owner = store_with(&dir, "orphan.db", Duration::from_secs(3600), "owner").await;
+    let mut rec = RunRecord::queued("live".into(), None, BTreeMap::new(), None, Utc::now());
+    rec.status = RunStatus::Running;
+    owner.upsert(&rec).await.unwrap();
+    let stmts = Stmts::new(Dialect::Sqlite);
+    let mut conn = sqlx::SqliteConnection::connect(&format!(
+        "sqlite:{}",
+        dir.path().join("orphan.db").display()
+    ))
+    .await
+    .unwrap();
+    let now = faucet_cli::serve::history::sql::fmt_ts(Utc::now());
+    let done = sqlx::query(&stmts.fail_orphan)
+        .bind("failed")
+        .bind(&now)
+        .bind("scanner")
+        .bind(&now)
+        .bind("{}")
+        .bind("live")
+        .bind(&now)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(done.rows_affected(), 0, "a live lease is not failed");
+    assert_eq!(
+        owner.get("live").await.unwrap().unwrap().status,
+        RunStatus::Running
+    );
+}
+
+/// #789 SERVE-25: a run its owner gives up on at shutdown goes back to
+/// `pending` with no owner, so a peer can claim it.
+#[tokio::test]
+async fn release_owned_requeues_only_the_owners_running_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = store_with(&dir, "release.db", Duration::from_secs(3600), "a").await;
+    let b = store_with(&dir, "release.db", Duration::from_secs(3600), "b").await;
+    let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+    rec.status = RunStatus::Running;
+    rec.started_at = Some(Utc::now());
+    a.upsert(&rec).await.unwrap();
+    assert!(!b.release_owned(&rec).await.unwrap(), "not b's run");
+    assert!(a.release_owned(&rec).await.unwrap());
+    let back = a.get("r").await.unwrap().unwrap();
+    assert_eq!(back.status, RunStatus::Pending);
+    assert!(back.started_at.is_none());
+    assert!(!a.release_owned(&rec).await.unwrap(), "already released");
+    let claimed = b.claim_pending(5).await.unwrap();
+    assert_eq!(claimed.len(), 1, "a peer claims it");
+}
+
+/// #789 SERVE-40 / SERVE-50: the catalog's SQL listing pages by its sort key
+/// (rows that run again between pages are neither repeated nor skipped) and
+/// an opaque run clears an edge's stale column lineage.
+#[tokio::test]
+async fn catalog_pages_by_sort_key_and_opaque_runs_clear_column_lineage() {
+    use faucet_cli::serve::history::catalog::{
+        CatalogListFilter, CatalogUpdate, DatasetObservation, DatasetRole,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(&dir, "catalog-page.db").await;
+    let obs = |uri: &str, role| DatasetObservation {
+        uri: uri.into(),
+        kind: "csv".into(),
+        role,
+        schema: None,
+        records: 1,
+    };
+    let t0 = Utc::now();
+    let run = |src: &str, dst: &str, at, lineage| CatalogUpdate {
+        run_id: "r".into(),
+        pipeline: "p".into(),
+        row: "default".into(),
+        recorded_at: at,
+        sources: vec![obs(src, DatasetRole::Source)],
+        sink: obs(dst, DatasetRole::Sink),
+        column_lineage: lineage,
+    };
+    s.catalog_record(&run(
+        "csv://a",
+        "csv://b",
+        t0,
+        Some(serde_json::json!({"fields": {}})),
+    ))
+    .await
+    .unwrap();
+    s.catalog_record(&run(
+        "csv://c",
+        "csv://d",
+        t0 + ChronoDuration::seconds(1),
+        None,
+    ))
+    .await
+    .unwrap();
+    let first = s
+        .catalog_list_datasets(&CatalogListFilter {
+            limit: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.datasets.len(), 2);
+    // a → b runs again (opaque now) and jumps to the top.
+    s.catalog_record(&run(
+        "csv://a",
+        "csv://b",
+        t0 + ChronoDuration::seconds(9),
+        None,
+    ))
+    .await
+    .unwrap();
+    let rest = s
+        .catalog_list_datasets(&CatalogListFilter {
+            limit: 2,
+            cursor: first.next_cursor.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let seen: std::collections::HashSet<_> = first
+        .datasets
+        .iter()
+        .chain(&rest.datasets)
+        .map(|d| d.uri.clone())
+        .collect();
+    assert_eq!(
+        seen.len(),
+        first.datasets.len() + rest.datasets.len(),
+        "no repeats"
+    );
+    assert!(rest.datasets.len() <= 2);
+    let edges = s.catalog_lineage(None, 5).await.unwrap();
+    let ab = edges.iter().find(|e| e.src_uri == "csv://a").unwrap();
+    assert!(ab.column_lineage.is_none(), "{ab:?}");
+}
+
+/// #789 SERVE-51: purging a tenant namespace removes its edges, snapshots,
+/// volume points and profiles and every dataset only it touched; a dataset
+/// another pipeline shares is kept and re-attributed. Run against SQLite and
+/// the in-memory backend, which must agree.
+async fn catalog_purge_scenario(s: &dyn RunHistory) {
+    use faucet_cli::serve::history::catalog::{
+        CatalogProfileRecord, CatalogUpdate, ConfigSnapshot, DatasetObservation, DatasetRole,
+        dataset_id,
+    };
+    let obs = |uri: &str, role| DatasetObservation {
+        uri: uri.into(),
+        kind: "csv".into(),
+        role,
+        schema: None,
+        records: 3,
+    };
+    let t0 = Utc::now();
+    let update = |run: &str, pipeline: &str, src: &str, at| CatalogUpdate {
+        run_id: run.into(),
+        pipeline: pipeline.into(),
+        row: "default".into(),
+        recorded_at: at,
+        sources: vec![obs(src, DatasetRole::Source)],
+        sink: obs("csv://shared", DatasetRole::Sink),
+        column_lineage: None,
+    };
+    s.catalog_record(&update("r-other", "other", "csv://b", t0))
+        .await
+        .unwrap();
+    s.catalog_record(&update(
+        "r-acme",
+        "acme::p",
+        "csv://a",
+        t0 + ChronoDuration::seconds(5),
+    ))
+    .await
+    .unwrap();
+    let profile = |run: &str, pipeline: &str, secs| {
+        let mut p = faucet_core::Profiler::new(faucet_core::ProfilingSpec::default());
+        p.observe_page(&[serde_json::json!({"a": 1})]);
+        CatalogProfileRecord {
+            run_id: run.into(),
+            pipeline: pipeline.into(),
+            row: "default".into(),
+            recorded_at: t0 + ChronoDuration::seconds(secs),
+            profile: p.finish(),
+            drift: Vec::new(),
+            baseline_runs: 0,
+        }
+    };
+    let shared = dataset_id("csv://shared");
+    s.catalog_record_profile(&shared, &profile("r-other", "other", 1))
+        .await
+        .unwrap();
+    s.catalog_record_profile(&shared, &profile("r-acme", "acme::p", 6))
+        .await
+        .unwrap();
+    for pipeline in ["acme::p", "other"] {
+        s.catalog_record_config_snapshot(&ConfigSnapshot {
+            pipeline: pipeline.into(),
+            recorded_at: t0,
+            faucet_version: "test".into(),
+            rows: Default::default(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let report = s
+        .catalog_purge("acme::", &["r-acme".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.edges, report.datasets, report.config_snapshots),
+        (1, 1, 1),
+        "{report:?}"
+    );
+    assert!(
+        s.catalog_get_dataset(&dataset_id("csv://a"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let detail = s.catalog_get_dataset(&shared).await.unwrap().unwrap();
+    assert_eq!(detail.dataset.pipeline, "other");
+    assert_eq!(detail.dataset.last_run_id, "r-other");
+    assert!(detail.stats.iter().all(|p| p.run_id != "r-acme"));
+    assert_eq!(detail.upstream.len(), 1);
+    assert_eq!(detail.upstream[0].src_uri, "csv://b");
+    let profiles = s.catalog_profile_history(&shared, 10).await.unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].run_id, "r-other");
+    assert!(
+        s.catalog_last_config_snapshot("acme::p")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        s.catalog_last_config_snapshot("other")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let again = s.catalog_purge("acme::", &[]).await.unwrap();
+    assert_eq!(again, Default::default(), "idempotent");
+}
+
+#[tokio::test]
+async fn catalog_purge_removes_a_tenant_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    catalog_purge_scenario(&store(&dir, "purge.db").await).await;
+    catalog_purge_scenario(&faucet_cli::serve::history::memory::MemoryHistory::new(
+        Duration::from_secs(3600),
+    ))
+    .await;
+}
+
+/// #789 SERVE-16: a connection write is a compare-and-set on `updated_at`.
+async fn connection_replace_scenario(s: &dyn RunHistory) {
+    use faucet_cli::serve::history::tenants::{ConnectionRecord, ConnectionStatus};
+    let t0 = Utc::now();
+    let rec = |sealed: &str, at| ConnectionRecord {
+        tenant: "acme".into(),
+        name: "crm".into(),
+        provider_type: "oauth2_refresh".into(),
+        connect_provider: None,
+        sealed: sealed.into(),
+        status: ConnectionStatus::Active,
+        reauth_reason: None,
+        created_at: t0,
+        updated_at: at,
+        updated_by: "t".into(),
+    };
+    assert!(
+        !s.connection_replace(&rec("a", t0), t0).await.unwrap(),
+        "absent"
+    );
+    s.connection_upsert(&rec("a", t0)).await.unwrap();
+    let t1 = t0 + ChronoDuration::seconds(1);
+    assert!(s.connection_replace(&rec("b", t1), t0).await.unwrap());
+    let t2 = t0 + ChronoDuration::seconds(2);
+    assert!(
+        !s.connection_replace(&rec("c", t2), t0).await.unwrap(),
+        "stale updated_at"
+    );
+    let got = s.connection_get("acme", "crm").await.unwrap().unwrap();
+    assert_eq!(got.sealed, "b");
+    assert_eq!(got.updated_at, t1);
+}
+
+#[tokio::test]
+async fn connection_replace_is_a_compare_and_set() {
+    let dir = tempfile::tempdir().unwrap();
+    connection_replace_scenario(&store(&dir, "conn.db").await).await;
+    connection_replace_scenario(&faucet_cli::serve::history::memory::MemoryHistory::new(
+        Duration::from_secs(3600),
+    ))
+    .await;
 }

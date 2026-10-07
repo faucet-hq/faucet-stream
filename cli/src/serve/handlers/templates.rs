@@ -135,12 +135,13 @@ pub async fn register_template(
         version = record.version,
         "registered pipeline template"
     );
-    crate::serve::audit::write(
+    crate::serve::audit::record(
         &state,
         &actor,
         "template.register",
         None,
         Some(fingerprint),
+        Some(format!("template:{}@{}", record.id, record.version)),
         "ok",
     )
     .await;
@@ -498,6 +499,10 @@ pub async fn template_rows(
         ),
         None => None,
     };
+    let tenant = match actor.tenant.as_deref() {
+        Some(t) => Some(crate::templates::rows::tenant_values(&s, t).await),
+        None => None,
+    };
     let report = crate::templates::rows::list_rows(
         &s,
         crate::templates::rows::RowsQuery {
@@ -513,6 +518,9 @@ pub async fn template_rows(
                 }),
             selection: selection.as_ref(),
             state: q.state.unwrap_or(true),
+            // A tenant-scoped principal sees its own state and runs, never
+            // another tenant's (#789 SERVE-31).
+            tenant: tenant.as_ref(),
         },
     )
     .await
@@ -561,7 +569,17 @@ pub async fn delete_template(
         removed,
         "deleted pipeline template version(s)"
     );
-    crate::serve::audit::write(&state, &actor, "template.delete", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        &state,
+        &actor,
+        "template.delete",
+        match target {
+            Some(v) => format!("template:{id}@{v}"),
+            None => format!("template:{id}"),
+        },
+        "ok",
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -615,7 +633,14 @@ pub async fn promote_template(
         version,
         "promoted pipeline template channel"
     );
-    crate::serve::audit::write(&state, &actor, "template.promote", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        &state,
+        &actor,
+        "template.promote",
+        format!("template:{id}@{version}#{}", body.tag.as_str()),
+        "ok",
+    )
+    .await;
     Ok(Json(PromoteResponse {
         id,
         tag: body.tag.as_str().to_string(),
@@ -702,7 +727,14 @@ async fn finish_launch(
         action,
         "pipeline template launch"
     );
-    crate::serve::audit::write(state, actor, action, None, None, "ok").await;
+    crate::serve::audit::write_target(
+        state,
+        actor,
+        action,
+        format!("template:{id}@{}", outcome.version),
+        "ok",
+    )
+    .await;
     Ok(Json(LaunchResponse {
         id: id.to_string(),
         version: outcome.version,
@@ -754,7 +786,7 @@ pub async fn deprecate_template(
         status = status.as_str(),
         "pipeline template deprecation changed"
     );
-    crate::serve::audit::write(&state, &actor, action, None, None, "ok").await;
+    crate::serve::audit::write_target(&state, &actor, action, format!("template:{id}"), "ok").await;
     Ok(Json(
         serde_json::json!({ "id": id, "status": status.as_str() }),
     ))
@@ -793,12 +825,11 @@ pub async fn deprecate_version(
         deprecated = !body.undo,
         "pipeline template version deprecation changed"
     );
-    crate::serve::audit::write(
+    crate::serve::audit::write_target(
         &state,
         &actor,
         "template.version_deprecate",
-        None,
-        None,
+        format!("template:{id}@{version}"),
         "ok",
     )
     .await;
@@ -888,6 +919,11 @@ pub struct TriggerBody {
     /// lists them and previews what a selection resolves to.
     #[serde(default)]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// Set (never from the wire) by a fire of a trigger declared in the
+    /// server's `--triggers` file: the declaration is a standing approval,
+    /// so the fire runs without a change request.
+    #[serde(skip)]
+    pub standing_approval: bool,
 }
 
 /// A trigger's `overlay`: a registered deployment id, or an inline document.
@@ -993,6 +1029,11 @@ pub async fn trigger_template_outcome(
     id: String,
     mut body: TriggerBody,
 ) -> Result<TriggerOutcome, ServeError> {
+    if actor.tenant.is_some() && !body.env.is_empty() {
+        return Err(ServeError::Forbidden(
+            "a tenant-scoped principal may not override a template's environment (`env`)".into(),
+        ));
+    }
     let overlay = body.overlay_choice();
     let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
     // Resolve through the registry: a channel needs a lookup, and an unpinned
@@ -1023,8 +1064,9 @@ pub async fn trigger_template_outcome(
     // (#456 C5). What cannot be deferred is a value the *caller* supplied, so
     // those are refused below.
     let clustered = state.cluster().enabled();
-    let gated =
-        body.require_approval || state.requires_approval(crate::serve::changes::ChangeKind::Run);
+    let gated = body.require_approval
+        || (!body.standing_approval
+            && state.requires_approval(crate::serve::changes::ChangeKind::Run));
     let mode = if clustered || gated {
         crate::templates::Materialize::Persisted
     } else {
@@ -1129,11 +1171,15 @@ pub async fn trigger_template_outcome(
         selection: materialized.selection.clone(),
         trusted_config: true,
     };
-    let run = match runner::submit_gated(state.clone(), req, actor.clone()).await? {
-        runner::SubmitOutcome::Accepted(run) => run,
-        // Approval first (#703): the trigger became a change request.
-        runner::SubmitOutcome::PendingApproval(change) => {
-            return Ok(TriggerOutcome::PendingApproval(change));
+    let run = if !gated {
+        runner::submit(state.clone(), req, actor.clone()).await?
+    } else {
+        match runner::submit_gated(state.clone(), req, actor.clone()).await? {
+            runner::SubmitOutcome::Accepted(run) => run,
+            // Approval first (#703): the trigger became a change request.
+            runner::SubmitOutcome::PendingApproval(change) => {
+                return Ok(TriggerOutcome::PendingApproval(change));
+            }
         }
     };
     // `submit` already recorded `run.submit`; this second entry attributes the
@@ -1634,6 +1680,22 @@ write_mode_aliases:
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["status"], "pending_approval", "{v}");
         assert!(v["change_id"].is_string());
+
+        // A fire of a declared `--triggers` entry is a standing approval: it
+        // runs instead of filing one change request per event (#789 SERVE-19).
+        let fired = trigger_template_outcome(
+            state.clone(),
+            AuthContext::trigger("nightly"),
+            "tpl-demo".into(),
+            TriggerBody {
+                params: [("tag".to_string(), json!("gamma"))].into(),
+                standing_approval: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("trigger fire");
+        assert!(matches!(fired, TriggerOutcome::Run(_)), "{fired:?}");
 
         let ok = trigger_template(
             State(test_state_with(&dir).await),
@@ -2151,6 +2213,43 @@ write_mode_aliases:
         }
     }
 
+    /// #789 CLI-118: a secret param bound from its deferred `${env:…}` default
+    /// is not caller-supplied, so a clustered server accepts the trigger.
+    #[tokio::test]
+    async fn a_secret_param_left_at_its_deferred_default_runs_on_a_clustered_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state_clustered();
+        let body = format!(
+            "version: 1\nname: tpl-secret-default\nparams:\n  token: {{ secret: true, default: \"${{env:TPL_DEFERRED_TOKEN}}\" }}\npipeline:\n  source:\n    type: csv\n    config:\n      path: ./x-${{param.token}}.csv\n  sink:\n    type: jsonl\n    config:\n      path: {}\n",
+            dir.path().join("o.jsonl").display()
+        );
+        let _registered = register_template(
+            State(state.clone()),
+            Extension(actor()),
+            Json(RegisterBody {
+                id: None,
+                config: body,
+                config_format: ConfigFormatWire::Yaml,
+                description: None,
+                tags: vec![],
+                launch: true,
+            }),
+        )
+        .await
+        .expect("register");
+        unsafe { std::env::set_var("TPL_DEFERRED_TOKEN", "deferred-token-value") };
+        let (code, resp) = trigger_pair(
+            State(state),
+            Extension(actor()),
+            Path("tpl-secret-default".into()),
+            Json(TriggerBody::default()),
+        )
+        .await
+        .expect("a deferred default is not refused");
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(resp.0.params["token"], json!("***"));
+    }
+
     /// #456 M4: an `env` override substitutes into the config exactly like a
     /// param and is just as likely to be a credential, so on a clustered server —
     /// where the materialized body is persisted for a peer — it must be refused
@@ -2410,6 +2509,7 @@ pub async fn sync_templates(
             ],
         )?;
     }
+    let sync_origin = body.origin.clone();
     let results = crate::templates::sync::sync_all(
         &store(&state),
         &file,
@@ -2442,7 +2542,14 @@ pub async fn sync_templates(
         dry_run = body.dry_run,
         "template sync requested"
     );
-    crate::serve::audit::write(&state, &actor, "template.sync", None, None, result).await;
+    crate::serve::audit::write_target(
+        &state,
+        &actor,
+        "template.sync",
+        format!("origin:{}", sync_origin.as_deref().unwrap_or("*")),
+        result,
+    )
+    .await;
     Ok(Json(SyncResponse {
         dry_run: body.dry_run,
         reports,
@@ -2482,6 +2589,13 @@ pub async fn publish_template(
         origin = %report.origin,
         "template published"
     );
-    crate::serve::audit::write(&state, &actor, "template.publish", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        &state,
+        &actor,
+        "template.publish",
+        format!("template:{id}@{}", report.version),
+        "ok",
+    )
+    .await;
     Ok(Json(report))
 }

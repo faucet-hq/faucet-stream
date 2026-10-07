@@ -241,7 +241,7 @@ pub fn build_router(
                 }
             })
             .collect();
-        CorsLayer::new().allow_origin(AllowOrigin::list(origins))
+        cors_layer(origins)
     };
 
     // The hosted-OAuth callback is public: the provider redirects a browser
@@ -265,10 +265,50 @@ pub fn build_router(
     }
 
     router
+        // axum's own 2 MiB extractor cap would otherwise win over a larger
+        // `--body-limit-bytes`.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(config.body_limit_bytes))
         .layer(axum::middleware::from_fn(metrics::track_metrics))
         .layer(cors)
         .with_state(state)
+}
+
+/// The `--cors-origin` layer: the listed origins may call every `/v1` route
+/// with a bearer token, a JSON body and an idempotency key.
+fn cors_layer(origins: Vec<axum::http::HeaderValue>) -> CorsLayer {
+    use axum::http::{Method, header};
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("idempotency-key"),
+        ])
+        .expose_headers([header::RETRY_AFTER])
+}
+
+/// Drain the Prometheus histograms on an interval: they are otherwise drained
+/// only when `/metrics` is scraped, so an unscraped server grows without bound.
+fn spawn_metrics_upkeep(
+    handle: metrics_exporter_prometheus::PrometheusHandle,
+    every: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            handle.run_upkeep();
+        }
+    })
 }
 
 /// Load the optional `--default-config` once at startup, fully resolved, as a
@@ -596,7 +636,11 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
 pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> CliResult<()> {
     let (prom, log_hub) =
         crate::serve::observability::install(&config.log_level, config.log_format);
+    crate::serve::callback::set_allow_hosts(config.callback_allow_hosts.clone());
     crate::serve::metrics::set_cluster_enabled(config.cluster.enabled);
+    if let Some(h) = &prom {
+        spawn_metrics_upkeep(h.clone(), Duration::from_secs(5));
+    }
 
     // This process's identity for run-ownership leases (#146 H7). A fresh id per
     // process, so a restarted instance recovers its prior incarnation's runs only
@@ -924,6 +968,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     .with_graceful_shutdown(async move {
         wait_for_signal().await;
         tracing::info!("shutdown signal received; draining in-flight runs");
+        drain_state.set_draining();
         // Stop pulling NEW work the moment we begin draining.
         if let Some(claim) = claim {
             claim.abort();
@@ -966,6 +1011,11 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     for h in sync_handles {
         h.abort();
     }
+    // Persist the run-log lines still buffered (#789 SERVE-49).
+    state
+        .log_hub()
+        .shutdown_persistence(Duration::from_secs(10))
+        .await;
     // Flush any buffered OTLP telemetry after in-flight runs drain (no-op without
     // the `otel` feature).
     faucet_core::shutdown_otel();
@@ -986,6 +1036,20 @@ mod tests {
     use crate::serve::history::{RunRecord, RunStatus};
     use chrono::Utc;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn metrics_upkeep_drains_histograms_on_its_own() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            ::metrics::histogram!("faucet_upkeep_probe").record(1.0);
+        });
+        let task = spawn_metrics_upkeep(handle.clone(), Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished(), "the upkeep loop keeps running");
+        task.abort();
+        assert!(handle.render().contains("faucet_upkeep_probe"));
+    }
 
     #[test]
     fn lease_health_fences_once_per_outage_after_the_window() {

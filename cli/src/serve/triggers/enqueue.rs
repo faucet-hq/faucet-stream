@@ -130,7 +130,6 @@ pub async fn fire(
                 tracing::warn!(trigger = compiled.name(), tenant = %t, error = %e, "tenant fire failed; retrying");
                 FireOutcome::Error(e)
             }
-            (None, FireOutcome::Failed(e)) => FireOutcome::Error(e),
             (_, other) => other,
         };
         outcomes.push(outcome);
@@ -375,6 +374,7 @@ pub fn template_body(
         timeout_secs: compiled.spec.run.timeout_secs,
         idempotency_key: Some(context::idempotency_key(name, event)),
         selection: compiled.spec.run.selection.clone(),
+        standing_approval: true,
         ..Default::default()
     })
 }
@@ -521,6 +521,7 @@ mod tests {
                     labels: Default::default(),
                     limits: Default::default(),
                     notifications: Vec::new(),
+                    notifications_sealed: None,
                     suspended: false,
                     created_at: now,
                     updated_at: now,

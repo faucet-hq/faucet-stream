@@ -69,6 +69,7 @@ fn local_name(qname: &[u8]) -> String {
 /// Read one attribute of an element by (namespace-stripped) name.
 fn attr(e: &BytesStart, key: &str) -> Option<String> {
     e.attributes()
+        .with_checks(false)
         .flatten()
         .find(|a| local_name(a.key.as_ref()) == key)
         .and_then(|a| a.unescape_value().ok().map(|v| v.to_string()))

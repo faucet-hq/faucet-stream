@@ -126,7 +126,7 @@ profiling: { min_history: 1 }
         r#"version: 1
 pipeline:
   source: { type: csv, config: { path: in.csv } }
-  sink: { type: jsonl, config: { path: out.jsonl } }
+  sink: { type: jsonl, config: { path: out.jsonl, append: true } }
   state: { type: memory, config: {} }
 profiling: { window: 30 }
 matrix:

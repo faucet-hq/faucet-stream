@@ -174,9 +174,14 @@ impl ConnectProviders {
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("reading --connect-providers {}: {e}", path.display()))?;
-        let text = crate::interpolate::interpolate(&raw)
+        // Parse first, then resolve directives inside each value (#789
+        // SERVE-54): a resolved secret holding ` #`, `: ` or a leading quote
+        // must stay one string instead of reshaping the YAML around it.
+        let mut doc: serde_json::Value = serde_yaml::from_str(&raw)
+            .map_err(|e| format!("parsing --connect-providers {}: {e}", path.display()))?;
+        crate::interpolate::interpolate_value(&mut doc)
             .map_err(|e| format!("--connect-providers {}: {e}", path.display()))?;
-        let file: ConnectProvidersFile = serde_yaml::from_str(&text)
+        let file: ConnectProvidersFile = serde_json::from_value(doc)
             .map_err(|e| format!("parsing --connect-providers {}: {e}", path.display()))?;
         Self::from_file(file).map_err(|e| format!("--connect-providers {}: {e}", path.display()))
     }
@@ -278,7 +283,9 @@ pub async fn start(
         provider: provider_name.to_string(),
         connection: req.connection,
         redirect: req.redirect,
-        sealed_verifier: rt.require_vault()?.seal_str(&verifier),
+        sealed_verifier: rt
+            .require_vault()?
+            .seal_str_for(&verifier, &format!("connect-session:{oauth_state}")),
         created_by: actor.principal.clone(),
         created_at: now,
         expires_at,
@@ -393,7 +400,10 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
         .get(&session.provider)
         .ok_or_else(|| format!("provider '{}' is no longer configured", session.provider))?;
     let vault = rt.vault.as_ref().ok_or("this server has no vault key")?;
-    let verifier = vault.open_str(&session.sealed_verifier)?;
+    let verifier = vault.open_str_for(
+        &session.sealed_verifier,
+        &format!("connect-session:{}", session.state),
+    )?;
     let tokens = exchange(provider, code, &verifier).await?;
     let refresh_token = tokens
         .get("refresh_token")
@@ -428,7 +438,10 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
         name: session.connection.clone(),
         provider_type: "oauth2_refresh".into(),
         connect_provider: Some(session.provider.clone()),
-        sealed: vault.seal(&spec),
+        sealed: vault.seal_for(
+            &spec,
+            &super::vault::Vault::connection_context(&session.tenant, &session.connection),
+        ),
         status: ConnectionStatus::Active,
         reauth_reason: None,
         created_at,
@@ -446,7 +459,14 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
         source_ip: None,
         tenant: Some(session.tenant.clone()),
     };
-    crate::serve::audit::write(state, &actor, "connect.complete", None, None, "ok").await;
+    crate::serve::audit::write_target(
+        state,
+        &actor,
+        "connect.complete",
+        format!("connection:{}/{}", session.tenant, session.connection),
+        "ok",
+    )
+    .await;
     Ok(())
 }
 
@@ -622,6 +642,26 @@ mod tests {
                 .unwrap_err()
                 .contains("parsing")
         );
+        // A resolved secret with YAML-significant characters stays whole
+        // (#789 SERVE-54).
+        let secret = path.with_extension("secret");
+        std::fs::write(&secret, "'s3c #ret: x").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "version: 1\nproviders:\n  - name: crm\n    authorize_url: https://i/a\n    token_url: https://i/t\n    client_id: c\n    client_secret: ${{file:{}}}\n    redirect_base: https://f\n    allowed_redirects: [https://app]\n",
+                secret.display()
+            ),
+        )
+        .unwrap();
+        let ps = ConnectProviders::load(&path).unwrap();
+        assert_eq!(ps.get("crm").unwrap().client_secret, "'s3c #ret: x");
+        std::fs::write(
+            &path,
+            "version: 1\nproviders: \"${env:FAUCET_789_UNSET_VAR}\"\n",
+        )
+        .unwrap();
+        assert!(ConnectProviders::load(&path).is_err());
     }
 
     #[test]

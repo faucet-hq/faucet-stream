@@ -68,6 +68,11 @@ pub struct McpContext {
     /// Change kinds the server requires an approved change request for
     /// (`--require-approval`); the template-lifecycle tools refuse them.
     pub approval_required: Vec<crate::serve::changes::ChangeKind>,
+    /// The server a `faucet serve --mcp` request reached, with the caller's
+    /// identity: `run_pipeline` / `run_template` submit through it (approval
+    /// gate, server policy, default config, run queue, run record) instead of
+    /// running in the request task. `None` on the stdio transport.
+    pub server: Option<ChangeProposer>,
 }
 
 /// What the MCP `propose_*` tools need to file a change request (#703).
@@ -100,7 +105,14 @@ impl McpContext {
             changes: None,
             submitted: None,
             approval_required: Vec::new(),
+            server: None,
         }
+    }
+
+    /// Submit runs through this server as this caller (the HTTP transport).
+    pub fn with_server(mut self, server: ChangeProposer) -> Self {
+        self.server = Some(server);
+        self
     }
 
     /// Screen caller-supplied configs as the server does (`origin`).

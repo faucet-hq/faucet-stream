@@ -51,6 +51,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # never forces a major. Every other API-stability lint stays at its default
 # (deny) level, so genuine removals and signature changes still fail the gate.
 [package.metadata.cargo-semver-checks.lints]
+enum_variant_added = "allow"
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"

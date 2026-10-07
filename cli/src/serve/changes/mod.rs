@@ -663,6 +663,40 @@ async fn save(state: &ServerState, c: &ChangeRequest) -> Result<(), ServeError> 
     state.history().change_upsert(c).await.map_err(store_err)
 }
 
+/// Write `c` only if the stored request is still `from`: two approvals, or an
+/// approval racing a rejection or the expiry sweep, cannot both win.
+async fn transition(
+    state: &ServerState,
+    c: &ChangeRequest,
+    from: ChangeStatus,
+) -> Result<(), ServeError> {
+    if state
+        .history()
+        .change_transition(c, from)
+        .await
+        .map_err(store_err)?
+    {
+        Ok(())
+    } else {
+        Err(ServeError::Conflict(format!(
+            "change {} was changed concurrently; reload it",
+            c.id
+        )))
+    }
+}
+
+/// Serializes every transition of one change request within this process.
+fn change_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::LazyLock::new(dashmap::DashMap::new);
+    LOCKS.entry(id.to_string()).or_default().clone()
+}
+
+/// How long an `approved` request may sit unexecuted before the sweep treats
+/// its execution as interrupted.
+const STALE_APPROVED: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
 /// Create a request: validate + plan the payload, work out the quorum, store
 /// it, audit `change.requested`, and (for a run whose config declares
 /// `notifications:`) ping the approvers with a `change_requested` event.
@@ -722,7 +756,7 @@ pub async fn create(
     .await;
     refresh_pending_gauge(state).await;
     #[cfg(feature = "notify")]
-    notify_requested(&change).await;
+    notify_requested(state, &change).await;
     Ok(change)
 }
 
@@ -730,28 +764,37 @@ pub async fn create(
 /// block (a run request only — that is the config that names the channels).
 /// Best-effort: a malformed block is logged, never an error.
 #[cfg(feature = "notify")]
-async fn notify_requested(change: &ChangeRequest) {
+async fn notify_requested(state: &ServerState, change: &ChangeRequest) {
     if change.kind != ChangeKind::Run {
         return;
     }
-    let Some(config) = change.payload.get("config").and_then(Value::as_str) else {
+    let Ok(req) = serde_json::from_value::<SubmitRequest>(change.payload.clone()) else {
         return;
     };
-    let doc: Value = match serde_yaml::from_str(config) {
-        Ok(v) => v,
-        Err(_) => return,
+    // Load the config the way the plan did, so `${env:…}` webhook URLs and the
+    // `--default-config` base resolve before the notifier is built.
+    let loaded = match runner::load_selected(
+        state,
+        &req.config,
+        req.config_format.into(),
+        change.tenant.as_deref(),
+        req.selection.as_ref(),
+        state.origin(change.trusted_config),
+    )
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(change = %change.id, "change_requested notification skipped: {e}");
+            return;
+        }
     };
-    let specs: Vec<crate::notify::NotificationSpec> = doc
-        .get("notifications")
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
-    let pipeline = doc
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("serve")
-        .to_string();
-    match crate::notify::Notifier::from_specs(&specs) {
+    let pipeline = loaded
+        .cfg
+        .name
+        .clone()
+        .unwrap_or_else(|| "serve".to_string());
+    match crate::notify::Notifier::from_specs(&loaded.cfg.notifications) {
         Ok(Some(n)) => {
             n.emit(crate::notify::NotifyEvent::change_requested(
                 pipeline,
@@ -785,7 +828,15 @@ async fn expire_if_due(
     if change.status == ChangeStatus::Pending && change.expires_at <= Utc::now() {
         change.status = ChangeStatus::Expired;
         change.touch();
-        save(state, &change).await?;
+        if !state
+            .history()
+            .change_transition(&change, ChangeStatus::Pending)
+            .await
+            .map_err(store_err)?
+        {
+            // Approved or rejected in the meantime: report what is stored.
+            return load(state, &change.id).await;
+        }
         record_metric(change.kind, "expired");
         crate::serve::audit::write(
             state,
@@ -814,6 +865,8 @@ pub async fn approve(
     id: &str,
     comment: Option<String>,
 ) -> Result<ChangeRequest, ServeError> {
+    let lock = change_lock(id);
+    let _held = lock.lock().await;
     let mut change = get(state, id).await?;
     if change.status != ChangeStatus::Pending {
         return Err(ServeError::Conflict(format!(
@@ -856,11 +909,11 @@ pub async fn approve(
     )
     .await;
     if (change.approvals.len() as u32) < change.required_approvals {
-        save(state, &change).await?;
+        transition(state, &change, ChangeStatus::Pending).await?;
         return Ok(change);
     }
     change.status = ChangeStatus::Approved;
-    save(state, &change).await?;
+    transition(state, &change, ChangeStatus::Pending).await?;
     let change = execute(state, actor, change).await?;
     refresh_pending_gauge(state).await;
     Ok(change)
@@ -873,6 +926,8 @@ pub async fn reject(
     id: &str,
     reason: String,
 ) -> Result<ChangeRequest, ServeError> {
+    let lock = change_lock(id);
+    let _held = lock.lock().await;
     let mut change = get(state, id).await?;
     if change.status != ChangeStatus::Pending {
         return Err(ServeError::Conflict(format!(
@@ -893,7 +948,7 @@ pub async fn reject(
         reason,
     });
     change.touch();
-    save(state, &change).await?;
+    transition(state, &change, ChangeStatus::Pending).await?;
     record_metric(change.kind, "rejected");
     crate::serve::audit::write(
         state,
@@ -981,6 +1036,10 @@ async fn execute(
                 (a, b) => a.or(b),
             };
             req.labels.insert("change".to_string(), change.id.clone());
+            // A retried execution (a double approval, the sweep reconciling an
+            // interrupted one) replays this run instead of starting another.
+            req.idempotency_key
+                .get_or_insert_with(|| format!("change:{}", change.id));
             runner::submit(state.clone(), req, requester.clone())
                 .await
                 .map(|r| (Some(r.run_id), None))
@@ -1137,6 +1196,62 @@ pub async fn expire_due(state: &ServerState) -> usize {
     }
     if n > 0 {
         refresh_pending_gauge(state).await;
+    }
+    reconcile_stale_approved(state).await;
+    n
+}
+
+/// Finish requests left `approved` by an execution that never recorded its
+/// outcome (a crash or a failed save between approval and `executed`). A run
+/// or launch is executed again — the run's `change:<id>` idempotency key
+/// replays the original submission, a launch of the live version is a no-op —
+/// and a registration, which would add a second version, fails with an
+/// explanation instead.
+pub async fn reconcile_stale_approved(state: &ServerState) -> usize {
+    let approved = match state
+        .history()
+        .change_list(&ChangeListFilter {
+            status: Some(ChangeStatus::Approved),
+            limit: 10_000,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("change reconcile sweep: {e}");
+            return 0;
+        }
+    };
+    let cutoff = Utc::now() - STALE_APPROVED;
+    let mut n = 0;
+    for c in approved.into_iter().filter(|c| c.updated_at <= cutoff) {
+        let lock = change_lock(&c.id);
+        let _held = lock.lock().await;
+        let Ok(c) = load(state, &c.id).await else {
+            continue;
+        };
+        if c.status != ChangeStatus::Approved {
+            continue;
+        }
+        let actor = AuthContext::system("reconcile");
+        let done = if c.kind == ChangeKind::TemplateRegister {
+            finish_failed(
+                state,
+                &actor,
+                c,
+                "execution was interrupted after approval and its outcome is unknown; check \
+                 the template's versions before proposing it again"
+                    .into(),
+            )
+            .await
+        } else {
+            execute(state, &actor, c).await
+        };
+        match done {
+            Ok(_) => n += 1,
+            Err(e) => tracing::warn!("change reconcile sweep: {e}"),
+        }
     }
     n
 }
@@ -1555,20 +1670,131 @@ mod tests {
         assert!(inv.error.unwrap().contains("→"));
     }
 
+    #[tokio::test]
+    async fn concurrent_approvals_execute_once_and_a_rejection_cannot_be_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let mk = || async {
+            create(
+                &state,
+                &actor("bob"),
+                NewChange {
+                    kind: ChangeKind::Run,
+                    payload: json!({ "config": csv_yaml(dir.path(), "race", "") }),
+                    reason: Some("x".into()),
+                    budget: None,
+                    trusted_config: false,
+                },
+            )
+            .await
+            .unwrap()
+        };
+        let c = mk().await;
+        let (alice, carol) = (actor("alice"), actor("carol"));
+        let (a, b) = tokio::join!(
+            approve(&state, &alice, &c.id, None),
+            approve(&state, &carol, &c.id, None)
+        );
+        let executed: Vec<_> = [&a, &b]
+            .into_iter()
+            .filter_map(|r| r.as_ref().ok())
+            .filter(|c| c.status == ChangeStatus::Executed)
+            .collect();
+        assert_eq!(executed.len(), 1, "{a:?} {b:?}");
+        assert!(
+            matches!(
+                a.as_ref().err().or(b.as_ref().err()),
+                Some(ServeError::Conflict(_))
+            ),
+            "{a:?} {b:?}"
+        );
+
+        let c = mk().await;
+        reject(&state, &actor("alice"), &c.id, "no".into())
+            .await
+            .unwrap();
+        let late = approve(&state, &actor("carol"), &c.id, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(late, ServeError::Conflict(_)), "{late:?}");
+        assert_eq!(
+            get(&state, &c.id).await.unwrap().status,
+            ChangeStatus::Rejected
+        );
+
+        // The store-level compare-and-set refuses a stale writer.
+        let mut stale = get(&state, &c.id).await.unwrap();
+        stale.status = ChangeStatus::Approved;
+        assert!(
+            !state
+                .history()
+                .change_transition(&stale, ChangeStatus::Pending)
+                .await
+                .unwrap()
+        );
+        let err = transition(&state, &stale, ChangeStatus::Pending)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn the_sweep_finishes_requests_stranded_in_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let created = create(
+            &state,
+            &actor("bob"),
+            NewChange {
+                kind: ChangeKind::Run,
+                payload: json!({ "config": csv_yaml(dir.path(), "stranded", "") }),
+                reason: None,
+                budget: None,
+                trusted_config: false,
+            },
+        )
+        .await
+        .unwrap();
+        let mut c = get(&state, &created.id).await.unwrap();
+        c.status = ChangeStatus::Approved;
+        save(&state, &c).await.unwrap();
+        // Fresh: left alone.
+        assert_eq!(reconcile_stale_approved(&state).await, 0);
+        c.updated_at = Utc::now() - chrono::TimeDelta::minutes(10);
+        save(&state, &c).await.unwrap();
+        let mut reg = stored(ChangeKind::TemplateRegister, json!({"config": "x"}), "m", 1);
+        reg.status = ChangeStatus::Approved;
+        reg.updated_at = c.updated_at;
+        save(&state, &reg).await.unwrap();
+        assert_eq!(expire_due(&state).await, 0);
+        let done = get(&state, &c.id).await.unwrap();
+        assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+        let run_id = done.run_id.clone().unwrap();
+        let rec = state.history().get(&run_id).await.unwrap().unwrap();
+        assert_eq!(
+            rec.idempotency_key.as_deref(),
+            Some(format!("change:{}", c.id).as_str())
+        );
+        let reg = get(&state, &reg.id).await.unwrap();
+        assert_eq!(reg.status, ChangeStatus::Failed);
+        assert!(reg.error.unwrap().contains("interrupted"));
+    }
+
     #[cfg(feature = "notify")]
     #[tokio::test]
     async fn requested_notifications_skip_what_they_cannot_read() {
+        let state = crate::serve::test_support::test_state();
         let mut c = stored(ChangeKind::TemplateLaunch, json!({"config": "x"}), "m", 1);
-        notify_requested(&c).await;
+        notify_requested(&state, &c).await;
         c.kind = ChangeKind::Run;
         c.payload = json!({});
-        notify_requested(&c).await;
+        notify_requested(&state, &c).await;
         c.payload = json!({"config": "{ nope"});
-        notify_requested(&c).await;
+        notify_requested(&state, &c).await;
         c.payload = json!({"config": "notifications:\n  - name: x\n    on: [change_requested]\n    channel:\n      type: webhook\n      config:\n        url: \"\"\n"});
-        notify_requested(&c).await;
+        notify_requested(&state, &c).await;
         c.payload = json!({"config": "name: p\n"});
-        notify_requested(&c).await;
+        notify_requested(&state, &c).await;
     }
 
     #[test]
