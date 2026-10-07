@@ -118,6 +118,7 @@ the secrets/redaction boundary like any other config string.
 |-------|------|---------|-------------|
 | `pagination` | `PaginationStyle` | `None` | Pagination strategy. See [Pagination](#pagination). |
 | `records_path` | string / null | `null` | JSONPath expression to extract the record array from each response body (e.g. `$.data[*]`). When unset, the whole body is treated as the record set. |
+| `allow_missing_records_path` | bool | `false` | By default a response in which `records_path` resolves to nothing — the key is absent, not an empty array — fails the run (it is usually an error body served with HTTP 200, or a renamed field) instead of ending pagination green. Set `true` for APIs that omit the records key on an empty result. |
 | `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
 | `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short persists no record-derived or window bookmark (it would skip the unread pages); only a `persist_cursor` bookmark is kept, and a windowed sweep stops at that window. |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |

@@ -173,6 +173,13 @@ pub struct RestStreamConfig {
     /// single object, which is emitted as one record).
     #[serde(default)]
     pub records_path: Option<String>,
+    /// Accept a response in which `records_path` resolves to nothing (the key
+    /// is absent) as an empty page. Off by default: a missing key usually means
+    /// an error body served with HTTP 200 or a renamed field, and treating it
+    /// as "no more records" ends the run green with rows unread. Enable it
+    /// only for APIs that omit the records key on an empty result.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_missing_records_path: bool,
     /// Optional cap on pages fetched per pass, across every pagination style.
     /// Unset by default: each pagination style already stops on its own end
     /// signal and loop guards. When the cap cuts a pass short, only a persisted
@@ -794,6 +801,7 @@ impl Default for RestStreamConfig {
             records_route: None,
             persist_cursor: false,
             discovery: None,
+            allow_missing_records_path: false,
         }
     }
 }

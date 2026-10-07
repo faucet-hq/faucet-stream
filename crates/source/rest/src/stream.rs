@@ -989,6 +989,21 @@ impl RestStream {
             &self.config.records_multi,
             self.config.op_field.as_deref().unwrap_or("_op"),
         )?;
+        if records.is_empty()
+            && !self.config.allow_missing_records_path
+            && self.config.records_multi.is_empty()
+            && let Some(path) = self.config.records_path.as_deref()
+            && !records_path_resolves(body, path)
+        {
+            let mut excerpt = body.to_string();
+            excerpt.truncate(excerpt.floor_char_boundary(300));
+            return Err(FaucetError::Source(format!(
+                "rest: `records_path` '{path}' matched nothing — the key is absent from the \
+                 response, which is usually an error served with HTTP 200 or a renamed field \
+                 (response: {excerpt}); set `allow_missing_records_path: true` if this API \
+                 omits the key on an empty result"
+            )));
+        }
         // Protocol control fields stamped per record (`@odata.etag`, JSON:API's
         // `links`, HAL's `_links`, …) are metadata, not data, and are often
         // invalid column names downstream. Drop them so records carry only the
@@ -2906,6 +2921,32 @@ fn parse_retry_after(headers: &HeaderMap) -> Duration {
     DEFAULT
 }
 
+/// Whether `path` addresses something in `body`, telling "no records" from "the
+/// records key is absent" (API-23). A path matching nothing still resolves when
+/// its container does (`$.items[*]` over `{"items": []}`), and an empty body
+/// (a `204`, a tolerated error) always resolves.
+fn records_path_resolves(body: &Value, path: &str) -> bool {
+    use jsonpath_rust::JsonPath;
+    let matches = |p: &str| body.query(p).map_or(true, |m| !m.is_empty());
+    if matches!(body, Value::Null)
+        || body.as_array().is_some_and(Vec::is_empty)
+        || body.as_object().is_some_and(serde_json::Map::is_empty)
+        || matches(path)
+    {
+        return true;
+    }
+    let parent = if let Some(p) = path.strip_suffix(".*") {
+        p
+    } else if path.ends_with(']')
+        && let Some(open) = path.rfind('[')
+    {
+        &path[..open]
+    } else {
+        return false;
+    };
+    parent != "$" && !parent.is_empty() && matches(parent)
+}
+
 /// Keep the larger of two bookmark values when consolidating per-partition
 /// bookmarks in [`Source::stream_pages`] (#535). Numbers compare numerically,
 /// strings lexicographically (the usual timestamp/id bookmark shapes); any
@@ -3744,6 +3785,18 @@ impl RestStream {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn records_path_resolution_tells_absent_from_empty() {
+        assert!(records_path_resolves(&json!({"items": []}), "$.items[*]"));
+        assert!(records_path_resolves(&json!({"d": {"items": {}}}), "$.d.items.*"));
+        assert!(records_path_resolves(&json!({"items": [1]}), "$.items[*]"));
+        assert!(records_path_resolves(&json!([]), "$.items[*]"));
+        assert!(records_path_resolves(&Value::Null, "$.items[*]"));
+        assert!(!records_path_resolves(&json!({"error": "busy"}), "$.items[*]"));
+        assert!(!records_path_resolves(&json!({"error": "busy"}), "$.items"));
+        assert!(!records_path_resolves(&json!({"e": 1}), "$.d.items.*"));
+    }
 
     #[test]
     fn a_zero_poll_interval_is_clamped_to_one_second() {

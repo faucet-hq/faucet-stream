@@ -875,6 +875,41 @@ async fn test_429_with_a_day_long_retry_after_fails_instead_of_sleeping() {
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
 
+#[tokio::test]
+async fn a_200_error_body_mid_pagination_fails_instead_of_ending_green() {
+    // API-23: a missing records key read as "empty page" and ended the run.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"error": "busy"})))
+        .mount(&server)
+        .await;
+    let config = || {
+        RestStreamConfig::new(&server.uri(), "/api/items")
+            .records_path("$.items[*]")
+            .pagination(PaginationStyle::PageNumber {
+                param_name: "page".into(),
+                start_page: 1,
+                page_size: None,
+                page_size_param: None,
+            })
+    };
+    let err = RestStream::new(config()).unwrap().fetch_all().await.unwrap_err();
+    assert!(err.to_string().contains("matched nothing"), "{err}");
+    assert!(err.to_string().contains("busy"), "{err}");
+    let mut lenient = config();
+    lenient.allow_missing_records_path = true;
+    let records = RestStream::new(lenient).unwrap().fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+}
+
 // ── Tolerated HTTP errors ─────────────────────────────────────────────────────
 
 #[tokio::test]
