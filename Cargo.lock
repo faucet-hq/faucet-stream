@@ -4753,6 +4753,7 @@ dependencies = [
 name = "faucet-cli"
 version = "1.13.2"
 dependencies = [
+ "aho-corasick",
  "assert_cmd",
  "async-stream",
  "async-trait",
@@ -6417,7 +6418,7 @@ dependencies = [
  "prost-reflect 0.15.3",
  "prost-types 0.13.5",
  "protoc-bin-vendored",
- "rustls 0.23.40",
+ "rustls 0.23.45",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -6636,6 +6637,7 @@ dependencies = [
  "async-nats",
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "faucet-common-nats",
  "faucet-conformance",
  "faucet-core",
