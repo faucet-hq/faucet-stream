@@ -352,6 +352,19 @@ pub fn build_transaction_sql(
     )
 }
 
+/// Top-level record fields with no matching column in `columns`, sorted and
+/// deduplicated (SQL-94). Non-object records contribute nothing.
+pub(crate) fn unknown_fields(columns: &[FieldSpec], records: &[Value]) -> Vec<String> {
+    let known: std::collections::HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for r in records {
+        if let Some(obj) = r.as_object() {
+            out.extend(obj.keys().filter(|k| !known.contains(k.as_str())).cloned());
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Deterministic, sanitized `requestId` for transport-retry dedup. Correctness
 /// does not depend on it (the transaction + core skip logic are authoritative);
 /// it just suppresses duplicate jobs from a retried HTTP request within
@@ -882,6 +895,24 @@ mod tests {
         let m = sql.find("MERGE").unwrap();
         let c = sql.find("COMMIT TRANSACTION").unwrap();
         assert!(i < m && m < c, "statement order wrong: {sql}");
+    }
+
+    #[test]
+    fn unknown_fields_lists_record_keys_without_a_column() {
+        let col = |n: &str| FieldSpec {
+            name: n.into(),
+            ty: BqType::String,
+            repeated: false,
+            fields: vec![],
+        };
+        let columns = vec![col("id"), col("name")];
+        let records = vec![
+            json!({"id": 1, "name": "a", "extra": 1}),
+            json!({"id": 2, "added": true, "extra": 2}),
+            json!(5),
+        ];
+        assert_eq!(unknown_fields(&columns, &records), vec!["added", "extra"]);
+        assert!(unknown_fields(&columns, &[json!({"id": 1})]).is_empty());
     }
 
     #[test]

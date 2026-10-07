@@ -222,9 +222,8 @@ fn records_to_ndjson(records: &[Value]) -> Result<String, FaucetError> {
 }
 
 /// Build the BigQuery load-job resource JSON for a `NEWLINE_DELIMITED_JSON`
-/// media upload into `project.dataset.table`. `ignoreUnknownValues` mirrors the
-/// typed `INSERT … SELECT` path (which projects only the target columns), so a
-/// page carrying an extra field never fails the load.
+/// media upload into `project.dataset.table`. `ignoreUnknownValues` is off, so a
+/// field the table has no column for fails the load instead of being dropped.
 fn build_load_job_json(
     project: &str,
     dataset: &str,
@@ -254,8 +253,7 @@ fn build_load_job_json(
 /// row that doesn't match that inferred type fails the whole load ("JSON table
 /// encountered too many errors"). An explicit all-`STRING` schema matches the
 /// `Value` write path exactly (CSV fields are all strings) and never mis-types.
-/// `autodetect` is the fallback only when no schema can be derived. Keeps
-/// `ignoreUnknownValues` so an extra column never fails a load.
+/// `autodetect` is the fallback only when no schema can be derived.
 #[allow(clippy::too_many_arguments)]
 fn build_load_job_json_fmt(
     project: &str,
@@ -300,9 +298,9 @@ fn build_load_job_json_full(
         },
         "sourceFormat": source_format,
         "writeDisposition": write_disposition,
-        // A truncating load must not silently drop fields the schema lacks
-        // (SQL-35): they would be gone from the refreshed table.
-        "ignoreUnknownValues": write_disposition != "WRITE_TRUNCATE",
+        // A field the table has no column for fails the load rather than
+        // vanishing (SQL-35 for truncate, SQL-94 for append).
+        "ignoreUnknownValues": false,
     });
     match schema {
         // Explicit schema wins; autodetect must be off or BigQuery ignores the schema.
@@ -1140,6 +1138,7 @@ impl BigQuerySink {
             return Ok(records.len());
         }
         let columns = self.target_schema().await?;
+        self.reject_unknown_fields(&columns, records)?;
         let payload = serde_json::to_string(records).map_err(|e| {
             FaucetError::Sink(format!("BigQuery overwrite: serialize page payload: {e}"))
         })?;
@@ -1302,6 +1301,33 @@ impl BigQuerySink {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Fail a typed `INSERT … SELECT` / `MERGE` page carrying fields the table
+    /// has no column for: the statement projects only the table's columns, so
+    /// they would be dropped without a trace (SQL-94).
+    fn reject_unknown_fields(
+        &self,
+        columns: &[idempotent::FieldSpec],
+        records: &[Value],
+    ) -> Result<(), FaucetError> {
+        let unknown = idempotent::unknown_fields(columns, records);
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        Err(FaucetError::Sink(format!(
+            "BigQuery: field(s) {} are not columns of {}.{}.{} and would be dropped. Add \
+             them to the table (`schema: {{on_drift: evolve}}`), or drop them explicitly \
+             (`schema: {{on_drift: ignore}}` or a `drop` transform)",
+            unknown
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.config.project_id,
+            self.config.dataset_id,
+            self.config.table_id
+        )))
     }
 
     /// Where schema-tolerant fallback requests go (SQL-172).
@@ -1953,6 +1979,7 @@ impl BigQuerySink {
     ) -> Result<usize, FaucetError> {
         let columns = self.target_schema().await?;
         merge::validate_keys_present(&columns, &self.config.write.key)?;
+        self.reject_unknown_fields(&columns, &plan.upserts)?;
 
         let has_upserts = !plan.upserts.is_empty();
         let has_deletes = !plan.deletes.is_empty();
@@ -2751,6 +2778,7 @@ impl faucet_core::Sink for BigQuerySink {
         }
 
         let columns = self.target_schema().await?;
+        self.reject_unknown_fields(&columns, records)?;
 
         let payload = serde_json::to_string(records).map_err(|e| {
             FaucetError::Sink(format!(
@@ -3142,7 +3170,10 @@ mod tests {
         let load = &job["configuration"]["load"];
         assert_eq!(load["sourceFormat"], "NEWLINE_DELIMITED_JSON");
         assert_eq!(load["writeDisposition"], "WRITE_APPEND");
-        assert_eq!(load["ignoreUnknownValues"], true);
+        assert_eq!(
+            load["ignoreUnknownValues"], false,
+            "an append must not drop fields the table lacks (SQL-94)"
+        );
         assert_eq!(load["destinationTable"]["projectId"], "proj");
         assert_eq!(load["destinationTable"]["datasetId"], "ds");
         assert_eq!(load["destinationTable"]["tableId"], "tbl");
@@ -3182,7 +3213,10 @@ mod tests {
         );
         let append =
             build_load_job_json_fmt("p", "d", "t", "WRITE_APPEND", None, "CSV", None, true);
-        assert_eq!(append["configuration"]["load"]["ignoreUnknownValues"], true);
+        assert_eq!(
+            append["configuration"]["load"]["ignoreUnknownValues"],
+            false
+        );
     }
 
     #[test]

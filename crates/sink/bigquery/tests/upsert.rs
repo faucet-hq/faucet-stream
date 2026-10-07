@@ -597,3 +597,35 @@ async fn a_failed_transaction_that_was_not_a_conflict_is_not_retried() {
     assert!(err.to_string().contains("Bad cast"), "{err}");
     assert_eq!(captured_query_bodies(&server).await.len(), 1);
 }
+
+/// A record field the table has no column for fails the write instead of
+/// being projected away by the MERGE (SQL-94).
+#[tokio::test]
+async fn a_field_missing_from_the_table_fails_instead_of_vanishing() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_done(&server, "job-u").await;
+    mount_job_done(&server, "job-u").await;
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a", "nickname": "x"})])
+        .await
+        .expect_err("an unknown field must not be dropped");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`nickname`") && msg.contains("on_drift"),
+        "{msg}"
+    );
+    assert!(
+        captured_query_bodies(&server)
+            .await
+            .iter()
+            .all(|b| !b["query"].as_str().unwrap_or("").contains("MERGE INTO")),
+        "nothing is written"
+    );
+}
