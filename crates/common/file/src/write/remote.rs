@@ -165,6 +165,7 @@ pub struct RemoteBackend {
     slots: Arc<tokio::sync::Semaphore>,
     in_flight: std::sync::Mutex<Vec<InFlight>>,
     seq: std::sync::atomic::AtomicU64,
+    scrubbed: tokio::sync::Mutex<[bool; 2]>,
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -212,7 +213,30 @@ impl RemoteBackend {
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
             in_flight: std::sync::Mutex::new(Vec::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
+            scrubbed: tokio::sync::Mutex::new([false; 2]),
         })
+    }
+
+    /// Remove the upload scratch a crashed run of this output left in `area`,
+    /// once per area, before the first upload into it — not when the area is
+    /// prepared, so a run needs the store only when it publishes.
+    async fn scrub_upload_scratch(&self, area: Area) -> Result<(), FaucetError> {
+        if !self.client.leaves_upload_scratch() {
+            return Ok(());
+        }
+        let mut done = self.scrubbed.lock().await;
+        let slot = &mut done[usize::from(area == Area::Swap)];
+        if *slot {
+            return Ok(());
+        }
+        let prefix = self.prefix(area).to_string();
+        for name in direct_children(&prefix, self.client.list(&prefix).await?) {
+            if self.template.owns_scratch(&name) {
+                self.client.delete(&format!("{prefix}{name}")).await?;
+            }
+        }
+        *slot = true;
+        Ok(())
     }
 
     /// Keep up to `n` uploads in flight (at least 1). With 1 (the default)
@@ -332,17 +356,7 @@ impl StorageBackend for RemoteBackend {
         self.scratch.path().join(format!("{tag}-{safe}"))
     }
 
-    /// Remove upload scratch a crashed run of this output left behind.
-    async fn prepare(&self, area: Area) -> Result<(), FaucetError> {
-        if !self.client.leaves_upload_scratch() {
-            return Ok(());
-        }
-        let prefix = self.prefix(area).to_string();
-        for name in direct_children(&prefix, self.client.list(&prefix).await?) {
-            if self.template.owns_scratch(&name) {
-                self.client.delete(&format!("{prefix}{name}")).await?;
-            }
-        }
+    async fn prepare(&self, _area: Area) -> Result<(), FaucetError> {
         Ok(())
     }
 
@@ -361,6 +375,10 @@ impl StorageBackend for RemoteBackend {
     }
 
     async fn publish(&self, scratch: &Path, area: Area, name: &str) -> Result<(), FaucetError> {
+        if let Err(e) = self.scrub_upload_scratch(area).await {
+            let _ = std::fs::remove_file(scratch);
+            return Err(e);
+        }
         let key = self.key(area, name);
         if self.uploads <= 1 {
             let result = self.client.upload(scratch, &key).await;
