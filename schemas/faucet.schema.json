@@ -10156,7 +10156,7 @@
           }
         },
         "write_disposition": {
-          "description": "BigQuery load `writeDisposition` — `WRITE_APPEND` (default),\n`WRITE_TRUNCATE`, or `WRITE_EMPTY`.",
+          "description": "BigQuery load `writeDisposition`. Only `WRITE_APPEND` (the default) is\naccepted: the staged path runs one load job per batch, so a truncating\nor empty-only disposition would keep only the last batch or fail on the\nsecond. Use `write_mode: overwrite` (bucket-free) for a full refresh.",
           "type": "string",
           "default": "WRITE_APPEND"
         },

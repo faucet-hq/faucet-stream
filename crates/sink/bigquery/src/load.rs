@@ -45,6 +45,7 @@ pub async fn write_columnar(
     let cfg = config.bulk_load.as_ref().ok_or_else(|| {
         FaucetError::Sink("BigQuery columnar write requested with no `bulk_load` config".into())
     })?;
+    cfg.validate()?;
 
     // Parquet encode is CPU-bound — off the async runtime.
     let batch_owned = batch.clone();
@@ -96,13 +97,15 @@ pub async fn write_columnar(
     let job_id = job_ref
         .job_id
         .ok_or_else(|| FaucetError::Sink("BigQuery load job returned no jobId".into()))?;
-    await_load_job(
+    let loaded = await_load_job(
         client,
         &config.project_id,
         &job_id,
         job_ref.location.as_deref(),
     )
-    .await?;
+    .await;
+    delete_staged(cfg, &key).await;
+    loaded?;
 
     tracing::info!(
         table = %format!("{}.{}.{}", config.project_id, config.dataset_id, config.table_id),
@@ -111,6 +114,30 @@ pub async fn write_columnar(
         "BigQuery columnar Parquet load job complete"
     );
     Ok(batch.num_rows())
+}
+
+/// Best-effort removal of a staged Parquet object once its load job has
+/// finished (SQL-100); a failure only warns, the rows are already loaded.
+async fn delete_staged(cfg: &crate::config::BigQueryLoadConfig, key: &str) {
+    let control =
+        match faucet_common_gcs::build_storage_control(&cfg.gcs_auth, cfg.storage_host.as_deref())
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(key, error = %e, "could not delete staged BigQuery load object");
+                return;
+            }
+        };
+    if let Err(e) = control
+        .delete_object()
+        .set_bucket(format!("projects/_/buckets/{}", cfg.staging_bucket))
+        .set_object(key.to_string())
+        .send()
+        .await
+    {
+        tracing::warn!(key, error = %e, "could not delete staged BigQuery load object");
+    }
 }
 
 /// Bucket-free columnar write (#635): encode `batch` to Parquet and POST it

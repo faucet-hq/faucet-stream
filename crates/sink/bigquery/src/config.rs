@@ -174,14 +174,32 @@ pub struct BigQueryLoadConfig {
     /// Credentials.
     #[serde(default)]
     pub gcs_auth: faucet_common_gcs::GcsCredentials,
-    /// BigQuery load `writeDisposition` — `WRITE_APPEND` (default),
-    /// `WRITE_TRUNCATE`, or `WRITE_EMPTY`.
+    /// BigQuery load `writeDisposition`. Only `WRITE_APPEND` (the default) is
+    /// accepted: the staged path runs one load job per batch, so a truncating
+    /// or empty-only disposition would keep only the last batch or fail on the
+    /// second. Use `write_mode: overwrite` (bucket-free) for a full refresh.
     #[serde(default = "default_write_disposition")]
     pub write_disposition: String,
     /// Optional GCS storage endpoint override (e.g. a fake-gcs-server host for
     /// tests). `None` uses the real Google endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_host: Option<String>,
+}
+
+#[cfg(feature = "arrow")]
+impl BigQueryLoadConfig {
+    /// Refuse a `write_disposition` other than `WRITE_APPEND` (SQL-100).
+    pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        if self.write_disposition == "WRITE_APPEND" {
+            return Ok(());
+        }
+        Err(faucet_core::FaucetError::Config(format!(
+            "BigQuery bulk_load.write_disposition `{}` is not supported: the staged path \
+             runs one load job per batch, so it would keep only the last batch. Use \
+             WRITE_APPEND, or `write_mode: overwrite` without `bulk_load` for a full refresh",
+            self.write_disposition
+        )))
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -459,6 +477,19 @@ mod tests {
         assert_eq!(l.staging_prefix, "faucet-bq-load/");
         assert_eq!(l.write_disposition, "WRITE_APPEND");
         assert!(l.storage_host.is_none());
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn bulk_load_refuses_non_append_dispositions() {
+        let mut load: BigQueryLoadConfig =
+            serde_json::from_value(serde_json::json!({"staging_bucket": "b"})).unwrap();
+        load.validate().unwrap();
+        for d in ["WRITE_TRUNCATE", "WRITE_EMPTY", "write_append"] {
+            load.write_disposition = d.into();
+            let err = load.validate().unwrap_err().to_string();
+            assert!(err.contains(d) && err.contains("last batch"), "{err}");
+        }
     }
 
     #[test]

@@ -466,7 +466,9 @@ append, so one atomic load replaces the table and a mid-run failure leaves
 the prior data intact. (That first-batch-truncates shape needs a per-batch
 disposition, which the staged path's fixed `write_disposition` cannot
 express, so a staged overwrite is refused rather than silently leaving only
-the last batch.)
+the last batch. For the same reason `bulk_load.write_disposition` accepts only
+`WRITE_APPEND`.) Each staged Parquet object is deleted once its load job
+finishes.
 
 ```yaml
 sink:
@@ -480,7 +482,7 @@ sink:
       staging_bucket: my-bq-staging          # GCS bucket for Parquet staging
       staging_prefix: faucet-bq-load/         # default
       gcs_auth: { type: application_default }  # creds for the staging upload
-      write_disposition: WRITE_APPEND          # default (or WRITE_TRUNCATE / WRITE_EMPTY)
+      write_disposition: WRITE_APPEND          # the only accepted value
 ```
 
 `bulk_load` is only present in `arrow` builds, and is now optional rather

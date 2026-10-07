@@ -714,6 +714,10 @@ impl BigQuerySink {
     pub async fn new(config: BigQuerySinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         config.write.validate()?;
+        #[cfg(feature = "arrow")]
+        if let Some(load) = &config.bulk_load {
+            load.validate()?;
+        }
         if config.media_load && config.insert_id_field.is_some() {
             tracing::warn!(
                 insert_id_field = config.insert_id_field.as_deref(),
