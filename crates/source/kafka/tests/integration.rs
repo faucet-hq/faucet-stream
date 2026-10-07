@@ -530,3 +530,50 @@ async fn a_bookmark_below_the_log_start_resumes_at_the_log_start() {
     let ids: Vec<_> = second.iter().map(|r| r["value"]["id"].clone()).collect();
     assert_eq!(ids, vec![serde_json::json!(5), serde_json::json!(6)]);
 }
+
+/// A binary key without `key_format` arrives base64 instead of failing the
+/// record; repeated headers keep every value and a valueless header is `null`
+/// (#789 MSG-95).
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_keys_and_repeated_headers_keep_their_fidelity() {
+    use rdkafka::message::{Header, OwnedHeaders};
+    let (_container, brokers) = start_kafka().await;
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .unwrap();
+    let headers = OwnedHeaders::new()
+        .insert(Header {
+            key: "h",
+            value: Some("1"),
+        })
+        .insert(Header {
+            key: "h",
+            value: Some("2"),
+        })
+        .insert(Header::<&str> {
+            key: "empty",
+            value: None,
+        });
+    producer
+        .send(
+            FutureRecord::<[u8], str>::to("fidelity")
+                .key(&[0xff_u8, 0x00][..])
+                .payload(r#"{"id":1}"#)
+                .headers(headers),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("produce");
+    let source = KafkaSource::new(source_config(&brokers, "fidelity", "g-fid", 1))
+        .await
+        .unwrap();
+    let (records, _) = source.fetch_all_incremental().await.unwrap();
+    assert_eq!(records[0]["key"], "/wA=");
+    assert_eq!(
+        records[0]["headers"],
+        serde_json::json!({"h": ["1", "2"], "empty": null})
+    );
+    assert!(records[0]["timestamp"].is_i64());
+}

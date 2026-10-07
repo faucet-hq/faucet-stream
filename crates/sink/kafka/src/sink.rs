@@ -28,6 +28,10 @@ pub struct KafkaSink {
     txn: tokio::sync::OnceCell<Arc<FutureProducer>>,
     #[cfg(feature = "schema-registry")]
     sr_client: Option<SchemaRegistryClient>,
+    /// The registry the key format names (it may differ from the value's),
+    /// falling back to the value's (#789 MSG-95).
+    #[cfg(feature = "schema-registry")]
+    key_sr_client: Option<SchemaRegistryClient>,
 }
 
 impl KafkaSink {
@@ -42,6 +46,11 @@ impl KafkaSink {
 
         #[cfg(feature = "schema-registry")]
         let sr_client = build_sr_client(&config.value_format, config.key_format.as_ref())?;
+        #[cfg(feature = "schema-registry")]
+        let key_sr_client = match &config.key_format {
+            Some(kf) => build_sr_client(kf, Some(&config.value_format))?,
+            None => None,
+        };
 
         Ok(Self {
             config,
@@ -49,6 +58,8 @@ impl KafkaSink {
             txn: tokio::sync::OnceCell::new(),
             #[cfg(feature = "schema-registry")]
             sr_client,
+            #[cfg(feature = "schema-registry")]
+            key_sr_client,
         })
     }
 
@@ -99,7 +110,7 @@ impl KafkaSink {
                             &v,
                             fmt,
                             #[cfg(feature = "schema-registry")]
-                            self.sr_client.as_ref(),
+                            self.key_sr_client.as_ref(),
                             #[cfg(feature = "schema-registry")]
                             &key_ctx,
                         )

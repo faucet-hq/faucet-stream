@@ -62,6 +62,45 @@ pub(crate) struct BookmarkContext {
     /// partition the group has no offset for starts, so that position can be
     /// seeded into the group before anything is consumed (#789 MSG-72).
     pub(crate) earliest: Arc<AtomicBool>,
+    /// Event clock for [`Self::stale_since_revoke`]: when each partition last
+    /// delivered a message and when it was last revoked.
+    pub(crate) events: Arc<Mutex<PartitionEvents>>,
+}
+
+/// Per-partition delivery / revocation order (#789 MSG-95).
+#[derive(Default)]
+pub(crate) struct PartitionEvents {
+    clock: u64,
+    delivered: HashMap<(String, i32), u64>,
+    revoked: HashMap<(String, i32), u64>,
+}
+
+impl PartitionEvents {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    pub(crate) fn note_delivered(&mut self, tp: (String, i32)) {
+        let t = self.tick();
+        self.delivered.insert(tp, t);
+    }
+
+    pub(crate) fn note_revoked(&mut self, tp: (String, i32)) {
+        let t = self.tick();
+        self.revoked.insert(tp, t);
+    }
+
+    /// Whether `tp` was revoked after this member last delivered from it: its
+    /// pending offset predates the revoke, and another member may have moved
+    /// the group past it since, so committing it would regress the group.
+    pub(crate) fn stale_since_revoke(&self, tp: &(String, i32)) -> bool {
+        match (self.revoked.get(tp), self.delivered.get(tp)) {
+            (Some(r), Some(d)) => r > d,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Where a bookmarked partition actually resumes: never below the log start.
@@ -124,6 +163,9 @@ impl BookmarkContext {
     pub(crate) fn note_delivered(&self, topic: &str, partition: i32, next_offset: i64) {
         if let Ok(mut map) = self.delivered.lock() {
             map.insert((topic.to_string(), partition), next_offset);
+        }
+        if let Ok(mut ev) = self.events.lock() {
+            ev.note_delivered((topic.to_string(), partition));
         }
     }
 
@@ -313,6 +355,11 @@ impl ConsumerContext for BookmarkContext {
             }
 
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => {
+                if let Ok(mut ev) = self.events.lock() {
+                    for e in tpl.elements() {
+                        ev.note_revoked((e.topic().to_string(), e.partition()));
+                    }
+                }
                 let rebalance = Rebalance::Revoke(tpl);
                 self.pre_rebalance(base_consumer, &rebalance);
                 drop(rebalance);
@@ -532,6 +579,25 @@ mod tests {
         );
         *ctx.start_offsets.lock().unwrap() = None;
         assert!(ctx.reassign_bookmark().is_none());
+    }
+
+    #[test]
+    fn a_revoke_after_the_last_delivery_makes_an_offset_stale() {
+        let tp = ("t".to_string(), 0);
+        let mut ev = PartitionEvents::default();
+        assert!(!ev.stale_since_revoke(&tp));
+        ev.note_delivered(tp.clone());
+        assert!(!ev.stale_since_revoke(&tp));
+        ev.note_revoked(tp.clone());
+        assert!(ev.stale_since_revoke(&tp), "revoked after the delivery");
+        ev.note_delivered(tp.clone());
+        assert!(
+            !ev.stale_since_revoke(&tp),
+            "delivered again after re-assignment"
+        );
+        let other = ("t".to_string(), 1);
+        ev.note_revoked(other.clone());
+        assert!(ev.stale_since_revoke(&other));
     }
 
     #[test]

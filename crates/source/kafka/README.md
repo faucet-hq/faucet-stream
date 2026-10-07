@@ -83,7 +83,7 @@ All fields are keys under `source.config`.
 | `group_id` | string | — *(required)* | Kafka consumer group ID. Drives partition assignment and forms part of the state-store key. |
 | `auth` | `KafkaAuth` | `{ type: none }` | Authentication mode — see [Authentication](#authentication). |
 | `value_format` | `KafkaValueFormat` | `{ type: json }` | How message **value** bytes are decoded — see [Value formats](#value-formats). |
-| `key_format` | `KafkaValueFormat` \| null | `null` | How message **key** bytes are decoded. When unset, key bytes are decoded as UTF-8 (or `null` if the message carried no key). |
+| `key_format` | `KafkaValueFormat` \| null | `null` | How message **key** bytes are decoded. When unset, key bytes are decoded as UTF-8 — base64 when they are not UTF-8 — or `null` if the message carried no key. A schema-registry key format uses its own registry (falling back to the value format's). |
 
 ### Termination & polling
 
@@ -192,11 +192,11 @@ Each Kafka message becomes one JSON object:
 }
 ```
 
-- `key` — the key decoded as UTF-8, or per `key_format` if set. `null` when the message carried no key.
+- `key` — the key decoded as UTF-8 (base64 when the bytes are not UTF-8), or per `key_format` if set. `null` when the message carried no key.
 - `value` — the decoded payload; shape depends on `value_format`.
 - `topic` / `partition` / `offset` — provenance for the message within its partition.
-- `timestamp` — milliseconds since the Unix epoch; `0` when the message had no timestamp.
-- `headers` — a flat string→string object; non-UTF-8 values are base64-encoded; `{}` when none were set.
+- `timestamp` — milliseconds since the Unix epoch; `null` when the message had no timestamp.
+- `headers` — an object keyed by header name; non-UTF-8 values are base64-encoded, a valueless header is `null`, and a name that appears more than once holds an array of its values in order; `{}` when none were set.
 
 ## Examples
 
