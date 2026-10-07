@@ -490,6 +490,16 @@ sink:
 than the trigger for the columnar path. The Storage **Write** API (gRPC
 `AppendRows`) is a separate future enhancement.
 
+## Concurrent writers
+
+BigQuery aborts a transaction when another transaction or DML statement
+changes the same table at the same time — exactly-once pages share one
+dataset-wide `_faucet_commit_token` table, and fan-out upserts share their
+target. An aborted transaction commits nothing, so the sink re-submits it
+(up to 6 attempts, jittered backoff, a fresh `requestId` each time) instead of
+failing the run. Upsert `MERGE`s and the scoped-cleanup `DELETE` are retried
+the same way.
+
 ## Column types the client does not know
 
 A destination table with a column type the REST client cannot decode (such as

@@ -27,6 +27,29 @@ use tokio::sync::RwLock;
 /// BigQuery holds the connection open up to this long, so we don't busy-wait.
 const JOB_POLL_LONG_POLL_MS: i32 = 10_000;
 
+/// Attempts (including the first) for a transaction BigQuery aborted for a
+/// concurrent update (SQL-95).
+const TXN_CONFLICT_ATTEMPTS: u32 = 6;
+
+/// Whether a failed job is a transaction BigQuery aborted because another
+/// transaction or DML statement changed the same table. BigQuery reports this
+/// only through the message (its `reason` is the generic `invalidQuery`).
+fn is_concurrent_txn_abort(err: &gcp_bigquery_client::model::error_proto::ErrorProto) -> bool {
+    let msg = err.message.as_deref().unwrap_or("").to_ascii_lowercase();
+    msg.contains("aborted due to concurrent update")
+        || msg.contains("could not serialize access to table")
+}
+
+/// Up to half of `delay`, so concurrent writers that collided do not retry in
+/// lockstep.
+fn txn_jitter(delay: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let half = (delay.as_millis() as u64 / 2).max(1);
+    Duration::from_millis(u64::from(nanos) % half)
+}
+
 /// Whether a job polled since `started` has outlived `limit` (`0` = never).
 pub(crate) fn job_timed_out(limit: Duration, started: std::time::Instant) -> bool {
     !limit.is_zero() && started.elapsed() >= limit
@@ -1759,7 +1782,18 @@ impl BigQuerySink {
     /// authoritative terminal-failure signal; the `errors` array can also carry
     /// non-fatal warnings, so it must not be treated as failure on its own.
     async fn await_query_job(&self, initial: QueryResponse) -> Result<Job, FaucetError> {
-        let (job_id, location) = Self::job_reference(&initial)?;
+        self.await_query_job_classified(initial)
+            .await
+            .map_err(|(e, _)| e)
+    }
+
+    /// [`await_query_job`](Self::await_query_job) that also says whether a
+    /// failed job was a transaction BigQuery aborted for a concurrent update.
+    async fn await_query_job_classified(
+        &self,
+        initial: QueryResponse,
+    ) -> Result<Job, (FaucetError, bool)> {
+        let (job_id, location) = Self::job_reference(&initial).map_err(|e| (e, false))?;
 
         // Phase 1 — wait for completion via server-side long-poll (not a busy wait).
         if !initial.job_complete.unwrap_or(false) {
@@ -1777,15 +1811,20 @@ impl BigQuerySink {
                     .get_query_results(&self.config.project_id, &job_id, params)
                     .await
                     .map_err(|e| {
-                        FaucetError::Sink(format!("BigQuery jobs.getQueryResults failed: {e}"))
+                        (
+                            FaucetError::Sink(format!("BigQuery jobs.getQueryResults failed: {e}")),
+                            false,
+                        )
                     })?;
                 if resp.job_complete.unwrap_or(false) {
                     break;
                 }
                 if self.job_timed_out(started) {
-                    return Err(self
-                        .cancel_timed_out_job("query", &job_id, location.as_deref())
-                        .await);
+                    return Err((
+                        self.cancel_timed_out_job("query", &job_id, location.as_deref())
+                            .await,
+                        false,
+                    ));
                 }
                 // The server long-poll normally blocks until completion, but if
                 // it returns early, back off so a still-running job can't turn
@@ -1810,7 +1849,12 @@ impl BigQuerySink {
             location.as_deref(),
         )
         .await
-        .map_err(|e| FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")))?;
+        .map_err(|e| {
+            (
+                FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")),
+                false,
+            )
+        })?;
         if let Some(b) = job
             .statistics
             .as_ref()
@@ -1824,26 +1868,63 @@ impl BigQuerySink {
         // itself can be handed back to the caller.
         let (state, error_result) = {
             let status = job.status.as_ref().ok_or_else(|| {
-                FaucetError::Sink(format!(
-                    "BigQuery job '{job_id}' returned no status; cannot confirm durable commit"
-                ))
+                (
+                    FaucetError::Sink(format!(
+                        "BigQuery job '{job_id}' returned no status; cannot confirm durable commit"
+                    )),
+                    false,
+                )
             })?;
-            (
-                status.state.clone(),
-                status.error_result.as_ref().map(|e| e.to_string()),
-            )
+            (status.state.clone(), status.error_result.clone())
         };
         if let Some(err) = error_result {
-            return Err(FaucetError::Sink(format!(
-                "BigQuery query job '{job_id}' failed: {err}"
-            )));
+            return Err((
+                FaucetError::Sink(format!("BigQuery query job '{job_id}' failed: {err}")),
+                is_concurrent_txn_abort(&err),
+            ));
         }
         match state.as_deref() {
             Some("DONE") => Ok(job),
-            other => Err(FaucetError::Sink(format!(
-                "BigQuery job '{job_id}' is in state {other:?}, not DONE; cannot confirm durable commit"
-            ))),
+            other => Err((
+                FaucetError::Sink(format!(
+                    "BigQuery job '{job_id}' is in state {other:?}, not DONE; cannot confirm durable commit"
+                )),
+                false,
+            )),
         }
+    }
+
+    /// Submit a transactional query and wait for it, re-submitting it when
+    /// BigQuery aborts the transaction for a concurrent update on the same
+    /// table (SQL-95): an aborted transaction committed nothing, so running it
+    /// again is safe. A retry gets a fresh `requestId`, or BigQuery would hand
+    /// back the aborted job.
+    async fn run_transaction(&self, mut req: QueryRequest, what: &str) -> Result<Job, FaucetError> {
+        let base_id = req.request_id.clone();
+        let mut delay = Duration::from_millis(200);
+        for attempt in 1..=TXN_CONFLICT_ATTEMPTS {
+            self.roundtrips.record("query");
+            let resp = self
+                .client
+                .job()
+                .query(&self.config.project_id, req.clone())
+                .await
+                .map_err(|e| FaucetError::Sink(format!("{what} failed: {e}")))?;
+            match self.await_query_job_classified(resp).await {
+                Ok(job) => return Ok(job),
+                Err((e, true)) if attempt < TXN_CONFLICT_ATTEMPTS => {
+                    tracing::warn!(
+                        what, attempt, error = %e,
+                        "BigQuery aborted the transaction for a concurrent update; retrying"
+                    );
+                    tokio::time::sleep(delay + txn_jitter(delay)).await;
+                    delay = (delay * 2).min(Duration::from_secs(10));
+                    req.request_id = base_id.as_ref().map(|id| format!("{id}-r{attempt}"));
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        unreachable!("the final attempt returns")
     }
 
     /// Extract `(job_id, location)` from a query response's job reference.
@@ -1937,15 +2018,7 @@ impl BigQuerySink {
         }
         req.query_parameters = Some(params);
 
-        self.roundtrips.record("query");
-
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("bigquery upsert write failed: {e}")))?;
-        self.await_query_complete(resp).await?;
+        self.run_transaction(req, "bigquery upsert write").await?;
 
         Ok(plan.upserts.len() + plan.deletes.len())
     }
@@ -1998,15 +2071,7 @@ impl BigQuerySink {
             Self::string_param("keys", &keys_payload),
         ]);
 
-        self.roundtrips.record("query");
-
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("bigquery cleanup delete failed: {e}")))?;
-        let job = self.await_query_job(resp).await?;
+        let job = self.run_transaction(req, "bigquery cleanup delete").await?;
         let deleted = dml_affected_rows(&job);
 
         tracing::info!(
@@ -2709,15 +2774,8 @@ impl faucet_core::Sink for BigQuerySink {
             Self::string_param("token", token),
         ]);
 
-        self.roundtrips.record("query");
-
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery idempotent write failed: {e}")))?;
-        self.await_query_complete(resp).await?;
+        self.run_transaction(req, "BigQuery idempotent write")
+            .await?;
 
         tracing::info!(
             table = %format!(
@@ -2886,6 +2944,29 @@ impl faucet_core::Sink for BigQuerySink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_update_aborts_are_recognised_and_jitter_is_bounded() {
+        use gcp_bigquery_client::model::error_proto::ErrorProto;
+        let e = |m: &str| ErrorProto {
+            message: Some(m.into()),
+            ..Default::default()
+        };
+        assert!(super::is_concurrent_txn_abort(&e(
+            "Transaction is aborted due to concurrent update against table p:d.t"
+        )));
+        assert!(super::is_concurrent_txn_abort(&e(
+            "Could not serialize access to table p:d.t due to concurrent update"
+        )));
+        assert!(!super::is_concurrent_txn_abort(&e("Bad cast")));
+        assert!(!super::is_concurrent_txn_abort(&ErrorProto::default()));
+        let d = std::time::Duration::from_millis(200);
+        assert!(super::txn_jitter(d) < std::time::Duration::from_millis(100));
+        assert_eq!(
+            super::txn_jitter(std::time::Duration::ZERO),
+            std::time::Duration::ZERO
+        );
+    }
+
     #[test]
     fn job_timeout_zero_never_expires() {
         let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(10);
