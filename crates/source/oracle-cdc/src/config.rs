@@ -90,8 +90,10 @@ pub struct OracleCdcSourceConfig {
     /// changes (bounded memory). `None` = unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_staged_records: Option<usize>,
-    /// `0` accumulates every change into one trailing page; otherwise each
-    /// committed transaction is its own page. Default [`DEFAULT_BATCH_SIZE`].
+    /// `0` aggregates committed transactions into pages of up to 100,000
+    /// records, emitted at least every `idle_timeout`, each with its bookmark;
+    /// otherwise each committed transaction is its own page. Default
+    /// [`DEFAULT_BATCH_SIZE`].
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Maximum pooled sessions. Default 2.
