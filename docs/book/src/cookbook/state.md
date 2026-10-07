@@ -215,6 +215,11 @@ state:
   old files stay readable and every write re-seals with the new key.
 - **Backward compatible** — plaintext bookmarks written before encryption was
   enabled remain readable and are sealed on their next write.
+- **Bound to its key** — each sealed file carries its state key as
+  authenticated data, so a file copied over another key's file fails to
+  decrypt instead of restoring the wrong position. Files sealed by earlier
+  releases stay readable and are re-sealed this way on their next write (an
+  older faucet cannot read the new format).
 - **Failure behavior** — a wrong/rotated-away key or a tampered file is a
   *typed error*, never a silent "no bookmark" (which would trigger a full
   re-sync); an encrypted file read by a store with no `encryption` block

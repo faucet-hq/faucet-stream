@@ -491,7 +491,7 @@ impl StateStore for FileStateStore {
                 #[cfg(feature = "encryption")]
                 let bytes: Vec<u8> = if crate::encryption::is_encrypted(&bytes) {
                     match &self.encryption {
-                        Some(enc) => enc.decrypt(&bytes).map_err(|e| {
+                        Some(enc) => enc.decrypt_bound(&bytes, key.as_bytes()).map_err(|e| {
                             // Wrong/rotated key must be a loud, typed error —
                             // treating it as "no bookmark" would silently
                             // trigger a full re-sync.
@@ -550,7 +550,7 @@ impl StateStore for FileStateStore {
         })?;
         #[cfg(feature = "encryption")]
         let bytes = match &self.encryption {
-            Some(enc) => enc.encrypt(&bytes),
+            Some(enc) => enc.encrypt_bound(&bytes, key.as_bytes()),
             None => bytes,
         };
         let final_path = self.entry_path(key);
