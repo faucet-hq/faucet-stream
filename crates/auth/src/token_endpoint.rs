@@ -136,25 +136,28 @@ impl TokenEndpointProvider {
     }
 
     async fn fetch(&self) -> Result<(String, Option<u64>), FaucetError> {
-        let mut req = self.http.request(self.method.clone(), &self.url);
-        if let Some(body) = &self.body {
-            req = match self.encoding {
-                BodyEncoding::Json => req.json(body),
-                // Form encoding requires a flat map of string→string pairs; the
-                // OAuth token endpoints that need `encoding: form` always send
-                // such a body (`grant_type`, `client_id`, `resource`, …).
-                BodyEncoding::Form => req.form(&form_pairs(body)?),
-            };
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+        let reply = crate::retry::send_token_request(|| {
+            let mut req = self.http.request(self.method.clone(), &self.url);
+            if let Some(body) = &self.body {
+                req = match self.encoding {
+                    BodyEncoding::Json => req.json(body),
+                    // Form encoding requires a flat map of string→string pairs; the
+                    // OAuth token endpoints that need `encoding: form` always send
+                    // such a body (`grant_type`, `client_id`, `resource`, …).
+                    BodyEncoding::Form => req.form(&form_pairs(body)?),
+                };
+            }
+            Ok(req)
+        })
+        .await?;
+        if !reply.is_success() {
             return Err(FaucetError::Auth(format!(
-                "token endpoint request failed (HTTP {status}): {body}"
+                "token endpoint request failed (HTTP {}): {}",
+                reply.status,
+                reply.text()
             )));
         }
-        let body: Value = resp.json().await?;
+        let body: Value = serde_json::from_slice(&reply.body)?;
         let token = extract_string(&body, &self.token_path).ok_or_else(|| {
             FaucetError::Auth(format!(
                 "token_path '{}' did not match a string value in the response",

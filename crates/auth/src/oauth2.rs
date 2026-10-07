@@ -88,18 +88,17 @@ impl OAuth2ClientCredentialsProvider {
     }
 
     async fn fetch(&self) -> Result<TokenResponse, FaucetError> {
-        let resp = self
-            .http
-            .post(&self.token_url)
-            .form(&[
+        let scope = self.scopes.join(" ");
+        let reply = crate::retry::send_token_request(|| {
+            Ok(self.http.post(&self.token_url).form(&[
                 ("grant_type", "client_credentials"),
-                ("client_id", &self.client_id),
-                ("client_secret", &self.client_secret),
-                ("scope", &self.scopes.join(" ")),
-            ])
-            .send()
-            .await?;
-        parse_token_response(resp).await
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("scope", scope.as_str()),
+            ]))
+        })
+        .await?;
+        parse_token_response(reply)
     }
 }
 
@@ -302,8 +301,11 @@ impl OAuth2RefreshProvider {
         if let Some(scope) = &self.scope {
             form.push(("scope", scope));
         }
-        let resp = self.http.post(&self.token_url).form(&form).send().await?;
-        let body = parse_token_response(resp).await?;
+        let reply = crate::retry::send_token_request(|| {
+            Ok(self.http.post(&self.token_url).form(&form))
+        })
+        .await?;
+        let body = parse_token_response(reply)?;
         state.access_token = Some(body.access_token.clone());
         state.expires_at = expiry_instant(body.expires_in, self.expiry_ratio);
         if let Some(rotated) = body.refresh_token {
@@ -470,15 +472,15 @@ fn string_array(config: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResponse, FaucetError> {
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
+fn parse_token_response(reply: crate::retry::TokenReply) -> Result<TokenResponse, FaucetError> {
+    if !reply.is_success() {
         return Err(FaucetError::Auth(format!(
-            "OAuth2 token request failed (HTTP {status}): {body}"
+            "OAuth2 token request failed (HTTP {}): {}",
+            reply.status,
+            reply.text()
         )));
     }
-    resp.json::<TokenResponse>().await.map_err(Into::into)
+    serde_json::from_slice(&reply.body).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -726,6 +728,28 @@ mod tests {
             p2.credential().await.unwrap(),
             Credential::Bearer("A2".into())
         );
+    }
+
+    #[tokio::test]
+    async fn an_idp_503_is_retried_not_fatal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(CountingToken {
+                hits: Arc::new(AtomicUsize::new(0)),
+                token_prefix: "A",
+            })
+            .mount(&server)
+            .await;
+        let p = OAuth2ClientCredentialsProvider::from_config(&serde_json::json!({
+            "token_url": server.uri(), "client_id": "id", "client_secret": "s",
+        }))
+        .unwrap();
+        assert_eq!(p.credential().await.unwrap(), Credential::Bearer("A1".into()));
     }
 
     #[tokio::test]

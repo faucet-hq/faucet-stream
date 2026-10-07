@@ -87,9 +87,10 @@ impl TokenCache {
         )
         .await?;
 
-        let expires_at = expires_in.map(|secs| {
+        let expires_at = expires_in.and_then(|secs| {
             let effective = (secs as f64 * expiry_ratio) as u64;
-            tokio::time::Instant::now() + std::time::Duration::from_secs(effective)
+            // An absurd lifetime overflows `Instant`; treat it as "no expiry".
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(effective))
         });
 
         *guard = Some(CachedToken {
@@ -132,27 +133,45 @@ async fn fetch_oauth2_token_inner_with_client(
     client_secret: &str,
     scopes: &[String],
 ) -> Result<(String, Option<u64>), FaucetError> {
-    let resp = client
-        .post(token_url)
-        .form(&[
-            ("grant_type", "client_credentials"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("scope", &scopes.join(" ")),
-        ])
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(FaucetError::Auth(format!(
-            "OAuth2 token request failed (HTTP {status}): {body}"
-        )));
+    use super::token_endpoint::{TOKEN_MAX_ATTEMPTS, is_transient_token_status, token_backoff};
+    let scope = scopes.join(" ");
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let last = attempt >= TOKEN_MAX_ATTEMPTS;
+        let sent = client
+            .post(token_url)
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("scope", &scope),
+            ])
+            .send()
+            .await;
+        let resp = match sent {
+            Ok(r) => r,
+            Err(e) if !last && (e.is_timeout() || e.is_connect()) => {
+                token_backoff(attempt).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            if !last && is_transient_token_status(status, &body) {
+                tracing::warn!(status, attempt, "OAuth2 token endpoint transient failure; retrying");
+                token_backoff(attempt).await;
+                continue;
+            }
+            return Err(FaucetError::Auth(format!(
+                "OAuth2 token request failed (HTTP {status}): {body}"
+            )));
+        }
+        let token_resp: TokenResponse = resp.json().await?;
+        return Ok((token_resp.access_token, token_resp.expires_in));
     }
-
-    let token_resp: TokenResponse = resp.json().await?;
-    Ok((token_resp.access_token, token_resp.expires_in))
 }
 
 #[cfg(test)]
@@ -205,6 +224,36 @@ mod tests {
             }
             other => panic!("expected FaucetError::Auth, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_transient_idp_failure_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "after-retry",
+                "expires_in": u64::MAX
+            })))
+            .mount(&server)
+            .await;
+        let url = format!("{}/token", server.uri());
+        let cache = TokenCache::new();
+        let token = cache
+            .get_or_refresh(&Client::new(), &url, "id", "s", &[], DEFAULT_EXPIRY_RATIO)
+            .await
+            .unwrap();
+        assert_eq!(token, "after-retry");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        let unreachable = fetch_oauth2_token("http://127.0.0.1:1/token", "id", "s", &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(unreachable, FaucetError::Http(_)), "{unreachable:?}");
     }
 
     #[tokio::test]

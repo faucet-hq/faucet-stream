@@ -29,6 +29,7 @@ mod google_sa;
 mod oauth1;
 mod oauth2;
 mod private_store;
+mod retry;
 mod static_provider;
 mod token_endpoint;
 
@@ -130,9 +131,10 @@ pub(crate) fn expiry_instant(
     expires_in: Option<u64>,
     expiry_ratio: f64,
 ) -> Option<tokio::time::Instant> {
-    expires_in.map(|secs| {
+    expires_in.and_then(|secs| {
         let effective = (secs as f64 * expiry_ratio) as u64;
-        tokio::time::Instant::now() + std::time::Duration::from_secs(effective)
+        // An absurd lifetime overflows `Instant`; treat it as "no expiry".
+        tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(effective))
     })
 }
 
@@ -166,6 +168,13 @@ pub(crate) fn parse_expiry_ratio(config: &Value) -> Result<f64, FaucetError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_absurd_expiry_means_no_expiry_rather_than_a_panic() {
+        assert!(super::expiry_instant(Some(u64::MAX), 1.0).is_none());
+        assert!(super::expiry_instant(Some(3600), 0.9).is_some());
+        assert!(super::expiry_instant(None, 0.9).is_none());
+    }
+
     use super::*;
 
     #[test]

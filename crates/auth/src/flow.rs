@@ -782,7 +782,7 @@ impl FlowProvider {
         let expires_at = self
             .config
             .ttl_secs
-            .map(|s| Instant::now() + Duration::from_secs(s));
+            .and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
         *guard = Some(Session {
             ctx: ctx.clone(),
             expires_at,
@@ -1182,6 +1182,27 @@ mod tests {
         let p = FlowProvider::from_config(&cfg).unwrap();
         let _ = p.credential().await.unwrap();
         // Within the TTL window the session is reused (Session::valid == true).
+        let _ = p.credential().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_absurd_ttl_does_not_panic() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(CountingLogin(hits.clone()))
+            .mount(&server)
+            .await;
+        let cfg = json!({
+            "steps": [ { "request": { "method": "POST", "url": format!("{}/login", server.uri()) },
+                         "capture": { "sid": "$.sid" } } ],
+            "apply": [ { "into": "header", "name": "X", "value": "${sid}" } ],
+            "ttl_secs": u64::MAX
+        });
+        let p = FlowProvider::from_config(&cfg).unwrap();
+        let _ = p.credential().await.unwrap();
         let _ = p.credential().await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
