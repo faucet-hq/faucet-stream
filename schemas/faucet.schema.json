@@ -7159,7 +7159,7 @@
           "const": "on_sink_confirm"
         },
         {
-          "description": "At-most-once: the broker considers a message delivered as soon as it is\nsent (`no_ack`). Fastest, but a crash loses in-flight messages.",
+          "description": "At-most-once: the broker considers a message delivered as soon as it is\nsent (`no_ack`). Fastest, but a crash loses in-flight messages. Cannot\nbe combined with `max_messages`: the broker pushes the backlog into the\nclient buffer ahead of consumption, so stopping at a count would lose\neverything already pushed.",
           "type": "string",
           "const": "auto"
         }
@@ -16020,6 +16020,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "visibility_extension_secs": {
+                      "description": "Visibility timeout, in seconds, the source keeps renewing on every\nmessage it has received but not yet deleted (while a page is assembled\nand while the sink writes it), so a slow page is not redelivered into\nthe same run. Renewed every third of this window. `0` disables renewal\nand leaves the queue's own visibility timeout in charge. Default 60.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint32",
+                      "minimum": 0,
+                      "default": 60
                     }
                   }
                 },
@@ -16144,6 +16154,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "progress_interval_secs": {
+                      "description": "JetStream only: send an in-progress ack (`+WPI`) every this many\nseconds for every message pulled but not yet acked (while a page is\nassembled and while the sink writes it), resetting the consumer's\n`ack_wait` so a slow page is not redelivered into the same run. Keep\nit below the consumer's `ack_wait` (30 s by default). `0` disables.\nDefault 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
                     }
                   },
                   "title": "NatsSourceConfig",
@@ -17461,6 +17481,21 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "on_decode_error": {
+                      "description": "What to do with a message whose payload does not decode. Default\n`fail`.",
+                      "$ref": "#/$defs/source_pubsub__OnDecodeError",
+                      "default": "fail"
+                    },
+                    "ack_deadline_extension_secs": {
+                      "description": "Ack deadline, in seconds, the source keeps renewing on every message it\nhas pulled but not yet acked (while a page is assembled and while the\nsink writes it), so a slow page is not redelivered into the same run.\nRenewed every 5 s (or every third of the window, if shorter). `0`\ndisables renewal. Range 10–600. Default 60.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint32",
+                      "minimum": 0,
+                      "default": 60
                     }
                   },
                   "title": "PubsubSourceConfig",
@@ -18628,7 +18663,7 @@
                       "default": []
                     },
                     "include_closed": {
-                      "description": "Also consume closed (post-resharding) shards still inside the\nretention window. Default `false` (open shards only).",
+                      "description": "Also consume closed (post-resharding) shards still inside the\nretention window that have no bookmark. A bookmarked closed shard is\nalways drained, before its children. Default `false`.",
                       "type": [
                         "boolean",
                         "string"
@@ -18656,7 +18691,7 @@
                       "default": 500
                     },
                     "shard_concurrency": {
-                      "description": "Max shards read concurrently. Default 4.",
+                      "description": "Max concurrent `GetRecords` calls; every shard is still read, in turn.\nDefault 4.",
                       "type": [
                         "integer",
                         "string"
@@ -31147,6 +31182,26 @@
           "const": "skip",
           "description": "Log a warning and resume from the earliest retained change, accepting\nthe loss (e.g. after re-snapshotting the destination).",
           "type": "string"
+        }
+      ]
+    },
+    "source_pubsub__OnDecodeError": {
+      "description": "What to do with a message whose payload does not decode under\n`value_format`.",
+      "oneOf": [
+        {
+          "description": "Fail the run. The message stays unacked, so Pub/Sub redelivers it and\nthe next run fails at it again until it is removed.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Drop the message: it is acked with its page and no record is emitted.",
+          "type": "string",
+          "const": "skip"
+        },
+        {
+          "description": "Emit the record with the payload base64-encoded under `data` and the\ndecode error under `decode_error`.",
+          "type": "string",
+          "const": "raw"
         }
       ]
     }
