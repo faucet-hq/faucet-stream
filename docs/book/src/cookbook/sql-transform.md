@@ -46,6 +46,20 @@ computed columns — anything DuckDB supports as a `SELECT` statement.
 
 `batch` is reserved. Using it as a reference relation name is a compile-time error.
 
+A field that is a number in one record and a string in another becomes a `VARCHAR`
+column. A key some records lack is `NULL` for them inside DuckDB; when the query
+keeps `batch`'s columns (`SELECT *`, `SELECT * EXCLUDE (…)`, filters) those keys are
+left out of the output again, so an upsert sink never overwrites the destination
+with an invented `NULL`. A real `null` in the input stays `null`.
+
+### Sandbox
+
+Once the reference relations are loaded, the DuckDB connection is closed to the
+host: no `read_text` / `read_csv` / `COPY … TO` / `ATTACH` / network reads (only the
+files of `reload_on_change` relations stay readable), no extension install or
+autoload, and the configuration is locked, so a query cannot raise its own
+`memory_limit` or `threads`.
+
 ## Per-page semantics and `batch_size: 0`
 
 **This is the most important thing to know about the SQL transform.**

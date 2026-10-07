@@ -2,9 +2,12 @@
 
 use crate::compile::{Reloadable, build_connection, sql_escape, validate_query};
 use crate::config::SqlTransformConfig;
-use crate::shovel::{infer_schema, json_to_record_batch, record_batches_to_json, schema_eq};
+use crate::shovel::{
+    ABSENT_MARKER, infer_schema, json_to_record_batch, mark_absent_fields, record_batches_to_json,
+    schema_eq, strip_absent_fields,
+};
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use duckdb::Connection;
 use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
 use faucet_core::FaucetError;
@@ -123,13 +126,18 @@ fn run_query_batches(st: &mut State, batch: RecordBatch) -> Result<Vec<RecordBat
     Ok(batches)
 }
 
-fn execute_page(st: &mut State, records: Vec<Value>) -> Result<Vec<Value>, FaucetError> {
+fn execute_page(st: &mut State, mut records: Vec<Value>) -> Result<Vec<Value>, FaucetError> {
     if records.is_empty() {
         return Ok(Vec::new());
     }
     // Schema cache: infer once per page, reuse the cached schema on a match,
     // otherwise adopt the freshly inferred one (first page or drift).
-    let fresh = infer_schema(&records)?;
+    let mut fresh = infer_schema(&records)?;
+    if mark_absent_fields(&mut records, &fresh) {
+        let mut fields: Vec<_> = fresh.fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(ABSENT_MARKER, DataType::Utf8, true)));
+        fresh = Arc::new(Schema::new(fields));
+    }
     let schema = match &st.cached_schema {
         Some(s) if schema_eq(s, &fresh) => s.clone(),
         _ => {
@@ -139,7 +147,9 @@ fn execute_page(st: &mut State, records: Vec<Value>) -> Result<Vec<Value>, Fauce
     };
     let batch = json_to_record_batch(&records, schema)?;
     let batches = run_query_batches(st, batch)?;
-    record_batches_to_json(&batches)
+    let mut rows = record_batches_to_json(&batches)?;
+    strip_absent_fields(&mut rows);
+    Ok(rows)
 }
 
 /// The columnar analogue of [`execute_page`]: feed an Arrow `RecordBatch`
