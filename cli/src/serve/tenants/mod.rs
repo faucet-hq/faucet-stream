@@ -565,13 +565,76 @@ pub async fn mark_needs_reauth(state: &ServerState, tenant: &str, name: &str, re
     .await;
 }
 
+/// Store a tenant's `notifications:` list: sealed under the vault key, the
+/// plain list left empty. An empty list needs no vault.
+pub fn seal_notifications(
+    rt: &TenantsRuntime,
+    rec: &mut TenantRecord,
+    list: Vec<Value>,
+) -> Result<(), ServeError> {
+    if list.is_empty() {
+        rec.notifications = Vec::new();
+        rec.notifications_sealed = None;
+        return Ok(());
+    }
+    let vault = rt.require_vault()?;
+    rec.notifications_sealed = Some(vault.seal(&Value::Array(list)));
+    rec.notifications = Vec::new();
+    Ok(())
+}
+
+/// A tenant's `notifications:` list in clear (a record written before
+/// sealing keeps its plain list).
+pub fn open_notifications(rt: &TenantsRuntime, rec: &TenantRecord) -> Result<Vec<Value>, String> {
+    let Some(sealed) = &rec.notifications_sealed else {
+        return Ok(rec.notifications.clone());
+    };
+    let vault = rt
+        .vault
+        .as_ref()
+        .ok_or("the tenant's notifications are sealed and this server has no vault key")?;
+    match vault.open(sealed)? {
+        Value::Array(list) => Ok(list),
+        _ => Err("sealed notifications are not a list".into()),
+    }
+}
+
+/// The `notifications:` list as an API response shows it: rule structure
+/// kept, every string under a channel's `config` masked.
+pub fn mask_notifications(list: &[Value]) -> Vec<Value> {
+    fn mask(v: &mut Value) {
+        match v {
+            Value::String(s) => *s = "***".into(),
+            Value::Array(a) => a.iter_mut().for_each(mask),
+            Value::Object(o) => o.values_mut().for_each(mask),
+            _ => {}
+        }
+    }
+    list.iter()
+        .cloned()
+        .map(|mut rule| {
+            if let Some(cfg) = rule.pointer_mut("/channel/config") {
+                mask(cfg);
+            }
+            rule
+        })
+        .collect()
+}
+
 /// Emit an event through a tenant's own `notifications:` rules.
 pub async fn notify_tenant(state: &ServerState, tenant: &str, event: crate::notify::NotifyEvent) {
     let Ok(Some(rec)) = state.history().tenant_get(tenant).await else {
         return;
     };
+    let list = match open_notifications(&state.tenants(), &rec) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(tenant, error = %e, "tenant notifications skipped");
+            return;
+        }
+    };
     let specs: Vec<crate::notify::NotificationSpec> =
-        match serde_json::from_value(Value::Array(rec.notifications.clone())) {
+        match serde_json::from_value(Value::Array(list)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(tenant, error = %e, "tenant notifications are malformed; skipped");
@@ -748,6 +811,7 @@ mod tests {
             labels: BTreeMap::new(),
             limits: Default::default(),
             notifications: Vec::new(),
+            notifications_sealed: None,
             suspended: false,
             created_at: now,
             updated_at: now,

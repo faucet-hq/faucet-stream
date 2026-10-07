@@ -107,6 +107,11 @@ pub async fn replay(
         state.caller_origin(),
     )
     .await?;
+    if !req.dry_run {
+        crate::serve::runner::refuse_unapproved_write(&state, "DLQ replay")?;
+        crate::serve::runner::policy_gate(&state, &actor, &loaded).await?;
+    }
+    let _permit = crate::serve::runner::inline_permit(&state)?;
     let auth = build_auth_catalog(loaded.cfg.auth.as_ref()).map_err(cli_to_serve)?;
     let pipeline_name = loaded
         .cfg

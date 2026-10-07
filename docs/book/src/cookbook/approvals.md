@@ -130,9 +130,19 @@ faucet serve --auth-config auth.yaml --require-approval run,template_launch
 ```
 
 - `run`: `POST /v1/runs` and template triggers answer with a pending change
-  request instead of starting a run; `POST /v1/backfill` is refused (propose
-  each window as a `run` change); the MCP `run_pipeline` tool points the agent
-  at `propose_run`.
+  request instead of starting a run; `POST /v1/backfill`, a `POST /v1/verify`
+  with `repair` and a `POST /v1/dlq/replay` (each writes to the destination;
+  their `dry_run` forms still answer) are refused with `403` (propose the run
+  as a `run` change); the MCP `run_pipeline` tool points the agent at
+  `propose_run`, and the MCP `run_template` tool answers with the pending
+  change request, as `POST /v1/templates/{id}/runs` does.
+- A trigger declared in the server's `--triggers` file is a **standing
+  approval**: whoever controls that file (the server operator) approved the
+  pipeline it names, so its fires — object arrivals, queue edges, schedule
+  ticks and `POST /v1/triggers/{name}` — run without a change request. A
+  fire per event would otherwise file one request per file or tick, and a
+  rejected one would lose the event. Leave a pipeline out of `--triggers` if
+  every run of it needs review.
 - `template_register` / `template_launch`: those kinds must come through
   `POST /v1/changes`. `POST /v1/templates` (both kinds when it also launches or
   assigns channels), `/launch`, `/rollback`, `/tags` and a non-dry-run

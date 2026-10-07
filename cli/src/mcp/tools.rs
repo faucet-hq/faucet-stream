@@ -742,6 +742,30 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
         return Ok(report);
     }
 
+    if let Some(server) = &ctx.server {
+        let mut req = json!({
+            "config": text,
+            "config_format": args.get("config_format").cloned().unwrap_or(json!("yaml")),
+        });
+        for key in ["name", "labels", "timeout_secs", "clock", "selection"] {
+            if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
+                req[key] = v.clone();
+            }
+        }
+        let req: crate::serve::runner::SubmitRequest =
+            serde_json::from_value(req).map_err(|e| format!("invalid arguments: {e}"))?;
+        let outcome =
+            crate::serve::runner::submit_gated(server.state.clone(), req, server.actor.clone())
+                .await
+                .map_err(|e| e.api_error().error.message)?;
+        return Ok(pretty(&match outcome {
+            crate::serve::runner::SubmitOutcome::Accepted(r) => json!(r),
+            crate::serve::runner::SubmitOutcome::PendingApproval(c) => {
+                crate::serve::runner::pending_approval_body(&c)
+            }
+        }));
+    }
+
     let summary = crate::run_from_yaml_str_selected(text, selection.as_ref())
         .await
         .map_err(|e| e.to_string())?;
@@ -1040,6 +1064,9 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         },
     };
     let selection = selection_arg(args)?;
+    if !dry_run && let Some(server) = &ctx.server {
+        return run_template_on_server(server, id, version, supplied, env, sink, selection).await;
+    }
     let materialized = crate::templates::materialize_for_run_selected(
         store,
         id,
@@ -1113,6 +1140,54 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         ));
     }
     Ok(pretty(&doc))
+}
+
+/// `run_template` on `faucet serve --mcp`: the same path as
+/// `POST /v1/templates/{id}/runs`, as the calling principal.
+#[cfg(feature = "templates")]
+async fn run_template_on_server(
+    server: &crate::mcp::ChangeProposer,
+    id: &str,
+    version: u32,
+    supplied: crate::params::SuppliedParams,
+    env: std::collections::BTreeMap<String, String>,
+    sink: crate::templates::SinkChoice,
+    selection: Option<crate::select::SelectionRequest>,
+) -> Result<String, String> {
+    use crate::serve::handlers::templates::{
+        OverlayRef, TriggerBody, TriggerOutcome, trigger_template_outcome,
+    };
+    use crate::serve::history::templates::VersionSelector;
+    let (overlay, overlay_version) = match sink.overlay {
+        Some(crate::templates::OverlayChoice::Registered { id, version }) => {
+            (Some(OverlayRef::Id(id)), Some(version))
+        }
+        Some(crate::templates::OverlayChoice::Inline(v)) => (Some(OverlayRef::Inline(v)), None),
+        None => (None, None),
+    };
+    let body = TriggerBody {
+        params: supplied.into_iter().collect(),
+        env,
+        version: Some(VersionSelector::Pinned(version)),
+        sink: sink.id,
+        sink_version: Some(sink.version),
+        overlay,
+        overlay_version,
+        selection,
+        ..Default::default()
+    };
+    let outcome = trigger_template_outcome(
+        server.state.clone(),
+        server.actor.clone(),
+        id.to_string(),
+        body,
+    )
+    .await
+    .map_err(|e| e.api_error().error.message)?;
+    Ok(pretty(&match outcome {
+        TriggerOutcome::Run(r) => json!(r),
+        TriggerOutcome::PendingApproval(c) => crate::serve::runner::pending_approval_body(&c),
+    }))
 }
 
 #[cfg(test)]

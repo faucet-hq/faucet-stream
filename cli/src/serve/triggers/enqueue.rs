@@ -375,6 +375,7 @@ pub fn template_body(
         timeout_secs: compiled.spec.run.timeout_secs,
         idempotency_key: Some(context::idempotency_key(name, event)),
         selection: compiled.spec.run.selection.clone(),
+        standing_approval: true,
         ..Default::default()
     })
 }
@@ -521,6 +522,7 @@ mod tests {
                     labels: Default::default(),
                     limits: Default::default(),
                     notifications: Vec::new(),
+                    notifications_sealed: None,
                     suspended: false,
                     created_at: now,
                     updated_at: now,

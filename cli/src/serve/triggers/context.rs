@@ -142,7 +142,7 @@ fn substitute_value(
 ) -> Result<(), String> {
     match v {
         serde_yaml::Value::String(s) if s.contains("${trigger.") => {
-            *s = substitute_plain(s, event, name, fired_at)?;
+            *s = substitute_with(s, event, name, fired_at, true)?;
         }
         serde_yaml::Value::Sequence(items) => {
             for item in items {
@@ -169,6 +169,19 @@ pub fn substitute_plain(
     name: &str,
     fired_at: &str,
 ) -> Result<String, String> {
+    substitute_with(text, event, name, fired_at, false)
+}
+
+/// `escape` writes each `${` an event value carries as `$${`, so the
+/// interpolation pass the config goes through next keeps it literal instead
+/// of resolving a directive the event's author smuggled in.
+fn substitute_with(
+    text: &str,
+    event: &TriggerEvent,
+    name: &str,
+    fired_at: &str,
+    escape: bool,
+) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${trigger.") {
@@ -179,6 +192,7 @@ pub fn substitute_plain(
         };
         let token = &after[8..end];
         match event.lookup(token, name, fired_at) {
+            Some(v) if escape => out.push_str(&v.replace("${", "$${")),
             Some(v) => out.push_str(&v),
             None => {
                 return Err(format!(
@@ -205,7 +219,7 @@ pub fn idempotency_key(name: &str, event: &TriggerEvent) -> String {
             format!("trig:{name}:{bucket}:{key}:{last_modified}")
         }
         TriggerEvent::ObjectBatch { watermark, .. } => format!("trig:{name}:{watermark}"),
-        TriggerEvent::Webhook { idem, .. } => idem.clone(),
+        TriggerEvent::Webhook { idem, .. } => format!("trig:{name}:{idem}"),
         TriggerEvent::QueueDepth { edge, .. } => format!("trig:{name}:edge:{edge}"),
         TriggerEvent::Schedule { tick } => format!("trig:{name}:{tick}"),
     }
@@ -262,6 +276,26 @@ pub fn render_name(template: &str, event: &TriggerEvent, name: &str, fired_at: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directives_carried_by_event_values_stay_literal_through_interpolation() {
+        let e = TriggerEvent::Object {
+            bucket: "b".into(),
+            key: "incoming/${env:HOME}/x$${env:HOME}.csv".into(),
+            size: 1,
+            last_modified: "t".into(),
+        };
+        let out = substitute("path: data/${trigger.object_key}\n", &e, "n", "f").unwrap();
+        let resolved = crate::interpolate::interpolate(&out).unwrap();
+        assert_eq!(
+            parsed(&resolved)["path"],
+            "data/incoming/${env:HOME}/x$${env:HOME}.csv"
+        );
+        assert_eq!(
+            substitute_plain("${trigger.object_key}", &e, "n", "f").unwrap(),
+            "incoming/${env:HOME}/x$${env:HOME}.csv"
+        );
+    }
 
     #[test]
     fn schedule_events_substitute_label_and_key_by_tick() {

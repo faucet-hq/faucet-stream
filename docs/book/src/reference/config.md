@@ -301,7 +301,9 @@ trigger body); supplying a value for one is an error. A `computed` expression ma
 reference other params (`${param.NAME}`, including other computed params) and the
 `${map:NAME|case=value|*=default}` lookup — a small, non-Turing-complete switch on
 another param's value. Cycles and an unmatched map with no `*` default are
-load-time errors.
+load-time errors. A computed param that references a `secret: true` param
+(directly or through another computed param) is secret too: its value is
+redacted from logs and shown as `***` in trigger responses.
 
 ```yaml
 params:

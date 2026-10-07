@@ -57,6 +57,10 @@ pub type SuppliedParams = BTreeMap<String, Value>;
 pub struct BoundParams {
     pub values: BTreeMap<String, Value>,
     pub secret_names: BTreeSet<String>,
+    /// The secret params whose value the caller supplied (and computed params
+    /// derived from one). A secret that came from its `default` is not here:
+    /// its `${env:…}` default can be deferred to the executing instance.
+    pub supplied_secret_names: BTreeSet<String>,
 }
 
 impl BoundParams {
@@ -80,6 +84,12 @@ impl BoundParams {
     /// guard in the template-trigger path).
     pub fn has_secrets(&self) -> bool {
         !self.secret_names.is_empty()
+    }
+
+    /// Whether a caller-supplied value of a secret param was bound — what a
+    /// persisted (clustered / approval) body cannot carry.
+    pub fn has_supplied_secrets(&self) -> bool {
+        !self.supplied_secret_names.is_empty()
     }
 }
 
@@ -177,6 +187,9 @@ pub fn resolve(
             // API body. `register` no-ops below the registry's minimum length.
             crate::secrets::registry::register(&value_to_string(&value));
             bound.secret_names.insert(name.clone());
+            if supplied.contains_key(name) {
+                bound.supplied_secret_names.insert(name.clone());
+            }
         }
         bound.values.insert(name.clone(), value);
     }
@@ -211,6 +224,14 @@ fn resolve_computed(spec: &ParamsSpec, bound: &mut BoundParams) -> CliResult<()>
             let refs = referenced_params(&expr);
             if refs.iter().all(|r| bound.values.contains_key(r)) {
                 let value = eval_computed_expr(&name, &expr, &bound.values)?;
+                // Derived from a secret, the computed value is one too.
+                if refs.iter().any(|r| bound.secret_names.contains(r)) {
+                    crate::secrets::registry::register(&value);
+                    bound.secret_names.insert(name.clone());
+                }
+                if refs.iter().any(|r| bound.supplied_secret_names.contains(r)) {
+                    bound.supplied_secret_names.insert(name.clone());
+                }
                 bound.values.insert(name, Value::String(value));
                 progressed = true;
             } else {
@@ -968,6 +989,52 @@ mod tests {
         assert_eq!(doc["pipeline"]["headers"]["X-Tenant"], "v");
         assert_eq!(doc["pipeline"]["list"][0], json!(2));
         assert_eq!(doc["pipeline"]["list"][1], json!("n=2"));
+    }
+
+    #[test]
+    fn a_computed_param_derived_from_a_secret_is_secret_too() {
+        let spec = spec_of(
+            "api_token: { required: true, secret: true }\n\
+             auth_header: { computed: \"Bearer ${param.api_token}\" }\n\
+             upper: { computed: \"[${param.auth_header}]\" }\n\
+             region: { default: eu }\n\
+             path: { computed: \"/${param.region}\" }\n",
+        );
+        let bound = resolve(
+            &spec,
+            &supplied(&[("api_token", json!("tok-derived-secret-123"))]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        let red = bound.redacted();
+        assert_eq!(red["auth_header"], json!("***"));
+        assert_eq!(red["upper"], json!("***"));
+        assert_eq!(red["path"], json!("/eu"));
+        assert!(bound.supplied_secret_names.contains("upper"));
+        assert!(!bound.secret_names.contains("path"));
+        assert_eq!(
+            crate::secrets::registry::redact("h=Bearer tok-derived-secret-123"),
+            "h=***"
+        );
+    }
+
+    #[test]
+    fn a_secret_bound_from_its_default_is_not_a_supplied_secret() {
+        let spec = spec_of(
+            "token: { secret: true, default: \"from-default-value\" }\n\
+             hdr: { computed: \"x ${param.token}\" }\n",
+        );
+        let bound = resolve(&spec, &SuppliedParams::new(), BindMode::Strict).unwrap();
+        assert!(bound.has_secrets());
+        assert!(!bound.has_supplied_secrets());
+        assert_eq!(bound.redacted()["hdr"], json!("***"));
+        let bound = resolve(
+            &spec,
+            &supplied(&[("token", json!("caller-value-long"))]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        assert!(bound.has_supplied_secrets());
     }
 
     #[test]

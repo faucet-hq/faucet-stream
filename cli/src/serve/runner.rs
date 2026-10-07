@@ -149,6 +149,32 @@ pub async fn submit_gated(
     Ok(SubmitOutcome::Accepted(submit(state, req, actor).await?))
 }
 
+/// Refuse a write that would bypass `--require-approval run` (#789
+/// SERVE-18): verify repair and DLQ replay write to a sink outside the run
+/// queue, so under approval they must be proposed as a `run` change instead.
+pub(crate) fn refuse_unapproved_write(state: &ServerState, what: &str) -> Result<(), ServeError> {
+    if state.requires_approval(crate::serve::changes::ChangeKind::Run) {
+        return Err(ServeError::Forbidden(format!(
+            "this server requires an approved change request for runs (--require-approval run); \
+             {what} writes to the destination, so propose the run through POST /v1/changes \
+             (or use dry_run)"
+        )));
+    }
+    Ok(())
+}
+
+/// A run slot for work that executes inline in the request (verify, DLQ
+/// replay), so it counts against `--max-concurrent-runs` like a queued run.
+pub(crate) fn inline_permit(
+    state: &ServerState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ServeError> {
+    state.semaphore().try_acquire_owned().map_err(|_| {
+        ServeError::TooManyRequests(
+            "every run slot is busy (--max-concurrent-runs); retry when a run finishes".into(),
+        )
+    })
+}
+
 /// Fold a request-level budget (#703) into the config document, so the
 /// stored body (what a cluster peer re-runs) carries it too. The config's own
 /// `budget:` and the request's merge, the stricter of each ceiling winning.
@@ -942,7 +968,7 @@ pub async fn submit(
     // that guessing either way would be wrong (#610).
     if req.concurrency == Some(0) {
         return Err(ServeError::Unprocessable {
-            message: "concurrency must be greater than 0 — it is a connection/fetch count,                       not a `0 = unlimited` sentinel"
+            message: "concurrency must be greater than 0 — it is a connection/fetch count, not a `0 = unlimited` sentinel"
                 .into(),
             details: None,
         });

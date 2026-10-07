@@ -88,7 +88,10 @@ pub struct TenantView {
     pub active_runs: usize,
 }
 
-async fn view(state: &ServerState, tenant: TenantRecord) -> Result<TenantView, ServeError> {
+async fn view(state: &ServerState, mut tenant: TenantRecord) -> Result<TenantView, ServeError> {
+    let plain = tenants::open_notifications(&state.tenants(), &tenant).unwrap_or_default();
+    tenant.notifications = tenants::mask_notifications(&plain);
+    tenant.notifications_sealed = None;
     let connections = state
         .history()
         .connection_list(&tenant.id)
@@ -147,17 +150,19 @@ pub async fn create_tenant(
         )));
     }
     let now = Utc::now();
-    let rec = TenantRecord {
+    let mut rec = TenantRecord {
         id: body.id,
         name: body.name,
         labels: body.labels,
         limits: body.limits,
-        notifications: body.notifications,
+        notifications: Vec::new(),
+        notifications_sealed: None,
         suspended: false,
         created_at: now,
         updated_at: now,
         created_by: actor.principal.clone(),
     };
+    tenants::seal_notifications(&state.tenants(), &mut rec, body.notifications)?;
     history.tenant_upsert(&rec).await.map_err(store_err)?;
     crate::serve::audit::write(
         &state,
@@ -225,8 +230,8 @@ pub async fn patch_tenant(
     if let Some(l) = body.limits {
         rec.limits = l;
     }
-    if let Some(n) = body.notifications {
-        rec.notifications = n;
+    if let Some(n) = &body.notifications {
+        tenants::validate_notifications(n).map_err(ServeError::BadConfig)?;
     }
     let action = match body.suspended {
         Some(true) if !rec.suspended => "tenant.suspend",
@@ -236,7 +241,10 @@ pub async fn patch_tenant(
     if let Some(s) = body.suspended {
         rec.suspended = s;
     }
-    check_fields(&rec.limits, &rec.notifications)?;
+    rec.limits.validate().map_err(ServeError::BadConfig)?;
+    if let Some(n) = body.notifications {
+        tenants::seal_notifications(&state.tenants(), &mut rec, n)?;
+    }
     rec.updated_at = Utc::now();
     state
         .history()

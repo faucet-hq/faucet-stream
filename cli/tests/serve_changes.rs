@@ -475,6 +475,29 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
         .await;
     assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
     assert_eq!(list[0]["id"], proposed["change_id"]);
+    // On the server transport `run_pipeline` is a tracked run in the queue,
+    // not an in-request execution (#789 SERVE-20).
+    let mcp_out = dir.path().join("mcp-out.jsonl");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {
+                "name": "run_pipeline",
+                "arguments": { "config": csv_config(&input, &mcp_out, "via-mcp") }
+            }}),
+        )
+        .await;
+    assert!(!r["result"]["isError"].as_bool().unwrap_or(false), "{r}");
+    let sub: Value =
+        serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let rec = api.wait_run(sub["run_id"].as_str().unwrap()).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+    assert_eq!(
+        std::fs::read_to_string(&mcp_out).unwrap().lines().count(),
+        3
+    );
+
     // A proposal whose config cannot be planned comes back as a tool error
     // carrying the server error's `code: message` rendering.
     let (_, bad) = api
@@ -599,6 +622,52 @@ async fn require_approval_turns_submissions_into_change_requests() {
             .contains("propose_run"),
         "{r}"
     );
+
+    // Verify repair and DLQ replay write to the sink outside the queue, so
+    // they are refused under the gate too (#789 SERVE-18).
+    let (code, r) = api
+        .post(
+            "bob-tok",
+            "/v1/verify",
+            json!({ "config": config, "repair": true, "allow_delete": true }),
+        )
+        .await;
+    assert_eq!(code, 403, "{r}");
+    let (code, r) = api
+        .post(
+            "bob-tok",
+            "/v1/dlq/replay",
+            json!({ "config": config, "from": dir.path().join("dlq.jsonl").display().to_string() }),
+        )
+        .await;
+    assert_eq!(code, 403, "{r}");
+    assert!(!output.exists());
+
+    // MCP `run_template` submits through the server, so it becomes a change
+    // request instead of running in the request task (#789 SERVE-20).
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({ "config": format!("kind: pipeline\n{}", csv_config(&input, &output, "tpl-gated")),
+                    "id": "tpl-gated", "launch": true }),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (_, r) = api
+        .post(
+            "bob-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "run_template", "arguments": { "id": "tpl-gated" }
+            }}),
+        )
+        .await;
+    let text = r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("pending_approval"), "{r}");
+    assert!(!output.exists());
 
     // Approval runs it.
     let (code, executed) = api

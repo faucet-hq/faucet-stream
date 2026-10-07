@@ -202,6 +202,36 @@ async fn webhook_trigger_enqueues_exactly_one_run() {
         "idempotency must dedupe the replay — got {} runs",
         page2.runs.len()
     );
+
+    // The same event id delivered to a second webhook trigger runs that
+    // trigger's pipeline too: keys are namespaced by trigger (#789 SERVE-37).
+    let out2 = dir.path().join("out2.jsonl");
+    let inline2 = inline_pipeline(csv.to_str().unwrap(), out2.to_str().unwrap());
+    let file2: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: hook2\n    type: webhook\n    dedupe_header: Idempotency-Key\n    config: {}\n",
+        serde_json::to_string(&inline2).unwrap()
+    ))
+    .unwrap();
+    let compiled2 = CompiledTriggers::compile(file2).unwrap();
+    let event3 = faucet_cli::serve::triggers::context::TriggerEvent::Webhook {
+        method: "POST".into(),
+        body: "{}".into(),
+        headers: Default::default(),
+        query: Default::default(),
+        idem: "evt-1".into(),
+    };
+    let outcome =
+        faucet_cli::serve::triggers::enqueue::fire(&state, &compiled2.triggers[0], event3, &now)
+            .await;
+    assert!(
+        matches!(
+            outcome,
+            faucet_cli::serve::triggers::enqueue::FireOutcome::Enqueued(_)
+        ),
+        "expected Enqueued, got {outcome:?}"
+    );
+    wait_for_runs(&state, 2).await;
+    assert!(out2.exists(), "the second trigger's pipeline ran");
 }
 
 fn webhook_event(query: &[(&str, &str)]) -> faucet_cli::serve::triggers::context::TriggerEvent {
@@ -863,4 +893,43 @@ async fn webhook_debounce_coalesces_second_fire() {
         1,
         "debounce must coalesce the second fire — exactly one run expected"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn webhook_query_values_are_percent_decoded() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+    let triggers = write_triggers_file(
+        dir.path(),
+        "hook",
+        &csv,
+        std::path::Path::new("${trigger.query.out}"),
+        "",
+    );
+    let token = "test-token";
+    let port = free_port();
+    let base = spawn_serve_with_triggers(port, Some(token), &triggers).await;
+    let target = dir.path().join("sub dir").join("out.jsonl");
+    let encoded: String = target
+        .to_str()
+        .unwrap()
+        .replace('%', "%25")
+        .replace('/', "%2F")
+        .replace(' ', "+");
+    let ok = reqwest::Client::new()
+        .post(format!("{base}/v1/triggers/hook?out={encoded}"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 202);
+    for _ in 0..400 {
+        if target.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(target.exists(), "the decoded path was written");
 }

@@ -149,8 +149,8 @@ debounce_secs: 0            # leading-edge debounce window in seconds (default 0
 > since the last accepted fire. Debounce is webhook-only; polling triggers
 > (`object_arrival`, `queue_depth`) pace themselves via `poll_interval_secs`.
 
-> **`dedupe_header` trust boundary:** the caller-supplied header value is used
-> verbatim as the run's idempotency key. A caller who controls this value can
+> **`dedupe_header` trust boundary:** the caller-supplied header value becomes
+> the run's idempotency key (namespaced by the trigger name). A caller who controls this value can
 > suppress a legitimate run by reusing a key from a prior run. Only set
 > `dedupe_header` when callers are trusted or the header value is verified
 > upstream (e.g. by a gateway signing scheme or HMAC validation).
@@ -171,9 +171,11 @@ debounce_secs: 0            # leading-edge debounce window in seconds (default 0
 | `${trigger.header.<name>}` | Value of HTTP request header `<name>` |
 | `${trigger.query.<name>}` | Value of query parameter `<name>` |
 
-**Idempotency key:** the raw value of the `dedupe_header` when configured and
-present in the request (no prefix or name segment — the header value is used
-verbatim); otherwise a fresh per-request UUID (also bare, no prefix).
+**Idempotency key:** `trig:<name>:<value>`, where `<value>` is the
+`dedupe_header` value when configured and present in the request, otherwise a
+fresh per-request UUID. The trigger name keeps keys apart: one event id
+delivered to two webhook triggers runs both pipelines, and never collides with
+a key a caller used on `POST /v1/runs`.
 
 Fire the webhook with `curl`:
 

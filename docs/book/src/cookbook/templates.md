@@ -114,7 +114,10 @@ faucet validate tenant-sync.yaml --param tenant_id=acme --param api_token=x
 `${env:VAR}` resolution only; bare `--param-env TOKEN` takes the value from your
 own environment, so a secret never appears in the process arguments. The process
 environment itself is never modified — which is what makes this safe inside a
-concurrent server.
+concurrent server. A template trigger's `env` overrides (HTTP / MCP) may only
+name variables the template reads (`${env:NAME}` / `${secret:NAME}`) and are
+literal text — a value containing `${` is refused, and a tenant-scoped
+principal may not pass `env` at all.
 
 ```bash
 faucet run tenant-sync.yaml --param tenant_id=acme --param-env API_HOST=eu.example.com
@@ -733,10 +736,13 @@ redaction, and echoed back as `"***"`.
 
 One consequence is worth stating plainly: a **clustered** server persists the
 materialized config so a peer can execute the run, which would put a secret param
-value in the shared history database. A clustered trigger of a template declaring
-`secret: true` params is therefore refused with a `422` explaining the two safe
-alternatives (reference the secret from the body, or trigger on a non-clustered
-server). Non-clustered servers store no config body and are unaffected.
+value in the shared history database. A clustered trigger that *supplies* a value
+for a `secret: true` param is therefore refused with a `422` explaining the two
+safe alternatives (reference the secret from the body, or trigger on a
+non-clustered server). A secret param left at a `default: "${env:VAR}"` is not
+refused: the reference stays unresolved in the persisted body and resolves on
+the executing instance. Non-clustered servers store no config body and are
+unaffected.
 
 ## Hosting templates in a repo or bucket (sync)
 

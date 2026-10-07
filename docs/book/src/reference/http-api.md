@@ -370,7 +370,10 @@ is the last `run_id` from the previous page.
 ```
 
 `status` is one of `queued`, `running`, `completed`, `failed`, `cancelled`.
-`elapsed_secs` is filled live for running runs. Each invocation carries
+`elapsed_secs` is filled live for running runs. A run's completion `callback`
+comes back with every header value as `***` and URL credentials stripped, and
+the stored `config_body` (cluster runs) is returned to admins only — it can
+hold inline credentials. Each invocation carries
 `batches` — how its sink writes ended (`committed` / `dlq_partial` / `dlq_all` /
 `failed`, #737) — and, for a source with a head, `source_lag` at the end of the
 invocation (`bytes` / `events` / `seconds`, #733).

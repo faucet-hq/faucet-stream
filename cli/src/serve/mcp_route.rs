@@ -56,6 +56,10 @@ pub async fn handle(
         .with_template_admin(actor.role.grants(Permission::TemplateAdmin))
         .with_submitted_origin(state.caller_origin())
         .with_approval_required(state.require_approval().to_vec());
+    let ctx = ctx.with_server(crate::mcp::ChangeProposer {
+        state: state.clone(),
+        actor: actor.clone(),
+    });
     #[cfg(feature = "templates")]
     let ctx = ctx.with_templates(state.history());
     // Change requests (#703): an agent that may submit a run may propose one.

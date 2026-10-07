@@ -1643,6 +1643,7 @@ mod tests {
             labels: BTreeMap::new(),
             limits: Default::default(),
             notifications: Vec::new(),
+            notifications_sealed: None,
             suspended: false,
             created_at: now,
             updated_at: now,
