@@ -254,7 +254,14 @@ fn table_descriptor(cols: &[CatalogRow]) -> Result<DatasetDescriptor, FaucetErro
         }
         let mut fragment = family.json_schema();
         if c.nullable {
-            fragment = faucet_core::nullable_type(fragment);
+            fragment = match fragment.get("type").cloned() {
+                Some(Value::Array(mut types)) => {
+                    types.push(json!("null"));
+                    fragment["type"] = Value::Array(types);
+                    fragment
+                }
+                _ => faucet_core::nullable_type(fragment),
+            };
         }
         schema_cols.push((c.column.clone(), fragment));
     }
@@ -479,10 +486,13 @@ mod tests {
         );
         assert_eq!(ds[0].config_patch["json_columns"], json!(["DOC"]));
         let schema = ds[0].schema.as_ref().unwrap();
-        assert_eq!(schema["properties"]["ID"]["type"], "integer");
+        assert_eq!(
+            schema["properties"]["ID"]["type"],
+            json!(["integer", "string"])
+        );
         assert_eq!(
             schema["properties"]["TOTAL"]["type"],
-            json!(["number", "null"])
+            json!(["number", "string", "null"])
         );
         assert_eq!(
             ds[1].config_patch,
