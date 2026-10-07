@@ -50,7 +50,7 @@ is flattened in alongside these fields:
 | `include_metadata`  | `bool`                  | `false`           | wrap records as `{data, exchange, routing_key, delivery_tag, redelivered, headers, content_type, message_id, correlation_id, timestamp}` |
 | `consumer_tag`      | `Option<String>`        | broker-generated  | consumer tag |
 | `max_messages`      | `Option<usize>`         | —                 | stop after this many messages |
-| `idle_timeout_secs` | `Option<u64>`           | —                 | stop after this many idle seconds |
+| `idle_timeout_secs` | `Option<u64>`           | —                 | stop after this many idle seconds; the window restarts each time the pipeline asks for the next page, so a slow sink write is not idleness |
 | `batch_size`        | `usize`                 | `1000`            | records per page and per ack (`0` = one page for the run) |
 
 At least one of `max_messages` / `idle_timeout_secs` must be set so the run

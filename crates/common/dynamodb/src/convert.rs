@@ -173,6 +173,45 @@ pub fn json_to_attribute(v: &Value) -> AttributeValue {
     }
 }
 
+/// Convert a JSON key value to the table's declared key type, so a record
+/// read from another DynamoDB table (where `B` arrives as base64 and an
+/// imprecise `N` as a decimal string) addresses the same key. A value that
+/// cannot be that type is an error naming the attribute.
+pub fn json_to_key_attribute(
+    name: &str,
+    v: &Value,
+    scalar: crate::table::ScalarType,
+) -> Result<AttributeValue, String> {
+    use crate::table::ScalarType;
+    match (scalar, v) {
+        (ScalarType::String, Value::String(s)) => Ok(AttributeValue::S(s.clone())),
+        (ScalarType::Number, Value::Number(n)) => Ok(AttributeValue::N(json_number_to_n(n))),
+        (ScalarType::Number, Value::String(s)) if canonical_decimal(s).is_some() => {
+            Ok(AttributeValue::N(s.trim().to_string()))
+        }
+        (ScalarType::Binary, Value::String(s)) => base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map(|b| AttributeValue::B(Blob::new(b)))
+            .map_err(|e| {
+                format!("key attribute '{name}' is a binary (B) key but is not base64: {e}")
+            }),
+        (scalar, other) => Err(format!(
+            "key attribute '{name}' must be {} for the table's {} key, got {}",
+            match scalar {
+                ScalarType::String => "a string",
+                ScalarType::Number => "a number or a decimal string",
+                ScalarType::Binary => "a base64 string",
+            },
+            match scalar {
+                ScalarType::String => "S",
+                ScalarType::Number => "N",
+                ScalarType::Binary => "B",
+            },
+            json_kind(other)
+        )),
+    }
+}
+
 /// Convert a JSON object record to a DynamoDB item. Non-objects are rejected.
 pub fn json_to_item(v: &Value) -> Result<HashMap<String, AttributeValue>, FaucetError> {
     match v {
@@ -415,6 +454,43 @@ mod tests {
             number_to_json("1e99999999999999999999"),
             json!("1e99999999999999999999")
         );
+    }
+
+    #[test]
+    fn key_attributes_follow_the_declared_type() {
+        use crate::table::ScalarType;
+        assert_eq!(
+            json_to_key_attribute("k", &json!("a"), ScalarType::String).unwrap(),
+            AttributeValue::S("a".into())
+        );
+        assert_eq!(
+            json_to_key_attribute("k", &json!(7), ScalarType::Number).unwrap(),
+            AttributeValue::N("7".into())
+        );
+        let big = "123456789012345678901234567890.000000001";
+        assert_eq!(
+            json_to_key_attribute("k", &json!(big), ScalarType::Number).unwrap(),
+            AttributeValue::N(big.into())
+        );
+        let bin = json_to_key_attribute("k", &json!("AAEC"), ScalarType::Binary).unwrap();
+        assert_eq!(bin, AttributeValue::B(Blob::new(vec![0u8, 1, 2])));
+        let raw = AttributeValue::B(Blob::new(vec![0u8, 1, 2]));
+        assert_eq!(
+            json_to_key_attribute("k", &attribute_to_json(&raw).unwrap(), ScalarType::Binary)
+                .unwrap(),
+            raw
+        );
+        let e = json_to_key_attribute("k", &json!("@@"), ScalarType::Binary).unwrap_err();
+        assert!(e.contains("not base64"), "{e}");
+        let e = json_to_key_attribute("k", &json!("x1"), ScalarType::Number).unwrap_err();
+        assert!(e.contains("table's N key") && e.contains("string"), "{e}");
+        let e = json_to_key_attribute("k", &json!(1), ScalarType::String).unwrap_err();
+        assert!(
+            e.contains("a string for the table's S key, got number"),
+            "{e}"
+        );
+        let e = json_to_key_attribute("k", &json!(true), ScalarType::Binary).unwrap_err();
+        assert!(e.contains("base64 string"), "{e}");
     }
 
     #[test]

@@ -28,10 +28,18 @@ source:
 | `idle_timeout_secs` / `max_messages` | — | **At least one is required** so a batch run terminates. |
 | `wait_time_seconds` | `10` | Long-poll wait per `ReceiveMessage` (0–20). |
 | `batch_size` | `1000` | Records per emitted page. `0` = one page for the whole drain. |
+| `include_metadata` | `false` | Wrap each record as `{message_id, attributes, payload}` — the SQS `MessageId` for downstream deduplication of redeliveries, and the message attributes (requested only when this is on). |
 | `visibility_extension_secs` | `60` | Visibility timeout renewed (every third of the window) on every message received but not yet deleted, so a slow page is not redelivered into the same run. `0` disables renewal (3–43200 otherwise). |
 
 Each `ReceiveMessage` call requests up to 10 messages (the SQS API cap),
-capped further so it never over-reads past `max_messages`.
+capped further so it never over-reads past `max_messages`. With
+`wait_time_seconds: 0` an empty receive is followed by a short pause rather
+than an immediate retry.
+
+**FIFO queues** (`.fifo`) hand out nothing more from a message group while its
+earlier messages are in flight, so the source emits — and, once written,
+deletes — a page after every receive instead of waiting for `batch_size`
+messages; a single-group queue drains completely.
 
 ## Record shape
 

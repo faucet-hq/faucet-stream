@@ -19,6 +19,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

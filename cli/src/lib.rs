@@ -404,6 +404,7 @@ pub async fn run_from_yaml_str_selected(
         nodes,
         executor::ExecuteOptions {
             legacy_state_writes: false,
+            force_lease: false,
             pipeline_name,
             run_id: None,
             execution: cfg.execution.clone(),

@@ -28,6 +28,10 @@ pub struct KafkaSink {
     txn: tokio::sync::OnceCell<Arc<FutureProducer>>,
     #[cfg(feature = "schema-registry")]
     sr_client: Option<SchemaRegistryClient>,
+    /// The registry the key format names (it may differ from the value's),
+    /// falling back to the value's (#789 MSG-95).
+    #[cfg(feature = "schema-registry")]
+    key_sr_client: Option<SchemaRegistryClient>,
 }
 
 impl KafkaSink {
@@ -42,6 +46,11 @@ impl KafkaSink {
 
         #[cfg(feature = "schema-registry")]
         let sr_client = build_sr_client(&config.value_format, config.key_format.as_ref())?;
+        #[cfg(feature = "schema-registry")]
+        let key_sr_client = match &config.key_format {
+            Some(kf) => build_sr_client(kf, Some(&config.value_format))?,
+            None => None,
+        };
 
         Ok(Self {
             config,
@@ -49,6 +58,8 @@ impl KafkaSink {
             txn: tokio::sync::OnceCell::new(),
             #[cfg(feature = "schema-registry")]
             sr_client,
+            #[cfg(feature = "schema-registry")]
+            key_sr_client,
         })
     }
 
@@ -99,7 +110,7 @@ impl KafkaSink {
                             &v,
                             fmt,
                             #[cfg(feature = "schema-registry")]
-                            self.sr_client.as_ref(),
+                            self.key_sr_client.as_ref(),
                             #[cfg(feature = "schema-registry")]
                             &key_ctx,
                         )
@@ -134,8 +145,8 @@ impl KafkaSink {
         extracted: Option<Value>,
     ) -> Result<Option<Value>, FaucetError> {
         match extracted {
-            Some(v) => Ok(Some(v)),
-            None => match self.config.on_key_error {
+            Some(v) if !v.is_null() => Ok(Some(v)),
+            _ => match self.config.on_key_error {
                 OnKeyError::Fail => Err(FaucetError::Sink(
                     "key_path did not resolve and on_key_error=fail".into(),
                 )),
@@ -167,6 +178,9 @@ impl KafkaSink {
                 let msg_timeout_ms = self.config.message_timeout.as_millis();
                 let txn_timeout_ms = msg_timeout_ms.max(60_000);
                 cfg.set("transaction.timeout.ms", txn_timeout_ms.to_string());
+                if let Some(cap) = crate::idempotent::txn_queue_capacity(&self.config) {
+                    cfg.set("queue.buffering.max.messages", cap);
+                }
 
                 let producer: FutureProducer = cfg
                     .create()
@@ -416,8 +430,8 @@ impl Sink for KafkaSink {
                     partition,
                     headers,
                 },
-                self.config.queue_full_max_retries,
                 self.config.queue_full_backoff,
+                self.config.message_timeout,
             )
             .await
             {
@@ -441,8 +455,8 @@ impl Sink for KafkaSink {
                 key: Some(token_key.into_bytes()),
                 ..RecordRouting::default()
             },
-            self.config.queue_full_max_retries,
             self.config.queue_full_backoff,
+            self.config.message_timeout,
         )
         .await
         {

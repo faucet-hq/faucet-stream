@@ -346,6 +346,21 @@ impl crate::state::StateStore for VersionedStateStore {
         self.inner.list(prefix).await
     }
 
+    fn supports_compare_and_put(&self) -> bool {
+        self.inner.supports_compare_and_put()
+    }
+
+    async fn compare_and_put(
+        &self,
+        key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        self.inner
+            .compare_and_put(key, expected, &self.stored(key, value))
+            .await
+    }
+
     fn supports_atomic_batch(&self) -> bool {
         self.inner.supports_atomic_batch()
     }
@@ -363,6 +378,22 @@ impl crate::state::StateStore for VersionedStateStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn compare_and_put_reaches_the_inner_store() {
+        use crate::state::StateStore as _;
+        let inner = std::sync::Arc::new(crate::state::MemoryStateStore::new());
+        let codec = StateCodec {
+            owner: "x".into(),
+            schema: 1,
+            legacy: false,
+        };
+        let v = VersionedStateStore::new(inner.clone(), "bm", codec);
+        assert!(v.supports_compare_and_put());
+        assert!(v.compare_and_put("lease", None, &json!(1)).await.unwrap());
+        assert!(!v.compare_and_put("lease", None, &json!(2)).await.unwrap());
+        assert_eq!(inner.get("lease").await.unwrap(), Some(json!(1)));
+    }
 
     #[test]
     fn legacy_values_parse_as_schema_zero() {

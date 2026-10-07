@@ -400,3 +400,25 @@ async fn check_probes_connect_and_queue() {
     ));
     assert_eq!(wait_ready(&broker.url, "exists", 0).await, 0);
 }
+
+/// A sink slower than `idle_timeout_secs` no longer ends the run after one
+/// page: the idle window restarts when the pipeline asks for the next page
+/// (#789 MSG-61).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_sink_does_not_count_as_idle() {
+    let broker = start_broker().await;
+    declare_queue(&broker.url, "slow").await;
+    publish_json(&broker.url, "slow", 15).await;
+    let mut cfg = source_cfg(&broker.url, "slow");
+    cfg.batch_size = 5;
+    cfg.idle_timeout_secs = Some(2);
+    let source = RabbitMqSource::new(cfg).await.unwrap();
+    let ctx = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 0);
+    let mut total = 0;
+    while let Some(page) = pages.next().await {
+        total += page.unwrap().records.len();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await; // the "sink write"
+    }
+    assert_eq!(total, 15);
+}

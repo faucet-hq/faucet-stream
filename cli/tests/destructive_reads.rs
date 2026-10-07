@@ -29,6 +29,7 @@ pipeline:
 fn opts(dry_run: bool, limit: Option<usize>) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: "queue_preview".into(),
         run_id: None,
         execution: None,

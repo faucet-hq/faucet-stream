@@ -14,6 +14,7 @@ use faucet_cli::expand::expand;
 fn opts(name: &str, max_concurrent: Option<usize>) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: name.into(),
         run_id: None,
         execution: max_concurrent.map(|n| faucet_cli::config::ExecutionSpec {

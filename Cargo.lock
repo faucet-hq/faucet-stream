@@ -5168,6 +5168,7 @@ version = "1.1.0"
 dependencies = [
  "faucet-core",
  "gcloud-auth",
+ "gcloud-gax",
  "gcloud-googleapis",
  "gcloud-pubsub",
  "schemars 1.2.1",
@@ -6358,6 +6359,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "urlencoding",
  "wiremock",
 ]
 
@@ -6844,6 +6846,7 @@ version = "1.4.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "faucet-conformance",
  "faucet-core",
  "futures",
@@ -7055,6 +7058,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-sdk-sqs",
+ "base64 0.22.1",
  "faucet-common-sqs",
  "faucet-conformance",
  "faucet-core",

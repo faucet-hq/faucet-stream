@@ -17,7 +17,10 @@ pub struct ElasticsearchSourceConfig {
     pub index: String,
     /// Elasticsearch query DSL. Defaults to `{"match_all": {}}`.
     pub query: Value,
-    /// Scroll context timeout (e.g. `"1m"`). Defaults to `"1m"`.
+    /// Scroll context keep-alive (e.g. `"5m"`), renewed by every scroll
+    /// request — so it must outlast the slowest page *write* between two
+    /// requests, or the context expires mid-run. Defaults to `"5m"`.
+    #[serde(default = "default_scroll_timeout")]
     pub scroll_timeout: String,
     /// Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
@@ -30,19 +33,37 @@ pub struct ElasticsearchSourceConfig {
     /// scroll response becomes exactly one `StreamPage`. Defaults to
     /// [`DEFAULT_BATCH_SIZE`].
     ///
-    /// `batch_size = 0` is the "no batching" sentinel: the source issues a
-    /// single non-scroll `_search` request with `size = 10_000` (the default
-    /// `index.max_result_window`) and emits one `StreamPage`. Use it for
-    /// small indices or for sinks (e.g. SQL `COPY`, BigQuery load jobs) that
-    /// prefer one large request to many small ones. Indices that have raised
-    /// their `max_result_window` will still cap at 10_000 — raise this knob
-    /// or switch back to scroll if you need more.
+    /// `batch_size = 0` is the "no batching" sentinel: the whole result set
+    /// is drained through the scroll API (10 000 documents per request) and
+    /// emitted as one `StreamPage`. Use it for small indices or for sinks
+    /// (e.g. SQL `COPY`, BigQuery load jobs) that prefer one large request to
+    /// many small ones.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Seconds to wait for a TCP/TLS connection to the cluster. Default `10`.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Seconds one search or scroll request may take end to end before it
+    /// fails as retriable. Default `300`, so a half-open connection or a
+    /// wedged node cannot hang a run forever.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
+}
+
+fn default_scroll_timeout() -> String {
+    "5m".to_string()
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_request_timeout_secs() -> u64 {
+    300
 }
 
 impl ElasticsearchSourceConfig {
@@ -52,10 +73,12 @@ impl ElasticsearchSourceConfig {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             index: index.into(),
             query: json!({"match_all": {}}),
-            scroll_timeout: "1m".to_string(),
+            scroll_timeout: default_scroll_timeout(),
             auth: AuthSpec::Inline(ElasticsearchAuth::None),
             max_pages: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            connect_timeout_secs: default_connect_timeout_secs(),
+            request_timeout_secs: default_request_timeout_secs(),
         }
     }
 
@@ -87,8 +110,7 @@ impl ElasticsearchSourceConfig {
     /// parameter and the emitted [`StreamPage`](faucet_core::StreamPage)
     /// size.
     ///
-    /// Pass `0` to opt out of scroll entirely — the source will issue a
-    /// single `_search` with `size = 10_000` and emit one page.
+    /// Pass `0` to drain the whole result set into one page.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
@@ -110,6 +132,12 @@ impl ElasticsearchSourceConfig {
             ));
         }
         validate_batch_size(self.batch_size)?;
+        if self.connect_timeout_secs == 0 || self.request_timeout_secs == 0 {
+            return Err(FaucetError::Config(
+                "Elasticsearch source: connect_timeout_secs and request_timeout_secs must be > 0"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -124,7 +152,7 @@ mod tests {
         assert_eq!(config.base_url, "http://localhost:9200");
         assert_eq!(config.index, "my_index");
         assert_eq!(config.query, json!({"match_all": {}}));
-        assert_eq!(config.scroll_timeout, "1m");
+        assert_eq!(config.scroll_timeout, "5m");
         assert!(config.max_pages.is_none());
     }
 
@@ -220,6 +248,17 @@ mod tests {
             ElasticsearchSourceConfig::new("  ", "idx").validate(),
             Err(FaucetError::Config(_))
         ));
+    }
+
+    #[test]
+    fn scroll_timeout_and_timeouts_default_and_validate() {
+        let json =
+            r#"{"base_url": "http://h", "index": "i", "query": {}, "auth": {"type": "none"}}"#;
+        let mut c: ElasticsearchSourceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.scroll_timeout, "5m");
+        assert_eq!((c.connect_timeout_secs, c.request_timeout_secs), (10, 300));
+        c.connect_timeout_secs = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]

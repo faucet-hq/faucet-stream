@@ -84,6 +84,14 @@ pub struct NatsSourceConfig {
     /// than being altered (#789 MSG-39).
     #[serde(default)]
     pub value_format: NatsValueFormat,
+
+    /// Wrap each record as `{ subject, sequence, message_id, payload }` so a
+    /// downstream consumer can deduplicate redeliveries: `sequence` is the
+    /// JetStream stream sequence (`null` in core mode) and `message_id` the
+    /// `Nats-Msg-Id` header (`null` when absent). Default `false` (the
+    /// payload alone).
+    #[serde(default)]
+    pub include_metadata: bool,
 }
 
 /// How [`NatsSourceConfig::value_format`] decodes a payload.
@@ -120,6 +128,7 @@ impl NatsSourceConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             progress_interval_secs: default_progress_interval_secs(),
             value_format: NatsValueFormat::Auto,
+            include_metadata: false,
         }
     }
 
@@ -169,6 +178,12 @@ impl NatsSourceConfig {
                 "nats source: at least one of `max_messages` or `idle_timeout_secs` must be set \
                  so the run terminates"
                     .into(),
+            ));
+        }
+
+        if self.max_messages == Some(0) || self.idle_timeout_secs == Some(0) {
+            return Err(FaucetError::Config(
+                "nats source: `max_messages` and `idle_timeout_secs` must be greater than 0".into(),
             ));
         }
 
@@ -249,6 +264,16 @@ mod tests {
         assert_eq!(c.connection.servers, vec!["nats://a:4222".to_string()]);
         assert_eq!(c.max_messages, Some(10));
         assert_eq!(c.batch_size, DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn zero_terminators_are_rejected() {
+        let mut c = NatsSourceConfig::new("x");
+        c.max_messages = Some(0);
+        assert!(c.validate().is_err());
+        let mut c = NatsSourceConfig::new("x");
+        c.idle_timeout_secs = Some(0);
+        assert!(c.validate().is_err());
     }
 
     #[test]

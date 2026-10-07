@@ -41,7 +41,15 @@ sink:
 | `static` | One constant key → one shard (rarely what you want). |
 
 Keys must be 1–256 characters (per-record error otherwise). Records sharing a
-partition key land on the same shard, preserving their relative order.
+partition key (or explicit hash key) land on the same shard **in input
+order**: a page is split into `concurrency` lanes by key, each lane's
+`PutRecords` requests run one after another, so one key is never in two
+requests at once. When an entry is rejected, it is re-sent together with every
+later entry of its key from the same request (Kinesis may have written those
+ahead of it), and once a key's record fails for good its later records in the
+page fail too rather than overtaking it. An explicit hash key must be a decimal
+integer below 2^128. Only transient request failures (transport, 5xx,
+throttling) are retried; a missing stream or denied access fails at once.
 
 ## Failure semantics
 

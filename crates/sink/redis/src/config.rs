@@ -47,6 +47,14 @@ pub struct RedisSinkConfig {
     /// [`StreamPage`](faucet_core::StreamPage) framing.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// `KeyValue` only: expire every written key after this many seconds
+    /// (`SET … EX`). Keys never expire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+    /// `Stream` only: cap the stream at about this many entries
+    /// (`XADD … MAXLEN ~ n`), trimming the oldest. Unbounded when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_max_len: Option<u64>,
 }
 
 fn default_batch_size() -> usize {
@@ -59,6 +67,8 @@ impl std::fmt::Debug for RedisSinkConfig {
             .field("url", &"***")
             .field("sink_type", &self.sink_type)
             .field("batch_size", &self.batch_size)
+            .field("ttl_secs", &self.ttl_secs)
+            .field("stream_max_len", &self.stream_max_len)
             .finish()
     }
 }
@@ -70,6 +80,28 @@ impl RedisSinkConfig {
             url: url.into(),
             sink_type,
             batch_size: DEFAULT_BATCH_SIZE,
+            ttl_secs: None,
+            stream_max_len: None,
+        }
+    }
+
+    /// Refuse options that do not apply to the configured `sink_type`, or a
+    /// zero TTL / length (which Redis rejects or would empty the stream).
+    pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        faucet_core::validate_batch_size(self.batch_size)?;
+        let err = |m: &str| Err(faucet_core::FaucetError::Config(format!("redis sink: {m}")));
+        match (&self.sink_type, self.ttl_secs, self.stream_max_len) {
+            (_, Some(0), _) => err("ttl_secs must be greater than 0"),
+            (_, _, Some(0)) => err("stream_max_len must be greater than 0"),
+            (RedisSinkType::KeyValue { .. }, _, Some(_))
+            | (RedisSinkType::List { .. }, _, Some(_)) => {
+                err("stream_max_len applies only to the Stream sink type")
+            }
+            (RedisSinkType::Stream { .. }, Some(_), _)
+            | (RedisSinkType::List { .. }, Some(_), _) => {
+                err("ttl_secs applies only to the KeyValue sink type")
+            }
+            _ => Ok(()),
         }
     }
 
@@ -173,6 +205,30 @@ mod tests {
         }"#;
         let config: RedisSinkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn options_must_match_the_sink_type() {
+        let kv = RedisSinkType::KeyValue {
+            key_field: "id".into(),
+        };
+        let stream = RedisSinkType::Stream { key: "s".into() };
+        let list = RedisSinkType::List { key: "l".into() };
+        let with = |t: &RedisSinkType, ttl, len| {
+            let mut c = RedisSinkConfig::new("redis://localhost", t.clone());
+            c.ttl_secs = ttl;
+            c.stream_max_len = len;
+            c.validate()
+        };
+        assert!(with(&kv, Some(60), None).is_ok());
+        assert!(with(&stream, None, Some(1000)).is_ok());
+        assert!(with(&list, None, None).is_ok());
+        assert!(with(&kv, Some(0), None).is_err());
+        assert!(with(&stream, None, Some(0)).is_err());
+        assert!(with(&kv, None, Some(5)).is_err());
+        assert!(with(&list, None, Some(5)).is_err());
+        assert!(with(&stream, Some(5), None).is_err());
+        assert!(with(&list, Some(5), None).is_err());
     }
 
     #[test]

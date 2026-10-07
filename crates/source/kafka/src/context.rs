@@ -58,6 +58,93 @@ pub(crate) struct BookmarkContext {
     /// Assign (a rebalance after the first) re-seeks from the start bookmark
     /// plus these, instead of falling back to `auto.offset.reset`.
     pub(crate) delivered: Arc<Mutex<HashMap<(String, i32), i64>>>,
+    /// Whether `auto.offset.reset` is `earliest` — where a member-mode
+    /// partition the group has no offset for starts, so that position can be
+    /// seeded into the group before anything is consumed (#789 MSG-72).
+    pub(crate) earliest: Arc<AtomicBool>,
+    /// Event clock for [`Self::stale_since_revoke`]: when each partition last
+    /// delivered a message and when it was last revoked.
+    pub(crate) events: Arc<Mutex<PartitionEvents>>,
+}
+
+/// Per-partition delivery / revocation order (#789 MSG-95).
+#[derive(Default)]
+pub(crate) struct PartitionEvents {
+    clock: u64,
+    delivered: HashMap<(String, i32), u64>,
+    revoked: HashMap<(String, i32), u64>,
+}
+
+impl PartitionEvents {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    pub(crate) fn note_delivered(&mut self, tp: (String, i32)) {
+        let t = self.tick();
+        self.delivered.insert(tp, t);
+    }
+
+    pub(crate) fn note_revoked(&mut self, tp: (String, i32)) {
+        let t = self.tick();
+        self.revoked.insert(tp, t);
+    }
+
+    /// Whether `tp` was revoked after this member last delivered from it: its
+    /// pending offset predates the revoke, and another member may have moved
+    /// the group past it since, so committing it would regress the group.
+    pub(crate) fn stale_since_revoke(&self, tp: &(String, i32)) -> bool {
+        match (self.revoked.get(tp), self.delivered.get(tp)) {
+            (Some(r), Some(d)) => r > d,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Where a bookmarked partition actually resumes: never below the log start.
+/// Returns the offset and how many bookmarked records retention already
+/// deleted. librdkafka resets an out-of-range offset to `auto.offset.reset`
+/// (default `latest`), which would skip the still-retained backlog (#789
+/// MSG-24); starting at the low watermark keeps it.
+pub(crate) fn clamp_to_log_start(bookmark: i64, low: Option<i64>) -> (i64, u64) {
+    match low {
+        Some(low) if bookmark < low => (low, (low - bookmark) as u64),
+        _ => (bookmark, 0),
+    }
+}
+
+/// The group offsets a member-mode consumer seeds for partitions the group has
+/// never committed: the bookmarked position when there is one, else where
+/// `auto.offset.reset` starts it. Without the seed, a partition that migrates
+/// to another member before the first durable commit falls back to that
+/// member's `auto.offset.reset` and skips what this member had started
+/// reading from (#789 MSG-72).
+pub(crate) fn member_seeds(
+    assigned: &[(String, i32)],
+    committed: &HashMap<(String, i32), Option<i64>>,
+    seeks: &HashMap<(String, i32), i64>,
+    watermarks: &HashMap<(String, i32), (i64, i64)>,
+    earliest: bool,
+) -> Vec<(String, i32, i64)> {
+    let mut out = Vec::new();
+    for tp in assigned {
+        if committed.get(tp).copied().flatten().is_some() {
+            continue;
+        }
+        let offset = match seeks.get(tp) {
+            Some(o) => Some(*o),
+            None => watermarks
+                .get(tp)
+                .map(|(low, high)| if earliest { *low } else { *high }),
+        };
+        if let Some(o) = offset {
+            out.push((tp.0.clone(), tp.1, o));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Where a re-assigned partition resumes outside member mode: the start
@@ -77,13 +164,18 @@ impl BookmarkContext {
         if let Ok(mut map) = self.delivered.lock() {
             map.insert((topic.to_string(), partition), next_offset);
         }
+        if let Ok(mut ev) = self.events.lock() {
+            ev.note_delivered((topic.to_string(), partition));
+        }
     }
 
     fn reassign_bookmark(&self) -> Option<Bookmark> {
-        if self.member_mode.load(Ordering::Acquire) {
-            return None;
-        }
         let start = self.start_offsets.lock().ok().and_then(|g| g.clone());
+        if self.member_mode.load(Ordering::Acquire) {
+            // Only durable positions apply in member mode: the start bookmark,
+            // filtered against the group's committed offsets at assign time.
+            return start.filter(|b| !b.partition_offsets.is_empty());
+        }
         let delivered = self.delivered.lock().ok()?.clone();
         resume_bookmark(start.as_ref(), &delivered)
     }
@@ -146,6 +238,7 @@ impl ConsumerContext for BookmarkContext {
                 }
                 .or_else(|| self.reassign_bookmark());
 
+                let mut applied: Vec<(String, i32, i64)> = Vec::new();
                 if let Some(bookmark) = bookmark {
                     let lookup: HashMap<(&str, i32), i64> = bookmark
                         .partition_offsets
@@ -184,6 +277,26 @@ impl ConsumerContext for BookmarkContext {
                         seeks = filter_seeks_by_committed(base_consumer, seeks);
                     }
 
+                    for (topic, partition, offset) in &mut seeks {
+                        let low = base_consumer
+                            .fetch_watermarks(topic, *partition, COMMITTED_LOOKUP_TIMEOUT)
+                            .ok()
+                            .map(|(low, _)| low);
+                        let (clamped, lost) = clamp_to_log_start(*offset, low);
+                        if lost > 0 {
+                            tracing::warn!(
+                                topic = %topic,
+                                partition = *partition,
+                                bookmark = *offset,
+                                log_start = clamped,
+                                lost,
+                                "kafka source: the bookmark fell out of topic retention; \
+                                 resuming at the log start (the deleted records are gone)"
+                            );
+                            *offset = clamped;
+                        }
+                    }
+
                     // Partitions absent from the bookmark are left at their
                     // default offset (earliest/latest per `auto.offset.reset`).
                     // With the assigned-set bookmark seeding in
@@ -194,9 +307,9 @@ impl ConsumerContext for BookmarkContext {
                     // correct. Partitions that were assigned but empty in a
                     // prior run are recorded via their position and so DO
                     // appear in the bookmark and get seeked here.
-                    for (topic, partition, offset) in seeks {
+                    for (topic, partition, offset) in &seeks {
                         if let Err(e) =
-                            tpl.set_partition_offset(&topic, partition, Offset::Offset(offset))
+                            tpl.set_partition_offset(topic, *partition, Offset::Offset(*offset))
                         {
                             self.record_error(FaucetError::State(format!(
                                 "kafka set_partition_offset topic={topic} \
@@ -204,6 +317,16 @@ impl ConsumerContext for BookmarkContext {
                             )));
                         }
                     }
+                    applied = seeks;
+                }
+
+                let seeds = if self.member_mode.load(Ordering::Acquire) {
+                    self.member_seed_offsets(base_consumer, tpl, &applied)
+                } else {
+                    Vec::new()
+                };
+                for (topic, partition, offset) in &seeds {
+                    let _ = tpl.set_partition_offset(topic, *partition, Offset::Offset(*offset));
                 }
 
                 match base_consumer.rebalance_protocol() {
@@ -223,11 +346,20 @@ impl ConsumerContext for BookmarkContext {
                     }
                 }
 
+                if !seeds.is_empty() {
+                    commit_seeds(base_consumer, &seeds);
+                }
+
                 let rebalance = Rebalance::Assign(tpl);
                 self.post_rebalance(base_consumer, &rebalance);
             }
 
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => {
+                if let Ok(mut ev) = self.events.lock() {
+                    for e in tpl.elements() {
+                        ev.note_revoked((e.topic().to_string(), e.partition()));
+                    }
+                }
                 let rebalance = Rebalance::Revoke(tpl);
                 self.pre_rebalance(base_consumer, &rebalance);
                 drop(rebalance);
@@ -263,6 +395,80 @@ impl ConsumerContext for BookmarkContext {
     }
 }
 
+impl BookmarkContext {
+    /// Member mode: the starting offset of every assigned partition the group
+    /// has no committed offset for (see [`member_seeds`]). A lookup failure
+    /// seeds nothing, which leaves today's `auto.offset.reset` behaviour.
+    fn member_seed_offsets(
+        &self,
+        consumer: &BaseConsumer<BookmarkContext>,
+        tpl: &TopicPartitionList,
+        applied: &[(String, i32, i64)],
+    ) -> Vec<(String, i32, i64)> {
+        let assigned: Vec<(String, i32)> = tpl
+            .elements()
+            .into_iter()
+            .map(|e| (e.topic().to_string(), e.partition()))
+            .collect();
+        let mut query = TopicPartitionList::with_capacity(assigned.len());
+        for (t, p) in &assigned {
+            query.add_partition(t, *p);
+        }
+        let committed = match consumer.committed_offsets(query, COMMITTED_LOOKUP_TIMEOUT) {
+            Ok(c) => committed_map(&c),
+            Err(e) => {
+                tracing::warn!(error = %e, "kafka member mode: committed-offsets lookup failed; not seeding");
+                return Vec::new();
+            }
+        };
+        let seeks: HashMap<(String, i32), i64> = applied
+            .iter()
+            .map(|(t, p, o)| ((t.clone(), *p), *o))
+            .collect();
+        let mut watermarks = HashMap::new();
+        for tp in &assigned {
+            if committed.get(tp).copied().flatten().is_none()
+                && !seeks.contains_key(tp)
+                && let Ok(w) = consumer.fetch_watermarks(&tp.0, tp.1, COMMITTED_LOOKUP_TIMEOUT)
+            {
+                watermarks.insert(tp.clone(), w);
+            }
+        }
+        member_seeds(
+            &assigned,
+            &committed,
+            &seeks,
+            &watermarks,
+            self.earliest.load(Ordering::Acquire),
+        )
+    }
+}
+
+fn committed_map(tpl: &TopicPartitionList) -> HashMap<(String, i32), Option<i64>> {
+    tpl.elements()
+        .into_iter()
+        .map(|e| {
+            let offset = match e.offset() {
+                Offset::Offset(n) => Some(n),
+                _ => None,
+            };
+            ((e.topic().to_string(), e.partition()), offset)
+        })
+        .collect()
+}
+
+/// Commit the seeded starting offsets to the group (synchronously, so a member
+/// that takes a partition over right after this rebalance finds them).
+fn commit_seeds(consumer: &BaseConsumer<BookmarkContext>, seeds: &[(String, i32, i64)]) {
+    let mut tpl = TopicPartitionList::with_capacity(seeds.len());
+    for (t, p, o) in seeds {
+        let _ = tpl.add_partition_offset(t, *p, Offset::Offset(*o));
+    }
+    if let Err(e) = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync) {
+        tracing::warn!(error = %e, "kafka member mode: seeding group offsets failed");
+    }
+}
+
 /// Drop bookmark seeks that the group's committed offsets already cover
 /// (member mode only). Queries the committed offset for each seek candidate in
 /// one bounded broker round-trip; a lookup failure conservatively keeps every
@@ -278,17 +484,7 @@ fn filter_seeks_by_committed(
     }
     let committed: HashMap<(String, i32), Option<i64>> =
         match consumer.committed_offsets(query, COMMITTED_LOOKUP_TIMEOUT) {
-            Ok(tpl) => tpl
-                .elements()
-                .into_iter()
-                .map(|e| {
-                    let offset = match e.offset() {
-                        Offset::Offset(n) => Some(n),
-                        _ => None,
-                    };
-                    ((e.topic().to_string(), e.partition()), offset)
-                })
-                .collect(),
+            Ok(tpl) => committed_map(&tpl),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -375,9 +571,64 @@ mod tests {
         assert_eq!(got, vec![("t", 0, 10), ("t", 1, 27), ("t", 2, 3)]);
 
         ctx.member_mode.store(true, Ordering::Release);
+        let b = ctx.reassign_bookmark().unwrap();
+        assert_eq!(
+            b.partition_offsets.len(),
+            2,
+            "member mode re-applies only the durable start bookmark, never this run's deliveries"
+        );
+        *ctx.start_offsets.lock().unwrap() = None;
+        assert!(ctx.reassign_bookmark().is_none());
+    }
+
+    #[test]
+    fn a_revoke_after_the_last_delivery_makes_an_offset_stale() {
+        let tp = ("t".to_string(), 0);
+        let mut ev = PartitionEvents::default();
+        assert!(!ev.stale_since_revoke(&tp));
+        ev.note_delivered(tp.clone());
+        assert!(!ev.stale_since_revoke(&tp));
+        ev.note_revoked(tp.clone());
+        assert!(ev.stale_since_revoke(&tp), "revoked after the delivery");
+        ev.note_delivered(tp.clone());
         assert!(
-            ctx.reassign_bookmark().is_none(),
-            "member mode defers to the group's committed offsets"
+            !ev.stale_since_revoke(&tp),
+            "delivered again after re-assignment"
+        );
+        let other = ("t".to_string(), 1);
+        ev.note_revoked(other.clone());
+        assert!(ev.stale_since_revoke(&other));
+    }
+
+    #[test]
+    fn a_bookmark_below_the_log_start_resumes_at_the_log_start() {
+        assert_eq!(clamp_to_log_start(5, Some(20)), (20, 15));
+        assert_eq!(clamp_to_log_start(25, Some(20)), (25, 0));
+        assert_eq!(clamp_to_log_start(20, Some(20)), (20, 0));
+        assert_eq!(clamp_to_log_start(5, None), (5, 0));
+    }
+
+    #[test]
+    fn member_seeds_cover_only_partitions_the_group_never_committed() {
+        let tp = |p: i32| ("t".to_string(), p);
+        let assigned = vec![tp(0), tp(1), tp(2), tp(3)];
+        let committed: HashMap<_, _> = [
+            (tp(0), Some(7)),
+            (tp(1), None),
+            (tp(2), None),
+            (tp(3), None),
+        ]
+        .into();
+        let seeks: HashMap<_, _> = [(tp(1), 40)].into();
+        let marks: HashMap<_, _> = [(tp(2), (3, 9))].into();
+        assert_eq!(
+            member_seeds(&assigned, &committed, &seeks, &marks, false),
+            vec![("t".into(), 1, 40), ("t".into(), 2, 9)],
+            "committed partition 0 is left alone, 3 has no known position"
+        );
+        assert_eq!(
+            member_seeds(&assigned, &committed, &seeks, &marks, true),
+            vec![("t".into(), 1, 40), ("t".into(), 2, 3)]
         );
     }
 

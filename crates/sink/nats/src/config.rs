@@ -28,12 +28,30 @@ pub struct NatsSinkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_field: Option<String>,
 
-    /// Records per publish batch. Records are published one NATS message each;
-    /// after every `batch_size` records the client is flushed so nothing is
-    /// lost. Defaults to [`DEFAULT_BATCH_SIZE`]. `0` publishes the whole batch
-    /// handed by the pipeline, flushing once at the end.
+    /// Records per publish batch: the client is flushed (core NATS) or the
+    /// acks awaited (JetStream) after every `batch_size` records. Defaults to
+    /// [`DEFAULT_BATCH_SIZE`]. `0` publishes the whole page handed by the
+    /// pipeline before flushing / awaiting once.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// Publish through JetStream and await each message's acknowledgement, so
+    /// a publish no stream stores (no stream bound to the subject, a stream
+    /// limit, a rejected message) fails its row instead of vanishing. Each row
+    /// gets its own outcome, so failed rows can go to a DLQ. Default `false`:
+    /// core NATS publish, which only confirms the server received the bytes.
+    #[serde(default)]
+    pub jetstream: bool,
+
+    /// Seconds a publish batch (publishes plus the flush, or the JetStream
+    /// acks) may take before the write fails as retriable, so a server outage
+    /// cannot wedge the run. Default `30`.
+    #[serde(default = "default_publish_timeout_secs")]
+    pub publish_timeout_secs: u64,
+}
+
+fn default_publish_timeout_secs() -> u64 {
+    30
 }
 
 impl NatsSinkConfig {
@@ -44,6 +62,8 @@ impl NatsSinkConfig {
             subject: subject.into(),
             subject_field: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            jetstream: false,
+            publish_timeout_secs: default_publish_timeout_secs(),
         }
     }
 
@@ -63,14 +83,25 @@ impl NatsSinkConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
+        if self.publish_timeout_secs == 0 {
+            return Err(FaucetError::Config(
+                "nats sink: `publish_timeout_secs` must be greater than 0".into(),
+            ));
+        }
         Ok(())
     }
 }
 
 impl NatsSinkConfig {
-    /// What a failed batch write leaves behind (#737): each record is its own publish.
+    /// What a failed batch write leaves behind (#737): each record is its own
+    /// publish; with `jetstream: true` every row has its own acknowledged
+    /// outcome, without it a failure says nothing about the earlier rows.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        faucet_core::BatchAtomicity::BestEffort
+        if self.jetstream {
+            faucet_core::BatchAtomicity::PerRow
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
     }
 }
 
@@ -82,6 +113,16 @@ mod tests {
     #[test]
     fn validate_accepts_minimal() {
         assert!(NatsSinkConfig::new("events.out").validate().is_ok());
+    }
+
+    #[test]
+    fn jetstream_is_per_row_and_timeouts_are_positive() {
+        let mut c = NatsSinkConfig::new("x");
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        c.jetstream = true;
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::PerRow);
+        c.publish_timeout_secs = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! schedule, iterator-type mapping, record assembly) are separated from the
 //! I/O loop so they unit-test offline.
 
-use crate::config::{KinesisSourceConfig, StartPosition, ValueFormat};
+use crate::config::{KinesisSourceConfig, OnDecodeError, StartPosition, ValueFormat};
 use aws_sdk_kinesis::Client;
 use aws_sdk_kinesis::types::ShardIteratorType;
 use faucet_core::FaucetError;
@@ -97,6 +97,38 @@ pub(crate) fn decode_payload(
     }
 }
 
+/// Attempts at a shard's first `GetShardIterator` before the run fails.
+const INITIAL_ITERATOR_ATTEMPTS: u32 = 4;
+
+/// [`decode_payload`] under `on_decode_error` (#789 MSG-53): `Ok(None)` is a
+/// skipped record, `raw` emits `{ raw_base64, error }`. Pure.
+pub(crate) fn decode_with_policy(
+    data: &[u8],
+    format: ValueFormat,
+    policy: OnDecodeError,
+    shard_id: &str,
+    sequence: &str,
+) -> Result<Option<Value>, FaucetError> {
+    match decode_payload(data, format, shard_id, sequence) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => match policy {
+            OnDecodeError::Fail => Err(e),
+            OnDecodeError::Skip => {
+                tracing::warn!(shard = %shard_id, sequence, error = %e,
+                    "kinesis: skipping a record that does not decode");
+                Ok(None)
+            }
+            OnDecodeError::Raw => {
+                use base64::Engine as _;
+                Ok(Some(serde_json::json!({
+                    "raw_base64": base64::engine::general_purpose::STANDARD.encode(data),
+                    "error": e.to_string(),
+                })))
+            }
+        },
+    }
+}
+
 /// Assemble the emitted record: decoded payload + Kinesis metadata. Pure.
 pub(crate) fn assemble_record(
     payload: Value,
@@ -122,9 +154,11 @@ pub(crate) enum ShardEvent {
     /// buffers, so any emitted page's bookmark equals the sequence of its last
     /// included record — never a batch-final sequence that runs ahead of records
     /// still buffered but not yet emitted (audit #321 C2).
+    /// `None` is a record `on_decode_error: skip` dropped: the bookmark
+    /// still moves past it.
     Records {
         shard_id: String,
-        records: Vec<(String, Value)>,
+        records: Vec<(String, Option<Value>)>,
     },
     /// The shard is fully consumed (closed shard reached its end).
     Done { shard_id: String },
@@ -153,14 +187,26 @@ pub(crate) async fn run_shard(
     let mut last_sequence = bookmarked_sequence.clone();
     let mut error_attempts: u32 = 0;
 
-    let mut iterator =
-        match acquire_iterator(&client, &config, &shard_id, last_sequence.as_deref()).await {
-            Ok(it) => it,
-            Err(error) => {
-                let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
-                return false;
+    // The first iterator is retried like a later one (#789 MSG-95): a
+    // throttled GetShardIterator at start used to fail the run.
+    let mut iterator = {
+        let mut attempt = 0u32;
+        loop {
+            match acquire_iterator(&client, &config, &shard_id, last_sequence.as_deref()).await {
+                Ok(it) => break it,
+                Err(error) if attempt + 1 < INITIAL_ITERATOR_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::debug!(shard = %shard_id, error = %error, attempt,
+                        "kinesis: GetShardIterator failed; retrying");
+                    tokio::time::sleep(backoff_delay(poll_interval, attempt)).await;
+                }
+                Err(error) => {
+                    let _ = tx.send(ShardEvent::Failed { shard_id, error }).await;
+                    return false;
+                }
             }
-        };
+        }
+    };
 
     loop {
         let Some(current) = iterator.clone() else {
@@ -192,9 +238,10 @@ pub(crate) async fn run_shard(
                         let arrival_ms = r
                             .approximate_arrival_timestamp()
                             .map(|t| t.to_millis().unwrap_or_default());
-                        let payload = match decode_payload(
+                        let payload = match decode_with_policy(
                             r.data().as_ref(),
                             config.value_format,
+                            config.on_decode_error,
                             &shard_id,
                             sequence,
                         ) {
@@ -207,13 +254,15 @@ pub(crate) async fn run_shard(
                         last_sequence = Some(sequence.to_string());
                         decoded.push((
                             sequence.to_string(),
-                            assemble_record(
-                                payload,
-                                partition_key,
-                                sequence,
-                                &shard_id,
-                                arrival_ms,
-                            ),
+                            payload.map(|payload| {
+                                assemble_record(
+                                    payload,
+                                    partition_key,
+                                    sequence,
+                                    &shard_id,
+                                    arrival_ms,
+                                )
+                            }),
                         ));
                     }
                     if tx
@@ -241,7 +290,9 @@ pub(crate) async fn run_shard(
             Err(err) => {
                 let service = err.into_service_error();
                 if service.is_provisioned_throughput_exceeded_exception() {
-                    // Expected at the 2 MB/s/shard cap — back off, don't fail.
+                    // Expected at the 2 MB/s/shard cap — back off (growing
+                    // with each consecutive throttle, #789 MSG-95), don't fail.
+                    error_attempts = error_attempts.saturating_add(1);
                     let delay = backoff_delay(poll_interval, error_attempts.min(4));
                     tracing::debug!(shard = %shard_id, delay_ms = delay.as_millis() as u64,
                         "kinesis: throughput exceeded; backing off");
@@ -350,6 +401,25 @@ async fn acquire_iterator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undecodable_records_follow_on_decode_error() {
+        let bad = b"not json";
+        assert!(decode_with_policy(bad, ValueFormat::Json, OnDecodeError::Fail, "s", "1").is_err());
+        assert_eq!(
+            decode_with_policy(bad, ValueFormat::Json, OnDecodeError::Skip, "s", "1").unwrap(),
+            None
+        );
+        let raw = decode_with_policy(bad, ValueFormat::Json, OnDecodeError::Raw, "s", "1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw["raw_base64"], "bm90IGpzb24=");
+        assert!(raw["error"].as_str().unwrap().contains("not valid JSON"));
+        assert_eq!(
+            decode_with_policy(b"{}", ValueFormat::Json, OnDecodeError::Skip, "s", "1").unwrap(),
+            Some(serde_json::json!({}))
+        );
+    }
 
     /// Assert a jittered delay sits in core's documented `[0.5, 1.5)` band
     /// around `expected` and never collapses to zero (a zero sleep would turn

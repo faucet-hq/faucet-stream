@@ -690,6 +690,7 @@ async fn run_repair(
         vec![repair],
         ExecuteOptions {
             legacy_state_writes: false,
+            force_lease: false,
             pipeline_name: format!("{}-verify-repair", inputs.pipeline_name),
             run_id: None,
             execution: inputs.execution.clone(),

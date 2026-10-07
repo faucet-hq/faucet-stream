@@ -312,3 +312,58 @@ async fn held_messages_are_not_redelivered_while_a_page_is_assembled() {
         "without renewal the held messages come back (proves the test can fail)"
     );
 }
+
+/// A single-group FIFO queue drains completely: SQS hands out nothing more
+/// from a group while earlier messages are in flight, so the source emits and
+/// deletes after every receive instead of waiting for a full page (#789
+/// MSG-48). Records carry the SQS message id with `include_metadata` (MSG-91).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_group_fifo_queue_drains_in_order() {
+    use aws_sdk_sqs::types::QueueAttributeName;
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    let mut queue_url = None;
+    for _ in 0..120 {
+        match client
+            .create_queue()
+            .queue_name("orders.fifo")
+            .attributes(QueueAttributeName::FifoQueue, "true")
+            .attributes(QueueAttributeName::ContentBasedDeduplication, "true")
+            .attributes(QueueAttributeName::VisibilityTimeout, "300")
+            .send()
+            .await
+        {
+            Ok(out) => {
+                queue_url = Some(out.queue_url().unwrap().to_string());
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+        }
+    }
+    let queue_url = queue_url.expect("fifo queue");
+    for i in 0..15 {
+        client
+            .send_message()
+            .queue_url(&queue_url)
+            .message_body(format!("{{\"i\":{i}}}"))
+            .message_group_id("g")
+            .send()
+            .await
+            .expect("send");
+    }
+    let mut cfg = SqsSourceConfig::new(&queue_url);
+    cfg.region = Some("us-east-1".into());
+    cfg.endpoint_url = Some(endpoint.clone());
+    cfg.credentials = test_credentials();
+    cfg.idle_timeout_secs = Some(4);
+    cfg.wait_time_seconds = 1;
+    cfg.include_metadata = true;
+    let source = SqsSource::new(cfg).await.unwrap();
+    let got = drain(&source).await;
+    let order: Vec<i64> = got
+        .iter()
+        .map(|r| r["payload"]["i"].as_i64().unwrap())
+        .collect();
+    assert_eq!(order, (0..15).collect::<Vec<i64>>());
+    assert!(got.iter().all(|r| r["message_id"].is_string()));
+}

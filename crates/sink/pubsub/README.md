@@ -47,7 +47,7 @@ Pub/Sub → Pub/Sub pipeline round-trips attributes.
 
 ### `batch_size`
 
-Records per `Publish` request, `1..=1000`, default `100`. Pages larger than
+Records per `Publish` request (the SDK publisher's bundle size), `1..=1000`, default `100`. `concurrency` is the number of publisher workers sending bundles in parallel. Pages larger than
 `batch_size` are re-chunked into several publishes. The house `batch_size: 0`
 "no batching" sentinel does **not** apply here — Pub/Sub caps a single
 `Publish` at 1000 messages, so a whole-page request is not expressible, and `0`
@@ -56,8 +56,15 @@ Records per `Publish` request, `1..=1000`, default `100`. Pages larger than
 ## Delivery semantics — at-least-once
 
 Pub/Sub is at-least-once and this sink does not implement idempotent writes, so
-`delivery: exactly_once` is not supported. De-duplicate downstream on
-`message_id` if replays must converge. Per-record encode failures and
+`delivery: exactly_once` is not supported. De-duplicate downstream on a
+business key in the payload or an attribute if replays must converge — the
+server assigns a new `message_id` to every publish, so a re-sent record never
+shares its id. With an `ordering_key`, a failed message also fails every later
+message of the same key in the batch: those reached the topic ahead of it, and
+failing them together lets a DLQ replay or retry restore the key's order.
+Every publish confirmation is bounded (120 s), and the client uses gRPC
+keepalives and a per-RPC deadline, so a dropped connection fails the write
+instead of hanging it. Per-record encode failures and
 per-message publish rejections surface via `write_batch_partial`, so a DLQ
 captures individual bad records instead of failing the whole page.
 

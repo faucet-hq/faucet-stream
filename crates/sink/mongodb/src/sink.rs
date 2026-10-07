@@ -208,6 +208,34 @@ fn check_key_alignment(key: &[String], seen: &[faucet_core::KeyTuple]) -> Result
 /// The `cursor.firstBatch` of a command reply (`listCollections`,
 /// `listIndexes`). A collection has at most 64 indexes, so one batch holds
 /// them all. Pure.
+/// What one `insert_many` call of `n` documents did, given its rejected
+/// `(index, message)` pairs: the batch positions that failed, and how many
+/// leading positions are settled (inserted or failed). An unordered insert
+/// settles the whole batch; an ordered one stops at its first rejection, so
+/// only the documents up to and including it are settled and the caller
+/// re-sends the rest.
+struct InsertStep {
+    failed: Vec<(usize, String)>,
+    consumed: usize,
+}
+
+fn insert_step(n: usize, ordered: bool, rejected: &[(usize, String)]) -> InsertStep {
+    let mut failed: Vec<(usize, String)> =
+        rejected.iter().filter(|(i, _)| *i < n).cloned().collect();
+    failed.sort_by_key(|(i, _)| *i);
+    if ordered && let Some((first, _)) = failed.first().cloned() {
+        failed.truncate(1);
+        return InsertStep {
+            failed,
+            consumed: first + 1,
+        };
+    }
+    InsertStep {
+        failed,
+        consumed: n,
+    }
+}
+
 fn first_batch(reply: &Document) -> Vec<Document> {
     reply
         .get_document("cursor")
@@ -350,7 +378,7 @@ impl MongoSink {
     }
 
     /// Create the staging collection with the destination's options and
-    /// secondary indexes. A no-op when the destination does not exist.
+    /// secondary indexes (an empty one when the destination does not exist).
     async fn clone_destination_shape(&self) -> Result<(), FaucetError> {
         let db = self.client.database(&self.config.database);
         let staging = self.staging_collection();
@@ -365,7 +393,14 @@ impl MongoSink {
             .await
             .map_err(|e| err("listCollections", e))?;
         let Some(spec) = first_batch(&listed).into_iter().next() else {
-            return Ok(());
+            // No destination yet: an empty staging collection, so a run that
+            // writes nothing still has something to rename into place.
+            return match db.run_command(bson::doc! { "create": &staging }).await {
+                Err(e) if !is_namespace_exists_code(command_error_code(&e)) => {
+                    Err(err("creating the staging collection", e))
+                }
+                _ => Ok(()),
+            };
         };
         let options = spec.get_document("options").cloned().unwrap_or_default();
         let mut create = bson::doc! { "create": &staging };
@@ -385,6 +420,85 @@ impl MongoSink {
                 .map_err(|e| err("copying indexes to the staging collection", e))?;
         }
         Ok(())
+    }
+
+    /// Append/overwrite with per-row outcomes (#789 MSG-44): a document the
+    /// server rejects (`insert_many`'s `write_errors`, by index) or that is
+    /// not a JSON object fails alone and is DLQ'd; the rest are inserted —
+    /// under `ordered: true` the batch resumes after the rejected document.
+    /// An outer `Err` is returned only while nothing has been inserted, so a
+    /// failed call never leaves rows that a DLQ replay would duplicate.
+    async fn insert_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        let collection = self
+            .client
+            .database(&self.config.database)
+            .collection::<Document>(&self.effective_collection());
+        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
+        let mut docs: Vec<(usize, Document)> = Vec::with_capacity(records.len());
+        for (i, r) in records.iter().enumerate() {
+            match Self::value_to_document(r) {
+                Ok(d) => docs.push((i, d)),
+                Err(e) => outcomes[i] = Err(e),
+            }
+        }
+        let chunk = if self.config.batch_size == 0 {
+            docs.len().max(1)
+        } else {
+            self.config.batch_size
+        };
+        let mut inserted_any = false;
+        let mut pending: &[(usize, Document)] = &docs;
+        while !pending.is_empty() {
+            let take = chunk.min(pending.len());
+            let batch = &pending[..take];
+            let opts = mongodb::options::InsertManyOptions::builder()
+                .ordered(self.config.ordered)
+                .build();
+            let result = collection
+                .insert_many(batch.iter().map(|(_, d)| d))
+                .with_options(opts)
+                .await;
+            let rejected: Vec<(usize, String)> = match result {
+                Ok(_) => Vec::new(),
+                Err(e) => match e.kind.as_ref() {
+                    mongodb::error::ErrorKind::InsertMany(ime)
+                        if ime.write_concern_error.is_none() && ime.write_errors.is_some() =>
+                    {
+                        ime.write_errors
+                            .iter()
+                            .flatten()
+                            .map(|we| (we.index, we.message.clone()))
+                            .collect()
+                    }
+                    _ if !inserted_any => {
+                        return Err(FaucetError::Sink(format!(
+                            "MongoDB insert_many failed: {e}"
+                        )));
+                    }
+                    _ => {
+                        // Earlier documents committed: report the rest per row.
+                        for (i, _) in pending {
+                            outcomes[*i] = Err(FaucetError::Sink(format!(
+                                "MongoDB insert_many failed: {e}"
+                            )));
+                        }
+                        return Ok(outcomes);
+                    }
+                },
+            };
+            let step = insert_step(take, self.config.ordered, &rejected);
+            for (pos, msg) in &step.failed {
+                outcomes[batch[*pos].0] = Err(FaucetError::Sink(format!(
+                    "MongoDB rejected the document: {msg}"
+                )));
+            }
+            inserted_any |= step.consumed > step.failed.len();
+            pending = &pending[step.consumed..];
+        }
+        Ok(outcomes)
     }
 
     /// Staging collection used while an overwrite run is in flight.
@@ -778,7 +892,8 @@ impl faucet_core::Sink for MongoSink {
     /// destination's collection options (validator, collation, capped, …) and
     /// secondary indexes, so the swap in
     /// [`commit_overwrite`](faucet_core::Sink::commit_overwrite) keeps them. With
-    /// no destination yet the first `insert_many` creates staging.
+    /// no destination yet an empty staging collection is created, so a run
+    /// whose source returns no rows still commits (#789 MSG-52).
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         let db = self.client.database(&self.config.database);
         // Best-effort drop; a missing namespace is not an error for our purpose.
@@ -852,11 +967,10 @@ impl faucet_core::Sink for MongoSink {
     }
 
     fn dataset_uri(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            faucet_core::redact_uri_credentials(&self.config.connection_uri),
-            self.config.database,
-            self.config.collection
+        collection_uri(
+            &self.config.connection_uri,
+            &self.config.database,
+            &self.config.collection,
         )
     }
 
@@ -974,9 +1088,7 @@ impl faucet_core::Sink for MongoSink {
             self.config.write.write_mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
-            // Append and overwrite: insert-shaped, no per-row key failures.
-            self.write_batch(records).await?;
-            return Ok(records.iter().map(|_| Ok(())).collect());
+            return self.insert_partial(records).await;
         }
 
         let plan = faucet_core::plan_writes(records, &self.config.write);
@@ -1062,9 +1174,16 @@ impl faucet_core::Sink for MongoSink {
             .start_session()
             .await
             .map_err(|e| FaucetError::Sink(format!("MongoDB session start failed: {e}")))?;
-        session.start_transaction().await.map_err(|e| {
-            classify_transaction_error("MongoDB transaction start failed", &e.to_string())
-        })?;
+        // `w: majority` explicitly: with the client default (`w:1` before
+        // MongoDB 5.0 and on arbiter topologies) a committed page and its
+        // watermark can roll back after a failover (#789 MSG-71).
+        session
+            .start_transaction()
+            .write_concern(mongodb::options::WriteConcern::majority())
+            .await
+            .map_err(|e| {
+                classify_transaction_error("MongoDB transaction start failed", &e.to_string())
+            })?;
 
         let written = match self
             .apply_in_transaction(&mut session, prepared, scope, token)
@@ -1122,6 +1241,22 @@ impl faucet_core::Sink for MongoSink {
     }
 }
 
+/// `mongodb://hosts/<db>/<collection>` with the URI's credentials, path
+/// (auth database) and query options removed, so a URI carrying options
+/// still yields one well-formed, stable catalog identity (#789 MSG-92).
+pub(crate) fn collection_uri(connection_uri: &str, database: &str, collection: &str) -> String {
+    let redacted = faucet_core::redact_uri_credentials(connection_uri);
+    let base = match redacted.find("://") {
+        Some(i) => {
+            let rest = &redacted[i + 3..];
+            let end = rest.find(['/', '?']).unwrap_or(rest.len());
+            &redacted[..i + 3 + end]
+        }
+        None => redacted.as_str(),
+    };
+    format!("{base}/{database}/{collection}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,6 +1273,22 @@ mod tests {
             specs,
             vec![bson::doc! { "v": 2, "key": { "email": 1 }, "name": "email_1", "unique": true }]
         );
+    }
+
+    #[test]
+    fn insert_step_settles_unordered_batches_and_resumes_ordered_ones() {
+        let rejected = vec![(3, "dup".to_string()), (1, "bad".to_string())];
+        let step = insert_step(5, false, &rejected);
+        assert_eq!(step.consumed, 5);
+        assert_eq!(
+            step.failed.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        let step = insert_step(5, true, &rejected);
+        assert_eq!(step.consumed, 2);
+        assert_eq!(step.failed, vec![(1, "bad".to_string())]);
+        let step = insert_step(4, true, &[]);
+        assert_eq!((step.consumed, step.failed.len()), (4, 0));
     }
 
     #[test]

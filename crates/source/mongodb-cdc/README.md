@@ -170,7 +170,7 @@ scope: { type: collection, database: appdb, collection: orders }
 
 ```yaml
 start_from: { type: now }                        # only events from now on (default)
-start_from: { type: earliest }                   # from the oldest retained oplog entry
+start_from: { type: earliest }                   # from the oldest entry still in the oplog
 start_from: { type: resume_token, token: {...} } # an explicit opaque token
 start_from: { type: timestamp, timestamp_secs: 1779019200 }  # a cluster time, in epoch seconds
 ```
@@ -272,7 +272,7 @@ pipeline:
 
 ## Streaming & batching
 
-The source overrides `stream_pages` to tail the change stream natively. It accumulates change events into a `StreamPage` and yields a page when **either** `batch_size` events have accumulated **or** `idle_timeout` elapses with no new event. The bookmark carried on each page is the `resume_token` of the last event in that page, so the pipeline persists durable progress every page.
+The source overrides `stream_pages` to tail the change stream natively. It accumulates change events into a `StreamPage` and yields a page when **either** `batch_size` events have accumulated **or** `idle_timeout` elapses with no new event. The bookmark carried on each page is the `resume_token` of the last event in that page, so the pipeline persists durable progress every page. When the cycle ends idle, the final page carries the stream's **post-batch resume token** instead — it covers the events the server filtered out (`operation_types`, `aggregation_pipeline`) and the quiet period, so a filtered or low-write stream's bookmark keeps moving and never falls out of the oplog window; the page is emitted (bookmark-only) even when no event arrived. A page that reaches `batch_size` in the middle of a multi-document transaction is held until that transaction's events are all buffered, so a reader never sees half of a source transaction.
 
 - The `batch_size` config field is authoritative — a pipeline-supplied hint never overrides it.
 - `batch_size: 0` is the "no batching" sentinel: drain events until idle and emit a single page. Use it for low-traffic collections where you'd rather get one consolidated page per quiet period.
@@ -282,10 +282,9 @@ The source overrides `stream_pages` to tail the change stream natively. It accum
 
 The connector is fully resumable. After each emitted page the pipeline writes the `resume_token` of the last event to the configured `StateStore`. On the next run, `apply_start_bookmark` restores the token and the change stream opens with `resumeAfter: <token>` — MongoDB delivers events from exactly that point onwards.
 
-**`start_from` precedence (only consulted when no persisted bookmark exists, except as noted):**
+**`start_from` precedence:** every variant places only a **fresh** run. Once a bookmark exists the connector always resumes from it — an explicit `resume_token` / `timestamp` no longer overrides it, because replaying from a fixed point every run rewrote committed pages under exactly-once, ignored a mirror's captured handoff position, and failed for good once the point left the oplog. To restart from an explicit position, clear the state (`faucet state reset`) first.
 
-- `resume_token` and `timestamp` variants **always** override a persisted bookmark — they force an explicit start position regardless of what the state store holds.
-- `now` and `earliest` variants **yield** to a persisted bookmark: if one exists the connector resumes from it; if none exists, the variant chooses the initial position. A fresh `now` start persists the position it opened at before any change arrives, so a quiet first cycle followed by writes between runs loses nothing: the next run resumes from that position.
+- `earliest` opens at the oldest entry still in the oplog (read from `local.oplog.rs`), so it works on a replica set whose oplog has rolled; without read access to `local` it falls back to the beginning of time with a warning. A fresh `now` start persists the position it opened at before any change arrives, so a quiet first cycle followed by writes between runs loses nothing: the next run resumes from that position.
 
 State keys (one per scope) so that two pipelines on different scopes never collide:
 
@@ -411,7 +410,7 @@ This crate has no optional features of its own. From the umbrella / CLI it is ga
 |---------|-------------|
 | `The $changeStream stage is only supported on replica sets` or a startup `FaucetError::Source` about standalone | The URI points at a standalone `mongod`. Change Streams need a replica set or sharded cluster. Run `mongod --replSet rs0` and `rs.initiate()`, then add `?replicaSet=rs0` to the URI. |
 | Config error: `max_await_time_ms must be strictly less than idle_timeout` | `max_await_time_ms` is in **milliseconds** and must be `< idle_timeout` (which is in **seconds**). E.g. `idle_timeout: 30` (30 000 ms) with `max_await_time_ms: 1000` is valid. |
-| `start_from: earliest` errors with an oplog/`resume of change stream was not possible` message | The oldest available oplog entry has rolled past. Use `{ type: now }` for fresh deployments, and size the oplog (and your tolerated downtime) so the window outlasts any gap between runs. |
+| `start_from: earliest` errors with an oplog/`resume of change stream was not possible` message | The connector could not read `local.oplog.rs` (it logs a warning) and fell back to the beginning of time, which the server rejects once the oplog has rolled. Grant read on `local`, or use `{ type: now }` / an explicit `timestamp` inside the oplog window. |
 | Resume fails after restart with a "resume point may no longer be in the oplog" error | The persisted `resumeToken` rolled off the oplog while the pipeline was down. Increase the oplog size, or restart with `start_from: { type: now }` (accepting the gap). |
 | `before` is always `null` despite `full_document_before_change` set | Pre-images need MongoDB 6.0+ **and** `changeStreamPreAndPostImages: { enabled: true }` on the collection: `db.runCommand({ collMod: "mycoll", changeStreamPreAndPostImages: { enabled: true } })`. With `required` and pre-images off, the stream errors; with `when_available` you get `before: null`. |
 | `after` reflects a newer state than the change | You're using `full_document: update_lookup`, which re-reads the document at lookup time. If the doc was further modified or deleted in between, `after` shows the later state (or is absent). Don't rely on it for a strict point-in-time image. |
@@ -424,7 +423,7 @@ This crate has no optional features of its own. From the umbrella / CLI it is ga
 
 - **Replica set or sharded cluster required.** Standalone `mongod` instances do not support Change Streams; the connector validates this at startup and returns a typed `FaucetError::Source` immediately.
 - **`full_document: update_lookup` has at-least-once / read-skew semantics.** The document is re-read from the primary at delivery time, not at change time. If the document was further modified or deleted in between, the `after` image reflects the later state (or is absent).
-- **`start_from: earliest` may error** if the oplog has rolled past the earliest timestamp. Keep the oplog window large enough for your expected downtime.
+- **`start_from: earliest` needs read access to `local.oplog.rs`** to find the oldest retained entry; without it, it errors once the oplog has rolled.
 - **DDL events are best-effort.** Collection drops/renames arrive as `ddl` records, but the change stream does not replicate index operations or `collMod` changes that don't appear in the oplog.
 - **Per-batch durability, not per-event.** A crash mid-page replays at most `batch_size` events (unless effectively-once delivery is enabled).
 

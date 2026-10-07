@@ -291,3 +291,70 @@ async fn stream_write_batch_empty_input_is_zero_writes() {
     let exists: bool = conn.exists("untouched").await.expect("exists");
     assert!(!exists, "empty input must create no stream");
 }
+
+/// A null, object or array key fails only its own row (DLQ-routable) instead
+/// of collapsing every such record onto the key `"null"` (#789 MSG-20); the
+/// valid rows are written, and `ttl_secs` expires them.
+#[tokio::test(flavor = "multi_thread")]
+async fn key_value_partial_write_isolates_unusable_keys_and_sets_ttl() {
+    let (_container, url) = start_redis().await;
+    let mut cfg = RedisSinkConfig::new(
+        &url,
+        RedisSinkType::KeyValue {
+            key_field: "id".into(),
+        },
+    );
+    cfg.ttl_secs = Some(600);
+    let sink = RedisSink::new(cfg).await.expect("sink build");
+    let records = vec![
+        json!({"id": "a"}),
+        json!({"id": null}),
+        json!({"id": [1]}),
+        json!({"id": 7}),
+    ];
+    let outcomes = sink.write_batch_partial(&records).await.unwrap();
+    assert!(outcomes[0].is_ok() && outcomes[3].is_ok());
+    assert!(outcomes[1].is_err() && outcomes[2].is_err());
+    let mut conn = open_conn(&url).await;
+    let exists_null: bool = redis::cmd("EXISTS")
+        .arg("null")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(!exists_null, "no record lands on the literal key \"null\"");
+    let ttl: i64 = redis::cmd("TTL")
+        .arg("7")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(ttl > 0 && ttl <= 600, "ttl {ttl}");
+
+    let err = sink.write_batch(&records).await.unwrap_err();
+    assert!(err.to_string().contains("not a string"), "{err}");
+}
+
+/// `stream_max_len` trims the stream as it is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_max_len_caps_the_stream() {
+    let (_container, url) = start_redis().await;
+    let mut cfg = RedisSinkConfig::new(
+        &url,
+        RedisSinkType::Stream {
+            key: "capped".into(),
+        },
+    );
+    cfg.stream_max_len = Some(10);
+    let sink = RedisSink::new(cfg).await.unwrap();
+    let records: Vec<_> = (0..500).map(|i| json!({"i": i})).collect();
+    sink.write_batch(&records).await.unwrap();
+    let mut conn = open_conn(&url).await;
+    let len: usize = redis::cmd("XLEN")
+        .arg("capped")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        len < 500,
+        "approximate trimming bounds the stream, got {len}"
+    );
+}

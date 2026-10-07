@@ -1,20 +1,76 @@
 //! Redis source stream executor.
 
-use crate::config::{RedisSourceConfig, RedisSourceType};
+use crate::config::{RedisBinary, RedisJsonParsing, RedisSourceConfig, RedisSourceType};
 use async_trait::async_trait;
+use base64::Engine as _;
 use faucet_core::{FaucetError, Stream, StreamPage};
-use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::pin::Pin;
+
+/// How the source turns raw Redis bytes into JSON values.
+#[derive(Debug, Clone, Copy)]
+struct Decoding {
+    parse_json: RedisJsonParsing,
+    binary: RedisBinary,
+}
+
+impl Decoding {
+    fn of(config: &RedisSourceConfig) -> Self {
+        Self {
+            parse_json: config.parse_json,
+            binary: config.binary,
+        }
+    }
+
+    /// Decode one value read from `key`. Invalid UTF-8 follows `binary` (a
+    /// whole reply used to fail on one binary value, #789 MSG-54); valid text
+    /// is parsed as JSON only as `parse_json` allows (#789 MSG-85).
+    fn value(self, bytes: &[u8], key: &str) -> Result<Value, FaucetError> {
+        let text = match std::str::from_utf8(bytes) {
+            Ok(t) => std::borrow::Cow::Borrowed(t),
+            Err(_) => match self.binary {
+                RedisBinary::Base64 => {
+                    return Ok(Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                    ));
+                }
+                RedisBinary::Lossy => String::from_utf8_lossy(bytes),
+                RedisBinary::Error => {
+                    return Err(FaucetError::Source(format!(
+                        "Redis value at '{key}' is not valid UTF-8 (set `binary: base64` or \
+                         `binary: lossy` to read binary values)"
+                    )));
+                }
+            },
+        };
+        Ok(self.text(&text))
+    }
+
+    fn text(self, text: &str) -> Value {
+        let parse = match self.parse_json {
+            RedisJsonParsing::None => false,
+            RedisJsonParsing::All => true,
+            RedisJsonParsing::Containers => {
+                matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['))
+            }
+        };
+        if parse && let Ok(v) = serde_json::from_str::<Value>(text) {
+            return v;
+        }
+        Value::String(text.to_string())
+    }
+}
 
 /// A configured Redis source that reads records from Redis data structures.
 pub struct RedisSource {
     config: RedisSourceConfig,
-    /// Lazily-opened multiplexed connection, reused across every `fetch_all`
-    /// and `stream_pages` call instead of opening a fresh client + TCP/AUTH
-    /// handshake per call (#78/#22). `MultiplexedConnection` is cheap to clone
-    /// (it shares one underlying socket), so each call clones the cached one.
-    conn: tokio::sync::OnceCell<redis::aio::MultiplexedConnection>,
+    /// Lazily-opened connection, reused across every read. A
+    /// [`ConnectionManager`] reconnects after the server connection drops (a
+    /// failover), where a bare multiplexed connection failed every later
+    /// command until it was rebuilt (#789 MSG-78). Cheap to clone.
+    conn: tokio::sync::OnceCell<ConnectionManager>,
 }
 
 impl RedisSource {
@@ -29,16 +85,19 @@ impl RedisSource {
         })
     }
 
-    /// Return a clone of the shared multiplexed connection, opening it once on
-    /// first call.
-    async fn connection(&self) -> Result<redis::aio::MultiplexedConnection, FaucetError> {
+    /// Return a clone of the shared connection, opening it once on first call.
+    async fn connection(&self) -> Result<ConnectionManager, FaucetError> {
         let conn = self
             .conn
             .get_or_try_init(|| async {
                 let client = redis::Client::open(self.config.url.as_str())
                     .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
-                client
-                    .get_multiplexed_async_connection()
+                let manager = redis::aio::ConnectionManagerConfig::new()
+                    .set_number_of_retries(3)
+                    .set_factor(2)
+                    .set_max_delay(1000)
+                    .set_connection_timeout(std::time::Duration::from_secs(10));
+                ConnectionManager::new_with_config(client, manager)
                     .await
                     .map_err(|e| FaucetError::Source(format!("Redis connection failed: {e}")))
             })
@@ -47,176 +106,41 @@ impl RedisSource {
     }
 
     /// Fetch all records from the configured Redis source.
+    ///
+    /// The same reads as [`stream_pages`](faucet_core::Source::stream_pages),
+    /// collected: a `Stream` source uses `XRANGE` here too, so a preview never
+    /// claims entries into a consumer group's pending list (#789 MSG-18).
     pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
-        let mut conn = self.connection().await?;
+        self.collect(&std::collections::HashMap::new()).await
+    }
 
-        let mut records = match &self.config.source_type {
-            RedisSourceType::List { key } => self.fetch_list(&mut conn, key).await?,
-            RedisSourceType::Stream {
-                key,
-                group,
-                consumer,
-                count,
-            } => {
-                self.fetch_stream(&mut conn, key, group, consumer, count)
-                    .await?
-            }
-            RedisSourceType::Keys { pattern } => self.fetch_keys(&mut conn, pattern).await?,
-        };
-
-        if let Some(max) = self.config.max_records {
-            records.truncate(max);
+    async fn collect(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        use faucet_core::Source as _;
+        let mut records = Vec::new();
+        let pages = self.stream_pages(context, self.config.batch_size);
+        futures::pin_mut!(pages);
+        while let Some(page) = futures::StreamExt::next(&mut pages).await {
+            records.extend(page?.records);
         }
-
         tracing::info!(records = records.len(), "Redis fetch complete");
-        Ok(records)
-    }
-
-    /// Read all elements from a Redis list.
-    async fn fetch_list(
-        &self,
-        conn: &mut redis::aio::MultiplexedConnection,
-        key: &str,
-    ) -> Result<Vec<Value>, FaucetError> {
-        let values: Vec<String> = conn
-            .lrange(key, 0, -1)
-            .await
-            .map_err(|e| FaucetError::Source(format!("LRANGE failed on '{key}': {e}")))?;
-
-        let records = values
-            .into_iter()
-            .map(|v| serde_json::from_str::<Value>(&v).unwrap_or_else(|_| Value::String(v.clone())))
-            .collect();
-
-        Ok(records)
-    }
-
-    /// Read entries from a Redis stream.
-    async fn fetch_stream(
-        &self,
-        conn: &mut redis::aio::MultiplexedConnection,
-        key: &str,
-        group: &Option<String>,
-        consumer: &Option<String>,
-        count: &Option<usize>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        let mut records = Vec::new();
-        match (group, consumer) {
-            (Some(group_name), Some(consumer_name)) => {
-                // Drain ALL currently-pending new messages for the group, not just
-                // the first `count`. A single XREADGROUP with the default
-                // `count = 100` silently truncated the rest (#146 narrowed); loop,
-                // consuming `>` until a short read (fewer than requested → the
-                // backlog is drained) or the `max_records` cap is hit.
-                let per_read = count.unwrap_or(100).max(1);
-                loop {
-                    let opts = redis::streams::StreamReadOptions::default().count(per_read);
-                    let reply: redis::streams::StreamReadReply = conn
-                        .xread_options(&[key], &[">"], &opts.group(group_name, consumer_name))
-                        .await
-                        .map_err(|e| {
-                            FaucetError::Source(format!("XREADGROUP failed on '{key}': {e}"))
-                        })?;
-                    let mut got = 0usize;
-                    for stream_key in &reply.keys {
-                        for entry in &stream_key.ids {
-                            records.push(stream_entry_to_json(&entry.id, &entry.map));
-                            got += 1;
-                        }
-                    }
-                    // A short read means Redis returned everything currently
-                    // pending — stop (also breaks at `got == 0`). This also avoids
-                    // spinning against a live producer.
-                    if got < per_read {
-                        break;
-                    }
-                    if let Some(max) = self.config.max_records
-                        && records.len() >= max
-                    {
-                        break;
-                    }
-                }
-            }
-            _ => {
-                // No consumer group: XREAD from `0` returns the whole stream when
-                // no `count` is set; an explicit `count` is the caller's own cap.
-                let mut opts = redis::streams::StreamReadOptions::default();
-                if let Some(c) = count {
-                    opts = opts.count(*c);
-                }
-                let reply: redis::streams::StreamReadReply = conn
-                    .xread_options(&[key], &["0"], &opts)
-                    .await
-                    .map_err(|e| FaucetError::Source(format!("XREAD failed on '{key}': {e}")))?;
-                for stream_key in &reply.keys {
-                    for entry in &stream_key.ids {
-                        records.push(stream_entry_to_json(&entry.id, &entry.map));
-                    }
-                }
-            }
-        }
-
-        Ok(records)
-    }
-
-    /// Scan for keys matching a pattern, then MGET all keys in a single round-trip.
-    async fn fetch_keys(
-        &self,
-        conn: &mut redis::aio::MultiplexedConnection,
-        pattern: &str,
-    ) -> Result<Vec<Value>, FaucetError> {
-        let keys: Vec<String> = {
-            let mut collected = Vec::new();
-            let mut iter: redis::AsyncIter<String> =
-                conn.scan_match(pattern).await.map_err(|e| {
-                    FaucetError::Source(format!("SCAN failed with pattern '{pattern}': {e}"))
-                })?;
-
-            while let Some(key) = iter.next_item().await {
-                collected.push(key);
-            }
-            collected
-        };
-
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let values: Vec<Option<String>> = redis::cmd("MGET")
-            .arg(&keys)
-            .query_async(conn)
-            .await
-            .map_err(|e| FaucetError::Source(format!("MGET failed: {e}")))?;
-
-        let mut records = Vec::new();
-        for (key, value) in keys.iter().zip(values) {
-            if let Some(v) = value {
-                let parsed =
-                    serde_json::from_str::<Value>(&v).unwrap_or_else(|_| Value::String(v.clone()));
-                records.push(json!({
-                    "key": key,
-                    "value": parsed,
-                }));
-            }
-        }
-
         Ok(records)
     }
 }
 
-/// Convert a single XRANGE/XREAD stream entry into the JSON record shape used
-/// by both [`RedisSource::fetch_all`] and [`RedisSource::stream_pages`].
-fn stream_entry_to_json(id: &str, map: &std::collections::HashMap<String, redis::Value>) -> Value {
+/// Convert a single XRANGE stream entry into the JSON record shape.
+fn stream_entry_to_json(
+    id: &str,
+    map: &std::collections::HashMap<String, redis::Value>,
+    decoding: Decoding,
+) -> Result<Value, FaucetError> {
     let mut fields = serde_json::Map::new();
     for (field_name, field_value) in map {
         let val = match field_value {
-            redis::Value::BulkString(bytes) => {
-                let s = String::from_utf8_lossy(bytes);
-                serde_json::from_str::<Value>(&s).unwrap_or_else(|_| Value::String(s.into_owned()))
-            }
-            redis::Value::SimpleString(s) => {
-                serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone()))
-            }
+            redis::Value::BulkString(bytes) => decoding.value(bytes, field_name)?,
+            redis::Value::SimpleString(s) => decoding.text(s),
             redis::Value::Int(n) => json!(n),
             redis::Value::Double(n) => json!(n),
             redis::Value::Boolean(b) => json!(b),
@@ -225,10 +149,39 @@ fn stream_entry_to_json(id: &str, map: &std::collections::HashMap<String, redis:
         };
         fields.insert(field_name.clone(), val);
     }
-    json!({
+    Ok(json!({
         "id": id,
         "fields": Value::Object(fields),
-    })
+    }))
+}
+
+/// Escape the glob metacharacters `SCAN MATCH` interprets, so a value
+/// substituted into a `Keys` pattern matches literally instead of widening the
+/// match (#789 MSG-94).
+fn escape_glob(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\' | '^') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Substitute `context` into a `Keys` pattern, escaping each value.
+fn substitute_pattern(pattern: &str, context: &std::collections::HashMap<String, Value>) -> String {
+    let escaped: std::collections::HashMap<String, Value> = context
+        .iter()
+        .map(|(k, v)| {
+            let text = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), Value::String(escape_glob(&text)))
+        })
+        .collect();
+    faucet_core::util::substitute_context(pattern, &escaped)
 }
 
 /// Parse a Redis stream entry ID (`ms-seq`) and return the immediate
@@ -257,43 +210,7 @@ impl faucet_core::Source for RedisSource {
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Value>, FaucetError> {
-        if context.is_empty() {
-            return RedisSource::fetch_all(self).await;
-        }
-
-        let mut conn = self.connection().await?;
-
-        // Substitute context into the key/pattern of each source type variant.
-        let mut records = match &self.config.source_type {
-            RedisSourceType::List { key } => {
-                let resolved_key = faucet_core::util::substitute_context(key, context);
-                self.fetch_list(&mut conn, &resolved_key).await?
-            }
-            RedisSourceType::Stream {
-                key,
-                group,
-                consumer,
-                count,
-            } => {
-                let resolved_key = faucet_core::util::substitute_context(key, context);
-                self.fetch_stream(&mut conn, &resolved_key, group, consumer, count)
-                    .await?
-            }
-            RedisSourceType::Keys { pattern } => {
-                let resolved_pattern = faucet_core::util::substitute_context(pattern, context);
-                self.fetch_keys(&mut conn, &resolved_pattern).await?
-            }
-        };
-
-        if let Some(max) = self.config.max_records {
-            records.truncate(max);
-        }
-
-        tracing::info!(
-            records = records.len(),
-            "Redis fetch complete (with context)"
-        );
-        Ok(records)
+        self.collect(context).await
     }
 
     /// Stream records page-by-page so the pipeline can write to the sink as
@@ -316,6 +233,7 @@ impl faucet_core::Source for RedisSource {
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         let batch_size = self.config.batch_size;
         let max_records = self.config.max_records;
+        let decoding = Decoding::of(&self.config);
 
         Box::pin(async_stream::try_stream! {
             let mut conn = self.connection().await?;
@@ -329,7 +247,7 @@ impl faucet_core::Source for RedisSource {
                     } else {
                         faucet_core::util::substitute_context(key, context)
                     };
-                    let pages = stream_list(&mut conn, &resolved, batch_size, max_records);
+                    let pages = stream_list(&mut conn, &resolved, batch_size, max_records, decoding);
                     futures::pin_mut!(pages);
                     while let Some(page) = futures::StreamExt::next(&mut pages).await {
                         let page = page?;
@@ -338,25 +256,17 @@ impl faucet_core::Source for RedisSource {
                     }
                 }
                 RedisSourceType::Stream { key, group, consumer, .. } => {
-                    // Streaming intentionally uses XRANGE — consumer-group
-                    // semantics (XREADGROUP) don't compose with "drain to a
-                    // bookmarked checkpoint" because acknowledgement state
-                    // would have to be deferred until the sink succeeds, and
-                    // the source has no incremental mode today.
-                    //
-                    // The `group`/`consumer` fields select XREADGROUP on the
-                    // `fetch_all` batch path (consume-once), but here they are
-                    // ignored — so a streaming run with a configured group
-                    // silently re-reads the WHOLE stream from the start every
-                    // run. Warn loudly rather than swallowing the gap (F56).
+                    // Every path uses XRANGE: reading through a consumer group
+                    // would move entries into the group's pending list and
+                    // withhold them from its other consumers (#789 MSG-18). A
+                    // configured group is ignored — warn so the full re-read
+                    // every run is not a surprise (F56).
                     if stream_ignores_consumer_group(group.as_deref(), consumer.as_deref()) {
                         tracing::warn!(
                             stream = %key,
-                            "Redis Stream source has a consumer group/consumer configured, but \
-                             the streaming path (stream_pages) ignores it and uses XRANGE — it \
-                             re-reads the entire stream every run. Use the fetch_all batch path \
-                             for XREADGROUP consume-once semantics, or drop group/consumer to \
-                             silence this warning."
+                            "Redis Stream source has a consumer group/consumer configured; it is \
+                             ignored — the source reads with XRANGE and re-reads the entire \
+                             stream every run. Drop group/consumer to silence this warning."
                         );
                     }
                     let resolved = if context.is_empty() {
@@ -364,7 +274,7 @@ impl faucet_core::Source for RedisSource {
                     } else {
                         faucet_core::util::substitute_context(key, context)
                     };
-                    let pages = stream_xrange(&mut conn, &resolved, batch_size, max_records);
+                    let pages = stream_xrange(&mut conn, &resolved, batch_size, max_records, decoding);
                     futures::pin_mut!(pages);
                     while let Some(page) = futures::StreamExt::next(&mut pages).await {
                         let page = page?;
@@ -376,9 +286,9 @@ impl faucet_core::Source for RedisSource {
                     let resolved = if context.is_empty() {
                         pattern.clone()
                     } else {
-                        faucet_core::util::substitute_context(pattern, context)
+                        substitute_pattern(pattern, context)
                     };
-                    let pages = stream_keys(&mut conn, &resolved, batch_size, max_records);
+                    let pages = stream_keys(&mut conn, &resolved, batch_size, max_records, decoding);
                     futures::pin_mut!(pages);
                     while let Some(page) = futures::StreamExt::next(&mut pages).await {
                         let page = page?;
@@ -427,21 +337,16 @@ impl faucet_core::Source for RedisSource {
 /// a queue-style workload where the list is being consumed concurrently,
 /// prefer a Redis Stream (`XRANGE`/consumer groups) over a list.
 fn stream_list<'a>(
-    conn: &'a mut redis::aio::MultiplexedConnection,
+    conn: &'a mut ConnectionManager,
     key: &'a str,
     batch_size: usize,
     max_records: Option<usize>,
+    decoding: Decoding,
 ) -> impl Stream<Item = Result<StreamPage, FaucetError>> + 'a {
     async_stream::try_stream! {
         if batch_size == 0 {
-            let values: Vec<String> = conn
-                .lrange(key, 0, -1)
-                .await
-                .map_err(|e| FaucetError::Source(format!("LRANGE failed on '{key}': {e}")))?;
-            let mut records: Vec<Value> = values
-                .into_iter()
-                .map(|v| serde_json::from_str::<Value>(&v).unwrap_or_else(|_| Value::String(v.clone())))
-                .collect();
+            let values = lrange(conn, key, 0, -1).await?;
+            let mut records = decode_all(&values, key, decoding)?;
             if let Some(max) = max_records {
                 records.truncate(max);
             }
@@ -453,17 +358,11 @@ fn stream_list<'a>(
         let mut emitted: usize = 0;
         loop {
             let stop: isize = start + batch_size as isize - 1;
-            let values: Vec<String> = conn
-                .lrange(key, start, stop)
-                .await
-                .map_err(|e| FaucetError::Source(format!("LRANGE failed on '{key}': {e}")))?;
+            let values = lrange(conn, key, start, stop).await?;
             if values.is_empty() {
                 break;
             }
-            let mut records: Vec<Value> = values
-                .into_iter()
-                .map(|v| serde_json::from_str::<Value>(&v).unwrap_or_else(|_| Value::String(v.clone())))
-                .collect();
+            let mut records = decode_all(&values, key, decoding)?;
             let returned = records.len();
             // Respect max_records — truncate the final page and stop.
             let mut stop_after_yield = false;
@@ -483,15 +382,41 @@ fn stream_list<'a>(
     }
 }
 
+/// `LRANGE` as raw bytes, so one binary element cannot fail the whole reply.
+async fn lrange(
+    conn: &mut ConnectionManager,
+    key: &str,
+    start: isize,
+    stop: isize,
+) -> Result<Vec<Vec<u8>>, FaucetError> {
+    redis::cmd("LRANGE")
+        .arg(key)
+        .arg(start)
+        .arg(stop)
+        .query_async(conn)
+        .await
+        .map_err(|e| FaucetError::Source(format!("LRANGE failed on '{key}': {e}")))
+}
+
+fn decode_all(
+    values: &[Vec<u8>],
+    key: &str,
+    decoding: Decoding,
+) -> Result<Vec<Value>, FaucetError> {
+    values.iter().map(|v| decoding.value(v, key)).collect()
+}
+
 /// Stream a Redis stream via `XRANGE start + COUNT batch_size`, advancing the
 /// start ID on each page. With `batch_size == 0`, drains via a single
 /// `XRANGE - +` round-trip.
 fn stream_xrange<'a>(
-    conn: &'a mut redis::aio::MultiplexedConnection,
+    conn: &'a mut ConnectionManager,
     key: &'a str,
     batch_size: usize,
     max_records: Option<usize>,
+    decoding: Decoding,
 ) -> impl Stream<Item = Result<StreamPage, FaucetError>> + 'a {
+    use redis::AsyncCommands as _;
     async_stream::try_stream! {
         if batch_size == 0 {
             let reply: redis::streams::StreamRangeReply = conn
@@ -501,8 +426,8 @@ fn stream_xrange<'a>(
             let mut records: Vec<Value> = reply
                 .ids
                 .iter()
-                .map(|entry| stream_entry_to_json(&entry.id, &entry.map))
-                .collect();
+                .map(|entry| stream_entry_to_json(&entry.id, &entry.map, decoding))
+                .collect::<Result<_, _>>()?;
             if let Some(max) = max_records {
                 records.truncate(max);
             }
@@ -534,8 +459,8 @@ fn stream_xrange<'a>(
             let mut records: Vec<Value> = reply
                 .ids
                 .into_iter()
-                .map(|entry| stream_entry_to_json(&entry.id, &entry.map))
-                .collect();
+                .map(|entry| stream_entry_to_json(&entry.id, &entry.map, decoding))
+                .collect::<Result<_, _>>()?;
 
             let mut stop_after_yield = false;
             if let Some(max) = max_records
@@ -561,10 +486,11 @@ fn stream_xrange<'a>(
 /// `batch_size == 0`, drains the entire scan and emits one page after a
 /// single `MGET`.
 fn stream_keys<'a>(
-    conn: &'a mut redis::aio::MultiplexedConnection,
+    conn: &'a mut ConnectionManager,
     pattern: &'a str,
     batch_size: usize,
     max_records: Option<usize>,
+    decoding: Decoding,
 ) -> impl Stream<Item = Result<StreamPage, FaucetError>> + 'a {
     use faucet_core::DEFAULT_BATCH_SIZE;
     async_stream::try_stream! {
@@ -583,6 +509,9 @@ fn stream_keys<'a>(
         let mut cursor: u64 = 0;
         let mut buffer: Vec<String> = Vec::new();
         let mut emitted: usize = 0;
+        // SCAN may return a key more than once; emit each once (#789 MSG-85).
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut skipped: usize = 0;
 
         'scan: loop {
             let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
@@ -595,13 +524,14 @@ fn stream_keys<'a>(
                 .await
                 .map_err(|e| FaucetError::Source(format!("SCAN failed with pattern '{pattern}': {e}")))?;
             cursor = next_cursor;
-            buffer.extend(keys);
+            buffer.extend(keys.into_iter().filter(|k| seen.insert(k.clone())));
 
             // Flush as many full pages as the buffer now holds.
             while emitted < cap && buffer.len() >= chunk_size {
                 let take = chunk_size.min(cap - emitted);
                 let page_keys: Vec<String> = buffer.drain(..take).collect();
-                let records = mget_records(conn, &page_keys).await?;
+                let (records, other) = mget_records(conn, &page_keys, decoding).await?;
+                skipped += other;
                 emitted += records.len();
                 yield StreamPage { records, bookmark: None };
             }
@@ -615,40 +545,80 @@ fn stream_keys<'a>(
         if emitted < cap && !buffer.is_empty() {
             let take = (cap - emitted).min(buffer.len());
             let page_keys: Vec<String> = buffer.drain(..take).collect();
-            let records = mget_records(conn, &page_keys).await?;
+            let (records, other) = mget_records(conn, &page_keys, decoding).await?;
+            skipped += other;
             yield StreamPage { records, bookmark: None };
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                pattern,
+                skipped,
+                "Redis Keys source skipped matched keys that are not strings (hash, set, list, \
+                 zset or stream); narrow the pattern to string keys"
+            );
         }
     }
 }
 
-/// `MGET` a slice of keys and pair them with their values via
-/// [`collect_kv_records`].
+/// `MGET` a slice of keys (as raw bytes) and pair them with their values via
+/// [`collect_kv_records`]. A key `MGET` returns nil for was either deleted
+/// since the `SCAN` or is not a string; the second count is the non-strings,
+/// found with one pipelined `TYPE` round trip over the nil keys only (#789
+/// MSG-30).
 async fn mget_records(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut ConnectionManager,
     keys: &[String],
-) -> Result<Vec<Value>, FaucetError> {
-    let values: Vec<Option<String>> = redis::cmd("MGET")
+    decoding: Decoding,
+) -> Result<(Vec<Value>, usize), FaucetError> {
+    let values: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
         .arg(keys)
         .query_async(conn)
         .await
         .map_err(|e| FaucetError::Source(format!("MGET failed: {e}")))?;
-    Ok(collect_kv_records(keys, values))
+    let missing: Vec<&String> = keys
+        .iter()
+        .zip(&values)
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k)
+        .collect();
+    let mut non_strings = 0;
+    if !missing.is_empty() {
+        let mut pipe = redis::pipe();
+        for k in &missing {
+            pipe.cmd("TYPE").arg(*k);
+        }
+        let types: Vec<String> = pipe
+            .query_async(conn)
+            .await
+            .map_err(|e| FaucetError::Source(format!("TYPE failed: {e}")))?;
+        non_strings = count_non_strings(&types);
+    }
+    Ok((collect_kv_records(keys, values, decoding)?, non_strings))
+}
+
+/// Keys whose `TYPE` is a non-string data type (`none` = deleted meanwhile).
+fn count_non_strings(types: &[String]) -> usize {
+    types
+        .iter()
+        .filter(|t| !matches!(t.as_str(), "none" | "string"))
+        .count()
 }
 
 /// Pair `keys` with their `MGET`-returned values into `{ "key", "value" }`
-/// records. Missing values (deleted between `SCAN` and `MGET`) are dropped,
-/// matching [`RedisSource::fetch_keys`].
-fn collect_kv_records(keys: &[String], values: Vec<Option<String>>) -> Vec<Value> {
-    keys.iter()
-        .zip(values)
-        .filter_map(|(key, value)| {
-            value.map(|v| {
-                let parsed =
-                    serde_json::from_str::<Value>(&v).unwrap_or_else(|_| Value::String(v.clone()));
-                json!({ "key": key, "value": parsed })
-            })
-        })
-        .collect()
+/// records. Missing values (deleted between `SCAN` and `MGET`, or not
+/// strings) are dropped.
+fn collect_kv_records(
+    keys: &[String],
+    values: Vec<Option<Vec<u8>>>,
+    decoding: Decoding,
+) -> Result<Vec<Value>, FaucetError> {
+    let mut out = Vec::new();
+    for (key, value) in keys.iter().zip(values) {
+        if let Some(v) = value {
+            out.push(json!({ "key": key, "value": decoding.value(&v, key)? }));
+        }
+    }
+    Ok(out)
 }
 
 /// `true` when a Redis Stream source has a consumer group/consumer configured
@@ -663,6 +633,82 @@ fn stream_ignores_consumer_group(group: Option<&str>, consumer: Option<&str>) ->
 mod tests {
     use super::*;
     use crate::config::RedisSourceConfig;
+
+    fn cfg() -> RedisSourceConfig {
+        RedisSourceConfig::new(
+            "redis://localhost",
+            RedisSourceType::List { key: "k".into() },
+        )
+    }
+
+    #[test]
+    fn values_parse_as_json_only_as_configured() {
+        let mut c = cfg();
+        let d = Decoding::of(&c);
+        assert_eq!(d.value(b"1.10", "k").unwrap(), json!("1.10"));
+        assert_eq!(d.value(b"true", "k").unwrap(), json!("true"));
+        assert_eq!(
+            d.value(b"123456789012345678901234", "k").unwrap(),
+            json!("123456789012345678901234")
+        );
+        assert_eq!(d.value(b" {\"a\":1}", "k").unwrap(), json!({"a": 1}));
+        assert_eq!(d.value(b"[1,2]", "k").unwrap(), json!([1, 2]));
+        assert_eq!(d.value(b"{oops", "k").unwrap(), json!("{oops"));
+        c.parse_json = RedisJsonParsing::All;
+        assert_eq!(Decoding::of(&c).value(b"true", "k").unwrap(), json!(true));
+        c.parse_json = RedisJsonParsing::None;
+        assert_eq!(Decoding::of(&c).value(b"[1]", "k").unwrap(), json!("[1]"));
+    }
+
+    #[test]
+    fn binary_values_follow_the_binary_policy() {
+        let bytes = [0xff_u8, 0x00, b'a'];
+        let mut c = cfg();
+        assert_eq!(Decoding::of(&c).value(&bytes, "k").unwrap(), json!("/wBh"));
+        c.binary = RedisBinary::Lossy;
+        assert_eq!(
+            Decoding::of(&c).value(&bytes, "k").unwrap(),
+            json!("\u{fffd}\u{0}a")
+        );
+        c.binary = RedisBinary::Error;
+        let err = Decoding::of(&c).value(&bytes, "bin:1").unwrap_err();
+        assert!(err.to_string().contains("bin:1"), "{err}");
+        assert_eq!(Decoding::of(&c).value(b"ok", "k").unwrap(), json!("ok"));
+    }
+
+    #[test]
+    fn keys_pattern_substitution_escapes_glob_metacharacters() {
+        let ctx: std::collections::HashMap<String, Value> = [
+            ("p.id".to_string(), json!("a*b?[c]\\^")),
+            ("n".to_string(), json!(7)),
+        ]
+        .into();
+        assert_eq!(
+            substitute_pattern("user:{p.id}:{n}:*", &ctx),
+            "user:a\\*b\\?\\[c\\]\\\\\\^:7:*"
+        );
+    }
+
+    #[test]
+    fn only_non_string_types_count_as_skipped() {
+        let types: Vec<String> = ["string", "none", "hash", "zset"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(count_non_strings(&types), 2);
+    }
+
+    #[test]
+    fn kv_records_drop_missing_values() {
+        let keys = vec!["a".to_string(), "b".to_string()];
+        let out = collect_kv_records(
+            &keys,
+            vec![Some(b"{\"x\":1}".to_vec()), None],
+            Decoding::of(&cfg()),
+        )
+        .unwrap();
+        assert_eq!(out, vec![json!({"key": "a", "value": {"x": 1}})]);
+    }
 
     #[test]
     fn stream_ignores_consumer_group_flags_configured_group() {
@@ -795,7 +841,7 @@ mod tests {
             redis::Value::BulkString(b"value1".to_vec()),
         );
         map.insert("field2".to_string(), redis::Value::Int(42));
-        let json = stream_entry_to_json("100-0", &map);
+        let json = stream_entry_to_json("100-0", &map, Decoding::of(&cfg())).unwrap();
         assert_eq!(json["id"], "100-0");
         assert_eq!(json["fields"]["field1"], "value1");
         assert_eq!(json["fields"]["field2"], 42);

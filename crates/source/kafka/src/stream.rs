@@ -43,8 +43,17 @@ pub struct KafkaSource {
     /// The offsets last handed to the pipeline on a page bookmark — where
     /// [`Source::lag`] measures from (#733).
     emitted: std::sync::Mutex<Option<Bookmark>>,
+    /// Whether the consumer has subscribed. Subscription is deferred to the
+    /// first read, because subscribing joins the consumer group: a probe-only
+    /// instance (`faucet doctor`, `status`, `lag`) must never trigger a
+    /// rebalance of the group's running members (#789 MSG-73).
+    subscribed: std::sync::Mutex<bool>,
     #[cfg(feature = "schema-registry")]
     sr_client: Option<SchemaRegistryClient>,
+    /// The registry the key format names (it may differ from the value's),
+    /// falling back to the value's (#789 MSG-95).
+    #[cfg(feature = "schema-registry")]
+    key_sr_client: Option<SchemaRegistryClient>,
 }
 
 /// Messages left in one partition: from the next offset to read (or, with no
@@ -82,19 +91,26 @@ impl KafkaSource {
         }
 
         let context = BookmarkContext::new();
+        context.earliest.store(
+            matches!(
+                config.auto_offset_reset,
+                crate::config::OffsetReset::Earliest
+            ),
+            Ordering::Release,
+        );
         let consumer: StreamConsumer<BookmarkContext> = client_config
             .create_with_context(context.clone())
             .map_err(|e| FaucetError::Source(format!("kafka consumer init: {e}")))?;
-
-        let topic_refs: Vec<&str> = config.topics.iter().map(String::as_str).collect();
-        consumer
-            .subscribe(&topic_refs)
-            .map_err(|e| FaucetError::Source(format!("kafka subscribe: {e}")))?;
 
         let state_key_value = state_key(&config.group_id, &config.topics);
 
         #[cfg(feature = "schema-registry")]
         let sr_client = build_sr_client(&config.value_format, config.key_format.as_ref())?;
+        #[cfg(feature = "schema-registry")]
+        let key_sr_client = match &config.key_format {
+            Some(kf) => build_sr_client(kf, Some(&config.value_format))?,
+            None => None,
+        };
 
         Ok(Self {
             config,
@@ -104,9 +120,35 @@ impl KafkaSource {
             assigned_floor: std::sync::Mutex::new(HashMap::new()),
             member_shard: std::sync::Mutex::new(None),
             emitted: std::sync::Mutex::new(None),
+            subscribed: std::sync::Mutex::new(false),
             #[cfg(feature = "schema-registry")]
             sr_client,
+            #[cfg(feature = "schema-registry")]
+            key_sr_client,
         })
+    }
+
+    /// Subscribe to the configured topics on the first read (see
+    /// [`Self::subscribed`]).
+    fn ensure_subscribed(&self) -> Result<(), FaucetError> {
+        let mut done = self
+            .subscribed
+            .lock()
+            .map_err(|e| FaucetError::State(format!("kafka subscribe mutex poisoned: {e}")))?;
+        if !*done {
+            let topics: Vec<&str> = self.config.topics.iter().map(String::as_str).collect();
+            self.consumer
+                .subscribe(&topics)
+                .map_err(|e| FaucetError::Source(format!("kafka subscribe: {e}")))?;
+            *done = true;
+        }
+        Ok(())
+    }
+
+    /// Whether the consumer has joined the group (test hook).
+    #[cfg(test)]
+    fn is_subscribed(&self) -> bool {
+        *self.subscribed.lock().unwrap()
     }
 
     /// Drain the callback-error slot. Called once per poll iteration so
@@ -305,7 +347,17 @@ impl KafkaSource {
                 return;
             }
         };
-        let list = commit_list(offsets, &assigned);
+        // Drop partitions revoked since this member last read them: their
+        // offset is stale if another member advanced the group meanwhile.
+        let fresh: HashMap<(String, i32), i64> = match self.context.events.lock() {
+            Ok(ev) => offsets
+                .iter()
+                .filter(|(tp, _)| !ev.stale_since_revoke(tp))
+                .map(|(tp, o)| (tp.clone(), *o))
+                .collect(),
+            Err(_) => offsets.clone(),
+        };
+        let list = commit_list(&fresh, &assigned);
         if list.is_empty() {
             return;
         }
@@ -413,33 +465,16 @@ impl KafkaSource {
                     msg.key(),
                     fmt,
                     #[cfg(feature = "schema-registry")]
-                    self.sr_client.as_ref(),
+                    self.key_sr_client.as_ref(),
                 )
                 .await?
             }
-            None => match msg.key() {
-                Some(bytes) => Value::String(
-                    std::str::from_utf8(bytes)
-                        .map_err(|e| FaucetError::Source(format!("kafka key utf-8: {e}")))?
-                        .to_string(),
-                ),
-                None => Value::Null,
-            },
+            None => raw_key(msg.key()),
         };
-
-        let mut headers_obj = Map::new();
-        if let Some(headers) = msg.headers() {
-            for h in headers.iter() {
-                if let Some(value_bytes) = h.value {
-                    if let Ok(s) = std::str::from_utf8(value_bytes) {
-                        headers_obj.insert(h.key.to_string(), Value::String(s.to_string()));
-                    } else {
-                        let encoded = base64::engine::general_purpose::STANDARD.encode(value_bytes);
-                        headers_obj.insert(h.key.to_string(), Value::String(encoded));
-                    }
-                }
-            }
-        }
+        let headers = msg
+            .headers()
+            .map(|h| h.iter().map(|h| (h.key, h.value)).collect::<Vec<_>>())
+            .unwrap_or_default();
 
         Ok(json!({
             "key": key,
@@ -447,10 +482,53 @@ impl KafkaSource {
             "topic": msg.topic(),
             "partition": msg.partition(),
             "offset": msg.offset(),
-            "timestamp": msg.timestamp().to_millis().unwrap_or(0),
-            "headers": Value::Object(headers_obj),
+            "timestamp": msg.timestamp().to_millis(),
+            "headers": headers_value(&headers),
         }))
     }
+}
+
+/// A key with no `key_format`: its UTF-8 text, or base64 when the bytes are
+/// not UTF-8 (a binary key used to fail the record, #789 MSG-95). Pure.
+pub(crate) fn raw_key(bytes: Option<&[u8]>) -> Value {
+    match bytes {
+        None => Value::Null,
+        Some(b) => match std::str::from_utf8(b) {
+            Ok(s) => Value::String(s.to_string()),
+            Err(_) => Value::String(base64::engine::general_purpose::STANDARD.encode(b)),
+        },
+    }
+}
+
+/// Message headers as JSON (#789 MSG-95): a valueless header is `null`
+/// (it used to be dropped), a header repeated under one name becomes an
+/// array of its values in order (only the last used to survive), and a
+/// non-UTF-8 value is base64. Pure.
+pub(crate) fn headers_value(headers: &[(&str, Option<&[u8]>)]) -> Value {
+    let render = |v: Option<&[u8]>| match v {
+        None => Value::Null,
+        Some(b) => match std::str::from_utf8(b) {
+            Ok(s) => Value::String(s.to_string()),
+            Err(_) => Value::String(base64::engine::general_purpose::STANDARD.encode(b)),
+        },
+    };
+    let mut grouped: Vec<(String, Vec<Value>)> = Vec::new();
+    for (k, v) in headers {
+        match grouped.iter_mut().find(|(n, _)| n == k) {
+            Some((_, vs)) => vs.push(render(*v)),
+            None => grouped.push(((*k).to_string(), vec![render(*v)])),
+        }
+    }
+    let mut out = Map::new();
+    for (k, mut vs) in grouped {
+        let v = if vs.len() == 1 {
+            vs.pop().unwrap_or(Value::Null)
+        } else {
+            Value::Array(vs)
+        };
+        out.insert(k, v);
+    }
+    Value::Object(out)
 }
 
 #[cfg(feature = "schema-registry")]
@@ -514,6 +592,7 @@ impl Source for KafkaSource {
         &self,
         _context: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
+        self.ensure_subscribed()?;
         let mut records: Vec<Value> = Vec::new();
         let mut pending_offsets: HashMap<(String, i32), i64> = HashMap::new();
         let mut last_message_at = Instant::now();
@@ -640,6 +719,7 @@ impl Source for KafkaSource {
         let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
 
         Box::pin(async_stream::try_stream! {
+            self.ensure_subscribed()?;
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut pending_offsets: HashMap<(String, i32), i64> = HashMap::new();
             let mut last_message_at = Instant::now();
@@ -1047,6 +1127,33 @@ mod tests {
         KafkaSource::new(config)
             .await
             .expect("offline construction")
+    }
+
+    #[test]
+    fn keys_and_headers_keep_their_fidelity() {
+        assert_eq!(raw_key(None), Value::Null);
+        assert_eq!(raw_key(Some(b"k1")), json!("k1"));
+        assert_eq!(raw_key(Some(&[0xff, 0x00])), json!("/wA="));
+        let h = headers_value(&[
+            ("a", Some(b"1".as_slice())),
+            ("empty", None),
+            ("a", Some(b"2".as_slice())),
+            ("bin", Some(&[0xff][..])),
+            ("a", Some(b"3".as_slice())),
+        ]);
+        assert_eq!(
+            h,
+            json!({"a": ["1", "2", "3"], "empty": null, "bin": "/w=="})
+        );
+    }
+
+    #[tokio::test]
+    async fn construction_and_probes_never_join_the_group() {
+        let source = offline_source().await;
+        assert!(!source.is_subscribed(), "construction must not subscribe");
+        source.ensure_subscribed().unwrap();
+        source.ensure_subscribed().unwrap();
+        assert!(source.is_subscribed());
     }
 
     #[tokio::test]

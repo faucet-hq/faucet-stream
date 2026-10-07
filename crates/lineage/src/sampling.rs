@@ -167,17 +167,22 @@ fn tap_native_payload(
                 let mut inner = inner;
                 let mut buf: Vec<u8> = Vec::new();
                 let mut sampling = !state.sample_full();
-                // Track whether the payload's final byte is a newline: a last
-                // line without a trailing `\n` is a real record the per-chunk
-                // newline count misses (the `Bytes` arm counts it via `split`),
-                // so it is counted — and sampled — at stream end.
-                let mut last_byte: Option<u8> = None;
+                // Counts non-empty lines exactly like the `Bytes` arm, including a final line without `\n`.
+                let mut line_len: usize = 0;
                 while let Some(chunk) = inner.next().await {
                     let chunk = chunk?;
-                    state.add_count(chunk.iter().filter(|&&b| b == b'\n').count() as u64);
-                    if let Some(&b) = chunk.last() {
-                        last_byte = Some(b);
+                    let mut lines = 0u64;
+                    for &b in chunk.iter() {
+                        if b == b'\n' {
+                            if line_len > 0 {
+                                lines += 1;
+                            }
+                            line_len = 0;
+                        } else {
+                            line_len += 1;
+                        }
                     }
+                    state.add_count(lines);
                     if sampling {
                         buf.extend_from_slice(&chunk);
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -197,7 +202,7 @@ fn tap_native_payload(
                     }
                     yield chunk;
                 }
-                if last_byte.is_some_and(|b| b != b'\n') {
+                if line_len > 0 {
                     state.add_count(1);
                     if sampling
                         && !buf.is_empty()
@@ -233,7 +238,17 @@ impl Sink for SamplingSink {
     }
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         let outcomes = self.inner.write_batch_partial(records).await?;
-        self.state.observe(records);
+        if outcomes.iter().all(Result::is_ok) {
+            self.state.observe(records);
+        } else {
+            let accepted: Vec<Value> = records
+                .iter()
+                .zip(&outcomes)
+                .filter(|(_, o)| o.is_ok())
+                .map(|(r, _)| r.clone())
+                .collect();
+            self.state.observe(&accepted);
+        }
         Ok(outcomes)
     }
     async fn flush(&self) -> Result<(), FaucetError> {
@@ -1303,6 +1318,81 @@ mod tests {
         assert_eq!(collected, b"{\"id\":1}\n{\"id\":2}");
         assert_eq!(shared.count(), 2, "trailing line must be counted");
         assert_eq!(shared.samples().len(), 2, "trailing line must be sampled");
+    }
+
+    #[tokio::test]
+    async fn stream_and_bytes_taps_count_blank_lines_the_same() {
+        let data: &[u8] = b"{\"id\":1}\n\n{\"id\":2}\n\n";
+        let bytes_state = Arc::new(SampleState::new(10));
+        let _ = tap_native_payload(
+            faucet_core::NativePayload::Bytes(data.to_vec()),
+            faucet_core::NativeFormat::NdJson,
+            None,
+            Arc::clone(&bytes_state),
+        );
+        let stream_state = Arc::new(SampleState::new(10));
+        let chunks: Vec<Vec<u8>> = vec![
+            data[..9].to_vec(),
+            data[9..10].to_vec(),
+            data[10..].to_vec(),
+        ];
+        let tapped = tap_native_payload(
+            faucet_core::NativePayload::Stream(Box::pin(faucet_core::async_stream::try_stream! {
+                for c in chunks { yield c; }
+            })),
+            faucet_core::NativeFormat::NdJson,
+            None,
+            Arc::clone(&stream_state),
+        );
+        assert_eq!(drain_payload(tapped).await, data);
+        assert_eq!(bytes_state.count(), 2);
+        assert_eq!(stream_state.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn partial_write_samples_only_accepted_rows() {
+        struct HalfSink;
+        #[async_trait]
+        impl Sink for HalfSink {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            async fn write_batch_partial(
+                &self,
+                r: &[Value],
+            ) -> Result<Vec<RowOutcome>, FaucetError> {
+                Ok(r.iter()
+                    .map(|v| {
+                        if v["ok"] == json!(true) {
+                            Ok(())
+                        } else {
+                            Err(FaucetError::Sink("rejected".into()))
+                        }
+                    })
+                    .collect())
+            }
+            async fn flush(&self) -> Result<(), FaucetError> {
+                Ok(())
+            }
+            fn config_schema(&self) -> Value {
+                json!({})
+            }
+        }
+        let shared = Arc::new(SampleState::new(10));
+        let sink = SamplingSink::new(Box::new(HalfSink), Arc::clone(&shared));
+        let out = sink
+            .write_batch_partial(&[json!({"ok": true, "a": 1}), json!({"ok": false, "b": 2})])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(shared.count(), 1);
+        assert_eq!(shared.samples(), vec![json!({"ok": true, "a": 1})]);
+        let out = sink
+            .write_batch_partial(&[json!({"ok": true, "c": 3})])
+            .await
+            .unwrap();
+        assert!(out[0].is_ok());
+        assert_eq!(shared.count(), 2);
     }
 
     #[tokio::test]

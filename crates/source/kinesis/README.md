@@ -26,7 +26,7 @@ source:
 | `region` | SDK default chain | |
 | `endpoint_url` | — | LocalStack / VPC endpoint override. |
 | `credentials` | `{ type: default }` | `default` \| `profile` \| `access_key` \| `assume_role` \| `web_identity` — see `faucet-common-kinesis`. |
-| `start_position` | `{ type: trim_horizon }` | `trim_horizon` \| `latest` \| `at_timestamp { timestamp_secs }` \| `at_sequence_number { sequence }` \| `after_sequence_number { sequence }`. `at_timestamp` matches at **second** granularity. |
+| `start_position` | `{ type: trim_horizon }` | `trim_horizon` \| `latest` \| `at_timestamp { timestamp_secs }` \| `at_sequence_number { sequence }` \| `after_sequence_number { sequence }`. `at_timestamp` matches at **second** granularity. A sequence number belongs to one shard, so the sequence positions require `shard_ids` to list exactly that shard. |
 | `shard_ids` | `[]` (all) | Explicit shard allowlist. |
 | `include_closed` | `false` | Also drain closed (post-resharding) shards inside the retention window that have no bookmark. A closed shard **with** a bookmark is always drained. A fully-drained closed shard counts as *done*, not idle. |
 | `poll_interval_ms` | `1000` | Base wait between `GetRecords` per shard; floored at 200 ms (the 5 reads/sec/shard API budget). |
@@ -34,6 +34,7 @@ source:
 | `shard_concurrency` | `4` | Maximum concurrent `GetRecords` calls. Every eligible shard is read, in turn, even when there are more shards than this. |
 | `idle_termination_secs` / `max_messages` | — | **At least one is required** so a batch run terminates. |
 | `value_format` | `json` | `json` (parse; invalid JSON fails with shard+sequence context) \| `string` (strict UTF-8) \| `bytes` (base64). |
+| `on_decode_error` | `fail` | A record `value_format` cannot decode: `fail` the run, `skip` it (warned; the shard's bookmark moves past it), or emit it `raw` as `data: { raw_base64, error }`. With `fail`, one bad record blocks its shard on every run. |
 | `batch_size` | `1000` | Records per emitted page. `0` = one page per drain cycle. |
 
 ## Record shape
@@ -54,7 +55,12 @@ State key: `kinesis:<stream_name>`. The bookmark is a per-shard map
 `{ "shards": { "<shard-id>": "<last-sequence>" } }`, attached cumulatively to
 **every** page — any page's bookmark is a valid resume point. On restart a
 bookmarked shard resumes at `AFTER_SEQUENCE_NUMBER`; unbookmarked shards use
-`start_position`.
+`start_position`. A malformed stored bookmark fails the run instead of quietly
+restarting every shard at `start_position` (which under `latest` would skip
+everything written since). Shards the stream no longer lists (expired after a
+reshard) are dropped from the map. A shard's first `GetShardIterator` is
+retried with backoff, and consecutive throughput throttles back off further
+each time.
 
 **Resharding:** after a split or merge, a closed parent shard that has a
 bookmark is drained before its children start, so its unread tail is never

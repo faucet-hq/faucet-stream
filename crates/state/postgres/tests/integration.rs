@@ -183,3 +183,95 @@ async fn values_containing_nul_round_trip() {
         .expect("batch with NUL");
     assert_eq!(store.get("nul2").await.expect("get"), Some(v));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_and_put_is_atomic_across_concurrent_callers() {
+    let (_container, url) = start_postgres().await;
+    let store = std::sync::Arc::new(
+        PostgresStateStore::connect_with(&url, 16, "faucet_state")
+            .await
+            .expect("connect"),
+    );
+    store.ensure_table().await.expect("ensure_table");
+    assert!(store.supports_compare_and_put());
+
+    let mut tasks = Vec::new();
+    for i in 0..32 {
+        let s = store.clone();
+        tasks.push(tokio::spawn(async move {
+            s.compare_and_put("lease", None, &json!({ "by": i }))
+                .await
+                .expect("cas")
+        }));
+    }
+    let mut winners = 0;
+    for t in tasks {
+        if t.await.expect("join") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one absent-expected take may win");
+    let held = store.get("lease").await.expect("get").expect("lease held");
+
+    let mut tasks = Vec::new();
+    for i in 0..32 {
+        let (s, held) = (store.clone(), held.clone());
+        tasks.push(tokio::spawn(async move {
+            s.compare_and_put("lease", Some(&held), &json!({ "next": i }))
+                .await
+                .expect("cas")
+        }));
+    }
+    let mut winners = 0;
+    for t in tasks {
+        if t.await.expect("join") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one swap from the held value may win");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_and_put_mismatch_leaves_the_value() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStateStore::connect(&url).await.expect("connect");
+    store.ensure_table().await.expect("ensure_table");
+    let a = json!({"a": 1, "b": [1, 2], "c": {"x": null}});
+    let b = json!({"b": 2});
+
+    assert!(store.compare_and_put("k", None, &a).await.unwrap());
+    assert!(!store.compare_and_put("k", None, &b).await.unwrap());
+    assert!(!store.compare_and_put("k", Some(&b), &b).await.unwrap());
+    assert!(
+        !store.compare_and_put("absent", Some(&a), &b).await.unwrap(),
+        "an expected value never matches an absent key"
+    );
+    assert_eq!(store.get("absent").await.unwrap(), None);
+    assert_eq!(store.get("k").await.unwrap(), Some(a.clone()));
+
+    // The value read back (JSONB re-orders keys) compares equal.
+    let read_back = store.get("k").await.unwrap().unwrap();
+    assert!(
+        store
+            .compare_and_put("k", Some(&read_back), &b)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get("k").await.unwrap(), Some(b));
+    assert!(store.compare_and_put("bad key!", None, &a).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_and_put_handles_values_containing_nul() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStateStore::connect(&url).await.expect("connect");
+    store.ensure_table().await.expect("ensure_table");
+    let a = json!({"cursor": "abc\u{0}def"});
+    let b = json!({"cursor": "next\u{0}"});
+    assert!(store.compare_and_put("k", None, &a).await.unwrap());
+    let held = store.get("k").await.unwrap().unwrap();
+    assert_eq!(held, a);
+    assert!(!store.compare_and_put("k", Some(&b), &b).await.unwrap());
+    assert!(store.compare_and_put("k", Some(&held), &b).await.unwrap());
+    assert_eq!(store.get("k").await.unwrap(), Some(b));
+}

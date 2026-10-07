@@ -17,6 +17,7 @@ use wiremock::{Mock, MockServer};
 fn opts(name: &str) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: name.into(),
         run_id: None,
         execution: None,

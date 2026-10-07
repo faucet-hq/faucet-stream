@@ -356,6 +356,7 @@ creates the alias); a concrete index of that name is rejected at `begin`.
 - `schema.on_drift: evolve` — the staging target is a pre-run clone, so evolving the live target mid-run would leave the staged data a column short at swap time.
 - Scoped cleanup (`complete_for`) — cleanup requires `write_mode: upsert`; a full overwrite already removes source-deleted rows wholesale.
 - `shard:` — each shard would swap in only its own slice, replacing the rest of the table.
+- A source that acknowledges messages as it reads them (`rabbitmq`, `pubsub`, `sqs`, `nats` with `jetstream_stream`) — each page is acked once it lands in staging, and a failed or cancelled run discards staging, so those messages would be gone.
 - A post-run `verify:` check (`after_run`, the default) — the swap happens after the run, so the check would read the replaced table. Set `after_run: false` and run `faucet verify` afterwards.
 
 ### Every writer of a destination swaps together

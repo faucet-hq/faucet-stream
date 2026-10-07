@@ -29,6 +29,7 @@ pipeline:
 fn opts_with_reconcile(reconcile: Option<ReconcileSpec>) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: "recon_test".into(),
         run_id: None,
         execution: None,

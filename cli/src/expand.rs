@@ -1169,6 +1169,18 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         // derivation so an EO source + idempotent sink cannot slip overwrite
         // onto the atomic-watermark path.
         if matches!(mode, faucet_core::WriteMode::Overwrite) {
+            if crate::registry::source_kind_consumes_destructively(
+                &merged_source.kind,
+                &merged_source.config,
+            ) {
+                return Err(CliError::Config(format!(
+                    "row '{}': write_mode: overwrite cannot read from source '{}' — it \
+                     acknowledges each page once it is written into the staging copy, and a \
+                     failed or cancelled run discards staging, losing those messages for \
+                     good. Use write_mode: append or upsert",
+                    ids[i], merged_source.kind
+                )));
+            }
             if cfg.shard.is_some() {
                 return Err(CliError::Config(format!(
                     "row '{}': write_mode: overwrite cannot be combined with `shard:` — each \
@@ -4255,6 +4267,43 @@ pipeline:
             msg.contains("overwrite") && msg.contains("exactly_once"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn rejects_overwrite_from_ack_on_consume_sources() {
+        for source in [
+            r#"{ type: rabbitmq, config: { url: "amqp://x", queue: q, idle_timeout_secs: 1 } }"#,
+            r#"{ type: pubsub, config: { project_id: p, subscription: s, max_messages: 1 } }"#,
+            r#"{ type: nats, config: { url: "nats://x", subject: s, jetstream_stream: S } }"#,
+        ] {
+            let c = cfg(&format!(
+                r#"
+version: 1
+name: t
+pipeline:
+  source: {source}
+  sink:   {{ type: postgres, config: {{ connection_url: "postgres://x", table_name: t, column_mapping: auto_map, write_mode: overwrite }} }}
+"#
+            ));
+            let msg = format!("{}", expand(&c).unwrap_err());
+            assert!(
+                msg.contains("write_mode: overwrite cannot read from source"),
+                "{source}: {msg}"
+            );
+        }
+        let c = cfg(r#"
+version: 1
+name: t
+pipeline:
+  source: { type: nats, config: { url: "nats://x", subject: s } }
+  sink:   { type: postgres, config: { connection_url: "postgres://x", table_name: t, column_mapping: auto_map, write_mode: overwrite } }
+"#);
+        if let Err(e) = expand(&c) {
+            assert!(
+                !format!("{e}").contains("cannot read from source"),
+                "core NATS does not ack: {e}"
+            );
+        }
     }
 
     #[test]

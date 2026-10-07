@@ -5,7 +5,25 @@
 use crate::config::{PubsubConnection, PubsubCredentials};
 use faucet_core::FaucetError;
 use gcloud_auth::credentials::CredentialsFile;
+use gcloud_gax::conn::{ConnectionOptions, Environment};
 use gcloud_pubsub::client::{Client, ClientConfig};
+use std::time::Duration;
+
+/// Per-RPC deadline: a call outliving it fails instead of hanging the run.
+pub const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// gRPC connection options: a connect timeout, a per-RPC deadline and HTTP/2
+/// keepalive pings, so a connection a NAT or conntrack table silently dropped
+/// is detected instead of wedging the run (#789 MSG-60).
+pub fn connection_options() -> ConnectionOptions {
+    ConnectionOptions {
+        timeout: Some(RPC_TIMEOUT),
+        connect_timeout: Some(Duration::from_secs(10)),
+        http2_keep_alive_interval: Some(Duration::from_secs(30)),
+        keep_alive_timeout: Some(Duration::from_secs(20)),
+        keep_alive_while_idle: Some(true),
+    }
+}
 
 fn auth_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Auth(format!("pubsub auth ({context}): {e}"))
@@ -23,20 +41,21 @@ fn auth_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
 /// Construction is I/O-light: ADC token acquisition may touch the metadata
 /// server, but gRPC channels connect lazily on first RPC.
 pub async fn build_client(conn: &PubsubConnection) -> Result<Client, FaucetError> {
-    // The SDK reads `PUBSUB_EMULATOR_HOST` when assembling `ClientConfig`.
-    // Export an explicit config value so both signals converge on one code
-    // path. Connectors build their client once at startup, before spawning
-    // any worker task, so this process-env write is not racing readers.
-    if let Some(host) = &conn.emulator_host
-        && std::env::var_os("PUBSUB_EMULATOR_HOST").is_none()
-    {
-        // SAFETY: single-threaded startup path (no concurrent env access).
-        unsafe {
-            std::env::set_var("PUBSUB_EMULATOR_HOST", host);
+    // An explicit `emulator_host` is set on this client's config only. It used
+    // to be exported as `PUBSUB_EMULATOR_HOST`, which redirected every later
+    // Pub/Sub client in the process (a `faucet serve` or matrix run) to the
+    // emulator, and wrote the environment from a multi-threaded runtime
+    // (#789 MSG-38). The SDK still honours the variable when it is set.
+    let mut config = ClientConfig {
+        connection_option: connection_options(),
+        ..Default::default()
+    };
+    if let Some(host) = conn.explicit_emulator_host() {
+        config.environment = Environment::Emulator(host);
+        if config.project_id.is_none() {
+            config.project_id = Some("local-project".to_string());
         }
     }
-
-    let mut config = ClientConfig::default();
     if let Some(project) = &conn.project_id {
         config.project_id = Some(project.clone());
     }
@@ -81,4 +100,28 @@ pub async fn build_client(conn: &PubsubConnection) -> Result<Client, FaucetError
     Client::new(config)
         .await
         .map_err(|e| FaucetError::Source(format!("pubsub: client build failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An explicit `emulator_host` configures this client only; it no longer
+    /// leaks into the process environment for every later client (#789
+    /// MSG-38).
+    #[tokio::test]
+    async fn an_explicit_emulator_host_never_touches_the_environment() {
+        assert!(std::env::var_os("PUBSUB_EMULATOR_HOST").is_none());
+        let conn = PubsubConnection {
+            emulator_host: Some("127.0.0.1:1".into()),
+            credentials: PubsubCredentials::ApplicationDefault,
+            ..Default::default()
+        };
+        // Nothing listens there; only the environment matters.
+        let _ = build_client(&conn).await;
+        assert!(std::env::var_os("PUBSUB_EMULATOR_HOST").is_none());
+        let opts = connection_options();
+        assert_eq!(opts.timeout, Some(RPC_TIMEOUT));
+        assert_eq!(opts.keep_alive_while_idle, Some(true));
+    }
 }

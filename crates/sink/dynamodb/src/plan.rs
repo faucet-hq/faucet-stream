@@ -7,7 +7,9 @@
 
 use crate::config::{MAX_ITEM_BYTES, MAX_REQUEST_BYTES};
 use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
-use faucet_common_dynamodb::{item_size, item_to_typed_json, json_to_attribute, json_to_item};
+use faucet_common_dynamodb::{
+    KeyAttribute, item_size, item_to_typed_json, json_to_item, json_to_key_attribute,
+};
 use faucet_core::{FaucetError, WriteMode, WriteSpec};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -104,8 +106,10 @@ fn row_error(mode: WriteMode, msg: String) -> FaucetError {
     FaucetError::Sink(format!("dynamodb {}: {msg}", mode.as_str()))
 }
 
-/// Plan a page. `keys` is the table's key schema (partition key first).
-pub(crate) fn plan(records: &[Value], spec: &WriteSpec, keys: &[String]) -> Planned {
+/// Plan a page. `keys` is the table's key schema (partition key first); key
+/// attributes are written as the table's declared type.
+pub(crate) fn plan(records: &[Value], spec: &WriteSpec, keys: &[KeyAttribute]) -> Planned {
+    let names: Vec<String> = keys.iter().map(|k| k.name.clone()).collect();
     let mode = spec.write_mode;
     let mut planned = Planned::default();
     let mut slots: HashMap<String, usize> = HashMap::new();
@@ -119,13 +123,19 @@ pub(crate) fn plan(records: &[Value], spec: &WriteSpec, keys: &[String]) -> Plan
         let mut key_item = Item::new();
         let mut missing = None;
         for k in keys {
-            match obj.get(k) {
-                None => missing = Some(format!("missing key attribute '{k}'")),
-                Some(Value::Null) => missing = Some(format!("null value for key attribute '{k}'")),
-                Some(v) => {
-                    key_item.insert(k.clone(), json_to_attribute(v));
-                    continue;
+            let name = &k.name;
+            match obj.get(name) {
+                None => missing = Some(format!("missing key attribute '{name}'")),
+                Some(Value::Null) => {
+                    missing = Some(format!("null value for key attribute '{name}'"))
                 }
+                Some(v) => match json_to_key_attribute(name, v, k.scalar) {
+                    Ok(av) => {
+                        key_item.insert(name.clone(), av);
+                        continue;
+                    }
+                    Err(e) => missing = Some(e),
+                },
             }
             break;
         }
@@ -148,7 +158,10 @@ pub(crate) fn plan(records: &[Value], spec: &WriteSpec, keys: &[String]) -> Plan
                 map.remove(&dm.field);
             }
             match json_to_item(&body) {
-                Ok(item) => OpKind::Put(item),
+                Ok(mut item) => {
+                    item.extend(key_item);
+                    OpKind::Put(item)
+                }
                 Err(e) => {
                     planned.failures.insert(i, row_error(mode, e.to_string()));
                     continue;
@@ -156,7 +169,7 @@ pub(crate) fn plan(records: &[Value], spec: &WriteSpec, keys: &[String]) -> Plan
             }
         };
         let canon = match &kind {
-            OpKind::Put(item) | OpKind::Delete(item) => key_canon(item, keys),
+            OpKind::Put(item) | OpKind::Delete(item) => key_canon(item, &names),
         };
         match slots.get(&canon) {
             Some(&slot) => {
@@ -219,14 +232,30 @@ mod tests {
     use faucet_core::DeleteMarker;
     use serde_json::json;
 
-    fn keys() -> Vec<String> {
+    fn keys() -> Vec<KeyAttribute> {
+        use faucet_common_dynamodb::{KeyRole, ScalarType};
+        vec![
+            KeyAttribute {
+                name: "pk".into(),
+                role: KeyRole::Hash,
+                scalar: ScalarType::String,
+            },
+            KeyAttribute {
+                name: "sk".into(),
+                role: KeyRole::Range,
+                scalar: ScalarType::Number,
+            },
+        ]
+    }
+
+    fn names() -> Vec<String> {
         vec!["pk".into(), "sk".into()]
     }
 
     fn spec(mode: WriteMode) -> WriteSpec {
         WriteSpec {
             write_mode: mode,
-            key: keys(),
+            key: names(),
             ..Default::default()
         }
     }
@@ -319,24 +348,73 @@ mod tests {
             &keys(),
         );
         let req = p.ops[0].write_request();
-        assert_eq!(request_canon(&req, &keys()).unwrap(), p.ops[0].canon);
+        assert_eq!(request_canon(&req, &names()).unwrap(), p.ops[0].canon);
         let d = plan(
             &[json!({"pk": "a", "sk": 1})],
             &spec(WriteMode::Delete),
             &keys(),
         );
         assert_eq!(
-            request_canon(&d.ops[0].write_request(), &keys()).unwrap(),
+            request_canon(&d.ops[0].write_request(), &names()).unwrap(),
             p.ops[0].canon
         );
-        assert!(request_canon(&WriteRequest::builder().build(), &keys()).is_none());
-        let seven = plan(&[json!({"pk": 7, "sk": 1})], &WriteSpec::default(), &keys());
-        let seven_s = plan(
-            &[json!({"pk": "7", "sk": 1})],
+        assert!(request_canon(&WriteRequest::builder().build(), &names()).is_none());
+        let seven = plan(
+            &[json!({"pk": "7", "sk": 7})],
             &WriteSpec::default(),
             &keys(),
         );
-        assert_ne!(seven.ops[0].canon, seven_s.ops[0].canon);
+        let seven_s = plan(
+            &[json!({"pk": "7", "sk": "7"})],
+            &WriteSpec::default(),
+            &keys(),
+        );
+        assert_eq!(
+            seven.ops[0].canon, seven_s.ops[0].canon,
+            "an N key arrives as N whether the record carried 7 or \"7\""
+        );
+    }
+
+    #[test]
+    fn key_attributes_take_the_table_declared_type() {
+        use faucet_common_dynamodb::{KeyRole, ScalarType};
+        let bin_keys = vec![KeyAttribute {
+            name: "id".into(),
+            role: KeyRole::Hash,
+            scalar: ScalarType::Binary,
+        }];
+        let p = plan(
+            &[json!({"id": "AAEC", "v": "AAEC"})],
+            &WriteSpec::default(),
+            &bin_keys,
+        );
+        match &p.ops[0].kind {
+            OpKind::Put(item) => {
+                assert_eq!(
+                    item["id"],
+                    AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(vec![0u8, 1, 2]))
+                );
+                assert_eq!(item["v"], AttributeValue::S("AAEC".into()));
+            }
+            other => panic!("{other:?}"),
+        }
+        let big = "123456789012345678901234567890.5";
+        let p = plan(
+            &[json!({"pk": "a", "sk": big})],
+            &WriteSpec::default(),
+            &keys(),
+        );
+        match &p.ops[0].kind {
+            OpKind::Put(item) => assert_eq!(item["sk"], AttributeValue::N(big.into())),
+            other => panic!("{other:?}"),
+        }
+        let p = plan(&[json!({"pk": 7, "sk": 1})], &WriteSpec::default(), &keys());
+        assert!(p.ops.is_empty());
+        assert!(
+            p.failures[&0].to_string().contains("table's S key"),
+            "{}",
+            p.failures[&0]
+        );
     }
 
     #[test]

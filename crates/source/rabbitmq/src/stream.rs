@@ -199,7 +199,6 @@ enum Polled {
     Delivery(Box<Delivery>),
     Closed,
     Idle,
-    Interrupted,
     Failed(FaucetError),
 }
 
@@ -253,18 +252,17 @@ impl Source for RabbitMqSource {
             loop {
                 if let Some(tag) = acks.take_durable() {
                     ack(&channel, tag).await?;
+                    last_at = Instant::now();
                 }
 
                 let (budget, deadline) = poll_budget(idle, last_at, poll_fallback);
-                let polled = tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => Polled::Interrupted,
-                    next = tokio::time::timeout(budget, consumer.next()) => match next {
-                        Ok(Some(Ok(delivery))) => Polled::Delivery(Box::new(delivery)),
-                        Ok(Some(Err(e))) => Polled::Failed(amqp_error("consume", e)),
-                        Ok(None) => Polled::Closed,
-                        Err(_elapsed) => Polled::Idle,
-                    }
+                // Shutdown is the pipeline's cancel token: a library must not
+                // install a process-wide signal handler (#789 MSG-89).
+                let polled = match tokio::time::timeout(budget, consumer.next()).await {
+                    Ok(Some(Ok(delivery))) => Polled::Delivery(Box::new(delivery)),
+                    Ok(Some(Err(e))) => Polled::Failed(amqp_error("consume", e)),
+                    Ok(None) => Polled::Closed,
+                    Err(_elapsed) => Polled::Idle,
                 };
 
                 let mut stop = false;
@@ -314,10 +312,6 @@ impl Source for RabbitMqSource {
                         cfg.queue
                     )))?,
                     Polled::Failed(e) => Err(e)?,
-                    Polled::Interrupted => {
-                        tracing::info!("rabbitmq source: ctrl_c received, stopping");
-                        stop = true;
-                    }
                     Polled::Idle => {
                         if idle_expired(deadline) {
                             stop = true;
@@ -329,6 +323,11 @@ impl Source for RabbitMqSource {
                     let records = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
                     acks.seal();
                     yield StreamPage { records, bookmark: page_bookmark(deferred, &cfg.queue, total) };
+                    // The idle window restarts when the pipeline comes back for
+                    // more: the sink's write time is not idleness, and with the
+                    // default prefetch the broker could not have sent anything
+                    // while the page was unacked (#789 MSG-61).
+                    last_at = Instant::now();
                 }
 
                 if stop {
@@ -456,7 +455,7 @@ async fn ack(channel: &lapin::Channel, tag: u64) -> Result<(), FaucetError> {
 }
 
 /// The poll timeout for this iteration and the idle deadline, if any. Without
-/// an idle timeout, poll in short bursts so ctrl_c stays responsive.
+/// an idle timeout, poll in short bursts so termination stays responsive.
 fn poll_budget(
     idle: Option<Duration>,
     last_at: Instant,

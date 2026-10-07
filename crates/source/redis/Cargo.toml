@@ -17,10 +17,11 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-redis = { workspace = true }
+redis = { workspace = true, features = ["connection-manager"] }
 tokio = { workspace = true, features = ["sync"] }
 async-stream = { workspace = true }
 futures.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 faucet-conformance.workspace = true

@@ -78,6 +78,7 @@ pipeline:
         expand(&cfg).unwrap(),
         ExecuteOptions {
             legacy_state_writes: false,
+            force_lease: false,
             pipeline_name: "pg_mirror".into(),
             run_id: None,
             execution: None,

@@ -773,6 +773,7 @@ async fn execute_shard(
     };
     let opts = ExecuteOptions {
         legacy_state_writes: state.cluster().legacy_state_writes(),
+        force_lease: false,
         pipeline_name,
         // Correlate notifications to the submitted run (#480). Every shard of a
         // sharded run reports the same `run_id`; they differ by `invocation_id`.
@@ -1905,6 +1906,7 @@ async fn execute_run(
     };
     let opts = ExecuteOptions {
         legacy_state_writes: state.cluster().legacy_state_writes(),
+        force_lease: false,
         pipeline_name,
         // The id returned by `POST /v1/runs`, so a completion notification can be
         // matched back to the submission (#480).
@@ -1978,6 +1980,7 @@ async fn execute_run(
                 clock: Some(opts.clock),
                 budget: opts.budget.clone(),
                 run_id: opts.run_id.clone(),
+                force_lease: opts.force_lease,
             },
         )
     });

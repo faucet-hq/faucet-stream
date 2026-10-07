@@ -13,26 +13,23 @@ pub enum RedisSourceType {
         /// The list key.
         key: String,
     },
-    /// Read entries from a Redis stream via `XRANGE` (or `XREAD` / `XREADGROUP`
-    /// for the consumer-group convenience path on `fetch_all`).
+    /// Read entries from a Redis stream via `XRANGE`.
     Stream {
         /// The stream key.
         key: String,
-        /// Optional consumer group name. When set, [`fetch_all`](super::RedisSource::fetch_all)
-        /// uses `XREADGROUP`. Streaming via [`stream_pages`](faucet_core::Source::stream_pages)
-        /// always uses `XRANGE` (consumer-group semantics are incompatible
-        /// with the page-then-write streaming contract).
+        /// Ignored. Every read path uses `XRANGE`, which never touches a
+        /// consumer group's pending-entries list; reading through a group
+        /// would withhold entries from the group's other consumers. A
+        /// configured value logs a warning.
         group: Option<String>,
-        /// Consumer name within the group (required when `group` is set).
+        /// Ignored (see `group`).
         consumer: Option<String>,
-        /// Maximum number of entries to read per call. Used by
-        /// [`fetch_all`](super::RedisSource::fetch_all)'s `XREAD` / `XREADGROUP`
-        /// path; ignored by streaming, which uses
-        /// [`RedisSourceConfig::batch_size`] as both the per-page count and
-        /// the `XRANGE COUNT` hint.
+        /// Ignored; [`RedisSourceConfig::batch_size`] is the `XRANGE COUNT`.
         count: Option<usize>,
     },
-    /// Scan for keys matching a pattern, then `MGET` each batch.
+    /// Scan for keys matching a pattern, then `MGET` each batch. Only string
+    /// keys carry a value `MGET` can read; a matched key of another type
+    /// (hash, set, list, zset, stream) is skipped and counted in a warning.
     Keys {
         /// Glob pattern for `SCAN` (e.g. `"user:*"`).
         pattern: String,
@@ -68,6 +65,43 @@ pub struct RedisSourceConfig {
     /// request to many small ones.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Which values are parsed as JSON. `containers` (default) parses a value
+    /// only when it is a JSON object or array, so `"1.10"`, `"true"` and long
+    /// numeric ids stay the strings Redis holds; `all` also parses scalars;
+    /// `none` keeps every value a string.
+    #[serde(default)]
+    pub parse_json: RedisJsonParsing,
+    /// What to do with a value that is not valid UTF-8 (msgpack, gzip, …):
+    /// `base64` (default) emits it base64-encoded, `lossy` replaces invalid
+    /// sequences with U+FFFD, `error` fails the run naming the key.
+    #[serde(default)]
+    pub binary: RedisBinary,
+}
+
+/// Which Redis values the source parses as JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisJsonParsing {
+    /// Parse objects and arrays only; scalars stay strings.
+    #[default]
+    Containers,
+    /// Parse any value that is valid JSON.
+    All,
+    /// Never parse; every value is a string.
+    None,
+}
+
+/// How the source renders a value that is not valid UTF-8.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisBinary {
+    /// Standard base64 (padded) string.
+    #[default]
+    Base64,
+    /// UTF-8 with invalid sequences replaced by U+FFFD.
+    Lossy,
+    /// Fail the run.
+    Error,
 }
 
 fn default_batch_size() -> usize {
@@ -81,6 +115,8 @@ impl std::fmt::Debug for RedisSourceConfig {
             .field("source_type", &self.source_type)
             .field("max_records", &self.max_records)
             .field("batch_size", &self.batch_size)
+            .field("parse_json", &self.parse_json)
+            .field("binary", &self.binary)
             .finish()
     }
 }
@@ -93,6 +129,8 @@ impl RedisSourceConfig {
             source_type,
             max_records: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            parse_json: RedisJsonParsing::default(),
+            binary: RedisBinary::default(),
         }
     }
 

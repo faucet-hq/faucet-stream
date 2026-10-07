@@ -69,10 +69,17 @@ pub struct RabbitMqSinkConfig {
 
     /// Publish with the `mandatory` flag: a message no queue is bound to
     /// receive is returned by the broker and surfaces as a per-row error
-    /// (DLQ-routable) instead of being silently dropped. Requires `confirm`.
-    /// Defaults to `false`.
-    #[serde(default)]
+    /// (DLQ-routable) instead of being silently dropped. Takes effect with
+    /// `confirm` (returns are matched to rows through the confirms) and is
+    /// ignored without it. Defaults to `true`.
+    #[serde(default = "default_true")]
     pub mandatory: bool,
+
+    /// Seconds one publish group (its publishes and their confirms) may take
+    /// before the write fails as retriable — a broker under a memory or disk
+    /// alarm blocks publishers indefinitely. Default `60`.
+    #[serde(default = "default_publish_timeout_secs")]
+    pub publish_timeout_secs: u64,
 
     /// Enable publisher confirms: every batch waits for the broker to
     /// acknowledge each message before the write returns. Defaults to `true`
@@ -95,7 +102,17 @@ pub(crate) enum RoutingKey {
     JsonPath(String),
 }
 
+fn default_publish_timeout_secs() -> u64 {
+    60
+}
+
 impl RabbitMqSinkConfig {
+    /// `mandatory` as published: only with publisher confirms, which is how
+    /// a returned message is matched to its row (#789 MSG-75).
+    pub fn effective_mandatory(&self) -> bool {
+        self.mandatory && self.confirm
+    }
+
     /// A sink publishing to the default exchange with a static routing key —
     /// i.e. straight into the queue named `queue`.
     pub fn to_queue(queue: impl Into<String>) -> Self {
@@ -108,7 +125,8 @@ impl RabbitMqSinkConfig {
             routing_key_jsonpath: None,
             value_format: RabbitMqValueFormat::default(),
             persistent: true,
-            mandatory: false,
+            mandatory: true,
+            publish_timeout_secs: default_publish_timeout_secs(),
             confirm: true,
             batch_size: DEFAULT_BATCH_SIZE,
         }
@@ -174,11 +192,9 @@ impl RabbitMqSinkConfig {
                     .into(),
             ));
         }
-        if self.mandatory && !self.confirm {
+        if self.publish_timeout_secs == 0 {
             return Err(FaucetError::Config(
-                "rabbitmq sink: `mandatory: true` requires `confirm: true` — returned messages \
-                 are matched to rows through publisher confirms"
-                    .into(),
+                "rabbitmq sink: `publish_timeout_secs` must be greater than 0".into(),
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
@@ -214,7 +230,9 @@ mod tests {
             "routing_key_field": "kind"
         }))
         .unwrap();
-        assert!(c.persistent && c.confirm && !c.mandatory);
+        assert!(c.persistent && c.confirm && c.mandatory);
+        assert_eq!(c.publish_timeout_secs, 60);
+        assert!(c.effective_mandatory());
         assert_eq!(c.value_format, RabbitMqValueFormat::Json);
         assert_eq!(c.batch_size, DEFAULT_BATCH_SIZE);
         assert_eq!(c.routing().unwrap(), RoutingKey::Field("kind".into()));
@@ -287,14 +305,19 @@ mod tests {
         assert!(c.validate().unwrap_err().to_string().contains("255"));
     }
 
+    // `mandatory` now defaults to true, so `confirm: false` with the default
+    // must stay valid: mandatory is ignored without confirms instead of
+    // refusing the config (the old `mandatory_requires_confirm`).
     #[test]
-    fn mandatory_requires_confirm() {
+    fn mandatory_takes_effect_only_with_confirm() {
         let mut c = RabbitMqSinkConfig::to_queue("q");
-        c.mandatory = true;
         c.confirm = false;
-        assert!(c.validate().unwrap_err().to_string().contains("confirm"));
-        c.confirm = true;
         assert!(c.validate().is_ok());
+        assert!(!c.effective_mandatory());
+        c.confirm = true;
+        assert!(c.effective_mandatory());
+        c.publish_timeout_secs = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 **Redis** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes JSON records into Redis lists (`RPUSH`), streams (`XADD`), or individual keys (`SET`), batching each page of records into a single pipelined round-trip.
 
-Reach for it when you want to land pipeline output in Redis as a work queue, an event stream for consumers, or a cache/lookup table — with one declarative config and no glue code. Redis pipelining keeps the write path fast: every chunk of records ships as one network round-trip over a connection that's opened once and reused. With `delivery: exactly_once` it commits each page's records and a watermark in one atomic `MULTI`/`EXEC` transaction.
+Reach for it when you want to land pipeline output in Redis as a work queue, an event stream for consumers, or a cache/lookup table — with one declarative config and no glue code. Redis pipelining keeps the write path fast: every chunk of records ships as one network round-trip over a connection that's opened once and reused. With `delivery: exactly_once` it commits each page's records and a watermark in one atomic Lua script that refuses before writing anything when a target key holds another type.
 
 ## Feature highlights
 
@@ -16,7 +16,7 @@ Reach for it when you want to land pipeline output in Redis as a work queue, an 
 - **Stream field mapping** — for `Stream` mode, each record's top-level JSON object fields become native stream entry fields; non-object records land in a single `_data` field.
 - **Connection reuse** — a multiplexed async connection is opened once in `new()` and shared (cheaply cloned) across every `write_batch` call.
 - **Tunable batch window** — `batch_size` controls how many commands go in one pipeline, with a `0` sentinel that passes the upstream page straight through.
-- **Effectively-once delivery** — with `delivery: exactly_once`, each page's records and a per-page commit token commit in one atomic `MULTI`/`EXEC` transaction, so a resumed pipeline skips already-committed pages with zero duplicates.
+- **Effectively-once delivery** — with `delivery: exactly_once`, each page's records and a per-page commit token commit in one atomic script, so a resumed pipeline skips already-committed pages with zero duplicates.
 - **Preflight probe** — `faucet doctor` issues a non-mutating `PING` over the live connection.
 - **Credential-safe logging** — the config's `Debug` impl masks the connection URL, and the lineage dataset URI strips credentials.
 
@@ -75,6 +75,15 @@ faucet run pipeline.yaml
 |-------|------|---------|-------------|
 | `batch_size` | int | `1000` | Maximum commands packed into one Redis pipeline. When `write_batch` receives a slice larger than this, the sink re-chunks it and issues one pipeline per chunk. **`0` = no batching**: the entire upstream slice is packed into a single pipeline, preserving the source's `StreamPage` framing. Validated against `MAX_BATCH_SIZE` (1,000,000) at construction. |
 
+### Write options
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ttl_secs` | int | *(none)* | `KeyValue` only: every written key expires after this many seconds (`SET … EX`). Must be > 0. |
+| `stream_max_len` | int | *(none)* | `Stream` only: cap the stream at about this many entries (`XADD … MAXLEN ~ n`), trimming the oldest. Must be > 0. |
+
+Setting either on another sink type is a config error. The connection reconnects on its own after the server drops it (a failover).
+
 ### Sink types
 
 `sink_type` is an adjacently-tagged enum keyed by `type`:
@@ -83,7 +92,7 @@ faucet run pipeline.yaml
 |--------|--------|---------------|-----------|
 | `List` | `key: string` | `RPUSH` | Append each record, serialized to a JSON string, to the list at `key`. |
 | `Stream` | `key: string` | `XADD` | Append each record as a stream entry at `key` with an auto-generated ID (`*`). Top-level object fields become entry fields; a non-object record is stored as a single `_data` field. |
-| `KeyValue` | `key_field: string` | `SET` | Store each record under a key read from its `key_field`. The full record (serialized JSON) is the value. A record missing `key_field` raises an error. |
+| `KeyValue` | `key_field: string` | `SET` | Store each record under a key read from its `key_field` (a string, number or boolean). The full record (serialized JSON) is the value. A record whose `key_field` is missing, `null`, an object or an array fails **that row** (DLQ-routable via `write_batch_partial`) — it is never stored under a rendered key such as `"null"`, which would collapse those records onto one key. Without a DLQ the batch fails before any of it is written. |
 
 #### Stream entry field mapping
 
@@ -194,10 +203,10 @@ This connector reports observability metrics under the label `connector="redis"`
 
 `RedisSink` implements `Sink::supports_idempotent_writes` (returns `true`) and the two companion hooks:
 
-- `write_batch_idempotent(records, scope, token)` — packs every record's command for the configured `sink_type` **plus** a `SET _faucet_commit_token:<scope> <token>` into one atomic Redis transaction (`MULTI`/`EXEC`), so the page's data and its watermark either commit together or not at all.
+- `write_batch_idempotent(records, scope, token)` — runs every record's command for the configured `sink_type` **plus** a `SET _faucet_commit_token:<scope> <token>` in one Lua script. The script first checks that each target key is absent or of the expected type (`list` / `stream`) and refuses before writing anything otherwise: Redis does not roll back a `WRONGTYPE` error inside `MULTI`/`EXEC`, so a transaction used to apply the watermark while the data command failed, and the next run skipped the page as committed.
 - `last_committed_token(scope)` — a `GET` on the same `_faucet_commit_token:<scope>` key, so the pipeline skips already-committed pages on resume. The token is stored and read back as an opaque string.
 
-**One page = one transaction.** `batch_size` re-chunking does **not** apply on the idempotent path — splitting a page across multiple `MULTI`/`EXEC` blocks would break atomicity (a crash between chunks could commit rows without the watermark). Size the source's page (`batch_size` on the source) rather than the sink window when running `delivery: exactly_once`.
+**One page = one script.** `batch_size` re-chunking does **not** apply on the idempotent path — splitting a page across several scripts would break atomicity (a crash between chunks could commit rows without the watermark). Size the source's page (`batch_size` on the source) rather than the sink window when running `delivery: exactly_once`.
 
 The watermark key mirrors the SQL sinks' `_faucet_commit_token(scope, token)` table: one plain Redis string key per pipeline scope (the per-row state key, e.g. `myfeed::row1`), namespaced under the `_faucet_commit_token:` prefix. It lives in the same database as the data keys — don't evict or delete it while a pipeline is live, or resume falls back to replaying from the state-store bookmark.
 
@@ -312,7 +321,7 @@ println!("transferred {} records", result.records_written);
 1. `new()` validates `batch_size`, opens a `redis::Client` from `url`, and establishes a **multiplexed async connection** — once. The connection is cheaply cloneable and shared across every `write_batch` call (it multiplexes commands over a single socket).
 2. `write_batch` chunks the incoming slice by the effective window (`batch_size`, or the whole slice when `batch_size: 0`).
 3. Each chunk is assembled into one `redis::pipe()` — `RPUSH` for `List`, `XADD` for `Stream`, `SET` for `KeyValue` — and executed in a single round-trip via `query_async`.
-4. Under `delivery: exactly_once`, `write_batch_idempotent` builds the same per-record commands but ships the **whole page** as one atomic `MULTI`/`EXEC` pipeline with a final `SET _faucet_commit_token:<scope> <token>` — see [Effectively-once delivery](#effectively-once-delivery).
+4. Under `delivery: exactly_once`, `write_batch_idempotent` builds the same per-record commands but ships the **whole page** as one Lua script (type check first, then the commands) with a final `SET _faucet_commit_token:<scope> <token>` — see [Effectively-once delivery](#effectively-once-delivery).
 5. A failed pipeline surfaces as `FaucetError::Sink`; a record missing its `key_field` (KeyValue) or a JSON-serialization failure does the same.
 
 ## Lineage dataset URI

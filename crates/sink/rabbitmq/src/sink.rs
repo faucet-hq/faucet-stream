@@ -113,7 +113,7 @@ impl RabbitMqSink {
         let channel = self.channel().await?;
         let props = self.properties();
         let options = BasicPublishOptions {
-            mandatory: self.config.mandatory,
+            mandatory: self.config.effective_mandatory(),
             ..BasicPublishOptions::default()
         };
         let chunk = if self.config.batch_size == 0 {
@@ -122,7 +122,35 @@ impl RabbitMqSink {
             self.config.batch_size
         };
 
+        let limit = std::time::Duration::from_secs(self.config.publish_timeout_secs);
         for group in prepared.chunks(chunk) {
+            // Bounded: a broker resource alarm (`connection.blocked`) holds
+            // publishers indefinitely (#789 MSG-84).
+            tokio::time::timeout(
+                limit,
+                self.publish_group(&channel, group, &props, options, &mut outcomes),
+            )
+            .await
+            .map_err(|_| {
+                FaucetError::Sink(format!(
+                    "rabbitmq sink: a publish batch did not complete within {}s \
+                         (broker blocked by a resource alarm?)",
+                    self.config.publish_timeout_secs
+                ))
+            })??;
+        }
+        Ok(outcomes)
+    }
+
+    async fn publish_group(
+        &self,
+        channel: &lapin::Channel,
+        group: &[(usize, (String, Vec<u8>))],
+        props: &lapin::BasicProperties,
+        options: BasicPublishOptions,
+        outcomes: &mut [RowOutcome],
+    ) -> Result<(), FaucetError> {
+        {
             let mut confirms = FuturesUnordered::new();
             for (i, (key, body)) in group {
                 let confirm = channel
@@ -143,7 +171,7 @@ impl RabbitMqSink {
                 outcomes[i] = confirmation_outcome(confirmation, &self.config.exchange);
             }
         }
-        Ok(outcomes)
+        Ok(())
     }
 }
 

@@ -26,16 +26,31 @@ pub(crate) enum StartPosition {
     /// `start_after(token)` — required (not `resume_after`) when resuming from an
     /// **invalidate** token, which MongoDB rejects for `resumeAfter` (#321 M3).
     StartAfter(ResumeToken),
+    /// The oldest entry still in the oplog, resolved when the stream opens.
+    Earliest,
 }
 
 /// Resolve the effective start position from config + any persisted bookmark.
 ///
-/// Precedence: explicit `resume_token`/`timestamp` win over a persisted
-/// bookmark; `now`/`earliest` yield to a persisted bookmark.
+/// A persisted bookmark always wins: `start_from` only places a **fresh** run.
+/// An explicit `resume_token` / `timestamp` that overrode the bookmark replayed
+/// from the same point every run — rewriting committed pages under new tokens
+/// in exactly-once mode, ignoring a mirror's captured handoff position, and
+/// failing for good once the point left the oplog (#789 MSG-32).
 pub(crate) fn resolve_start(
     start_from: &StartFrom,
     pending: Option<&Bookmark>,
 ) -> Result<StartPosition, FaucetError> {
+    if let Some(b) = pending {
+        // A bookmark captured from an invalidate event must resume with
+        // `start_after` — `resume_after` on an invalidate token is rejected by
+        // MongoDB and would wedge the pipeline (#321 M3).
+        return if b.invalidate {
+            Ok(StartPosition::StartAfter(b.to_token()?))
+        } else {
+            Ok(StartPosition::ResumeAfter(b.to_token()?))
+        };
+    }
     match start_from {
         StartFrom::ResumeToken { token } => {
             let b = Bookmark {
@@ -48,26 +63,24 @@ pub(crate) fn resolve_start(
             time: *timestamp_secs,
             increment: 0,
         })),
-        StartFrom::Now | StartFrom::Earliest => {
-            if let Some(b) = pending {
-                // A bookmark captured from an invalidate event must resume with
-                // `start_after` — `resume_after` on an invalidate token is
-                // rejected by MongoDB and would wedge the pipeline (#321 M3).
-                if b.invalidate {
-                    Ok(StartPosition::StartAfter(b.to_token()?))
-                } else {
-                    Ok(StartPosition::ResumeAfter(b.to_token()?))
-                }
-            } else if matches!(start_from, StartFrom::Earliest) {
-                // Earliest retained oplog entry (errors at open if rolled).
-                Ok(StartPosition::AtOperationTime(Timestamp {
-                    time: 1,
-                    increment: 1,
-                }))
-            } else {
-                Ok(StartPosition::Now)
-            }
-        }
+        StartFrom::Earliest => Ok(StartPosition::Earliest),
+        StartFrom::Now => Ok(StartPosition::Now),
+    }
+}
+
+/// Where `start_from: earliest` opens when the oldest oplog entry cannot be
+/// read: the beginning of time, which works until the oplog first rolls over.
+const EARLIEST_FALLBACK: Timestamp = Timestamp {
+    time: 1,
+    increment: 1,
+};
+
+/// The identity of the transaction an event belongs to (`lsid` +
+/// `txnNumber`), or `None` for an event outside a multi-document transaction.
+fn txn_key(lsid: Option<&Document>, txn_number: Option<i64>) -> Option<(String, i64)> {
+    match (lsid, txn_number) {
+        (Some(l), Some(n)) => Some((l.to_string(), n)),
+        _ => None,
     }
 }
 
@@ -491,7 +504,6 @@ impl MongoCdcSource {
         let max_staged = self.config.max_staged_records;
 
         Box::pin(async_stream::try_stream! {
-            use futures::StreamExt;
 
             let pending = self.pending_bookmark.lock().await.take();
             let mut start = resolve_start(&self.config.start_from, pending.as_ref())?;
@@ -500,6 +512,9 @@ impl MongoCdcSource {
                 let token = self.capture_now_token().await?;
                 anchor = Some(Bookmark::from_token(&token)?.to_value()?);
                 start = StartPosition::ResumeAfter(token);
+            }
+            if start == StartPosition::Earliest {
+                start = StartPosition::AtOperationTime(self.oldest_oplog_time().await);
             }
             let pipeline = build_pipeline(&self.config)?;
             let report_invalidate = reports_invalidate(&self.config);
@@ -525,7 +540,7 @@ impl MongoCdcSource {
                         w = w.full_document_before_change(fb);
                     }
                     w = match &start {
-                        StartPosition::Now => w,
+                        StartPosition::Now | StartPosition::Earliest => w,
                         StartPosition::AtOperationTime(ts) => w.start_at_operation_time(*ts),
                         StartPosition::ResumeAfter(tok) => w.resume_after(tok.clone()),
                         StartPosition::StartAfter(tok) => w.start_after(tok.clone()),
@@ -548,7 +563,7 @@ impl MongoCdcSource {
                         w = w.full_document_before_change(fb);
                     }
                     w = match &start {
-                        StartPosition::Now => w,
+                        StartPosition::Now | StartPosition::Earliest => w,
                         StartPosition::AtOperationTime(ts) => w.start_at_operation_time(*ts),
                         StartPosition::ResumeAfter(tok) => w.resume_after(tok.clone()),
                         StartPosition::StartAfter(tok) => w.start_after(tok.clone()),
@@ -570,7 +585,7 @@ impl MongoCdcSource {
                         w = w.full_document_before_change(fb);
                     }
                     w = match &start {
-                        StartPosition::Now => w,
+                        StartPosition::Now | StartPosition::Earliest => w,
                         StartPosition::AtOperationTime(ts) => w.start_at_operation_time(*ts),
                         StartPosition::ResumeAfter(tok) => w.resume_after(tok.clone()),
                         StartPosition::StartAfter(tok) => w.start_after(tok.clone()),
@@ -579,7 +594,7 @@ impl MongoCdcSource {
                         .map_err(|e| FaucetError::Source(format!("mongodb-cdc watch failed: {e}")))?
                 }
             };
-            let mut change_stream = std::pin::pin!(change_stream);
+            let mut change_stream = change_stream;
             if anchor.is_some() {
                 yield StreamPage { records: Vec::new(), bookmark: anchor };
             }
@@ -589,14 +604,21 @@ impl MongoCdcSource {
             // Bookmark of the last record currently in `buffer`. `None` only when
             // the buffer is empty (no events seen this cycle).
             let mut last_bookmark: Option<Value> = None;
+            // Transaction of the last buffered event: a full page is held back
+            // until that transaction's events are all buffered, so a reader
+            // never sees half of a source transaction (#789 MSG-92).
+            let mut buffered_txn: Option<(String, i64)> = None;
+            let mut last_event_at = std::time::Instant::now();
+            // A getMore waits at most `max_await` server-side; the client-side
+            // bound only guards a dead connection.
+            let poll_bound = max_await * 4 + std::time::Duration::from_secs(5);
 
             // Graceful shutdown is handled one layer up: `run_stream`'s page loop
             // `biased`-`select!`s the pipeline cancel token (Pipeline::with_cancel,
             // #146) against polling this stream for its next page, so a cancel
-            // mid-idle-wait stops at the page boundary and flushes the sinks — no
-            // source-side signal handling needed. Nothing is persisted until a
-            // page yields, so a dropped in-flight buffer is simply re-fetched
-            // (the resume token has not advanced).
+            // stops at the page boundary and flushes the sinks. Nothing is
+            // persisted until a page yields, so a dropped in-flight buffer is
+            // simply re-fetched (the resume token has not advanced).
             loop {
                 if !change_stream.is_alive() {
                     tracing::warn!(
@@ -611,10 +633,18 @@ impl MongoCdcSource {
                     }
                     break;
                 }
-                match tokio::time::timeout(idle_timeout, change_stream.next()).await {
-                    Ok(Some(Ok(event))) => {
+                match tokio::time::timeout(poll_bound, change_stream.next_if_any()).await {
+                    Ok(Ok(Some(event))) => {
+                        last_event_at = std::time::Instant::now();
                         if let Some(ts) = &event.cluster_time {
                             self.note_position(u64::from(ts.time));
+                        }
+                        let txn = txn_key(event.lsid.as_ref(), event.txn_number);
+                        if per_batch && buffer.len() >= chunk && txn != buffered_txn {
+                            yield StreamPage {
+                                records: std::mem::take(&mut buffer),
+                                bookmark: last_bookmark.take(),
+                            };
                         }
                         let bookmark = Bookmark::from_token(&event.id)?;
                         let is_invalidate = matches!(
@@ -624,21 +654,19 @@ impl MongoCdcSource {
                         // OOM safety valve: with `batch_size: 0` (or `fetch_all`)
                         // the buffer is never flushed mid-cycle, so a
                         // high-throughput stream would grow it without bound.
-                        // Abort with a typed error before staging one more record
-                        // past the cap rather than risk an OOM-kill.
                         if report_invalidate || !is_invalidate {
                             check_staging_cap(buffer.len(), max_staged)?;
                             buffer.push(to_envelope(&event, &bookmark)?);
                         }
                         // The persisted bookmark records whether it is an
                         // invalidate token, so resume uses `start_after` not
-                        // `resume_after` (#321 M3). The envelope above keeps the
-                        // plain token — only the durable state carries the flag.
+                        // `resume_after` (#321 M3).
                         let persisted = Bookmark {
                             invalidate: is_invalidate,
                             ..bookmark
                         };
                         last_bookmark = Some(persisted.to_value()?);
+                        buffered_txn = txn;
 
                         // An invalidate closes the stream server-side: flush the
                         // page (including the invalidate event) and end.
@@ -649,24 +677,50 @@ impl MongoCdcSource {
                             };
                             break;
                         }
-                        if per_batch && buffer.len() >= chunk {
+                        if per_batch && buffer.len() >= chunk && buffered_txn.is_none() {
                             yield StreamPage {
                                 records: std::mem::take(&mut buffer),
                                 bookmark: last_bookmark.take(),
                             };
                         }
                     }
-                    Ok(Some(Err(e))) => {
+                    Ok(Err(e)) => {
                         Err(FaucetError::Source(format!("mongodb-cdc stream error: {e}")))?;
                     }
-                    // Idle (timeout) or cursor closed: flush whatever we have and
-                    // end this fetch cycle.
-                    Ok(None) | Err(_) => {
-                        // Nothing arrived for the idle window: the stream has
-                        // caught up to the present. (The driver's resume token
-                        // must not be read here — a timed-out `next()` leaves
-                        // the stream mid-poll.)
+                    // An empty batch: every event up to the present is delivered.
+                    Ok(Ok(None)) => {
+                        if last_event_at.elapsed() < idle_timeout {
+                            // A held-back page's transaction is complete.
+                            if per_batch && buffer.len() >= chunk {
+                                buffered_txn = None;
+                                yield StreamPage {
+                                    records: std::mem::take(&mut buffer),
+                                    bookmark: last_bookmark.take(),
+                                };
+                            }
+                            continue;
+                        }
                         self.note_position(unix_now_secs());
+                        // The post-batch resume token covers everything
+                        // delivered *and* everything the pipeline filtered out,
+                        // so a quiet or filtered stream keeps its bookmark
+                        // inside the oplog window (#789 MSG-33).
+                        let bookmark = match change_stream.resume_token() {
+                            Some(tok) => Some(Bookmark::from_token(&tok)?.to_value()?),
+                            None => last_bookmark.take(),
+                        };
+                        if !buffer.is_empty() || bookmark.is_some() {
+                            yield StreamPage {
+                                records: std::mem::take(&mut buffer),
+                                bookmark,
+                            };
+                        }
+                        break;
+                    }
+                    // The poll outlived its bound (a dead connection): flush
+                    // what was read with its own bookmark. The driver's resume
+                    // token must not be read here — the poll is mid-flight.
+                    Err(_) => {
                         if !buffer.is_empty() {
                             yield StreamPage {
                                 records: std::mem::take(&mut buffer),
@@ -680,6 +734,36 @@ impl MongoCdcSource {
 
             tracing::info!(connector = "mongodb-cdc", "change stream fetch cycle complete");
         })
+    }
+
+    /// The timestamp of the oldest entry still in the oplog, where
+    /// `start_from: earliest` opens: `{t: 1, i: 1}` is rejected once the
+    /// oplog has rolled over (#789 MSG-74). Without read access to
+    /// `local.oplog.rs` it falls back to `{1, 1}` with a warning.
+    async fn oldest_oplog_time(&self) -> Timestamp {
+        let found = self
+            .client
+            .database("local")
+            .collection::<Document>("oplog.rs")
+            .find_one(Document::new())
+            .sort(bson::doc! { "$natural": 1 })
+            .projection(bson::doc! { "ts": 1 })
+            .await;
+        match found {
+            Ok(Some(doc)) => match doc.get_timestamp("ts") {
+                Ok(ts) => ts,
+                Err(_) => EARLIEST_FALLBACK,
+            },
+            Ok(None) => EARLIEST_FALLBACK,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "mongodb-cdc: start_from: earliest could not read the oldest oplog entry; \
+                     starting at the beginning of time, which fails once the oplog has rolled"
+                );
+                EARLIEST_FALLBACK
+            }
+        }
     }
 
     /// Open a change stream at "now", read its `postBatchResumeToken` without
@@ -802,21 +886,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // These two pinned the old precedence (an explicit start_from beat the
+    // bookmark on every run, #789 MSG-32): the bookmark now wins, and the
+    // explicit position applies only to a fresh run.
     #[test]
-    fn explicit_timestamp_overrides_bookmark() {
+    fn a_bookmark_beats_an_explicit_timestamp() {
         let pending = Bookmark {
             resume_token: json!({ "_data": "AA" }),
             ..Default::default()
         };
-        let pos = resolve_start(
-            &StartFrom::Timestamp {
-                timestamp_secs: 100,
-            },
-            Some(&pending),
-        )
-        .unwrap();
+        let ts = StartFrom::Timestamp {
+            timestamp_secs: 100,
+        };
+        assert!(matches!(
+            resolve_start(&ts, Some(&pending)).unwrap(),
+            StartPosition::ResumeAfter(_)
+        ));
         assert_eq!(
-            pos,
+            resolve_start(&ts, None).unwrap(),
             StartPosition::AtOperationTime(Timestamp {
                 time: 100,
                 increment: 0
@@ -825,29 +912,37 @@ mod tests {
     }
 
     #[test]
-    fn explicit_resume_token_overrides_bookmark() {
-        // An explicit ResumeToken in config must win over any persisted
-        // bookmark and resolve to ResumeAfter(token).
+    fn a_bookmark_beats_an_explicit_resume_token() {
         let pending = Bookmark {
             resume_token: json!({ "_data": "PENDING" }),
             ..Default::default()
         };
-        let pos = resolve_start(
-            &StartFrom::ResumeToken {
-                token: json!({ "_data": "8264AB00" }),
-            },
-            Some(&pending),
-        )
-        .unwrap();
-        // The resolved position must round-trip back to the configured token,
-        // not the pending bookmark's token.
-        match pos {
+        let explicit = StartFrom::ResumeToken {
+            token: json!({ "_data": "8264AB00" }),
+        };
+        let data = |pos: StartPosition| match pos {
             StartPosition::ResumeAfter(tok) => {
-                let b = Bookmark::from_token(&tok).unwrap();
-                assert_eq!(b.resume_token["_data"], json!("8264AB00"));
+                Bookmark::from_token(&tok).unwrap().resume_token["_data"].clone()
             }
             other => panic!("expected ResumeAfter, got {other:?}"),
-        }
+        };
+        assert_eq!(
+            data(resolve_start(&explicit, Some(&pending)).unwrap()),
+            json!("PENDING")
+        );
+        assert_eq!(
+            data(resolve_start(&explicit, None).unwrap()),
+            json!("8264AB00")
+        );
+    }
+
+    #[test]
+    fn transaction_keys_need_both_session_and_number() {
+        let lsid = bson::doc! { "id": 1 };
+        assert!(txn_key(Some(&lsid), Some(3)).is_some());
+        assert_ne!(txn_key(Some(&lsid), Some(3)), txn_key(Some(&lsid), Some(4)));
+        assert_eq!(txn_key(None, Some(3)), None);
+        assert_eq!(txn_key(Some(&lsid), None), None);
     }
 
     #[test]
@@ -893,13 +988,10 @@ mod tests {
     }
 
     #[test]
-    fn earliest_without_bookmark_uses_operation_time() {
+    fn earliest_without_bookmark_resolves_at_open() {
         assert_eq!(
             resolve_start(&StartFrom::Earliest, None).unwrap(),
-            StartPosition::AtOperationTime(Timestamp {
-                time: 1,
-                increment: 1
-            })
+            StartPosition::Earliest
         );
     }
 

@@ -7,7 +7,7 @@ use crate::plan::{Op, OpKind, chunk_ops, plan, request_canon};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use faucet_common_dynamodb::{
-    ErrorClass, classify_error, json_to_attribute, key_schema, sdk_error_parts,
+    ErrorClass, KeyAttribute, classify_error, json_to_attribute, key_schema, sdk_error_parts,
 };
 use faucet_core::{FaucetError, RowOutcome, WriteMode};
 use serde_json::Value;
@@ -72,7 +72,7 @@ pub(crate) fn row_outcomes(
 pub struct DynamoDbSink {
     config: DynamoDbSinkConfig,
     client: Client,
-    keys: tokio::sync::OnceCell<Vec<String>>,
+    keys: tokio::sync::OnceCell<(Vec<KeyAttribute>, Vec<String>)>,
     names: Option<HashMap<String, String>>,
     values: Option<HashMap<String, AttributeValue>>,
 }
@@ -134,23 +134,24 @@ impl DynamoDbSink {
         })
     }
 
-    /// The table key (partition key first), read once.
-    async fn table_keys(&self) -> Result<&[String], FaucetError> {
-        let keys = self
+    /// The table key (partition key first) with its declared types, plus the names; read once.
+    async fn table_keys(&self) -> Result<(&[KeyAttribute], &[String]), FaucetError> {
+        let (keys, names) = self
             .keys
             .get_or_try_init(|| async {
                 let desc = self.describe().await?;
-                let keys: Vec<String> = key_schema(&desc)?.into_iter().map(|k| k.name).collect();
+                let keys = key_schema(&desc)?;
+                let names: Vec<String> = keys.iter().map(|k| k.name.clone()).collect();
                 if matches!(
                     self.config.write.write_mode,
                     WriteMode::Upsert | WriteMode::Delete
                 ) {
-                    check_key(&self.config.write.key, &keys)?;
+                    check_key(&self.config.write.key, &names)?;
                 }
-                Ok::<_, FaucetError>(keys)
+                Ok::<_, FaucetError>((keys, names))
             })
             .await?;
-        Ok(keys)
+        Ok((keys, names))
     }
 
     /// [`Self::single_write`] with a request failure reported against the op's
@@ -338,7 +339,7 @@ impl faucet_core::Sink for DynamoDbSink {
         if records.is_empty() {
             return Ok(0);
         }
-        let keys = self.table_keys().await?;
+        let (keys, names) = self.table_keys().await?;
         let planned = plan(records, &self.config.write, keys);
         if let Some((row, e)) = planned.failures.iter().next() {
             return Err(FaucetError::Sink(format!(
@@ -346,7 +347,7 @@ impl faucet_core::Sink for DynamoDbSink {
                 records.len()
             )));
         }
-        let outcomes = self.execute(planned.ops, keys).await?;
+        let outcomes = self.execute(planned.ops, names).await?;
         let failed: Vec<&String> = outcomes
             .iter()
             .filter_map(|(_, r)| r.as_ref().err())
@@ -372,9 +373,9 @@ impl faucet_core::Sink for DynamoDbSink {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let keys = self.table_keys().await?;
+        let (keys, names) = self.table_keys().await?;
         let planned = plan(records, &self.config.write, keys);
-        let outcomes = self.execute(planned.ops, keys).await?;
+        let outcomes = self.execute(planned.ops, names).await?;
         Ok(row_outcomes(records.len(), planned.failures, outcomes))
     }
 
@@ -571,7 +572,15 @@ mod tests {
         config.retry.initial_backoff_ms = 1;
         config.retry.max_backoff_ms = 2;
         let keys = tokio::sync::OnceCell::new();
-        keys.set(vec!["pk".to_string()]).unwrap();
+        keys.set((
+            vec![KeyAttribute {
+                name: "pk".into(),
+                role: faucet_common_dynamodb::KeyRole::Hash,
+                scalar: faucet_common_dynamodb::ScalarType::String,
+            }],
+            vec!["pk".to_string()],
+        ))
+        .unwrap();
         DynamoDbSink {
             config,
             client: dynamo(uri),

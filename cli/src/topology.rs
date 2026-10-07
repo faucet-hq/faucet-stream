@@ -49,6 +49,8 @@ pub struct TopologyRunOptions {
     /// Run id, so a caller (serve) can attribute the run to its own id. A
     /// fresh UUIDv7 when `None`.
     pub run_id: Option<String>,
+    /// Start even when another run holds a sink node's live lease (`--force`).
+    pub force_lease: bool,
 }
 
 impl TopologyRunOptions {
@@ -1144,7 +1146,7 @@ pub async fn run_topology(
     let governance = build_governance(cfg)?;
     // Run lease + run-outcome marker per sink node (#732 / #735), like a
     // matrix invocation's.
-    let mut markers = Vec::new();
+    let mut markers: Vec<(String, String, crate::pipeline_state::markers::RunMarkers)> = Vec::new();
     if !run.is_preview()
         && cfg
             .pipeline
@@ -1154,13 +1156,24 @@ pub async fn run_topology(
     {
         for (id, _, _) in sink_nodes(cfg)? {
             let base = format!("{pipeline_name}::{id}");
-            let m = crate::pipeline_state::markers::RunMarkers::begin(
+            let m = match crate::pipeline_state::markers::RunMarkers::begin(
                 state_store.clone(),
                 &base,
                 &run_id,
                 true,
+                run.force_lease,
             )
-            .await;
+            .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    for (_, base, m) in markers {
+                        m.finish(base, run_id.clone(), Ok(0), 0, false, Default::default())
+                            .await;
+                    }
+                    return Err(e);
+                }
+            };
             markers.push((id, base, m));
         }
     }

@@ -14,17 +14,20 @@ fn first_match(record: &Value, path: &str) -> Result<Option<Value>, FaucetError>
 }
 
 /// Extract a string value via JSONPath. Numbers are stringified; booleans
-/// become "true"/"false". Returns `None` if the path doesn't resolve.
+/// become "true"/"false". Returns `None` if the path doesn't resolve **or
+/// resolves to JSON `null`** — a null key must reach `on_key_error` rather
+/// than collapse every such record onto the literal key `"null"`.
 pub fn string_at(record: &Value, path: &str) -> Result<Option<String>, FaucetError> {
     let Some(v) = first_match(record, path)? else {
         return Ok(None);
     };
-    Ok(Some(match v {
-        Value::String(s) => s,
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        other => other.to_string(),
-    }))
+    Ok(match v {
+        Value::Null => None,
+        Value::String(s) => Some(s),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        other => Some(other.to_string()),
+    })
 }
 
 /// Extract an i32 partition. Errors on non-integer matches or out-of-range values.
@@ -100,6 +103,12 @@ mod tests {
     fn string_at_stringifies_numbers() {
         let r = json!({"id": 42});
         assert_eq!(string_at(&r, "$.id").unwrap().as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn string_at_treats_null_as_unresolved() {
+        let r = json!({"id": null});
+        assert!(string_at(&r, "$.id").unwrap().is_none());
     }
 
     #[test]

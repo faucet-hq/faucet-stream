@@ -581,3 +581,72 @@ mod serve {
         assert!(rollback.text().await.unwrap().contains("topology config"));
     }
 }
+
+// ── MSG-42: run leases per sink node ─────────────────────────────────────────
+
+/// A live lease on one sink node refuses the whole graph, and the leases the
+/// run already took on the other sink nodes are released, not left to expire.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_sink_node_lease_refuses_the_graph_and_releases_the_rest() {
+    use faucet_cli::pipeline_state::lease;
+    use faucet_core::{FileStateStore, StateStore};
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    let (yaml, a, b) = tee_yaml(dir.path(), "");
+    let yaml = yaml.replace(
+        "  nodes:\n",
+        &format!(
+            "  state: {{ type: file, config: {{ path: {} }} }}\n  nodes:\n",
+            state.display()
+        ),
+    );
+    let cfg = parse(&yaml);
+    let auth = build_auth_catalog(None).unwrap();
+    let store: Arc<dyn StateStore> = Arc::new(FileStateStore::new(&state));
+    // Sink nodes are leased in id order: `wa` is taken before `wb` refuses.
+    let other = lease::acquire(Arc::clone(&store), "graph::wb", "other-run")
+        .await
+        .expect("holder lease");
+
+    let err = run_topology(&cfg, &auth, TopologyRunOptions::default())
+        .await
+        .expect_err("a held lease refuses the run");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("other-run") && msg.contains("--force"),
+        "{msg}"
+    );
+    assert!(
+        lease::read(store.as_ref(), "graph::wa")
+            .await
+            .unwrap()
+            .is_none(),
+        "the lease taken on `wa` is released"
+    );
+    assert_eq!(
+        lease::read(store.as_ref(), "graph::wb")
+            .await
+            .unwrap()
+            .unwrap()
+            .run_id,
+        "other-run",
+        "the holder's lease is left alone"
+    );
+    assert!(lines(&a).is_empty() && lines(&b).is_empty(), "nothing ran");
+
+    let summary = run_topology(
+        &cfg,
+        &auth,
+        TopologyRunOptions {
+            force_lease: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("--force takes the lease");
+    assert!(!summary.had_failures(), "{summary:?}");
+    assert_eq!(lines(&a).len(), 4);
+    other.release().await;
+}

@@ -23,6 +23,10 @@ pub struct Lease {
     pub position: StartAt,
     /// Consecutive throttled reads (drives the backoff).
     pub throttles: u32,
+    /// Unix ms a `Latest` iterator was first acquired. If it expires before
+    /// the first record, the shard is re-read from its trim horizon, keeping
+    /// records created since about then, instead of skipping to a new `Latest`.
+    pub latest_since_ms: Option<i64>,
 }
 
 impl Lease {
@@ -33,6 +37,7 @@ impl Lease {
             iterator: None,
             position,
             throttles: 0,
+            latest_since_ms: None,
         }
     }
 }

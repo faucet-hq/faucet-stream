@@ -16,7 +16,7 @@ Reach for it when you want to land any faucet-stream source — a REST API, a da
 - **Write modes** — `append` (default), `upsert` (per-document `replace_one(upsert)`), and `delete` (`delete_one`); the `key` fields become the match filter (MongoDB is schemaless — no key columns).
 - **CDC mirroring** — a `delete_marker` mixes upserts and deletes in one stream, so a CDC source carrying an op flag (`__op: "u" | "d"`) keeps a collection in lock-step with its origin.
 - **Effectively-once delivery** — with `delivery: exactly_once` each page and its commit-token watermark commit atomically in one **multi-document transaction** (replica set required). See [Effectively-once delivery](#effectively-once-delivery).
-- **Dead-letter queue aware** — overrides `write_batch_partial` so missing/null-key rows can be routed to a DLQ per-row while the good documents still commit.
+- **Dead-letter queue aware** — overrides `write_batch_partial` so a document the server rejects (append) or a missing/null-key row (upsert/delete) is routed to a DLQ per-row while the good documents still commit.
 - **Nested documents preserved** — arbitrary nested objects, arrays, and all JSON scalar types convert to their BSON equivalents losslessly.
 - **Client built once** — the connection pool is created and validated in `new()` and reused for every write; the driver handles pooling and reconnection internally.
 - **Credential-safe logging** — the `Debug` impl masks `connection_uri` with `***`, and the lineage URI strips embedded credentials.
@@ -175,6 +175,7 @@ Semantics on the effectively-once path (vs. the at-least-once `write_batch`):
 
 - **One page = one transaction.** In append mode the whole page goes in a single `insert_many` — the sink's `batch_size` re-chunking knob does **not** apply on this path (chunking would break page↔watermark atomicity). Size pages with the **source's** `batch_size` instead, keeping each page within MongoDB's per-transaction limits.
 - **Upsert/delete ops run sequentially inside the transaction.** A MongoDB `ClientSession` cannot be used concurrently, so the planned `replace_one(upsert)` / `delete_one` ops are issued one at a time — a throughput tradeoff versus the at-least-once path's concurrent fan-out. Atomicity requires the single session.
+- **The transaction writes with `w: majority`**, whatever the client's default, so a committed page and its watermark cannot roll back after a failover.
 - **Commit is retried** while the driver reports `UnknownTransactionCommitResult` (the driver-recommended pattern, bounded); any other failure aborts the transaction (best-effort) and surfaces the original error — nothing from the page is committed.
 - The data and `_faucet_commit_token` collections are pre-created (idempotently) before the first transaction, so the path also works on servers that can't create collections inside a transaction (MongoDB < 4.4).
 
@@ -326,7 +327,7 @@ This crate has no optional features of its own; enable it in the CLI / umbrella 
 
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **best-effort** — insert_many and per-document upserts are not transactional. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **per-row** for `append` / `overwrite` — `write_batch_partial` maps `insert_many`'s write errors to the rejected documents (a duplicate `_id`, a validation failure, a non-object record), inserts every other document (under `ordered: true` it resumes after the rejected one), and fails outright only while nothing has been inserted. `upsert` / `delete` are **best-effort** — per-document upserts are not transactional. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
@@ -344,7 +345,7 @@ are staged into `{collection}__faucet_ovw` and published with an atomic
 failure leaves the previous documents intact. No `key` is needed. Requires the
 `renameCollection` privilege and is unsupported on sharded collections.
 
-The staging collection is created with the destination's options (validator,
+The staging collection is created at `begin` — empty when there is no destination yet, so a first run whose source returns no rows still commits an empty collection. The staging collection is created with the destination's options (validator,
 collation, capped size, …) and its secondary indexes (unique, TTL, compound,
 …), so they survive the swap. A unique index is enforced while the run loads,
 so rows that would break it fail the run before anything is replaced. The

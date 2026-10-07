@@ -112,7 +112,7 @@ impl KinesisSource {
     async fn discover_shards(
         &self,
         bookmarks: &ShardBookmarks,
-    ) -> Result<Vec<PlannedShard>, FaucetError> {
+    ) -> Result<(Vec<PlannedShard>, std::collections::HashSet<String>), FaucetError> {
         let mut all = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
@@ -150,6 +150,7 @@ impl KinesisSource {
                 break;
             }
         }
+        let listed: std::collections::HashSet<String> = all.iter().map(|s| s.id.clone()).collect();
         let eligible = plan_shards(
             all,
             &self.config.shard_ids,
@@ -163,7 +164,7 @@ impl KinesisSource {
                 self.config.stream_name, self.config.shard_ids, self.config.include_closed
             )));
         }
-        Ok(eligible)
+        Ok((eligible, listed))
     }
 }
 
@@ -204,7 +205,7 @@ impl faucet_core::Source for KinesisSource {
                 .expect("bookmark mutex poisoned")
                 .clone()
                 .unwrap_or_default();
-            let shards = self.discover_shards(&bookmarks).await?;
+            let (shards, listed) = self.discover_shards(&bookmarks).await?;
 
             // Every shard gets a worker; the semaphore bounds concurrent
             // `GetRecords` calls, not shard lifetimes, so every shard is read.
@@ -257,6 +258,7 @@ impl faucet_core::Source for KinesisSource {
                 .map(Duration::from_secs);
             let max_messages = self.config.max_messages;
             let mut cumulative = bookmarks;
+            cumulative.retain_listed(&listed);
             let mut buffer: Vec<Value> = Vec::new();
             let mut total = 0usize;
             let mut done_shards = 0usize;
@@ -280,6 +282,10 @@ impl faucet_core::Source for KinesisSource {
                 match event {
                     Some(ShardEvent::Records { shard_id, records }) => {
                         for (sequence, record) in records {
+                            let Some(record) = record else {
+                                cumulative.advance(&shard_id, &sequence);
+                                continue;
+                            };
                             buffer.push(record);
                             total += 1;
                             // Advance the shard bookmark to THIS record's sequence
@@ -375,7 +381,7 @@ impl faucet_core::Source for KinesisSource {
                     .clone()
                     .unwrap_or_default();
                 let mut worst: Option<i64> = None;
-                for shard in self.discover_shards(&bookmarks).await? {
+                for shard in self.discover_shards(&bookmarks).await?.0 {
                     if let Some(ms) = probe_behind(
                         &self.client,
                         &self.config,
@@ -397,7 +403,7 @@ impl faucet_core::Source for KinesisSource {
         *self
             .start_bookmarks
             .lock()
-            .expect("bookmark mutex poisoned") = Some(ShardBookmarks::from_value(&bookmark));
+            .expect("bookmark mutex poisoned") = Some(ShardBookmarks::try_from_value(&bookmark)?);
         Ok(())
     }
 

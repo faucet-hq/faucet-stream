@@ -214,7 +214,7 @@ Use `${env:VAR}` / `${secret:…}` interpolation so credentials never land in th
 
 ## Key error policy
 
-`on_key_error` controls what happens when `key_path` or `partition_path` extraction fails (path absent, type mismatch, or invalid partition):
+`on_key_error` controls what happens when `key_path` or `partition_path` extraction fails (path absent, resolving to JSON `null`, type mismatch, or invalid partition). A `null` key is never sent as the literal key `"null"`, which would put every such record on one partition and, on a compacted topic, keep only the last:
 
 | Value | Behaviour |
 |-------|-----------|
@@ -222,7 +222,7 @@ Use `${env:VAR}` / `${secret:…}` interpolation so credentials never land in th
 | `skip` | Drop the record, log a `WARN`, continue. |
 | `round_robin` | Send the record with no key; librdkafka assigns the partition. Record is kept. |
 
-It does **not** apply to `from_path` topic failures — those are always fatal.
+It does **not** apply to `from_path` topic failures (including a path resolving to `null`) — those are always fatal.
 
 ## Compression
 
@@ -316,7 +316,11 @@ Reach for `batch_size: 0` when a source emits its whole result set as a single p
 - `write_batch_idempotent(records, scope, token)` — a **transactional** producer writes the page's records **and** a commit-token record for `scope` into the compacted side-topic (`commit_token_topic`) inside a single Kafka transaction, so the data and the watermark commit atomically or not at all.
 - `last_committed_token(scope)` — reads the latest token for `scope` back from the side-topic so the pipeline skips already-committed pages on resume.
 
-The producer's `transactional.id` is auto-derived from the pipeline scope — stable across restarts and unique per matrix row — so a restart fences any prior producer. The side-topic is **auto-created** with `cleanup.policy=compact` if it does not exist (so only the latest token per scope is retained). Downstream consumers of the destination topic should set `isolation.level=read_committed` so they only ever observe committed transactions.
+The producer's `transactional.id` is auto-derived from the pipeline scope — stable across restarts and unique per matrix row — so a restart fences any prior producer. The side-topic is **auto-created** with `cleanup.policy=compact` if it does not exist (so only the latest token per scope is retained); its metadata is read first, so a principal without `CREATE` permission can use a pre-created side-topic.
+
+A transaction enqueues the whole page plus its token before awaiting anything, so the transactional producer's queue is not capped at `batch_size` (librdkafka's 100 000-message default, or `batch_size + 1` when larger; `extra_client_config` still wins), and a full queue waits for room for up to `message_timeout` instead of `queue_full_max_retries`.
+
+Scopes share the side-topic, so another pipeline's open transaction holds its Last Stable Offset below this scope's newer tokens. `last_committed_token` waits until every transaction open when it started has committed or aborted (bounded by `max(message_timeout, 60 s) + 10 s`, then the run fails) rather than resuming from an older token. Downstream consumers of the destination topic should set `isolation.level=read_committed` so they only ever observe committed transactions.
 
 To use effectively-once delivery, set `delivery: exactly_once` and pair this sink with a CDC source (`postgres-cdc`, `mysql-cdc`, `mongodb-cdc`) plus a `state:` block. A DLQ is not permitted in effectively-once mode. All four requirements are validated at config-load time (`faucet validate`) before any run starts.
 
