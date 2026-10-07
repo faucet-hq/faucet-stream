@@ -109,8 +109,29 @@ pub fn build_transaction_statement_inline(
     scope: &str,
     token: &str,
 ) -> String {
+    build_transaction_statement_inline_multi(
+        &[insert_sql.to_owned()],
+        database,
+        schema,
+        scope,
+        token,
+    )
+}
+
+/// [`build_transaction_statement_inline`] for a page split into several
+/// INSERTs (each payload within the per-value size limit), all in the one
+/// transaction: `BEGIN; INSERT…; MERGE; COMMIT;` —
+/// [`COMMIT_ONLY_STATEMENT_COUNT`] + `inserts.len()` statements.
+pub fn build_transaction_statement_inline_multi(
+    inserts: &[String],
+    database: &str,
+    schema: &str,
+    scope: &str,
+    token: &str,
+) -> String {
     format!(
-        "BEGIN;\n{insert_sql};\n{merge};\nCOMMIT;",
+        "BEGIN;\n{};\n{merge};\nCOMMIT;",
+        inserts.join(";\n"),
         merge = merge_token_with(
             database,
             schema,

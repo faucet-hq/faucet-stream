@@ -4,7 +4,8 @@ use crate::config::SnowflakeSinkConfig;
 use crate::idempotent;
 use async_trait::async_trait;
 use faucet_common_snowflake::{
-    SnowflakeAuth, authorization_header, credential_to_auth, snowflake_token_type,
+    CancelOnDrop, SnowflakeAuth, authorization_header, cancel_statement, credential_to_auth,
+    http_client, snowflake_token_type,
 };
 use faucet_core::util::quote_ident;
 use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider};
@@ -19,6 +20,8 @@ pub struct SnowflakeSink {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// The target's columns, loaded once (`None` until then).
+    columns: std::sync::Mutex<Option<TableColumns>>,
     /// Records accumulated across `write_batch` calls (#617). Without this,
     /// each small page was its own warehouse query.
     pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
@@ -43,6 +46,23 @@ pub struct SnowflakeSink {
     /// columnar write and reused for every subsequent staged file.
     #[cfg(feature = "arrow")]
     bulk_store: OnceCell<crate::bulk::BulkStore>,
+}
+
+/// Largest serialized page payload bound or inlined in one INSERT. Snowflake
+/// caps a single text value at 16 MB by default; half leaves room for
+/// escaping.
+pub const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// What the sink knows about the target's columns.
+#[derive(Debug, Default)]
+struct TableColumns {
+    /// `false` when the table could not be described (absent or not
+    /// visible); no column checks apply then.
+    known: bool,
+    names: std::collections::HashSet<String>,
+    /// `TIMESTAMP_NTZ` columns: offset-bearing values are converted to UTC
+    /// before they land, since Snowflake's cast would drop the offset.
+    ntz: std::collections::HashSet<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,12 +113,33 @@ impl SnowflakeSink {
         };
         let mut done = 0;
         for slice in rows.chunks(chunk) {
-            let (sql, payload) = self.build_insert(slice).map_err(|e| (done, e))?;
-            let bindings = json!({ "1": { "type": "TEXT", "value": payload } });
-            self.execute_sql(&sql, Some(bindings))
-                .await
-                .map_err(|e| (done, e))?;
-            done += slice.len();
+            let parts = size_chunks(slice, MAX_PAYLOAD_BYTES);
+            if self.config.batch_size == 0 && parts.len() > 1 {
+                // `batch_size: 0` promises one atomic statement per group; a
+                // group too large for one bind goes as one transaction.
+                let inserts = parts
+                    .iter()
+                    .map(|r| self.build_insert_inline(&slice[r.clone()]))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| (done, e))?;
+                let sql = format!("BEGIN;\n{};\nCOMMIT;", inserts.join(";\n"));
+                let parameters =
+                    json!({ "MULTI_STATEMENT_COUNT": (inserts.len() + 2).to_string() });
+                self.execute_statement(&sql, None, Some(parameters))
+                    .await
+                    .map_err(|e| (done, e))?;
+                done += slice.len();
+                continue;
+            }
+            for range in parts {
+                let part = &slice[range];
+                let (sql, payload) = self.build_insert(part).map_err(|e| (done, e))?;
+                let bindings = json!({ "1": { "type": "TEXT", "value": payload } });
+                self.execute_sql(&sql, Some(bindings))
+                    .await
+                    .map_err(|e| (done, e))?;
+                done += part.len();
+            }
         }
         Ok(())
     }
@@ -152,6 +193,103 @@ impl SnowflakeSink {
         Ok(())
     }
 
+    /// Load the target's columns once, then make every field of `records`
+    /// a column: with `create_table` a missing one is added as a nullable
+    /// `STRING`; without it the write fails naming the fields, before any row
+    /// of the page is buffered.
+    async fn ensure_columns(&self, records: &[Value]) -> Result<(), FaucetError> {
+        let loaded = self.columns.lock().map(|c| c.is_some()).unwrap_or(false);
+        if !loaded {
+            let cols = self.describe_table().await?;
+            if let Ok(mut slot) = self.columns.lock() {
+                slot.get_or_insert(cols);
+            }
+        }
+        let missing = {
+            let Ok(slot) = self.columns.lock() else {
+                return Ok(());
+            };
+            match slot.as_ref() {
+                Some(cols) if cols.known => missing_columns(records, &cols.names),
+                _ => return Ok(()),
+            }
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if !self.config.create_table {
+            return Err(FaucetError::Sink(format!(
+                "snowflake: table {}.{}.{} has no column(s) {} for fields in this page; \
+                 add them or set `create_table: true` to let the sink add them",
+                self.config.database,
+                self.config.schema,
+                self.config.table,
+                missing.join(", ")
+            )));
+        }
+        for column in &missing {
+            let sql = format!(
+                "ALTER TABLE {}.{}.{} ADD COLUMN IF NOT EXISTS {} STRING",
+                quote_ident(&self.config.database),
+                quote_ident(&self.config.schema),
+                quote_ident(&self.config.table),
+                quote_ident(column)
+            );
+            self.execute_sql(&sql, None).await?;
+            if let Ok(mut slot) = self.columns.lock()
+                && let Some(cols) = slot.as_mut()
+            {
+                cols.names.insert(column.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the target's column names and types from `information_schema`.
+    async fn describe_table(&self) -> Result<TableColumns, FaucetError> {
+        let sql = format!(
+            "SELECT column_name, data_type FROM {}.information_schema.columns \
+             WHERE table_schema = ? AND table_name = ?",
+            quote_ident(&self.config.database)
+        );
+        let bindings = json!({
+            "1": { "type": "TEXT", "value": self.config.schema },
+            "2": { "type": "TEXT", "value": self.config.table },
+        });
+        let resp = self.execute_statement(&sql, Some(bindings), None).await?;
+        Ok(table_columns(resp.data.unwrap_or_default()))
+    }
+
+    /// `records` with offset-bearing ISO strings in `TIMESTAMP_NTZ` columns
+    /// converted to UTC wall time.
+    fn normalize_ntz(&self, records: &[Value]) -> Vec<Value> {
+        let ntz = self
+            .columns
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.ntz.clone()))
+            .unwrap_or_default();
+        if ntz.is_empty() {
+            return records.to_vec();
+        }
+        records
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                if let Some(obj) = r.as_object_mut() {
+                    for col in &ntz {
+                        if let Some(Value::String(s)) = obj.get(col)
+                            && let Some(utc) = utc_wall_time(s)
+                        {
+                            obj.insert(col.clone(), Value::String(utc));
+                        }
+                    }
+                }
+                r
+            })
+            .collect()
+    }
+
     /// Create a new Snowflake sink.
     ///
     /// Returns [`FaucetError::Config`] if `batch_size` exceeds
@@ -175,8 +313,9 @@ impl SnowflakeSink {
                 config.commit_rows,
                 config.commit_bytes,
             )),
+            columns: std::sync::Mutex::new(None),
             config,
-            client: Client::new(),
+            client: http_client()?,
             endpoint: None,
             auth_provider: None,
             commit_table_ready: OnceCell::new(),
@@ -275,11 +414,14 @@ impl SnowflakeSink {
 
         let mut body = json!({
             "statement": sql,
-            "timeout": 60,
+            "timeout": self.config.statement_timeout.as_secs(),
             "database": self.config.database,
             "schema": self.config.schema,
             "warehouse": self.config.warehouse,
         });
+        if let Some(role) = &self.config.role {
+            body["role"] = json!(role);
+        }
         if let Some(bindings) = bindings {
             body["bindings"] = bindings;
         }
@@ -339,6 +481,7 @@ impl SnowflakeSink {
         let url = format!("{}/{}", self.api_url(), handle);
         let poll_timeout = self.config.poll_timeout;
         let started = std::time::Instant::now();
+        let mut guard = CancelOnDrop::new(self.client.clone(), self.api_url(), handle);
         loop {
             // Re-resolve auth every iteration: a long-running async statement can
             // outlive a short-lived OAuth token, so we re-ask the (single-flight,
@@ -346,6 +489,7 @@ impl SnowflakeSink {
             // minted at submit time — otherwise the poll 401s mid-run after a
             // rotation (#146).
             let (auth, token_type) = self.auth_header().await?;
+            guard.set_auth(auth.clone(), token_type);
             let resp = self
                 .client
                 .get(&url)
@@ -360,6 +504,11 @@ impl SnowflakeSink {
             if status.as_u16() == 202 {
                 // `poll_timeout == 0` disables the cap (poll forever).
                 if !poll_timeout.is_zero() && started.elapsed() >= poll_timeout {
+                    // An abandoned INSERT could still commit after the run
+                    // failed and duplicate on retry: cancel it.
+                    guard.disarm();
+                    cancel_statement(&self.client, &self.api_url(), handle, &auth, token_type)
+                        .await;
                     return Err(FaucetError::Sink(format!(
                         "Snowflake statement '{handle}' did not finish within poll_timeout ({}s); still HTTP 202",
                         poll_timeout.as_secs()
@@ -374,6 +523,7 @@ impl SnowflakeSink {
                     "Snowflake poll returned HTTP {status}: {body_text}"
                 )));
             }
+            guard.disarm();
             let sf_resp: SnowflakeResponse = resp.json().await.map_err(|e| {
                 FaucetError::Sink(format!("failed to parse Snowflake poll response: {e}"))
             })?;
@@ -464,7 +614,7 @@ impl SnowflakeSink {
     /// `OBJECT` / `ARRAY`) is stringified by the `::string` cast rather than
     /// stored as structured JSON; this sink maps records to scalar columns.
     fn build_insert(&self, records: &[Value]) -> Result<(String, String), FaucetError> {
-        let payload = Value::Array(records.to_vec()).to_string();
+        let payload = Value::Array(self.normalize_ntz(records)).to_string();
         Ok((self.insert_from(records, "?")?, payload))
     }
 
@@ -472,7 +622,7 @@ impl SnowflakeSink {
     /// literal, for the multi-statement exactly-once request where the SQL API
     /// accepts no bindings (SQL-44).
     fn build_insert_inline(&self, records: &[Value]) -> Result<String, FaucetError> {
-        let payload = Value::Array(records.to_vec()).to_string();
+        let payload = Value::Array(self.normalize_ntz(records)).to_string();
         self.insert_from(records, &idempotent::sql_string_literal(&payload))
     }
 
@@ -502,6 +652,69 @@ impl SnowflakeSink {
             projection,
         ))
     }
+}
+
+/// Split `rows` into consecutive ranges whose serialized JSON stays within
+/// `max_bytes` (a single row larger than that is a range of its own).
+fn size_chunks(rows: &[Value], max_bytes: usize) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut bytes = 2;
+    for (i, row) in rows.iter().enumerate() {
+        let len = faucet_core::estimate_json_bytes(row) as usize + 1;
+        if i > start && bytes + len > max_bytes {
+            out.push(start..i);
+            start = i;
+            bytes = 2;
+        }
+        bytes += len;
+    }
+    if start < rows.len() || out.is_empty() {
+        out.push(start..rows.len());
+    }
+    out
+}
+
+/// Fields of `records` that are not columns of the table, in first-seen order.
+fn missing_columns(records: &[Value], names: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for key in records
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.keys())
+    {
+        if !names.contains(key) && !missing.contains(key) {
+            missing.push(key.clone());
+        }
+    }
+    missing
+}
+
+/// Build [`TableColumns`] from `information_schema.columns` rows
+/// (`[column_name, data_type]`); no rows means the table is not visible.
+fn table_columns(rows: Vec<Vec<Value>>) -> TableColumns {
+    let mut cols = TableColumns::default();
+    for row in rows {
+        let (Some(Value::String(name)), ty) = (row.first(), row.get(1)) else {
+            continue;
+        };
+        cols.known = true;
+        if ty
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case("TIMESTAMP_NTZ"))
+        {
+            cols.ntz.insert(name.clone());
+        }
+        cols.names.insert(name.clone());
+    }
+    cols
+}
+
+/// An ISO 8601 timestamp carrying an offset (`Z` or `±HH:MM`) as UTC wall
+/// time; `None` for anything else (offset-less values are left alone).
+fn utc_wall_time(s: &str) -> Option<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).ok()?;
+    Some(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string())
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
@@ -624,6 +837,7 @@ impl faucet_core::Sink for SnowflakeSink {
         }
         self.flush().await?;
         self.ensure_table_ready(records).await?;
+        self.ensure_columns(records).await?;
         match self.commit_group(records).await {
             Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
             Err((0, e)) => Err(e),
@@ -649,6 +863,7 @@ impl faucet_core::Sink for SnowflakeSink {
             return Ok(0);
         }
         self.ensure_table_ready(records).await?;
+        self.ensure_columns(records).await?;
 
         // Accumulate across calls and commit once per threshold (#617). A
         // warehouse query per small page is dominated by per-query overhead,
@@ -700,6 +915,7 @@ impl faucet_core::Sink for SnowflakeSink {
         self.ensure_commit_table().await?;
         if !records.is_empty() {
             self.ensure_table_ready(records).await?;
+            self.ensure_columns(records).await?;
         }
 
         let (sql, count) = if records.is_empty() {
@@ -711,14 +927,18 @@ impl faucet_core::Sink for SnowflakeSink {
             );
             (sql, idempotent::COMMIT_ONLY_STATEMENT_COUNT)
         } else {
-            let sql = idempotent::build_transaction_statement_inline(
-                &self.build_insert_inline(records)?,
+            let inserts = size_chunks(records, MAX_PAYLOAD_BYTES)
+                .into_iter()
+                .map(|r| self.build_insert_inline(&records[r]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let sql = idempotent::build_transaction_statement_inline_multi(
+                &inserts,
                 &self.config.database,
                 &self.config.schema,
                 scope,
                 token,
             );
-            (sql, idempotent::TRANSACTION_STATEMENT_COUNT)
+            (sql, idempotent::COMMIT_ONLY_STATEMENT_COUNT + inserts.len())
         };
 
         let parameters = json!({ "MULTI_STATEMENT_COUNT": count.to_string() });
@@ -885,6 +1105,39 @@ mod tests {
         }))
         .unwrap();
         assert!(staged.supports_columnar());
+    }
+
+    #[test]
+    fn size_chunks_bound_the_payload() {
+        let rows: Vec<Value> = (0..5).map(|i| json!({"v": i})).collect();
+        assert_eq!(size_chunks(&rows, usize::MAX), vec![0..5]);
+        assert_eq!(size_chunks(&rows, 1), vec![0..1, 1..2, 2..3, 3..4, 4..5]);
+        assert_eq!(size_chunks(&[], 10), vec![0..0]);
+        let one = faucet_core::estimate_json_bytes(&rows[0]) as usize + 3;
+        assert_eq!(size_chunks(&rows, one * 2), vec![0..2, 2..4, 4..5]);
+    }
+
+    #[test]
+    fn column_helpers() {
+        let cols = table_columns(vec![
+            vec![json!("ID"), json!("TEXT")],
+            vec![json!("TS"), json!("timestamp_ntz")],
+            vec![json!(null)],
+        ]);
+        assert!(cols.known);
+        assert!(cols.ntz.contains("TS") && !cols.ntz.contains("ID"));
+        assert!(!table_columns(vec![]).known);
+        let missing = missing_columns(
+            &[json!({"ID": 1, "A": 2}), json!({"B": 1, "A": 3}), json!(5)],
+            &cols.names,
+        );
+        assert_eq!(missing, vec!["A", "B"]);
+        assert_eq!(
+            utc_wall_time("2024-01-02T03:04:05.25+05:30").as_deref(),
+            Some("2024-01-01T21:34:05.250")
+        );
+        assert_eq!(utc_wall_time("2024-01-02T03:04:05").as_deref(), None);
+        assert_eq!(utc_wall_time("plain"), None);
     }
 
     #[test]

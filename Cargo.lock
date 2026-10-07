@@ -5217,6 +5217,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6043,6 +6045,7 @@ dependencies = [
  "arrow 58.3.0",
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "faucet-common-snowflake",
  "faucet-conformance",
  "faucet-core",

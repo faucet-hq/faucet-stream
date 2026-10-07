@@ -79,13 +79,15 @@ faucet run pipeline.yaml
 | `schema` | string | — *(required)* | Target schema name. |
 | `table` | string | — *(required)* | Target table name. |
 | `auth` | `AuthSpec<SnowflakeAuth>` | — *(required)* | Authentication — inline `{ type, config }` or `{ ref: <name> }`. See [Authentication](#authentication). |
+| `role` | string | — | Role for the session. Without it Snowflake uses the user's default role, so set it for service users whose write grants are on another role. |
+| `statement_timeout` | int (seconds) | `0` | Server-side statement timeout, sent as `timeout` on every statement; Snowflake **cancels** a statement that runs longer. `0` = Snowflake's maximum. |
 
 ### Batching & reliability
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `batch_size` | int | `1000` | Maximum records per SQL REST API request. The sink re-chunks each incoming slice into `batch_size` slices and issues one `INSERT` per chunk. **`0` = no batching**: the whole slice is sent in one `INSERT`, no matter how large. Values above `MAX_BATCH_SIZE` (1,000,000) are rejected by `faucet_core::validate_batch_size`. |
-| `poll_timeout` | int (seconds) | `300` | Max wall-clock time to wait for an asynchronously-executed `INSERT` (HTTP 202) to finish before failing with `FaucetError::Sink`. **`0` = poll forever.** See [Asynchronous execution](#asynchronous-execution). |
+| `poll_timeout` | int (seconds) | `300` | Max wall-clock time to wait for an asynchronously-executed `INSERT` (HTTP 202) to finish before failing with `FaucetError::Sink`; the statement is then cancelled server-side so it cannot commit after the run failed. **`0` = poll forever.** See [Asynchronous execution](#asynchronous-execution). |
 
 ## Authentication
 
@@ -303,8 +305,8 @@ To drive it end-to-end, pair it with any source via `Pipeline::new(source, sink)
 ## How it works
 
 1. `SnowflakeSink::new()` builds an HTTP client (reused across all requests). No network call happens at construction.
-2. `write_batch()` splits records into `batch_size` chunks (or one chunk when `batch_size = 0`). For each chunk it builds an `INSERT` using `PARSE_JSON(?)` + `FLATTEN` and sends the chunk's JSON array as a **bound `TEXT` parameter**, parsing and inserting every row in one statement without interpolating data into the SQL text.
-3. **Field-to-column mapping:** each record's top-level keys project into matching table columns — `INSERT INTO "db"."schema"."tbl" ("col1","col2") SELECT value:"col1"::string, value:"col2"::string FROM TABLE(FLATTEN(input => PARSE_JSON(?)))`. The `::string` cast strips the VARIANT's JSON quotes so Snowflake coerces each scalar into the destination column's type on insert (text → number / boolean / timestamp, etc.). The column set comes from the **first record**; a key absent from a later record is inserted as `NULL`. Target columns should be **scalar** — a key targeting a `VARIANT`/`OBJECT`/`ARRAY` column is stringified, not stored as structured JSON. Both column identifiers and JSON path keys are quote-escaped, so record keys cannot inject SQL.
+2. `write_batch()` adds the page to a **cross-page accumulator** and commits a group at `commit_rows` / `commit_bytes` (default 100,000 rows or ~256 MiB) and at every `flush`. A group is split into `batch_size` chunks (or one chunk when `batch_size = 0`). For each chunk it builds an `INSERT` using `PARSE_JSON(?)` + `FLATTEN` and sends the chunk's JSON array as a **bound `TEXT` parameter**, parsing and inserting every row in one statement without interpolating data into the SQL text. A chunk whose JSON exceeds 8 MiB (Snowflake caps one text value at 16 MB) is split further; with `batch_size = 0` those parts run as one multi-statement transaction so the group stays atomic.
+3. **Field-to-column mapping:** each record's top-level keys project into matching table columns — `INSERT INTO "db"."schema"."tbl" ("col1","col2") SELECT value:"col1"::string, value:"col2"::string FROM TABLE(FLATTEN(input => PARSE_JSON(?)))`. The `::string` cast strips the VARIANT's JSON quotes so Snowflake coerces each scalar into the destination column's type on insert (text → number / boolean / timestamp, etc.). The column set is the **union of the chunk's keys**; a key absent from a record is inserted as `NULL`. Before the first write the sink reads the table's columns from `information_schema`: a field the table lacks is added as a nullable `STRING` column with `create_table: true` (the default), and fails the write naming the field with `create_table: false`. Offset-bearing ISO strings bound for a `TIMESTAMP_NTZ` column are converted to UTC first (Snowflake's own cast would drop the offset). Target columns should be **scalar** — a key targeting a `VARIANT`/`OBJECT`/`ARRAY` column is stringified, not stored as structured JSON. Both column identifiers and JSON path keys are quote-escaped, so record keys cannot inject SQL.
 4. The statement targets the fully-qualified `"database"."schema"."table"` with quoted identifiers.
 5. Auth headers are generated per request: an RS256 JWT (1-hour expiry, public-key fingerprint in `iss`) for `key_pair`, or `Bearer …` for `oauth`.
 6. Success is confirmed by the `090001` response code; an HTTP 202 enters the [async-execution poll loop](#asynchronous-execution).
@@ -326,11 +328,10 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | `Auth` error / 401 | Credentials rejected. For `key_pair`, confirm the **public** key is registered on the Snowflake user (`ALTER USER … SET RSA_PUBLIC_KEY=…`) and the PEM is a valid RSA private key (PKCS#8 `BEGIN PRIVATE KEY` or PKCS#1 `BEGIN RSA PRIVATE KEY`). For `oauth`, check the token isn't expired and matches the account's configured OAuth integration. Run `faucet doctor` for a one-shot `SELECT 1` probe. |
 | `invalid RSA private key` | The `private_key_pem` body isn't a parseable RSA key — check the `${file:…}` path resolved and the PEM wasn't truncated/escaped. |
 | `Snowflake auth provider must yield a bearer/token credential` | You pointed `auth: { ref }` at a non-bearer shared provider, or tried key-pair via a provider. Key-pair JWT must be inline; shared providers only supply OAuth/bearer tokens. |
-| Rows silently land as `NULL` | A record key doesn't match a table column name (case-sensitive — Snowflake folds unquoted identifiers to uppercase). Ensure record keys match the **quoted** column names exactly. |
+| `table … has no column(s) …` | With `create_table: false` a record field has no matching column (case-sensitive — Snowflake folds unquoted identifiers to uppercase). Rename the field with a transform, add the column, or set `create_table: true` to let the sink add it as `STRING`. |
 | Structured field stored as a JSON string | The target column isn't scalar. The `::string` cast stringifies `VARIANT`/`OBJECT`/`ARRAY` targets — land those into a `VARIANT` column with a transform, or split the field. |
 | Write fails with `FaucetError::Sink: … timed out` | The queued statement didn't finish within `poll_timeout`. Raise `poll_timeout` (or set `0`), and make sure the `warehouse` is not suspended / can resume. |
 | `batch_size` rejected | Values above `MAX_BATCH_SIZE` (1,000,000) are invalid. Use `0` for "no batching", or a value ≤ 1,000,000. |
-| First record's columns don't cover all rows | The column set is taken from the first record. Put a record with the full key set first, or normalize keys with an upstream transform so every row shares the same shape. |
 
 ## See also
 
@@ -348,10 +349,11 @@ first written page's inferred columns when it does not exist — a first-ever
 sync cannot assume the destination is already there. Every inferred column is
 created **nullable**: a column present in page 1 is not required forever, and a
 `NOT NULL` inferred from one page fails page 2 the first time a record omits
-the field (narrowing later is the `schema:` drift policy's job). Columns are created as `STRING`: the insert path projects every value with `::string`, so a typed column would reject its own writer's cast.
+the field. Columns are created as `STRING`: the insert path projects every value with `::string`, so a typed column would reject its own writer's cast. A field first seen on a later page gets its own `ALTER TABLE … ADD COLUMN IF NOT EXISTS … STRING` before that page is buffered, so it is never dropped. (`schema:` drift policies do not apply to this sink: it reports no destination schema.)
 
-Set `create_table: false` to require a pre-existing target; a missing one then
-fails fast with the same error every table sink raises, naming both ways out.
+Set `create_table: false` to require a pre-existing target; the INSERT then
+reports a missing table, and a record field the table lacks fails the write
+before any row of that page is buffered.
 
 
 ## Commit accumulation (`commit_rows` / `commit_bytes`)

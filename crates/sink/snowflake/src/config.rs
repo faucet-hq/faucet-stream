@@ -24,15 +24,31 @@ pub struct SnowflakeSinkConfig {
     pub schema: String,
     /// Target table name.
     pub table: String,
+    /// Optional role to assume for the session; without it Snowflake uses the
+    /// user's default role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Server-side statement timeout, sent as the `timeout` field of every
+    /// statement. Snowflake **cancels** a statement that runs longer. Defaults
+    /// to `0`: Snowflake's maximum.
+    #[serde(
+        default = "default_statement_timeout",
+        with = "faucet_core::config::duration_secs"
+    )]
+    #[schemars(with = "u64")]
+    pub statement_timeout: Duration,
     /// Create the target table if it does not exist, inferring the column
-    /// **names** from the first written page (#580). Enabled by default: a
-    /// first-ever sync cannot assume the destination already exists.
+    /// **names** from the first written page (#580), and add a nullable
+    /// `STRING` column for any field a later page brings that the table lacks.
+    /// Enabled by default: a first-ever sync cannot assume the destination
+    /// already exists.
     ///
     /// Columns are created as nullable `STRING`, not as inferred types,
     /// because the insert path projects every value with `::string` — a
     /// `NUMBER` column would reject its own writer's cast. Define the table
-    /// yourself and set `create_table: false` when you want typed columns
-    /// (then use `schema:` drift to keep them aligned).
+    /// yourself and set `create_table: false` when you want typed columns;
+    /// a record field the table lacks then fails the write naming the field.
+    /// (`schema:` drift policies do not apply: this sink reports no schema.)
     #[serde(default = "default_create_table")]
     pub create_table: bool,
     /// Commit-group size for the cross-page accumulator (#617).
@@ -172,6 +188,10 @@ fn default_create_table() -> bool {
     true
 }
 
+fn default_statement_timeout() -> Duration {
+    Duration::ZERO
+}
+
 impl SnowflakeSinkConfig {
     /// Create a new config with required fields and sensible defaults.
     pub fn new(
@@ -188,6 +208,8 @@ impl SnowflakeSinkConfig {
             database: database.into(),
             schema: schema.into(),
             table: table.into(),
+            role: None,
+            statement_timeout: default_statement_timeout(),
             create_table: default_create_table(),
             commit_rows: None,
             commit_bytes: None,
@@ -196,6 +218,19 @@ impl SnowflakeSinkConfig {
             poll_timeout: default_poll_timeout(),
             bulk_load: None,
         }
+    }
+
+    /// Run the session under `role`.
+    pub fn with_role(mut self, role: impl Into<String>) -> Self {
+        self.role = Some(role.into());
+        self
+    }
+
+    /// Set the server-side statement timeout (`Duration::ZERO` = Snowflake's
+    /// maximum).
+    pub fn with_statement_timeout(mut self, timeout: Duration) -> Self {
+        self.statement_timeout = timeout;
+        self
     }
 
     /// Opt out of auto-creating a missing target table (#580).

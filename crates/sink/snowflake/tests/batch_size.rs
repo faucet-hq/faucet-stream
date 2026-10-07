@@ -60,7 +60,7 @@ async fn write_batch_rechunks_into_batch_size_requests() {
     sink.flush().await.unwrap();
     assert_eq!(written, 2_500);
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert_eq!(
         requests.len(),
         3,
@@ -78,7 +78,7 @@ async fn write_batch_emits_single_request_for_exact_multiple() {
     sink.write_batch(&make_records(1_000)).await.unwrap();
     sink.flush().await.unwrap();
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert_eq!(requests.len(), 1);
 }
 
@@ -93,7 +93,7 @@ async fn write_batch_with_sentinel_zero_sends_single_request() {
     sink.write_batch(&make_records(5_000)).await.unwrap();
     sink.flush().await.unwrap();
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert_eq!(
         requests.len(),
         1,
@@ -111,7 +111,7 @@ async fn write_batch_empty_records_makes_no_requests() {
     let written = sink.write_batch(&[]).await.unwrap();
     assert_eq!(written, 0);
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert!(requests.is_empty());
 }
 
@@ -125,6 +125,15 @@ async fn write_batch_smaller_than_batch_size_makes_one_request() {
     sink.write_batch(&make_records(42)).await.unwrap();
     sink.flush().await.unwrap();
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert_eq!(requests.len(), 1);
+}
+
+/// Requests other than the sink's one-time `information_schema` column
+/// lookup, which these tests do not count.
+fn without_describe(requests: Vec<wiremock::Request>) -> Vec<wiremock::Request> {
+    requests
+        .into_iter()
+        .filter(|r| !String::from_utf8_lossy(&r.body).contains("information_schema.columns"))
+        .collect()
 }

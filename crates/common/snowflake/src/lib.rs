@@ -146,6 +146,80 @@ pub fn http_client() -> Result<reqwest::Client, FaucetError> {
         .map_err(|e| FaucetError::Config(format!("snowflake: cannot build HTTP client: {e}")))
 }
 
+/// Best-effort `POST {statements_url}/{handle}/cancel`, so an abandoned
+/// statement stops running (and billing) on the warehouse. `statements_url`
+/// is the `…/api/v2/statements` endpoint. A failure is logged, never returned.
+pub async fn cancel_statement(
+    client: &reqwest::Client,
+    statements_url: &str,
+    handle: &str,
+    auth: &str,
+    token_type: &str,
+) {
+    let url = format!("{}/{handle}/cancel", statements_url.trim_end_matches('/'));
+    let result = client
+        .post(&url)
+        .header("Authorization", auth)
+        .header("Accept", "application/json")
+        .header("X-Snowflake-Authorization-Token-Type", token_type)
+        .send()
+        .await;
+    if let Err(e) = result {
+        tracing::warn!(statement = handle, error = %e, "Snowflake statement cancel failed");
+    }
+}
+
+/// Cancels a still-running statement when the future polling it is dropped
+/// (the run was cancelled or timed out). [`disarm`](Self::disarm) it once the
+/// statement finished or was cancelled explicitly.
+pub struct CancelOnDrop {
+    client: reqwest::Client,
+    statements_url: String,
+    handle: String,
+    auth: Option<(String, &'static str)>,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    /// Arm a guard for `handle` on the `…/api/v2/statements` endpoint.
+    pub fn new(client: reqwest::Client, statements_url: String, handle: &str) -> Self {
+        Self {
+            client,
+            statements_url,
+            handle: handle.to_owned(),
+            auth: None,
+            armed: true,
+        }
+    }
+
+    /// The latest `Authorization` header and token type, used by the cancel.
+    pub fn set_auth(&mut self, auth: String, token_type: &'static str) {
+        self.auth = Some((auth, token_type));
+    }
+
+    /// Do not cancel on drop.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (Some((auth, token_type)), Ok(rt)) =
+            (self.auth.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let client = self.client.clone();
+        let url = std::mem::take(&mut self.statements_url);
+        let handle = std::mem::take(&mut self.handle);
+        rt.spawn(async move { cancel_statement(&client, &url, &handle, &auth, token_type).await });
+    }
+}
+
 /// Compute the Snowflake public-key fingerprint (`SHA256:<base64>`) from a
 /// PEM-encoded RSA private key.
 ///
@@ -367,6 +441,18 @@ yCkue9tat7y9DS8+VR5D6cM9oQpKbrfG+PfTdlkCgYBf/pUWO94VgZvpV5Ui7MHb
     fn public_key_fingerprint_matches_openssl() {
         let fp = public_key_fingerprint(TEST_RSA_PKCS8_PEM).unwrap();
         assert_eq!(fp, "SHA256:NiQ5G+9Hr4ZBmdBscIoTOgx2SM6aWPG0/Q9Y6NuFtpI=");
+    }
+
+    #[test]
+    fn a_guard_without_auth_or_runtime_does_nothing_on_drop() {
+        let mut g = CancelOnDrop::new(http_client().unwrap(), "http://x".into(), "h");
+        drop(CancelOnDrop::new(
+            http_client().unwrap(),
+            "http://x".into(),
+            "h",
+        ));
+        g.set_auth("Bearer t".into(), "OAUTH");
+        drop(g);
     }
 
     #[test]

@@ -25,6 +25,7 @@ tokio = { workspace = true, features = ["sync"] }
 reqwest.workspace = true
 base64.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 
 # Arrow columnar bulk-load path (#381, `arrow` feature): buffer RecordBatches
 # to Parquet, upload to an external stage's cloud storage, then `COPY INTO`.

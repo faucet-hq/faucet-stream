@@ -11,7 +11,8 @@ use crate::config::SnowflakeSourceConfig;
 use crate::convert::{ColumnMeta, row_to_json};
 use async_trait::async_trait;
 use faucet_common_snowflake::{
-    SnowflakeAuth, authorization_header, credential_to_auth, http_client, snowflake_token_type,
+    CancelOnDrop, SnowflakeAuth, authorization_header, cancel_statement, credential_to_auth,
+    http_client, snowflake_token_type,
 };
 use faucet_core::util::substitute_context_bind_params;
 use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Stream, StreamPage};
@@ -177,7 +178,14 @@ impl SnowflakeSource {
         let Ok((auth, token_type)) = self.auth_headers().await else {
             return;
         };
-        cancel_request(&self.client, &self.base_url(), handle, &auth, token_type).await;
+        cancel_statement(
+            &self.client,
+            &self.statements_url(),
+            handle,
+            &auth,
+            token_type,
+        )
+        .await;
     }
 
     /// Build the JSON body for `POST /api/v2/statements`.
@@ -328,10 +336,10 @@ impl SnowflakeSource {
         let url = format!("{}/api/v2/statements/{}", self.base_url(), handle);
         let poll_timeout = self.config.poll_timeout;
         let started = std::time::Instant::now();
-        let mut guard = CancelOnDrop::new(self.client.clone(), self.base_url(), handle);
+        let mut guard = CancelOnDrop::new(self.client.clone(), self.statements_url(), handle);
         loop {
             let (auth, token_type) = self.auth_headers().await?;
-            guard.auth = Some((auth.clone(), token_type));
+            guard.set_auth(auth.clone(), token_type);
             let resp = self
                 .client
                 .get(&url)
@@ -408,70 +416,6 @@ impl SnowflakeSource {
         })?;
         check_code(&parsed)?;
         Ok(parsed.data.unwrap_or_default())
-    }
-}
-
-/// `POST {base}/api/v2/statements/{handle}/cancel`, ignoring the outcome.
-async fn cancel_request(
-    client: &Client,
-    base: &str,
-    handle: &str,
-    auth: &str,
-    token_type: &'static str,
-) {
-    let url = format!("{base}/api/v2/statements/{handle}/cancel");
-    let result = client
-        .post(&url)
-        .header("Authorization", auth)
-        .header("Accept", "application/json")
-        .header("X-Snowflake-Authorization-Token-Type", token_type)
-        .send()
-        .await;
-    if let Err(e) = result {
-        tracing::warn!(statement = handle, error = %e, "Snowflake statement cancel failed");
-    }
-}
-
-/// Cancels a still-running statement when its poll is abandoned — the run
-/// was cancelled or timed out and dropped the future mid-poll.
-struct CancelOnDrop {
-    client: Client,
-    base: String,
-    handle: String,
-    auth: Option<(String, &'static str)>,
-    armed: bool,
-}
-
-impl CancelOnDrop {
-    fn new(client: Client, base: String, handle: &str) -> Self {
-        Self {
-            client,
-            base,
-            handle: handle.to_owned(),
-            auth: None,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let (Some((auth, token_type)), Ok(rt)) =
-            (self.auth.take(), tokio::runtime::Handle::try_current())
-        else {
-            return;
-        };
-        let client = self.client.clone();
-        let base = std::mem::take(&mut self.base);
-        let handle = std::mem::take(&mut self.handle);
-        rt.spawn(async move { cancel_request(&client, &base, &handle, &auth, token_type).await });
     }
 }
 

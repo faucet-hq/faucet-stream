@@ -21,6 +21,8 @@ sha2.workspace = true
 base64.workspace = true
 # `gzip`: the SQL API gzip-encodes result partitions after the first.
 reqwest = { workspace = true, features = ["gzip"] }
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
