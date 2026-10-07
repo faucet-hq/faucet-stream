@@ -124,6 +124,8 @@ jobs:
           python3 scripts/vendor-names.py
       - name: Check no connector crate depends on another connector (#784)
         run: python3 scripts/connector-deps.py
+      - name: Check no published crate packages a private key (#789 SUPPLY-20)
+        run: python3 scripts/packaged-keys.py
 
   clippy:
     name: Clippy

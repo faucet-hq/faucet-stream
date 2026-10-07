@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 description = "Shared, single-flight authentication providers (OAuth2, token-endpoint) for faucet-stream connectors"
 readme = "README.md"
+exclude = ["tests/fixtures/**"]
 keywords = ["oauth2", "auth", "etl", "pipeline", "faucet"]
 categories.workspace = true
 
