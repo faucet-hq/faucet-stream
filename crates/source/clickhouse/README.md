@@ -66,9 +66,18 @@ on the final page.
     replication:
       type: incremental
       column: updated_at
-      initial_value: "1970-01-01 00:00:00"
-    query: SELECT * FROM events WHERE updated_at > @bookmark
+      initial_value: "1970-01-01T00:00:00Z"
+    query: SELECT * FROM events WHERE updated_at > parseDateTime64BestEffort(@bookmark)
 ```
+
+`DateTime` / `DateTime64` values are emitted as RFC 3339 in UTC
+(`2024-01-01T04:30:00Z`, the `date_time_output_format=iso` setting), so a
+non-UTC column zone never shifts them. ClickHouse will not compare a
+`DateTime` column with an RFC 3339 string literal directly, so wrap the
+bookmark in `parseDateTime64BestEffort(@bookmark)` for a `DateTime` cursor, and
+write `initial_value` in the same RFC 3339 form so the client-side filter
+orders it correctly. Float `NaN` / `±Inf` are emitted as the strings `"nan"`,
+`"inf"` and `"-inf"` rather than `null`.
 
 Put the literal `@bookmark` token in the `WHERE` clause to push the cursor down
 to the server (efficient); it is substituted as an injection-safe SQL literal.

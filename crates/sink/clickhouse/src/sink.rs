@@ -34,13 +34,13 @@ pub struct ClickHouseSink {
 }
 
 /// Quote a (possibly schema-qualified) table name. Each `.`-separated segment
-/// is quoted with [`faucet_core::util::quote_ident`] so `db.table` becomes
-/// `"db"."table"` — safe against identifier injection while preserving the
-/// database/table split.
+/// is quoted with [`faucet_common_clickhouse::quote_ident`] so `db.table`
+/// becomes `"db"."table"` — safe against identifier injection while preserving
+/// the database/table split.
 fn quote_table(table: &str) -> String {
     table
         .split('.')
-        .map(faucet_core::util::quote_ident)
+        .map(faucet_common_clickhouse::quote_ident)
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -71,7 +71,7 @@ fn clickhouse_type(t: faucet_core::SqlBaseType) -> &'static str {
 /// `create_table: false`.
 fn build_create_table_sql(table: &str, columns: &[faucet_core::PlannedColumn]) -> String {
     let cols =
-        faucet_core::render_columns(columns, faucet_core::util::quote_ident, clickhouse_type);
+        faucet_core::render_columns(columns, faucet_common_clickhouse::quote_ident, clickhouse_type);
     format!(
         "CREATE TABLE IF NOT EXISTS {} ({cols}) ENGINE = MergeTree ORDER BY tuple()",
         quote_table(table)
@@ -84,6 +84,10 @@ fn insert_statement(table: &str) -> String {
     format!("INSERT INTO {} FORMAT JSONEachRow", quote_table(table))
 }
 
+/// Parse RFC 3339 / ISO-8601 timestamps (`T`, `Z`, offsets, fractions) into
+/// `DateTime` columns; the default `basic` parser rejects them.
+pub(crate) const DATE_TIME_INPUT: (&str, &str) = ("date_time_input_format", "best_effort");
+
 /// Build the ordered query parameters for an insert request: the `database`,
 /// any async-insert settings, and the `query` statement. Pure and
 /// unit-testable.
@@ -93,7 +97,7 @@ fn insert_params(
     async_insert: bool,
     wait_for_async_insert: bool,
 ) -> Vec<(String, String)> {
-    let mut settings: Vec<(&str, &str)> = Vec::new();
+    let mut settings: Vec<(&str, &str)> = vec![DATE_TIME_INPUT];
     if async_insert {
         settings.push(("async_insert", "1"));
         settings.push((
@@ -103,6 +107,24 @@ fn insert_params(
     }
     settings.push(("query", statement));
     query_params(database, &settings)
+}
+
+/// The request for a staged `INSERT … SELECT FROM s3()/gcs()`: the statement
+/// in the body (no `query` URL parameter, so credentials in it never reach a
+/// URL), plus the best-effort timestamp parser for the staged rows.
+#[cfg(feature = "staging")]
+pub(crate) fn staged_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    connection: &faucet_common_clickhouse::ClickHouseConnection,
+    statement: &str,
+) -> reqwest::RequestBuilder {
+    let params = query_params(&connection.database, &[DATE_TIME_INPUT]);
+    let req = client
+        .post(base_url)
+        .query(&params)
+        .body(statement.to_string());
+    apply_auth(req, connection)
 }
 
 impl ClickHouseSink {
@@ -505,10 +527,10 @@ mod tests {
 
     #[test]
     fn quote_table_escapes_hostile_identifier() {
-        // A double quote in the identifier is doubled by quote_ident, so it
-        // cannot break out of the quoting.
         let q = quote_table("we\"ird");
-        assert_eq!(q, "\"we\"\"ird\"");
+        assert_eq!(q, "\"we\\\"ird\"");
+        let q = quote_table("x\\\" Int64, y String) ENGINE=Log --");
+        assert_eq!(q, "\"x\\\\\\\" Int64, y String) ENGINE=Log --\"");
     }
 
     #[test]
@@ -523,16 +545,37 @@ mod tests {
     fn insert_params_without_async_insert() {
         let params = insert_params("analytics", "INSERT INTO x FORMAT JSONEachRow", false, true);
         assert_eq!(params[0], ("database".to_string(), "analytics".to_string()));
-        // Only database + query when async insert is off.
-        assert_eq!(params.len(), 2);
+        assert_eq!(params.len(), 3);
         assert_eq!(
             params[1],
+            (
+                "date_time_input_format".to_string(),
+                "best_effort".to_string()
+            )
+        );
+        assert_eq!(
+            params[2],
             (
                 "query".to_string(),
                 "INSERT INTO x FORMAT JSONEachRow".to_string()
             )
         );
         assert!(!params.iter().any(|(k, _)| k == "async_insert"));
+    }
+
+    #[cfg(feature = "staging")]
+    #[test]
+    fn staged_request_sends_statement_in_body_not_url() {
+        let conn = faucet_common_clickhouse::ClickHouseConnection::from_url("http://h:8123");
+        let stmt = "INSERT INTO \"t\" SELECT * FROM s3('u', 'AKIA', 'SECRET', 'JSONEachRow')";
+        let req = staged_request(&reqwest::Client::new(), "http://h:8123", &conn, stmt)
+            .build()
+            .unwrap();
+        let url = req.url().as_str();
+        assert!(!url.contains("SECRET") && !url.contains("query="), "{url}");
+        assert!(url.contains("date_time_input_format=best_effort"), "{url}");
+        let body = req.body().and_then(|b| b.as_bytes()).unwrap();
+        assert_eq!(body, stmt.as_bytes());
     }
 
     #[test]

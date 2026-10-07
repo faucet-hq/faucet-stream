@@ -30,8 +30,13 @@ sink:
     wait_for_async_insert: true  # wait for the flush ack (keeps at-least-once durability)
 ```
 
-The `table` (including a `db.table` qualifier) is identifier-quoted before use,
-so it is safe against injection.
+The `table` (including a `db.table` qualifier) and every auto-created column
+name are identifier-quoted with ClickHouse's own escaping (`\` and `"` are both
+backslash-escaped), so they are safe against injection.
+
+Inserts set `date_time_input_format=best_effort`, so RFC 3339 / ISO-8601
+timestamps (`2024-01-01T05:00:00+05:30`, `…Z`, fractional seconds) load into
+existing `DateTime` / `DateTime64` columns.
 
 ### Authentication
 
@@ -72,6 +77,13 @@ sink:
       access_key: "${env:CH_STAGE_KEY}"   # creds the server uses to READ the stage
       secret_key: "${env:CH_STAGE_SECRET}"
 ```
+
+The `INSERT … SELECT` statement is sent in the request **body**, never the
+URL, so explicit `access_key` / `secret_key` values stay out of proxy and HTTP
+access logs. ClickHouse still records the statement text in `system.query_log`;
+to keep keys out of the server entirely, omit them and give the server its own
+access (an IAM role, or a
+[named collection](https://clickhouse.com/docs/en/operations/named-collections)).
 
 Build with the crate's `staging` feature (CLI: `--features sink-clickhouse-staging`,
 included in `full`). The load SQL/URL generation is unit-tested; the server-side

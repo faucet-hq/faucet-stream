@@ -379,3 +379,56 @@ async fn landed_rows_are_not_restored_and_a_clean_page_reports_all_rows() {
     assert!(outcomes.iter().all(Result::is_ok));
     assert_eq!(count_of(&base, "SELECT count() AS n FROM landed").await, 15);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc3339_timestamps_load_into_datetime_columns() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE ts_events (id UInt32, at DateTime('UTC'), at64 DateTime64(3, 'UTC')) \
+         ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "ts_events")).expect("sink");
+    let rows = vec![json!({
+        "id": 1,
+        "at": "2024-01-01T05:00:00+05:30",
+        "at64": "2024-01-01T00:00:00.123Z"
+    })];
+    sink.write_batch(&rows).await.expect("write_batch");
+    sink.flush().await.expect("flush");
+    let back = read_rows(
+        &base,
+        "SELECT toString(at) AS at, toString(at64) AS at64 FROM ts_events",
+    )
+    .await;
+    assert_eq!(back[0]["at"], json!("2023-12-31 23:30:00"));
+    assert_eq!(back[0]["at64"], json!("2024-01-01 00:00:00.123"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_create_quotes_hostile_column_names() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "hostile")).expect("sink");
+    let evil = "x\\\" Int64, y String) ENGINE=Log --";
+    let mut row = serde_json::Map::new();
+    row.insert(evil.to_string(), json!("v"));
+    row.insert("trail\\".to_string(), json!("w"));
+    sink.write_batch(&[Value::Object(row)]).await.expect("write_batch");
+    sink.flush().await.expect("flush");
+    let cols = read_rows(
+        &base,
+        "SELECT name FROM system.columns WHERE table = 'hostile' ORDER BY name",
+    )
+    .await;
+    let names: Vec<&str> = cols.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["trail\\", evil]);
+    let engine = read_rows(
+        &base,
+        "SELECT engine FROM system.tables WHERE name = 'hostile'",
+    )
+    .await;
+    assert_eq!(engine[0]["engine"], json!("MergeTree"));
+}

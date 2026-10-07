@@ -310,3 +310,45 @@ async fn decimals_and_wide_integers_stay_exact() {
         json!("115792089237316195423570985008687907853269984665640564039457584007913129639935")
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn datetimes_carry_their_zone_and_denormals_survive() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE zoned (id UInt32, at DateTime('Asia/Kolkata'), f Float64) \
+         ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    http_exec(
+        &base,
+        "INSERT INTO zoned VALUES (1, '2024-01-01 10:00:00', nan), (2, '2024-01-02 10:00:00', inf), \
+         (3, '2024-01-03 10:00:00', -inf)",
+    )
+    .await;
+
+    let source = ClickHouseSource::new(ClickHouseSourceConfig::new(
+        &base,
+        "SELECT id, at, f FROM zoned ORDER BY id",
+    ))
+    .expect("source");
+    let rows = source.fetch_all().await.expect("fetch_all");
+    assert_eq!(rows[0]["at"], json!("2024-01-01T04:30:00Z"));
+    assert_eq!(rows[0]["f"], json!("nan"));
+    assert_eq!(rows[1]["f"], json!("inf"));
+    assert_eq!(rows[2]["f"], json!("-inf"));
+
+    let incremental = ClickHouseSource::new(
+        ClickHouseSourceConfig::new(
+            &base,
+            "SELECT id, at FROM zoned WHERE at > parseDateTime64BestEffort(@bookmark) ORDER BY at",
+        )
+        .incremental("at", json!("2024-01-01T04:30:00Z")),
+    )
+    .expect("source");
+    let (rows, bookmark) = incremental.fetch_all_incremental().await.expect("run");
+    let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![2, 3]);
+    assert_eq!(bookmark, Some(json!("2024-01-03T04:30:00Z")));
+}
