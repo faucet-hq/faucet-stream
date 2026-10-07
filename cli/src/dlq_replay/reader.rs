@@ -30,6 +30,8 @@ const SEALED_LINE_PREFIX: &str = "RkNU";
 pub struct DlqDecryptor {
     #[cfg(feature = "encryption")]
     inner: Option<Arc<faucet_core::CompiledEncryption>>,
+    #[cfg(feature = "encryption")]
+    sealing: Option<Value>,
 }
 
 impl std::fmt::Debug for DlqDecryptor {
@@ -66,6 +68,10 @@ impl DlqDecryptor {
             };
             Ok(Self {
                 inner: Some(Arc::new(faucet_core::CompiledEncryption::compile(&spec)?)),
+                sealing: Some(serde_json::json!({
+                    "key": keys[0],
+                    "previous_keys": &keys[1..],
+                })),
             })
         }
         #[cfg(not(feature = "encryption"))]
@@ -90,6 +96,7 @@ impl DlqDecryptor {
                 .map_err(|e| FaucetError::Config(format!("dlq sink `encryption` block: {e}")))?;
             Ok(Self {
                 inner: Some(Arc::new(faucet_core::CompiledEncryption::compile(&spec)?)),
+                sealing: Some(value.clone()),
             })
         }
         #[cfg(not(feature = "encryption"))]
@@ -98,6 +105,17 @@ impl DlqDecryptor {
              `encryption` feature"
                 .into(),
         ))
+    }
+
+    /// The `encryption` block that seals a file with the same keys this
+    /// decryptor reads, so a replay's re-failed rows stay encrypted.
+    pub fn sealing_value(&self) -> Option<Value> {
+        #[cfg(feature = "encryption")]
+        {
+            self.sealing.clone()
+        }
+        #[cfg(not(feature = "encryption"))]
+        None
     }
 
     /// Whether any key is loaded.

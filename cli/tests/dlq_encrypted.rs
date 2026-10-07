@@ -227,3 +227,68 @@ async fn discard_filters_sealed_envelopes_and_preserves_lines_verbatim() {
     .unwrap();
     assert_eq!(blind.discarded, 0);
 }
+
+/// Rows that fail again during a replay land in the fresh failure DLQ sealed
+/// with the same keys as the DLQ they came from, never in clear (CLI-47).
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn replay_seals_the_refailed_rows_like_the_source_dlq() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dir.path().join("dlq.jsonl");
+    let out = dir.path().join("out.jsonl");
+    write_encrypted_dlq(
+        &dlq,
+        &[
+            envelope("quality", json!({"id": 1, "ssn": "123-45-6789"})),
+            envelope("quality", json!({"ssn": "987-65-4321"})),
+        ],
+    )
+    .await;
+
+    let cfg_yaml = format!(
+        concat!(
+            "version: 1\nname: replay\npipeline:\n",
+            "  source: {{ type: csv, config: {{ path: /dev/null }} }}\n",
+            "  sink: {{ type: jsonl, config: {{ path: {out} }} }}\n",
+            "  quality:\n    record:\n",
+            "      - {{ type: not_null, field: id, on_failure: quarantine }}\n",
+            "  dlq:\n    sink:\n      type: jsonl\n",
+            "      config: {{ path: {dlq}, encryption: {{ key: \"{key}\" }} }}\n",
+        ),
+        out = out.display(),
+        dlq = dlq.display(),
+        key = KEY,
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    for decryptor in [
+        DlqDecryptor::default(),
+        DlqDecryptor::from_keys(&[KEY.to_string()]).unwrap(),
+    ] {
+        let failed = dir.path().join("failed.jsonl");
+        let _ = std::fs::remove_file(&failed);
+        dlq_replay::replay(
+            &cfg,
+            dlq.to_str().unwrap(),
+            ReplayInputs {
+                decryptor,
+                reason: None,
+                failed_dlq: Some(failed.to_str().unwrap()),
+                row: None,
+                dry_run: false,
+                pipeline_name: "replay".into(),
+                execution: None,
+                auth: build_auth_catalog(None).unwrap(),
+                clock: chrono::Utc::now().fixed_offset(),
+            },
+        )
+        .await
+        .unwrap();
+        let raw = std::fs::read_to_string(&failed).unwrap();
+        assert!(!raw.trim().is_empty(), "the id-less row fails again");
+        assert!(!raw.contains("987-65-4321"), "re-failed row written in clear");
+        let dec = DlqDecryptor::from_keys(&[KEY.to_string()]).unwrap();
+        let seen = dlq_replay::inspect(failed.to_str().unwrap(), None, 5, &dec).unwrap();
+        assert_eq!(seen.total_envelopes, 1);
+        assert_eq!(seen.undecryptable, 0);
+    }
+}
