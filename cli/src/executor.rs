@@ -3872,17 +3872,97 @@ impl Sink for CapturingSink {
     fn supports_idempotent_writes(&self) -> bool {
         self.inner.supports_idempotent_writes()
     }
-    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.inner.batch_atomicity()
     }
+    // The per-row path: only rows the inner sink accepted are captured for
+    // the children (#789 CLI-21); rejected ones go to the DLQ.
+    async fn write_batch_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        let outcomes = self.inner.write_batch_partial(records).await?;
+        let mut buf = self.captured.lock().await;
+        buf.extend(
+            records
+                .iter()
+                .zip(&outcomes)
+                .filter(|(_, o)| o.is_ok())
+                .map(|(r, _)| project_record(r, &self.projection)),
+        );
+        Ok(outcomes)
+    }
+    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
+        self.inner.sink_guarantee()
+    }
+    fn write_batch_is_replay_safe(&self) -> bool {
+        self.inner.write_batch_is_replay_safe()
+    }
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
         self.inner.supported_write_modes()
+    }
+    fn supports_cleanup(&self) -> bool {
+        self.inner.supports_cleanup()
+    }
+    async fn cleanup_scope(
+        &self,
+        scope: &std::collections::BTreeMap<String, Value>,
+        seen: &faucet_core::cleanup::SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        self.inner.cleanup_scope(scope, seen).await
+    }
+    fn is_overwrite(&self) -> bool {
+        self.inner.is_overwrite()
+    }
+    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+        self.inner.begin_overwrite().await
+    }
+    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+        self.inner.commit_overwrite().await
+    }
+    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+        self.inner.abort_overwrite().await
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder)
+    }
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &faucet_core::rollback::RollbackOptions,
+    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+        self.inner.rollback_run(run_id, opts).await
+    }
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.inner.rewind_commit_token(scope, token).await
+    }
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.inner.readback_source()
+    }
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
+    }
+    async fn check(
+        &self,
+        ctx: &faucet_core::CheckContext,
+    ) -> Result<faucet_core::CheckReport, FaucetError> {
+        self.inner.check(ctx).await
     }
     async fn write_batch_idempotent(
         &self,
@@ -3962,6 +4042,112 @@ impl Sink for LimitedSink {
     }
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
+    }
+    // The per-row path keeps the DLQ routing of the inner sink (#789 CLI-21);
+    // rows past the cap are dropped by design and reported as accepted.
+    async fn write_batch_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let take = remaining.min(records.len());
+        let mut outcomes = if take == 0 {
+            Vec::new()
+        } else {
+            self.inner.write_batch_partial(&records[..take]).await?
+        };
+        let accepted = outcomes.iter().filter(|o| o.is_ok()).count();
+        self.remaining
+            .fetch_sub(accepted.min(remaining), Ordering::Relaxed);
+        outcomes.resize_with(records.len(), || Ok(()));
+        Ok(outcomes)
+    }
+    fn supports_rollback(&self) -> bool {
+        self.inner.supports_rollback()
+    }
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.inner.forget_run(run_id).await
+    }
+    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+        self.inner.current_schema().await
+    }
+    fn supports_schema_evolution(&self) -> bool {
+        self.inner.supports_schema_evolution()
+    }
+    async fn evolve_schema(
+        &self,
+        evolution: &faucet_core::SchemaEvolution,
+    ) -> Result<(), FaucetError> {
+        self.inner.evolve_schema(evolution).await
+    }
+    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
+        self.inner.sink_guarantee()
+    }
+    fn write_batch_is_replay_safe(&self) -> bool {
+        self.inner.write_batch_is_replay_safe()
+    }
+    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
+        self.inner.supported_write_modes()
+    }
+    fn supports_cleanup(&self) -> bool {
+        self.inner.supports_cleanup()
+    }
+    async fn cleanup_scope(
+        &self,
+        scope: &std::collections::BTreeMap<String, Value>,
+        seen: &faucet_core::cleanup::SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        self.inner.cleanup_scope(scope, seen).await
+    }
+    fn is_overwrite(&self) -> bool {
+        self.inner.is_overwrite()
+    }
+    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+        self.inner.begin_overwrite().await
+    }
+    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+        self.inner.commit_overwrite().await
+    }
+    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+        self.inner.abort_overwrite().await
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder)
+    }
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &faucet_core::rollback::RollbackOptions,
+    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+        self.inner.rollback_run(run_id, opts).await
+    }
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.inner.rewind_commit_token(scope, token).await
+    }
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.inner.readback_source()
+    }
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
+    }
+    async fn check(
+        &self,
+        ctx: &faucet_core::CheckContext,
+    ) -> Result<faucet_core::CheckReport, FaucetError> {
+        self.inner.check(ctx).await
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let remaining = self.remaining.load(Ordering::Relaxed);
@@ -6775,6 +6961,147 @@ matrix:
         assert_eq!(groups.len(), 1, "one table ⇒ one staging ⇒ one group");
         assert_eq!(groups[0].members, 2);
         assert_eq!(task_group.len(), 2);
+    }
+
+    /// #789 CLI-21: the executor's sink decorators forward the inner sink's
+    /// whole surface, so a parent row (CapturingSink) or a `--limit` run
+    /// (LimitedSink) keeps DLQ routing, cleanup, overwrite and finalisation.
+    mod decorator_forwarding {
+        use super::*;
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Default)]
+        struct Spy {
+            completed: Arc<AtomicBool>,
+            recorder_set: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Sink for Spy {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                Ok(records.len())
+            }
+            async fn write_batch_partial(
+                &self,
+                records: &[Value],
+            ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+                Ok(records
+                    .iter()
+                    .map(|r| {
+                        if r.get("bad").is_some() {
+                            Err(FaucetError::Sink("rejected".into()))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .collect())
+            }
+            fn supports_cleanup(&self) -> bool {
+                true
+            }
+            async fn cleanup_scope(
+                &self,
+                _scope: &std::collections::BTreeMap<String, Value>,
+                _seen: &faucet_core::cleanup::SeenKeys,
+            ) -> Result<u64, FaucetError> {
+                Ok(3)
+            }
+            fn is_overwrite(&self) -> bool {
+                true
+            }
+            fn write_batch_is_replay_safe(&self) -> bool {
+                true
+            }
+            fn supports_rollback(&self) -> bool {
+                true
+            }
+            fn readback_source(&self) -> Option<(String, Value)> {
+                Some(("sqlite".into(), json!({})))
+            }
+            async fn complete_run(&self) -> Result<(), FaucetError> {
+                self.completed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn set_roundtrip_recorder(
+                &self,
+                _recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+            ) {
+                self.recorder_set.store(true, Ordering::SeqCst);
+            }
+            fn config_schema(&self) -> Value {
+                json!({"spy": true})
+            }
+        }
+
+        async fn assert_forwards(sink: &dyn Sink, completed: &AtomicBool, recorder: &AtomicBool) {
+            assert!(sink.is_overwrite());
+            assert!(sink.supports_cleanup());
+            assert!(sink.write_batch_is_replay_safe());
+            assert!(sink.supports_rollback());
+            assert!(sink.readback_source().is_some());
+            assert_eq!(sink.config_schema(), json!({"spy": true}));
+            let seen = faucet_core::cleanup::SeenKeys::default();
+            assert_eq!(
+                sink.cleanup_scope(&Default::default(), &seen)
+                    .await
+                    .unwrap(),
+                3
+            );
+            sink.complete_run().await.unwrap();
+            assert!(completed.load(Ordering::SeqCst));
+            sink.set_roundtrip_recorder(std::sync::Arc::new(
+                faucet_core::observability::RoundtripRecorder::new(
+                    faucet_core::observability::RoundtripSide::Sink,
+                    "p",
+                    "r",
+                    "spy",
+                ),
+            ));
+            assert!(recorder.load(Ordering::SeqCst));
+            let out = sink
+                .write_batch_partial(&[json!({"id": 1}), json!({"bad": 1}), json!({"id": 3})])
+                .await
+                .unwrap();
+            assert_eq!(out.iter().filter(|o| o.is_err()).count(), 1);
+            assert!(
+                out[1].is_err(),
+                "the bad row reaches the DLQ, not a page failure"
+            );
+        }
+
+        #[tokio::test]
+        async fn capturing_sink_forwards_and_captures_only_accepted_rows() {
+            let spy = Spy::default();
+            let (completed, recorder) = (spy.completed.clone(), spy.recorder_set.clone());
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let sink =
+                CapturingSink::wrap(Box::new(spy), captured.clone(), Arc::new(Projection::Full));
+            assert_forwards(&sink, &completed, &recorder).await;
+            let got = captured.lock().await.clone();
+            assert_eq!(got, vec![json!({"id": 1}), json!({"id": 3})]);
+        }
+
+        #[tokio::test]
+        async fn limited_sink_forwards_and_caps_accepted_rows() {
+            let spy = Spy::default();
+            let (completed, recorder) = (spy.completed.clone(), spy.recorder_set.clone());
+            let sink = LimitedSink::wrap(Box::new(spy), 10);
+            assert_forwards(&sink, &completed, &recorder).await;
+            let capped = LimitedSink::wrap(Box::new(Spy::default()), 1);
+            let out = capped
+                .write_batch_partial(&[json!({"id": 1}), json!({"id": 2})])
+                .await
+                .unwrap();
+            assert_eq!(out.len(), 2);
+            assert!(
+                capped
+                    .write_batch_partial(&[json!({"id": 3})])
+                    .await
+                    .unwrap()[0]
+                    .is_ok()
+            );
+            assert_eq!(capped.remaining.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
