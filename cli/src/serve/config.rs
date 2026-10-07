@@ -838,6 +838,17 @@ mod tests {
     }
 
     #[test]
+    fn the_history_url_can_come_from_the_environment() {
+        use clap::Parser;
+        // #789 SUPPLY-07: a DSN with a password stays out of `ps` by
+        // arriving as FAUCET_SERVE_HISTORY.
+        unsafe { std::env::set_var("FAUCET_SERVE_HISTORY", "sqlite:/tmp/from-env.db") };
+        let args = crate::cli::ServeArgs::try_parse_from(["serve", "--no-auth"]).unwrap();
+        unsafe { std::env::remove_var("FAUCET_SERVE_HISTORY") };
+        assert_eq!(args.history.as_deref(), Some("sqlite:/tmp/from-env.db"));
+    }
+
+    #[test]
     fn cluster_disabled_by_default() {
         let mut a = base_args();
         a.no_auth = true;

@@ -137,10 +137,14 @@ serve:
   # Run-history backend: "memory" | "sqlite" | "postgres"
   history:
     backend: memory
-    # sqlite: path on a mounted volume (see persistence). postgres: DSN or
-    # leave url empty and set it via env (FAUCET-style ${env:...} not applied
-    # here — pass a literal or use existingSecret env).
+    # sqlite: defaults to a file on the mounted volume (see persistence).
+    # postgres: a DSN. The URL reaches the pod as FAUCET_SERVE_HISTORY, never
+    # on the command line; a postgres DSN is stored in a chart-managed Secret.
     url: ""
+    # Or read the URL from your own Secret (recommended for postgres, so the
+    # password never sits in Helm values).
+    existingSecret: ""
+    existingSecretKey: FAUCET_SERVE_HISTORY
 
   # Enable the embedded web console (image must include the serve-ui feature).
   ui:
