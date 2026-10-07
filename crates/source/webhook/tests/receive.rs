@@ -2,7 +2,7 @@
 //! window-close refusal, driven over real HTTP.
 
 use faucet_core::Source;
-use faucet_source_webhook::{WebhookSignature, WebhookSource, WebhookSourceConfig};
+use faucet_source_webhook::{WebhookSource, WebhookSourceConfig};
 use hmac::{Mac, digest::KeyInit};
 use serde_json::{Value, json};
 use std::collections::HashMap;

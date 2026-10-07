@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn decompression_is_capped() {
-        let data = vec![7u8; 64];
+        let data = [7u8; 64];
         assert_eq!(read_capped(&data[..], 64, "gunzip").unwrap().len(), 64);
         let err = read_capped(&data[..], 63, "gunzip").unwrap_err();
         assert!(err.to_string().contains("exceeds 63 bytes"), "{err}");
