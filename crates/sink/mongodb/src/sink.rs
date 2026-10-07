@@ -776,7 +776,8 @@ impl faucet_core::Sink for MongoSink {
 
     /// Drop any leftover staging collection, then recreate it with the
     /// destination's collection options (validator, collation, capped, …) and
-    /// secondary indexes, so the swap in [`commit_overwrite`] keeps them. With
+    /// secondary indexes, so the swap in
+    /// [`commit_overwrite`](faucet_core::Sink::commit_overwrite) keeps them. With
     /// no destination yet the first `insert_many` creates staging.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         let db = self.client.database(&self.config.database);

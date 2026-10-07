@@ -636,6 +636,7 @@ pipeline:
     type: jsonl
     config:
       path: ./out.jsonl
+      append: true
 "#;
 
     #[test]
@@ -782,7 +783,7 @@ mod run_tests {
         std::fs::write(
             &cfg,
             format!(
-                "version: 1\nname: conn\npipeline:\n  source:\n    type: sqlite\n    config:\n      database_url: 'sqlite://{db}'\n      query: SELECT 1\n  sink:\n    type: jsonl\n    config: {{ path: ./out.jsonl }}\n"
+                "version: 1\nname: conn\npipeline:\n  source:\n    type: sqlite\n    config:\n      database_url: 'sqlite://{db}'\n      query: SELECT 1\n  sink:\n    type: jsonl\n    config: {{ path: ./out.jsonl, append: true }}\n"
             ),
         )
         .unwrap();
@@ -812,7 +813,7 @@ mod run_tests {
         let cfg = dir.path().join("conn.yaml");
         std::fs::write(
             &cfg,
-            "version: 1\npipeline:\n  source: { type: csv, config: { path: ./in.csv } }\n  sink: { type: jsonl, config: { path: ./o.jsonl } }\n",
+            "version: 1\npipeline:\n  source: { type: csv, config: { path: ./in.csv } }\n  sink: { type: jsonl, config: { path: ./o.jsonl, append: true } }\n",
         )
         .unwrap();
         let err = run(args(cfg)).await.unwrap_err();

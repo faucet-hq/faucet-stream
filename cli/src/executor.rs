@@ -5075,7 +5075,7 @@ matrix:
             r#"version: 1
 pipeline:
   source: {{ type: csv, config: {{ path: {good} }} }}
-  sink:   {{ type: jsonl, config: {{ path: {out} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}, append: true }} }}
 matrix:
   - id: stage
     source: {{ config: {{ path: {missing} }} }}
@@ -5405,7 +5405,7 @@ matrix:
             r#"version: 1
 pipeline:
   source: {{ type: csv, config: {{ path: {good_csv} }} }}
-  sink:   {{ type: jsonl, config: {{ path: {bad_dir} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {bad_dir}, append: true }} }}
 matrix:
   - id: bad
   - id: good_a

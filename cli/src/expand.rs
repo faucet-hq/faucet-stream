@@ -2659,7 +2659,7 @@ matrix:
     fn depends_on_is_recorded_and_deduped() {
         let c = cfg(r#"
 version: 1
-pipeline: { source: { type: rest, config: {} }, sink: { type: jsonl, config: { path: ./o } } }
+pipeline: { source: { type: rest, config: {} }, sink: { type: jsonl, config: { path: ./o, append: true } } }
 matrix:
   - { id: dims }
   - { id: staging }
@@ -3409,7 +3409,7 @@ matrix:
 version: 1
 pipeline:
   source: { type: rest, config: {} }
-  sink:   { type: jsonl, config: { path: ./o.jsonl } }
+  sink:   { type: jsonl, config: { path: ./o.jsonl, append: true } }
   dlq:
     sink: { type: jsonl, config: { path: ./base.jsonl } }
 matrix:
@@ -4401,7 +4401,7 @@ mod partition_tests {
 
     fn doc(partition: &str, source: &str) -> String {
         format!(
-            "version: 1\nname: p\npipeline:\n  source:{source}\n  sink:\n    type: jsonl\n    config:\n      path: ./out.jsonl\n{partition}"
+            "version: 1\nname: p\npipeline:\n  source:{source}\n  sink:\n    type: jsonl\n    config:\n      path: ./out-${{partition.index}}.jsonl\n{partition}"
         )
     }
 

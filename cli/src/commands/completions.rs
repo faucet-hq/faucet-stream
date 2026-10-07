@@ -192,7 +192,7 @@ version: 1
 name: demo
 pipeline:
   source: { type: rest, config: { url: "https://example.com" } }
-  sink: { type: jsonl, config: { path: out.jsonl } }
+  sink: { type: jsonl, config: { path: out.jsonl, append: true } }
 matrix:
   - id: alpha
     tags: [daily, us]

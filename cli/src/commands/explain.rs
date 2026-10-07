@@ -339,7 +339,7 @@ version: 1
 name: demo
 pipeline:
   source: { type: rest, config: { path: /events } }
-  sink: { type: jsonl, config: { path: out.jsonl } }
+  sink: { type: jsonl, config: { path: out.jsonl, append: true } }
   transforms:
     - { type: flatten }
 "#,
@@ -411,7 +411,7 @@ matrix:
     #[test]
     fn large_matrix_summarizes_without_rows_flag() {
         let mut yaml = String::from(
-            "version: 1\nname: big\npipeline:\n  source: { type: rest, config: {} }\n  sink: { type: jsonl, config: { path: o } }\nmatrix:\n",
+            "version: 1\nname: big\npipeline:\n  source: { type: rest, config: {} }\n  sink: { type: jsonl, config: { path: o, append: true } }\nmatrix:\n",
         );
         for i in 0..20 {
             yaml.push_str(&format!("  - id: r{i}\n"));
@@ -431,12 +431,12 @@ version: 1
 name: j
 pipeline:
   source: { type: rest, config: { path: /x } }
-  sink: { type: jsonl, config: { path: o } }
+  sink: { type: jsonl, config: { path: o, append: true } }
 "#,
         );
         let a = serde_json::to_string(&r).unwrap();
         let b = serde_json::to_string(&explain_yaml(
-            "version: 1\nname: j\npipeline:\n  source: { type: rest, config: { path: /x } }\n  sink: { type: jsonl, config: { path: o } }\n",
+            "version: 1\nname: j\npipeline:\n  source: { type: rest, config: { path: /x } }\n  sink: { type: jsonl, config: { path: o, append: true } }\n",
         ))
         .unwrap();
         assert_eq!(a, b);
@@ -462,7 +462,7 @@ pipeline:
         }
     }
 
-    const CFG: &str = "version: 1\nname: demo\npipeline:\n  source: { type: rest, config: { path: /x } }\n  sink: { type: jsonl, config: { path: o } }\n";
+    const CFG: &str = "version: 1\nname: demo\npipeline:\n  source: { type: rest, config: { path: /x } }\n  sink: { type: jsonl, config: { path: o, append: true } }\n";
 
     #[tokio::test]
     async fn run_prose_succeeds() {
@@ -479,7 +479,7 @@ pipeline:
     #[tokio::test]
     async fn run_prose_all_rows_on_a_matrix() {
         // A matrix config exercises the `--rows` (narrate every row) path.
-        let cfg = "version: 1\nname: m\nmatrix:\n  - { id: a }\n  - { id: b }\npipeline:\n  source: { type: rest, config: { path: /x } }\n  sink: { type: jsonl, config: { path: o } }\n";
+        let cfg = "version: 1\nname: m\nmatrix:\n  - { id: a }\n  - { id: b }\npipeline:\n  source: { type: rest, config: { path: /x } }\n  sink: { type: jsonl, config: { path: o, append: true } }\n";
         let (_d, path) = write_cfg(cfg);
         run(args(path, false, true)).await.expect("matrix prose ok");
     }
