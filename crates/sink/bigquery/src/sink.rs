@@ -2444,7 +2444,7 @@ impl faucet_core::Sink for BigQuerySink {
                 idempotent::build_scoped_overwrite_commit_sql(
                     &self.table_ref(),
                     &temp,
-                    &scope.render_where_literal(&col),
+                    &scope.render_where_with(&col, idempotent::sql_literal),
                 )
             }
             None => idempotent::build_overwrite_commit_sql(&self.table_ref(), &temp),

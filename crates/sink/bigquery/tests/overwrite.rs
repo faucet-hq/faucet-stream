@@ -279,6 +279,36 @@ async fn scoped_overwrite_commit_deletes_in_window_not_truncate() {
 }
 
 #[tokio::test]
+async fn scoped_overwrite_bound_with_backslash_quote_stays_inside_the_literal() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_and_job(&server, "job-s").await;
+    mount_staging_present(&server).await;
+
+    let mut config = config_overwrite();
+    config.scope = Some(OverwriteScope::Window {
+        column: "posting_date".into(),
+        from: json!("x\\' OR TRUE;--"),
+        to: json!("z"),
+    });
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("write");
+    sink.commit_overwrite().await.expect("commit");
+
+    let qs = queries(&server).await;
+    assert!(
+        qs.iter()
+            .any(|q| q
+                .contains(r"WHERE `posting_date` >= 'x\\\' OR TRUE;--' AND `posting_date` < 'z'")),
+        "bound escaped GoogleSQL-style: {qs:?}"
+    );
+}
+
+#[tokio::test]
 async fn overwrite_abort_drops_staging_without_swap() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;

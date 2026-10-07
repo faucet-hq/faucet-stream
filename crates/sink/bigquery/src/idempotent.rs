@@ -119,6 +119,18 @@ pub(crate) fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+/// A JSON scalar as a GoogleSQL literal: strings through [`sql_str`] (so a
+/// backslash cannot escape the closing quote), numbers and booleans verbatim,
+/// anything else `NULL`.
+pub(crate) fn sql_literal(v: &Value) -> String {
+    match v {
+        Value::String(s) => sql_str(s),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => "NULL".to_owned(),
+    }
+}
+
 /// Backtick-quoted identifier, with backslash and backtick **escaped** — the
 /// representation BigQuery's quoted-identifier grammar defines.
 ///
@@ -863,6 +875,19 @@ mod tests {
         );
         assert!(a.ends_with("_00000000000000000007"), "got: {a}");
         assert_ne!(a, build_request_id("pipe::row2", "00000000000000000007"));
+    }
+
+    #[test]
+    fn sql_literal_keeps_a_backslash_quote_bound_inside_the_literal() {
+        let scope = faucet_core::OverwriteScope::Window {
+            column: "d".into(),
+            from: json!("x\\' OR TRUE;--"),
+            to: json!(10),
+        };
+        let whr = scope.render_where_with("`d`", sql_literal);
+        assert_eq!(whr, r"`d` >= 'x\\\' OR TRUE;--' AND `d` < 10");
+        assert_eq!(sql_literal(&json!(true)), "true");
+        assert_eq!(sql_literal(&Value::Null), "NULL");
     }
 
     #[test]
