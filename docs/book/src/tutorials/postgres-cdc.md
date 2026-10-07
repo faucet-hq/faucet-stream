@@ -63,14 +63,18 @@ The state key is `postgres-cdc:<slot>`. Use a durable backend (`redis` /
 
 ## Slot lifecycle
 
-- `slot_type: temporary` drops the slot when the connection closes — good for
-  experiments. `permanent` (the default) keeps it, which retains WAL until you
-  drop it.
+- Only `slot_type: permanent` (the default) works; it retains WAL until you
+  drop it. `temporary` is refused at config load — a temporary slot is dropped
+  with the session that creates it, before replication starts. For an
+  experiment, use a permanent slot and drop it afterwards.
+- `tcp_keepalive` is accepted but has no effect: a dead replication connection
+  is detected through `status_update_interval` and the server's
+  `wal_sender_timeout`.
 - Free an abandoned slot's WAL with `PostgresCdcSource::drop_slot()` (library)
   or by dropping the replication slot in Postgres.
-- `tls: disable | require | verify_ca | verify_full` configures the replication
-  connection (default `disable` = plaintext; use `verify_full` over untrusted
-  networks).
+- `tls.mode: from_url | disable | require | verify_ca | verify_full` configures
+  the replication connection and the `faucet doctor` probe (default `from_url`:
+  the URL's `sslmode`; use `verify_full` over untrusted networks).
 
 ## See also
 

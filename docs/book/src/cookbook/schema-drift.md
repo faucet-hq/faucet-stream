@@ -97,7 +97,11 @@ pipeline:
 ### `evolve`
 
 Apply additive/widening DDL to the destination — `ADD COLUMN` for additions,
-type widening for widenings — then write the page through. Any incompatible
+type widening for widenings — then write the page through. An integer column
+that starts receiving fractions widens to an **exact** decimal type — `numeric`
+on Postgres, `DECIMAL(65,30)` on MySQL — never to a double, so stored values
+above 2^53 keep every digit (a MySQL `AUTO_INCREMENT` column cannot become
+`DECIMAL`, so widening one fails with a schema-drift error). Any incompatible
 residue is handled by `on_incompatible`. This is the mode that keeps a mirror in
 lockstep with a changing source without manual `ALTER TABLE`s.
 

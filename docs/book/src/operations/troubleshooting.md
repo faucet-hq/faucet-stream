@@ -40,8 +40,11 @@ sure those are installed in your build environment (CI installs
 A CDC replication slot retains WAL until a run advances the bookmark. If you
 created a permanent slot and stopped running the pipeline, Postgres keeps WAL
 forever. Either run the pipeline regularly, drop the slot
-(`PostgresCdcSource::drop_slot()` or `SELECT pg_drop_replication_slot(...)`), or
-use `slot_type: temporary` for experiments. See the
+(`PostgresCdcSource::drop_slot()` or `SELECT pg_drop_replication_slot(...)`)
+when you are done with it. (`slot_type: temporary` is refused at config load: a
+temporary slot is dropped with the session that creates it, before replication
+starts.) A postgres-cdc row also needs a `state:` block — without one the slot
+never advances and every run replays from its start. See the
 [CDC tutorial](../tutorials/postgres-cdc.md).
 
 ## Some records failed but I don't want the run to abort
