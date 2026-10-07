@@ -196,9 +196,10 @@ async fn page_number_pagination_walks_pages_until_empty() {
 }
 
 #[tokio::test]
-async fn page_number_pagination_stops_on_short_page() {
+async fn page_number_pagination_continues_past_a_short_page_until_empty() {
     let server = MockServer::start().await;
-    // page_size=3: first page full (3), second page short (1) -> stop.
+    // page_size=3 but the server clamps: page 2 is short (1), yet only the
+    // empty page 3 ends paging (API-15).
     Mock::given(method("GET"))
         .and(path("/feed.xml"))
         .and(query_param("page", "1"))
@@ -230,14 +231,30 @@ async fn page_number_pagination_stops_on_short_page() {
             page_size: Some(3),
             page_size_param: Some("size".into()),
         });
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .and(query_param("page", "3"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/xml")
+                .set_body_string(items_doc(4, 0)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let records = XmlStream::new(config).fetch_all().await.unwrap();
-    assert_eq!(records.len(), 4, "3 full + 1 short page, then stop");
+    assert_eq!(
+        records.len(),
+        4,
+        "3 full + 1 short page, then the empty page stops"
+    );
 }
 
 #[tokio::test]
-async fn offset_pagination_walks_until_short_page() {
+async fn offset_pagination_walks_until_an_empty_page() {
     let server = MockServer::start().await;
-    // limit=2: offset 0 -> 2, offset 2 -> 2, offset 4 -> 1 (short) -> stop.
+    // limit=2: offset 0 -> 2, 2 -> 2, 4 -> 1 (short), 5 -> 0 (empty) -> stop.
+    // A short page alone does not end paging: the server may clamp `limit`.
     Mock::given(method("GET"))
         .and(path("/feed.xml"))
         .and(query_param("offset", "0"))
@@ -279,6 +296,17 @@ async fn offset_pagination_walks_until_short_page() {
             limit_param: "limit".into(),
             limit: 2,
         });
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .and(query_param("offset", "5"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/xml")
+                .set_body_string(items_doc(5, 0)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let records = XmlStream::new(config).fetch_all().await.unwrap();
     assert_eq!(records.len(), 5);
     assert_eq!(records[4]["id"], "4");

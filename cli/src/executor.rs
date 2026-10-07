@@ -1223,7 +1223,33 @@ fn inject_singer_defaults(
         );
     }
     map.entry("_activate_version")
-        .or_insert_with(|| Value::from(clock.timestamp_millis()));
+        .or_insert_with(|| Value::from(activate_version_for(clock.timestamp_millis())));
+}
+
+/// The Singer `ACTIVATE_VERSION` for a run whose clock is `clock_ms`: never
+/// below the wall clock at the run's first sink, so rerunning with a past
+/// `--clock` (a backfill unit, an old schedule tick) still activates a version
+/// newer than the live one (API-59). Memoised per clock value, so every sink
+/// instance of one run — the writers and the overwrite-lifecycle sink —
+/// agrees on it.
+fn activate_version_for(clock_ms: i64) -> i64 {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    static VERSIONS: OnceLock<Mutex<BTreeMap<i64, i64>>> = OnceLock::new();
+    let wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(clock_ms);
+    let mut versions = VERSIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if versions.len() >= 4096
+        && let Some(oldest) = versions.keys().next().copied()
+    {
+        versions.remove(&oldest);
+    }
+    *versions.entry(clock_ms).or_insert(clock_ms.max(wall_ms))
 }
 
 /// Whether a node's sink is configured for `write_mode: overwrite`. The write
@@ -4355,7 +4381,15 @@ mod tests {
         let mut cfg = single[0].sink.config.clone();
         inject_singer_defaults(&single[0], "people", clock, &mut cfg);
         assert_eq!(cfg["stream"], json!("people"));
-        assert_eq!(cfg["_activate_version"], json!(clock.timestamp_millis()));
+        // A past clock activates a version at or after now, the same for
+        // every sink instance of the run (API-59).
+        let version = cfg["_activate_version"].as_i64().unwrap();
+        assert!(version >= chrono::Utc::now().timestamp_millis() - 60_000);
+        let mut again = single[0].sink.config.clone();
+        inject_singer_defaults(&single[0], "people", clock, &mut again);
+        assert_eq!(again["_activate_version"], json!(version));
+        let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
+        assert_eq!(activate_version_for(future), future);
         assert!(cfg.get("schema").is_none());
 
         let mut cfg = single[0].sink.config.clone();

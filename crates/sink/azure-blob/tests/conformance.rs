@@ -135,6 +135,10 @@ async fn conformance_connector_name_nonempty() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_capabilities_truthful() {
     let Some((_c, port)) = start_azurite().await else {
+        assert!(
+            std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+            "Docker unavailable and FAUCET_REQUIRE_BACKENDS is set"
+        );
         eprintln!("skipping azure-blob conformance_capabilities_truthful: Docker unavailable");
         return;
     };

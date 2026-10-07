@@ -43,13 +43,14 @@ Singer **target** as a faucet sink; the protocol types both share live in
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `executable` | string | — (required) | Tap binary on `PATH` or an absolute path |
-| `stream` | string | — (required) | The single stream to emit |
+| `stream` | string | — (required) | The single stream to emit. RECORDs match it or, with a `catalog`, the entry's other name (`stream` ↔ `tap_stream_id`). RECORDs for other streams are dropped with one warning per stream; if the tap emits RECORDs only for other streams, the run fails at the first STATE instead of checkpointing past rows it never delivered |
 | `args` | string[] | `[]` | Extra args appended after faucet's `--config`/`--catalog`/`--state` |
 | `tap_config` | object | `{}` | The tap's config (secret-resolved by faucet; written to a private temp file) |
 | `catalog` | object | — | Singer catalog, passed as `--catalog` |
 | `state_key` | string | `singer:{executable}:{stream}` | State-store key for the resume bookmark |
 | `flush_on_state` | bool | `true` | Flush a page (and checkpoint) on every STATE message |
-| `idle_timeout_secs` | int | — | Abort if no output arrives within this many seconds |
+| `idle_timeout_secs` | int / null | `3600` | Abort if no output arrives within this many seconds (`null` waits forever). Also bounds `--discover` |
+| `max_line_bytes` | int | `67108864` (64 MiB) | Longest tap output line accepted; a longer one fails the run instead of exhausting memory |
 | `on_malformed` | `skip` \| `fail` | `skip` | What to do with a non-Singer output line |
 | `inherit_env` | bool \| string[] | `true` | Which of faucet's environment variables the tap sees — see [Environment](#environment--inherit_env) |
 

@@ -674,3 +674,41 @@ async fn discovery_recipe_list_non_json_body_is_a_typed_error() {
     let err = stream.discover().await.expect_err("non-JSON must surface");
     assert!(err.to_string().contains("invalid JSON"), "{err}");
 }
+
+/// API-56: a paginated listing used to contribute only its first page.
+#[tokio::test]
+async fn discovery_recipe_follows_list_pages() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/objects"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"name": "c"}], "next": null
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/objects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"name": "b"}, {"name": "a"}], "next": "/objects?page=2"
+        })))
+        .mount(&server)
+        .await;
+    let stream = RestStream::new(recipe_config(
+        &server,
+        json!({
+            "list": { "get": "/objects", "items": "$.items[*]", "name": "$.name", "next": "$.next" },
+            "emit": { "config": { "path": "/${name}" } }
+        }),
+    ))
+    .unwrap();
+    let names: Vec<String> = stream
+        .discover()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(names, vec!["a", "b", "c"]);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}

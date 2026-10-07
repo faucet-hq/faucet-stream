@@ -18,7 +18,7 @@ categories.workspace = true
 mtls = ["reqwest/native-tls"]
 # Excel (XLSX) parsing in the response-decode pipeline (#540). Pulls `calamine`.
 # CSV/gzip/zip/base64 decode are always available; only XLSX needs this feature.
-excel = ["dep:calamine"]
+excel = ["dep:calamine", "dep:chrono"]
 
 [dependencies]
 faucet-core.workspace = true
@@ -29,7 +29,7 @@ async-trait.workspace = true
 async-stream.workspace = true
 futures.workspace = true
 tracing.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 reqwest.workspace = true
 quick-xml.workspace = true
 # Response-decode pipeline (#540): base64 → gunzip/unzip → parse csv/xlsx.
@@ -39,6 +39,7 @@ flate2 = { workspace = true }
 zip = { workspace = true }
 csv-async = { workspace = true }
 calamine = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 
 [dev-dependencies]
 faucet-conformance.workspace = true

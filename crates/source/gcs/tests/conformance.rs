@@ -40,7 +40,7 @@ async fn conformance_connector_name_nonempty() {
 
 /// Spawn `fake-gcs-server` and return `(host_url, bucket_name)`.
 /// Returns `None` when Docker is unavailable so tests skip cleanly.
-async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {
+async fn spawn_fake_gcs_inner() -> Option<(ContainerAsync<GenericImage>, String, String)> {
     let image = GenericImage::new("fsouza/fake-gcs-server", "latest")
         .with_exposed_port(4443.tcp())
         .with_wait_for(WaitFor::message_on_stderr("server started at"))
@@ -213,4 +213,15 @@ async fn conformance_errors_not_panics() {
         .with_batch_size(250);
     let source = GcsSource::new(config).await.expect("source builds lazily");
     assert_errors_not_panics(&source).await;
+}
+
+/// [`spawn_fake_gcs_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
+/// is set — CI provides Docker, so an unavailable backend is a failure there.
+async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {
+    let started = spawn_fake_gcs_inner().await;
+    assert!(
+        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+        "spawn_fake_gcs: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
+    );
+    started
 }

@@ -428,3 +428,59 @@ async fn full_table_jsonl_job_without_routing_passes_rows_through() {
     assert_eq!(records.len(), 3);
     assert!(records[0].get("_stream").is_none());
 }
+
+/// Serve one chunked JSONL body whose lines arrive `gap` apart, over raw TCP
+/// (wiremock cannot pace a body).
+async fn slow_jsonl_server(lines: usize, gap: std::time::Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/jsonl\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        for i in 0..lines {
+            let line = format!("{{\"id\":\"gid://example/Order/{i}\"}}\n");
+            sock.write_all(format!("{:x}\r\n{line}\r\n", line.len()).as_bytes())
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(gap).await;
+        }
+        sock.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+    format!("http://{addr}/bulk.jsonl")
+}
+
+/// API-24: `timeout` bounded the whole streamed download, so a bulk result
+/// taking longer than it to consume failed partway. It now bounds connect and
+/// each idle read only.
+#[tokio::test]
+async fn a_streamed_result_may_take_longer_than_timeout_while_it_keeps_flowing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/api/graphql.json"))
+        .and(body_string_contains("bulkOperationRunQuery"))
+        .respond_with(submit_ok())
+        .mount(&server)
+        .await;
+    let url = slow_jsonl_server(5, std::time::Duration::from_millis(400)).await;
+    mount_poll(&server, 0, completed(json!(url))).await;
+    let mut cfg = bulk_config(&server, json!({ "timeout": 1 }));
+    cfg.replication_method = faucet_core::ReplicationMethod::FullTable;
+    cfg.records_route = None;
+    let job = cfg.async_job.as_mut().unwrap();
+    job.incremental = None;
+    job.submit.json = Some(
+        json!({ "query": "mutation { bulkOperationRunQuery(query: \"{ orders { edges { node { id } } } }\") { bulkOperation { id } } }" }),
+    );
+    cfg.validate().unwrap();
+    let pages = collect(&RestStream::new(cfg).unwrap(), 1000).await.unwrap();
+    let records: Vec<Value> = pages.into_iter().flat_map(|p| p.records).collect();
+    assert_eq!(records.len(), 5);
+}

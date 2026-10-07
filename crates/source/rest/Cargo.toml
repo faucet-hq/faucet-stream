@@ -50,6 +50,7 @@ excel = ["dep:calamine"]
 arrow = ["faucet-core/arrow", "dep:arrow"]
 
 [dependencies]
+urlencoding = { workspace = true }
 arrow = { workspace = true, optional = true }
 faucet-core.workspace = true
 # `stream` for `Response::bytes_stream()` — the native byte-passthrough path (#633)
@@ -69,7 +70,7 @@ zip = { workspace = true }  # unzip decode step (#515)
 csv-async = { workspace = true }
 calamine = { workspace = true, optional = true }
 chrono = { workspace = true }  # datetime window slicing (#527): now-clock + RFC3339 boundaries
-tokio = { version = "1", features = ["time", "sync"] }
+tokio = { version = "1", features = ["time", "sync", "rt"] }
 base64 = "0.22"
 httpdate = "1"
 tracing.workspace = true

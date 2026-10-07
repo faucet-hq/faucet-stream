@@ -53,7 +53,7 @@ fn conformance_connector_name_nonempty() {
 /// Start an `atmoz/sftp` container with user `faucet:faucetpass` and a writable
 /// `upload` directory. Returns the container handle and mapped port, or `None`
 /// when Docker is unavailable so the test skips cleanly.
-async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
+async fn start_sftp_inner() -> Option<(ContainerAsync<GenericImage>, u16)> {
     let image = GenericImage::new("atmoz/sftp", "latest")
         .with_exposed_port(22.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
@@ -146,4 +146,15 @@ async fn conformance_errors_not_panics() {
     let source =
         SftpSource::new(SftpSourceConfig::new(conn, "/data")).expect("source builds lazily");
     assert_errors_not_panics(&source).await;
+}
+
+/// [`start_sftp_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
+/// is set — CI provides Docker, so an unavailable backend is a failure there.
+async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    let started = start_sftp_inner().await;
+    assert!(
+        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+        "start_sftp: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
+    );
+    started
 }

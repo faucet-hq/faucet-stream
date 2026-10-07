@@ -12,7 +12,6 @@ use std::time::Duration;
 /// Use a `Vec<MetadataEntry>` rather than a map because gRPC allows duplicate
 /// keys and order is occasionally observable.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(extend("x-faucet-aliases" = ["max_reconnect_attempts"]))]
 #[serde(deny_unknown_fields)]
 pub struct MetadataEntry {
     /// Metadata key. gRPC lowercases keys on the wire; a `-bin` suffix marks a
@@ -66,6 +65,7 @@ pub enum RpcKind {
 
 /// Configuration for the gRPC source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-faucet-aliases" = ["max_reconnect_attempts"]))]
 #[serde(deny_unknown_fields)]
 pub struct GrpcStreamConfig {
     /// gRPC endpoint URL (e.g. `"http://localhost:50051"`).
@@ -694,5 +694,17 @@ mod debug_redaction_tests {
         .unwrap();
         let dbg = format!("{v:?}");
         assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+    }
+
+    #[test]
+    fn the_reconnect_alias_is_declared_on_the_root_schema() {
+        // API-48: the CLI unknown-key check reads aliases from the root only.
+        let schema = serde_json::to_value(schemars::schema_for!(GrpcStreamConfig)).unwrap();
+        assert_eq!(
+            schema["x-faucet-aliases"],
+            serde_json::json!(["max_reconnect_attempts"])
+        );
+        let metadata = serde_json::to_value(schemars::schema_for!(MetadataEntry)).unwrap();
+        assert!(metadata.get("x-faucet-aliases").is_none());
     }
 }

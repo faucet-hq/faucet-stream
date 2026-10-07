@@ -10,6 +10,10 @@
 #[ignore = "requires a live Vault (set VAULT_TEST=1 and run with --ignored)"]
 async fn resolves_vault_secret_end_to_end() {
     if std::env::var("VAULT_TEST").as_deref() != Ok("1") {
+        assert!(
+            std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+            "VAULT_TEST is unset and FAUCET_REQUIRE_BACKENDS is set"
+        );
         return;
     }
     use faucet_cli::config::PipelineConfig;

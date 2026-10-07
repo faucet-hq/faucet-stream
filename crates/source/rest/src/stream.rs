@@ -32,6 +32,9 @@ use tokio::sync::Mutex as AsyncMutex;
 pub struct RestStream {
     config: RestStreamConfig,
     client: Client,
+    /// Client for streamed result downloads: `timeout` bounds connect and each
+    /// idle read, not the whole body.
+    stream_client: Client,
     /// Shared OAuth2 token cache (only used when `config.auth` is `Auth::OAuth2`).
     token_cache: TokenCache,
     /// Shared token endpoint cache (only used when `config.auth` is `Auth::TokenEndpoint`).
@@ -124,6 +127,12 @@ const POLL_BACKOFF_BASE_SECS: u64 = 1;
 /// large current delay never overflows.
 fn next_poll_delay(current: Duration, cap: Duration) -> Duration {
     std::cmp::min(current.saturating_mul(2), cap)
+}
+
+/// The poll-delay ceiling: `interval_secs`, but never below one second — a zero
+/// cadence would hammer the status endpoint back-to-back (API-55).
+fn poll_cap(interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs.max(POLL_BACKOFF_BASE_SECS))
 }
 
 /// Attach a mutual-TLS client identity (from [`TlsClientConfig`]) to the HTTP
@@ -425,11 +434,46 @@ fn inject_sql_predicate(query: &str, predicate: &str) -> String {
 fn sql_literal(v: &Value) -> String {
     match v {
         Value::String(s) if is_sql_datetime(s) => s.clone(),
+        Value::String(s) if let Some(t) = offset_datetime_as_rfc3339(s) => t,
         Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         other => format!("'{}'", other.to_string().replace('\'', "\\'")),
     }
+}
+
+/// Fill `{key}` placeholders in a URL path with percent-encoded values, so a
+/// parent value containing `/`, `?` or `#` stays inside its segment (API-58).
+/// A value that is exactly `.` or `..` is refused: URL parsing would resolve it
+/// as a dot-segment even encoded.
+fn substitute_path(template: &str, ctx: &HashMap<String, Value>) -> Result<String, FaucetError> {
+    let mut encoded = HashMap::with_capacity(ctx.len());
+    for (k, v) in ctx {
+        let raw = match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if template.contains(&format!("{{{k}}}")) && (raw == "." || raw == "..") {
+            return Err(FaucetError::Source(format!(
+                "rest: path placeholder `{{{k}}}` resolved to `{raw}`, which would change the \
+                 request path"
+            )));
+        }
+        encoded.insert(
+            k.clone(),
+            Value::String(urlencoding::encode(&raw).into_owned()),
+        );
+    }
+    Ok(faucet_core::util::substitute_context(template, &encoded))
+}
+
+/// A timestamp with a colon-less UTC offset (`2026-08-28T12:00:00.000+0000`,
+/// the shape many record payloads carry) rendered as RFC 3339, so a bookmark a
+/// sync-routed run persisted is emitted as a datetime literal (API-57).
+fn offset_datetime_as_rfc3339(s: &str) -> Option<String> {
+    chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z")
+        .ok()
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
 }
 
 /// Whether a string is a datetime/date literal (RFC3339 or `YYYY-MM-DD`).
@@ -497,21 +541,30 @@ impl RestStream {
             )));
         }
 
-        let mut builder = Client::builder();
         // Transparently request + decode gzip/brotli/deflate so large JSON APIs
         // (e.g. D365 F&O OData, which compresses ~5-10x) ship compressed bytes
         // instead of raw JSON. reqwest sets the `Accept-Encoding` header and
-        // decompresses the body automatically.
-        builder = builder.gzip(true).brotli(true).deflate(true);
-        if let Some(t) = config.timeout {
-            builder = builder.timeout(t);
-        }
-        // Mutual TLS: attach a client certificate/identity to the shared client
-        // so it is presented on every request — data pages AND any inline auth
-        // token request (both use `self.client`).
+        // decompresses the body automatically. Mutual TLS: the client
+        // certificate is presented on every request — data pages AND any
+        // inline auth token request.
         if let Some(tls) = &config.tls {
             tls.validate()?;
-            builder = apply_client_tls(builder, tls)?;
+        }
+        let new_builder = || -> Result<reqwest::ClientBuilder, FaucetError> {
+            let builder = Client::builder().gzip(true).brotli(true).deflate(true);
+            match &config.tls {
+                Some(tls) => apply_client_tls(builder, tls),
+                None => Ok(builder),
+            }
+        };
+        let mut builder = new_builder()?;
+        // The streaming client bounds connect and each idle read by `timeout`
+        // rather than the whole body, so a multi-GB result download (and sink
+        // back-pressure while consuming it) is not cut at `timeout` (API-24).
+        let mut stream_builder = new_builder()?;
+        if let Some(t) = config.timeout {
+            builder = builder.timeout(t);
+            stream_builder = stream_builder.connect_timeout(t).read_timeout(t);
         }
         // Build the default retry policy from REST's own legacy reliability
         // fields so behavior is unchanged when no policy is injected. The REST
@@ -534,6 +587,7 @@ impl RestStream {
         Ok(Self {
             config,
             client: builder.build()?,
+            stream_client: stream_builder.build()?,
             token_cache: TokenCache::new(),
             token_endpoint_cache: TokenEndpointCache::new(),
             auth_provider: None,
@@ -672,9 +726,30 @@ impl RestStream {
         let Some(key) = &self.replication_key else {
             return Ok(records);
         };
-        let out = filter_incremental_path(records, key, start, self.config.on_missing_key)?;
-        self.note_missing_key(out.missing);
-        Ok(out.records)
+        // Inclusive (`>=`): the bookmark is the previous run's max, and a row
+        // sharing that value but written after the previous run read it would
+        // otherwise be skipped forever (API-19). Re-delivering the boundary
+        // rows is at-least-once, absorbed by a keyed upsert sink.
+        let mut kept = Vec::with_capacity(records.len());
+        let mut missing = 0;
+        for record in records {
+            let at_bookmark = key.resolve(&record).is_some_and(|v| {
+                !v.is_null()
+                    && std::mem::discriminant(v) == std::mem::discriminant(start)
+                    && !faucet_core::replication::json_gt(v, start)
+                    && !faucet_core::replication::json_gt(start, v)
+            });
+            if at_bookmark {
+                kept.push(record);
+                continue;
+            }
+            let out =
+                filter_incremental_path(vec![record], key, start, self.config.on_missing_key)?;
+            missing += out.missing;
+            kept.extend(out.records);
+        }
+        self.note_missing_key(missing);
+        Ok(kept)
     }
 
     /// The page's max replication value. `count_missing` reports records
@@ -768,24 +843,16 @@ impl RestStream {
         if self.config.partitions.is_empty() {
             self.fetch_partition(None, None).await
         } else if let Some(concurrency) = self.config.partition_concurrency {
-            // Process partitions concurrently using a semaphore to limit parallelism.
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
-            let mut handles = Vec::with_capacity(self.config.partitions.len());
-
-            for ctx in &self.config.partitions {
-                let permit =
-                    semaphore.clone().acquire_owned().await.map_err(|e| {
-                        FaucetError::Config(format!("semaphore acquire failed: {e}"))
-                    })?;
-                let fut = self.fetch_partition(Some(ctx), None);
-                handles.push(async move {
-                    let result = fut.await;
-                    drop(permit);
-                    result
-                });
-            }
-
-            let results = futures::future::try_join_all(handles).await?;
+            // Bounded, order-preserving concurrency: each partition future
+            // starts only when a slot frees, so more `requests:` than permits
+            // can never deadlock (API-39).
+            use futures::{StreamExt, TryStreamExt};
+            let partitions = &self.config.partitions;
+            let results: Vec<Vec<Value>> = futures::stream::iter(0..partitions.len())
+                .map(|i| self.fetch_partition(Some(&partitions[i]), None))
+                .buffered(concurrency.max(1))
+                .try_collect()
+                .await?;
             Ok(results.into_iter().flatten().collect())
         } else {
             let mut all_records = Vec::new();
@@ -991,6 +1058,21 @@ impl RestStream {
             &self.config.records_multi,
             self.config.op_field.as_deref().unwrap_or("_op"),
         )?;
+        if records.is_empty()
+            && !self.config.allow_missing_records_path
+            && self.config.records_multi.is_empty()
+            && let Some(path) = self.config.records_path.as_deref()
+            && !records_path_resolves(body, path)
+        {
+            let mut excerpt = body.to_string();
+            excerpt.truncate(excerpt.floor_char_boundary(300));
+            return Err(FaucetError::Source(format!(
+                "rest: `records_path` '{path}' matched nothing — the key is absent from the \
+                 response, which is usually an error served with HTTP 200 or a renamed field \
+                 (response: {excerpt}); set `allow_missing_records_path: true` if this API \
+                 omits the key on an empty result"
+            )));
+        }
         // Protocol control fields stamped per record (`@odata.etag`, JSON:API's
         // `links`, HAL's `_links`, …) are metadata, not data, and are often
         // invalid column names downstream. Drop them so records carry only the
@@ -1767,7 +1849,7 @@ impl RestStream {
             self.roundtrips.get().cloned(),
             || async {
                 let resp = self
-                    .job_request_response_once(op, method, url, headers, query, json)
+                    .job_request_response_once(op, method, url, headers, query, json, false)
                     .await?;
                 let status = resp.status().as_u16();
                 let resp_headers = resp.headers().clone();
@@ -1801,7 +1883,7 @@ impl RestStream {
             self.retry_policy.max_attempts.saturating_sub(1),
             self.retry_policy.base,
             self.roundtrips.get().cloned(),
-            || self.job_request_response_once(op, method, url, headers, query, json),
+            || self.job_request_response_once(op, method, url, headers, query, json, true),
         )
         .await
     }
@@ -1809,6 +1891,7 @@ impl RestStream {
     /// One unretried attempt — the shared request-building core of
     /// [`job_request_bytes`](Self::job_request_bytes) /
     /// [`job_request_response`](Self::job_request_response).
+    #[allow(clippy::too_many_arguments)]
     async fn job_request_response_once(
         &self,
         op: &'static str,
@@ -1817,6 +1900,7 @@ impl RestStream {
         headers: &HashMap<String, String>,
         query: &HashMap<String, String>,
         json: Option<&Value>,
+        streamed: bool,
     ) -> Result<reqwest::Response, FaucetError> {
         let m = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).map_err(|_| {
             FaucetError::Config(format!("async_job: invalid HTTP method '{method}'"))
@@ -1840,7 +1924,12 @@ impl RestStream {
         for (k, v) in headers {
             insert_header(&mut hdrs, k, v)?;
         }
-        let mut req = self.client.request(m, url).headers(hdrs);
+        let client = if streamed {
+            &self.stream_client
+        } else {
+            &self.client
+        };
+        let mut req = client.request(m, url).headers(hdrs);
         if !query.is_empty() {
             let pairs: Vec<(&str, &str)> = query
                 .iter()
@@ -2076,7 +2165,7 @@ impl RestStream {
         // cap) so a long-running job doesn't hammer the API. `interval_secs` is
         // the ceiling, not a fixed wait — a fixed 15s made an instant job take
         // ~15s of dead poll-wait.
-        let poll_cap = std::time::Duration::from_secs(job.poll.interval_secs);
+        let poll_cap = poll_cap(job.poll.interval_secs);
         let mut poll_delay = std::cmp::min(
             std::time::Duration::from_secs(POLL_BACKOFF_BASE_SECS),
             poll_cap,
@@ -2381,7 +2470,7 @@ impl RestStream {
             Some(u) => u.to_string(),
             None => {
                 let path = match path_context {
-                    Some(ctx) => faucet_core::util::substitute_context(&self.config.path, ctx),
+                    Some(ctx) => substitute_path(&self.config.path, ctx)?,
                     None => self.config.path.clone(),
                 };
                 format!("{}/{}", base_url, path.trim_start_matches('/'))
@@ -2706,8 +2795,7 @@ impl RestStream {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             && self.config.retry_on_response.is_empty()
         {
-            let wait = parse_retry_after(resp.headers());
-            return Err(FaucetError::RateLimited(wait));
+            return Err(plain_rate_limit(resp.headers()));
         }
 
         // #756: throttling signalled by another status + a body/header marker.
@@ -2721,7 +2809,7 @@ impl RestStream {
                 return Err(e);
             }
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(FaucetError::RateLimited(parse_retry_after(&headers)));
+                return Err(plain_rate_limit(&headers));
             }
             if is_first_page && self.config.tolerated_http_errors.contains(&status.as_u16()) {
                 return Ok((Value::Array(vec![]), HeaderMap::new()));
@@ -2878,6 +2966,15 @@ fn http_status_error(status: u16, url: String, body: String) -> FaucetError {
     FaucetError::HttpStatus { status, url, body }
 }
 
+/// A plain 429: its `Retry-After` (60 s when absent), failing the run above
+/// [`faucet_core::DEFAULT_MAX_WAIT_SECS`] instead of sleeping for hours.
+fn plain_rate_limit(headers: &HeaderMap) -> FaucetError {
+    faucet_core::util::rate_limited(
+        parse_retry_after(headers),
+        Duration::from_secs(faucet_core::DEFAULT_MAX_WAIT_SECS),
+    )
+}
+
 fn parse_retry_after(headers: &HeaderMap) -> Duration {
     const DEFAULT: Duration = Duration::from_secs(60);
     let Some(raw) = headers
@@ -2898,6 +2995,32 @@ fn parse_retry_after(headers: &HeaderMap) -> Duration {
             .unwrap_or(Duration::ZERO);
     }
     DEFAULT
+}
+
+/// Whether `path` addresses something in `body`, telling "no records" from "the
+/// records key is absent" (API-23). A path matching nothing still resolves when
+/// its container does (`$.items[*]` over `{"items": []}`), and an empty body
+/// (a `204`, a tolerated error) always resolves.
+fn records_path_resolves(body: &Value, path: &str) -> bool {
+    use jsonpath_rust::JsonPath;
+    let matches = |p: &str| body.query(p).map_or(true, |m| !m.is_empty());
+    if matches!(body, Value::Null)
+        || body.as_array().is_some_and(Vec::is_empty)
+        || body.as_object().is_some_and(serde_json::Map::is_empty)
+        || matches(path)
+    {
+        return true;
+    }
+    let parent = if let Some(p) = path.strip_suffix(".*") {
+        p
+    } else if path.ends_with(']')
+        && let Some(open) = path.rfind('[')
+    {
+        &path[..open]
+    } else {
+        return false;
+    };
+    parent != "$" && !parent.is_empty() && matches(parent)
 }
 
 /// Keep the larger of two bookmark values when consolidating per-partition
@@ -3710,9 +3833,27 @@ impl RestStream {
         let names = if !spec.objects.is_empty() {
             spec.objects.clone()
         } else if let Some(list) = &spec.list {
-            let url = format!("{base}{}", list.get);
-            let resp = self.discover_get_json(&url, "discovery list").await?;
-            crate::discovery::dataset_names(&resp, list)
+            let mut url = format!("{base}{}", list.get);
+            let mut names = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                if seen.len() >= crate::discovery::MAX_LIST_PAGES {
+                    return Err(FaucetError::Source(format!(
+                        "rest discovery: `list` followed {} pages without reaching the end",
+                        crate::discovery::MAX_LIST_PAGES
+                    )));
+                }
+                seen.insert(url.clone());
+                let resp = self.discover_get_json(&url, "discovery list").await?;
+                names.extend(crate::discovery::dataset_names_unsorted(&resp, list));
+                match crate::discovery::next_list_url(&resp, list, base) {
+                    Some(next) if !seen.contains(&next) => url = next,
+                    _ => break,
+                }
+            }
+            names.sort();
+            names.dedup();
+            names
         } else {
             return Err(FaucetError::Source(
                 "rest discovery: neither `list` nor `objects` produced any datasets".into(),
@@ -3738,6 +3879,51 @@ impl RestStream {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn path_placeholders_are_percent_encoded() {
+        let ctx: HashMap<String, Value> = [
+            ("id".to_string(), json!("a/b?c#d e")),
+            ("n".to_string(), json!(7)),
+            ("dot".to_string(), json!("..")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            substitute_path("/items/{id}/n/{n}", &ctx).unwrap(),
+            "/items/a%2Fb%3Fc%23d%20e/n/7"
+        );
+        let err = substitute_path("/items/{dot}", &ctx).unwrap_err();
+        assert!(err.to_string().contains("`{dot}`"), "{err}");
+    }
+
+    #[test]
+    fn records_path_resolution_tells_absent_from_empty() {
+        assert!(records_path_resolves(&json!({"items": []}), "$.items[*]"));
+        assert!(records_path_resolves(
+            &json!({"d": {"items": {}}}),
+            "$.d.items.*"
+        ));
+        assert!(records_path_resolves(&json!({"items": [1]}), "$.items[*]"));
+        assert!(records_path_resolves(&json!([]), "$.items[*]"));
+        assert!(records_path_resolves(&Value::Null, "$.items[*]"));
+        assert!(!records_path_resolves(
+            &json!({"error": "busy"}),
+            "$.items[*]"
+        ));
+        assert!(!records_path_resolves(&json!({"error": "busy"}), "$.items"));
+        assert!(!records_path_resolves(&json!({"e": 1}), "$.d.items.*"));
+    }
+
+    #[test]
+    fn a_zero_poll_interval_is_clamped_to_one_second() {
+        assert_eq!(poll_cap(0), Duration::from_secs(1));
+        assert_eq!(poll_cap(5), Duration::from_secs(5));
+        assert_eq!(
+            next_poll_delay(poll_cap(0), poll_cap(0)),
+            Duration::from_secs(1)
+        );
+    }
     use super::*;
     use serde_json::json;
 
@@ -4313,6 +4499,15 @@ mod tests {
         // Number → bare.
         assert_eq!(sql_literal(&json!(42)), "42");
         assert!(is_sql_datetime("2026-08-28T00:00:00+05:30"));
+        // API-57: a colon-less offset is normalised, not quoted.
+        assert_eq!(
+            sql_literal(&json!("2026-08-28T12:00:00.000+0000")),
+            "2026-08-28T12:00:00Z"
+        );
+        assert_eq!(
+            sql_literal(&json!("2026-08-28T12:00:00.250+0530")),
+            "2026-08-28T12:00:00.250+05:30"
+        );
         assert!(!is_sql_datetime("not-a-date"));
     }
 

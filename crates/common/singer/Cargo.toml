@@ -16,6 +16,10 @@ schemars.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 
 [package.metadata.docs.rs]
 all-features = true

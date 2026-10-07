@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -31,14 +31,30 @@ fn now_unix_ms() -> u64 {
 /// A failed WebSocket handshake. An HTTP status the server answered with keeps
 /// its code, so a rejected credential can be told apart from a network failure.
 fn handshake_error(url: &str, e: tokio_tungstenite::tungstenite::Error) -> FaucetError {
+    // Credentials and the query string (where tokens often sit) never reach an
+    // error message (API-53).
+    let url = crate::config::envelope_url(url);
     match e {
         tokio_tungstenite::tungstenite::Error::Http(resp) => FaucetError::HttpStatus {
             status: resp.status().as_u16(),
-            url: url.to_string(),
+            url,
             body: String::new(),
         },
         other => FaucetError::Source(format!("websocket connect {url}: {other}")),
     }
+}
+
+/// A close the server sends to reject the session — `1008` (policy) or an
+/// application `4xxx` code — which reconnecting cannot fix (API-33).
+fn rejecting_close(frame: Option<&CloseFrame>) -> Option<FaucetError> {
+    let frame = frame?;
+    let code = u16::from(frame.code);
+    (code == 1008 || (4000..5000).contains(&code)).then(|| {
+        FaucetError::Source(format!(
+            "websocket source: the server closed the session with {code} ({}); not reconnecting",
+            frame.reason
+        ))
+    })
 }
 
 /// Delay before the next (re)connect after `attempt` consecutive failures,
@@ -154,9 +170,12 @@ impl WebsocketSource {
         url: &str,
         cred: Option<faucet_core::Credential>,
     ) -> Result<WsStream, FaucetError> {
-        let mut request = url
-            .into_client_request()
-            .map_err(|e| FaucetError::Config(format!("websocket url {url}: {e}")))?;
+        let mut request = url.into_client_request().map_err(|e| {
+            FaucetError::Config(format!(
+                "websocket url {}: {e}",
+                crate::config::envelope_url(url)
+            ))
+        })?;
 
         // Resolve effective auth: provider-first, then inline, or error on Reference.
         let effective_auth = match cred {
@@ -180,13 +199,24 @@ impl WebsocketSource {
                 .max_frame_size(Some(n))
         });
 
-        let (mut ws, _resp) = connect_async_with_config(request, ws_config, false)
-            .await
-            .map_err(|e| handshake_error(url, e))?;
+        let limit = self.config.connect_timeout;
+        let timed_out = |what: &str| {
+            FaucetError::Source(format!(
+                "websocket {what} {}: timed out after {}s",
+                crate::config::envelope_url(url),
+                limit.as_secs()
+            ))
+        };
+        let (mut ws, _resp) =
+            tokio::time::timeout(limit, connect_async_with_config(request, ws_config, false))
+                .await
+                .map_err(|_| timed_out("connect"))?
+                .map_err(|e| handshake_error(url, e))?;
 
         for msg in &self.config.subscribe_messages {
-            ws.send(Message::Text(msg.clone().into()))
+            tokio::time::timeout(limit, ws.send(Message::Text(msg.clone().into())))
                 .await
+                .map_err(|_| timed_out("subscribe"))?
                 .map_err(|e| FaucetError::Source(format!("websocket subscribe: {e}")))?;
         }
         Ok(ws)
@@ -251,10 +281,10 @@ impl Source for WebsocketSource {
 
                 // (Re)connect.
                 let ws = match self.connect(&resolved_url).await {
-                    Ok(ws) => {
-                        reconnect_attempts = 0;
-                        ws
-                    }
+                    // The attempt counter resets on a data frame, not on a
+                    // handshake: a server that accepts and then closes would
+                    // otherwise never reach `max_reconnect_attempts` (API-33).
+                    Ok(ws) => ws,
                     Err(e) => {
                         if reconnect
                             && max_attempts.is_none_or(|m| reconnect_attempts < m)
@@ -320,12 +350,11 @@ impl Source for WebsocketSource {
                         }
                     };
 
+                    // No signal handler here: a connector must not take over
+                    // the process's SIGINT (API-61). The caller cancels a run by
+                    // dropping this stream (`Pipeline::with_cancel`).
                     tokio::select! {
                         biased;
-                        _ = tokio::signal::ctrl_c() => {
-                            tracing::info!("websocket source: ctrl_c received, stopping cleanly");
-                            stop = true;
-                        }
                         _ = async { ping_timer.as_mut().unwrap().tick().await }, if ping_timer.is_some() => {
                             if let Err(e) = write.send(Message::Ping(Vec::new().into())).await {
                                 tracing::warn!(error = %e, "websocket source: ping failed, treating as disconnect");
@@ -346,6 +375,9 @@ impl Source for WebsocketSource {
                                         }
                                         Message::Pong(_) | Message::Frame(_) => {}
                                         Message::Close(frame) => {
+                                            if let Some(e) = rejecting_close(frame.as_ref()) {
+                                                fatal = Some(e);
+                                            }
                                             let clean = frame
                                                 .as_ref()
                                                 .map(|f| f.code == CloseCode::Normal)
@@ -659,6 +691,7 @@ mod tests {
             max_reconnect_attempts: None,
             max_message_bytes: None,
             batch_size: faucet_core::DEFAULT_BATCH_SIZE,
+            connect_timeout: std::time::Duration::from_secs(30),
         };
         let source = WebsocketSource::new(config).unwrap();
         let report = source.check(&CheckContext::default()).await.unwrap();
@@ -697,6 +730,7 @@ mod tests {
             max_reconnect_attempts: None,
             max_message_bytes: None,
             batch_size: faucet_core::DEFAULT_BATCH_SIZE,
+            connect_timeout: std::time::Duration::from_secs(30),
         };
         let source = WebsocketSource::new(config).unwrap();
         let report = source
@@ -731,6 +765,7 @@ mod tests {
             max_reconnect_attempts: None,
             max_message_bytes: None,
             batch_size: faucet_core::DEFAULT_BATCH_SIZE,
+            connect_timeout: std::time::Duration::from_secs(30),
         }
     }
 

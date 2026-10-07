@@ -15,11 +15,13 @@
 //!   subprocess receives.
 
 pub mod env;
+pub mod lines;
 pub mod message;
 pub mod redact;
 pub mod temp;
 
 pub use env::{BASELINE_ENV, InheritEnv};
+pub use lines::{CappedLine, DEFAULT_MAX_LINE_BYTES, read_capped_line};
 pub use message::{SingerMessage, parse_line};
 pub use redact::{Redactor, secret_like_values};
 pub use temp::write_private_json;

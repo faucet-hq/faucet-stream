@@ -21,7 +21,7 @@ use tokio::io::AsyncReadExt;
 const USER: &str = "faucet";
 const PASS: &str = "secret";
 
-async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
+async fn start_sftp_inner() -> Option<(ContainerAsync<GenericImage>, u16)> {
     let image = GenericImage::new("atmoz/sftp", "alpine")
         .with_exposed_port(22.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
@@ -149,4 +149,15 @@ async fn an_empty_write_leaves_no_file() {
 #[tokio::test]
 async fn avro_files_round_trip() {
     round_trip(SftpSinkFormat::Avro, FileFormat::Avro, ".avro").await;
+}
+
+/// [`start_sftp_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
+/// is set — CI provides Docker, so an unavailable backend is a failure there.
+async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    let started = start_sftp_inner().await;
+    assert!(
+        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+        "start_sftp: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
+    );
+    started
 }

@@ -336,3 +336,69 @@ async fn a_missing_response_element_fails_instead_of_returning_zero_rows() {
     assert!(matches!(err, FaucetError::Source(_)), "{err}");
     assert!(err.to_string().contains("GetUsersResponse"), "{err}");
 }
+
+#[tokio::test]
+async fn a_soap_fault_on_http_500_is_handled_once_not_retried() {
+    // API-46: a compliant SOAP 1.1 server answers a fault with 500; it used to
+    // be re-POSTed as a transient error and never reached fault handling.
+    let server = MockServer::start().await;
+    let fault = "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body>\
+         <soap:Fault><faultcode>soap:Server</faultcode>\
+         <faultstring>Account &amp; region not found</faultstring></soap:Fault></soap:Body></soap:Envelope>";
+    Mock::given(method("POST"))
+        .and(path("/ws"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(fault))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let config = |fault_as_error| {
+        XmlStreamConfig::new(server.uri(), "/ws")
+            .method(Method::POST)
+            .records_element_path("GetUsersResponse.Users.User")
+            .with_soap(SoapConfig {
+                body_inner: Some("<GetUsers/>".into()),
+                fault_as_error,
+                ..Default::default()
+            })
+    };
+    let err = XmlStream::new(config(true)).fetch_all().await.unwrap_err();
+    assert!(
+        matches!(&err, FaucetError::Source(m) if m.contains("Account & region not found")),
+        "got {err:?}"
+    );
+    assert!(
+        XmlStream::new(config(false))
+            .fetch_all()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_non_fault_http_500_is_still_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ws"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("<html>oops</html>"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/ws"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(soap_users_response("<User><Name>Ann</Name></User>")),
+        )
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/ws")
+        .method(Method::POST)
+        .records_element_path("GetUsersResponse.Users.User")
+        .with_soap(SoapConfig {
+            body_inner: Some("<GetUsers/>".into()),
+            ..Default::default()
+        });
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records[0]["Name"], "Ann");
+}

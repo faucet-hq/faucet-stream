@@ -157,9 +157,11 @@ is distinguishable from one that is slow for any other reason:
 | `faucet_source_throttle_wait_seconds` | histogram | `pipeline, row, connector` | Time actually slept after each one. |
 | `faucet_source_retries_total` | counter | `pipeline, row, connector, class` | Every source-side retry by class (`rate_limited`, `http_5xx`, `connection`, `timeout`) — the source-side mirror of `faucet_resilience_retries_total`. |
 
-The wait is **measured**, not read from the header: `rest` sleeps the server's
-`Retry-After` (seconds or an HTTP date), `graphql` and `xml` sleep the policy's
-backoff, and either way the recorded figure is the time that passed. A sleep cut
+The wait is **measured**, not read from the header: `rest`, `graphql` and `xml`
+sleep the server's `Retry-After` (seconds or an HTTP date; on `xml`/`graphql`
+also a `503` carrying one), else the policy's backoff, and either way the
+recorded figure is the time that passed. A stated wait over one hour fails the
+run with the wait named instead of sleeping through it. A sleep cut
 short by cancellation, a timeout or a dropped run records the partial wait.
 
 The totals also land on the run's [usage record](./usage.md) (`throttled`,
@@ -242,8 +244,9 @@ the response's `Date` header when present, so a skewed local clock does not
 change the wait, and an instant already in the past retries immediately. The
 order is `backoff_from`, then `backoff_secs`, then `Retry-After`, then
 exponential backoff; a missing or unreadable value falls through to the next.
-A stated wait longer than `max_wait_secs` (default 3600) fails the run with the
-reset named instead of parking it for hours.
+A stated wait longer than `max_wait_secs` (default 3600) — from `backoff_from`,
+`backoff_secs` or `Retry-After` alike — fails the run with the reset named
+instead of parking it for hours.
 
 #### Throttling inside a successful response (`match_success`)
 

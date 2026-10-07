@@ -77,7 +77,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `batch_mode` | `HttpBatchMode` | `Individual` | `Individual` = one POST per record; `Array` = records sent as one JSON-array body. See [Batch modes](#batch-modes). |
-| `concurrency` | int | `10` | Max concurrent in-flight requests in `Individual` mode. No effect in `Array` mode (one POST per chunk, issued sequentially). Clamped to a floor of `1`. |
+| `concurrency` | int | `10` | Max concurrent in-flight requests in `Individual` mode. Above `1` a page's records are sent in parallel and **may arrive out of order** — set `1` when the endpoint is last-write-wins and a page can hold several updates to one entity. No effect in `Array` mode (one POST per chunk, issued sequentially). Clamped to a floor of `1`. |
 | `batch_size` | int | `1000` | Max records per outbound HTTP request in `Array` mode (re-chunks the upstream page). **`0` = "no batching" sentinel** — forwards the whole page as one JSON array. **No effect in `Individual` mode** (each record is already its own request); kept for config-shape parity and validated via `faucet_core::validate_batch_size`. |
 | `timeout` | int / null | `30` | Per-request timeout in seconds — a stalled peer fails the request (so retries and resilience act) instead of hanging the run. `null` disables it. |
 | `connect_timeout` | int / null | `10` | Timeout for establishing a connection, in seconds. `null` disables it. |
@@ -86,7 +86,7 @@ faucet run pipeline.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_retries` | int | `0` | Number of retries on retriable failures (network errors, 5xx, 429). Each retry is immediate (no backoff). 4xx client errors fail fast. After exhausting retries the last error is returned. |
+| `max_retries` | int | `0` | Number of retries on retriable failures (network errors, 5xx, 429). Retries back off exponentially with jitter from 250 ms; a `429` (or `503`) carrying `Retry-After` waits the stated time instead (a stated wait over 3600 s fails at once). 4xx client errors fail fast. After exhausting retries the last error is returned. |
 
 ## Authentication
 

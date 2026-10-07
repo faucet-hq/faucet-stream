@@ -85,8 +85,8 @@ pub struct WebsocketSourceConfig {
     #[schemars(with = "u64")]
     pub reconnect_backoff: Duration,
 
-    /// Cap on *consecutive* failed reconnects (resets on any received
-    /// message). `None` = unlimited (then `idle_timeout` is the natural cap).
+    /// Cap on *consecutive* failed reconnects (resets on a received data
+    /// frame — a handshake the server accepts and then closes still counts). `None` = unlimited (then `idle_timeout` is the natural cap).
     ///
     /// Spelled `reconnect_max_attempts` on the wire, matching the gRPC
     /// source's `reconnect_*` prefix; the historical `max_reconnect_attempts`
@@ -111,6 +111,20 @@ pub struct WebsocketSourceConfig {
     /// page (same sentinel as the Kafka source).
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// Seconds allowed for the TCP connect + upgrade handshake and for sending
+    /// the subscribe frames (default 30). Expiry counts as a connect failure,
+    /// so `reconnect` retries it.
+    #[serde(
+        default = "default_connect_timeout",
+        with = "faucet_core::config::duration_secs"
+    )]
+    #[schemars(with = "u64")]
+    pub connect_timeout: Duration,
+}
+
+fn default_connect_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn default_backoff() -> Duration {
@@ -175,7 +189,8 @@ impl WebsocketSourceConfig {
         }
         if !(url.starts_with("ws://") || url.starts_with("wss://")) {
             return Err(FaucetError::Config(format!(
-                "websocket source: url must start with ws:// or wss:// (got {url})"
+                "websocket source: url must start with ws:// or wss:// (got {})",
+                envelope_url(url)
             )));
         }
         if self.max_messages.is_none() && self.idle_timeout.is_none() {
@@ -184,6 +199,11 @@ impl WebsocketSourceConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
+        if self.connect_timeout.is_zero() {
+            return Err(FaucetError::Config(
+                "websocket source: connect_timeout must be greater than 0".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -270,6 +290,7 @@ mod config_tests {
             max_reconnect_attempts: None,
             max_message_bytes: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            connect_timeout: std::time::Duration::from_secs(30),
         }
     }
 

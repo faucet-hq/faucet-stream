@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use faucet_core::{FaucetError, Pipeline, StateStore, Value, async_trait};
 use faucet_core::{MemoryStateStore, Sink};
 use faucet_source_singer::{SingerSource, SingerSourceConfig};
+use serde_json::json;
 
 /// Absolute path to the dependency-free fake tap shipped with the crate.
 fn fake_tap() -> String {
@@ -206,4 +207,87 @@ async fn real_tap_csv_end_to_end() {
     let source = SingerSource::new(SingerSourceConfig::new("tap-csv", "sample"));
     let sink = UpsertSink::default();
     let _ = Pipeline::new(&source, &sink).run().await;
+}
+
+fn script(dir: &tempfile::TempDir, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.path().join("tap.sh");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// API-26: a configured stream the tap never uses on RECORD used to drop every
+/// row and still checkpoint the tap's STATE.
+#[tokio::test]
+async fn records_for_only_another_stream_fail_before_checkpointing() {
+    let mut cfg = config_with_args(&["--stream", "s", "--total", "3", "--state-at", "3"]);
+    cfg.stream = "public-s".into();
+    let source = SingerSource::new(cfg);
+    let sink = UpsertSink::default();
+    let err = faucet_core::Pipeline::new(&source, &sink)
+        .run()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("only for other streams"), "{err}");
+}
+
+/// API-26: the catalog's other name for the stream is accepted on RECORD.
+#[tokio::test]
+async fn the_catalog_alias_of_the_stream_is_accepted() {
+    let mut cfg = config_with_args(&["--stream", "s", "--total", "3"]);
+    cfg.stream = "public-s".into();
+    cfg.catalog = Some(json!({"streams": [{"tap_stream_id": "public-s", "stream": "s"}]}));
+    let source = SingerSource::new(cfg);
+    let sink = UpsertSink::default();
+    faucet_core::Pipeline::new(&source, &sink)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(sink.ids(), vec![1, 2, 3]);
+}
+
+/// API-44: a line longer than max_line_bytes fails instead of growing a buffer.
+#[tokio::test]
+async fn an_overlong_tap_line_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let tap = script(
+        &dir,
+        "head -c 5000 /dev/zero | tr '\\0' 'a'; echo; sleep 30",
+    );
+    let mut cfg = SingerSourceConfig::new(tap, "s");
+    cfg.max_line_bytes = 100;
+    let source = SingerSource::new(cfg);
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        faucet_core::Source::fetch_all(&source),
+    )
+    .await
+    .expect("must not hang")
+    .unwrap_err();
+    assert!(err.to_string().contains("max_line_bytes (100)"), "{err}");
+}
+
+/// API-45: discovery is bounded and never echoes the tap's credentials.
+#[tokio::test]
+async fn discovery_times_out_and_redacts_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let tap = script(&dir, "echo 'bad token hunter2-secret-value' >&2; exit 1");
+    let mut cfg = SingerSourceConfig::new(tap, "s");
+    cfg.tap_config = json!({"api_token": "hunter2-secret-value"});
+    let err = faucet_source_singer::discover(&cfg).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("exited with status"), "{msg}");
+    assert!(!msg.contains("hunter2-secret-value"), "{msg}");
+
+    let slow = script(&dir, "sleep 30");
+    let mut cfg = SingerSourceConfig::new(slow, "s");
+    cfg.idle_timeout_secs = Some(1);
+    let started = std::time::Instant::now();
+    let err = faucet_source_singer::discover(&cfg).await.unwrap_err();
+    assert!(
+        err.to_string().contains("did not finish within 1s"),
+        "{err}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }

@@ -43,10 +43,96 @@ pub struct WebhookSourceConfig {
     /// — the server-side buffering behaviour does not change.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Optional HMAC request-signature verification for senders that sign the
+    /// raw body instead of sending a static secret. Unsigned or mis-signed
+    /// requests are rejected with `401`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<WebhookSignature>,
+}
+
+/// HMAC signature verification over the raw request body.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSignature {
+    /// Request header carrying the signature (e.g. `X-Hub-Signature-256`).
+    pub header: String,
+    /// The shared signing secret.
+    pub secret: String,
+    /// HMAC digest (default `sha256`).
+    #[serde(default)]
+    pub algorithm: SignatureAlgorithm,
+    /// How the digest is written in the header (default `hex`).
+    #[serde(default)]
+    pub encoding: SignatureEncoding,
+    /// Text before the digest in the header value (e.g. `sha256=`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Header carrying the Unix-seconds timestamp the sender signed. When set,
+    /// the signed content is `<timestamp>.<body>` and a timestamp more than
+    /// `tolerance_secs` from now is rejected (replay protection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_header: Option<String>,
+    /// Accepted clock difference for `timestamp_header`, in seconds (default 300).
+    #[serde(default = "default_tolerance_secs")]
+    pub tolerance_secs: u64,
+}
+
+/// HMAC digest for [`WebhookSignature`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureAlgorithm {
+    /// HMAC-SHA256.
+    #[default]
+    Sha256,
+    /// HMAC-SHA512.
+    Sha512,
+}
+
+/// Text encoding of the signature digest.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureEncoding {
+    /// Hexadecimal (case-insensitive).
+    #[default]
+    Hex,
+    /// Standard base64.
+    Base64,
+}
+
+fn default_tolerance_secs() -> u64 {
+    300
 }
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
+}
+
+/// Check a (possibly context-substituted) endpoint path before it reaches the
+/// router, which panics on an invalid one (API-49).
+pub fn validate_path(path: &str) -> Result<(), faucet_core::FaucetError> {
+    let bad = |why: &str| {
+        faucet_core::FaucetError::Config(format!("webhook source: `path` {path:?} {why}"))
+    };
+    if !path.starts_with('/') {
+        return Err(bad("must start with `/`"));
+    }
+    if path.contains(['?', '#']) || path.chars().any(char::is_whitespace) {
+        return Err(bad("must not contain `?`, `#` or whitespace"));
+    }
+    for seg in path.split('/') {
+        if seg.starts_with(':') || seg.starts_with('*') {
+            return Err(bad("must not have a segment starting with `:` or `*`"));
+        }
+        let braces = seg.contains(['{', '}']);
+        let placeholder = seg.len() > 2
+            && seg.starts_with('{')
+            && seg.ends_with('}')
+            && !seg[1..seg.len() - 1].contains(['{', '}', '*']);
+        if braces && !placeholder {
+            return Err(bad("may use braces only as a whole `{name}` segment"));
+        }
+    }
+    Ok(())
 }
 
 impl Default for WebhookSourceConfig {
@@ -59,6 +145,7 @@ impl Default for WebhookSourceConfig {
             max_body_bytes: 1024 * 1024,
             auth_token: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            signature: None,
         }
     }
 }
@@ -67,6 +154,20 @@ impl WebhookSourceConfig {
     /// Create a new config with sensible defaults.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Validate the path and signature settings.
+    pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        validate_path(&self.path)?;
+        if let Some(sig) = &self.signature
+            && (sig.header.trim().is_empty() || sig.secret.is_empty())
+        {
+            return Err(faucet_core::FaucetError::Config(
+                "webhook source: `signature.header` and `signature.secret` must not be empty"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Set the listen address.
@@ -96,6 +197,12 @@ impl WebhookSourceConfig {
     /// Set the maximum accepted request body size in bytes.
     pub fn max_body_bytes(mut self, bytes: usize) -> Self {
         self.max_body_bytes = bytes;
+        self
+    }
+
+    /// Verify an HMAC request signature on every request.
+    pub fn signature(mut self, signature: WebhookSignature) -> Self {
+        self.signature = Some(signature);
         self
     }
 

@@ -2,7 +2,7 @@
 
 use crate::config::{HttpBatchMode, HttpSinkAuth, HttpSinkConfig};
 use async_trait::async_trait;
-use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response};
+use faucet_core::util::{DEFAULT_ERROR_BODY_MAX_LEN, check_http_response_rate_limited};
 use faucet_core::{AuthSpec, Credential, FaucetError, SharedAuthProvider};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
@@ -166,10 +166,12 @@ impl HttpSink {
             // One retry path for both failure kinds — a transport error and a
             // retriable status differ only in how the error is obtained.
             let err = match req.send().await {
-                Ok(resp) => match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
-                    Ok(_) => return Ok(()),
-                    Err(e) => e,
-                },
+                Ok(resp) => {
+                    match check_http_response_rate_limited(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
+                        Ok(_) => return Ok(()),
+                        Err(e) => e,
+                    }
+                }
                 Err(e) => FaucetError::Http(e),
             };
             if attempt < self.config.max_retries && err.is_retriable() {

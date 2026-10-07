@@ -49,8 +49,9 @@ pub struct RetryMatcher {
     /// honoured, else exponential backoff applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_secs: Option<u64>,
-    /// Longest wait `backoff_from` may ask for (default 3600). A longer one
-    /// fails the run with an error naming the reset instead of parking it.
+    /// Longest wait a matched response may ask for — from `backoff_from`,
+    /// `backoff_secs` or `Retry-After` (default 3600). A longer one fails the
+    /// run with an error naming the reset instead of parking it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wait_secs: Option<u64>,
 }
@@ -251,11 +252,16 @@ impl RetryMatcher {
                 ),
             }
         }
-        Ok(self
-            .backoff_secs
-            .map(Duration::from_secs)
-            .or(retry_after)
-            .unwrap_or_else(|| crate::retry::backoff_with_jitter(base, attempt)))
+        let cap = Duration::from_secs(self.max_wait_secs.unwrap_or(DEFAULT_MAX_WAIT_SECS));
+        match self.backoff_secs.map(Duration::from_secs).or(retry_after) {
+            Some(w) if w > cap => Err(FaucetError::Source(format!(
+                "rate limited: the response asks to wait {}s, more than `max_wait_secs` ({}s)",
+                w.as_secs(),
+                cap.as_secs()
+            ))),
+            Some(w) => Ok(w),
+            None => Ok(crate::retry::backoff_with_jitter(base, attempt)),
+        }
     }
 }
 
@@ -349,9 +355,11 @@ impl WaitUnit {
     }
 }
 
+/// A relative wait; one too large for a `Duration` saturates so the
+/// `max_wait_secs` ceiling refuses it instead of panicking.
 fn relative(n: f64, scale: f64) -> Option<Duration> {
     let secs = n * scale;
-    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+    (secs >= 0.0).then(|| Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX))
 }
 
 fn as_f64(v: &Value) -> Option<f64> {
@@ -739,5 +747,51 @@ mod tests {
             0,
         );
         assert!(big.is_err());
+    }
+
+    #[test]
+    fn fallback_waits_are_capped_too() {
+        // API-18: `backoff_secs` / `Retry-After` used to be slept uncapped.
+        let h = HeaderMap::new();
+        let rule = m(json!({"status": [429], "max_wait_secs": 60}));
+        assert_eq!(
+            rule.wait(&h, "", Some(Duration::from_secs(30)), Duration::ZERO, 0)
+                .unwrap(),
+            Duration::from_secs(30)
+        );
+        let err = rule
+            .wait(&h, "", Some(Duration::from_secs(86_400)), Duration::ZERO, 0)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("more than `max_wait_secs` (60s)"),
+            "{err}"
+        );
+        let fixed = m(json!({"status": [429], "backoff_secs": 7200}));
+        assert!(fixed.wait(&h, "", None, Duration::ZERO, 0).is_err());
+    }
+
+    #[test]
+    fn a_huge_relative_wait_is_refused_not_a_panic() {
+        // API-43: Duration::from_secs_f64(1e30) panicked before the cap applied.
+        let rule = m(json!({
+            "status": [429],
+            "backoff_from": {"type": "body", "config": {"path": "$.wait", "unit": "minutes"}}
+        }));
+        let err = rule
+            .wait(
+                &HeaderMap::new(),
+                r#"{"wait": 1e300}"#,
+                None,
+                Duration::ZERO,
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("more than `max_wait_secs`"),
+            "{err}"
+        );
+        assert_eq!(relative(f64::INFINITY, 1.0), Some(Duration::MAX));
+        assert_eq!(relative(f64::NAN, 1.0), None);
+        assert_eq!(relative(-1.0, 1.0), None);
     }
 }

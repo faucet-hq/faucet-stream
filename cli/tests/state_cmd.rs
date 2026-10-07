@@ -551,6 +551,10 @@ async fn start<I: testcontainers::Image>(
     match image.start().await {
         Ok(c) => Some(c),
         Err(e) => {
+            assert!(
+                std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+                "no Docker daemon and FAUCET_REQUIRE_BACKENDS is set: {e}"
+            );
             eprintln!("skipping: no Docker daemon ({e})");
             None
         }
