@@ -174,9 +174,14 @@ impl ConnectProviders {
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("reading --connect-providers {}: {e}", path.display()))?;
-        let text = crate::interpolate::interpolate(&raw)
+        // Parse first, then resolve directives inside each value (#789
+        // SERVE-54): a resolved secret holding ` #`, `: ` or a leading quote
+        // must stay one string instead of reshaping the YAML around it.
+        let mut doc: serde_json::Value = serde_yaml::from_str(&raw)
+            .map_err(|e| format!("parsing --connect-providers {}: {e}", path.display()))?;
+        crate::interpolate::interpolate_value(&mut doc)
             .map_err(|e| format!("--connect-providers {}: {e}", path.display()))?;
-        let file: ConnectProvidersFile = serde_yaml::from_str(&text)
+        let file: ConnectProvidersFile = serde_json::from_value(doc)
             .map_err(|e| format!("parsing --connect-providers {}: {e}", path.display()))?;
         Self::from_file(file).map_err(|e| format!("--connect-providers {}: {e}", path.display()))
     }
@@ -622,6 +627,26 @@ mod tests {
                 .unwrap_err()
                 .contains("parsing")
         );
+        // A resolved secret with YAML-significant characters stays whole
+        // (#789 SERVE-54).
+        let secret = path.with_extension("secret");
+        std::fs::write(&secret, "'s3c #ret: x").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "version: 1\nproviders:\n  - name: crm\n    authorize_url: https://i/a\n    token_url: https://i/t\n    client_id: c\n    client_secret: ${{file:{}}}\n    redirect_base: https://f\n    allowed_redirects: [https://app]\n",
+                secret.display()
+            ),
+        )
+        .unwrap();
+        let ps = ConnectProviders::load(&path).unwrap();
+        assert_eq!(ps.get("crm").unwrap().client_secret, "'s3c #ret: x");
+        std::fs::write(
+            &path,
+            "version: 1\nproviders: \"${env:FAUCET_789_UNSET_VAR}\"\n",
+        )
+        .unwrap();
+        assert!(ConnectProviders::load(&path).is_err());
     }
 
     #[test]

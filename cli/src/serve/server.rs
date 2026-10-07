@@ -636,6 +636,7 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
 pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> CliResult<()> {
     let (prom, log_hub) =
         crate::serve::observability::install(&config.log_level, config.log_format);
+    crate::serve::callback::set_allow_hosts(config.callback_allow_hosts.clone());
     crate::serve::metrics::set_cluster_enabled(config.cluster.enabled);
     if let Some(h) = &prom {
         spawn_metrics_upkeep(h.clone(), Duration::from_secs(5));

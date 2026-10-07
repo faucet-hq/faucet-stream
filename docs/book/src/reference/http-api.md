@@ -1081,6 +1081,12 @@ no-op an hour later):
 | `on` contains a non-terminal status | |
 | Supplied on `POST /v1/backfill` | One backfill POST fans out into N unit runs, so a single callback has no single run to describe. Poll the unit runs by their `backfill` label instead. |
 
+The link-local check holds at delivery too: an IPv4-mapped IPv6 literal
+(`[::ffff:169.254.169.254]`) is refused, a host name is resolved and refused
+when any address it resolves to is link-local (the connection is then pinned
+to the checked addresses, so a second DNS answer cannot redirect it), and a
+redirect response is never followed — a `3xx` counts as a failed delivery.
+
 **Egress posture.** This guard closes the metadata hole; it is not a general
 egress control. A caller who can submit a run can already point a `rest` source
 at an arbitrary address, so the deployment-level mitigations in the
