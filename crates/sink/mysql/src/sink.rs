@@ -323,7 +323,7 @@ pub(crate) async fn insertable_columns(
                 .get::<Option<String>, _>("EXTRA")
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            !(extra.contains("generated") && !extra.contains("default_generated"))
+            !extra.contains("generated") || extra.contains("default_generated")
         })
         .map(|r| r.get("COLUMN_NAME"))
         .collect())

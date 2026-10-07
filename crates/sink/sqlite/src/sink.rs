@@ -237,11 +237,14 @@ fn no_matching_column_error(
 /// Rows grouped by the exact set of table columns they carry, in first-seen
 /// order: an upsert of one group never names a column its rows omit, so an
 /// absent column keeps its stored value instead of becoming NULL (#789 SQL-69).
+type RowCells<'a> = Vec<(&'a String, &'a Value)>;
+type ColumnGroup<'r, 'a> = (Vec<String>, Vec<&'r RowCells<'a>>);
+
 fn group_by_present_columns<'r, 'a>(
     columns: &[String],
-    rows: &'r [Vec<(&'a String, &'a Value)>],
-) -> Vec<(Vec<String>, Vec<&'r Vec<(&'a String, &'a Value)>>)> {
-    let mut groups: Vec<(Vec<String>, Vec<&'r Vec<(&'a String, &'a Value)>>)> = Vec::new();
+    rows: &'r [RowCells<'a>],
+) -> Vec<ColumnGroup<'r, 'a>> {
+    let mut groups: Vec<ColumnGroup<'r, 'a>> = Vec::new();
     for row in rows {
         let present: Vec<String> = columns
             .iter()
@@ -728,7 +731,7 @@ impl SqliteSink {
         // Get column names from the table using pragma_table_info. Use the
         // transaction's connection so a single-connection pool doesn't deadlock.
         let effective_table = self.effective_table();
-        let columns = table_columns(&mut **tx, &effective_table).await?;
+        let columns = table_columns(tx, &effective_table).await?;
 
         // A record that matches no column is an error, never a silent skip
         // (#789 SQL-70); fields matching no column are reported once.

@@ -302,10 +302,10 @@ fn pg_value_to_json(
 
     // `infinity` / `-infinity` dates and timestamps would overflow chrono
     // (a panic inside sqlx's decode), so the sentinels are read first.
-    if let Ok(raw) = row.try_get_raw(col_name) {
-        if let Some(v) = temporal_infinity(&raw) {
-            return Ok(v);
-        }
+    if let Ok(raw) = row.try_get_raw(col_name)
+        && let Some(v) = temporal_infinity(&raw)
+    {
+        return Ok(v);
     }
 
     // Richer types that would otherwise silently decode to Null (#78/#43).

@@ -325,7 +325,7 @@ fn time_text(t: &sqlx::mysql::types::MySqlTime) -> String {
     );
     match t.microseconds() {
         0 => {}
-        us if us % 1000 == 0 => out.push_str(&format!(".{:03}", us / 1000)),
+        us if us.is_multiple_of(1000) => out.push_str(&format!(".{:03}", us / 1000)),
         us => out.push_str(&format!(".{us:06}")),
     }
     out

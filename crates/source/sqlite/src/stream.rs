@@ -126,10 +126,10 @@ fn declared_boolean(row: &sqlx::sqlite::SqliteRow, idx: usize) -> bool {
 /// other text stays a string.
 fn text_to_json(text: String) -> Value {
     let trimmed = text.trim_start();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Ok(v @ (Value::Object(_) | Value::Array(_))) = serde_json::from_str(&text) {
-            return v;
-        }
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && let Ok(v @ (Value::Object(_) | Value::Array(_))) = serde_json::from_str(&text)
+    {
+        return v;
     }
     Value::String(text)
 }
