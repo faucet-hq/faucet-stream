@@ -95,6 +95,7 @@ These fields are flattened, so they appear at the sink `config` top level.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `job_timeout` | integer (seconds) | `3600` | Longest the sink waits for one BigQuery job it started (MERGE, overwrite swap, cleanup DELETE, DDL, load job). A job past the limit is cancelled before the write fails, so it cannot commit after the run was reported failed. `0` = no limit. |
 | `write_mode` | enum | `append` | `append` (bulk load by default; `insertAll` when `media_load: false` or `insert_id_field` is set), `upsert`, or `delete` (in-place `MERGE` / keyed `DELETE`), or `overwrite` (full refresh). An `upsert` updates only the columns a record carries: a column absent from the record keeps its current value on a matched row (an explicit `null` sets it to NULL). |
 | `key` | array | `[]` | Key column(s). **Required and non-empty** for `upsert`/`delete`; must be real columns of the target table. |
 | `delete_marker` | object | *(none)* | `upsert` only — `{ field: <name>, values: [<str>, …] }`; rows whose `field` matches one of `values` become deletes instead of upserts. |

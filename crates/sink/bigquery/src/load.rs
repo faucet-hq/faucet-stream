@@ -23,10 +23,6 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
-/// Max wall-clock spent polling a columnar Parquet load job to `DONE`. Load
-/// jobs can move a lot of data, so this is generous.
-const LOAD_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
-
 /// Full columnar write: encode `batch` to Parquet, stage it on GCS, then run a
 /// BigQuery `PARQUET` load job to completion. This is the sink's
 /// `write_batch_columnar` body, factored out here because it is pure cloud
@@ -268,7 +264,7 @@ async fn await_load_job(
     job_id: &str,
     location: Option<&str>,
 ) -> Result<(), FaucetError> {
-    let deadline = std::time::Instant::now() + LOAD_JOB_TIMEOUT;
+    let started = std::time::Instant::now();
     loop {
         let target = faucet_common_bigquery::raw::RawTarget {
             creds: &config.auth,
@@ -294,10 +290,11 @@ async fn await_load_job(
         if status.state.as_deref() == Some("DONE") {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(FaucetError::Sink(format!(
-                "BigQuery load job {job_id} did not finish within {LOAD_JOB_TIMEOUT:?}"
-            )));
+        if crate::sink::job_timed_out(config.job_timeout, started) {
+            return Err(crate::sink::cancel_timed_out_job(
+                client, config, "load", job_id, location,
+            )
+            .await);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

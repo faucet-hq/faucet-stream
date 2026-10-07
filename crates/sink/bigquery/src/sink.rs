@@ -23,19 +23,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// Max wall-clock spent polling an idempotent-write / token-read job to
-/// completion before giving up. Exactly-once pages are small, so this is a
-/// generous safety cap, not a steady-state wait.
-const IDEMPOTENT_JOB_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// Server-side long-poll window per `getQueryResults` completion check —
 /// BigQuery holds the connection open up to this long, so we don't busy-wait.
 const JOB_POLL_LONG_POLL_MS: i32 = 10_000;
 
-/// Max wall-clock spent polling a media-upload **load** job to completion.
-/// A bucket-free page load is a single job; this is a generous safety cap so a
-/// wedged job can't hang the run forever.
-const LOAD_JOB_TIMEOUT: Duration = Duration::from_secs(600);
+/// Whether a job polled since `started` has outlived `limit` (`0` = never).
+pub(crate) fn job_timed_out(limit: Duration, started: std::time::Instant) -> bool {
+    !limit.is_zero() && started.elapsed() >= limit
+}
+
+/// Best-effort `jobs.cancel` for a job that outlived `job_timeout`, returning
+/// the error the write fails with (SQL-96).
+pub(crate) async fn cancel_timed_out_job(
+    client: &Client,
+    config: &BigQuerySinkConfig,
+    kind: &str,
+    job_id: &str,
+    location: Option<&str>,
+) -> FaucetError {
+    let secs = config.job_timeout.as_secs();
+    let cancelled = match client
+        .job()
+        .cancel_job(&config.project_id, job_id, location)
+        .await
+    {
+        Ok(_) => "cancelled".to_string(),
+        Err(e) => {
+            tracing::warn!(job_id, error = %e, "BigQuery jobs.cancel failed after job_timeout");
+            format!("cancel failed: {e}")
+        }
+    };
+    FaucetError::Sink(format!(
+        "BigQuery {kind} job '{job_id}' did not complete within job_timeout ({secs}s); \
+         {cancelled}. Raise `job_timeout` (0 = no limit) for long-running jobs"
+    ))
+}
 
 /// `true` when a `tables.get` error is a 404 (table does not exist) — used by
 /// `current_schema` to report a not-yet-created target as `Ok(None)` rather
@@ -1252,19 +1274,13 @@ impl BigQuerySink {
                 }
                 return Ok(load_output_rows(&job));
             }
-            if started.elapsed() >= LOAD_JOB_TIMEOUT {
-                return Err(FaucetError::Sink(format!(
-                    "BigQuery load job '{job_id}' did not complete within {}s",
-                    LOAD_JOB_TIMEOUT.as_secs()
-                )));
+            if self.job_timed_out(started) {
+                return Err(self.cancel_timed_out_job("load", job_id, location).await);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
-    /// Base URL for the media/resumable **upload** endpoint. Fixed Google host in
-    /// production; overridable via `config.upload_base_url` so tests can point the
-    /// streaming load at a wiremock server.
     /// Where schema-tolerant fallback requests go (SQL-172).
     fn raw_target(&self) -> faucet_common_bigquery::raw::RawTarget<'_> {
         faucet_common_bigquery::raw::RawTarget {
@@ -1273,6 +1289,25 @@ impl BigQuerySink {
         }
     }
 
+    /// Whether a job started at `started` has outlived `job_timeout` (SQL-96).
+    fn job_timed_out(&self, started: std::time::Instant) -> bool {
+        job_timed_out(self.config.job_timeout, started)
+    }
+
+    /// Cancel a job that outlived `job_timeout` and build the run's error, so
+    /// the job cannot commit after the write was reported failed (SQL-96).
+    async fn cancel_timed_out_job(
+        &self,
+        kind: &str,
+        job_id: &str,
+        location: Option<&str>,
+    ) -> FaucetError {
+        cancel_timed_out_job(&self.client, &self.config, kind, job_id, location).await
+    }
+
+    /// Base URL for the media/resumable **upload** endpoint. Fixed Google host in
+    /// production; overridable via `config.upload_base_url` so tests can point the
+    /// streaming load at a wiremock server.
     fn upload_base(&self) -> &str {
         self.config
             .upload_base_url
@@ -1747,11 +1782,10 @@ impl BigQuerySink {
                 if resp.job_complete.unwrap_or(false) {
                     break;
                 }
-                if started.elapsed() >= IDEMPOTENT_JOB_TIMEOUT {
-                    return Err(FaucetError::Sink(format!(
-                        "BigQuery job '{job_id}' did not complete within {}s",
-                        IDEMPOTENT_JOB_TIMEOUT.as_secs()
-                    )));
+                if self.job_timed_out(started) {
+                    return Err(self
+                        .cancel_timed_out_job("query", &job_id, location.as_deref())
+                        .await);
                 }
                 // The server long-poll normally blocks until completion, but if
                 // it returns early, back off so a still-running job can't turn
@@ -2852,6 +2886,20 @@ impl faucet_core::Sink for BigQuerySink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_timeout_zero_never_expires() {
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        assert!(!super::job_timed_out(std::time::Duration::ZERO, long_ago));
+        assert!(super::job_timed_out(
+            std::time::Duration::from_secs(1),
+            long_ago
+        ));
+        assert!(!super::job_timed_out(
+            std::time::Duration::from_secs(60),
+            std::time::Instant::now()
+        ));
+    }
+
     #[test]
     fn persisted_bytes_reads_the_308_range_header() {
         assert_eq!(super::persisted_bytes(None).unwrap(), 0);

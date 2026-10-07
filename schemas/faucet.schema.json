@@ -21366,6 +21366,16 @@
                         "null"
                       ]
                     },
+                    "job_timeout": {
+                      "description": "Longest the sink waits, in seconds, for one BigQuery job it started (a\nMERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before\ncancelling it and failing the write. Default `3600`; `0` waits for as\nlong as the job runs. A job that times out is cancelled so it cannot\ncommit after the run has been reported failed.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
+                    },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",
                       "$ref": "#/$defs/sink_bigquery__WriteMode",

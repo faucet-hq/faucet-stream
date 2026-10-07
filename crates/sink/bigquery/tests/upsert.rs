@@ -455,3 +455,52 @@ async fn write_batch_idempotent_zero_rows_posts_watermark_only() {
         "no data params for a zero-row page: {pnames:?}"
     );
 }
+
+/// A MERGE that outlives `job_timeout` is cancelled before the write fails,
+/// so it cannot commit after the run was reported failed (SQL-96).
+#[tokio::test]
+async fn a_job_past_job_timeout_is_cancelled() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    let running = json!({
+        "kind": "bigquery#queryResponse",
+        "jobComplete": false,
+        "jobReference": {"projectId": PROJECT_ID, "jobId": "job-slow"}
+    });
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries/job-slow")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-slow/cancel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#jobCancelResponse",
+            "job": {"jobReference": {"projectId": PROJECT_ID, "jobId": "job-slow"}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+        c.job_timeout = std::time::Duration::from_millis(300);
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect_err("a job past job_timeout must fail the write");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("job_timeout") && msg.contains("cancelled"),
+        "{msg}"
+    );
+}
