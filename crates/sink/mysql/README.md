@@ -73,6 +73,7 @@ faucet run pipeline.yaml
 | `table_name` | string | — *(required)* | Target table. Quoted with backticks (embedded backticks doubled). |
 | `column_mapping` | `MysqlColumnMapping` | `{ json: { column: "data" } }` | How JSON records map to columns — see [Column mapping](#column-mapping). |
 | `max_connections` | int | `5` | Maximum connections in the `sqlx` pool. |
+| `write_timeout_secs` | int | `3600` | Longest one page write may wait on the server before it fails. A server that vanishes without closing the connection (failover, NAT or load-balancer idle eviction) would otherwise hang the run forever. `0` waits forever. |
 
 ### Batching
 
@@ -95,7 +96,7 @@ faucet run pipeline.yaml
 | Variant | YAML | Description |
 |---------|------|-------------|
 | `Json { column }` | `column_mapping: { json: { column: data } }` | Insert each record as a serialized JSON string in one column (defaults to `data`). Uses `INSERT INTO t (col) VALUES (?), (?), ...`. |
-| `AutoMap` | `column_mapping: auto_map` | Map top-level JSON keys directly to table columns discovered from `INFORMATION_SCHEMA.COLUMNS`. The INSERT column set is the **union** of record keys across the batch (a field present only in a later record is still written; on an append a row missing a column binds SQL `NULL`, while an **upsert** writes each row's own columns only, so a column a row omits keeps its stored value). A base64 string bound to a `BINARY`/`VARBINARY`/`BLOB` column is stored as its decoded bytes — how every faucet source emits binary; other text is bound as is. Extra keys with no matching column are silently ignored; records with no matching keys are skipped with a warning. |
+| `AutoMap` | `column_mapping: auto_map` | Map top-level JSON keys directly to table columns discovered from `INFORMATION_SCHEMA.COLUMNS`. The INSERT column set is the **union** of record keys across the batch (a field present only in a later record is still written; on an append a row missing a column binds SQL `NULL`, while an **upsert** writes each row's own columns only, so a column a row omits keeps its stored value). A base64 string bound to a `BINARY`/`VARBINARY`/`BLOB` column is stored as its decoded bytes — how every faucet source emits binary; other text is bound as is. Fields match columns exactly, else ignoring ASCII case (MySQL column names are case-insensitive). Extra keys with no matching column are not written — configure a `schema:` drift policy to add or quarantine them. A record matching **no** column is an error: `write_batch` fails, and `write_batch_partial` reports that row as failed so it reaches the DLQ. Integers above `i64::MAX` (`BIGINT UNSIGNED`) bind exactly. |
 
 ## Examples
 
@@ -178,6 +179,7 @@ In `auto_map` mode the INSERT is sub-chunked further so `rows × columns` never 
 - `column_mapping` must be `auto_map` — key columns must be real table columns, not packed inside a JSON blob.
 - `key` must be a non-empty list of column names.
 - The target table must have a **PRIMARY KEY or UNIQUE index whose columns exactly match `key`** (order-insensitive — a UNIQUE index on `(a, b)` matches `key: [b, a]`). MySQL's `ON DUPLICATE KEY UPDATE` does **not** name a conflict target; it resolves on *any* unique index on the table. Because the pipeline dedups and routes by exactly the configured `key`, a `key` that does not match a real unique index would make MySQL silently upsert on a *different* index — producing wrong results you cannot detect. To prevent this, the sink **validates `key` against `INFORMATION_SCHEMA.STATISTICS` at construction** and fails fast with a clear error if it does not match a PRIMARY/UNIQUE index exactly (a prefix, subset, or superset of an index does **not** match). If the table does not exist yet (no unique indexes found), the check is skipped with a warning and the first write surfaces the missing-table error.
+- For `write_mode: upsert` the `key` index must also be the table's **only** unique index: with `PRIMARY KEY (id)` and `UNIQUE (email)`, a row whose email collides with another row would update *that* row (keeping its id) instead of inserting, so such a table is refused at construction. `write_mode: delete` is unaffected.
 - A row missing/null in a key column fails. With a `dlq:` block configured, good rows are still written and only the bad rows are routed to the DLQ per-row; without a DLQ the whole batch fails.
 
 **`write_mode: upsert`** — each record is `INSERT … ON DUPLICATE KEY UPDATE` (last-write-wins). An optional `delete_marker` routes flagged records to deletes instead:
@@ -285,7 +287,7 @@ See the [effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/co
 Under `on_drift: evolve`, `MysqlSink::evolve_schema()` applies additive DDL:
 
 - **New columns** → `ADD COLUMN`. MySQL has no `ADD COLUMN IF NOT EXISTS`, so the current column set is read first and an `ADD COLUMN` is emitted only for names not already present (idempotent by pre-check).
-- **Lossless widenings** (e.g. integer → number) → `MODIFY COLUMN` — gated on `allow_type_widening`; re-running the same `MODIFY` is a no-op.
+- **Lossless widenings** (e.g. integer → number) → `MODIFY COLUMN` — gated on `allow_type_widening`; re-running the same `MODIFY` is a no-op. An integer column that starts receiving fractions becomes `DECIMAL(65,30)` (exact — `DOUBLE` would round every stored value above 2^53), and the statement re-emits the rest of the definition — `NOT NULL`, default, `ON UPDATE`, comment — so it survives. An `AUTO_INCREMENT` column cannot become `DECIMAL`; widening one fails with a schema-drift error.
 - **Nullability relaxations** → `MODIFY COLUMN` re-emits the column's exact definition from `INFORMATION_SCHEMA.COLUMNS` — `COLUMN_TYPE` (so `DECIMAL(12,2)` stays `DECIMAL(12,2)`), character set and collation, default (an expression default stays an expression), `AUTO_INCREMENT`, `ON UPDATE` and comment — with `NOT NULL` replaced by `NULL`. A generated column is left as it is.
 
 Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
@@ -387,7 +389,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 |---------|--------------------|
 | `MySQL pool acquire failed` / connection refused | Wrong `connection_url`, DB unreachable, or credentials rejected. Run `faucet doctor` — the sink's `SELECT 1` probe pinpoints connectivity vs auth. |
 | `Packet too large` / `max_allowed_packet` error | A single `INSERT` exceeded the server limit. Lower `batch_size` (or set a smaller upstream page size when using `batch_size: 0`), or raise the server's `max_allowed_packet`. |
-| Records silently not written in AutoMap mode | The record's keys don't match any existing column (extra keys are ignored; a record with **no** matching keys is skipped with a warning). Confirm the table columns match the JSON keys, or switch to JSON column mode. |
+| "record N has no field matching a column" | No field of the record names a column of the table (matching ignores case). Confirm the table columns match the JSON keys, or switch to JSON column mode. |
 | `upsert`/`delete` rejected at validate time | `write_mode: upsert`/`delete` requires `column_mapping: auto_map` and a non-empty `key`. Fix the config; `faucet validate` catches this before any run. |
 | Upsert updates nothing / inserts duplicates | The table has no PRIMARY/UNIQUE index on the `key` columns, so `ON DUPLICATE KEY UPDATE` never detects a conflict. Add the index. |
 | `mysql upsert: row N: ...` (missing/null key) | A record had a null/absent key column. Add a `dlq:` block to route those rows per-row, or fix upstream. |
@@ -436,6 +438,14 @@ mid-run failure leaves the previous rows intact. No `key` is needed; a missing t
 first run (staged from the first page, then renamed into place at commit — a
 failed first run leaves no table) when `create_table: true`.
 
+A `RENAME` swap would publish a table without the target's foreign keys and
+triggers (they stay on the renamed-away table). So when the target has either,
+the commit instead replaces its rows in place — `DELETE` + `INSERT … SELECT` in
+one transaction — keeping its definition (its triggers fire for those rows). A
+target that **other** tables reference by foreign key is refused before the run
+loads anything: InnoDB would re-point the children at the renamed-away table,
+and a `DELETE` would cascade into or be blocked by them.
+
 
 **Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table (or the `<table>__faucet_ovw_old` an interrupted `RENAME` swap leaves) read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
 
@@ -454,3 +464,11 @@ watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `mysql` source config
 `faucet verify` reads the destination back with). See the [rollback
 cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).
+
+The journal table is created on its own connection before the write
+transaction begins (MySQL commits an open transaction on any `CREATE TABLE`),
+so a journaled page stays one transaction. Before-images keep binary columns as
+base64, `BIT` as its integer and `DECIMAL` as exact text, and leave generated
+columns out, so a restore writes back exactly what was there. Rolling back an
+overwrite of a table with foreign keys or triggers puts the previous rows back
+in place rather than renaming.
