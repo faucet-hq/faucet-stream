@@ -45,10 +45,9 @@ fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
 impl PostgresSink {
     /// `<table>__faucet_prev` — the replaced table an overwrite keeps.
     pub(crate) fn previous_table_name(&self) -> String {
-        format!(
-            "{}{}",
-            self.config.table_name,
-            faucet_core::rollback::PREVIOUS_TABLE_SUFFIX
+        crate::sink::derived_table_name(
+            &self.config.table_name,
+            faucet_core::rollback::PREVIOUS_TABLE_SUFFIX,
         )
     }
 
@@ -110,7 +109,8 @@ impl PostgresSink {
             .collect();
         let sql = journal_sql();
 
-        let per = (MAX_PG_PARAMS / key.len().max(1)).max(1);
+        // The journal insert binds four values per key (#789 SQL-80).
+        let per = (MAX_PG_PARAMS / key.len().max(4)).max(1);
         for chunk in keys.chunks(per) {
             // 1) Current rows for the chunk's keys, as JSON, attributed to each
             // key by its position: re-deriving the key from the row's text
@@ -405,8 +405,7 @@ impl PostgresSink {
         let restored = if restores.is_empty() {
             0
         } else {
-            self.insert_auto_map_with_conflict(&mut *conn, &restores, Some(key))
-                .await? as u64
+            self.restore_images(&mut *conn, run_id, &restores).await?
         };
         let delete_journal = journal_sql().delete_table().replace(
             &quote_ident(faucet_core::rollback::RUN_JOURNAL_TABLE),
@@ -474,20 +473,26 @@ impl PostgresSink {
                 ..Default::default()
             });
         }
-        // Column list from the kept copy: the target may have gained columns
-        // since (schema evolution), and a bare `SELECT *` would misalign.
-        let cols = self
+        // Columns the kept copy has that the target can take: the target may
+        // have gained columns since (schema evolution), and generated columns
+        // are recomputed rather than written (#789 SQL-107).
+        let kept: Vec<String> = self
             .discover_columns(&mut *conn, &prev)
             .await?
             .into_iter()
-            .map(|(c, _)| quote_ident(&c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        for stmt in [
-            format!("TRUNCATE TABLE {target}"),
-            format!("INSERT INTO {target} ({cols}) SELECT {cols} FROM {prev}"),
-            format!("DROP TABLE {prev}"),
-        ] {
+            .map(|(c, _)| c)
+            .collect();
+        let roles = crate::sink::column_roles(&mut *conn, &target).await?;
+        let clear = crate::sink::clear_statements(
+            &target,
+            &crate::sink::referencing_foreign_keys(&mut *conn, &target).await?,
+        )?;
+        let copy = roles.copy_statements(&target, &prev, None, |c| kept.iter().any(|k| k == c));
+        let statements = clear
+            .into_iter()
+            .chain(copy)
+            .chain([format!("DROP TABLE {prev}")]);
+        for stmt in statements {
             sqlx::query(&stmt)
                 .execute(&mut *conn)
                 .await
@@ -499,6 +504,46 @@ impl PostgresSink {
             applied: true,
             ..Default::default()
         })
+    }
+
+    /// Re-insert the journaled before-images of `run_id` server-side: each
+    /// image is expanded with `jsonb_populate_record` into the target's row
+    /// type, so NUMERIC, timestamps and nested JSON come back exactly instead
+    /// of passing through an `f64` (#789 SQL-49). Generated columns are left
+    /// to the database; identity values are restored as they were.
+    async fn restore_images(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        run_id: &str,
+        images: &[Value],
+    ) -> Result<u64, FaucetError> {
+        let target = self.target_ref();
+        let roles = crate::sink::column_roles(&mut *conn, &target).await?;
+        let columns: Vec<String> = roles
+            .insertable
+            .into_iter()
+            .filter(|c| {
+                images
+                    .iter()
+                    .any(|img| img.as_object().is_some_and(|o| o.contains_key(c)))
+            })
+            .collect();
+        if columns.is_empty() {
+            return Ok(0);
+        }
+        let sql = restore_from_journal_sql(
+            &target,
+            &self.journal_ref(),
+            &columns,
+            &self.config.write.key,
+        );
+        let res = sqlx::query(&sql)
+            .bind(run_id)
+            .bind(&self.config.table_name)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| sink_err("restore before-images", e))?;
+        Ok(res.rows_affected())
     }
 
     /// Drop the journal rows of `run_id` for this table.
@@ -651,6 +696,33 @@ fn positional_key_select(
     )
 }
 
+/// `INSERT … SELECT` of every journaled image of one run (`$1` run id, `$2`
+/// table name) through `jsonb_populate_record(NULL::<target>, image)`,
+/// upserting by `key`.
+fn restore_from_journal_sql(
+    target: &str,
+    journal: &str,
+    columns: &[String],
+    key: &[String],
+) -> String {
+    let cols = columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let picked = columns
+        .iter()
+        .map(|c| format!("r.{}", quote_ident(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO {target} ({cols}) OVERRIDING SYSTEM VALUE SELECT {picked} FROM {journal} j \
+         CROSS JOIN LATERAL jsonb_populate_record(NULL::{target}, j.before_json) r \
+         WHERE j.run_id = $1 AND j.table_name = $2 AND j.before_json IS NOT NULL {}",
+        crate::sink::on_conflict_clause(key, columns)
+    )
+}
+
 /// The journal insert binds `before_json` as text; cast it to `jsonb`.
 fn cast_journal_placeholders(insert: &str, rows: usize) -> String {
     let mut out = insert.to_string();
@@ -673,6 +745,25 @@ mod tests {
             cast,
             "(\"a\", \"b\") IN (($1::int4, $2::text), ($3::int4, $4::text))"
         );
+    }
+
+    #[test]
+    fn restore_expands_images_into_the_row_type() {
+        let sql = restore_from_journal_sql(
+            "\"s\".\"t\"",
+            "\"s\".\"_faucet_run_journal\"",
+            &["id".into(), "amount".into()],
+            &["id".into()],
+        );
+        assert!(
+            sql.starts_with(
+                "INSERT INTO \"s\".\"t\" (\"id\", \"amount\") OVERRIDING SYSTEM VALUE \
+                 SELECT r.\"id\", r.\"amount\" FROM \"s\".\"_faucet_run_journal\" j"
+            ),
+            "{sql}"
+        );
+        assert!(sql.contains("jsonb_populate_record(NULL::\"s\".\"t\", j.before_json) r"));
+        assert!(sql.contains("ON CONFLICT"), "{sql}");
     }
 
     #[test]
