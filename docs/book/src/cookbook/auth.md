@@ -91,7 +91,10 @@ Set `persist.path` on an `oauth2_refresh` provider to durably store the rotated
 token (a file-backed state store) so later runs pick up where the last one left
 off. Token files are owner-only (`0600`, in a `0700` directory when faucet
 creates it), and a failed write fails the refresh rather than leaving the next
-run with a revoked token:
+run with a revoked token. The stored token is re-read before every refresh and
+written back with a compare-and-set, so overlapping runs that share the grant
+never refresh with a token another run already rotated away; a grant rejected
+with `invalid_grant` is retried once when the store holds a newer token:
 
 ```yaml
 auth:

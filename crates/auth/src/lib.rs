@@ -199,6 +199,16 @@ fn reject_unknown_keys(kind: &str, config: &Value) -> Result<(), FaucetError> {
     Ok(())
 }
 
+/// Whether a token-endpoint failure rejected the grant itself: `401`, or `400`
+/// with `invalid_grant` (RFC 6749 §5.2 — revoked, expired or already-rotated
+/// refresh token).
+pub(crate) fn is_rejected_grant(err: &FaucetError) -> bool {
+    let FaucetError::Auth(msg) = err else {
+        return false;
+    };
+    msg.contains("(HTTP 401)") || (msg.contains("(HTTP 400)") && msg.contains("invalid_grant"))
+}
+
 /// Compute the instant at which a token fetched now (with the given
 /// server-reported `expires_in`, in seconds) should be treated as expired,
 /// applying `expiry_ratio`. Returns `None` when the server gave no expiry.

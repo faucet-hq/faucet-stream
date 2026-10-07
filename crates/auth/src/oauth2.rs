@@ -227,31 +227,38 @@ impl OAuth2RefreshProvider {
         self
     }
 
-    /// Read the persisted refresh token (if any) into `state`, once. A store
-    /// read failure is logged and ignored — the config seed is the fallback, so
-    /// a missing/unreadable store degrades to the pre-persistence behavior
-    /// rather than failing the run.
-    async fn ensure_loaded(&self, state: &mut RefreshState) {
-        if state.loaded {
-            return;
-        }
+    /// Re-read the persisted refresh token before a refresh (#789 SERVE-16):
+    /// another holder of this grant — an overlapping run, another instance —
+    /// may have rotated it since this provider last looked. Returns what the
+    /// store held, which the rotated token is compare-and-set against. A store
+    /// read failure is logged and the in-memory token is used.
+    async fn reload(&self, state: &mut RefreshState) -> Observed {
+        let Some(store) = &self.store else {
+            return Observed::Unknown;
+        };
+        let first = !state.loaded;
         state.loaded = true;
-        let Some(store) = &self.store else { return };
         match store.get(&self.store_key).await {
-            Ok(Some(v)) => match persisted_token(&v, &self.seed) {
-                PersistedToken::Usable(tok) => {
-                    state.refresh_token = tok;
-                    tracing::debug!("oauth2_refresh: loaded persisted refresh token");
+            Ok(Some(v)) => {
+                match persisted_token(&v, &self.seed) {
+                    PersistedToken::Usable(tok) => {
+                        if tok != state.refresh_token {
+                            state.refresh_token = tok;
+                            tracing::debug!("oauth2_refresh: loaded persisted refresh token");
+                        }
+                    }
+                    PersistedToken::OtherGrant if first => tracing::warn!(
+                        key = %self.store_key,
+                        "oauth2_refresh: the persisted refresh token belongs to a different grant \
+                         than the configured refresh_token; ignoring it and using the config seed"
+                    ),
+                    _ => {}
                 }
-                PersistedToken::OtherGrant => tracing::warn!(
-                    key = %self.store_key,
-                    "oauth2_refresh: the persisted refresh token belongs to a different grant than \
-                     the configured refresh_token; ignoring it and using the config seed"
-                ),
-                PersistedToken::Empty => {}
-            },
+                Observed::Stored(Some(v))
+            }
             Ok(None) => {
-                if let Some(legacy) = &self.legacy_key
+                if first
+                    && let Some(legacy) = &self.legacy_key
                     && matches!(store.get(legacy).await, Ok(Some(_)))
                 {
                     tracing::warn!(
@@ -262,34 +269,80 @@ impl OAuth2RefreshProvider {
                          `persist.key: {legacy}` to keep using it"
                     );
                 }
+                Observed::Stored(None)
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "oauth2_refresh: could not read persisted refresh token; using the config seed"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "oauth2_refresh: could not read persisted refresh token; using the one in memory"
+                );
+                Observed::Unknown
+            }
         }
     }
 
-    /// Persist the current refresh token. A failure is an error: the server
+    /// Persist the current refresh token, compare-and-set against what the
+    /// store held before the refresh. When another holder rotated the grant
+    /// in the meantime its token is left in place (both are valid: the token
+    /// endpoint accepted both refreshes). A failure is an error: the server
     /// has already rotated the old token away, so a run that carried on would
     /// leave the next run holding a revoked token and needing a re-consent.
-    async fn persist(&self, state: &RefreshState) -> Result<(), FaucetError> {
+    async fn persist(&self, state: &RefreshState, observed: &Observed) -> Result<(), FaucetError> {
         let Some(store) = &self.store else {
             return Ok(());
         };
         let value = serde_json::json!({ "refresh_token": state.refresh_token, "seed": self.seed });
-        store.put(&self.store_key, &value).await.map_err(|e| {
-            FaucetError::Auth(format!(
+        let written = match observed {
+            Observed::Stored(expected) => {
+                store
+                    .compare_and_put(&self.store_key, expected.as_ref(), &value)
+                    .await
+            }
+            Observed::Unknown => store.put(&self.store_key, &value).await.map(|()| true),
+        };
+        match written {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::info!(
+                    key = %self.store_key,
+                    "oauth2_refresh: another holder of this grant stored a newer refresh token \
+                     first; keeping it"
+                );
+                Ok(())
+            }
+            Err(e) => Err(FaucetError::Auth(format!(
                 "oauth2_refresh: could not persist the rotated refresh token ({e}); the \
                  previous token is already revoked, so stopping rather than leaving the next \
                  run without a usable token"
-            ))
-        })
+            ))),
+        }
     }
 
-    /// Refresh using the *current* refresh token and capture rotation in place.
+    /// Refresh with the newest stored refresh token. When the token endpoint
+    /// rejects the grant and the store now holds a different token (another
+    /// holder rotated it mid-flight), retry once with that one before
+    /// reporting the grant as gone.
     async fn refresh(&self, state: &mut RefreshState) -> Result<String, FaucetError> {
-        self.ensure_loaded(state).await;
+        let observed = self.reload(state).await;
+        match self.exchange(state, &observed).await {
+            Err(e) if crate::is_rejected_grant(&e) && self.store.is_some() => {
+                let used = state.refresh_token.clone();
+                let observed = self.reload(state).await;
+                if state.refresh_token == used {
+                    return Err(e);
+                }
+                self.exchange(state, &observed).await
+            }
+            other => other,
+        }
+    }
+
+    /// One `refresh_token` grant with the current token; captures rotation.
+    async fn exchange(
+        &self,
+        state: &mut RefreshState,
+        observed: &Observed,
+    ) -> Result<String, FaucetError> {
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", &state.refresh_token),
@@ -309,13 +362,21 @@ impl OAuth2RefreshProvider {
         state.expires_at = expiry_instant(body.expires_in, self.expiry_ratio);
         if let Some(rotated) = body.refresh_token {
             state.refresh_token = rotated; // capture rotation centrally
-            if let Err(e) = self.persist(state).await {
+            if let Err(e) = self.persist(state, observed).await {
                 state.access_token = None;
                 return Err(e);
             }
         }
         Ok(body.access_token)
     }
+}
+
+/// What the durable store held when a refresh started.
+enum Observed {
+    /// No store, or it could not be read: write unconditionally.
+    Unknown,
+    /// The entry (or its absence) the rotated token replaces.
+    Stored(Option<Value>),
 }
 
 /// `(store, key, legacy_key)` of a `persist:` block.
@@ -794,6 +855,181 @@ mod tests {
         let err = p.credential().await.unwrap_err().to_string();
         assert!(err.contains("could not persist"), "{err}");
         assert!(err.contains("boom-write"), "{err}");
+    }
+
+    /// A token endpoint that accepts each refresh token once and rotates it.
+    async fn rotating_idp(steps: &[(&str, &str, &str)]) -> MockServer {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        for (used, access, next) in steps {
+            Mock::given(method("POST"))
+                .and(body_string_contains(format!("refresh_token={used}&")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": access,
+                    "expires_in": 0,
+                    "refresh_token": next,
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"error": "invalid_grant"})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn refresh_cfg(server: &MockServer) -> Value {
+        serde_json::json!({
+            "token_url": server.uri(),
+            "client_id": "id",
+            "client_secret": "secret",
+            "refresh_token": "rt0",
+        })
+    }
+
+    #[tokio::test]
+    async fn overlapping_holders_refresh_with_the_newest_stored_token() {
+        // #789 SERVE-16: two providers of one grant share a store; each
+        // re-reads it before refreshing, so neither spends a rotated-away token.
+        let server = rotating_idp(&[
+            ("rt0", "A1", "rt1"),
+            ("rt1", "A2", "rt2"),
+            ("rt2", "A3", "rt3"),
+        ])
+        .await;
+        let store: Arc<dyn StateStore> = Arc::new(faucet_core::MemoryStateStore::new());
+        let p1 = OAuth2RefreshProvider::from_config(&refresh_cfg(&server))
+            .unwrap()
+            .with_store(store.clone(), "k");
+        let p2 = OAuth2RefreshProvider::from_config(&refresh_cfg(&server))
+            .unwrap()
+            .with_store(store.clone(), "k");
+        assert_eq!(
+            p1.credential().await.unwrap(),
+            Credential::Bearer("A1".into())
+        );
+        assert_eq!(
+            p2.credential().await.unwrap(),
+            Credential::Bearer("A2".into())
+        );
+        assert_eq!(
+            p1.credential().await.unwrap(),
+            Credential::Bearer("A3".into())
+        );
+        assert_eq!(
+            store.get("k").await.unwrap().unwrap()["refresh_token"],
+            "rt3"
+        );
+    }
+
+    /// A store whose reads walk through `reads` (the last repeats) and whose
+    /// compare-and-set answers `cas`.
+    #[derive(Debug)]
+    struct ScriptedStore {
+        reads: std::sync::Mutex<Vec<Option<Value>>>,
+        cas: bool,
+        written: std::sync::Mutex<Vec<Value>>,
+    }
+    #[async_trait]
+    impl StateStore for ScriptedStore {
+        async fn get(&self, _key: &str) -> Result<Option<Value>, FaucetError> {
+            let mut reads = self.reads.lock().unwrap();
+            Ok(if reads.len() > 1 {
+                reads.remove(0)
+            } else {
+                reads[0].clone()
+            })
+        }
+        async fn put(&self, _key: &str, value: &Value) -> Result<(), FaucetError> {
+            self.written.lock().unwrap().push(value.clone());
+            Ok(())
+        }
+        async fn delete(&self, _key: &str) -> Result<(), FaucetError> {
+            Ok(())
+        }
+        async fn compare_and_put(
+            &self,
+            _key: &str,
+            _expected: Option<&Value>,
+            value: &Value,
+        ) -> Result<bool, FaucetError> {
+            if self.cas {
+                self.written.lock().unwrap().push(value.clone());
+            }
+            Ok(self.cas)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_grant_is_retried_once_with_a_newly_stored_token() {
+        let server = rotating_idp(&[("rtB", "B1", "rtC")]).await;
+        let store = Arc::new(ScriptedStore {
+            reads: std::sync::Mutex::new(vec![
+                Some(serde_json::json!({"refresh_token": "rtA"})),
+                Some(serde_json::json!({"refresh_token": "rtB"})),
+            ]),
+            cas: true,
+            written: Default::default(),
+        });
+        let p = OAuth2RefreshProvider::from_config(&refresh_cfg(&server))
+            .unwrap()
+            .with_store(store.clone(), "k");
+        assert_eq!(
+            p.credential().await.unwrap(),
+            Credential::Bearer("B1".into())
+        );
+        assert_eq!(store.written.lock().unwrap()[0]["refresh_token"], "rtC");
+
+        // Nothing newer stored: the rejection stands.
+        let server = rotating_idp(&[]).await;
+        let store = Arc::new(ScriptedStore {
+            reads: std::sync::Mutex::new(vec![Some(serde_json::json!({"refresh_token": "rtA"}))]),
+            cas: true,
+            written: Default::default(),
+        });
+        let p = OAuth2RefreshProvider::from_config(&refresh_cfg(&server))
+            .unwrap()
+            .with_store(store, "k");
+        let err = p.credential().await.unwrap_err().to_string();
+        assert!(err.contains("invalid_grant"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_compare_and_set_keeps_the_other_holders_token() {
+        let server = rotating_idp(&[("rt0", "A1", "rt1")]).await;
+        let store = Arc::new(ScriptedStore {
+            reads: std::sync::Mutex::new(vec![None]),
+            cas: false,
+            written: Default::default(),
+        });
+        let p = OAuth2RefreshProvider::from_config(&refresh_cfg(&server))
+            .unwrap()
+            .with_store(store.clone(), "k");
+        assert_eq!(
+            p.credential().await.unwrap(),
+            Credential::Bearer("A1".into())
+        );
+        assert!(store.written.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejected_grants_are_401_or_invalid_grant() {
+        let auth = |m: &str| FaucetError::Auth(m.into());
+        assert!(crate::is_rejected_grant(&auth("x (HTTP 401): no")));
+        assert!(crate::is_rejected_grant(&auth(
+            "x (HTTP 400): {\"error\":\"invalid_grant\"}"
+        )));
+        assert!(!crate::is_rejected_grant(&auth(
+            "x (HTTP 400): invalid_request"
+        )));
+        assert!(!crate::is_rejected_grant(&FaucetError::Config(
+            "(HTTP 401)".into()
+        )));
     }
 
     #[test]
