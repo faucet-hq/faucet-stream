@@ -2561,12 +2561,15 @@ components:
         active_runs: { type: integer }
     TenantDeleteReport:
       type: object
-      required: [runs, usage_records, change_requests, state_keys_deleted]
+      required: [runs, usage_records, change_requests, state_keys_deleted, catalog_datasets, catalog_edges, catalog_config_snapshots]
       properties:
         runs: { type: integer }
         usage_records: { type: integer }
         change_requests: { type: integer }
         state_keys_deleted: { type: integer }
+        catalog_datasets: { type: integer, description: "Catalog datasets only this tenant's runs touched." }
+        catalog_edges: { type: integer, description: "Catalog lineage edges this tenant's runs recorded." }
+        catalog_config_snapshots: { type: integer }
         state_keys_not_deleted: { type: array, items: { type: string }, description: "Keys left in place, with why." }
     FanoutResponse:
       type: object

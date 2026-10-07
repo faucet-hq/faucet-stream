@@ -18,6 +18,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// How many volume points a dataset keeps (older ones are pruned on write).
 pub const STATS_RETAIN: usize = 500;
@@ -141,7 +142,7 @@ pub struct RowSnapshot {
 pub struct ConnectorSnapshot {
     pub kind: String,
     /// Resolved config with every secret-sourced value replaced by a stable
-    /// `<secret:sha256:…>` token — no secret material is ever persisted.
+    /// `<secret:hmac:…>` token — no secret material is ever persisted.
     pub config: Value,
 }
 
@@ -388,6 +389,75 @@ pub fn profile_view(mut history: Vec<CatalogProfileRecord>) -> Option<CatalogPro
     history.truncate(PROFILE_DETAIL_LIMIT);
     let latest = history.first()?.clone();
     Some(CatalogProfile { latest, history })
+}
+
+/// What purging one namespace (a tenant's `{tenant}::` pipeline prefix) out
+/// of the catalog removes (#789 SERVE-51).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogPurgePlan {
+    /// `(src_id, dst_id)` of every edge a purged pipeline recorded.
+    pub edges: Vec<(String, String)>,
+    /// Datasets no remaining edge touches: removed with their schema
+    /// timeline, volume points and profiles.
+    pub datasets: Vec<String>,
+    /// Datasets another pipeline still touches whose last-run attribution
+    /// named a purged pipeline: re-attributed to the newest remaining edge as
+    /// `(pipeline, run id)`.
+    pub reattribute: BTreeMap<String, (String, String)>,
+}
+
+/// What a catalog purge removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogPurgeReport {
+    pub datasets: usize,
+    pub edges: usize,
+    pub config_snapshots: usize,
+}
+
+/// Plan the removal of every edge recorded under a pipeline starting with
+/// `prefix`, and of the datasets left without any edge. A dataset another
+/// pipeline still reads or writes is kept (it is shared), re-attributed when
+/// its last writer was purged.
+pub fn plan_purge(
+    edges: &[CatalogLineageEdge],
+    datasets: &BTreeMap<String, (String, String)>,
+    prefix: &str,
+    purged_runs: &std::collections::HashSet<String>,
+) -> CatalogPurgePlan {
+    let (gone, kept): (Vec<&CatalogLineageEdge>, Vec<&CatalogLineageEdge>) =
+        edges.iter().partition(|e| e.pipeline.starts_with(prefix));
+    let mut plan = CatalogPurgePlan {
+        edges: gone
+            .iter()
+            .map(|e| (e.src_id.clone(), e.dst_id.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    let touched: std::collections::BTreeSet<&str> = gone
+        .iter()
+        .flat_map(|e| [e.src_id.as_str(), e.dst_id.as_str()])
+        .collect();
+    for id in touched {
+        let newest = kept
+            .iter()
+            .filter(|e| e.src_id == id || e.dst_id == id)
+            .max_by(|a, b| a.last_seen.cmp(&b.last_seen));
+        match newest {
+            None => plan.datasets.push(id.to_string()),
+            Some(edge) => {
+                let stale = datasets.get(id).is_some_and(|(pipeline, run)| {
+                    pipeline.starts_with(prefix) || purged_runs.contains(run)
+                });
+                if stale {
+                    plan.reattribute.insert(
+                        id.to_string(),
+                        (edge.pipeline.clone(), edge.last_run_id.clone()),
+                    );
+                }
+            }
+        }
+    }
+    plan
 }
 
 /// Stable dataset id: the first 16 hex chars of sha256(uri). Short enough for

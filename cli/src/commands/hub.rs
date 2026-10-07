@@ -445,6 +445,7 @@ async fn rows(a: crate::cli::HubRowsArgs) -> CliResult<()> {
         selection: selection.as_ref(),
         state,
         history: Default::default(),
+        tenant: None,
     };
     let as_path = std::path::Path::new(&a.source);
     let is_pipeline = as_path.is_file()

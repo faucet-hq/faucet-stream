@@ -269,10 +269,14 @@ tenants starts two runs, and a key never reveals another tenant's run.
 
 ```bash
 curl -X DELETE localhost:8080/v1/tenants/acme -H "Authorization: Bearer $ADMIN"
-# → {"runs": 42, "usage_records": 42, "change_requests": 1, "state_keys_deleted": 3}
+# → {"runs": 42, "usage_records": 42, "change_requests": 1, "state_keys_deleted": 3,
+#    "catalog_datasets": 2, "catalog_edges": 1, "catalog_config_snapshots": 1}
 ```
 
-Deletes the tenant's run records, usage records, change requests, every
+Deletes the tenant's run records, usage records, change requests, its
+Data Movement Catalog rows (a tenant run records its datasets, lineage and
+config snapshot under the `<tenant>::<pipeline>` name, like its state keys;
+a dataset another pipeline also reads or writes is kept), every
 state key its runs used (recorded as each run starts, with its store spec
 sealed under the vault key) and their markers, its connections and pending
 connect sessions. It is refused while a run is queued or running. Destination

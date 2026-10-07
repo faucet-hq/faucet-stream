@@ -440,6 +440,37 @@ impl std::fmt::Debug for ConnectionTokenStore {
 }
 
 impl ConnectionTokenStore {
+    /// `rec` re-sealed with the refresh token in `value`; `None` when `value`
+    /// carries none.
+    fn rotated(
+        &self,
+        mut rec: ConnectionRecord,
+        mut spec: Value,
+        value: &Value,
+    ) -> Result<Option<ConnectionRecord>, FaucetError> {
+        let Some(token) = value.get("refresh_token").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        crate::secrets::registry::register(token);
+        if let Some(cfg) = spec.get_mut("config").and_then(Value::as_object_mut) {
+            let old = cfg.insert("refresh_token".into(), Value::String(token.to_string()));
+            // The rotated-away token is revoked; stop paying to scrub it.
+            if let Some(Value::String(old)) = old
+                && old != token
+            {
+                crate::secrets::registry::unregister(&old);
+            }
+        }
+        let rt = self.state.tenants();
+        let vault = rt
+            .vault
+            .as_ref()
+            .ok_or_else(|| FaucetError::State("no vault key".into()))?;
+        rec.sealed = vault.seal_for(&spec, &Vault::connection_context(&rec.tenant, &rec.name));
+        rec.updated_at = Utc::now();
+        Ok(Some(rec))
+    }
+
     async fn load(&self) -> Result<Option<(ConnectionRecord, Value)>, FaucetError> {
         let Some(rec) = self
             .state
@@ -476,26 +507,46 @@ impl StateStore for ConnectionTokenStore {
     }
 
     async fn put(&self, _key: &str, value: &Value) -> Result<(), FaucetError> {
-        let Some(token) = value.get("refresh_token").and_then(Value::as_str) else {
+        let Some((rec, spec)) = self.load().await? else {
             return Ok(());
         };
-        let Some((mut rec, mut spec)) = self.load().await? else {
+        let Some(next) = self.rotated(rec, spec, value)? else {
             return Ok(());
         };
-        crate::secrets::registry::register(token);
-        if let Some(cfg) = spec.get_mut("config").and_then(Value::as_object_mut) {
-            cfg.insert("refresh_token".into(), Value::String(token.to_string()));
-        }
-        let rt = self.state.tenants();
-        let vault = rt
-            .vault
-            .as_ref()
-            .ok_or_else(|| FaucetError::State("no vault key".into()))?;
-        rec.sealed = vault.seal_for(&spec, &Vault::connection_context(&rec.tenant, &rec.name));
-        rec.updated_at = Utc::now();
         self.state
             .history()
-            .connection_upsert(&rec)
+            .connection_upsert(&next)
+            .await
+            .map_err(|e| FaucetError::State(e.to_string()))
+    }
+
+    fn supports_compare_and_put(&self) -> bool {
+        true
+    }
+
+    async fn compare_and_put(
+        &self,
+        _key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        let Some((rec, spec)) = self.load().await? else {
+            return Ok(false);
+        };
+        let stored = spec
+            .pointer("/config/refresh_token")
+            .and_then(Value::as_str);
+        let wanted = expected.and_then(|v| v.get("refresh_token").and_then(Value::as_str));
+        if stored != wanted {
+            return Ok(false);
+        }
+        let since = rec.updated_at;
+        let Some(next) = self.rotated(rec, spec, value)? else {
+            return Ok(false);
+        };
+        self.state
+            .history()
+            .connection_replace(&next, since)
             .await
             .map_err(|e| FaucetError::State(e.to_string()))
     }
@@ -795,6 +846,12 @@ pub struct DeleteReport {
     pub usage_records: usize,
     pub change_requests: usize,
     pub state_keys_deleted: usize,
+    /// Data Movement Catalog rows recorded by the tenant's runs (#789
+    /// SERVE-51): datasets only the tenant touched, lineage edges and config
+    /// snapshots.
+    pub catalog_datasets: usize,
+    pub catalog_edges: usize,
+    pub catalog_config_snapshots: usize,
     /// State keys that could not be deleted, with why. The tenant is deleted
     /// anyway; these keys are left for the operator.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -802,7 +859,8 @@ pub struct DeleteReport {
 }
 
 /// Delete a tenant and everything it owns in faucet: its runs, usage
-/// records, change requests, state keys, connections and connect sessions.
+/// records, change requests, catalog rows, state keys, connections and
+/// connect sessions.
 /// Destination data is never touched. Refused while a run is active.
 pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteReport, ServeError> {
     get_tenant(state, tenant).await?;
@@ -849,6 +907,14 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
             report.runs += 1;
         }
     }
+
+    let purged = history
+        .catalog_purge(&format!("{tenant}::"), &run_ids)
+        .await
+        .map_err(store_err)?;
+    report.catalog_datasets = purged.datasets;
+    report.catalog_edges = purged.edges;
+    report.catalog_config_snapshots = purged.config_snapshots;
 
     let changes = history
         .change_list(&crate::serve::changes::ChangeListFilter {
@@ -1375,6 +1441,51 @@ mod tests {
         );
         store.delete("k").await.unwrap();
         assert!(format!("{store:?}").contains("crm"));
+    }
+
+    #[tokio::test]
+    async fn the_token_store_compare_and_sets_the_rotated_token() {
+        // #789 SERVE-16: a rotated token replaces only the one it was
+        // refreshed from; a writer that lost the race leaves the newer one.
+        let (state, v) = state_with_vault();
+        let store = ConnectionTokenStore {
+            state: state.clone(),
+            tenant: "acme".into(),
+            name: "crm".into(),
+        };
+        assert!(store.supports_compare_and_put());
+        let rt = |t: &str| serde_json::json!({"refresh_token": t});
+        assert!(!store.compare_and_put("k", None, &rt("x")).await.unwrap());
+        state
+            .history()
+            .connection_upsert(&conn(
+                &v,
+                "acme",
+                "crm",
+                serde_json::json!({"type": "oauth2_refresh", "config": {"refresh_token": "rt1"}}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compare_and_put("k", Some(&rt("rt1")), &rt("rt2"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compare_and_put("k", Some(&rt("rt1")), &rt("rt9"))
+                .await
+                .unwrap(),
+            "rt1 was already rotated away"
+        );
+        assert!(
+            !store
+                .compare_and_put("k", Some(&rt("rt2")), &serde_json::json!({"other": 1}))
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get("k").await.unwrap(), Some(rt("rt2")));
     }
 
     #[tokio::test]

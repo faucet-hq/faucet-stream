@@ -6,29 +6,103 @@
 //! from output the CLI emits (the [`RedactingWriter`]).
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Values shorter than this are not registered — masking 1–3 char strings
 /// would over-redact unrelated output.
 const MIN_REDACT_LEN: usize = 4;
 
-fn registry() -> &'static RwLock<HashSet<String>> {
-    static REG: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
-    REG.get_or_init(|| RwLock::new(HashSet::new()))
-}
-
 /// Shortest line of a multi-line secret registered on its own.
 const MIN_LINE_LEN: usize = 8;
 
-/// Register a resolved secret value so it is scrubbed from future output —
-/// along with the forms it takes once escaped (JSON logs, `{:?}` fields) and,
-/// for a multi-line secret such as a PEM key, each line on its own.
-pub fn register(secret: &str) {
-    if secret.len() < MIN_REDACT_LEN {
-        return;
+/// Most forms the registry holds (#789 SERVE-24). A long-running server
+/// registers every rotated token; past this the least recently registered
+/// secrets are dropped so redaction cost stays bounded.
+pub const MAX_FORMS: usize = 16_384;
+
+/// The registered forms, each with the sequence number of its last
+/// registration, plus the matcher compiled from them (rebuilt on change, not
+/// per call).
+struct Registry {
+    forms: HashMap<String, u64>,
+    seq: u64,
+    max_forms: usize,
+    compiled: Option<Arc<Compiled>>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            forms: HashMap::new(),
+            seq: 0,
+            max_forms: MAX_FORMS,
+            compiled: None,
+        }
     }
+}
+
+struct Compiled {
+    /// Every form, longest first (ties by text): a secret that is a
+    /// substring of another is replaced after it, so the longer one's tail
+    /// is never left exposed.
+    patterns: Vec<String>,
+    max_len: usize,
+}
+
+impl Registry {
+    fn insert(&mut self, forms: Vec<String>) {
+        self.seq += 1;
+        for f in forms {
+            self.forms.insert(f, self.seq);
+        }
+        if self.forms.len() > self.max_forms {
+            let mut by_age: Vec<(u64, String)> =
+                self.forms.iter().map(|(f, s)| (*s, f.clone())).collect();
+            by_age.sort();
+            let excess = self.forms.len() - self.max_forms;
+            let cutoff = by_age[excess - 1].0;
+            self.forms.retain(|_, s| *s > cutoff);
+        }
+        self.compiled = None;
+    }
+
+    fn compile(&self) -> Compiled {
+        let mut patterns: Vec<String> = self.forms.keys().cloned().collect();
+        patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        Compiled {
+            max_len: patterns.first().map(String::len).unwrap_or(0),
+            patterns,
+        }
+    }
+}
+
+fn registry() -> &'static RwLock<Registry> {
+    static REG: OnceLock<RwLock<Registry>> = OnceLock::new();
+    REG.get_or_init(|| RwLock::new(Registry::default()))
+}
+
+fn compiled() -> Arc<Compiled> {
+    if let Some(c) = &registry()
+        .read()
+        .expect("secret registry lock poisoned")
+        .compiled
+    {
+        return Arc::clone(c);
+    }
+    let mut reg = registry().write().expect("secret registry lock poisoned");
+    if let Some(c) = &reg.compiled {
+        return Arc::clone(c);
+    }
+    let c = Arc::new(reg.compile());
+    reg.compiled = Some(Arc::clone(&c));
+    c
+}
+
+/// The forms a secret takes in output: itself, escaped as JSON and `{:?}`,
+/// and for a multi-line secret each line on its own.
+fn forms_of(secret: &str) -> Vec<String> {
     let mut forms = vec![secret.to_owned()];
     let quoted = |s: String| s[1..s.len() - 1].to_owned();
     if let Ok(json) = serde_json::to_string(secret) {
@@ -44,8 +118,32 @@ pub fn register(secret: &str) {
                 .map(str::to_owned),
         );
     }
+    forms
+}
+
+/// Register a resolved secret value so it is scrubbed from future output —
+/// along with the forms it takes once escaped (JSON logs, `{:?}` fields) and,
+/// for a multi-line secret such as a PEM key, each line on its own.
+pub fn register(secret: &str) {
+    if secret.len() < MIN_REDACT_LEN {
+        return;
+    }
+    registry()
+        .write()
+        .expect("secret registry lock poisoned")
+        .insert(forms_of(secret));
+}
+
+/// Stop scrubbing `secret`: a refresh token rotated away (#789 SERVE-24).
+pub fn unregister(secret: &str) {
     let mut reg = registry().write().expect("secret registry lock poisoned");
-    reg.extend(forms);
+    let before = reg.forms.len();
+    for f in forms_of(secret) {
+        reg.forms.remove(&f);
+    }
+    if reg.forms.len() != before {
+        reg.compiled = None;
+    }
 }
 
 /// Replace every registered secret value in `input` with `***`.
@@ -58,24 +156,14 @@ pub fn redact(input: &str) -> Cow<'_, str> {
 /// it is called only for secrets actually present in `input`. Used by the
 /// config-snapshot writer (#374) to swap secrets for stable `<secret:hmac:…>`
 /// tokens instead of `***`, so a rotation surfaces as a changed hash without
-/// ever persisting the secret. Same longest-first ordering as [`redact`].
+/// ever persisting the secret. Longer secrets are replaced first.
 pub fn redact_with(input: &str, token: impl Fn(&str) -> String) -> Cow<'_, str> {
-    let reg = registry().read().expect("secret registry lock poisoned");
-    if reg.is_empty() {
-        return Cow::Borrowed(input);
-    }
-    // Process **longest secret first**: a secret that is a substring of another
-    // (e.g. `abcd` inside `abcdXYZW`) must be replaced *after* the longer one,
-    // otherwise replacing the shorter one first destroys the longer match and
-    // leaves its extra tail (`XYZW`) exposed. `HashSet` iteration order is
-    // randomized, so without this sort redaction is nondeterministic.
-    let mut secrets: Vec<&str> = reg.iter().map(String::as_str).collect();
-    secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    let c = compiled();
     let mut out: Option<String> = None;
-    for secret in secrets {
+    for secret in &c.patterns {
         let current = out.as_deref().unwrap_or(input);
-        if current.contains(secret) {
-            out = Some(current.replace(secret, &token(secret)));
+        if current.contains(secret.as_str()) {
+            out = Some(current.replace(secret.as_str(), &token(secret)));
         }
     }
     match out {
@@ -87,13 +175,7 @@ pub fn redact_with(input: &str, token: impl Fn(&str) -> String) -> Cow<'_, str> 
 /// Longest registered secret in bytes (0 if none). Sizes the [`RedactingWriter`]
 /// hold-back window so a secret split across two `write()` calls is still caught.
 fn max_secret_len() -> usize {
-    registry()
-        .read()
-        .expect("secret registry lock poisoned")
-        .iter()
-        .map(String::len)
-        .max()
-        .unwrap_or(0)
+    compiled().max_len
 }
 
 /// An `io::Write` adapter that runs [`redact`] over every chunk before
@@ -183,7 +265,7 @@ mod tests {
     use serial_test::serial;
 
     fn clear() {
-        registry().write().unwrap().clear();
+        *registry().write().unwrap() = Registry::default();
     }
 
     #[test]
@@ -267,6 +349,51 @@ mod tests {
             "secret leaked across write boundary: {out}"
         );
         assert_eq!(out, "token=*** done");
+    }
+
+    #[test]
+    #[serial]
+    fn unregister_drops_every_form_of_a_rotated_secret() {
+        clear();
+        register("rotated-away-token");
+        register("still-live-token");
+        assert_eq!(redact("rotated-away-token"), "***");
+        unregister("rotated-away-token");
+        unregister("never-registered");
+        assert_eq!(redact("rotated-away-token"), "rotated-away-token");
+        assert_eq!(redact("still-live-token"), "***");
+        clear();
+    }
+
+    #[test]
+    fn the_registry_is_bounded_and_evicts_the_oldest() {
+        let mut reg = Registry {
+            max_forms: 4,
+            ..Registry::default()
+        };
+        reg.insert(forms_of("the-very-first-secret"));
+        for i in 0..6 {
+            reg.insert(forms_of(&format!("bounded-secret-{i}")));
+        }
+        assert!(reg.forms.len() <= 4, "{}", reg.forms.len());
+        assert!(!reg.forms.contains_key("the-very-first-secret"));
+        assert!(reg.forms.contains_key("bounded-secret-5"));
+        let compiled = reg.compile();
+        assert_eq!(compiled.max_len, "bounded-secret-5".len());
+        assert!(Registry::default().compile().patterns.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn redact_with_hands_the_token_the_matched_secret() {
+        clear();
+        assert_eq!(redact_with("plain", |_| unreachable!()), "plain");
+        register("alpha-secret");
+        let out = redact_with("a alpha-secret b alpha-secret", |s| {
+            format!("<{}>", s.len())
+        });
+        assert_eq!(out, "a <12> b <12>");
+        clear();
     }
 
     #[test]

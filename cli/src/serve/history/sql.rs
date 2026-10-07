@@ -687,6 +687,9 @@ pub struct Stmts {
     pub tenant_delete_runs: String,
     pub tenant_delete_state_refs: String,
     pub connection_upsert: String,
+    /// Compare-and-set a connection on its stored `updated_at`. Params:
+    /// status, updated_at, body, tenant, name, expected updated_at.
+    pub connection_replace: String,
     pub connection_select: String,
     pub connection_list: String,
     pub connection_delete: String,
@@ -733,6 +736,21 @@ pub struct Stmts {
     pub catalog_upsert_config_snapshot: String,
     /// The latest config snapshot body for a pipeline. Param: pipeline.
     pub catalog_select_config_snapshot: String,
+    /// Catalog purge (#789 SERVE-51): one lineage edge. Params: src_id, dst_id.
+    pub catalog_delete_edge: String,
+    /// The dataset row, its schema timeline, volume points and profiles.
+    /// Param: dataset_id (each).
+    pub catalog_delete_dataset: String,
+    pub catalog_delete_dataset_versions: String,
+    pub catalog_delete_dataset_stats: String,
+    pub catalog_delete_dataset_profiles: String,
+    /// Volume points and profiles one run recorded. Param: run_id (each).
+    pub catalog_delete_run_stats: String,
+    pub catalog_delete_run_profiles: String,
+    /// Every config-snapshot pipeline name.
+    pub catalog_select_snapshot_pipelines: String,
+    /// One config snapshot. Param: pipeline.
+    pub catalog_delete_config_snapshot: String,
     // ── Pipeline templates (#444) ────────────────────────────────────────────
     /// Highest existing version for a template id (0 when new). Param: id.
     pub template_max_version: String,
@@ -1250,6 +1268,9 @@ impl Stmts {
             tenant_delete_runs: "DELETE FROM faucet_tenant_runs WHERE tenant=$1".into(),
             tenant_delete_state_refs: "DELETE FROM faucet_tenant_state_refs WHERE tenant=$1"
                 .into(),
+            connection_replace: "UPDATE faucet_tenant_connections SET status=$1, updated_at=$2, \
+                body=$3 WHERE tenant=$4 AND name=$5 AND updated_at=$6"
+                .into(),
             connection_upsert: "INSERT INTO faucet_tenant_connections \
                 (tenant, name, status, updated_at, body) VALUES ($1,$2,$3,$4,$5) \
                 ON CONFLICT (tenant, name) DO UPDATE SET status=excluded.status, \
@@ -1336,6 +1357,21 @@ impl Stmts {
                 .into(),
             catalog_select_config_snapshot:
                 "SELECT body FROM faucet_config_snapshots WHERE pipeline=$1".into(),
+            catalog_delete_edge: "DELETE FROM faucet_catalog_edges WHERE src_id=$1 AND dst_id=$2"
+                .into(),
+            catalog_delete_dataset: "DELETE FROM faucet_catalog_datasets WHERE id=$1".into(),
+            catalog_delete_dataset_versions:
+                "DELETE FROM faucet_catalog_schema_versions WHERE dataset_id=$1".into(),
+            catalog_delete_dataset_stats: "DELETE FROM faucet_catalog_stats WHERE dataset_id=$1"
+                .into(),
+            catalog_delete_dataset_profiles:
+                "DELETE FROM faucet_catalog_profiles WHERE dataset_id=$1".into(),
+            catalog_delete_run_stats: "DELETE FROM faucet_catalog_stats WHERE run_id=$1".into(),
+            catalog_delete_run_profiles: "DELETE FROM faucet_catalog_profiles WHERE run_id=$1"
+                .into(),
+            catalog_select_snapshot_pipelines: "SELECT pipeline FROM faucet_config_snapshots".into(),
+            catalog_delete_config_snapshot:
+                "DELETE FROM faucet_config_snapshots WHERE pipeline=$1".into(),
             template_max_version: "SELECT COALESCE(MAX(CAST(version AS BIGINT)), 0) AS v \
                 FROM faucet_templates WHERE id=$1"
                 .into(),
@@ -1674,6 +1710,9 @@ impl Stmts {
             tenant_delete_runs: "DELETE FROM faucet_tenant_runs WHERE tenant=?".into(),
             tenant_delete_state_refs: "DELETE FROM faucet_tenant_state_refs WHERE tenant=?"
                 .into(),
+            connection_replace: "UPDATE faucet_tenant_connections SET status=?, updated_at=?, \
+                body=? WHERE tenant=? AND name=? AND updated_at=?"
+                .into(),
             connection_upsert: "INSERT INTO faucet_tenant_connections \
                 (tenant, name, status, updated_at, body) VALUES (?,?,?,?,?) \
                 ON CONFLICT (tenant, name) DO UPDATE SET status=excluded.status, \
@@ -1760,6 +1799,21 @@ impl Stmts {
                 .into(),
             catalog_select_config_snapshot:
                 "SELECT body FROM faucet_config_snapshots WHERE pipeline=?".into(),
+            catalog_delete_edge: "DELETE FROM faucet_catalog_edges WHERE src_id=? AND dst_id=?"
+                .into(),
+            catalog_delete_dataset: "DELETE FROM faucet_catalog_datasets WHERE id=?".into(),
+            catalog_delete_dataset_versions:
+                "DELETE FROM faucet_catalog_schema_versions WHERE dataset_id=?".into(),
+            catalog_delete_dataset_stats: "DELETE FROM faucet_catalog_stats WHERE dataset_id=?"
+                .into(),
+            catalog_delete_dataset_profiles:
+                "DELETE FROM faucet_catalog_profiles WHERE dataset_id=?".into(),
+            catalog_delete_run_stats: "DELETE FROM faucet_catalog_stats WHERE run_id=?".into(),
+            catalog_delete_run_profiles: "DELETE FROM faucet_catalog_profiles WHERE run_id=?"
+                .into(),
+            catalog_select_snapshot_pipelines: "SELECT pipeline FROM faucet_config_snapshots".into(),
+            catalog_delete_config_snapshot:
+                "DELETE FROM faucet_config_snapshots WHERE pipeline=?".into(),
             template_max_version: "SELECT COALESCE(MAX(CAST(version AS INTEGER)), 0) AS v \
                 FROM faucet_templates WHERE id=?"
                 .into(),
@@ -3763,6 +3817,114 @@ macro_rules! impl_sql_history {
                 Ok(catalog::lineage_slice(edges, root, depth))
             }
 
+            async fn catalog_purge(
+                &self,
+                prefix: &str,
+                runs: &[String],
+            ) -> Result<
+                $crate::serve::history::catalog::CatalogPurgeReport,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::catalog;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let edges = self.catalog_all_edges().await?;
+                let mut attribution = std::collections::BTreeMap::new();
+                for r in sqlx::query(&self.stmts.catalog_select_datasets)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(backend)?
+                {
+                    let body: String = r.try_get("body").map_err(backend)?;
+                    let d: catalog::CatalogDataset = sql::decode_json(&body, "catalog dataset")?;
+                    attribution.insert(d.id.clone(), (d.pipeline, d.last_run_id));
+                }
+                let purged: std::collections::HashSet<String> = runs.iter().cloned().collect();
+                let plan = catalog::plan_purge(&edges, &attribution, prefix, &purged);
+                let mut tx = self.pool.begin().await.map_err(backend)?;
+                for (src, dst) in &plan.edges {
+                    sqlx::query(&self.stmts.catalog_delete_edge)
+                        .bind(src)
+                        .bind(dst)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                }
+                for id in &plan.datasets {
+                    for stmt in [
+                        &self.stmts.catalog_delete_dataset,
+                        &self.stmts.catalog_delete_dataset_versions,
+                        &self.stmts.catalog_delete_dataset_stats,
+                        &self.stmts.catalog_delete_dataset_profiles,
+                    ] {
+                        sqlx::query(stmt)
+                            .bind(id)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                    }
+                }
+                for (id, (pipeline, run)) in &plan.reattribute {
+                    let Some(row) = sqlx::query(&self.stmts.catalog_select_dataset)
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(backend)?
+                    else {
+                        continue;
+                    };
+                    let body: String = row.try_get("body").map_err(backend)?;
+                    let mut ds: catalog::CatalogDataset =
+                        sql::decode_json(&body, "catalog dataset")?;
+                    ds.pipeline = pipeline.clone();
+                    ds.last_run_id = run.clone();
+                    sqlx::query(&self.stmts.catalog_upsert_dataset)
+                        .bind(&ds.id)
+                        .bind(&ds.uri)
+                        .bind(&ds.kind)
+                        .bind(sql::fmt_ts(ds.last_seen))
+                        .bind(sql::encode_json(&ds, "catalog dataset")?)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                }
+                for run in runs {
+                    for stmt in [
+                        &self.stmts.catalog_delete_run_stats,
+                        &self.stmts.catalog_delete_run_profiles,
+                    ] {
+                        sqlx::query(stmt)
+                            .bind(run)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                    }
+                }
+                let mut config_snapshots = 0;
+                for r in sqlx::query(&self.stmts.catalog_select_snapshot_pipelines)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                {
+                    let pipeline: String = r.try_get("pipeline").map_err(backend)?;
+                    if pipeline.starts_with(prefix) {
+                        sqlx::query(&self.stmts.catalog_delete_config_snapshot)
+                            .bind(&pipeline)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                        config_snapshots += 1;
+                    }
+                }
+                tx.commit().await.map_err(backend)?;
+                Ok(catalog::CatalogPurgeReport {
+                    datasets: plan.datasets.len(),
+                    edges: plan.edges.len(),
+                    config_snapshots,
+                })
+            }
+
             async fn catalog_record_config_snapshot(
                 &self,
                 snapshot: &$crate::serve::history::catalog::ConfigSnapshot,
@@ -3992,6 +4154,26 @@ macro_rules! impl_sql_history {
                     .rows_affected();
                 tx.commit().await.map_err(backend)?;
                 Ok(n > 0)
+            }
+
+            async fn connection_replace(
+                &self,
+                connection: &$crate::serve::history::tenants::ConnectionRecord,
+                expected_updated_at: chrono::DateTime<chrono::Utc>,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let done = sqlx::query(&self.stmts.connection_replace)
+                    .bind(connection.status.as_str())
+                    .bind(sql::fmt_ts(connection.updated_at))
+                    .bind(sql::encode_json(connection, "connection")?)
+                    .bind(&connection.tenant)
+                    .bind(&connection.name)
+                    .bind(sql::fmt_ts(expected_updated_at))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(done.rows_affected() == 1)
             }
 
             async fn connection_upsert(

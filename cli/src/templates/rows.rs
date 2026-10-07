@@ -20,6 +20,29 @@ pub struct RowsQuery<'a> {
     pub overlay: Option<OverlayChoice>,
     pub selection: Option<&'a SelectionRequest>,
     pub state: bool,
+    /// List for a tenant (#709): read the tenant's own state namespace and
+    /// run history, never another tenant's (#789 SERVE-31).
+    pub tenant: Option<&'a crate::tenant_tokens::TenantValues>,
+}
+
+/// What `${tenant.*}` reads for `tenant`: its record, or just the id when the
+/// record is gone.
+pub async fn tenant_values(
+    store: &TemplateStore,
+    tenant: &str,
+) -> crate::tenant_tokens::TenantValues {
+    match store.tenant_get(tenant).await {
+        Ok(Some(rec)) => crate::tenant_tokens::TenantValues {
+            id: rec.id,
+            name: rec.name,
+            labels: rec.labels,
+        },
+        _ => crate::tenant_tokens::TenantValues {
+            id: tenant.to_string(),
+            name: None,
+            labels: Default::default(),
+        },
+    }
 }
 
 async fn record(
@@ -40,8 +63,9 @@ async fn record(
 async fn history(
     store: &TemplateStore,
     name: &str,
+    tenant: Option<&str>,
 ) -> (Vec<crate::status::HistoryRun>, Vec<String>) {
-    crate::status::history::read(store.as_ref(), name)
+    crate::status::history::read_scoped(store.as_ref(), name, tenant)
         .await
         .unwrap_or_default()
 }
@@ -60,7 +84,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
             }
             let name = pipeline_name(&doc, q.id);
             let history = if q.state {
-                history(store, &name).await
+                history(store, &name, q.tenant.map(|t| t.id.as_str())).await
             } else {
                 Default::default()
             };
@@ -71,6 +95,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
                     selection: q.selection,
                     state: q.state,
                     history,
+                    tenant: q.tenant,
                 },
             )
             .await?
@@ -101,7 +126,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
                 None => None,
             };
             let history = if q.state {
-                history(store, &src.id()).await
+                history(store, &src.id(), q.tenant.map(|t| t.id.as_str())).await
             } else {
                 Default::default()
             };
@@ -113,6 +138,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
                     selection: q.selection,
                     state: q.state,
                     history,
+                    tenant: q.tenant,
                 },
             )
             .await?;

@@ -1848,3 +1848,164 @@ async fn catalog_pages_by_sort_key_and_opaque_runs_clear_column_lineage() {
     let ab = edges.iter().find(|e| e.src_uri == "csv://a").unwrap();
     assert!(ab.column_lineage.is_none(), "{ab:?}");
 }
+
+/// #789 SERVE-51: purging a tenant namespace removes its edges, snapshots,
+/// volume points and profiles and every dataset only it touched; a dataset
+/// another pipeline shares is kept and re-attributed. Run against SQLite and
+/// the in-memory backend, which must agree.
+async fn catalog_purge_scenario(s: &dyn RunHistory) {
+    use faucet_cli::serve::history::catalog::{
+        CatalogProfileRecord, CatalogUpdate, ConfigSnapshot, DatasetObservation, DatasetRole,
+        dataset_id,
+    };
+    let obs = |uri: &str, role| DatasetObservation {
+        uri: uri.into(),
+        kind: "csv".into(),
+        role,
+        schema: None,
+        records: 3,
+    };
+    let t0 = Utc::now();
+    let update = |run: &str, pipeline: &str, src: &str, at| CatalogUpdate {
+        run_id: run.into(),
+        pipeline: pipeline.into(),
+        row: "default".into(),
+        recorded_at: at,
+        sources: vec![obs(src, DatasetRole::Source)],
+        sink: obs("csv://shared", DatasetRole::Sink),
+        column_lineage: None,
+    };
+    s.catalog_record(&update("r-other", "other", "csv://b", t0))
+        .await
+        .unwrap();
+    s.catalog_record(&update(
+        "r-acme",
+        "acme::p",
+        "csv://a",
+        t0 + ChronoDuration::seconds(5),
+    ))
+    .await
+    .unwrap();
+    let profile = |run: &str, pipeline: &str, secs| {
+        let mut p = faucet_core::Profiler::new(faucet_core::ProfilingSpec::default());
+        p.observe_page(&[serde_json::json!({"a": 1})]);
+        CatalogProfileRecord {
+            run_id: run.into(),
+            pipeline: pipeline.into(),
+            row: "default".into(),
+            recorded_at: t0 + ChronoDuration::seconds(secs),
+            profile: p.finish(),
+            drift: Vec::new(),
+            baseline_runs: 0,
+        }
+    };
+    let shared = dataset_id("csv://shared");
+    s.catalog_record_profile(&shared, &profile("r-other", "other", 1))
+        .await
+        .unwrap();
+    s.catalog_record_profile(&shared, &profile("r-acme", "acme::p", 6))
+        .await
+        .unwrap();
+    for pipeline in ["acme::p", "other"] {
+        s.catalog_record_config_snapshot(&ConfigSnapshot {
+            pipeline: pipeline.into(),
+            recorded_at: t0,
+            faucet_version: "test".into(),
+            rows: Default::default(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let report = s
+        .catalog_purge("acme::", &["r-acme".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.edges, report.datasets, report.config_snapshots),
+        (1, 1, 1),
+        "{report:?}"
+    );
+    assert!(
+        s.catalog_get_dataset(&dataset_id("csv://a"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let detail = s.catalog_get_dataset(&shared).await.unwrap().unwrap();
+    assert_eq!(detail.dataset.pipeline, "other");
+    assert_eq!(detail.dataset.last_run_id, "r-other");
+    assert!(detail.stats.iter().all(|p| p.run_id != "r-acme"));
+    assert_eq!(detail.upstream.len(), 1);
+    assert_eq!(detail.upstream[0].src_uri, "csv://b");
+    let profiles = s.catalog_profile_history(&shared, 10).await.unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].run_id, "r-other");
+    assert!(
+        s.catalog_last_config_snapshot("acme::p")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        s.catalog_last_config_snapshot("other")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let again = s.catalog_purge("acme::", &[]).await.unwrap();
+    assert_eq!(again, Default::default(), "idempotent");
+}
+
+#[tokio::test]
+async fn catalog_purge_removes_a_tenant_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    catalog_purge_scenario(&store(&dir, "purge.db").await).await;
+    catalog_purge_scenario(&faucet_cli::serve::history::memory::MemoryHistory::new(
+        Duration::from_secs(3600),
+    ))
+    .await;
+}
+
+/// #789 SERVE-16: a connection write is a compare-and-set on `updated_at`.
+async fn connection_replace_scenario(s: &dyn RunHistory) {
+    use faucet_cli::serve::history::tenants::{ConnectionRecord, ConnectionStatus};
+    let t0 = Utc::now();
+    let rec = |sealed: &str, at| ConnectionRecord {
+        tenant: "acme".into(),
+        name: "crm".into(),
+        provider_type: "oauth2_refresh".into(),
+        connect_provider: None,
+        sealed: sealed.into(),
+        status: ConnectionStatus::Active,
+        reauth_reason: None,
+        created_at: t0,
+        updated_at: at,
+        updated_by: "t".into(),
+    };
+    assert!(
+        !s.connection_replace(&rec("a", t0), t0).await.unwrap(),
+        "absent"
+    );
+    s.connection_upsert(&rec("a", t0)).await.unwrap();
+    let t1 = t0 + ChronoDuration::seconds(1);
+    assert!(s.connection_replace(&rec("b", t1), t0).await.unwrap());
+    let t2 = t0 + ChronoDuration::seconds(2);
+    assert!(
+        !s.connection_replace(&rec("c", t2), t0).await.unwrap(),
+        "stale updated_at"
+    );
+    let got = s.connection_get("acme", "crm").await.unwrap().unwrap();
+    assert_eq!(got.sealed, "b");
+    assert_eq!(got.updated_at, t1);
+}
+
+#[tokio::test]
+async fn connection_replace_is_a_compare_and_set() {
+    let dir = tempfile::tempdir().unwrap();
+    connection_replace_scenario(&store(&dir, "conn.db").await).await;
+    connection_replace_scenario(&faucet_cli::serve::history::memory::MemoryHistory::new(
+        Duration::from_secs(3600),
+    ))
+    .await;
+}

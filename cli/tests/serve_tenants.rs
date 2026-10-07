@@ -461,32 +461,15 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     let (code, tenants) = api.get("acme-tok", "/v1/tenants").await;
     assert_eq!(code, 200);
     assert_eq!(tenants.as_array().unwrap().len(), 1);
-    // The rows endpoint shows a tenant no shared state or run history
-    // (#789 SERVE-31); an admin still sees it.
+    // The rows endpoint shows a tenant its own state and runs, read under
+    // its namespace and filtered by tenant (#789 SERVE-31).
     let (code, rows) = api
         .get("acme-tok", &format!("/v1/templates/{id}/rows"))
         .await;
     assert_eq!(code, 200, "{rows}");
-    assert!(
-        rows["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|r| r.get("state").is_none()),
-        "{rows}"
-    );
-    assert!(
-        rows.to_string()
-            .contains("not shown to a tenant-scoped principal"),
-        "{rows}"
-    );
-    let (_, rows) = api
-        .get("admin-tok", &format!("/v1/templates/{id}/rows"))
-        .await;
-    assert!(
-        !rows.to_string().contains("tenant-scoped principal"),
-        "{rows}"
-    );
+    let row_state = &rows["rows"][0]["state"];
+    assert!(row_state["last_success"].is_string(), "{rows}");
+    assert!(!rows.to_string().contains("state omitted"), "{rows}");
     let (code, _) = api.get("acme-tok", "/v1/audit").await;
     assert_eq!(code, 403);
     // An operator-level route outside the tenant's scope is refused for the
@@ -941,11 +924,24 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
 
     // ── Delete cascade ─────────────────────────────────────────────────────
     #[cfg(feature = "catalog")]
+    let acme_edges = |lineage: &serde_json::Value| -> usize {
+        lineage["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["pipeline"].as_str().unwrap_or("").starts_with("acme::"))
+            .count()
+    };
+    #[cfg(feature = "catalog")]
     {
         let (_, u) = api
             .get("admin-tok", "/v1/usage?tenant=acme&include_records=true")
             .await;
         assert!(!u["records"].as_array().unwrap().is_empty(), "{u}");
+        // A tenant run's catalog rows are recorded under its namespace
+        // (#789 SERVE-51).
+        let (_, lineage) = api.get("admin-tok", "/v1/catalog/lineage").await;
+        assert!(acme_edges(&lineage) >= 1, "{lineage}");
     }
     let (code, report) = api
         .send(
@@ -970,6 +966,13 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
             .get("admin-tok", "/v1/usage?tenant=acme&include_records=true")
             .await;
         assert!(u["records"].as_array().unwrap().is_empty(), "{u}");
+        assert!(report["catalog_edges"].as_u64().unwrap() >= 1, "{report}");
+        assert!(
+            report["catalog_datasets"].as_u64().unwrap() >= 1,
+            "{report}"
+        );
+        let (_, lineage) = api.get("admin-tok", "/v1/catalog/lineage").await;
+        assert_eq!(acme_edges(&lineage), 0, "{lineage}");
     }
     let (code, _) = api.get("admin-tok", "/v1/tenants/acme").await;
     assert_eq!(code, 404);

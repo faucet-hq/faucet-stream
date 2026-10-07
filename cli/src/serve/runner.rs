@@ -1765,6 +1765,8 @@ async fn execute_run(
     let auth_result = loaded.auth_catalog();
     let LoadedSubmission { cfg, nodes, tenant } = loaded;
     let state_scope = tenant.as_ref().map(|t| t.state_scope()).unwrap_or_default();
+    #[cfg(feature = "catalog")]
+    let catalog_tenant = tenant.as_ref().map(|t| t.values.id.clone());
     let budget = run_budget(&cfg, tenant.as_deref());
 
     // Queued → running. From here the guard guarantees `mark_finished` (and a
@@ -1937,6 +1939,7 @@ async fn execute_run(
             run_id: Some(run_id.clone()),
             sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
             annotations: Vec::new(),
+            tenant: catalog_tenant.clone(),
         }),
         usage,
         budget,
@@ -1956,6 +1959,7 @@ async fn execute_run(
             run_id: Some(run_id.clone()),
             sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
             annotations: Vec::new(),
+            tenant: catalog_tenant.clone(),
         },
         cfg.name.clone().unwrap_or_else(|| "serve".to_string()),
         crate::catalog::snapshot::on_error_str(&cfg.execution).to_string(),

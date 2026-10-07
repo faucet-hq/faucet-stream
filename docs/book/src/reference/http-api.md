@@ -782,9 +782,9 @@ identity (`status`, `tags`, `default_selected`), hierarchy (`parent`,
 `children`, `depends_on`, `depth`, `per_parent_record`), `write` (resolved
 against `sink` when given, with `supported` / `unsupported_reason`), `read`,
 `guarantees`, `shape`, `params_used`, and the `faucet status` view as `state`
-when the state store is readable (`?state=false` skips it; a tenant-scoped
-principal never gets it — the state and run history are every tenant's — and
-the body says so in `notes`). Any selector
+when the state store is readable (`?state=false` skips it; for a
+tenant-scoped principal it is the tenant's own state — its `<tenant>::`
+state keys — and only its own runs). Any selector
 parameter (`select`, `only`, `skip`, `tags`, `status` comma-joined;
 `include_parents`) resolves that selection without running anything: rows gain
 `selected` / `pulled_in` / `blocked` / `excluded`, and the body gains `run_set`

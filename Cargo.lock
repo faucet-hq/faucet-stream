@@ -4753,7 +4753,6 @@ dependencies = [
 name = "faucet-cli"
 version = "1.13.2"
 dependencies = [
- "aho-corasick",
  "assert_cmd",
  "async-stream",
  "async-trait",

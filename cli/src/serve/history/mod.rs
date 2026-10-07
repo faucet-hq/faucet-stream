@@ -960,6 +960,20 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
+    /// Remove everything the catalog recorded for pipelines whose name starts
+    /// with `prefix` (a tenant's `{tenant}::` namespace) and for the runs in
+    /// `runs`: their lineage edges, config snapshots, profiles and volume
+    /// points, plus every dataset no other pipeline touches (#789 SERVE-51).
+    /// Default: nothing recorded, nothing removed.
+    async fn catalog_purge(
+        &self,
+        prefix: &str,
+        runs: &[String],
+    ) -> Result<catalog::CatalogPurgeReport, HistoryError> {
+        let _ = (prefix, runs);
+        Ok(catalog::CatalogPurgeReport::default())
+    }
+
     /// Record the latest resolved+expanded config snapshot for a pipeline
     /// (#374). Latest-wins per pipeline (upsert). Best-effort at the call site —
     /// recording never fails a run. Default: no-op.
@@ -1143,6 +1157,27 @@ pub trait RunHistory: Send + Sync {
         Err(HistoryError::Backend(
             "this run-history backend does not support tenant connections".into(),
         ))
+    }
+
+    /// Replace a connection only if its stored `updated_at` still equals
+    /// `expected_updated_at` — the compare-and-set two holders of one rotated
+    /// refresh token write through (#789 SERVE-16). `false` when the record
+    /// changed or is gone. Default: read, compare, upsert (not atomic).
+    async fn connection_replace(
+        &self,
+        connection: &tenants::ConnectionRecord,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, HistoryError> {
+        match self
+            .connection_get(&connection.tenant, &connection.name)
+            .await?
+        {
+            Some(cur) if cur.updated_at == expected_updated_at => {
+                self.connection_upsert(connection).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// One connection. Default: `None`.

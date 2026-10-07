@@ -739,6 +739,7 @@ async fn rows(args: crate::cli::TemplateRowsArgs) -> CliResult<()> {
             overlay: overlay_choice(args.overlay.as_deref(), &args.overlay_version)?,
             selection: selection.as_ref(),
             state: !args.no_state,
+            tenant: None,
         },
     )
     .await?;

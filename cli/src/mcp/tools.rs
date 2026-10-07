@@ -701,10 +701,15 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
     )
     .await
     .map_err(|e| e.to_string())?;
+    #[cfg(feature = "masking")]
+    let records = crate::preview_sample::mask(sample.records, first_root.masking.as_ref())
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "masking"))]
+    let records = sample.records;
     let mut doc = json!({
         "row": first_root.id,
-        "count": sample.records.len(),
-        "records": sample.records,
+        "count": records.len(),
+        "records": records,
     });
     if sample.timed_out {
         doc["timed_out"] = Value::Bool(true);
@@ -1008,6 +1013,10 @@ async fn list_template_rows(ctx: &McpContext, args: &Value) -> Result<String, St
         None => None,
     };
     let selection = selection_arg(args)?;
+    let tenant = match ctx.server.as_ref().and_then(|s| s.actor.tenant.as_deref()) {
+        Some(t) => Some(crate::templates::rows::tenant_values(store, t).await),
+        None => None,
+    };
     let report = crate::templates::rows::list_rows(
         store,
         crate::templates::rows::RowsQuery {
@@ -1017,6 +1026,7 @@ async fn list_template_rows(ctx: &McpContext, args: &Value) -> Result<String, St
             overlay: None,
             selection: selection.as_ref(),
             state: true,
+            tenant: tenant.as_ref(),
         },
     )
     .await
@@ -1531,6 +1541,27 @@ mod tests {
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"count\": 1"));
         assert!(text.contains("alice"));
+    }
+
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn preview_applies_the_masking_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = csv_config(dir.path());
+        cfg.push_str(
+            "  masking:\n    rules:\n      - name: names\n        match: {fields: [name]}\n        \
+             action: {type: redact}\n        applies_to: [elsewhere]\n",
+        );
+        let out = call_tool(
+            &ctx(false),
+            "preview",
+            &json!({ "config": cfg, "limit": 2 }),
+        )
+        .await;
+        assert_eq!(out["isError"], false, "{out}");
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("alice") && !text.contains("bob"), "{text}");
+        assert!(text.contains("\"***\""), "{text}");
     }
 
     #[tokio::test]

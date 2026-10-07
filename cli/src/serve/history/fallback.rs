@@ -425,6 +425,13 @@ impl RunHistory for FallbackHistory {
     ) -> Result<(), HistoryError> {
         strict!(self, p => p.connection_upsert(connection), f => f.connection_upsert(connection))
     }
+    async fn connection_replace(
+        &self,
+        connection: &super::tenants::ConnectionRecord,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.connection_replace(connection, expected_updated_at), f => f.connection_replace(connection, expected_updated_at))
+    }
     async fn connection_get(
         &self,
         tenant: &str,
@@ -473,6 +480,13 @@ impl RunHistory for FallbackHistory {
     }
     async fn usage_delete_runs(&self, run_ids: &[String]) -> Result<usize, HistoryError> {
         strict!(self, p => p.usage_delete_runs(run_ids), f => f.usage_delete_runs(run_ids))
+    }
+    async fn catalog_purge(
+        &self,
+        prefix: &str,
+        runs: &[String],
+    ) -> Result<crate::serve::history::catalog::CatalogPurgeReport, HistoryError> {
+        strict!(self, p => p.catalog_purge(prefix, runs), f => f.catalog_purge(prefix, runs))
     }
     async fn usage_delete_tenant(&self, tenant: &str) -> Result<usize, HistoryError> {
         strict!(self, p => p.usage_delete_tenant(tenant), f => f.usage_delete_tenant(tenant))
