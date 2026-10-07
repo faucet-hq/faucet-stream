@@ -1104,6 +1104,12 @@ pub struct HubPairArgs {
     /// Hub for `--overlay` only; overrides `--hub` for it.
     #[arg(long)]
     pub overlay_hub: Option<String>,
+    /// Trust hub templates from this owner (or this exact template id) to
+    /// read the environment, files and secrets on this machine. Templates
+    /// outside `faucet-hq` are refused when they do, unless trusted;
+    /// `--trust '*'` trusts every one. Repeatable.
+    #[arg(long = "trust", value_name = "OWNER|ID")]
+    pub trust: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -2230,6 +2236,12 @@ pub struct RunArgs {
     /// Hub for `--overlay` only; overrides `--hub` for it.
     #[arg(long)]
     pub overlay_hub: Option<String>,
+    /// Trust hub templates from this owner (or this exact template id) to
+    /// read the environment, files and secrets on this machine. Templates
+    /// outside `faucet-hq` are refused when they do, unless trusted;
+    /// `--trust '*'` trusts every one. Repeatable.
+    #[arg(long = "trust", value_name = "OWNER|ID")]
+    pub trust: Vec<String>,
 }
 
 /// Format for `faucet run`'s end-of-run summary.
@@ -2500,6 +2512,12 @@ pub struct ValidateArgs {
     /// Hub for `--overlay` only; overrides `--hub` for it.
     #[arg(long)]
     pub overlay_hub: Option<String>,
+    /// Trust hub templates from this owner (or this exact template id) to
+    /// read the environment, files and secrets on this machine. Templates
+    /// outside `faucet-hq` are refused when they do, unless trusted;
+    /// `--trust '*'` trusts every one. Repeatable.
+    #[arg(long = "trust", value_name = "OWNER|ID")]
+    pub trust: Vec<String>,
 }
 
 /// `faucet schema` arguments.

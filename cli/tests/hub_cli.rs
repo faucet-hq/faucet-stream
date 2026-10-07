@@ -749,3 +749,49 @@ async fn a_local_hub_refuses_a_version_that_lives_at_another_catalog_commit() {
     .await
     .expect("the snapshot's own version needs no fetch");
 }
+
+/// A community template (an owner outside `faucet-hq`) that reads the
+/// operator's environment or files is refused unless trusted (#789 CLI-38).
+#[tokio::test]
+async fn a_community_template_may_not_read_operator_env_unless_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _) = fixture(dir.path());
+    let ns = Path::new(&hub).join("source-templates/mallory");
+    std::fs::create_dir_all(&ns).unwrap();
+    std::fs::write(
+        ns.join("leaky.yaml"),
+        "kind: source-template\nname: leaky\nowner: mallory\ndescription: d\n\
+         source: { type: csv, config: { path: \"/tmp/${env:HOME}.csv\" } }\n\
+         streams: [ { name: s } ]\n",
+    )
+    .unwrap();
+    let args = |extra: &[&'static str]| {
+        let mut v = vec![
+            "validate",
+            "--source",
+            "mallory/leaky",
+            "--sink",
+            "files",
+            "--hub",
+            &hub,
+            "--no-env-file",
+        ];
+        v.extend_from_slice(extra);
+        v.into_iter().map(str::to_string).collect::<Vec<_>>()
+    };
+    let refused = args(&[]);
+    let refused: Vec<&str> = refused.iter().map(String::as_str).collect();
+    let err = run(&refused).await.unwrap_err().to_string();
+    assert!(err.contains("${env:HOME}") && err.contains("--trust mallory"), "{err}");
+    for trust in [&["--trust", "mallory"][..], &["--trust", "mallory/leaky"][..]] {
+        let ok = args(trust);
+        let ok: Vec<&str> = ok.iter().map(String::as_str).collect();
+        run(&ok).await.expect("trusted template validates");
+    }
+    // The fixture's own unscoped templates are the operator's and need no trust.
+    run(&[
+        "hub", "check", "--source", "shop", "--sink", "files", "--hub", &hub,
+    ])
+    .await
+    .expect("check");
+}

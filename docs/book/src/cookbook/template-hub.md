@@ -370,6 +370,12 @@ org exactly like any other namespace, and marked **official**. A bare name is
 shorthand for it: `--source erp` means `faucet-hq/erp`; when there is
 none, the CLI lists the community variants instead of guessing.
 
+A community template — any owner other than `faucet-hq` — may not read the
+machine it runs on: one that uses `${env:…}`, `${file:…}` or a secret-manager
+directive is refused, since it could send a credential to a URL it chooses.
+Hand it credentials through its declared params (`--param`, `--param-env`),
+or review it and pass `--trust <owner>` (or `--trust <owner/name>`).
+
 The full id names the composed pipeline, so state keys are
 `acme/erp::invoices` and two publishers' templates never collide in a
 shared state store or registry (`/` is a legal state-key character; the file

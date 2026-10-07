@@ -27,7 +27,7 @@ use crate::serve::history::catalog::{
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
