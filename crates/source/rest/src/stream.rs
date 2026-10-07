@@ -126,6 +126,12 @@ fn next_poll_delay(current: Duration, cap: Duration) -> Duration {
     std::cmp::min(current.saturating_mul(2), cap)
 }
 
+/// The poll-delay ceiling: `interval_secs`, but never below one second — a zero
+/// cadence would hammer the status endpoint back-to-back (API-55).
+fn poll_cap(interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs.max(POLL_BACKOFF_BASE_SECS))
+}
+
 /// Attach a mutual-TLS client identity (from [`TlsClientConfig`]) to the HTTP
 /// client builder. Only compiled with the `mtls` feature; the non-`mtls` stub
 /// errors so a `tls:` block on a build without the feature fails loudly rather
@@ -2076,7 +2082,7 @@ impl RestStream {
         // cap) so a long-running job doesn't hammer the API. `interval_secs` is
         // the ceiling, not a fixed wait — a fixed 15s made an instant job take
         // ~15s of dead poll-wait.
-        let poll_cap = std::time::Duration::from_secs(job.poll.interval_secs);
+        let poll_cap = poll_cap(job.poll.interval_secs);
         let mut poll_delay = std::cmp::min(
             std::time::Duration::from_secs(POLL_BACKOFF_BASE_SECS),
             poll_cap,
@@ -3746,6 +3752,13 @@ impl RestStream {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_zero_poll_interval_is_clamped_to_one_second() {
+        assert_eq!(poll_cap(0), Duration::from_secs(1));
+        assert_eq!(poll_cap(5), Duration::from_secs(5));
+        assert_eq!(next_poll_delay(poll_cap(0), poll_cap(0)), Duration::from_secs(1));
+    }
     use super::*;
     use serde_json::json;
 

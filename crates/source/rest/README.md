@@ -136,7 +136,7 @@ pagination: { type: RecordFieldCursor, field: JournalNumber, into: query, param:
 
 Both stop on a short page (fewer than `limit`/`page_size` records) and guard against a non-advancing cursor.
 
-**Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start.
+**Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start. It resumes **one** cursor, so it is refused with more than one `requests:` entry.
 
 ### Multi-array fan-out (`records_multi`) & envelope carry (`record_ancestors`)
 
@@ -495,7 +495,7 @@ job → poll a status endpoint until terminal → fetch the result → hand it t
 |-------|-------------|
 | `submit` | `{ method, url, headers, query, json }` — job-creation request. |
 | `job_id` | JSONPath to the job id in the submit response. |
-| `poll` | `{ url, method, interval_secs (5), timeout_secs (1800) }` — `${job_id}` substituted. `interval_secs` is the **ceiling** on the poll cadence, not a fixed wait: polling starts at 1s and doubles up to the cap, so a fast job is noticed in ~1s while a long one isn't hammered. |
+| `poll` | `{ url, method, interval_secs (5), timeout_secs (1800) }` — `${job_id}` substituted. `interval_secs` is the **ceiling** on the poll cadence, not a fixed wait: polling starts at 1s and doubles up to the cap, so a fast job is noticed in ~1s while a long one isn't hammered. A value of `0` is treated as `1`. `async_job` cannot be combined with `requests:` (every entry would submit the same job). |
 | `lookback` | Incremental only: re-read margin subtracted from the persisted bookmark (`45s` / `30m` / `6h`, default `5m`) — see below. |
 | `status` | `{ path, success: [...], failure: [...] }` — classify the poll response. |
 | `fetch` | `{ method, url \| url_from, headers, query, json }` — result download; body flows through `decode:`. Set **exactly one** of `url` (a `${job_id}`-templated path) or `url_from` (a JSONPath into the last poll body — see below). |
@@ -955,7 +955,7 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
 | `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same body returned twice in a row (content-stagnation detection for APIs that clamp out-of-range pages). |
-| `Offset` | `offset_param`, `limit_param`, `limit`, `total_path` | A zero-record page, offset reaches `total` (via `total_path`), or a page returns fewer records than `limit`. |
+| `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it. The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
 
 An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. `$top`/`$skip` paging) terminates cleanly rather than erroring.
 

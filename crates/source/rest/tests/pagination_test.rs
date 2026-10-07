@@ -187,6 +187,7 @@ fn offset_pagination_advances() {
         limit_param: "limit".into(),
         limit: 50,
         total_path: Some("$.total".into()),
+        rows_path: None,
     };
 
     let body = json!({"total": 120});
@@ -217,6 +218,7 @@ fn offset_stops_on_repeated_identical_page_without_total_path() {
         limit_param: "limit".into(),
         limit: 2,
         total_path: None,
+        rows_path: None,
     };
     let mut state = PaginationState::default();
     let body = json!([{"id": 1}, {"id": 2}]);
@@ -237,6 +239,7 @@ fn offset_continues_on_distinct_pages_without_total_path() {
         limit_param: "limit".into(),
         limit: 2,
         total_path: None,
+        rows_path: None,
     };
     let mut state = PaginationState::default();
 
@@ -250,13 +253,15 @@ fn offset_continues_on_distinct_pages_without_total_path() {
             .advance(&json!([{"id": 3}, {"id": 4}]), &no_headers(), &mut state, 2)
             .unwrap()
     );
-    // Short final page → stop via the existing record-count heuristic.
+    // A short page no longer ends paging (the server may clamp `limit`,
+    // API-15); the empty page after it does.
     assert!(
-        !style
+        style
             .advance(&json!([{"id": 5}]), &no_headers(), &mut state, 1)
             .unwrap()
     );
     assert_eq!(state.offset, 5);
+    assert!(!style.advance(&json!([]), &no_headers(), &mut state, 0).unwrap());
 }
 
 #[test]
@@ -269,6 +274,7 @@ fn offset_repeated_metadata_body_with_total_path_does_not_false_stop() {
         limit_param: "limit".into(),
         limit: 50,
         total_path: Some("$.total".into()),
+        rows_path: None,
     };
     let mut state = PaginationState::default();
     let body = json!({"total": 120});
@@ -455,4 +461,21 @@ fn next_link_body_loop_detection_stops_on_duplicate() {
     // Second advance: same link — loop detected.
     let has_next = style.advance(&body, &no_headers(), &mut state, 10).unwrap();
     assert!(!has_next, "expected loop detection to stop pagination");
+}
+
+#[test]
+fn offset_rows_path_advances_by_server_rows_not_child_records() {
+    // API-36: three child records from two server rows must advance by 2.
+    let style = PaginationStyle::Offset {
+        offset_param: "offset".into(),
+        limit_param: "limit".into(),
+        limit: 2,
+        total_path: None,
+        rows_path: Some("$.orders".into()),
+    };
+    let mut state = PaginationState::default();
+    let body = json!({"orders": [{"lines": [1, 2]}, {"lines": [3]}]});
+    assert!(style.advance(&body, &no_headers(), &mut state, 3).unwrap());
+    assert_eq!(state.offset, 2);
+    assert!(!style.advance(&json!({"orders": []}), &no_headers(), &mut state, 0).unwrap());
 }

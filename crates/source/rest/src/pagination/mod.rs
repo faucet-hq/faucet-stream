@@ -99,6 +99,13 @@ pub enum PaginationStyle {
         limit_param: String,
         limit: usize,
         total_path: Option<String>,
+        /// JSONPath whose matches are counted to advance the offset, instead of
+        /// the extracted record count. Required when `records_path` fans out
+        /// to nested children or `record_ancestors` is set, where the record
+        /// count is not the number of server rows (API-36). An array counts its
+        /// elements, an object 1, null or no match 0 (which ends pagination).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows_path: Option<String>,
     },
     /// Offset/limit pagination that writes the offset and limit into the JSON
     /// **request body** (POST-query APIs), rather than the query string
@@ -377,12 +384,19 @@ impl PaginationStyle {
                 Ok(true)
             }
             PaginationStyle::Offset {
-                limit, total_path, ..
+                limit,
+                total_path,
+                rows_path,
+                ..
             } => {
+                let count = match rows_path {
+                    Some(rp) => count_rows(body, rp)?,
+                    None => record_count,
+                };
                 let has_next = offset::advance(
                     body,
                     &mut state.offset,
-                    record_count,
+                    count,
                     *limit,
                     total_path.as_deref(),
                 )?;
@@ -393,7 +407,7 @@ impl PaginationStyle {
                 // page, so the run would loop until `max_pages`, duplicating
                 // records to the sink. Mirror the PageNumber guard: stop if
                 // this page's body is identical to the previous one. A
-                // zero-record / short page has already returned `false` above,
+                // zero-record page has already returned `false` above,
                 // so this only fires on a genuinely repeated full page.
                 //
                 // Scoped to `total_path.is_none()`: when `total_path` is set,

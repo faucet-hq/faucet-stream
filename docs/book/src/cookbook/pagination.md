@@ -13,7 +13,7 @@ window bookmark, because that would skip the pages it never read — only a
 | `Cursor` | the next-token JSONPath is null/absent (or repeats) |
 | `CursorInBody` | the next-token JSONPath is null/absent (or repeats) — for POST-search APIs that take the cursor in the request body |
 | `PageNumber` | a page returns zero records (or an identical body repeats) |
-| `Offset` | the offset reaches `total` (via `total_path`) or a short page arrives |
+| `Offset` | the offset reaches `total` (via `total_path`), or an empty page arrives (a short page alone does not stop it: servers clamp `limit`) |
 | `OffsetInBody` | a short page arrives — offset/limit are written into the JSON **request body** (POST-query APIs) |
 | `RecordFieldCursor` | a short page arrives — keyset paging by the running max/min of a **record field** |
 | `LinkHeader` | there's no `rel="next"` in the `Link` response header |

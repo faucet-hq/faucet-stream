@@ -178,6 +178,7 @@ async fn test_offset_pagination_terminates_when_server_ignores_offset() {
                 limit_param: "limit".into(),
                 limit: 2,
                 total_path: None,
+                rows_path: None,
             }),
     )
     .unwrap();
@@ -222,13 +223,21 @@ async fn test_offset_pagination_paginates_to_completion_when_pages_differ() {
         .mount(&server)
         .await;
 
-    // Short final page → stops via the record-count heuristic.
+    // A short page (the server capping `limit`) does not end paging (API-15);
+    // the empty page after it does.
     Mock::given(method("GET"))
         .and(path("/api/items"))
         .and(query_param("offset", "4"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "items": [{"id": 5}]
         })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .and(query_param("offset", "5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -240,6 +249,7 @@ async fn test_offset_pagination_paginates_to_completion_when_pages_differ() {
                 limit_param: "limit".into(),
                 limit: 2,
                 total_path: None,
+                rows_path: None,
             }),
     )
     .unwrap();
