@@ -233,7 +233,7 @@ fn matrix_config_requires_row_and_selects_it() {
 version: 1
 pipeline:
   source: { type: csv, config: { path: ./in.csv } }
-  sink:   { type: jsonl, config: { path: ./out.jsonl } }
+  sink:   { type: jsonl, config: { path: ./out.jsonl, append: true } }
 matrix:
   - id: plain
   - id: shaped
