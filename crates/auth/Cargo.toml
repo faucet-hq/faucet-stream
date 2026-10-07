@@ -28,10 +28,12 @@ base64.workspace = true
 percent-encoding = { workspace = true, optional = true }
 # RS256 JWT assertions for the Google service-account provider.
 jsonwebtoken = { workspace = true, optional = true }
+# Random OAuth1 nonces.
+uuid = { workspace = true, optional = true }
 
 [features]
 # OAuth1 (one-legged, HMAC-SHA256) request-signing provider.
-oauth1 = ["dep:percent-encoding"]
+oauth1 = ["dep:percent-encoding", "dep:uuid"]
 # Google service-account (RFC 7523 JWT-bearer) provider (#755).
 google-sa = ["dep:jsonwebtoken"]
 
