@@ -20,7 +20,16 @@ use wasmtime::{
 pub(crate) struct HostState {
     pub(crate) limits: StoreLimits,
     pub(crate) epoch_base: Instant,
+    pub(crate) logs_emitted: u32,
+    pub(crate) logs_dropped: u64,
 }
+
+/// Longest `faucet_v1::log` message forwarded; longer ones are truncated.
+pub(crate) const MAX_LOG_BYTES: usize = 4096;
+/// Log lines one instance may emit; the rest are counted and reported once.
+pub(crate) const MAX_LOGS_PER_INSTANCE: u32 = 100;
+/// Table-element ceiling, so a module cannot grow a table past the memory cap.
+pub(crate) const MAX_TABLE_ELEMENTS: usize = 100_000;
 
 /// A compiled WASM transform: owns the wasmtime engine, the compiled module,
 /// and the import linker. Cheap to build an instance from, per page.
@@ -53,6 +62,7 @@ impl WasmEngine {
 
         let mut config = Config::new();
         config.consume_fuel(true);
+        config.wasm_multi_memory(false);
         let engine = Engine::new(&config)
             .map_err(|e| FaucetError::Config(format!("wasm transform: engine init failed: {e}")))?;
 
@@ -147,6 +157,10 @@ impl WasmEngine {
     pub(crate) fn new_page_instance(&self) -> Result<WasmInstance, FaucetError> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.memory_bytes)
+            .memories(1)
+            .tables(1)
+            .table_elements(MAX_TABLE_ELEMENTS)
+            .instances(1)
             .trap_on_grow_failure(true)
             .build();
         let mut store = Store::new(
@@ -154,6 +168,8 @@ impl WasmEngine {
             HostState {
                 limits,
                 epoch_base: Instant::now(),
+                logs_emitted: 0,
+                logs_dropped: 0,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -184,7 +200,14 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>, FaucetError> {
             "faucet_v1",
             "log",
             |mut caller: Caller<'_, HostState>, level: i32, ptr: i32, len: i32| {
-                let msg = read_host_string(&mut caller, ptr, len);
+                let state = caller.data_mut();
+                if state.logs_emitted >= MAX_LOGS_PER_INSTANCE {
+                    state.logs_dropped += 1;
+                    return;
+                }
+                state.logs_emitted += 1;
+                let capped = len.clamp(0, MAX_LOG_BYTES as i32);
+                let msg = read_host_string(&mut caller, ptr, capped);
                 emit_log(level, &msg);
             },
         )

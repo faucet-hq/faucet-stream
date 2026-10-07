@@ -68,9 +68,16 @@ fn execute_page(
     let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
     eng.reload_if_changed();
     let mut inst = eng.new_page_instance()?;
+    let mut peak_memory = 0u64;
+    let mut dropped_logs = 0u64;
 
     let mut out = Vec::with_capacity(records.len());
     for rec in records {
+        if inst.trapped() {
+            peak_memory = peak_memory.max(inst.peak_memory());
+            dropped_logs += inst.dropped_logs();
+            inst = eng.new_page_instance()?;
+        }
         let input = serde_json::to_vec(&rec).map_err(|e| {
             FaucetError::Transform(format!("wasm transform: serialize record: {e}"))
         })?;
@@ -116,7 +123,16 @@ fn execute_page(
             }
         }
     }
-    metrics::memory_bytes(module_label, inst.peak_memory());
+    metrics::memory_bytes(module_label, peak_memory.max(inst.peak_memory()));
+    dropped_logs += inst.dropped_logs();
+    if dropped_logs > 0 {
+        tracing::warn!(
+            target: "faucet::transform::wasm",
+            module = %module_label,
+            dropped = dropped_logs,
+            "wasm module exceeded its log budget; further log lines were dropped"
+        );
+    }
     Ok(out)
 }
 
@@ -610,5 +626,82 @@ mod tests {
             t.run_page(vec![json!({"keep": true})]).unwrap(),
             vec![json!({"keep": true})]
         );
+    }
+
+    /// Traps on a short record after dirtying a global; a dirty instance drops
+    /// every later record instead of echoing it.
+    fn dirty_trap_wat() -> String {
+        format!(
+            r#"(module {PREAMBLE}
+            (global $dirty (mut i32) (i32.const 0))
+            (func (export "transform") (param $ptr i32) (param $len i32) (result i64)
+                (local $out i32)
+                (if (i32.lt_u (local.get $len) (i32.const 10))
+                    (then (global.set $dirty (i32.const 1)) unreachable))
+                (if (global.get $dirty) (then (return (i64.const 0))))
+                (local.set $out (global.get $bump))
+                (global.set $bump (i32.add (global.get $bump) (local.get $len)))
+                (memory.copy (local.get $out) (local.get $ptr) (local.get $len))
+                (i64.or
+                    (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+                    (i64.extend_i32_u (local.get $len)))))"#
+        )
+    }
+
+    #[test]
+    fn a_trapped_instance_is_replaced_before_the_next_record() {
+        let long = json!({"aaaaaaaaaaaa": 1});
+        let (t, _f) = build(&dirty_trap_wat(), |c| c.on_error = WasmOnError::Skip);
+        let out = t.run_page(vec![json!({}), long.clone()]).unwrap();
+        assert_eq!(out, vec![long.clone()]);
+        let (t, _f) = build(&dirty_trap_wat(), |c| c.on_error = WasmOnError::Passthrough);
+        let out = t
+            .run_page(vec![json!({}), long.clone(), json!({})])
+            .unwrap();
+        assert_eq!(out, vec![json!({}), long, json!({})]);
+    }
+
+    #[test]
+    fn a_module_with_two_memories_is_refused() {
+        let f = write_wasm(
+            r#"(module
+            (memory (export "memory") 1)
+            (memory $second 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "transform") (param i32) (param i32) (result i64) (i64.const 0)))"#,
+        );
+        let err = WasmTransform::compile(&cfg(f.path())).unwrap_err();
+        assert!(format!("{err}").contains("failed to compile"), "{err}");
+    }
+
+    #[test]
+    fn table_growth_is_capped() {
+        let wat = format!(
+            r#"(module {PREAMBLE}
+            (table $t 1 funcref)
+            (func (export "transform") (param i32) (param i32) (result i64)
+                (drop (table.grow $t (ref.null func) (i32.const 1000000)))
+                (i64.const 0)))"#
+        );
+        let (t, _f) = build(&wat, |_| {});
+        let err = t.run_page(vec![json!({"a": 1})]).unwrap_err();
+        assert!(format!("{err}").contains("transform"), "{err}");
+    }
+
+    #[test]
+    fn log_calls_are_capped_per_instance() {
+        let (t, _f) = build(&host_wat(), |_| {});
+        let eng = t.engine.lock().unwrap();
+        let mut inst = eng.new_page_instance().unwrap();
+        let extra = 25u64;
+        for _ in 0..(crate::engine::MAX_LOGS_PER_INSTANCE as u64 + extra) {
+            let r = inst.run(br#"{"a":1}"#).unwrap();
+            assert!(matches!(r.outcome, Outcome::Emit(_)));
+        }
+        assert_eq!(inst.dropped_logs(), extra);
+        assert!(!inst.trapped());
+        drop(eng);
+        let page: Vec<Value> = (0..150).map(|i| json!({"i": i})).collect();
+        assert_eq!(t.run_page(page).unwrap().len(), 150);
     }
 }
