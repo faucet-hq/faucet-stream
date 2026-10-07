@@ -199,11 +199,18 @@ fn is_secret_key(key: &str) -> bool {
     .any(|needle| k.contains(needle))
 }
 
+/// The shortest tenant-supplied string registered for redaction (#789
+/// SERVE-24): the redaction set is process-wide, so a short "secret" such
+/// as `https` would mask that word in every tenant's and admin's output.
+pub const MIN_TENANT_SECRET_LEN: usize = 12;
+
 /// Register every credential-looking string in a provider spec for redaction.
 pub fn register_secrets(value: &Value) {
     fn walk(v: &Value, secret: bool) {
         match v {
-            Value::String(s) if secret && !s.is_empty() => crate::secrets::registry::register(s),
+            Value::String(s) if secret && s.len() >= MIN_TENANT_SECRET_LEN => {
+                crate::secrets::registry::register(s)
+            }
             Value::Object(m) => m
                 .iter()
                 .for_each(|(k, v)| walk(v, secret || is_secret_key(k))),
@@ -239,16 +246,56 @@ fn catalog_builder(state: ServerState, tenant: String, names: BTreeSet<String>) 
 /// A connection's provider: an `oauth2_refresh` one persists every rotated
 /// refresh token back into the sealed connection, and every one is watched
 /// for a revoked grant.
+///
+/// Runs that overlap on this instance share one provider per stored
+/// connection version (#789 SERVE-16), so its single-flight refresh rotates
+/// the token once instead of every run refreshing with the same old token.
 fn connection_provider(
     state: &ServerState,
     tenant: &str,
     name: &str,
     spec: &Value,
 ) -> Result<SharedAuthProvider, FaucetError> {
+    use sha2::{Digest, Sha256};
+    static SHARED: std::sync::LazyLock<DashMap<String, std::sync::Weak<ReauthWatch>>> =
+        std::sync::LazyLock::new(DashMap::new);
+    let digest = Sha256::digest(spec.to_string().as_bytes());
+    let key = format!(
+        "{tenant}/{name}/{}",
+        digest
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    if let Some(shared) = SHARED.get(&key).and_then(|w| w.upgrade()) {
+        return Ok(shared);
+    }
+    SHARED.retain(|_, w| w.strong_count() > 0);
+    let inner = build_connection_inner(state, tenant, name, spec)?;
+    let watch = Arc::new(ReauthWatch {
+        statuses: inner.reauth_statuses().to_vec(),
+        inner: std::sync::RwLock::new(inner),
+        refreshes: spec.get("type").and_then(Value::as_str) == Some("oauth2_refresh"),
+        state: state.clone(),
+        tenant: tenant.to_string(),
+        name: name.to_string(),
+        fired: AtomicBool::new(false),
+    });
+    SHARED.insert(key, Arc::downgrade(&watch));
+    Ok(watch)
+}
+
+fn build_connection_inner(
+    state: &ServerState,
+    tenant: &str,
+    name: &str,
+    spec: &Value,
+) -> Result<SharedAuthProvider, FaucetError> {
     let kind = spec.get("type").and_then(Value::as_str).unwrap_or_default();
-    let inner: SharedAuthProvider = if kind == "oauth2_refresh" {
+    if kind == "oauth2_refresh" {
         let config = spec.get("config").cloned().unwrap_or(Value::Null);
-        Arc::new(
+        Ok(Arc::new(
             faucet_auth::OAuth2RefreshProvider::from_config(&config)?.with_store(
                 Arc::new(ConnectionTokenStore {
                     state: state.clone(),
@@ -257,17 +304,10 @@ fn connection_provider(
                 }),
                 "refresh_token",
             ),
-        )
+        ))
     } else {
-        faucet_auth::build_provider(spec)?
-    };
-    Ok(Arc::new(ReauthWatch {
-        inner,
-        state: state.clone(),
-        tenant: tenant.to_string(),
-        name: name.to_string(),
-        fired: AtomicBool::new(false),
-    }))
+        faucet_auth::build_provider(spec)
+    }
 }
 
 fn state_key_hook(state: ServerState, tenant: String) -> crate::executor::StateKeyHook {
@@ -459,8 +499,15 @@ pub fn is_revoked(err: &FaucetError) -> bool {
 
 /// Wraps a connection's provider: a revoked grant marks the connection
 /// `needs_reauth` (once per provider instance) and notifies the tenant.
+///
+/// Before declaring a refresh grant revoked it re-reads the stored
+/// connection and tries once more with what is there (#789 SERVE-16):
+/// another run or instance may have rotated the refresh token, which makes
+/// the old one `invalid_grant` without the grant being gone.
 struct ReauthWatch {
-    inner: SharedAuthProvider,
+    inner: std::sync::RwLock<SharedAuthProvider>,
+    statuses: Vec<u16>,
+    refreshes: bool,
     state: ServerState,
     tenant: String,
     name: String,
@@ -472,12 +519,42 @@ impl std::fmt::Debug for ReauthWatch {
         f.debug_struct("ReauthWatch")
             .field("tenant", &self.tenant)
             .field("name", &self.name)
-            .field("inner", &self.inner)
+            .field("inner", &self.current())
             .finish()
     }
 }
 
 impl ReauthWatch {
+    fn current(&self) -> SharedAuthProvider {
+        Arc::clone(&self.inner.read().expect("reauth watch lock poisoned"))
+    }
+
+    /// Swap in a provider built from the stored connection. `false` when
+    /// there is nothing newer to try.
+    async fn reload(&self) -> bool {
+        if !self.refreshes {
+            return false;
+        }
+        let Ok(Some(rec)) = self
+            .state
+            .history()
+            .connection_get(&self.tenant, &self.name)
+            .await
+        else {
+            return false;
+        };
+        let Ok(spec) = open_connection(&self.state.tenants(), &rec) else {
+            return false;
+        };
+        match build_connection_inner(&self.state, &self.tenant, &self.name, &spec) {
+            Ok(p) => {
+                *self.inner.write().expect("reauth watch lock poisoned") = p;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     async fn observe<T>(&self, r: Result<T, FaucetError>) -> Result<T, FaucetError> {
         if let Err(e) = &r
             && is_revoked(e)
@@ -490,14 +567,30 @@ impl ReauthWatch {
     }
 }
 
+/// Call `$op` on the current provider; on a revoked grant reload from the
+/// store and call it once more before reporting.
+macro_rules! with_reload {
+    ($self:ident, |$p:ident| $op:expr) => {{
+        let $p = $self.current();
+        let first = $op;
+        match first {
+            Err(e) if is_revoked(&e) && $self.reload().await => {
+                let $p = $self.current();
+                $self.observe($op).await
+            }
+            other => $self.observe(other).await,
+        }
+    }};
+}
+
 #[faucet_core::async_trait]
 impl AuthProvider for ReauthWatch {
     async fn credential(&self) -> Result<Credential, FaucetError> {
-        self.observe(self.inner.credential().await).await
+        with_reload!(self, |p| p.credential().await)
     }
 
     async fn invalidate(&self, stale: &Credential) -> Result<Credential, FaucetError> {
-        self.observe(self.inner.invalidate(stale).await).await
+        with_reload!(self, |p| p.invalidate(stale).await)
     }
 
     async fn sign_request(
@@ -506,8 +599,7 @@ impl AuthProvider for ReauthWatch {
         url: &str,
         query: &BTreeMap<String, String>,
     ) -> Result<Option<Credential>, FaucetError> {
-        self.observe(self.inner.sign_request(method, url, query).await)
-            .await
+        with_reload!(self, |p| p.sign_request(method, url, query).await)
     }
 
     async fn request_auth(
@@ -516,16 +608,17 @@ impl AuthProvider for ReauthWatch {
         url: &str,
         query: &BTreeMap<String, String>,
     ) -> Result<faucet_core::RequestAuth, FaucetError> {
-        self.observe(self.inner.request_auth(method, url, query).await)
-            .await
+        with_reload!(self, |p| p.request_auth(method, url, query).await)
     }
 
     fn reauth_statuses(&self) -> &[u16] {
-        self.inner.reauth_statuses()
+        // The provider kind never changes on reload, so the first one's
+        // statuses hold.
+        &self.statuses
     }
 
     fn provider_name(&self) -> &'static str {
-        self.inner.provider_name()
+        self.current().provider_name()
     }
 }
 
@@ -867,6 +960,82 @@ mod tests {
         ));
         let v = state.tenants().vault.clone().unwrap();
         (state, v)
+    }
+
+    #[tokio::test]
+    async fn a_token_rotated_elsewhere_is_reloaded_instead_of_marking_reauth() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let idp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=r0"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"error": "invalid_grant"})),
+            )
+            .mount(&idp)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=r1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-1", "refresh_token": "r2", "expires_in": 3600
+            })))
+            .mount(&idp)
+            .await;
+        let (state, v) = state_with_vault();
+        state
+            .history()
+            .tenant_upsert(&tenant("acme"))
+            .await
+            .unwrap();
+        let spec = |rt: &str| {
+            serde_json::json!({"type": "oauth2_refresh", "config": {
+                "token_url": format!("{}/token", idp.uri()),
+                "client_id": "c", "client_secret": "s", "refresh_token": rt
+            }})
+        };
+        state
+            .history()
+            .connection_upsert(&conn(&v, "acme", "crm", spec("r0")))
+            .await
+            .unwrap();
+        let p = connection_provider(&state, "acme", "crm", &spec("r0")).unwrap();
+        let again = connection_provider(&state, "acme", "crm", &spec("r0")).unwrap();
+        assert!(
+            Arc::ptr_eq(&p, &again),
+            "overlapping runs share one provider"
+        );
+        // Another instance rotated the token to r1 meanwhile.
+        state
+            .history()
+            .connection_upsert(&conn(&v, "acme", "crm", spec("r1")))
+            .await
+            .unwrap();
+        let cred = p.credential().await.expect("reloaded and refreshed");
+        assert!(
+            matches!(cred, Credential::Bearer(ref t) if t == "at-1"),
+            "{cred:?}"
+        );
+        let rec = state
+            .history()
+            .connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, ConnectionStatus::Active);
+        assert!(format!("{p:?}").contains("ReauthWatch"));
+        assert!(p.reauth_statuses().len() <= 2);
+        assert!(!p.provider_name().is_empty());
+
+        // A static connection has nothing to reload: revoked stays revoked.
+        let st = connection_provider(
+            &state,
+            "acme",
+            "static",
+            &serde_json::json!({"type": "static", "config": {"token": "x"}}),
+        )
+        .unwrap();
+        assert!(st.credential().await.is_ok());
     }
 
     #[tokio::test]
@@ -1240,6 +1409,13 @@ mod tests {
         assert!(!out.contains("pw-very-secret-2"), "{out}");
         assert!(out.contains("visible-client"), "{out}");
         assert!(out.contains("https://idp.example/token"), "{out}");
+        // A short tenant "secret" is not registered, so it cannot mask a
+        // common word for everyone.
+        register_secrets(&serde_json::json!({"config": {"token": "https"}}));
+        assert_eq!(
+            crate::secrets::registry::redact("https://x").into_owned(),
+            "https://x"
+        );
     }
 
     #[test]
