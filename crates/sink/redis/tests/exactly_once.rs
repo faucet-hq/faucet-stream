@@ -330,3 +330,46 @@ async fn crash_between_write_and_bookmark_yields_no_duplicates_on_resume() {
         "watermark must sit at seq 2, got: {token}"
     );
 }
+
+/// A data key holding another Redis type makes the exactly-once write refuse
+/// before writing anything — no rows and, above all, no watermark, so the
+/// page is not skipped as committed on the next run (#789 MSG-19). Under
+/// `MULTI`/`EXEC` the `RPUSH` failed at `EXEC` time while the token `SET`
+/// still applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrongtype_key_writes_neither_rows_nor_the_watermark() {
+    let (_container, url) = start_redis().await;
+    let mut conn = open_conn(&url).await;
+    let _: () = conn.set("q-wrong", "a string").await.unwrap();
+    let _: i64 = conn.rpush("q-ok", "seed").await.unwrap();
+    let sink = RedisSink::new(RedisSinkConfig::new(
+        &url,
+        RedisSinkType::List {
+            key: "q-wrong".into(),
+        },
+    ))
+    .await
+    .unwrap();
+    let err = sink
+        .write_batch_idempotent(&[json!({"id": 1})], "wt::row", "00000000000000000001")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("WRONGTYPE"), "{err}");
+    assert_eq!(get_token(&url, "wt::row").await, None);
+    let still: String = conn.get("q-wrong").await.unwrap();
+    assert_eq!(still, "a string");
+
+    // An existing list of the right type is appended to as before.
+    let ok = RedisSink::new(RedisSinkConfig::new(
+        &url,
+        RedisSinkType::List { key: "q-ok".into() },
+    ))
+    .await
+    .unwrap();
+    ok.write_batch_idempotent(&[json!({"id": 2})], "ok::row", "00000000000000000001")
+        .await
+        .unwrap();
+    let len: usize = conn.llen("q-ok").await.unwrap();
+    assert_eq!(len, 2);
+    assert!(get_token(&url, "ok::row").await.is_some());
+}
