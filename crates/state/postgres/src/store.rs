@@ -128,6 +128,24 @@ pub(crate) fn upsert_sql(table: &str) -> String {
     )
 }
 
+/// Swap an existing row whose value equals `$3` (JSONB equality: key order
+/// and whitespace do not matter).
+pub(crate) fn compare_update_sql(table: &str) -> String {
+    format!(
+        "UPDATE {} SET value = $2, updated_at = NOW() WHERE key = $1 AND value = $3",
+        quote_ident(table)
+    )
+}
+
+/// Write a row only when the key has none.
+pub(crate) fn insert_absent_sql(table: &str) -> String {
+    format!(
+        "INSERT INTO {} (key, value, updated_at) VALUES ($1, $2, NOW()) \
+         ON CONFLICT (key) DO NOTHING",
+        quote_ident(table)
+    )
+}
+
 pub(crate) fn delete_sql(table: &str) -> String {
     format!("DELETE FROM {} WHERE key = $1", quote_ident(table))
 }
@@ -205,6 +223,35 @@ impl StateStore for PostgresStateStore {
                     .map_err(|e| FaucetError::State(format!("failed to decode state key: {e}")))
             })
             .collect()
+    }
+
+    fn supports_compare_and_put(&self) -> bool {
+        true
+    }
+
+    /// Atomic: one conditional `UPDATE` (or `INSERT … ON CONFLICT DO NOTHING`
+    /// for an expected-absent key); the row lock serialises concurrent callers.
+    async fn compare_and_put(
+        &self,
+        key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        validate_state_key(key)?;
+        let sql = match expected {
+            Some(_) => compare_update_sql(&self.table),
+            None => insert_absent_sql(&self.table),
+        };
+        let mut query = sqlx::query(&sql).bind(key).bind(value);
+        if let Some(old) = expected {
+            query = query.bind(old);
+        }
+        let done = query.execute(&self.pool).await.map_err(|e| {
+            FaucetError::State(format!(
+                "Postgres compare-and-put for key '{key}' failed: {e}"
+            ))
+        })?;
+        Ok(done.rows_affected() == 1)
     }
 
     fn supports_atomic_batch(&self) -> bool {
@@ -361,6 +408,18 @@ mod tests {
         assert!(sql.contains("ON CONFLICT (key) DO UPDATE"));
         assert!(sql.contains("value = EXCLUDED.value"));
         assert!(sql.contains("updated_at = NOW()"));
+    }
+
+    #[test]
+    fn compare_and_put_sql_is_conditional() {
+        assert_eq!(
+            compare_update_sql("faucet_state"),
+            "UPDATE \"faucet_state\" SET value = $2, updated_at = NOW() \
+             WHERE key = $1 AND value = $3"
+        );
+        let insert = insert_absent_sql("faucet_state");
+        assert!(insert.starts_with("INSERT INTO \"faucet_state\""));
+        assert!(insert.ends_with("ON CONFLICT (key) DO NOTHING"));
     }
 
     #[test]
