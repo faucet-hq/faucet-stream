@@ -1825,7 +1825,7 @@ mod tests {
         let config = ElasticsearchSinkConfig::new("http://localhost:9200", "test_idx");
         let sink = ElasticsearchSink::new(config).unwrap();
 
-        let records = vec![
+        let records = [
             json!({"name": "Alice", "age": 30}),
             json!({"name": "Bob", "age": 25}),
         ];
@@ -1855,7 +1855,7 @@ mod tests {
             ElasticsearchSinkConfig::new("http://localhost:9200", "test_idx").id_field("doc_id");
         let sink = ElasticsearchSink::new(config).unwrap();
 
-        let records = vec![
+        let records = [
             json!({"doc_id": "abc-123", "name": "Alice"}),
             json!({"doc_id": 42, "name": "Bob"}),
             json!({"name": "Charlie"}), // missing id field
