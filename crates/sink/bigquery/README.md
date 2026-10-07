@@ -212,6 +212,8 @@ Appends (and overwrites) stream each page into a **single resumable load job** �
 
 This is the default because the alternative is job-latency bound rather than volume bound: a ~59k-row overwrite at `batch_size: 1000` issued ~60 sequential query jobs and took 6m44s, and BigQuery's per-table load-job budget (1,500/day) is spent one job per *run* here instead of one per *page*.
 
+**Native byte loads** (a source handing the sink raw NDJSON/CSV bytes) are typed by the sink's `schema` when set, else by the existing table's own schema, else as all-`STRING` columns from the payload (a CSV load's schema follows its header order). With `create_table: false` every load job is `CREATE_NEVER`, so a load cannot create the table the config says must already exist.
+
 **Sources that bookmark every page** (CDC, Kafka, Kinesis, incremental file reads) make the pipeline flush after each committed page, and a flush finalizes the load. So that a continuous stream does not run one load job per page — blocking on each and exhausting the daily budget — the first flush commits the run's load job and later append pages stream through `tabledata.insertAll` for the rest of the run (logged once). The same applies to native NDJSON pages; native CSV pages keep loading per page. On `arrow` builds the first columnar batch is one Parquet load and later batches join the row path, so a run makes at most two load jobs (`bulk_load: true` still stages and loads each batch through GCS).
 
 `batch_size` does not chunk the load — pages feed one stream. Three things opt out of it:

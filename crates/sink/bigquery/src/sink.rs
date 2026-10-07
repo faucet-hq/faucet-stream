@@ -365,6 +365,30 @@ fn all_string_schema<I: IntoIterator<Item = String>>(columns: I) -> Option<Value
     }
 }
 
+/// `schema`'s fields re-ordered to a CSV header's `columns` (a CSV load maps
+/// columns by position): a header column the schema lacks becomes a nullable
+/// `STRING`, so the load fails on it rather than shifting every later column.
+fn schema_in_column_order(schema: &Value, columns: &[String]) -> Value {
+    let fields = schema
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ordered: Vec<Value> = columns
+        .iter()
+        .map(|c| {
+            fields
+                .iter()
+                .find(|f| f.get("name").and_then(Value::as_str) == Some(c.as_str()))
+                .cloned()
+                .unwrap_or_else(
+                    || serde_json::json!({"name": c, "type": "STRING", "mode": "NULLABLE"}),
+                )
+        })
+        .collect();
+    serde_json::json!({ "fields": ordered })
+}
+
 /// Convert an `infer_schema`-shaped JSON Schema (`{"type":"object","properties":
 /// {"col":{"type":…}}}`) into a BigQuery load-job schema
 /// (`{"fields":[{"name","type","mode":"NULLABLE"}]}`). Field types map via the
@@ -1000,6 +1024,35 @@ impl BigQuerySink {
         }
     }
 
+    /// The load schema for a native byte load (SQL-126, SQL-134): the sink's
+    /// explicit `schema`, else the existing table's own schema (so a typed
+    /// table is neither retyped to `STRING` nor refused for a mismatched
+    /// schema), else `infer` (the payload's columns, all `STRING`).
+    async fn native_load_schema(
+        &self,
+        table_id: &str,
+        infer: impl FnOnce() -> Option<Value>,
+    ) -> Result<Option<Value>, FaucetError> {
+        if let Some(explicit) = self
+            .config
+            .schema
+            .as_ref()
+            .and_then(json_schema_to_load_schema)
+        {
+            return Ok(Some(explicit));
+        }
+        self.truncate_schema(table_id, infer).await
+    }
+
+    /// `CREATE_NEVER` on a load job when `create_table` is off, so a load
+    /// never creates the table the config says must already exist (SQL-126).
+    fn apply_create_disposition(&self, mut job: Value) -> Value {
+        if !self.config.create_table {
+            job["configuration"]["load"]["createDisposition"] = Value::from("CREATE_NEVER");
+        }
+        job
+    }
+
     /// Fetch (once) and cache the target table's schema as
     /// [`idempotent::FieldSpec`]s, returning an owned clone. Used by the
     /// exactly-once / upsert write paths, which require a table with a defined
@@ -1189,14 +1242,15 @@ impl BigQuerySink {
             return Ok(());
         }
         let ndjson = records_to_ndjson(records)?;
-        let job_json = build_load_job_json(
-            &self.config.project_id,
-            &self.config.dataset_id,
-            table_id,
-            write_disposition,
-            self.config.location.as_deref(),
-        )
-        .to_string();
+        let job_json = self
+            .apply_create_disposition(build_load_job_json(
+                &self.config.project_id,
+                &self.config.dataset_id,
+                table_id,
+                write_disposition,
+                self.config.location.as_deref(),
+            ))
+            .to_string();
         let media = gzip(ndjson.as_bytes())?;
         self.load_media(&job_json, &media).await.map(|_| ())
     }
@@ -1374,18 +1428,19 @@ impl BigQuerySink {
         write_disposition: &str,
         schema: Option<Value>,
     ) -> Result<UploadSession, FaucetError> {
-        let job_json = build_load_job_json_full(
-            &self.config.project_id,
-            &self.config.dataset_id,
-            table_id,
-            write_disposition,
-            self.config.location.as_deref(),
-            "NEWLINE_DELIMITED_JSON",
-            None,
-            schema,
-            false,
-        )
-        .to_string();
+        let job_json = self
+            .apply_create_disposition(build_load_job_json_full(
+                &self.config.project_id,
+                &self.config.dataset_id,
+                table_id,
+                write_disposition,
+                self.config.location.as_deref(),
+                "NEWLINE_DELIMITED_JSON",
+                None,
+                schema,
+                false,
+            ))
+            .to_string();
         let token = self.access_token().await?;
         let url = format!(
             "{}/upload/bigquery/v2/projects/{}/jobs?uploadType=resumable",
@@ -2457,17 +2512,14 @@ impl faucet_core::Sink for BigQuerySink {
                     }
                     // The explicit all-STRING schema (from the first chunk) opens the
                     // session; later chunks pass `None` (session already open).
-                    let schema = if !first {
-                        None
-                    } else if write_disposition == "WRITE_TRUNCATE" {
-                        self.truncate_schema(&table, || {
+                    let schema = if first {
+                        self.native_load_schema(&table, || {
                             native_batch_columns(&chunk, faucet_core::NativeFormat::NdJson, b',')
                                 .and_then(all_string_schema)
                         })
                         .await?
                     } else {
-                        native_batch_columns(&chunk, faucet_core::NativeFormat::NdJson, b',')
-                            .and_then(all_string_schema)
+                        None
                     };
                     rows += chunk.iter().filter(|&&b| b == b'\n').count();
                     self.feed_session_bytes(&table, write_disposition, schema, &chunk)
@@ -2493,11 +2545,7 @@ impl faucet_core::Sink for BigQuerySink {
                     native_batch_columns(&raw, faucet_core::NativeFormat::NdJson, b',')
                         .and_then(all_string_schema)
                 };
-                let schema = if write_disposition == "WRITE_TRUNCATE" {
-                    self.truncate_schema(&table, inferred).await?
-                } else {
-                    inferred()
-                };
+                let schema = self.native_load_schema(&table, inferred).await?;
                 self.feed_session_bytes(&table, write_disposition, schema, &raw)
                     .await?;
                 Ok(rows)
@@ -2510,29 +2558,29 @@ impl faucet_core::Sink for BigQuerySink {
                 }
                 let rows = batch.records.unwrap_or(0) as usize;
                 let skip_rows = if csv.has_header { Some(1) } else { None };
-                let inferred = || {
-                    native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter)
-                        .and_then(all_string_schema)
-                };
-                let schema = if write_disposition == "WRITE_TRUNCATE" {
-                    self.truncate_schema(&table, inferred).await?
-                } else {
-                    inferred()
+                let header =
+                    native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter);
+                let inferred = || header.clone().and_then(all_string_schema);
+                let schema = self.native_load_schema(&table, inferred).await?;
+                let schema = match (schema, csv.has_header, &header) {
+                    (Some(s), true, Some(cols)) => Some(schema_in_column_order(&s, cols)),
+                    (s, _, _) => s,
                 };
                 let autodetect_fallback = schema.is_none();
                 let media = gzip(&raw)?;
-                let job_json = build_load_job_json_full(
-                    &self.config.project_id,
-                    &self.config.dataset_id,
-                    &table,
-                    write_disposition,
-                    self.config.location.as_deref(),
-                    "CSV",
-                    skip_rows,
-                    schema,
-                    autodetect_fallback,
-                )
-                .to_string();
+                let job_json = self
+                    .apply_create_disposition(build_load_job_json_full(
+                        &self.config.project_id,
+                        &self.config.dataset_id,
+                        &table,
+                        write_disposition,
+                        self.config.location.as_deref(),
+                        "CSV",
+                        skip_rows,
+                        schema,
+                        autodetect_fallback,
+                    ))
+                    .to_string();
                 self.load_media(&job_json, &media).await?;
                 Ok(rows)
             }
@@ -2992,6 +3040,23 @@ mod tests {
         assert_eq!(
             super::txn_jitter(std::time::Duration::ZERO),
             std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn csv_schema_follows_the_header_order() {
+        let schema = json!({"fields": [
+            {"name": "b", "type": "INTEGER", "mode": "REQUIRED"},
+            {"name": "a", "type": "DATE", "mode": "NULLABLE"}
+        ]});
+        let ordered = super::schema_in_column_order(&schema, &["a".into(), "b".into(), "c".into()]);
+        let f = ordered["fields"].as_array().unwrap();
+        assert_eq!(f[0]["name"], "a");
+        assert_eq!(f[0]["type"], "DATE");
+        assert_eq!(f[1]["type"], "INTEGER");
+        assert_eq!(
+            f[2],
+            json!({"name": "c", "type": "STRING", "mode": "NULLABLE"})
         );
     }
 
