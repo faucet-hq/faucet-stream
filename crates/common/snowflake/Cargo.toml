@@ -19,6 +19,8 @@ jsonwebtoken.workspace = true
 rsa = { workspace = true, features = ["sha2"] }
 sha2.workspace = true
 base64.workspace = true
+# `gzip`: the SQL API gzip-encodes result partitions after the first.
+reqwest = { workspace = true, features = ["gzip"] }
 
 [package.metadata.docs.rs]
 all-features = true

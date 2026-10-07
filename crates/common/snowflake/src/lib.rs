@@ -127,6 +127,25 @@ pub fn jwt_account(account: &str) -> String {
     base.to_uppercase()
 }
 
+/// TCP connect timeout of [`http_client`].
+pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle read timeout of [`http_client`]: longer than the ~45 s the SQL API
+/// holds a submit before answering 202, so only a stalled connection trips it.
+pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The HTTP client the Snowflake source and sink share: gzip-decoding (result
+/// partitions after the first arrive gzip-encoded) with connect and idle-read
+/// timeouts, so a half-open connection fails instead of hanging the run.
+pub fn http_client() -> Result<reqwest::Client, FaucetError> {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .gzip(true)
+        .build()
+        .map_err(|e| FaucetError::Config(format!("snowflake: cannot build HTTP client: {e}")))
+}
+
 /// Compute the Snowflake public-key fingerprint (`SHA256:<base64>`) from a
 /// PEM-encoded RSA private key.
 ///
@@ -348,6 +367,12 @@ yCkue9tat7y9DS8+VR5D6cM9oQpKbrfG+PfTdlkCgYBf/pUWO94VgZvpV5Ui7MHb
     fn public_key_fingerprint_matches_openssl() {
         let fp = public_key_fingerprint(TEST_RSA_PKCS8_PEM).unwrap();
         assert_eq!(fp, "SHA256:NiQ5G+9Hr4ZBmdBscIoTOgx2SM6aWPG0/Q9Y6NuFtpI=");
+    }
+
+    #[test]
+    fn http_client_builds() {
+        assert!(http_client().is_ok());
+        assert!(HTTP_READ_TIMEOUT > std::time::Duration::from_secs(45));
     }
 
     #[test]

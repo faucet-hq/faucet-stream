@@ -14,7 +14,11 @@
 //! | `real`                  | `Number` (f64)                           |
 //! | `boolean`               | `Bool`                                   |
 //! | `text` / `binary`       | `String`                                 |
-//! | `date` / `time` / `timestamp_*` | `String` (ISO/Unix-seconds as-is) |
+//! | `date`                  | `String` `YYYY-MM-DD`                    |
+//! | `time`                  | `String` `HH:MM:SS[.fff…]`               |
+//! | `timestamp_ntz`         | `String` `YYYY-MM-DDTHH:MM:SS[.fff…]` (no offset) |
+//! | `timestamp_ltz`         | `String` UTC, `…Z`                       |
+//! | `timestamp_tz`          | `String` wall time with its `+HH:MM` offset |
 //! | `variant` / `object` / `array` | parsed JSON value (falls back to `String`) |
 //! | anything else           | `String` (raw cell)                      |
 //!
@@ -27,8 +31,8 @@ use serde_json::{Map, Value};
 /// are deserialised; everything else is ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ColumnMeta {
-    /// Column name as Snowflake reports it. Typically uppercase for
-    /// unquoted identifiers; we keep the casing untouched.
+    /// Column name as Snowflake reports it (upper-case for unquoted
+    /// identifiers); the casing is kept untouched as the row's JSON key.
     pub name: String,
     /// Low-level Snowflake type — lowercased identifiers like `"fixed"`,
     /// `"text"`, `"boolean"`, `"variant"`, `"timestamp_ntz"`. See the
@@ -81,15 +85,134 @@ fn cell_to_json(cell: Option<&Value>, ty: &str, scale: i64) -> Value {
         other => return other.clone(),
     };
 
-    match ty.to_ascii_lowercase().as_str() {
+    let ty = ty.to_ascii_lowercase();
+    match ty.as_str() {
         "fixed" => parse_number(s, scale),
         "real" => parse_real(s),
         "boolean" => parse_bool(s),
         "variant" | "object" | "array" => {
             serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_owned()))
         }
+        "date" | "time" | "timestamp_ntz" | "timestamp_ltz" | "timestamp_tz" => {
+            temporal_to_iso(s, &ty)
+                .map(Value::String)
+                .unwrap_or_else(|| Value::String(s.to_owned()))
+        }
         _ => Value::String(s.to_owned()),
     }
+}
+
+/// Render a SQL API temporal cell as ISO 8601. The JSON v2 format sends a
+/// DATE as days since the epoch, a TIME as seconds since midnight, NTZ/LTZ
+/// timestamps as epoch seconds, and TZ as `<epoch seconds> <offset + 1440>`
+/// (offset in minutes). Seconds are split as text so the fraction is exact.
+/// `None` when the cell is not in that shape.
+fn temporal_to_iso(s: &str, ty: &str) -> Option<String> {
+    let s = s.trim();
+    match ty {
+        "date" => {
+            let days: i64 = s.parse().ok()?;
+            let (y, m, d) = civil_from_days(days);
+            Some(format!("{y:04}-{m:02}-{d:02}"))
+        }
+        "time" => {
+            let (secs, frac) = split_seconds(s)?;
+            Some(format!("{}{frac}", clock(secs.rem_euclid(86_400))))
+        }
+        "timestamp_ntz" => {
+            let (secs, frac) = split_seconds(s)?;
+            Some(format!("{}{frac}", datetime(secs)))
+        }
+        "timestamp_ltz" => {
+            let (secs, frac) = split_seconds(s)?;
+            Some(format!("{}{frac}Z", datetime(secs)))
+        }
+        "timestamp_tz" => {
+            let (epoch, tz) = s.split_once(' ')?;
+            let (secs, frac) = split_seconds(epoch)?;
+            let offset_min = tz.trim().parse::<i64>().ok()? - 1440;
+            let sign = if offset_min < 0 { '-' } else { '+' };
+            let abs = offset_min.abs();
+            Some(format!(
+                "{}{frac}{sign}{:02}:{:02}",
+                datetime(secs + offset_min * 60),
+                abs / 60,
+                abs % 60
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Split a decimal seconds value into whole seconds (floored) and the exact
+/// fraction text (`.ddd`, empty when there is none).
+fn split_seconds(s: &str) -> Option<(i64, String)> {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !frac.bytes().all(|b| b.is_ascii_digit()) || frac.len() > 18 {
+        return None;
+    }
+    let whole: i64 = int.parse().ok()?;
+    let has_frac = frac.bytes().any(|b| b != b'0');
+    if !neg {
+        let f = if frac.is_empty() {
+            String::new()
+        } else {
+            format!(".{frac}")
+        };
+        return Some((whole, f));
+    }
+    if !has_frac {
+        let f = if frac.is_empty() {
+            String::new()
+        } else {
+            format!(".{frac}")
+        };
+        return Some((-whole, f));
+    }
+    let scale = 10u64.pow(frac.len() as u32);
+    let complement = scale - frac.parse::<u64>().ok()?;
+    Some((
+        -whole - 1,
+        format!(".{complement:0width$}", width = frac.len()),
+    ))
+}
+
+fn clock(secs_of_day: i64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs_of_day / 3600,
+        (secs_of_day / 60) % 60,
+        secs_of_day % 60
+    )
+}
+
+fn datetime(epoch_secs: i64) -> String {
+    let (y, m, d) = civil_from_days(epoch_secs.div_euclid(86_400));
+    format!(
+        "{y:04}-{m:02}-{d:02}T{}",
+        clock(epoch_secs.rem_euclid(86_400))
+    )
+}
+
+/// Proleptic Gregorian (year, month, day) for a day count since 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
 }
 
 /// Parse a `FIXED` (`NUMBER`/`DECIMAL`/`NUMERIC`) column value losslessly.
@@ -414,13 +537,77 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_passes_through_as_string() {
-        let row = [json!("1700000000.000000000")];
-        let cols = [col("TS", "timestamp_ntz")];
+    fn temporal_cells_render_as_iso_8601() {
+        let row = [
+            json!("19675"),
+            json!("45296.123456789"),
+            json!("1700000000.000000000"),
+            json!("1700000000.5"),
+            json!("1700000000.250 1920"),
+            json!("1700000000 1380"),
+        ];
+        let cols = [
+            col("D", "date"),
+            col("T", "time"),
+            col("NTZ", "timestamp_ntz"),
+            col("LTZ", "TIMESTAMP_LTZ"),
+            col("TZ", "timestamp_tz"),
+            col("TZW", "timestamp_tz"),
+        ];
         assert_eq!(
             row_to_json(&row, &cols),
-            json!({"TS": "1700000000.000000000"})
+            json!({
+                "D": "2023-11-14",
+                "T": "12:34:56.123456789",
+                "NTZ": "2023-11-14T22:13:20.000000000",
+                "LTZ": "2023-11-14T22:13:20.5Z",
+                "TZ": "2023-11-15T06:13:20.250+08:00",
+                "TZW": "2023-11-14T21:13:20-01:00",
+            })
         );
+    }
+
+    #[test]
+    fn temporal_cells_before_the_epoch_floor_the_seconds() {
+        let row = [json!("-1"), json!("-1.250"), json!("-86400"), json!("-0.5")];
+        let cols = [
+            col("D", "date"),
+            col("A", "timestamp_ntz"),
+            col("B", "timestamp_ntz"),
+            col("C", "timestamp_ntz"),
+        ];
+        assert_eq!(
+            row_to_json(&row, &cols),
+            json!({
+                "D": "1969-12-31",
+                "A": "1969-12-31T23:59:58.750",
+                "B": "1969-12-31T00:00:00",
+                "C": "1969-12-31T23:59:59.5",
+            })
+        );
+        assert_eq!(civil_from_days(-719_468), (0, 3, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn malformed_temporal_cells_pass_through() {
+        for (raw, ty) in [
+            ("x", "date"),
+            ("1.2.3", "timestamp_ntz"),
+            ("1.x", "time"),
+            ("", "timestamp_ltz"),
+            ("17 zz", "timestamp_tz"),
+            ("17", "timestamp_tz"),
+            ("1.1234567890123456789", "timestamp_ntz"),
+        ] {
+            let row = [json!(raw)];
+            assert_eq!(
+                row_to_json(&row, &[col("C", ty)]),
+                json!({"C": raw}),
+                "{ty} {raw}"
+            );
+        }
+        assert_eq!(temporal_to_iso("1", "text"), None);
     }
 
     #[test]
