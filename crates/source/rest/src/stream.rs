@@ -3797,9 +3797,27 @@ impl RestStream {
         let names = if !spec.objects.is_empty() {
             spec.objects.clone()
         } else if let Some(list) = &spec.list {
-            let url = format!("{base}{}", list.get);
-            let resp = self.discover_get_json(&url, "discovery list").await?;
-            crate::discovery::dataset_names(&resp, list)
+            let mut url = format!("{base}{}", list.get);
+            let mut names = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                if seen.len() >= crate::discovery::MAX_LIST_PAGES {
+                    return Err(FaucetError::Source(format!(
+                        "rest discovery: `list` followed {} pages without reaching the end",
+                        crate::discovery::MAX_LIST_PAGES
+                    )));
+                }
+                seen.insert(url.clone());
+                let resp = self.discover_get_json(&url, "discovery list").await?;
+                names.extend(crate::discovery::dataset_names_unsorted(&resp, list));
+                match crate::discovery::next_list_url(&resp, list, base) {
+                    Some(next) if !seen.contains(&next) => url = next,
+                    _ => break,
+                }
+            }
+            names.sort();
+            names.dedup();
+            names
         } else {
             return Err(FaucetError::Source(
                 "rest discovery: neither `list` nor `objects` produced any datasets".into(),

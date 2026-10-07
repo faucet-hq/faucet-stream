@@ -391,7 +391,7 @@ a catalog endpoint, a REST admin API) is pure YAML, never a code path.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`. Omit when `objects` is supplied directly. |
+| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`, and `next` (JSONPath to the next page's URL — absolute or relative to `base_url`; pages are followed until it is null/empty/repeats; without it only the first page is read). Omit when `objects` is supplied directly. |
 | `objects` | array<string> **or** string | `[]` | Datasets supplied directly — a list or a comma-separated string, so one run-param can drive it (`objects: "${param.objects}"`). |
 | `describe` | object / null | — | Step 2: per-dataset field discovery — `get` (templated path), `fields`/`field_name`/`field_type`/`field_nullable` JSONPaths, a `type_map`, and `skip_types`. Omit when the source returns every column by default. |
 | `emit.config` | object | — | Step 3: JSON deep-merged into the dataset's source config (e.g. a query built from `${field_names}`). Every string leaf is templated. |

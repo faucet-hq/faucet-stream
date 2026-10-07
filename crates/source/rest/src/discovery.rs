@@ -74,6 +74,32 @@ pub struct DiscoveryList {
     /// `[ChangeEvent, Feed, Share, History]`). Vendor-neutral name filtering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_name_suffixes: Vec<String>,
+    /// JSONPath to the next listing page's URL (absolute, or a path relative to
+    /// `base_url`) in each response, e.g. `$.next`. Pages are followed until it
+    /// is absent, null, empty or repeats. Without it only the first page is
+    /// read, so set it for a paginated listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// Most listing pages a `discovery.list` walk follows before failing.
+pub const MAX_LIST_PAGES: usize = 1000;
+
+/// The next listing page's URL from `response`, resolved against `base`.
+pub fn next_list_url(response: &Value, list: &DiscoveryList, base: &str) -> Option<String> {
+    let next = match extract_one(response, list.next.as_deref()?)? {
+        Value::String(s) => s,
+        _ => return None,
+    };
+    let next = next.trim();
+    if next.is_empty() {
+        return None;
+    }
+    Some(if next.starts_with("http://") || next.starts_with("https://") {
+        next.to_string()
+    } else {
+        format!("{base}/{}", next.trim_start_matches('/'))
+    })
 }
 
 /// A keep-if predicate: keep a listing item when the value at `path` equals
@@ -198,8 +224,25 @@ fn map_type(raw: Option<&str>, type_map: &HashMap<String, String>) -> String {
 /// Filter + name a listing response's items into dataset names (keep_if, then
 /// name-suffix exclusion), sorted for determinism.
 pub fn dataset_names(list_response: &Value, list: &DiscoveryList) -> Vec<String> {
+    dataset_names_unsorted(list_response, list).sorted_dedup()
+}
+
+trait SortedDedup {
+    fn sorted_dedup(self) -> Self;
+}
+
+impl SortedDedup for Vec<String> {
+    fn sorted_dedup(mut self) -> Self {
+        self.sort();
+        self.dedup();
+        self
+    }
+}
+
+/// The names one listing page contributes, in response order.
+pub fn dataset_names_unsorted(list_response: &Value, list: &DiscoveryList) -> Vec<String> {
     let items = extract_records(list_response, Some(&list.items)).unwrap_or_default();
-    let mut names: Vec<String> = items
+    items
         .iter()
         .filter(|item| match &list.keep_if {
             Some(p) => extract_one(item, &p.path).as_ref() == Some(&p.equals),
@@ -212,10 +255,7 @@ pub fn dataset_names(list_response: &Value, list: &DiscoveryList) -> Vec<String>
                 .iter()
                 .any(|suf| name.ends_with(suf.as_str()))
         })
-        .collect();
-    names.sort();
-    names.dedup();
-    names
+        .collect()
 }
 
 /// Render `${name}`, `${name_lower}`, `${name_snake}`, and `${field_names}` in a
@@ -400,5 +440,28 @@ mod tests {
         spec.list = None;
         spec.objects.clear();
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn next_list_url_resolves_and_stops() {
+        let list: DiscoveryList = serde_json::from_value(json!({
+            "get": "/objects", "items": "$.objects[*]", "name": "$.name", "next": "$.next"
+        }))
+        .unwrap();
+        let base = "https://api.example.com";
+        assert_eq!(
+            next_list_url(&json!({"next": "/objects?page=2"}), &list, base).as_deref(),
+            Some("https://api.example.com/objects?page=2")
+        );
+        assert_eq!(
+            next_list_url(&json!({"next": "https://cdn.example.com/p2"}), &list, base).as_deref(),
+            Some("https://cdn.example.com/p2")
+        );
+        for end in [json!({"next": null}), json!({"next": " "}), json!({}), json!({"next": 2})] {
+            assert_eq!(next_list_url(&end, &list, base), None);
+        }
+        let mut no_next = list.clone();
+        no_next.next = None;
+        assert_eq!(next_list_url(&json!({"next": "/p2"}), &no_next, base), None);
     }
 }
