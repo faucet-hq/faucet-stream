@@ -171,6 +171,15 @@ pagination:
   next_link_path: $.links.next         # JSONPath to the absolute next-page URL
 ```
 
+A server-given link (either style, or an async-job URL) that points at another
+scheme, host or port than `base_url` is fetched **without** the source's
+credentials, and an `https` base never follows a plain-`http` link. When the API
+really serves pages from a second host, list it:
+
+```yaml
+trusted_hosts: [files.example.com, "*.cdn.example.com"]
+```
+
 > Use `faucet schema source rest` to see the exact fields and defaults for each
 > style in your installed version.
 
