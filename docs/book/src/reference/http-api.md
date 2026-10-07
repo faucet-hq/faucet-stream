@@ -440,6 +440,10 @@ it automatically). Viewer-readable under RBAC; requires a build with the
 
 - `GET /v1/catalog/datasets?kind=&q=&limit=&cursor=` — paginated dataset list,
   ordered `(last_seen DESC, id DESC)`; `q` is a case-insensitive URI substring.
+  `next_cursor` is the last row's sort key (`<last_seen>~<id>`), so paging
+  continues after that row even when a dataset's `last_seen` moves between
+  requests (a dataset that runs again mid-listing moves ahead of the cursor and
+  shows up on a fresh listing, not twice).
 - `GET /v1/catalog/datasets/{id}` — the dataset plus its deduplicated schema
   timeline (each version with a `diff` vs the previous), recent per-run volume
   points, upstream/downstream lineage edges, and — once a `profiling:`

@@ -1736,3 +1736,88 @@ async fn release_owned_requeues_only_the_owners_running_run() {
     let claimed = b.claim_pending(5).await.unwrap();
     assert_eq!(claimed.len(), 1, "a peer claims it");
 }
+
+/// #789 SERVE-40 / SERVE-50: the catalog's SQL listing pages by its sort key
+/// (rows that run again between pages are neither repeated nor skipped) and
+/// an opaque run clears an edge's stale column lineage.
+#[tokio::test]
+async fn catalog_pages_by_sort_key_and_opaque_runs_clear_column_lineage() {
+    use faucet_cli::serve::history::catalog::{
+        CatalogListFilter, CatalogUpdate, DatasetObservation, DatasetRole,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(&dir, "catalog-page.db").await;
+    let obs = |uri: &str, role| DatasetObservation {
+        uri: uri.into(),
+        kind: "csv".into(),
+        role,
+        schema: None,
+        records: 1,
+    };
+    let t0 = Utc::now();
+    let run = |src: &str, dst: &str, at, lineage| CatalogUpdate {
+        run_id: "r".into(),
+        pipeline: "p".into(),
+        row: "default".into(),
+        recorded_at: at,
+        sources: vec![obs(src, DatasetRole::Source)],
+        sink: obs(dst, DatasetRole::Sink),
+        column_lineage: lineage,
+    };
+    s.catalog_record(&run(
+        "csv://a",
+        "csv://b",
+        t0,
+        Some(serde_json::json!({"fields": {}})),
+    ))
+    .await
+    .unwrap();
+    s.catalog_record(&run(
+        "csv://c",
+        "csv://d",
+        t0 + ChronoDuration::seconds(1),
+        None,
+    ))
+    .await
+    .unwrap();
+    let first = s
+        .catalog_list_datasets(&CatalogListFilter {
+            limit: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.datasets.len(), 2);
+    // a → b runs again (opaque now) and jumps to the top.
+    s.catalog_record(&run(
+        "csv://a",
+        "csv://b",
+        t0 + ChronoDuration::seconds(9),
+        None,
+    ))
+    .await
+    .unwrap();
+    let rest = s
+        .catalog_list_datasets(&CatalogListFilter {
+            limit: 2,
+            cursor: first.next_cursor.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let seen: std::collections::HashSet<_> = first
+        .datasets
+        .iter()
+        .chain(&rest.datasets)
+        .map(|d| d.uri.clone())
+        .collect();
+    assert_eq!(
+        seen.len(),
+        first.datasets.len() + rest.datasets.len(),
+        "no repeats"
+    );
+    assert!(rest.datasets.len() <= 2);
+    let edges = s.catalog_lineage(None, 5).await.unwrap();
+    let ab = edges.iter().find(|e| e.src_uri == "csv://a").unwrap();
+    assert!(ab.column_lineage.is_none(), "{ab:?}");
+}

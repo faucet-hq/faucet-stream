@@ -885,6 +885,49 @@ impl Stmts {
         (sql, binds)
     }
 
+    /// Build the catalog dataset listing query (#789 SERVE-50): the kind
+    /// filter, the keyset cursor and (without a substring filter, which runs
+    /// on the decoded rows) one row past the page are pushed into SQL, so a
+    /// page does not load the whole never-purged table. The Rust pass in
+    /// `catalog::filter_datasets` re-applies every clause.
+    pub fn catalog_dataset_query(
+        &self,
+        filter: &crate::serve::history::catalog::CatalogListFilter,
+    ) -> (String, Vec<String>) {
+        let mut sql = self.catalog_select_datasets.clone();
+        let mut binds: Vec<String> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(kind) = &filter.kind {
+            binds.push(kind.clone());
+            clauses.push(format!("kind={}", self.placeholder(binds.len())));
+        }
+        if let Some((ts, id)) = filter
+            .cursor
+            .as_deref()
+            .and_then(crate::serve::history::catalog::decode_cursor)
+        {
+            let ts = fmt_ts(ts);
+            binds.push(ts.clone());
+            let a = self.placeholder(binds.len());
+            binds.push(ts);
+            let b = self.placeholder(binds.len());
+            binds.push(id);
+            let c = self.placeholder(binds.len());
+            clauses.push(format!(
+                "(last_seen < {a} OR (last_seen = {b} AND id < {c}))"
+            ));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY last_seen DESC, id DESC");
+        if filter.q.is_none() && filter.cursor.as_deref().is_none_or(|c| c.contains('~')) {
+            sql.push_str(&format!(" LIMIT {}", sql_limit(filter.limit.max(1) + 1)));
+        }
+        (sql, binds)
+    }
+
     /// Build the change-request listing query for `filter` (#703): clauses
     /// mirror [`ChangeListFilter::matches`](crate::serve::changes::ChangeListFilter::matches)
     /// exactly, pushed into SQL so a never-purged table is not scanned whole.
@@ -3566,10 +3609,12 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::catalog;
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let rows = sqlx::query(&self.stmts.catalog_select_datasets)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(backend)?;
+                let (sql_text, binds) = self.stmts.catalog_dataset_query(filter);
+                let mut query = sqlx::query(&sql_text);
+                for bind in &binds {
+                    query = query.bind(bind);
+                }
+                let rows = query.fetch_all(&self.pool).await.map_err(backend)?;
                 let mut all = Vec::with_capacity(rows.len());
                 for r in &rows {
                     let body: String = r.try_get("body").map_err(backend)?;
