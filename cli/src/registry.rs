@@ -1302,6 +1302,30 @@ pub fn source_kind_consumes_destructively(kind: &str, config: &Value) -> bool {
     }
 }
 
+/// Whether a source configured this way resumes from a stored bookmark, so a
+/// run with `state:` reads only what changed since the last one: an
+/// incremental `replication_method`, the file source's `incremental:` block,
+/// an incremental Iceberg / DynamoDB-streams read, or a change-stream / log
+/// source. A full refresh (`write_mode: overwrite`) from such a source would
+/// replace the destination with only the delta (#789 CLI-20).
+pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
+    let incremental_method = match config.get("replication_method") {
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("incremental"),
+        Some(Value::Object(o)) => o
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case("incremental")),
+        _ => false,
+    };
+    let mode = config.get("mode").and_then(Value::as_str);
+    incremental_method
+        || (kind == "file" && config.get("incremental").is_some_and(|v| !v.is_null()))
+        || (kind == "iceberg" && mode == Some("incremental"))
+        || (kind == "dynamodb" && mode == Some("streams"))
+        || kind.ends_with("-cdc")
+        || matches!(kind, "kafka" | "kinesis")
+}
+
 /// See [`EXACTLY_ONCE_SOURCE_KINDS`].
 pub fn source_supports_exactly_once(kind: &str) -> bool {
     source_replay_guarantee(kind) == faucet_core::ReplayGuarantee::Deterministic

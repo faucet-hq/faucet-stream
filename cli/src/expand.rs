@@ -1198,6 +1198,22 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     ids[i], merged_source.kind
                 )));
             }
+            if state.is_some()
+                && merged_sink.config.get("scope").is_none_or(Value::is_null)
+                && crate::registry::source_resumes_from_bookmark(
+                    &merged_source.kind,
+                    &merged_source.config,
+                )
+            {
+                return Err(CliError::Config(format!(
+                    "row '{}': write_mode: overwrite replaces the whole destination, but source \
+                     '{}' resumes from its stored bookmark when `state:` is set, so every run \
+                     after the first would replace the table with only the rows changed since \
+                     the last one. Read the full source (drop the incremental setting or the \
+                     `state:` block) or use write_mode: upsert",
+                    ids[i], merged_source.kind
+                )));
+            }
             if cfg.shard.is_some() {
                 return Err(CliError::Config(format!(
                     "row '{}': write_mode: overwrite cannot be combined with `shard:` — each \
@@ -1448,6 +1464,15 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                         quarantines.join("`/`")
                     )));
                 }
+                check_cleanup_completeness(
+                    &ids[i],
+                    &role,
+                    claim,
+                    state.is_some(),
+                    row.partition.is_some()
+                        || (matches!(role, NodeRole::Root) && cfg.partition.is_some()),
+                    &merged_source,
+                )?;
                 Some(claim.scope.clone())
             }
         };
@@ -2101,6 +2126,69 @@ fn validate_tag(tag: &str, row_id: &str) -> CliResult<()> {
     Ok(())
 }
 
+/// `complete_for … on_missing: delete` deletes every in-scope destination row
+/// an invocation did not write, so each invocation's fetch must be the whole
+/// scope (#789 CLI-23, CLI-25):
+/// - a partitioned row's chunks each write a slice and would delete the
+///   others' rows;
+/// - a source that resumes from a bookmark reads only what changed;
+/// - a row that runs once per parent record or tuple must narrow its scope
+///   with that invocation's own token, or each invocation deletes its
+///   siblings' rows.
+fn check_cleanup_completeness(
+    row_id: &str,
+    role: &NodeRole,
+    claim: &crate::config::CompletenessClaim,
+    has_state: bool,
+    partitioned: bool,
+    source: &ConnectorSpec,
+) -> CliResult<()> {
+    if partitioned {
+        return Err(CliError::Config(format!(
+            "row '{row_id}': `complete_for.on_missing: delete` cannot be combined with \
+             `partition:` — each chunk reads only its slice, so its cleanup would delete the \
+             rows the other chunks wrote"
+        )));
+    }
+    if has_state && crate::registry::source_resumes_from_bookmark(&source.kind, &source.config) {
+        return Err(CliError::Config(format!(
+            "row '{row_id}': `complete_for.on_missing: delete` needs a complete fetch every run, \
+             but source '{}' resumes from its stored bookmark when `state:` is set, so a run \
+             reads only what changed and its cleanup would delete every unchanged row in scope",
+            source.kind
+        )));
+    }
+    let ids: Vec<&str> = match role {
+        NodeRole::Child { parent_id, .. } => vec![parent_id.as_str()],
+        NodeRole::Product { dims, collected } => {
+            dims.iter().chain(collected).map(String::as_str).collect()
+        }
+        NodeRole::Root | NodeRole::Discovery { .. } => return Ok(()),
+    };
+    let mut narrowed = false;
+    for v in claim.scope.values() {
+        let _ = walk_strings(v, &mut |s| {
+            narrowed |= iter_directives(s)
+                .any(|(_, d)| matches!(d, Directive::Deferred { id, .. } if ids.contains(&id)));
+            Ok(())
+        });
+    }
+    if !narrowed {
+        return Err(CliError::Config(format!(
+            "row '{row_id}' runs once per {} but its `complete_for.scope` carries no \
+             per-invocation token, so every invocation would delete the rows its siblings \
+             wrote — scope it with e.g. `${{{}.id}}`",
+            if matches!(role, NodeRole::Child { .. }) {
+                "parent record"
+            } else {
+                "discovered tuple"
+            },
+            ids.first().copied().unwrap_or("parent")
+        )));
+    }
+    Ok(())
+}
+
 /// A row id: letters, digits, `_` and `-` (#789 CLI-79). `::` would read as a
 /// child key in state tooling and `.` splits interpolation paths.
 fn is_row_id(id: &str) -> bool {
@@ -2127,9 +2215,7 @@ fn check_deferred_scope(
         }
         let resolvable = match role {
             NodeRole::Child { parent_id, .. } => parent_id == id,
-            NodeRole::Product { dims, collected } => {
-                dims.iter().chain(collected).any(|d| d == id)
-            }
+            NodeRole::Product { dims, collected } => dims.iter().chain(collected).any(|d| d == id),
             NodeRole::Root | NodeRole::Discovery { .. } => false,
         };
         if !resolvable {
@@ -4648,7 +4734,10 @@ pipeline:
         let grandparent = format!(
             "{TWO_ROWS}  - id: a\n  - id: b\n    parent: a\n  - id: c\n    parent: b\n    source: {{ config: {{ path: \"c-${{a.id}}.csv\" }} }}\n"
         );
-        assert!(expand(&cfg(&grandparent)).is_err(), "only the parent record is in scope");
+        assert!(
+            expand(&cfg(&grandparent)).is_err(),
+            "only the parent record is in scope"
+        );
     }
 
     /// #789 CLI-141: graph edges never resolve to a flow-auth capture name.

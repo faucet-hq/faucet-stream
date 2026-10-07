@@ -529,7 +529,7 @@ pub fn compose_with(
     doc.insert("matrix".into(), Value::Array(rows));
 
     let incremental = has_incremental_stream(source);
-    let warnings = if incremental {
+    let mut warnings = if incremental {
         vec![format!(
             "'{}' has incremental streams but the composed run has no `state:` block, so they re-read everything each run — apply a deployment overlay (`kind: deployment`) that sets `state:`",
             source.id()
@@ -537,6 +537,16 @@ pub fn compose_with(
     } else {
         Vec::new()
     };
+    // #789 CLI-20: a full refresh from a bookmarked read would swap in only
+    // the delta; `faucet validate` refuses the pairing once `state:` is set.
+    for (stream, plan) in source.streams.iter().zip(&plans) {
+        if plan.chosen == WriteMode::Overwrite && stream_is_incremental(source, stream) {
+            warnings.push(format!(
+                "stream '{}' writes `overwrite` from an incremental read: it stays a full re-read only while the run has no `state:` — with `state:` (e.g. from a deployment overlay) the config is refused, because each run would replace the table with only the changed rows",
+                stream.name
+            ));
+        }
+    }
 
     Ok(Composition {
         name: source.id(),
@@ -553,6 +563,21 @@ pub fn compose_with(
         overlay_hub: None,
         document: Value::Object(doc),
     })
+}
+
+/// Whether one stream reads incrementally: its own override, else the source
+/// it selects.
+fn stream_is_incremental(source: &SourceTemplate, stream: &Stream) -> bool {
+    let base = match &stream.source.r#ref {
+        Some(name) => source.sources.get(name).map(|s| (&s.kind, &s.config)),
+        None => Some((&source.source.kind, &source.source.config)),
+    };
+    let Some((kind, config)) = base else {
+        return false;
+    };
+    let mut merged = config.clone();
+    crate::merge::merge_value(&mut merged, stream.source.config.clone());
+    crate::registry::source_resumes_from_bookmark(kind, &merged)
 }
 
 /// Whether any stream reads incrementally (`replication_method: Incremental`
@@ -743,6 +768,24 @@ per_stream:
         WriteMode::Delete,
         WriteMode::Overwrite,
     ];
+
+    #[test]
+    fn an_overwrite_stream_on_an_incremental_read_is_warned_about() {
+        let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let mut t = src();
+        t.streams[0].source.config["replication_method"] = serde_json::json!("incremental");
+        let c = compose_with(&t, &sink, ALL).unwrap();
+        assert_eq!(c.streams[0].chosen, WriteMode::Overwrite);
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("stream 'bills' writes `overwrite` from an incremental read")),
+            "{:?}",
+            c.warnings
+        );
+        let plain = compose_with(&src(), &sink, ALL).unwrap();
+        assert!(plain.warnings.iter().all(|w| !w.contains("overwrite")));
+    }
 
     #[test]
     fn composes_a_full_pipeline_document_for_a_capable_sink() {
@@ -1209,8 +1252,10 @@ streams:
     #[test]
     fn incremental_streams_warn_without_state_and_with_memory_state() {
         let mut s = src();
-        s.streams[0].source.config =
-            json!({ "path": "/bills", "replication_method": { "type": "Incremental" } });
+        // The append stream: an incremental overwrite stream has its own
+        // warning (#789 CLI-20).
+        s.streams[1].source.config =
+            json!({ "path": "/users", "replication_method": { "type": "Incremental" } });
         let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         let c = compose_with(&s, &k, ALL).unwrap();
         assert!(c.incremental);
