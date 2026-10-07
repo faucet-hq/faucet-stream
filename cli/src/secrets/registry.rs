@@ -56,7 +56,7 @@ pub fn redact(input: &str) -> Cow<'_, str> {
 /// Replace every registered secret value in `input` with a caller-supplied
 /// token. `token(secret)` receives the raw secret and returns its replacement;
 /// it is called only for secrets actually present in `input`. Used by the
-/// config-snapshot writer (#374) to swap secrets for stable `<secret:sha256:…>`
+/// config-snapshot writer (#374) to swap secrets for stable `<secret:hmac:…>`
 /// tokens instead of `***`, so a rotation surfaces as a changed hash without
 /// ever persisting the secret. Same longest-first ordering as [`redact`].
 pub fn redact_with(input: &str, token: impl Fn(&str) -> String) -> Cow<'_, str> {

@@ -336,7 +336,7 @@ Because the diff operates on the **resolved + expanded** model, a one-line
 effect, and two textually-different files that resolve to the same movement show
 no diff. Requires a `catalog:` block (`faucet schema catalog`) and the `catalog`
 build feature. `--diff` resolves secrets so the diff matches what `run` recorded;
-every secret-sourced value is stored only as a stable `<secret:sha256:…>` token,
+every secret-sourced value is stored only as a stable `<secret:hmac:…>` token (an HMAC under `FAUCET_SNAPSHOT_KEY`, or a key faucet keeps owner-only in `~/.local/state/faucet/snapshot.key`; instances sharing a catalog store should share `FAUCET_SNAPSHOT_KEY`),
 so a rotated credential surfaces as "secret rotated" and no secret is ever
 persisted. On a first run (nothing recorded yet) every row is reported as new.
 
