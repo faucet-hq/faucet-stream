@@ -379,6 +379,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         if RESERVED_IDS.contains(&id.as_str()) {
             return Err(CliError::ReservedRowId { id });
         }
+        if !is_row_id(&id) {
+            return Err(CliError::Config(format!(
+                "matrix row id '{id}' may only contain letters, digits, `_` and `-` — it is \
+                 part of the row's state key and interpolation tokens"
+            )));
+        }
         if !seen.insert(id.clone()) {
             return Err(CliError::DuplicateRowId { id });
         }
@@ -394,6 +400,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         .chain(capture_names.iter())
         .map(String::as_str)
         .collect();
+    // Graph edges (`parent:`, `depends_on:`, `for_each:`) name rows only, never
+    // a capture name (#789 CLI-141).
+    let row_id_set: HashSet<&str> = ids.iter().map(String::as_str).collect();
 
     // 1b) Discovery-driven matrix (#501): identify `discover:` rows and validate
     // the `discover:` / `for_each:` shapes before the graph checks below, so
@@ -471,7 +480,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                         "matrix row '{id}': `for_each` cannot reference itself"
                     )));
                 }
-                if !id_set.contains(dim.as_str()) {
+                if !row_id_set.contains(dim.as_str()) {
                     return Err(CliError::Config(format!(
                         "matrix row '{id}': `for_each` references unknown row '{dim}'"
                     )));
@@ -495,11 +504,18 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
     for (i, row) in rows.iter().enumerate() {
         let id = ids[i].as_str();
         if let Some(parent) = row.parent.as_deref() {
-            if !id_set.contains(parent) {
+            if !row_id_set.contains(parent) {
                 return Err(CliError::UnknownParent {
                     id: id.to_owned(),
                     parent: parent.to_owned(),
                 });
+            }
+            if discovery_ids.contains(parent) {
+                return Err(CliError::Config(format!(
+                    "matrix row '{id}': `parent: {parent}` names a `fan_out:` row, which publishes \
+                     values rather than records — use `for_each: [{parent}]` to run once per \
+                     discovered value"
+                )));
             }
             if parent == id {
                 return Err(CliError::ParentCycle {
@@ -525,7 +541,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let id = ids[i].as_str();
         let mut deps: Vec<String> = Vec::with_capacity(row.depends_on.len());
         for dep in &row.depends_on {
-            if !id_set.contains(dep.as_str()) {
+            if !row_id_set.contains(dep.as_str()) {
                 return Err(CliError::UnknownDependency {
                     id: id.to_owned(),
                     depends_on: dep.clone(),
@@ -825,6 +841,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let mut deferred = Vec::new();
         collect_deferred(&merged_source.config, &mut deferred);
         collect_deferred(&merged_sink.config, &mut deferred);
+        check_deferred_scope(row_id, &role, &deferred, &row_id_set)?;
 
         // Resolved readiness status (#371): `merged_source.status` already
         // carries the template→row `source.status` scalar merge; default to
@@ -2080,6 +2097,50 @@ fn validate_tag(tag: &str, row_id: &str) -> CliResult<()> {
             "row '{row_id}': invalid tag '{tag}' — tags must match ^[a-z0-9][a-z0-9_-]*$ \
              (lowercase letters, digits, `_`, `-`; first char alphanumeric)"
         )));
+    }
+    Ok(())
+}
+
+/// A row id: letters, digits, `_` and `-` (#789 CLI-79). `::` would read as a
+/// child key in state tooling and `.` splits interpolation paths.
+fn is_row_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A deferred `${row.path}` token resolves only against the record or tuple
+/// the invocation runs for: the row's parent, or its `for_each` and collected
+/// discovery rows (#789 CLI-60). Any other row's token would reach the
+/// connector verbatim.
+fn check_deferred_scope(
+    row_id: &str,
+    role: &NodeRole,
+    deferred: &[DeferredRef],
+    row_ids: &HashSet<&str>,
+) -> CliResult<()> {
+    for r in deferred {
+        let id = r.referenced_id.as_str();
+        if id == row_id || !row_ids.contains(id) {
+            continue;
+        }
+        let resolvable = match role {
+            NodeRole::Child { parent_id, .. } => parent_id == id,
+            NodeRole::Product { dims, collected } => {
+                dims.iter().chain(collected).any(|d| d == id)
+            }
+            NodeRole::Root | NodeRole::Discovery { .. } => false,
+        };
+        if !resolvable {
+            return Err(CliError::Config(format!(
+                "row '{row_id}' references `{}`, but '{id}' is not its parent or one of its \
+                 `for_each` dimensions, so the token would reach the connector unresolved — \
+                 add `parent: {id}` (once per {id} record) or `for_each: [{id}]` (a `fan_out:` \
+                 row)",
+                r.token
+            )));
+        }
     }
     Ok(())
 }
@@ -4540,6 +4601,65 @@ pipeline:
                 "{constant}: {err:?}"
             );
         }
+    }
+
+    const TWO_ROWS: &str = "version: 1\nname: t\npipeline:\n  source: { type: csv, config: { path: p.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl, append: true } }\nmatrix:\n";
+
+    /// #789 CLI-79: hand-written row ids are limited to `[A-Za-z0-9_-]`.
+    #[test]
+    fn row_ids_outside_the_charset_are_refused() {
+        for bad in ["a::b", "a b", "a.b", "a/b", "é"] {
+            let yaml = format!("{TWO_ROWS}  - id: \"{bad}\"\n");
+            let err = expand(&cfg(&yaml)).unwrap_err().to_string();
+            assert!(err.contains("may only contain letters"), "{bad}: {err}");
+        }
+        assert!(expand(&cfg(&format!("{TWO_ROWS}  - id: Orders_v2-eu\n"))).is_ok());
+        let err = expand(&cfg(&format!("{TWO_ROWS}  - id: now\n")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("partition") && err.contains("faucet"), "{err}");
+    }
+
+    /// #789 CLI-59: a `parent:` naming a `fan_out:` row would run nothing.
+    #[test]
+    fn parent_naming_a_fan_out_row_is_refused() {
+        let yaml = format!(
+            "{TWO_ROWS}  - id: regions\n    fan_out: {{ source: {{ type: csv, config: {{ path: r.csv }} }}, select: region, as: name }}\n  - id: c\n    parent: regions\n    sink: {{ config: {{ path: \"o-${{regions.name}}.jsonl\" }} }}\n"
+        );
+        let err = expand(&cfg(&yaml)).unwrap_err().to_string();
+        assert!(err.contains("for_each: [regions]"), "{err}");
+    }
+
+    /// #789 CLI-60: a deferred token must name the row's parent or dimension.
+    #[test]
+    fn a_token_for_a_row_that_is_not_the_parent_is_refused() {
+        let yaml = format!(
+            "{TWO_ROWS}  - id: orders\n  - id: lines\n    depends_on: [orders]\n    source: {{ config: {{ path: \"l-${{orders.id}}.csv\" }} }}\n"
+        );
+        let err = expand(&cfg(&yaml)).unwrap_err().to_string();
+        assert!(
+            err.contains("row 'lines' references `${orders.id}`") && err.contains("parent: orders"),
+            "{err}"
+        );
+        let ok = format!(
+            "{TWO_ROWS}  - id: orders\n  - id: lines\n    parent: orders\n    source: {{ config: {{ path: \"l-${{orders.id}}.csv\" }} }}\n"
+        );
+        assert!(expand(&cfg(&ok)).is_ok());
+        let grandparent = format!(
+            "{TWO_ROWS}  - id: a\n  - id: b\n    parent: a\n  - id: c\n    parent: b\n    source: {{ config: {{ path: \"c-${{a.id}}.csv\" }} }}\n"
+        );
+        assert!(expand(&cfg(&grandparent)).is_err(), "only the parent record is in scope");
+    }
+
+    /// #789 CLI-141: graph edges never resolve to a flow-auth capture name.
+    #[test]
+    fn depends_on_a_capture_name_is_an_unknown_dependency_not_a_panic() {
+        let yaml = "version: 1\nname: t\nauth:\n  login:\n    type: flow\n    config:\n      steps:\n        - capture: { session: \"$.token\" }\npipeline:\n  source: { type: csv, config: { path: p.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\nmatrix:\n  - id: a\n    depends_on: [session]\n";
+        let err = expand(&cfg(yaml)).unwrap_err();
+        assert!(matches!(err, CliError::UnknownDependency { .. }), "{err:?}");
+        let parent = yaml.replace("depends_on: [session]", "parent: session");
+        let err = expand(&cfg(&parent)).unwrap_err();
+        assert!(matches!(err, CliError::UnknownParent { .. }), "{err:?}");
     }
 
     /// #789 CLI-143: two `fan_out:` rows reading one file are not two writers.

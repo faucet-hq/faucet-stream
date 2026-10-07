@@ -344,6 +344,12 @@ replace). A row with `parent:` runs once per parent record. See the
 rows, define named templates under `pipeline.sources` / `pipeline.sinks` and
 select them per row with `ref:`.
 
+A row `id` may contain only letters, digits, `_` and `-` (it is part of the
+row's state key and of `${id.field}` tokens). A row may reference another row's
+record with `${id.field}` only when `id` is its `parent:` (or, for a
+`for_each:` row, one of its dimensions) — any other row's token would reach the
+connector unresolved, so it is refused at load time.
+
 ### `depends_on` — completion ordering between rows
 
 A row with `depends_on: [row_id, …]` starts only after **every listed row's
@@ -440,7 +446,8 @@ Semantics:
   keys (`{name}::{row}::alias:value/…`; a value outside `[A-Za-z0-9_.-]` or longer
   than 64 characters is replaced by a readable prefix plus a hash) let every cell resume independently.
 - Guards (all at load time via `faucet validate`): `for_each` must name
-  `fan_out:` rows; a `fan_out:` row can't carry a sink or `parent:`;
+  `fan_out:` rows; a `fan_out:` row can't carry a sink or `parent:`, and
+  no row can name one in `parent:` (use `for_each:`);
   `for_each` can't combine with `parent:` (v1). The product is
   bounded by `MAX_MATRIX_PRODUCT` (10 000) — a larger cross-product fails
   rather than spawning an unbounded fleet.
