@@ -527,8 +527,8 @@ async fn append_creates_table_when_missing_by_default() {
     let qs = queries(&server).await;
     assert!(
         qs.iter()
-            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
-        "append path must create the missing table: {qs:?}"
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
+        "append path must create the missing table (IF NOT EXISTS, SQL-98): {qs:?}"
     );
 }
 
@@ -1862,7 +1862,7 @@ async fn append_creates_table_when_missing_under_the_default_load_path() {
         queries(&server)
             .await
             .iter()
-            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
         "create_table must still run before the load: {:?}",
         queries(&server).await
     );

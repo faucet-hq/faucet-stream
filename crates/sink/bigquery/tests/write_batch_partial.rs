@@ -488,8 +488,8 @@ async fn check_probe_fails_on_tables_get_error() {
     mount_token_endpoint(&server).await;
     Mock::given(method("GET"))
         .and(path(tables_get_path()))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "error": {"code": 404, "message": "Not found: Table"}
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"code": 403, "message": "Access Denied: Table"}
         })))
         .mount(&server)
         .await;
@@ -506,6 +506,30 @@ async fn check_probe_fails_on_tables_get_error() {
     assert!(
         report.probes[0].hint.is_some(),
         "a failing probe must carry a remediation hint"
+    );
+}
+
+/// SQL-138: with `create_table` (the default) a missing table is created on the
+/// first write, so doctor must not fail it.
+#[tokio::test]
+async fn check_probe_passes_on_missing_table_when_create_table_is_on() {
+    use faucet_core::check::{CheckContext, ProbeStatus};
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    Mock::given(method("GET"))
+        .and(path(tables_get_path()))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {"code": 404, "message": "Not found: Table",
+                      "errors": [{"reason": "notFound", "message": "Not found: Table"}]}
+        })))
+        .mount(&server)
+        .await;
+    let (sink, _sa_file) = build_sink(&server, 0).await;
+    let report = sink.check(&CheckContext::default()).await.unwrap();
+    assert!(
+        matches!(report.probes[0].status, ProbeStatus::Pass),
+        "{:?}",
+        report.probes[0].status
     );
 }
 

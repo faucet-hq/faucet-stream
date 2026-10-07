@@ -1686,6 +1686,14 @@ impl BigQuerySink {
             ))
         })?;
         self.ensure_dataset().await?;
+        // Replace only a table verified to exist without a schema; a missing
+        // one is created IF NOT EXISTS, so a concurrent first writer's rows
+        // are never dropped by a second writer's late CREATE OR REPLACE.
+        let ddl = if self.table_exists(&self.config.table_id).await? {
+            ddl
+        } else {
+            idempotent::create_if_missing(&ddl)
+        };
         self.run_ddl(ddl).await?;
         *self.schema_cache.write().await = None;
         Ok(())
@@ -2079,6 +2087,11 @@ impl faucet_core::Sink for BigQuerySink {
 
         let probe = match result {
             Ok(Ok(_table)) => Probe::pass("auth", started.elapsed()),
+            // A 404 proves the credentials work; the table is created on the
+            // first write.
+            Ok(Err(e)) if self.config.create_table && is_table_not_found(&e) => {
+                Probe::pass("auth", started.elapsed())
+            }
             Ok(Err(e)) => Probe::fail_hint(
                 "auth",
                 started.elapsed(),
