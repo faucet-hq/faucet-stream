@@ -28,6 +28,7 @@ async fn conformance_errors_not_panics() {
     cfg.idle_timeout_secs = Some(1);
     let source = RabbitMqSource::new(cfg).await.expect("lazy construction");
     faucet_conformance::assert_connector_name_nonempty(&source);
+    assert!(faucet_core::Source::consumes_destructively(&source));
     assert_errors_not_panics(&source).await;
 }
 

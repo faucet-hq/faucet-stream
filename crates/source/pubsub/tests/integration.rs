@@ -281,7 +281,7 @@ async fn on_decode_error_skips_or_keeps_the_raw_payload() {
     let config = |sub: &str, policy| {
         let mut cfg = PubsubSourceConfig::new(sub);
         cfg.connection = conn(host);
-        cfg.idle_termination_secs = Some(5);
+        cfg.idle_termination_secs = Some(10);
         cfg.on_decode_error = policy;
         cfg
     };
