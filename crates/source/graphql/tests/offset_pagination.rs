@@ -263,3 +263,56 @@ async fn offset_stop_when_short_false_paginates_until_empty() {
         "stop_when_short: false keeps paginating over the short page until an empty page"
     );
 }
+
+/// API-15: a server that caps every page at 2 rows below the configured
+/// `page_size` of 3 is read in full by default, with the offset advancing by
+/// the rows received (0, 2, 4, 6) and the empty page ending the walk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clamped_page_size_is_read_in_full_and_advances_by_rows_received() {
+    let server = MockServer::start().await;
+    let offsets = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = offsets.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |req: &Request| {
+            let off = request_offset(req).expect("offset variable");
+            seen.lock().unwrap().push(off);
+            let n = 5u64.saturating_sub(off).min(2);
+            ResponseTemplate::new(200).set_body_json(make_page(off, n))
+        })
+        .mount(&server)
+        .await;
+    let config: GraphqlStreamConfig = serde_json::from_value(json!({
+        "endpoint": server.uri(),
+        "query": "query($q_offset: Int) { orders(offset: $q_offset) { id } }",
+        "auth": {"type": "none"},
+        "records_path": "$.data.orders[*]",
+        "pagination": {"type": "Offset", "offset_variable": "q_offset", "page_size": 3}
+    }))
+    .unwrap();
+    let records = GraphqlStream::new(config).fetch_all().await.unwrap();
+    let ids: Vec<u64> = records.iter().map(|r| r["id"].as_u64().unwrap()).collect();
+    assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+    assert_eq!(*offsets.lock().unwrap(), vec![0, 2, 4, 5]);
+}
+
+/// A server that ignores the offset returns the same page forever; the
+/// identical-page guard ends the walk.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offset_ignoring_server_stops_on_the_repeated_page() {
+    let server = MockServer::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_req: &Request| {
+            h.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(make_page(0, 2))
+        })
+        .mount(&server)
+        .await;
+    let records = GraphqlStream::new(offset_config(&server, 2, false))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}

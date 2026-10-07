@@ -152,11 +152,11 @@ async fn fetch_all_single_page_stops_immediately() {
     assert_eq!(requests.len(), 1, "a single non-next page ends pagination");
 }
 
-/// `fetch_all` stops when the server claims `hasNextPage: true` but provides no
-/// `endCursor` — advancing is impossible, so the walk terminates without
-/// re-fetching (the missing-cursor terminator).
+/// `fetch_all` fails when the server claims `hasNextPage: true` but provides no
+/// `endCursor`: advancing is impossible, and stopping would end the run green
+/// with pages unread (API-28). It makes exactly one request.
 #[tokio::test(flavor = "multi_thread")]
-async fn fetch_all_stops_when_next_cursor_is_absent() {
+async fn fetch_all_fails_when_next_cursor_is_absent_but_has_next_is_true() {
     let server = MockServer::start().await;
     // hasNextPage=true but endCursor=null.
     Mock::given(method("POST"))
@@ -173,15 +173,39 @@ async fn fetch_all_stops_when_next_cursor_is_absent() {
         .await;
 
     let source = GraphqlStream::new(relay_config(&server));
-    let records = source.fetch_all().await.expect("fetch_all ok");
-    assert_eq!(records.len(), 1);
+    let err = source.fetch_all().await.expect_err("must not end green");
+    assert!(err.to_string().contains("no string or number cursor"), "{err}");
 
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests.len(),
-        1,
-        "a null endCursor must stop the walk after one request"
-    );
+    assert_eq!(requests.len(), 1, "no request is re-sent");
+}
+
+/// API-28: a server repeating its cursor while reporting more pages fails the
+/// run instead of persisting a bookmark past the unread pages.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_cursor_with_has_next_true_fails_the_stream() {
+    use faucet_core::Source;
+    use futures::StreamExt;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "users": {
+                    "edges": [{ "node": { "id": 0 } }],
+                    "pageInfo": { "hasNextPage": true, "endCursor": "same" }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let source = GraphqlStream::new(relay_config(&server));
+    let ctx = std::collections::HashMap::new();
+    let pages: Vec<_> = source.stream_pages(&ctx, 0).collect().await;
+    let last = pages.last().unwrap();
+    let err = last.as_ref().expect_err("the stream must end in an error");
+    assert!(err.to_string().contains("cursor just used"), "{err}");
+    assert!(pages.iter().all(|p| p.as_ref().map_or(true, |p| p.bookmark.is_none())));
 }
 
 /// Parent context values are merged into the GraphQL request `variables` via

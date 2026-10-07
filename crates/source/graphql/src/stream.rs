@@ -522,6 +522,7 @@ impl GraphqlStream {
             let mut cursor: Option<String> = None;
             let mut offset = 0usize;
             let mut cursor_guard = CursorGuard::new();
+            let mut prev_fingerprint: Option<u64> = None;
             let mut pages_fetched = 0usize;
             let mut warned_unresolved_has_next = false;
             // Incremental replication (#751): filter each page against the
@@ -590,8 +591,23 @@ impl GraphqlStream {
                                 tracing::warn!("cursor loop detected, stopping pagination");
                                 false
                             }
+                            PageStep::Inconsistent(why) => {
+                                Err::<(), _>(FaucetError::Source(format!(
+                                    "graphql pagination: {why}; refusing to end the run with \
+                                     pages unread"
+                                )))?;
+                                false
+                            }
                             PageStep::Advance(next) => {
                                 if cursor_guard.is_repeat(&next) {
+                                    if !unresolved {
+                                        Err::<(), _>(FaucetError::Source(format!(
+                                            "graphql pagination: `{}` is true but cursor {next:?} \
+                                             was already used (a cursor cycle); refusing to end \
+                                             the run with pages unread",
+                                            pag.has_next_page_path
+                                        )))?;
+                                    }
                                     tracing::warn!(
                                         "cursor cycle detected (cursor already seen), stopping pagination"
                                     );
@@ -604,11 +620,25 @@ impl GraphqlStream {
                         }
                     }
                     Some(GraphqlPaginationSpec::Offset(off)) => {
-                        let advance = offset_should_continue(records_in_page, off);
-                        if advance {
-                            offset += off.page_size;
+                        // Advance by the rows the server returned, not the
+                        // requested size: a server that clamps the page would
+                        // otherwise have rows skipped on every page (API-15).
+                        let fingerprint = page_fingerprint(&body);
+                        let repeated = prev_fingerprint == Some(fingerprint);
+                        prev_fingerprint = Some(fingerprint);
+                        if repeated && records_in_page > 0 {
+                            tracing::warn!(
+                                "GraphQL offset pagination returned an identical page; stopping"
+                            );
+                            records.clear();
+                            false
+                        } else {
+                            let advance = offset_should_continue(records_in_page, off);
+                            if advance {
+                                offset += records_in_page;
+                            }
+                            advance
                         }
-                        advance
                     }
                     None => false,
                 };
@@ -721,14 +751,6 @@ impl faucet_core::Source for GraphqlStream {
 
     fn dataset_uri(&self) -> String {
         faucet_core::redact_uri_credentials(&self.config.endpoint)
-    }
-}
-
-fn extract_string(body: &Value, path: &str) -> Option<String> {
-    let results = body.query(path).ok()?;
-    match results.first()? {
-        Value::String(s) => Some(s.clone()),
-        _ => None,
     }
 }
 
@@ -881,6 +903,10 @@ enum PageStep {
     StopLoop,
     /// Fetch another page with this cursor.
     Advance(String),
+    /// `hasNextPage` is `true` but the cursor is missing, not a scalar, or the
+    /// one just used: stopping would end the run green with pages unread
+    /// (API-28), so the caller fails.
+    Inconsistent(String),
 }
 
 /// Pure pagination-advance decision shared by the eager and streaming paths.
@@ -896,26 +922,52 @@ fn decide_next_page(
     pag: &GraphqlPagination,
     prev_cursor: Option<&str>,
 ) -> (PageStep, bool) {
-    let (stop, unresolved) = match extract_bool(body, &pag.has_next_page_path) {
-        Some(false) => (true, false),
-        Some(true) => (false, false),
-        // Path absent / not a boolean: defer the decision to the cursor signal.
-        None => (false, true),
+    let has_next = extract_bool(body, &pag.has_next_page_path);
+    if has_next == Some(false) {
+        return (PageStep::Stop, false);
+    }
+    let unresolved = has_next.is_none();
+    let next = extract_cursor(body, &pag.cursor_path);
+    let step = match (next, unresolved) {
+        (None, true) => PageStep::Stop,
+        (None, false) => PageStep::Inconsistent(format!(
+            "`{}` is true but `{}` holds no string or number cursor",
+            pag.has_next_page_path, pag.cursor_path
+        )),
+        (Some(next), true) if Some(next.as_str()) == prev_cursor => PageStep::StopLoop,
+        (Some(next), false) if Some(next.as_str()) == prev_cursor => {
+            PageStep::Inconsistent(format!(
+                "`{}` is true but the server returned the cursor just used ({next:?})",
+                pag.has_next_page_path
+            ))
+        }
+        (Some(next), _) => PageStep::Advance(next),
     };
-    if stop {
-        return (PageStep::Stop, unresolved);
+    (step, unresolved)
+}
+
+/// The next-page cursor: a string, or a number rendered as text.
+fn extract_cursor(body: &Value, path: &str) -> Option<String> {
+    match body.query(path).ok()?.first()? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
     }
-    match extract_string(body, &pag.cursor_path) {
-        None => (PageStep::Stop, unresolved),
-        Some(next) if Some(next.as_str()) == prev_cursor => (PageStep::StopLoop, unresolved),
-        Some(next) => (PageStep::Advance(next), unresolved),
-    }
+}
+
+/// Content fingerprint of a response body, the offset-pagination loop guard
+/// for a server that ignores the offset.
+fn page_fingerprint(body: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.to_string().hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Pure offset-pagination advance decision.
 ///
 /// Returns `true` when another page should be fetched (the caller then advances
-/// the offset by `page_size`), `false` to stop. Termination rules:
+/// the offset by the records received), `false` to stop. Termination rules:
 ///
 /// - A **fully empty** page (0 records) always stops — this is the unconditional
 ///   loop guard that keeps `stop_when_short: false` from paginating forever.
@@ -984,7 +1036,7 @@ mod tests {
     fn extract_string_from_json() {
         let body = json!({"data": {"users": {"pageInfo": {"endCursor": "abc123"}}}});
         assert_eq!(
-            extract_string(&body, "$.data.users.pageInfo.endCursor"),
+            extract_cursor(&body, "$.data.users.pageInfo.endCursor"),
             Some("abc123".into())
         );
     }
@@ -1025,11 +1077,29 @@ mod tests {
     }
 
     #[test]
-    fn decide_next_page_detects_cursor_loop() {
+    fn decide_next_page_refuses_a_repeated_cursor_while_has_next_is_true() {
+        // API-28: this used to stop green with the remaining pages unread.
         let body =
             json!({"data": {"users": {"pageInfo": {"hasNextPage": true, "endCursor": "c1"}}}});
         let (step, _) = decide_next_page(&body, &pageinfo_pagination(), Some("c1"));
+        assert!(matches!(step, PageStep::Inconsistent(m) if m.contains("cursor just used")));
+        // With has-next unresolved, a repeat is still a warn-and-stop loop guard.
+        let body = json!({"data": {"users": {"pageInfo": {"endCursor": "c1"}}}});
+        let (step, _) = decide_next_page(&body, &pageinfo_pagination(), Some("c1"));
         assert_eq!(step, PageStep::StopLoop);
+    }
+
+    #[test]
+    fn decide_next_page_refuses_a_missing_cursor_and_stringifies_numbers() {
+        let body = json!({"data": {"users": {"pageInfo": {"hasNextPage": true}}}});
+        let (step, _) = decide_next_page(&body, &pageinfo_pagination(), None);
+        assert!(matches!(step, PageStep::Inconsistent(m) if m.contains("no string or number")));
+        let body = json!({"data": {"users": {"pageInfo": {"hasNextPage": true, "endCursor": {"x": 1}}}}});
+        let (step, _) = decide_next_page(&body, &pageinfo_pagination(), None);
+        assert!(matches!(step, PageStep::Inconsistent(_)));
+        let body = json!({"data": {"users": {"pageInfo": {"hasNextPage": true, "endCursor": 42}}}});
+        let (step, _) = decide_next_page(&body, &pageinfo_pagination(), None);
+        assert_eq!(step, PageStep::Advance("42".into()));
     }
 
     #[test]

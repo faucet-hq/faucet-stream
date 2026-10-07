@@ -89,19 +89,21 @@ pub struct GraphqlOffsetPagination {
     /// Discriminator — must be `Offset`.
     pub r#type: OffsetPaginationKind,
     /// Name of the GraphQL variable that receives the current offset. It is
-    /// injected as a JSON number (starting at `0`, incremented by `page_size`
-    /// after each page). Reference it from the query string or as a variable
+    /// injected as a JSON number (starting at `0`, advanced by the number of
+    /// records each page returned). Reference it from the query string or as a variable
     /// (e.g. `${q_offset}` inside the query string).
     pub offset_variable: String,
-    /// Records requested per page. Used both to advance the offset
-    /// (`offset += page_size`) and, with `stop_when_short`, to detect the final
-    /// page. Must be greater than `0`. This value is **not** injected into the
+    /// Records requested per page, used with `stop_when_short` to detect the
+    /// final page; the offset advances by the records each page actually
+    /// returned. Must be greater than `0`. This value is **not** injected into the
     /// request — bake the limit into your query (`LIMIT 250 OFFSET ${q_offset}`).
     pub page_size: usize,
     /// Terminate when a page yields fewer than `page_size` records (default
-    /// `true`). When `false`, pagination continues until a fully empty page (or
-    /// `max_pages`) is reached.
-    #[serde(default = "default_true")]
+    /// `false`: pagination continues until a fully empty page, an identical
+    /// repeated page, or `max_pages`). A server that caps the page below
+    /// `page_size` returns short pages mid-stream, so enable this only when the
+    /// API is known never to clamp.
+    #[serde(default)]
     pub stop_when_short: bool,
     /// Substitute `${offset_variable}` occurrences in the **query string** with
     /// the current offset before each request, instead of sending it as a
@@ -112,10 +114,6 @@ pub struct GraphqlOffsetPagination {
     /// `false` (variable injection, the #550 behavior).
     #[serde(default)]
     pub substitute_in_query: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Pagination style for the GraphQL source.
@@ -613,13 +611,13 @@ mod tests {
     }
 
     #[test]
-    fn offset_pagination_stop_when_short_defaults_true() {
+    fn offset_pagination_stop_when_short_defaults_false() {
         let json = r#"{ "type": "Offset", "offset_variable": "q_offset", "page_size": 100 }"#;
         let spec: GraphqlPaginationSpec = serde_json::from_str(json).unwrap();
         match spec {
             GraphqlPaginationSpec::Offset(off) => assert!(
-                off.stop_when_short,
-                "stop_when_short must default to true when omitted"
+                !off.stop_when_short,
+                "stop_when_short defaults to false: a clamped page must not end paging (API-15)"
             ),
             other => panic!("expected Offset variant, got {other:?}"),
         }
