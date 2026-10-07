@@ -16,6 +16,8 @@ pub fn schema_targets() -> Vec<&'static str> {
         "sink",
         "transform",
         "dlq",
+        "usage",
+        "budget",
         "mirror",
         "backfill",
         "partition",
@@ -37,6 +39,7 @@ pub fn schema_targets() -> Vec<&'static str> {
     targets.push("test");
     targets.push("source-template");
     targets.push("sink-template");
+    targets.push("deployment");
     #[cfg(feature = "templates")]
     targets.push("template-test");
     #[cfg(feature = "templates-sync")]
@@ -450,6 +453,23 @@ mod tests {
         assert_eq!(v["type"], "object");
         assert!(v["properties"].get("transport").is_some());
         assert!(v["properties"].get("namespace").is_some());
+    }
+
+    #[test]
+    fn schema_targets_match_every_subcommand() {
+        use clap::Subcommand;
+        let cmd = crate::cli::SchemaTarget::augment_subcommands(clap::Command::new("schema"));
+        let mut from_clap: Vec<String> = cmd
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        from_clap.sort();
+        let mut listed: Vec<String> = super::schema_targets()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        listed.sort();
+        assert_eq!(listed, from_clap);
     }
 
     #[test]
