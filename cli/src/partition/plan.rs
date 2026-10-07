@@ -28,8 +28,8 @@ const PREFIX: &str = "${partition.";
 /// One planned chunk: a stable id plus the tokens its invocation substitutes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionChunk {
-    /// Stable id, used as the state-key suffix and in log lines. Zero-padded so
-    /// chunk ids sort in plan order.
+    /// Stable id, used as the state-key suffix and in log lines. Unpadded, so
+    /// it stays the same when the plan grows past a power of ten.
     pub id: String,
     /// Token name → rendered value, e.g. `start` → `"10000"`.
     pub tokens: BTreeMap<String, String>,
