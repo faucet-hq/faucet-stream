@@ -186,7 +186,8 @@ faucet state export orders.yaml -o orders-state.json
 ```
 
 Every key under the namespace, exactly as stored (run leases excluded — they
-describe a process, not a position). The format is versioned; a frozen v1
+describe a process, not a position) — values are written verbatim, never run
+through log redaction, and `-o` creates the file owner-only (`0600`). The format is versioned; a frozen v1
 document is part of the release compatibility suite, and an import of a newer
 version is refused rather than half-read.
 

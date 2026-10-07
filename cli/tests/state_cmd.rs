@@ -713,3 +713,38 @@ async fn verbs_work_against_redis_and_postgres_and_migrate_between_them() {
         .unwrap();
     assert!(redis_store.get("orders::b").await.unwrap().is_none());
 }
+
+/// An export carries bookmark values verbatim — even one equal to an
+/// env-sourced value the log redactor masks — and a written export is
+/// owner-only (#789 CLI-28).
+#[tokio::test]
+async fn export_is_verbatim_and_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_config(dir.path(), &file_state(dir.path()), "");
+    let cfgs = s(&cfg);
+    faucet_cli::secrets::registry::register("orders-topic-name");
+    run(&[
+        "state",
+        "set",
+        &cfgs,
+        "--row",
+        "a",
+        "--bookmark",
+        r#"{"topic":"orders-topic-name","offset":7}"#,
+        "--yes",
+    ])
+    .await
+    .unwrap();
+    let backup = dir.path().join("backup.json");
+    run(&["state", "export", &cfgs, "-o", &s(&backup)])
+        .await
+        .unwrap();
+    let text = std::fs::read_to_string(&backup).unwrap();
+    assert!(text.contains("orders-topic-name"), "{text}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
