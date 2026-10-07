@@ -674,7 +674,9 @@ impl XmlStream {
                     })?;
                     self.roundtrips.record("request");
                     let resp = req.send().await.map_err(FaucetError::Http)?;
-                    let resp = util::check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+                    let resp =
+                        util::check_http_response_rate_limited(resp, DEFAULT_ERROR_BODY_MAX_LEN)
+                            .await?;
                     resp.text().await.map_err(FaucetError::Http)
                 }
             },

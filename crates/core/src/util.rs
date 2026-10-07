@@ -77,6 +77,60 @@ pub async fn check_http_response(
 /// Default maximum body length for error responses.
 pub const DEFAULT_ERROR_BODY_MAX_LEN: usize = 2048;
 
+/// The wait a `Retry-After` header states: delta-seconds or an HTTP date (a
+/// date in the past is zero). `None` when absent or unreadable.
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+    Some(
+        (when.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default(),
+    )
+}
+
+/// `FaucetError::RateLimited(wait)` when `wait` is at most `max`; above it a
+/// non-retriable error naming the wait, so a run fails instead of sleeping for
+/// hours on a quota reset.
+pub fn rate_limited(wait: std::time::Duration, max: std::time::Duration) -> FaucetError {
+    if wait > max {
+        return FaucetError::Source(format!(
+            "rate limited: the server asks to wait {}s, more than the {}s ceiling",
+            wait.as_secs(),
+            max.as_secs()
+        ));
+    }
+    FaucetError::RateLimited(wait)
+}
+
+/// [`check_http_response`] that also honours a server-stated wait: a `429`, or
+/// a `503` carrying `Retry-After`, with a readable `Retry-After` becomes
+/// [`FaucetError::RateLimited`] (failing above
+/// [`DEFAULT_MAX_WAIT_SECS`](crate::DEFAULT_MAX_WAIT_SECS)); everything else
+/// behaves exactly like [`check_http_response`].
+pub async fn check_http_response_rate_limited(
+    resp: reqwest::Response,
+    max_body_len: usize,
+) -> Result<reqwest::Response, FaucetError> {
+    let status = resp.status().as_u16();
+    if (status == 429 || status == 503)
+        && let Some(wait) = retry_after(resp.headers())
+    {
+        return Err(rate_limited(
+            wait,
+            std::time::Duration::from_secs(crate::DEFAULT_MAX_WAIT_SECS),
+        ));
+    }
+    check_http_response(resp, max_body_len).await
+}
+
 // ── Context Utilities ──────────────────────────────────────────────────────
 
 /// Substitute `{key}` placeholders in a template string with values from context.
@@ -560,6 +614,38 @@ mod snake_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn retry_after_reads_seconds_and_http_dates() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after(&h), None);
+        h.insert(reqwest::header::RETRY_AFTER, " 30 ".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(std::time::Duration::from_secs(30)));
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&h), Some(std::time::Duration::ZERO));
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(120)).to_rfc2822();
+        h.insert(reqwest::header::RETRY_AFTER, future.parse().unwrap());
+        let w = retry_after(&h).unwrap();
+        assert!(w > std::time::Duration::from_secs(100) && w <= std::time::Duration::from_secs(120));
+        h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(retry_after(&h), None);
+    }
+
+    #[test]
+    fn rate_limited_fails_above_the_ceiling() {
+        let max = std::time::Duration::from_secs(60);
+        assert!(matches!(
+            rate_limited(std::time::Duration::from_secs(5), max),
+            FaucetError::RateLimited(d) if d.as_secs() == 5
+        ));
+        let e = rate_limited(std::time::Duration::from_secs(86_400), max);
+        assert!(matches!(&e, FaucetError::Source(m) if m.contains("86400s")), "{e:?}");
+        assert!(!e.is_retriable());
+    }
+
     #[test]
     fn fmt_redacted_masks_secret_keys_at_any_depth() {
         struct Show<'a>(&'a Value);

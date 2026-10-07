@@ -843,6 +843,28 @@ async fn test_429_retries_after_header_delay() {
     assert_eq!(records.len(), 1);
 }
 
+#[tokio::test]
+async fn test_429_with_a_day_long_retry_after_fails_instead_of_sleeping() {
+    // API-18: a `Retry-After: 86400` used to park the run for a day.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .respond_with(ResponseTemplate::new(429).append_header("retry-after", "86400"))
+        .mount(&server)
+        .await;
+    let stream = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/api/items").records_path("$.items[*]"),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(30), stream.fetch_all())
+        .await
+        .expect("must not sleep")
+        .unwrap_err();
+    assert!(err.to_string().contains("86400s"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
+
 // ── Tolerated HTTP errors ─────────────────────────────────────────────────────
 
 #[tokio::test]

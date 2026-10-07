@@ -2706,8 +2706,7 @@ impl RestStream {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             && self.config.retry_on_response.is_empty()
         {
-            let wait = parse_retry_after(resp.headers());
-            return Err(FaucetError::RateLimited(wait));
+            return Err(plain_rate_limit(resp.headers()));
         }
 
         // #756: throttling signalled by another status + a body/header marker.
@@ -2721,7 +2720,7 @@ impl RestStream {
                 return Err(e);
             }
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(FaucetError::RateLimited(parse_retry_after(&headers)));
+                return Err(plain_rate_limit(&headers));
             }
             if is_first_page && self.config.tolerated_http_errors.contains(&status.as_u16()) {
                 return Ok((Value::Array(vec![]), HeaderMap::new()));
@@ -2876,6 +2875,15 @@ fn http_status_error(status: u16, url: String, body: String) -> FaucetError {
         body
     };
     FaucetError::HttpStatus { status, url, body }
+}
+
+/// A plain 429: its `Retry-After` (60 s when absent), failing the run above
+/// [`faucet_core::DEFAULT_MAX_WAIT_SECS`] instead of sleeping for hours.
+fn plain_rate_limit(headers: &HeaderMap) -> FaucetError {
+    faucet_core::util::rate_limited(
+        parse_retry_after(headers),
+        Duration::from_secs(faucet_core::DEFAULT_MAX_WAIT_SECS),
+    )
 }
 
 fn parse_retry_after(headers: &HeaderMap) -> Duration {

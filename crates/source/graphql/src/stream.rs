@@ -404,9 +404,11 @@ impl GraphqlStream {
                             self.roundtrips.record("request");
                             let resp = req.send().await.map_err(FaucetError::Http)?;
                             if self.config.retry_on_response.is_empty() {
-                                let resp =
-                                    util::check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN)
-                                        .await?;
+                                let resp = util::check_http_response_rate_limited(
+                                    resp,
+                                    DEFAULT_ERROR_BODY_MAX_LEN,
+                                )
+                                .await?;
                                 return resp.json().await.map_err(FaucetError::Http);
                             }
                             self.read_with_matchers(resp, matches).await
@@ -451,11 +453,7 @@ impl GraphqlStream {
             &text,
         ) {
             let n = matches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let retry_after = headers
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(Duration::from_secs);
+            let retry_after = util::retry_after(&headers);
             let wait = rule.wait(&headers, &text, retry_after, self.retry_policy.base, n)?;
             tracing::warn!(
                 status,
@@ -463,6 +461,14 @@ impl GraphqlStream {
                 "response matched retry_on_response; treating as throttling"
             );
             return Err(FaucetError::RateLimited(wait));
+        }
+        if (status == 429 || status == 503)
+            && let Some(wait) = util::retry_after(&headers)
+        {
+            return Err(util::rate_limited(
+                wait,
+                Duration::from_secs(faucet_core::DEFAULT_MAX_WAIT_SECS),
+            ));
         }
         if !(200..300).contains(&status) {
             let body = if text.len() > DEFAULT_ERROR_BODY_MAX_LEN {
