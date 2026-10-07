@@ -93,6 +93,8 @@ pub struct ExecuteOptions {
     /// Store bookmarks bare instead of in the versioned envelope (#736): a
     /// `faucet serve --cluster` member that predates it is still live.
     pub legacy_state_writes: bool,
+    /// Start even when another run holds the row's live lease (`faucet run --force`).
+    pub force_lease: bool,
     /// Pipeline name — used in log lines and as the first segment of every
     /// state key.
     pub pipeline_name: String,
@@ -1390,28 +1392,38 @@ async fn run_unit(
     // Run lease + run-outcome marker (#732 / #735): what `faucet status`
     // reports and what `faucet state` refuses to change under a live run.
     let cancel_seen = cancel.clone();
-    let markers = crate::pipeline_state::markers::RunMarkers::begin(
+    let (markers, refused) = match crate::pipeline_state::markers::RunMarkers::begin(
         markers_store(&unit.node, opts).await,
         &unit.state_key,
         &run_id,
         matches!(unit.node.role, NodeRole::Root | NodeRole::Product { .. }),
+        opts.force_lease,
     )
-    .await;
-    let result = boxed_run_one_invocation(
-        &unit.node,
-        unit.parent_record.as_deref(),
-        unit.product_ctx.as_ref(),
-        &unit.state_key,
-        capture,
-        opts,
-        cancel,
-        suppress_overwrite,
-        overwrite_grouped,
-        run_id.clone(),
-        observers.clone(),
-        markers.store.clone(),
-    )
-    .await;
+    .await
+    {
+        Ok(m) => (m, None),
+        Err(e) => (Default::default(), Some(e)),
+    };
+    let result = match refused {
+        Some(e) => Err(e),
+        None => {
+            boxed_run_one_invocation(
+                &unit.node,
+                unit.parent_record.as_deref(),
+                unit.product_ctx.as_ref(),
+                &unit.state_key,
+                capture,
+                opts,
+                cancel,
+                suppress_overwrite,
+                overwrite_grouped,
+                run_id.clone(),
+                observers.clone(),
+                markers.store.clone(),
+            )
+            .await
+        }
+    };
     let duration_ms = started.elapsed().as_millis() as u64;
     markers
         .finish(
@@ -4251,6 +4263,7 @@ mod tests {
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "t".into(),
                 run_id: None,
                 execution: None,
@@ -4298,6 +4311,7 @@ mod tests {
     fn exec_opts(name: &str) -> ExecuteOptions {
         ExecuteOptions {
             legacy_state_writes: false,
+            force_lease: false,
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
@@ -4873,6 +4887,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "matrix".into(),
                 run_id: None,
                 execution: None,
@@ -4944,6 +4959,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "dagtest".into(),
                 run_id: None,
                 execution: None,
@@ -5180,6 +5196,7 @@ execution:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "stoptest".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
@@ -5276,6 +5293,7 @@ pipeline:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "bad name".into(), // space is illegal in a state key
                 run_id: None,
                 execution: None,
@@ -5346,6 +5364,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "ok".into(),
                 run_id: None,
                 execution: None,
@@ -5425,6 +5444,7 @@ execution:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "stop_parallel".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
@@ -5505,6 +5525,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "continuetest".into(),
                 run_id: None,
                 execution: None,
@@ -5794,6 +5815,7 @@ matrix:
     fn opts(name: &str) -> ExecuteOptions {
         ExecuteOptions {
             legacy_state_writes: false,
+            force_lease: false,
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
@@ -6518,6 +6540,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "projtest".into(),
                 run_id: None,
                 execution: None,

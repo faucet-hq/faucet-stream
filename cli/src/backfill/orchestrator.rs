@@ -319,6 +319,7 @@ fn make_opts(
 ) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: opts.pipeline_name.clone(),
         run_id: None,
         execution: opts.execution.clone(),
