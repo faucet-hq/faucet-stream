@@ -89,7 +89,9 @@ refresh** — the old one is invalidated. In-memory rotation works for a single
 run, but the *next* scheduled run would present the now-stale seed and get a 401.
 Set `persist.path` on an `oauth2_refresh` provider to durably store the rotated
 token (a file-backed state store) so later runs pick up where the last one left
-off:
+off. Token files are owner-only (`0600`, in a `0700` directory when faucet
+creates it), and a failed write fails the refresh rather than leaving the next
+run with a revoked token:
 
 ```yaml
 auth:

@@ -15,7 +15,7 @@ faucet-core.workspace = true
 async-trait.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["time", "sync", "fs", "io-util"] }
 reqwest = { workspace = true, features = ["json", "form"] }
 jsonpath-rust.workspace = true
 tracing.workspace = true

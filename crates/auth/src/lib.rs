@@ -28,6 +28,7 @@ mod google_sa;
 #[cfg(feature = "oauth1")]
 mod oauth1;
 mod oauth2;
+mod private_store;
 mod static_provider;
 mod token_endpoint;
 
