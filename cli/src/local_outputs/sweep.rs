@@ -77,6 +77,8 @@ pub struct SweepOptions {
     /// gap between a slow source's pages; `0` disables it, for an operator who
     /// knows nothing is running.
     pub in_flight_grace: Duration,
+    /// Only outputs of this pipeline. `None` = every pipeline in the ledger.
+    pub pipeline: Option<String>,
 }
 
 impl SweepOptions {
@@ -87,7 +89,13 @@ impl SweepOptions {
             now: Utc::now(),
             in_flight: BTreeSet::new(),
             in_flight_grace: Duration::from_secs(DEFAULT_IN_FLIGHT_GRACE_SECS),
+            pipeline: None,
         }
+    }
+
+    pub fn pipeline(mut self, pipeline: Option<String>) -> Self {
+        self.pipeline = pipeline;
+        self
     }
 
     pub fn dry_run(mut self, yes: bool) -> Self {
@@ -143,6 +151,12 @@ pub fn select(
 
 /// Whether `scope` names this row at all.
 fn in_scope(rec: &LocalOutputRecord, scope: &SweepScope, opts: &SweepOptions) -> bool {
+    if let Some(p) = &opts.pipeline
+        && !matches!(scope, SweepScope::Output(_))
+        && rec.pipeline != *p
+    {
+        return false;
+    }
     match scope {
         SweepScope::Output(id) => rec.id == *id,
         // The bulk scopes ignore rows whose file is already gone.
@@ -211,6 +225,7 @@ pub async fn run(
             store
                 .local_output_list(&LocalOutputFilter {
                     include_deleted: false,
+                    pipeline: opts.pipeline.clone(),
                     ..Default::default()
                 })
                 .await?
@@ -436,6 +451,29 @@ mod tests {
             1
         );
         assert!(select(&rows, &SweepScope::OlderThanDays(30), &opts()).is_empty());
+    }
+
+    #[test]
+    fn a_pipeline_scope_leaves_other_pipelines_outputs_alone() {
+        let mut other = obs("/tmp/b.jsonl", "2026-08-01T00:00:00Z");
+        other.pipeline = "q".into();
+        let rows = vec![
+            rec("/tmp/a.jsonl", "2026-08-01T00:00:00Z"),
+            LocalOutputRecord::new(&other),
+        ];
+        let o = opts().pipeline(Some("p".into()));
+        for scope in [
+            SweepScope::Expired,
+            SweepScope::All,
+            SweepScope::OlderThanDays(1),
+        ] {
+            let sel = select(&rows, &scope, &o);
+            assert_eq!(sel.len(), 1, "{scope:?}");
+            assert_eq!(sel[0].record.path, "/tmp/a.jsonl");
+        }
+        let id = LocalOutputRecord::new(&other).id;
+        assert_eq!(select(&rows, &SweepScope::Output(id), &o).len(), 1);
+        assert_eq!(select(&rows, &SweepScope::All, &opts()).len(), 2);
     }
 
     #[test]

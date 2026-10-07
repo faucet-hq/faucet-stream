@@ -1662,12 +1662,18 @@ The ledger of outputs lives in the config's `catalog:` store — the same one
 `faucet run` / `schedule` / `mirror` record into and `faucet serve --history`
 browses — so `--store` can point at a server's store directly.
 
+**Which pipeline's outputs.** With a config, every scope except `--output` is
+limited to that config's pipeline (its `name:`, else the file stem) — other
+pipelines sharing the store keep their files and their own retention.
+`--pipeline <name>` names another one; with `--store` and no `--pipeline`, the
+sweep covers every pipeline in the ledger.
+
 **`--retention-days` vs `--older-than-days`** — easy to conflate, and they do
 different things:
 
 | Flag | Kind | Meaning |
 |---|---|---|
-| `--retention-days <n>` | *policy* | The window the bare (expired-only) sweep measures against, overriding the config's `local_outputs.retention_days`. Reads `FAUCET_LOCAL_SINK_OUTPUT_RETENTION_DAYS` when unset, so it matches the `faucet serve` default. `0` = keep forever. Per-pipeline overrides still apply. |
+| `--retention-days <n>` | *policy* | The window the bare (expired-only) sweep measures against, overriding the config's `local_outputs.retention_days`. Reads `FAUCET_LOCAL_SINK_OUTPUT_RETENTION_DAYS` when unset, so it matches the `faucet serve` default. `0` = keep forever. It applies only to outputs that recorded no window of their own: a run that recorded `local_outputs.retention_days` keeps that window (use `--older-than-days` to purge regardless). |
 | `--older-than-days <n>` | *scope* | Selects everything older than `n` days **ignoring every retention setting**, including per-pipeline overrides. `0` matches every output and needs `--yes`. |
 
 So `--retention-days 3` means "treat 3 days as this store's policy and collect

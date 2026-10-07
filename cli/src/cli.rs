@@ -274,6 +274,11 @@ pub struct CleanupArgs {
     /// Emit the machine-readable sweep report instead of the human summary.
     #[arg(long)]
     pub json: bool,
+    /// Only clean outputs of this pipeline (its `name:`, or the config file's
+    /// stem). Defaults to the config's own pipeline when the ledger comes from a
+    /// config; with `--store` and no `--pipeline`, every pipeline is swept.
+    #[arg(long)]
+    pub pipeline: Option<String>,
     /// Ledger store URL (`sqlite:<path>`, `postgres://…`, or `memory`), instead
     /// of reading it from a config's `catalog:` block. Point this at the same URL
     /// `faucet serve --history` uses to clean a server's outputs.
@@ -298,7 +303,10 @@ pub struct CleanupArgs {
     #[arg(long)]
     pub all: bool,
     /// Retention window in days for the default (expired-only) sweep, overriding
-    /// the config's `local_outputs.retention_days`. `0` = keep forever. Distinct
+    /// the config's `local_outputs.retention_days`. Applies only to outputs that
+    /// recorded no window of their own — a pipeline whose run recorded
+    /// `retention_days` keeps it (use `--older-than-days` to purge regardless).
+    /// `0` = keep forever. Distinct
     /// from `--older-than-days`, which is a *scope selector* that ignores every
     /// retention setting.
     ///
@@ -719,9 +727,9 @@ pub struct TemplateRegisterArgs {
     pub description: Option<String>,
     /// Point a named channel at the newly registered version, e.g.
     /// `--tag dev --tag test`. The version number itself always auto-increments;
-    /// channels come from a fixed set (`dev`, `test`, `staging`, `pre-prod`,
-    /// `canary`, `stable`, `prod`, `previous`). `latest` is derived and always
-    /// names the newest version, so it cannot be assigned.
+    /// assignable channels are `dev`, `test`, `staging`, `pre-prod`, `canary`
+    /// and `prod`. `stable`, `previous` and `newest` are derived and cannot be
+    /// assigned — `stable` moves only with `--launch` / `faucet template launch`.
     #[arg(long = "tag", value_name = "CHANNEL")]
     pub tag: Vec<String>,
     /// Launch the new version immediately, making it the one unpinned runs use.
@@ -854,7 +862,7 @@ pub struct TemplateShowArgs {
 pub struct TemplateDeleteArgs {
     /// Template id.
     pub id: String,
-    /// Delete only this version — a number, or a named channel (`latest`,
+    /// Delete only this version — a number, or a named channel (`newest`,
     /// `prod`, …) resolved to the version it points at. Omitted = delete every
     /// version of the template.
     #[arg(long)]
