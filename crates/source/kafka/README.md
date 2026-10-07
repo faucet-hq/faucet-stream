@@ -298,6 +298,8 @@ When a `StateStore` is wired in (via `state:` in YAML, or `Pipeline::with_state_
 
 The bookmark records an offset for **every assigned partition**, not just those that produced a message this run. An empty-this-run partition is recorded at the consumer's current position; if it were omitted, the next resume would fall back to `auto_offset_reset` (default `latest`) and silently **skip** records that arrived meanwhile. A partition that has *never* been assigned (e.g. added to the topic after the last run) honours `auto_offset_reset` on first encounter. A bookmarked partition that has not delivered yet in this run keeps its bookmarked offset — the watermark the assignment resolved only seeds partitions nothing else knows about.
 
+**A bookmark that fell out of retention.** When a bookmarked offset is below the partition's log start (retention deleted those records while the pipeline was down), the source resumes at the log start and logs a `WARN` naming how many bookmarked records were deleted — it never lets librdkafka reset the partition to `auto_offset_reset` (default `latest`), which would also skip the still-retained backlog.
+
 **Rebalances during a run.** Outside cluster member mode nothing is committed to the consumer group, so a rebalance after the first one (another consumer joining the same `group_id`, a session-timeout rejoin) re-seeks each re-assigned partition from the start bookmark advanced by what this run already delivered, instead of restarting it at `auto_offset_reset`.
 
 **Transient broker errors.** Broker transport failures, "all brokers down", coordinator moves, request timeouts and a `max.poll.interval.ms` overrun are logged and the consumer keeps polling (librdkafka reconnects / rejoins on its own); any other consumer error fails the run. A page write plus flush that regularly outlasts `max.poll.interval.ms` (librdkafka default 300 s) costs a rejoin each time — raise it through `extra_client_config` (`max.poll.interval.ms: "900000"`) for slow sinks.
@@ -366,6 +368,7 @@ Under `faucet serve --cluster`, a top-level `shard: { count: N }` block distribu
 
 In member mode (i.e. only when a cluster coordinator applies a shard — a plain `faucet run` is unchanged) the source additionally:
 
+- **seeds the group with its starting position** for every assigned partition the group has no committed offset for (the bookmarked offset, or where `auto_offset_reset` starts), so a partition that migrates before the first durable commit resumes there rather than at `auto_offset_reset`;
 - **commits offsets to the consumer group at durable page boundaries** — after the pipeline has written a page to the sink and persisted its bookmark, plus a synchronous commit at stream end — so a partition that migrates to another member resumes from the last durable position instead of `auto_offset_reset`;
 - **defers bookmark seeks to the group's committed offsets** whenever those are ahead (another member may have durably advanced a partition past this member's bookmark); a bookmark *ahead* of the committed offset — the durable-write→commit crash window — still wins.
 
