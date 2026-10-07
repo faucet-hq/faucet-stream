@@ -106,4 +106,68 @@ mod docker {
         })
         .await;
     }
+
+    /// JetStream mode awaits every publish acknowledgement: a row whose
+    /// subject no stream stores fails alone instead of vanishing behind a
+    /// green run (#789 MSG-31), and the batch is bounded by
+    /// `publish_timeout_secs` (#789 MSG-59).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jetstream_publishes_are_acknowledged_per_row() {
+        use testcontainers::ImageExt;
+        use testcontainers_modules::nats::NatsServerCmd;
+        let cmd = NatsServerCmd::default().with_jetstream();
+        let container = Nats::default().with_cmd(&cmd).start().await.expect("start");
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(4222).await.unwrap();
+        let server = format!("nats://{host}:{port}");
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(c) = async_nats::connect(&server).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let js = async_nats::jetstream::new(client.expect("connect"));
+        let stream = js
+            .create_stream(async_nats::jetstream::stream::Config {
+                name: "OUT".into(),
+                subjects: vec!["out.>".into()],
+                ..Default::default()
+            })
+            .await
+            .expect("stream");
+
+        let mut cfg = NatsSinkConfig::new("out.ok");
+        cfg.connection.servers = vec![server.clone()];
+        cfg.subject_field = Some("to".into());
+        cfg.jetstream = true;
+        cfg.batch_size = 2;
+        let sink = NatsSink::new(cfg).await.unwrap();
+        let rows = vec![
+            serde_json::json!({"to": "out.a"}),
+            serde_json::json!({"to": "nowhere.b"}),
+            serde_json::json!({"to": "out.c"}),
+            serde_json::json!({"no_subject": 1}),
+        ];
+        let outcomes = sink.write_batch_partial(&rows).await.unwrap();
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok(), "{outcomes:?}");
+        assert!(outcomes[1].is_err() && outcomes[3].is_err());
+        let info = stream.get_info().await.unwrap();
+        assert_eq!(info.state.messages, 2);
+        assert!(sink.write_batch(&rows).await.is_err());
+
+        drop(container);
+        let mut cfg = NatsSinkConfig::new("out.x");
+        cfg.connection.servers = vec![server];
+        cfg.publish_timeout_secs = 1;
+        let started = std::time::Instant::now();
+        let sink = NatsSink::new(cfg).await.unwrap();
+        assert!(
+            sink.write_batch(&[serde_json::json!({"a": 1})])
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
 }

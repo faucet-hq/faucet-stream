@@ -1,14 +1,17 @@
 //! `NatsSink` — the NATS producer implementation (the one module that does I/O).
 //!
 //! Append-only: each record is serialized to JSON and published to a subject
-//! (fixed, or per-record from `subject_field`). After each batch the client is
-//! flushed so no message is left buffered when `write_batch` returns.
+//! (fixed, or per-record from `subject_field`). Core NATS flushes the client
+//! after every `batch_size` records; JetStream mode awaits each publish's
+//! acknowledgement and reports a per-row outcome. Every batch is bounded by
+//! `publish_timeout_secs`.
 
 use crate::config::NatsSinkConfig;
 use async_trait::async_trait;
 use bytes::Bytes;
 use faucet_core::{FaucetError, Sink};
 use serde_json::Value;
+use std::time::Duration;
 use tokio::sync::OnceCell;
 
 /// A sink that publishes each record as a JSON NATS message.
@@ -40,6 +43,92 @@ impl NatsSink {
             .cloned()
     }
 
+    /// Bound `fut` by `publish_timeout_secs` (#789 MSG-59).
+    async fn bounded<F: std::future::Future>(
+        &self,
+        fut: F,
+        what: &str,
+    ) -> Result<F::Output, FaucetError> {
+        tokio::time::timeout(Duration::from_secs(self.config.publish_timeout_secs), fut)
+            .await
+            .map_err(|_| {
+                FaucetError::Sink(format!(
+                    "nats {what} did not complete within {}s (server unreachable?)",
+                    self.config.publish_timeout_secs
+                ))
+            })
+    }
+
+    /// Publish every record in `batch_size` groups and return one outcome
+    /// per record. A record whose subject cannot be resolved fails alone.
+    /// Core NATS: a group's publishes then a flush. JetStream: the group's
+    /// publishes, then each acknowledgement (#789 MSG-31).
+    async fn publish_all(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
+        if records.is_empty() {
+            return Ok(outcomes);
+        }
+        let client = self.client().await?;
+        let js = self
+            .config
+            .jetstream
+            .then(|| async_nats::jetstream::new(client.clone()));
+        let group = if self.config.batch_size == 0 {
+            records.len()
+        } else {
+            self.config.batch_size
+        };
+        for (offset, chunk) in records.chunks(group).enumerate() {
+            let base = offset * group;
+            let work = async {
+                let mut acks = Vec::new();
+                for (i, record) in chunk.iter().enumerate() {
+                    let subject = match self.resolve_subject(record) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            outcomes[base + i] = Err(e);
+                            continue;
+                        }
+                    };
+                    let payload = Bytes::from(serde_json::to_vec(record)?);
+                    match &js {
+                        Some(js) => match js.publish(subject, payload).await {
+                            Ok(ack) => acks.push((base + i, ack)),
+                            Err(e) => {
+                                outcomes[base + i] =
+                                    Err(FaucetError::Sink(format!("nats jetstream publish: {e}")))
+                            }
+                        },
+                        None => client
+                            .publish(subject, payload)
+                            .await
+                            .map_err(|e| FaucetError::Sink(format!("nats publish: {e}")))?,
+                    }
+                }
+                if js.is_some() {
+                    for (idx, ack) in acks {
+                        if let Err(e) = ack.await {
+                            outcomes[idx] = Err(FaucetError::Sink(format!(
+                                "nats jetstream publish not acknowledged: {e}"
+                            )));
+                        }
+                    }
+                } else {
+                    client
+                        .flush()
+                        .await
+                        .map_err(|e| FaucetError::Sink(format!("nats flush: {e}")))?;
+                }
+                Ok::<(), FaucetError>(())
+            };
+            self.bounded(work, "publish").await??;
+        }
+        Ok(outcomes)
+    }
+
     /// Resolve the destination subject for a record: the per-record
     /// `subject_field` value when configured, else the fixed `subject`.
     fn resolve_subject(&self, record: &Value) -> Result<String, FaucetError> {
@@ -68,33 +157,24 @@ impl Sink for NatsSink {
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
+        let outcomes = self.publish_all(records).await?;
+        match outcomes.into_iter().find_map(Result::err) {
+            Some(e) => Err(e),
+            None => Ok(records.len()),
         }
-        let client = self.client().await?;
+    }
 
-        let mut written = 0usize;
-        for record in records {
-            let subject = self.resolve_subject(record)?;
-            let payload = serde_json::to_vec(record)?;
-            client
-                .publish(subject, Bytes::from(payload))
-                .await
-                .map_err(|e| FaucetError::Sink(format!("nats publish: {e}")))?;
-            written += 1;
-        }
-
-        // Flush before returning so the batch is on the wire — nothing is left
-        // buffered in the client when the pipeline advances.
-        self.flush().await?;
-        Ok(written)
+    async fn write_batch_partial(
+        &self,
+        records: &[Value],
+    ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        self.publish_all(records).await
     }
 
     async fn flush(&self) -> Result<(), FaucetError> {
         let client = self.client().await?;
-        client
-            .flush()
-            .await
+        self.bounded(client.flush(), "flush")
+            .await?
             .map_err(|e| FaucetError::Sink(format!("nats flush: {e}")))?;
         Ok(())
     }
