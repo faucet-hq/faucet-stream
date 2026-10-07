@@ -18,8 +18,8 @@
 //! - `on_error: continue` (default) skips a failed node's subtree but keeps
 //!   running siblings. `on_error: stop` cancels everything after the first
 //!   failure.
-//! - State-key collisions among children of the same parent surface as a
-//!   `CliError::DuplicateStateKey`.
+//! - A state-key collision among children of the same parent fails that child
+//!   invocation (a `CliError::DuplicateStateKey` outcome); its siblings run.
 
 use crate::auth_catalog::AuthCatalog;
 use crate::config::{DispatchOrder, ExecutionSpec, OnError};
@@ -232,7 +232,16 @@ pub fn check_budget_sinks(
             return Err(CliError::BudgetSinkNotAllowed {
                 row: node.id.clone(),
                 sink: format!("{} ({})", node.sink_ref, node.sink.kind),
-                allowed: budget.allowed_sinks.join(", "),
+                allowed: if budget
+                    .allowed_sinks
+                    .iter()
+                    .any(|s| s == faucet_core::BudgetSpec::DENY_ALL_SINKS)
+                {
+                    "no sink (the merged budgets' allowed_sinks lists have nothing in common)"
+                        .to_string()
+                } else {
+                    budget.allowed_sinks.join(", ")
+                },
             });
         }
     }
@@ -264,6 +273,9 @@ pub enum InvocationErrorKind {
     /// page or cancelled the run. Serve marks the change request / run as
     /// over budget rather than as a generic failure.
     BudgetExceeded,
+    /// The invocation never ran because its parent or a `depends_on` row
+    /// failed or was skipped.
+    Skipped,
     /// Any other failure. No consumer needs to distinguish these yet, and it
     /// stays separate from `None` (= this outcome was never classified, e.g. a
     /// synthetic placeholder outcome) so the two are never confused.
@@ -408,10 +420,19 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
+    /// Invocations that ran and failed (or were refused). A row skipped
+    /// because its parent or dependency failed is not counted again.
     pub fn failure_count(&self) -> usize {
         self.invocations
             .iter()
-            .filter(|i| i.error.is_some())
+            .filter(|i| i.error.is_some() && i.error_kind != Some(InvocationErrorKind::Skipped))
+            .count()
+    }
+    /// Invocations that never ran because a parent or dependency failed.
+    pub fn skipped_count(&self) -> usize {
+        self.invocations
+            .iter()
+            .filter(|i| i.error_kind == Some(InvocationErrorKind::Skipped))
             .count()
     }
     pub fn had_failures(&self) -> bool {
@@ -640,6 +661,9 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             }
             snapshot
         };
+        // Outcomes decided before anything runs: skipped rows and invocations
+        // refused while building their unit (#789 CLI-52/CLI-142).
+        let mut pre_outcomes: Vec<InvocationOutcome> = Vec::new();
         for id in &ready {
             let node = &nodes_by_id[id];
             // If a parent failed (and on_error=continue), the subtree is
@@ -649,6 +673,12 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             {
                 skipped_subtrees.insert(id.clone());
                 tracing::warn!(row = %id, parent = %parent_id, "skipping subtree under failed parent");
+                pre_outcomes.push(synthetic_outcome(
+                    id,
+                    None,
+                    format!("skipped: parent row '{parent_id}' failed or was skipped"),
+                    InvocationErrorKind::Skipped,
+                ));
                 continue;
             }
             // Same for a failed/skipped `depends_on` prerequisite: the row
@@ -665,6 +695,12 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                     row = %id, dependency = %dep,
                     "skipping row: a depends_on row failed or was skipped"
                 );
+                pre_outcomes.push(synthetic_outcome(
+                    id,
+                    None,
+                    format!("skipped: depends_on row '{dep}' failed or was skipped"),
+                    InvocationErrorKind::Skipped,
+                ));
                 continue;
             }
             match &node.role {
@@ -765,12 +801,16 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                             &node.id,
                             Some(&suffix),
                         );
-                        validate_unit_state_key(&node.id, uses_state, &state_key)?;
-                        if !seen_keys.insert(state_key.clone()) {
-                            return Err(CliError::DuplicateStateKey {
-                                id: node.id.clone(),
-                                state_key,
-                            });
+                        if let Err(e) =
+                            check_unit_state_key(&node.id, uses_state, &state_key, &mut seen_keys)
+                        {
+                            pre_outcomes.push(synthetic_outcome(
+                                &node.id,
+                                Some(suffix),
+                                e.to_string(),
+                                InvocationErrorKind::Other,
+                            ));
+                            continue;
                         }
                         units.push(Unit {
                             node: node.clone(),
@@ -805,14 +845,20 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         let state_key = build_state_key(
                             &opts.state_scope.prefix(&opts.pipeline_name),
                             &node.id,
-                            Some(&pk_string),
+                            Some(&crate::discovery_matrix::state_key_component(
+                                &pk_string, true,
+                            )),
                         );
-                        validate_unit_state_key(&node.id, uses_state, &state_key)?;
-                        if !seen_keys.insert(state_key.clone()) {
-                            return Err(CliError::DuplicateStateKey {
-                                id: node.id.clone(),
-                                state_key,
-                            });
+                        if let Err(e) =
+                            check_unit_state_key(&node.id, uses_state, &state_key, &mut seen_keys)
+                        {
+                            pre_outcomes.push(synthetic_outcome(
+                                &node.id,
+                                Some(pk_string),
+                                e.to_string(),
+                                InvocationErrorKind::Other,
+                            ));
+                            continue;
                         }
                         units.push(Unit {
                             node: node.clone(),
@@ -843,26 +889,39 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         } else {
             plan_overwrite_groups(&units, opts.as_ref())?
         };
-        for group in &overwrite_groups {
+        // A group whose begin fails does not run; the error becomes its
+        // members' outcome rather than aborting the whole run (#789 CLI-80).
+        let mut begin_failed: HashMap<usize, String> = HashMap::new();
+        for (gi, group) in overwrite_groups.iter().enumerate() {
             // Build a short-lived sink just for begin, then drop it (closing its
             // pool) before the invocations run — so it never contends with the
             // per-invocation sinks on a single-writer backend.
             let mut cfg = group.cfg.clone();
             mark_overwrite_staging(&group.kind, &mut cfg, group.members > 1);
-            let sink = build_sink(&group.kind, cfg, &opts.auth).await?;
-            sink.begin_overwrite().await.map_err(|e| {
-                CliError::Internal(format!(
-                    "overwrite: preparing destination '{}': {e}",
-                    group.dest
-                ))
-            })?;
+            let begun = match build_sink(&group.kind, cfg, &opts.auth).await {
+                Ok(sink) => sink.begin_overwrite().await.map_err(CliError::from),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = begun {
+                begin_failed.insert(
+                    gi,
+                    format!("overwrite: preparing destination '{}': {e}", group.dest),
+                );
+            }
         }
         // Group indices whose fan-out had at least one failed invocation: the
         // whole group must abort (a full-refresh must never commit partial data).
-        let mut failed_overwrite_groups: HashSet<usize> = HashSet::new();
+        let mut failed_overwrite_groups: HashSet<usize> = begin_failed.keys().copied().collect();
 
         let mut had_level_failure = false;
         let mut nodes_with_any_failure: HashSet<String> = HashSet::new();
+        for outcome in pre_outcomes {
+            if outcome.error_kind != Some(InvocationErrorKind::Skipped) {
+                had_level_failure = true;
+                nodes_with_any_failure.insert(outcome.row_id.clone());
+            }
+            outcomes.push(outcome);
+        }
 
         // Unified parallel execution. Tasks run concurrently under the global
         // semaphore. Under `on_error: stop`, the first failure triggers
@@ -876,12 +935,33 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         // this level's invocations cooperatively; it is a child of the root
         // token, so an external cancel (serve) still propagates here (#146 H16).
         let level_cancel = cancel.child_token();
+        if had_level_failure && matches!(on_error, OnError::Stop) {
+            level_cancel.cancel();
+        }
         let mut joinset = tokio::task::JoinSet::new();
         // Map each spawned task's id back to its row id + parent key so that a
         // panic (surfaced as a JoinError, which doesn't carry the unit) can be
         // attributed to the right invocation.
         let mut task_meta: HashMap<tokio::task::Id, (String, Option<String>)> = HashMap::new();
         for unit in units {
+            if level_cancel.is_cancelled() && matches!(on_error, OnError::Stop) {
+                break;
+            }
+            let group_key = (unit.node.id.clone(), unit.parent_record_key.clone());
+            if let Some(err) = overwrite_task_group
+                .get(&group_key)
+                .and_then(|gi| begin_failed.get(gi))
+            {
+                had_level_failure = true;
+                nodes_with_any_failure.insert(unit.node.id.clone());
+                outcomes.push(synthetic_outcome(
+                    &unit.node.id,
+                    unit.parent_record_key.clone(),
+                    err.clone(),
+                    InvocationErrorKind::Other,
+                ));
+                continue;
+            }
             let sem = Arc::clone(&semaphore);
             let opts2 = Arc::clone(&opts);
             let captured = Arc::clone(&captured);
@@ -898,7 +978,10 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             let overwrite_grouped = overwrite_task_group
                 .get(&meta)
                 .is_some_and(|gi| overwrite_groups[*gi].members > 1);
-            let unit_cancel = level_cancel.clone();
+            // A child token per unit: a budget ceiling cancels its own unit
+            // only, never its siblings, while a level cancel still reaches all
+            // of them (#789 CLI-54).
+            let unit_cancel = level_cancel.child_token();
             let dlq_sinks = Arc::clone(&dlq_sinks);
             let handle = joinset.spawn(DLQ_SINKS.scope(dlq_sinks, async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
@@ -1014,6 +1097,10 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         // across the whole fan-out, so every parent's rows are swapped in
         // together, atomically.
         let level_cancelled = level_cancel.is_cancelled() || cancel.is_cancelled();
+        // Groups whose swap did not happen although members succeeded: their
+        // members are reported failed below, since the destination still holds
+        // the previous data (#789 CLI-55/CLI-80).
+        let mut unswapped: HashMap<usize, String> = HashMap::new();
         for (gi, group) in overwrite_groups.iter().enumerate() {
             // `--limit` writes a sample: committing it would replace the whole
             // destination with N rows (#789 CLI-05), so the staged sample is
@@ -1029,7 +1116,17 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                 level_cancelled || failed_overwrite_groups.contains(&gi) || opts.limit.is_some();
             let mut cfg = group.cfg.clone();
             mark_overwrite_staging(&group.kind, &mut cfg, group.members > 1);
-            let sink = build_sink(&group.kind, cfg, &opts.auth).await?;
+            let sink = match build_sink(&group.kind, cfg, &opts.auth).await {
+                Ok(sink) => sink,
+                Err(e) => {
+                    tracing::error!(error = %e, dest = %group.dest, "overwrite: building the lifecycle sink failed");
+                    unswapped.insert(
+                        gi,
+                        format!("overwrite: finishing destination '{}': {e}", group.dest),
+                    );
+                    continue;
+                }
+            };
             if must_abort {
                 if let Err(e) = sink.abort_overwrite().await {
                     tracing::warn!(
@@ -1038,13 +1135,51 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                          the destination is unchanged"
                     );
                 }
-            } else {
-                sink.commit_overwrite().await.map_err(|e| {
-                    CliError::Internal(format!(
+                if failed_overwrite_groups.contains(&gi) && !begin_failed.contains_key(&gi) {
+                    unswapped.insert(
+                        gi,
+                        format!(
+                            "overwrite of '{}' aborted because another invocation of the group \
+                             failed; the destination is unchanged",
+                            group.dest
+                        ),
+                    );
+                }
+            } else if let Err(e) = sink.commit_overwrite().await {
+                tracing::error!(error = %e, dest = %group.dest, "overwrite: commit failed");
+                unswapped.insert(
+                    gi,
+                    format!(
                         "overwrite: swapping destination '{}' into place: {e}",
                         group.dest
-                    ))
-                })?;
+                    ),
+                );
+            }
+        }
+        if !unswapped.is_empty() {
+            for outcome in outcomes.iter_mut().filter(|o| o.error.is_none()) {
+                let key = (outcome.row_id.clone(), outcome.parent_record_key.clone());
+                let Some(msg) = overwrite_task_group
+                    .get(&key)
+                    .and_then(|gi| unswapped.get(gi))
+                else {
+                    continue;
+                };
+                outcome.error = Some(msg.clone());
+                outcome.error_kind = Some(InvocationErrorKind::Other);
+                had_level_failure = true;
+                nodes_with_any_failure.insert(outcome.row_id.clone());
+                #[cfg(feature = "notify")]
+                if let Some(notifier) = &opts.notifier {
+                    notifier
+                        .emit(crate::notify::NotifyEvent::run_failure(
+                            opts.pipeline_name.clone(),
+                            outcome.row_id.clone(),
+                            "overwrite_aborted",
+                            msg.clone(),
+                        ))
+                        .await;
+                }
             }
         }
 
@@ -1342,12 +1477,11 @@ fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResult<Ove
         }
         let kind = unit.node.sink.kind.clone();
         let cfg = resolved_sink_destination(unit, opts)?;
-        // Same sink source-object + key-preserving resolution ⇒ stable
-        // serialization, so equal destinations collapse to one group.
-        let key = format!(
-            "{kind}\u{0}{}",
-            serde_json::to_string(&cfg).unwrap_or_default()
-        );
+        // Keyed on the destination identity, not the whole config: two rows
+        // on one table that differ only in a write knob (`batch_size`, `key`)
+        // stage into the same `{table}__faucet_ovw`, so they must share one
+        // begin/commit (#789 CLI-22).
+        let key = crate::destination::identity(&kind, &cfg);
         let gi = match index_by_key.get(&key) {
             Some(gi) => {
                 groups[*gi].members += 1;
@@ -1809,6 +1943,43 @@ fn validate_unit_state_key(node_id: &str, uses_state: bool, state_key: &str) -> 
         })?;
     }
     Ok(())
+}
+
+/// [`validate_unit_state_key`] plus the sibling-collision check, as one
+/// per-invocation verdict (#789 CLI-52).
+fn check_unit_state_key(
+    node_id: &str,
+    uses_state: bool,
+    state_key: &str,
+    seen: &mut HashSet<String>,
+) -> CliResult<()> {
+    validate_unit_state_key(node_id, uses_state, state_key)?;
+    if !seen.insert(state_key.to_owned()) {
+        return Err(CliError::DuplicateStateKey {
+            id: node_id.to_owned(),
+            state_key: state_key.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// An outcome for an invocation that never ran.
+fn synthetic_outcome(
+    row_id: &str,
+    parent_record_key: Option<String>,
+    error: String,
+    kind: InvocationErrorKind,
+) -> InvocationOutcome {
+    InvocationOutcome {
+        row_id: row_id.to_owned(),
+        parent_record_key,
+        run_id: None,
+        records_written: 0,
+        error: Some(error),
+        error_kind: Some(kind),
+        metrics: None,
+        usage: None,
+    }
 }
 
 /// Walk the parent record by `parent_key` (a dotted path) and clone the value.
@@ -4562,6 +4733,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failing_overwrite_begin_fails_its_members_not_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        // The database's directory does not exist, so the group's begin fails.
+        let db_url = format!(
+            "sqlite:{}",
+            dir.path().join("missing").join("ow.db").display()
+        );
+        std::fs::write(dir.path().join("parents.csv"), "id\n1\n2\n").unwrap();
+        std::fs::write(dir.path().join("child_1.csv"), "id,v\n1,A\n").unwrap();
+        std::fs::write(dir.path().join("child_2.csv"), "id,v\n2,B\n").unwrap();
+        let yaml = overwrite_fanout_yaml(dir.path(), &db_url);
+        let cfg = PipelineConfig::from_text(&yaml, &dir.path().join("ow.yaml")).unwrap();
+        let summary = run_expanded(expand(&cfg).unwrap(), exec_opts("t"))
+            .await
+            .expect("a begin failure no longer discards the run summary");
+        let children: Vec<_> = summary
+            .invocations
+            .iter()
+            .filter(|o| o.parent_record_key.is_some())
+            .collect();
+        assert_eq!(children.len(), 2, "{summary:?}");
+        for c in children {
+            assert!(
+                c.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("preparing destination"),
+                "{c:?}"
+            );
+        }
+        assert!(
+            summary
+                .invocations
+                .iter()
+                .any(|o| o.parent_record_key.is_none() && o.error.is_none()),
+            "the parent row's outcome is kept"
+        );
+    }
+
+    #[tokio::test]
     async fn child_fanout_overwrite_aborts_on_failure_leaving_destination_intact() {
         let dir = tempfile::tempdir().unwrap();
         let db_url = format!("sqlite:{}", dir.path().join("ow.db").display());
@@ -4576,6 +4787,23 @@ mod tests {
         assert!(
             summary.had_failures(),
             "a missing child source must fail a unit"
+        );
+        // The member that wrote fine is reported failed too: its rows never
+        // reached the destination (#789 CLI-55).
+        let children: Vec<_> = summary
+            .invocations
+            .iter()
+            .filter(|o| o.parent_record_key.is_some())
+            .collect();
+        assert_eq!(children.len(), 2, "{summary:?}");
+        assert!(children.iter().all(|o| o.error.is_some()), "{children:?}");
+        assert!(
+            children.iter().any(|o| o
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("aborted because another invocation")),
+            "{children:?}"
         );
 
         // The prior destination is untouched: still exactly the seed row.
@@ -5117,7 +5345,7 @@ matrix:
     #[tokio::test]
     async fn failed_dependency_skips_dependent() {
         // `stage` fails (missing input file); `load` depends on it and must be
-        // skipped — no invocation outcome, no output file.
+        // skipped — a synthetic `skipped` outcome, no output file (#789 CLI-142).
         let dir = tempfile::tempdir().unwrap();
         let good_input = dir.path().join("good.csv");
         let out = dir.path().join("out.jsonl");
@@ -5141,9 +5369,16 @@ matrix:
         let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
         let nodes = expand(&cfg).unwrap();
         let summary = run_expanded(nodes, opts("depskip")).await.unwrap();
-        assert_eq!(summary.invocations.len(), 1, "{summary:?}");
+        assert_eq!(summary.invocations.len(), 2, "{summary:?}");
         assert_eq!(summary.invocations[0].row_id, "stage");
         assert!(summary.invocations[0].error.is_some());
+        let load = &summary.invocations[1];
+        assert_eq!(load.row_id, "load");
+        assert_eq!(load.error_kind, Some(InvocationErrorKind::Skipped));
+        assert!(
+            load.error.as_deref().unwrap().contains("'stage'"),
+            "{load:?}"
+        );
         assert!(
             !out.exists(),
             "dependent row must not run after its dependency failed"
@@ -5179,9 +5414,16 @@ matrix:
         let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
         let nodes = expand(&cfg).unwrap();
         let summary = run_expanded(nodes, opts("depcascade")).await.unwrap();
-        assert_eq!(summary.invocations.len(), 1, "{summary:?}");
-        assert_eq!(summary.invocations[0].row_id, "p");
+        let rows: Vec<(&str, Option<InvocationErrorKind>)> = summary
+            .invocations
+            .iter()
+            .map(|o| (o.row_id.as_str(), o.error_kind))
+            .collect();
+        assert_eq!(rows.len(), 3, "{summary:?}");
+        assert_eq!(rows[0].0, "p");
         assert!(summary.invocations[0].error.is_some());
+        assert_eq!(rows[1], ("c", Some(InvocationErrorKind::Skipped)));
+        assert_eq!(rows[2], ("q", Some(InvocationErrorKind::Skipped)));
         assert!(
             !out.exists(),
             "q must be skipped when its dependency was skipped"
@@ -5363,9 +5605,9 @@ pipeline:
     }
 
     #[tokio::test]
-    async fn invalid_parent_key_value_with_state_errors_up_front() {
-        // A parent-record value that yields an illegal state-key suffix must
-        // fail up front at the child's unit construction, not mid-run.
+    async fn a_parent_key_outside_the_state_key_charset_is_encoded_and_runs() {
+        // A parent-record value with characters a state key cannot hold is
+        // encoded into a legal segment, so the child still runs (#789 CLI-52).
         let dir = tempfile::tempdir().unwrap();
         let parent_csv = dir.path().join("parents.csv");
         let child_csv = dir.path().join("child.csv");
@@ -5429,10 +5671,15 @@ matrix:
             },
         )
         .await
-        .expect_err(
-            "an illegal parent-key value must be rejected up front when state is configured",
-        );
-        assert!(matches!(err, CliError::InvalidStateKey { .. }), "{err:?}");
+        .expect("an unusual parent-key value no longer aborts the run");
+        let child: Vec<_> = err
+            .invocations
+            .iter()
+            .filter(|o| o.row_id == "child")
+            .collect();
+        assert_eq!(child.len(), 1);
+        assert!(child[0].error.is_none(), "{:?}", child[0].error);
+        assert_eq!(child[0].parent_record_key.as_deref(), Some("bad id"));
     }
 
     #[tokio::test]
@@ -5969,10 +6216,10 @@ matrix:
     }
 
     #[tokio::test]
-    async fn duplicate_state_key_among_siblings_is_rejected() {
+    async fn duplicate_state_key_among_siblings_fails_only_that_invocation() {
         // Two parent records whose `parent_key` value collides (both id="dup")
-        // produce two child units with the SAME state key. With state
-        // configured, that collision must surface as DuplicateStateKey.
+        // produce two child units with the SAME state key. The second one
+        // fails with DuplicateStateKey; the run and its summary survive.
         let dir = tempfile::tempdir().unwrap();
         let parent_csv = dir.path().join("parents.csv");
         let child_csv = dir.path().join("child.csv");
@@ -6001,16 +6248,25 @@ matrix:
         );
         let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
         let nodes = expand(&cfg).unwrap();
-        let err = run_expanded(nodes, opts("dupkey"))
+        let summary = run_expanded(nodes, opts("dupkey"))
             .await
-            .expect_err("colliding sibling state keys must be rejected");
-        match err {
-            CliError::DuplicateStateKey { id, state_key } => {
-                assert_eq!(id, "child");
-                assert_eq!(state_key, "dupkey::child::dup");
-            }
-            other => panic!("expected DuplicateStateKey, got {other:?}"),
-        }
+            .expect("a colliding sibling no longer aborts the run");
+        let child: Vec<_> = summary
+            .invocations
+            .iter()
+            .filter(|o| o.row_id == "child")
+            .collect();
+        assert_eq!(child.len(), 2, "{child:?}");
+        assert_eq!(child.iter().filter(|o| o.error.is_none()).count(), 1);
+        let failed = child.iter().find(|o| o.error.is_some()).unwrap();
+        let msg = failed.error.as_deref().unwrap();
+        assert!(msg.contains("dupkey::child::dup"), "{msg}");
+        assert!(
+            summary
+                .invocations
+                .iter()
+                .any(|o| o.row_id == "parents" && o.error.is_none())
+        );
     }
 
     #[tokio::test]
@@ -6498,6 +6754,27 @@ matrix:
             groups2.iter().all(|g| g.members == 1),
             "per-parent destinations are solo"
         );
+    }
+
+    #[tokio::test]
+    async fn overwrite_rows_differing_only_in_a_write_knob_share_one_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = exec_opts("t");
+        let a = overwrite_child_node(dir.path(), "orders");
+        let mut b = a.clone();
+        b.id = "c2".into();
+        b.sink.config["batch_size"] = json!(17);
+        let mk = |node: &ExpandedNode| Unit {
+            node: node.clone(),
+            parent_record: Some(std::sync::Arc::new(json!({ "id": 1 }))),
+            state_key: format!("t::{}::1", node.id),
+            parent_record_key: Some("1".into()),
+            product_ctx: None,
+        };
+        let (groups, task_group) = plan_overwrite_groups(&[mk(&a), mk(&b)], &opts).unwrap();
+        assert_eq!(groups.len(), 1, "one table ⇒ one staging ⇒ one group");
+        assert_eq!(groups[0].members, 2);
+        assert_eq!(task_group.len(), 2);
     }
 
     #[test]

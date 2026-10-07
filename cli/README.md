@@ -974,7 +974,7 @@ metrics (`faucet_pipeline_adaptive_batch_*`).
 #### State keys
 
 - Root invocations: `{name}::{row_id}`.
-- Child invocations: `{name}::{row_id}::{parent_record_key}` where `parent_record_key` is the value at `parent_key` (default `id`) in the parent record.
+- Child invocations: `{name}::{row_id}::{parent_record_key}` where `parent_record_key` is the value at `parent_key` (default `id`) in the parent record. A value with characters outside `[A-Za-z0-9_.:/-]`, a `::`, or more than 64 characters is written as a readable prefix plus a stable hash, so an email or a non-ASCII key still gets its own resumable state; a parent key that collides with a sibling's fails only that child invocation.
 
 A state-key collision among siblings sharing a parent is detected upfront and errors with both offenders named.
 

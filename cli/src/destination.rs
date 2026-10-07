@@ -67,17 +67,22 @@ pub fn destination_key(node: &ExpandedNode) -> Option<String> {
     if has_runtime_token(&node.sink.config) {
         return None;
     }
-    let mut cfg = node.sink.config.clone();
+    Some(identity(&node.sink.kind, &node.sink.config))
+}
+
+/// The destination identity of a resolved sink config: the kind plus every
+/// config key except the ones that only tune how the sink writes.
+pub fn identity(kind: &str, config: &Value) -> String {
+    let mut cfg = config.clone();
     if let Value::Object(map) = &mut cfg {
         for k in NON_IDENTITY_KEYS {
             map.remove(*k);
         }
     }
-    Some(format!(
-        "{}\u{0}{}",
-        node.sink.kind,
+    format!(
+        "{kind}\u{0}{}",
         serde_json::to_string(&cfg).unwrap_or_default()
-    ))
+    )
 }
 
 /// A short, credential-free description of a node's destination for messages.

@@ -153,9 +153,40 @@ pub fn cartesian(dims: &[Dim]) -> Vec<HashMap<String, Value>> {
     out
 }
 
+/// Longest raw value kept verbatim in a state-key segment.
+const STATE_KEY_COMPONENT_MAX: usize = 64;
+
+/// Render one fan-out value as a state-key segment (#789 CLI-52/CLI-53). A
+/// value made only of state-key characters is kept as is, so existing keys do
+/// not move; anything else (an email, a space, non-ASCII, `::`, an over-long
+/// value) becomes a readable prefix plus a stable 64-bit hash of the raw value.
+/// `allow_separators` admits `:` and `/` (a child's parent key, which stands
+/// alone after `::`); a product tuple keeps them for its own separators.
+pub fn state_key_component(raw: &str, allow_separators: bool) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    let legal = |c: char| plain(c) || (allow_separators && matches!(c, ':' | '/'));
+    if !raw.is_empty()
+        && raw.len() <= STATE_KEY_COMPONENT_MAX
+        && raw.chars().all(legal)
+        && !raw.contains("::")
+        && !raw.starts_with(':')
+        && !raw.ends_with(':')
+    {
+        return raw.to_owned();
+    }
+    let readable: String = raw.chars().filter(|c| plain(*c)).take(32).collect();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in raw.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{readable}.h{hash:016x}")
+}
+
 /// Stable, collision-resistant state-key suffix for one product tuple, in
-/// declared dimension order: `alias=value&alias=value…`. `dims` supplies the
-/// order + aliases; `ctx` is one entry from [`cartesian`]. Pure.
+/// declared dimension order: `alias:value/alias:value…`, each part a legal
+/// state-key segment ([`state_key_component`]). `dims` supplies the order +
+/// aliases; `ctx` is one entry from [`cartesian`]. Pure.
 pub fn tuple_state_key_suffix(dims: &[Dim], ctx: &HashMap<String, Value>) -> String {
     dims.iter()
         .map(|d| {
@@ -164,10 +195,14 @@ pub fn tuple_state_key_suffix(dims: &[Dim], ctx: &HashMap<String, Value>) -> Str
                 .and_then(|o| o.get(&d.alias))
                 .map(value_brief)
                 .unwrap_or_else(|| "(missing)".to_string());
-            format!("{}={}", d.alias, v)
+            format!(
+                "{}:{}",
+                state_key_component(&d.alias, false),
+                state_key_component(&v, false)
+            )
         })
         .collect::<Vec<_>>()
-        .join("&")
+        .join("/")
 }
 
 /// Brief scalar rendering of a JSON value for a state-key segment.
@@ -340,9 +375,55 @@ mod tests {
             dim("fields", "field_id", vec![json!("a")]),
         ];
         let ctxs = cartesian(&dims);
+        let suffix = tuple_state_key_suffix(&dims, &ctxs[0]);
+        assert_eq!(suffix, "subsidiary_id:1/field_id:a");
+        faucet_core::state::validate_state_key(&format!("p::row::{suffix}")).unwrap();
+    }
+
+    #[test]
+    fn tuple_state_key_encodes_values_outside_the_key_charset() {
+        let dims = vec![dim(
+            "users",
+            "email",
+            vec![
+                json!("a@x.com"),
+                json!("b@x.com"),
+                json!("a b"),
+                json!("x::y"),
+            ],
+        )];
+        let ctxs = cartesian(&dims);
+        let keys: Vec<String> = ctxs
+            .iter()
+            .map(|c| format!("p::row::{}", tuple_state_key_suffix(&dims, c)))
+            .collect();
+        for k in &keys {
+            faucet_core::state::validate_state_key(k).unwrap();
+        }
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "{keys:?}");
+        assert!(keys[0].starts_with("p::row::email:ax.com.h"), "{}", keys[0]);
         assert_eq!(
-            tuple_state_key_suffix(&dims, &ctxs[0]),
-            "subsidiary_id=1&field_id=a"
+            keys,
+            ctxs.iter()
+                .map(|c| format!("p::row::{}", tuple_state_key_suffix(&dims, c)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn state_key_component_keeps_legal_values_and_hashes_the_rest() {
+        assert_eq!(state_key_component("cust-42_a.b", false), "cust-42_a.b");
+        assert_eq!(state_key_component("a/b:c", true), "a/b:c");
+        assert_ne!(state_key_component("a/b:c", false), "a/b:c");
+        for raw in ["", "x::y", ":x", "y:", "émoji", &"z".repeat(65)] {
+            let c = state_key_component(raw, true);
+            assert!(c.contains(".h"), "{raw:?} → {c}");
+            faucet_core::state::validate_state_key(&format!("p::r::{c}")).unwrap();
+        }
+        assert_ne!(
+            state_key_component("a b", true),
+            state_key_component("a  b", true)
         );
     }
 }
