@@ -22,6 +22,8 @@ tokio.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 tracing.workspace = true
+# TCP keepalive on pooled connections (half-open detection).
+socket2 = "0.6"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

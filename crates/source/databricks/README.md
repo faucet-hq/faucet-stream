@@ -52,6 +52,7 @@ the Delta Lake connectors ([`faucet-source-delta`](https://crates.io/crates/fauc
 | `parameters` | `[{name, value, type?}]` | `[]` | named `:name` SQL parameters |
 | `wait_timeout_secs` | int | `50` | server wait before async (`0` or `5`–`50`) |
 | `poll_interval_secs` | int | `1` | client poll cadence while running |
+| `statement_timeout_secs` | int | `3600` | client deadline for the statement to finish; on expiry it is cancelled and the read fails (`0` = wait indefinitely) |
 | `batch_size` | int | `1000` | rows per emitted page; `0` is the "no batching" sentinel — the whole result set is emitted in a single page |
 | `result_disposition` | `external_links` \| `inline` | `external_links` | how the row path receives results. `external_links` downloads each chunk from a presigned cloud-storage URL (no size cap; the client must reach the workspace's storage); `inline` keeps results in the API response, which Databricks fails above 25 MiB. Ignored under `arrow_native`. |
 | `arrow_native` | bool | `false` | fetch as `EXTERNAL_LINKS` + `ARROW_STREAM` and decode Arrow IPC; enables the columnar fast path. Requires the `arrow` feature and `replication: full`. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode). |

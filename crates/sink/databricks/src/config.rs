@@ -224,6 +224,13 @@ impl DatabricksSinkConfig {
             )));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
+        if self.poll_interval_ms == 0 {
+            return Err(FaucetError::Config(
+                "databricks sink: `poll_interval_ms` must be > 0 (0 would poll the workspace \
+                 in a tight loop)"
+                    .into(),
+            ));
+        }
         if self.max_statement_bytes == 0 || self.max_statement_bytes > STATEMENT_TEXT_LIMIT {
             return Err(FaucetError::Config(format!(
                 "databricks sink: `max_statement_bytes` must be between 1 and {STATEMENT_TEXT_LIMIT}"

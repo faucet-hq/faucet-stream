@@ -102,7 +102,9 @@ pub struct MssqlCdcSourceConfig {
     /// [`DEFAULT_BATCH_SIZE`].
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-    /// Maximum pooled connections. Defaults to 5.
+    /// Maximum pooled connections. Defaults to 5; raised to the number of
+    /// capture instances, since a poll reads every instance's changes at once
+    /// to merge them in commit order.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
     /// Per-query timeout in seconds (`0` disables). Defaults to 300.
@@ -155,6 +157,13 @@ impl MssqlCdcSourceConfig {
         let key = self.resolved_state_key();
         faucet_core::state::validate_state_key(&key)?;
         Ok(())
+    }
+
+    /// The pool size: `max_connections`, at least one connection per capture
+    /// instance.
+    pub fn pool_size(&self) -> u32 {
+        self.max_connections
+            .max(u32::try_from(self.capture_instances.len()).unwrap_or(u32::MAX))
     }
 
     /// The state-store key for this source's LSN bookmark map. Uses the explicit
@@ -341,6 +350,18 @@ mod tests {
     #[test]
     fn accepts_minimal() {
         assert!(minimal().validate().is_ok());
+    }
+
+    #[test]
+    fn pool_has_a_connection_per_capture_instance() {
+        let mut c: MssqlCdcSourceConfig = serde_json::from_value(json!({
+            "connection_url": "mssql://sa:pw@h/db",
+            "capture_instances": ["a", "b"]
+        }))
+        .unwrap();
+        assert_eq!(c.pool_size(), 5);
+        c.max_connections = 1;
+        assert_eq!(c.pool_size(), 2);
     }
 
     #[test]

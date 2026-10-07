@@ -59,10 +59,18 @@ first written page's inferred columns when it does not exist — a first-ever
 sync cannot assume the destination is already there. Every inferred column is
 created **nullable**: a column present in page 1 is not required forever, and a
 `NOT NULL` inferred from one page fails page 2 the first time a record omits
-the field (narrowing later is the `schema:` drift policy's job).
+the field. With `auto_map`, a field first seen on a later page (or missing
+from a pre-existing table) is added with `ALTER TABLE … ADD COLUMN IF NOT
+EXISTS`, typed the same way, in the page's transaction — it is never dropped.
 
 Set `create_table: false` to require a pre-existing target; a missing one then
-fails fast with the same error every table sink raises, naming both ways out.
+fails fast with the same error every table sink raises, naming both ways out,
+and with `auto_map` a record field the table has no column for fails the write
+naming the field.
+
+With `auto_map`, an ISO 8601 string carrying an offset (`…-08:00`, `…Z`) bound
+for a tz-less `TIMESTAMP` column is converted to UTC first; DuckDB's text cast
+would otherwise drop the offset. Offset-less strings are stored as given.
 
 ## Batch atomicity
 

@@ -73,7 +73,7 @@ faucet run pipeline.yaml
 | `max_connections` | int | `10` | Maximum pooled connections. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. **`0` = no batching**: the entire result set is emitted as a single page (good for small lookup tables, or sinks that prefer one large request). |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
-| `statement_timeout_secs` | int (seconds) | `300` | Per-query timeout. **`0` disables** (wait indefinitely). |
+| `statement_timeout_secs` | int (seconds) | `300` | Bounds the query's first response and every wait for the next row. **`0` disables** (wait indefinitely). |
 | `state_key` | string | *(derived)* | Explicit state-store key for the incremental bookmark. When unset, a stable key is derived from the connection host plus a fingerprint of the query. |
 
 ### Replication
@@ -97,7 +97,7 @@ faucet run pipeline.yaml
 
 | `tls.type` | Behavior |
 |------------|----------|
-| `prefer` | Encrypt if the server supports it — the safe modern default. |
+| `prefer` | Encrypt; fails against a server that offers no TLS (same as `require`). The default. |
 | `require` | Require encryption; fail if the server does not offer it. |
 | `trust_server_certificate` | Encrypt and accept the server certificate **without validating its chain** (self-signed dev servers). **Insecure against MITM — never use in production.** |
 | `disable` | No transport encryption. |
@@ -244,7 +244,7 @@ Discovery reads catalog metadata only — it never scans table data.
 | TINYINT / SMALLINT / INT / BIGINT | number |
 | REAL / FLOAT | number |
 | BIT | bool |
-| DECIMAL / NUMERIC / MONEY | string (precision-preserving) |
+| DECIMAL / NUMERIC / MONEY | string (precision-preserving; MONEY/SMALLMONEY as exact 4-decimal text — the driver delivers MONEY as a float, which is exact below about ±900 billion, the range we render without loss) |
 | CHAR / VARCHAR / NCHAR / NVARCHAR / TEXT / NTEXT / XML | string |
 | DATE | `YYYY-MM-DD` |
 | TIME | ISO time |

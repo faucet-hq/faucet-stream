@@ -24,8 +24,9 @@ The authentication method for a Snowflake connector. It serializes as the projec
 
 | Function | Returns | Purpose |
 |---|---|---|
-| `authorization_header(auth, account) -> Result<String, FaucetError>` | `Bearer {jwt}` for `KeyPair`; `Snowflake Token="{token}"` for `OAuth` | Builds the `Authorization` header value for a SQL REST API request. `account` (e.g. `"xy12345.us-east-1"`) is uppercased into the JWT `iss`/`sub` claims. |
+| `authorization_header(auth, account) -> Result<String, FaucetError>` | `Bearer {jwt}` for `KeyPair`; `Bearer {token}` for `OAuth` | Builds the `Authorization` header value for a SQL REST API request. `account` (e.g. `"xy12345.us-east-1"`) names the host; its locator (region and `.global` suffix removed, see `jwt_account`) is uppercased into the JWT `iss`/`sub` claims. |
 | `snowflake_token_type(auth) -> &'static str` | `KEYPAIR_JWT` or `OAUTH` | The matching `X-Snowflake-Authorization-Token-Type` header value. |
+| `jwt_account(account) -> String` | e.g. `XY12345` | The account part of the key-pair JWT claims: the locator without its region / `.global` suffix, upper-cased. |
 | `credential_to_auth(cred) -> Result<SnowflakeAuth, FaucetError>` | `SnowflakeAuth::OAuth { token }` | Maps a `faucet_core::Credential` from a shared `AuthProvider` onto `SnowflakeAuth`. `Bearer`/`Token` → OAuth; `Basic`/`Header` → `FaucetError::Auth` (key-pair JWT can't come from a provider). |
 
 ## Who should depend on this
@@ -70,7 +71,7 @@ use faucet_common_snowflake::{SnowflakeAuth, authorization_header, snowflake_tok
 let auth = SnowflakeAuth::OAuth { token: "ey...".into() };
 let account = "xy12345.us-east-1";
 
-let authorization = authorization_header(&auth, account)?;      // Snowflake Token="ey..."
+let authorization = authorization_header(&auth, account)?;      // Bearer ey...
 let token_type = snowflake_token_type(&auth);                   // "OAUTH"
 
 let resp = client

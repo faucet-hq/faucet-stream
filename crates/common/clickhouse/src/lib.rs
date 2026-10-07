@@ -151,11 +151,21 @@ impl ClickHouseConnection {
     }
 }
 
+/// TCP connect timeout of [`build_client`].
+pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle read timeout of [`build_client`]: how long a response may go without
+/// a byte before the request fails (a half-open connection otherwise hangs
+/// the run forever).
+pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Build a reqwest [`Client`](reqwest::Client) for the ClickHouse HTTP
-/// interface. Kept in one place so both connectors share the client-construction
-/// path and connection pool.
+/// interface, with connect and idle-read timeouts. Kept in one place so both
+/// connectors share the client-construction path and connection pool.
 pub fn build_client(_conn: &ClickHouseConnection) -> Result<reqwest::Client, FaucetError> {
     reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
         .build()
         .map_err(FaucetError::Http)
 }

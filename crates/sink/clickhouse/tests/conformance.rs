@@ -20,6 +20,15 @@ use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 /// Start a ClickHouse container, or `None` when Docker is unavailable.
+/// A missing test backend: a skip locally, a failure when CI requires the
+/// backends (`FAUCET_REQUIRE_BACKENDS`).
+fn backend_missing(why: &str) {
+    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
+        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
+    }
+    eprintln!("skipping: {why}");
+}
+
 async fn start_clickhouse() -> Option<(ContainerAsync<ClickHouse>, String)> {
     let started = async {
         let container = ClickHouse::default()
@@ -102,7 +111,7 @@ fn conformance_connector_name_nonempty() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_capabilities_truthful() {
     let Some((_c, base)) = start_clickhouse().await else {
-        eprintln!("skipping clickhouse conformance_capabilities_truthful: Docker unavailable");
+        backend_missing("clickhouse conformance_capabilities_truthful: Docker unavailable");
         return;
     };
 

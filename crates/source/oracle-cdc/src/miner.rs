@@ -14,7 +14,9 @@ use faucet_core::FaucetError;
 use serde_json::{Map, Value, json};
 
 use crate::config::OnUnsupported;
-use crate::redo::{DmlKind, Image, LobChange, Resolved, apply_lob, parse_dml, parse_lob_change};
+use crate::redo::{
+    DmlKind, Image, LobChange, Resolved, apply_lob, is_full_rewrite, parse_dml, parse_lob_change,
+};
 
 /// `V$LOGMNR_CONTENTS.OPERATION_CODE` values the miner acts on.
 pub mod op {
@@ -36,6 +38,12 @@ pub mod op {
     pub const LOB_TRIM: i64 = 11;
     /// `ROLLBACK`.
     pub const ROLLBACK: i64 = 36;
+    /// `XML DOC BEGIN` (binary XMLType).
+    pub const XML_DOC_BEGIN: i64 = 68;
+    /// `XML DOC WRITE` (binary XMLType).
+    pub const XML_DOC_WRITE: i64 = 70;
+    /// `XML DOC END` (binary XMLType).
+    pub const XML_DOC_END: i64 = 71;
     /// `UNSUPPORTED`.
     pub const UNSUPPORTED: i64 = 255;
 }
@@ -365,13 +373,23 @@ impl Miner {
             }
             op::LOB_WRITE | op::LOB_TRIM => match parse_lob_change(&row.redo) {
                 Ok(change) if !is_mismatch(row) => {
-                    self.lob(row, change);
+                    if !self.lob(row, change) {
+                        return self.unsupported(
+                            row,
+                            "a partial LOB write (append, offset write or trim) on a LOB whose \
+                             current value is not in this transaction",
+                        );
+                    }
                     self.check_staged(&row.xid)?;
                     Ok(None)
                 }
                 Ok(_) => self.unsupported(row, "dictionary mismatch"),
                 Err(e) => self.unsupported(row, &e),
             },
+            op::XML_DOC_BEGIN | op::XML_DOC_WRITE | op::XML_DOC_END => self.unsupported(
+                row,
+                "a binary XMLType change, which LogMiner cannot reconstruct as SQL",
+            ),
             op::UNSUPPORTED => {
                 let info = row
                     .info
@@ -466,7 +484,10 @@ impl Miner {
         Ok(None)
     }
 
-    fn lob(&mut self, row: &LogRow, change: LobChange) {
+    /// Fold a LOB change into the transaction. Returns `false`, changing
+    /// nothing, when the change is partial and the value it modifies is not
+    /// known here — synthesising it would emit a padded or truncated LOB.
+    fn lob(&mut self, row: &LogRow, change: LobChange) -> bool {
         let id = self.id();
         let txn = self.txn(&row.xid, row.scn);
         let target = txn.events.iter_mut().rev().find(|e| {
@@ -483,13 +504,18 @@ impl Miner {
                 let current = after
                     .iter()
                     .find(|(c, _)| c == &change.column)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(Resolved::Null);
+                    .map(|(_, v)| v.clone());
+                let current = match current {
+                    Some(v) => v,
+                    None if is_full_rewrite(&change) => Resolved::Null,
+                    None => return false,
+                };
                 overlay(
                     after,
                     &vec![(change.column.clone(), apply_lob(&current, &change))],
                 );
             }
+            None if !is_full_rewrite(&change) => return false,
             None => {
                 let mut after = change.conditions.clone();
                 overlay(
@@ -504,6 +530,7 @@ impl Miner {
                 });
             }
         }
+        true
     }
 }
 
@@ -943,6 +970,53 @@ mod tests {
         assert_eq!(upd["op"], "u");
         assert_eq!(upd["after"], json!({"ID": 9, "NOTE": "zz"}));
         assert_eq!(upd["before"], json!({"ID": 9}));
+    }
+
+    #[test]
+    fn binary_xmltype_rows_go_through_on_unsupported() {
+        for code in [op::XML_DOC_BEGIN, op::XML_DOC_WRITE, op::XML_DOC_END] {
+            let err = miner().apply(&row(1, code, "X", "")).unwrap_err();
+            assert!(err.to_string().contains("XMLType"), "{err}");
+            let mut skip = Miner::new(OnUnsupported::Skip, None);
+            assert!(skip.apply(&row(1, code, "X", "")).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn a_partial_lob_write_without_a_known_value_is_unsupported() {
+        let append = "DECLARE loc_c CLOB; BEGIN select \"NOTE\" into loc_c from \"APP\".\"T\" where \"ID\" = '9' for update; buf_c := 'zz'; dbms_lob.write(loc_c, 2, 5, buf_c); END;";
+        let err = miner()
+            .apply(&row(1, op::LOB_WRITE, "X", append))
+            .unwrap_err();
+        assert!(err.to_string().contains("partial LOB write"), "{err}");
+
+        let mut skip = Miner::new(OnUnsupported::Skip, None);
+        skip.apply(&row(
+            1,
+            op::UPDATE,
+            "X",
+            r#"update "APP"."T" set "N" = '2' where "ID" = '9'"#,
+        ))
+        .unwrap();
+        assert!(
+            skip.apply(&row(2, op::LOB_WRITE, "X", append))
+                .unwrap()
+                .is_none()
+        );
+        let c = skip
+            .apply(&row(3, op::COMMIT, "X", "commit"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.events.len(), 1, "no event is synthesised");
+        assert!(
+            !c.events[0]
+                .after
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|(col, _)| col == "NOTE"),
+            "the LOB column is not fabricated"
+        );
     }
 
     #[test]

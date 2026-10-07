@@ -31,6 +31,8 @@ pub struct RedshiftSink {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// The target's column names, lower-cased, loaded once.
+    known_columns: tokio::sync::Mutex<Option<std::collections::HashSet<String>>>,
     /// Records accumulated across `write_batch` calls (#617).
     ///
     /// `COPY` wants millions of rows per load; one `COPY` per 1000-row page
@@ -107,7 +109,8 @@ impl RedshiftSink {
         if !self.config.create_table {
             let exists: Option<i32> = sqlx::query_scalar(
                 "SELECT 1 FROM information_schema.tables \
-                 WHERE table_name = $1 AND ($2::text IS NULL OR table_schema = $2)",
+                 WHERE lower(table_name) = lower($1) \
+                   AND lower(table_schema) = COALESCE(lower($2::text), lower(current_schema()))",
             )
             .bind(&self.config.table_name)
             .bind(self.config.schema.as_deref())
@@ -146,6 +149,63 @@ impl RedshiftSink {
         Ok(())
     }
 
+    /// Make every field of `records` a column before the page is buffered:
+    /// with `create_table` a missing one is added (typed from the page),
+    /// without it the write fails naming the fields. Loads drop fields with
+    /// no column, so a field first seen after the table was created would
+    /// otherwise be lost on every page.
+    async fn ensure_columns(&self, records: &[Value]) -> Result<(), FaucetError> {
+        let mut known = self.known_columns.lock().await;
+        if known.is_none() {
+            *known = Some(self.lowercased_columns().await?);
+        }
+        let Some(cols) = known.as_mut() else {
+            return Ok(());
+        };
+        let missing = crate::copy::missing_fields(records, cols);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if !self.config.create_table {
+            return Err(FaucetError::Sink(format!(
+                "redshift: {} has no column for field(s) {}; add them, drop the fields with a \
+                 transform, or set `create_table: true` to let the sink add them",
+                self.table_ref(),
+                missing.join(", ")
+            )));
+        }
+        let planned = faucet_core::plan_columns(records).unwrap_or_default();
+        for name in &missing {
+            let Some(col) = planned.iter().find(|c| &c.name == name) else {
+                continue;
+            };
+            let sql = crate::copy::add_column_sql(&self.table_ref(), col);
+            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
+                // A concurrent writer may have added it first.
+                if !self
+                    .lowercased_columns()
+                    .await?
+                    .contains(&name.to_lowercase())
+                {
+                    return Err(FaucetError::Sink(format!(
+                        "redshift: ALTER TABLE ADD COLUMN failed: {e}"
+                    )));
+                }
+            }
+            cols.insert(name.to_lowercase());
+        }
+        Ok(())
+    }
+
+    async fn lowercased_columns(&self) -> Result<std::collections::HashSet<String>, FaucetError> {
+        Ok(self
+            .discover_columns()
+            .await?
+            .into_iter()
+            .map(|c| c.to_lowercase())
+            .collect())
+    }
+
     /// Create a new sink. Validates config, builds a lazily-connected pool (no
     /// DB I/O), and — for the `copy` strategy — an S3 client.
     pub async fn new(config: RedshiftSinkConfig) -> Result<Self, FaucetError> {
@@ -159,6 +219,7 @@ impl RedshiftSink {
         };
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            known_columns: tokio::sync::Mutex::new(None),
             pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
                 config.commit_bytes,
@@ -198,8 +259,9 @@ impl RedshiftSink {
     /// `copy` path (both need the column set/order).
     async fn discover_columns(&self) -> Result<Vec<String>, FaucetError> {
         let rows = sqlx::query(
-            "SELECT column_name FROM information_schema.columns \
-             WHERE table_name = $1 AND ($2::text IS NULL OR table_schema = $2) \
+            "SELECT column_name::text AS column_name FROM information_schema.columns \
+             WHERE lower(table_name) = lower($1) \
+               AND lower(table_schema) = COALESCE(lower($2::text), lower(current_schema())) \
              ORDER BY ordinal_position",
         )
         .bind(&self.config.table_name)
@@ -453,6 +515,7 @@ impl faucet_core::Sink for RedshiftSink {
         }
         self.flush().await?;
         self.ensure_table_ready(records).await?;
+        self.ensure_columns(records).await?;
         match self.commit_group(records).await {
             Ok(()) => Ok(records.iter().map(|_| Ok(())).collect()),
             Err((0, e)) => Err(e),
@@ -478,6 +541,7 @@ impl faucet_core::Sink for RedshiftSink {
             return Ok(0);
         }
         self.ensure_table_ready(records).await?;
+        self.ensure_columns(records).await?;
         // Accumulate across calls and load once per threshold (#617): `COPY`
         // wants millions of rows per load, and `batch_size` could only ever
         // split a page — never merge two small ones.

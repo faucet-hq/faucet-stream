@@ -10,7 +10,7 @@ use std::time::Duration;
 pub use faucet_common_snowflake::SnowflakeAuth;
 
 fn default_statement_timeout() -> Duration {
-    Duration::from_secs(60)
+    Duration::ZERO
 }
 
 fn default_poll_timeout() -> Duration {
@@ -52,10 +52,11 @@ pub struct SnowflakeSourceConfig {
     /// [SQL API docs](https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#using-bind-variables-in-a-statement)).
     #[serde(default)]
     pub params: Vec<Value>,
-    /// Per-statement server-side timeout. Defaults to 60 seconds. Passed
-    /// through as the `timeout` field on the `POST /api/v2/statements` request
-    /// body. The HTTP-level timeout for each individual request is configured
-    /// separately by the source via the underlying `reqwest` client defaults.
+    /// Server-side statement timeout, sent as the `timeout` field of
+    /// `POST /api/v2/statements`. Snowflake **cancels** a statement that runs
+    /// longer (error 000630). Defaults to `0`: Snowflake's maximum. This is not
+    /// how long the submit waits before going async — that is fixed by the
+    /// SQL API; see [`poll_timeout`](Self::poll_timeout) for the client cap.
     #[serde(
         default = "default_statement_timeout",
         with = "faucet_core::config::duration_secs"
@@ -220,7 +221,7 @@ mod tests {
         assert_eq!(cfg.schema, "PUBLIC");
         assert!(cfg.role.is_none());
         assert!(cfg.params.is_empty());
-        assert_eq!(cfg.statement_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.statement_timeout, Duration::ZERO);
         assert_eq!(cfg.poll_timeout, Duration::from_secs(300));
         assert_eq!(cfg.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
     }
@@ -263,7 +264,7 @@ mod tests {
         }"#;
         let cfg: SnowflakeSourceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
-        assert_eq!(cfg.statement_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.statement_timeout, Duration::ZERO);
         assert!(cfg.role.is_none());
         assert!(cfg.params.is_empty());
     }

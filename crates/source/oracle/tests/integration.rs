@@ -182,7 +182,7 @@ async fn oracle_query_source_end_to_end() {
     assert_eq!(t.primary_key, Some(vec!["ID".to_string()]));
     assert_eq!(
         t.schema.as_ref().unwrap()["properties"]["ID"]["type"],
-        "integer"
+        json!(["integer", "string"])
     );
     let report = source
         .check(&faucet_core::check::CheckContext::default())

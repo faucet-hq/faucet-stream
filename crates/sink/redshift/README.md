@@ -23,11 +23,11 @@ Append-only: Redshift has no `ON CONFLICT`, and `COPY` cannot upsert, so
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `host` / `port` / `database` / `user` / `credentials` / `tls` | — | Connection block (see `faucet-common-redshift`). |
-| `table_name` | yes | Target table. |
-| `schema` | no | Namespace qualifying the table. |
+| `host` / `port` / `database` / `user` / `credentials` / `tls` / `tls_mode` / `ssl_root_cert` | — | Connection block (see `faucet-common-redshift`); `tls_mode: verify_full` + `ssl_root_cert` verifies the server certificate. |
+| `table_name` | yes | Target table (matched case-insensitively, as Redshift folds identifiers). |
+| `schema` | no | Namespace qualifying the table. Unset = the session's `current_schema()`; same-named tables in other schemas are ignored. |
 | `write_strategy` | no | `copy` (default) or `insert`. |
-| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto ignorecase'`) or `csv` (`FORMAT AS CSV`). |
+| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto ignorecase'`) or `csv` (`FORMAT AS CSV NULL AS '__FAUCET_NULL__'`: a NULL is written as that marker and an empty string as `""`, so NULL text values do not load as empty strings). |
 | `copy.staging_bucket` | copy only | S3 bucket for staged files. |
 | `copy.staging_prefix` | no | Key prefix for staged objects. |
 | `copy.iam_role` | copy only | IAM role ARN Redshift assumes to read the staged file. |
@@ -75,10 +75,12 @@ first written page's inferred columns when it does not exist — a first-ever
 sync cannot assume the destination is already there. Every inferred column is
 created **nullable**: a column present in page 1 is not required forever, and a
 `NOT NULL` inferred from one page fails page 2 the first time a record omits
-the field (narrowing later is the `schema:` drift policy's job). No DISTKEY or SORTKEY is chosen — faucet has no basis to pick either, and a wrong one is baked into the table.
+the field. No DISTKEY or SORTKEY is chosen — faucet has no basis to pick either, and a wrong one is baked into the table. A field first seen on a later page (or missing from a pre-existing table) is added with `ALTER TABLE … ADD COLUMN`, typed the same way, before the page is buffered — the loads drop fields with no column, so it would otherwise be lost on every page.
 
 Set `create_table: false` to require a pre-existing target; a missing one then
-fails fast with the same error every table sink raises, naming both ways out.
+fails fast with the same error every table sink raises, naming both ways out,
+and a record field the table has no column for fails the write naming the
+field (drop or rename it with a transform).
 
 ## Commit accumulation (`commit_rows` / `commit_bytes`)
 

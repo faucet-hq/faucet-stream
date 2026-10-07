@@ -10170,7 +10170,7 @@
           }
         },
         "write_disposition": {
-          "description": "BigQuery load `writeDisposition` — `WRITE_APPEND` (default),\n`WRITE_TRUNCATE`, or `WRITE_EMPTY`.",
+          "description": "BigQuery load `writeDisposition`. Only `WRITE_APPEND` (the default) is\naccepted: the staged path runs one load job per batch, so a truncating\nor empty-only disposition would keep only the last batch or fail on the\nsecond. Use `write_mode: overwrite` (bucket-free) for a full refresh.",
           "type": "string",
           "default": "WRITE_APPEND"
         },
@@ -21470,6 +21470,16 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "job_timeout": {
+                      "description": "Longest the sink waits, in seconds, for one BigQuery job it started (a\nMERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before\ncancelling it and failing the write. Default `3600`; `0` waits for as\nlong as the job runs. A job that times out is cancelled so it cannot\ncommit after the run has been reported failed.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
                     },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",

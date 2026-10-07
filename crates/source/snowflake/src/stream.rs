@@ -11,7 +11,8 @@ use crate::config::SnowflakeSourceConfig;
 use crate::convert::{ColumnMeta, row_to_json};
 use async_trait::async_trait;
 use faucet_common_snowflake::{
-    SnowflakeAuth, authorization_header, credential_to_auth, snowflake_token_type,
+    CancelOnDrop, SnowflakeAuth, authorization_header, cancel_statement, credential_to_auth,
+    http_client, snowflake_token_type,
 };
 use faucet_core::util::substitute_context_bind_params;
 use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Stream, StreamPage};
@@ -90,7 +91,7 @@ impl SnowflakeSource {
         faucet_core::validate_batch_size(config.batch_size)?;
         Ok(Self {
             config,
-            client: Client::new(),
+            client: http_client()?,
             endpoint_base: None,
             auth_provider: None,
         })
@@ -159,6 +160,32 @@ impl SnowflakeSource {
                 r.name
             ))),
         }
+    }
+
+    /// Mint the `Authorization` header and its token type for one request.
+    /// Called per request, never cached: key-pair JWTs expire after an hour
+    /// and shared OAuth providers rotate tokens, so a header minted at submit
+    /// time can be stale by the last partition of a long export.
+    async fn auth_headers(&self) -> Result<(String, &'static str), FaucetError> {
+        let effective = self.resolve_auth().await?;
+        let auth = authorization_header(&effective, &self.config.account)?;
+        Ok((auth, snowflake_token_type(&effective)))
+    }
+
+    /// Best-effort `POST /api/v2/statements/{handle}/cancel`, so an abandoned
+    /// statement stops running (and billing) on the warehouse.
+    async fn cancel_statement(&self, handle: &str) {
+        let Ok((auth, token_type)) = self.auth_headers().await else {
+            return;
+        };
+        cancel_statement(
+            &self.client,
+            &self.statements_url(),
+            handle,
+            &auth,
+            token_type,
+        )
+        .await;
     }
 
     /// Build the JSON body for `POST /api/v2/statements`.
@@ -261,9 +288,7 @@ impl SnowflakeSource {
         body["statement"] = Value::String(statement);
 
         let url = self.statements_url();
-        let effective = self.resolve_auth().await?;
-        let auth = authorization_header(&effective, &self.config.account)?;
-        let token_type = snowflake_token_type(&effective);
+        let (auth, token_type) = self.auth_headers().await?;
 
         let resp = self
             .client
@@ -298,7 +323,7 @@ impl SnowflakeSource {
                     "Snowflake returned 202 without a statementHandle to poll".into(),
                 )
             })?;
-            self.poll_until_ready(&handle, &auth, token_type).await
+            self.poll_until_ready(&handle).await
         } else {
             check_code(&parsed)?;
             Ok(parsed)
@@ -307,20 +332,18 @@ impl SnowflakeSource {
 
     /// Poll the same handle as a partition-less GET until the response is
     /// 200 + `code: "090001"`. Used after a 202 from the initial POST.
-    async fn poll_until_ready(
-        &self,
-        handle: &str,
-        auth: &str,
-        token_type: &'static str,
-    ) -> Result<StatementResponse, FaucetError> {
+    async fn poll_until_ready(&self, handle: &str) -> Result<StatementResponse, FaucetError> {
         let url = format!("{}/api/v2/statements/{}", self.base_url(), handle);
         let poll_timeout = self.config.poll_timeout;
         let started = std::time::Instant::now();
+        let mut guard = CancelOnDrop::new(self.client.clone(), self.statements_url(), handle);
         loop {
+            let (auth, token_type) = self.auth_headers().await?;
+            guard.set_auth(auth.clone(), token_type);
             let resp = self
                 .client
                 .get(&url)
-                .header("Authorization", auth)
+                .header("Authorization", &auth)
                 .header("Accept", "application/json")
                 .header("X-Snowflake-Authorization-Token-Type", token_type)
                 .send()
@@ -331,6 +354,8 @@ impl SnowflakeSource {
             if status.as_u16() == 202 {
                 // `poll_timeout == 0` disables the cap (poll forever).
                 if !poll_timeout.is_zero() && started.elapsed() >= poll_timeout {
+                    guard.disarm();
+                    self.cancel_statement(handle).await;
                     return Err(FaucetError::Source(format!(
                         "Snowflake statement '{handle}' did not finish within poll_timeout ({}s); still HTTP 202",
                         poll_timeout.as_secs()
@@ -345,6 +370,7 @@ impl SnowflakeSource {
                     "Snowflake poll returned HTTP {status}: {text}"
                 )));
             }
+            guard.disarm();
             let parsed: StatementResponse = resp.json().await.map_err(|e| {
                 FaucetError::Source(format!("failed to parse Snowflake poll response: {e}"))
             })?;
@@ -358,14 +384,13 @@ impl SnowflakeSource {
         &self,
         handle: &str,
         partition: usize,
-        auth: &str,
-        token_type: &'static str,
     ) -> Result<Vec<Vec<Value>>, FaucetError> {
         let url = self.partition_url(handle, partition);
+        let (auth, token_type) = self.auth_headers().await?;
         let resp = self
             .client
             .get(&url)
-            .header("Authorization", auth)
+            .header("Authorization", &auth)
             .header("Accept", "application/json")
             .header("X-Snowflake-Authorization-Token-Type", token_type)
             .send()
@@ -591,15 +616,8 @@ impl faucet_core::Source for SnowflakeSource {
                         .into(),
                 )
             })?;
-            let effective = self.resolve_auth().await.map_err(wrap)?;
-            let auth = authorization_header(&effective, &self.config.account).map_err(wrap)?;
-            let token_type = snowflake_token_type(&effective);
             for i in 1..partition_count {
-                raw.extend(
-                    self.fetch_partition(&handle, i, &auth, token_type)
-                        .await
-                        .map_err(wrap)?,
-                );
+                raw.extend(self.fetch_partition(&handle, i).await.map_err(wrap)?);
             }
         }
 
@@ -718,12 +736,8 @@ impl faucet_core::Source for SnowflakeSource {
                         .into(),
                 )
             })?;
-            let effective = self.resolve_auth().await?;
-            let auth = authorization_header(&effective, &self.config.account)?;
-            let token_type = snowflake_token_type(&effective);
-
             for i in 1..partition_count {
-                let raw = self.fetch_partition(&handle, i, &auth, token_type).await?;
+                let raw = self.fetch_partition(&handle, i).await?;
                 for r in raw {
                     rows.push(row_to_json(&r, &columns));
                 }
@@ -810,10 +824,6 @@ impl faucet_core::Source for SnowflakeSource {
                         "Snowflake reported >1 partition without a statementHandle".into(),
                     )
                 })?;
-                let effective = self.resolve_auth().await?;
-                let auth = authorization_header(&effective, &self.config.account)?;
-                let token_type = snowflake_token_type(&effective);
-
                 // Ordered look-ahead (#621): partitions are fetched up to
                 // `partition_concurrency` at a time but consumed **in order**,
                 // so the emitted row order is unchanged and a failure is still
@@ -825,8 +835,7 @@ impl faucet_core::Source for SnowflakeSource {
                 let mut fetches = futures::stream::iter(1..partition_count)
                     .map(|i| {
                         let handle = handle.clone();
-                        let auth = auth.clone();
-                        async move { self.fetch_partition(&handle, i, &auth, token_type).await }
+                        async move { self.fetch_partition(&handle, i).await }
                     })
                     .buffered(concurrency);
                 while let Some(raw) = fetches.next().await {
@@ -922,7 +931,7 @@ mod tests {
         let src = SnowflakeSource::new(cfg()).unwrap();
         let body = src.build_request_body(&[]);
         assert_eq!(body["statement"], "SELECT 1");
-        assert_eq!(body["timeout"], 60);
+        assert_eq!(body["timeout"], 0);
         assert_eq!(body["database"], "DB");
         assert_eq!(body["schema"], "PUBLIC");
         assert_eq!(body["warehouse"], "WH");

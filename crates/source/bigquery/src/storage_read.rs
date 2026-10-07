@@ -24,6 +24,7 @@ use gcloud_googleapis::cloud::bigquery::storage::v1::{
     CreateReadSessionRequest, DataFormat, ReadRowsRequest, ReadSession,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use faucet_common_bigquery::BigQueryCredentials;
@@ -111,10 +112,34 @@ async fn build_environment(auth: &BigQueryCredentials) -> Result<Environment, Fa
     Ok(Environment::GoogleCloud(Box::new(tsp)))
 }
 
+/// How long a Storage Read call — opening the session or a stream, or waiting
+/// for the next message — may go without a response.
+pub(crate) const GRPC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `fut` bounded by [`GRPC_IDLE_TIMEOUT`], so a half-open connection fails the
+/// read instead of hanging it.
+async fn within<F: std::future::Future>(fut: F, what: &str) -> Result<F::Output, FaucetError> {
+    within_for(GRPC_IDLE_TIMEOUT, fut, what).await
+}
+
+async fn within_for<F: std::future::Future>(
+    limit: std::time::Duration,
+    fut: F,
+    what: &str,
+) -> Result<F::Output, FaucetError> {
+    tokio::time::timeout(limit, fut).await.map_err(|_| {
+        FaucetError::Source(format!(
+            "BigQuery Storage Read {what}: no response within {}s",
+            limit.as_secs()
+        ))
+    })
+}
+
 /// Open a read session for the configured table and stream its Arrow batches.
-fn read_batches(
-    src: &BigQuerySource,
-) -> impl Stream<Item = Result<RecordBatch, FaucetError>> + Send + '_ {
+fn read_batches<'a>(
+    src: &'a BigQuerySource,
+    context: &'a HashMap<String, Value>,
+) -> impl Stream<Item = Result<RecordBatch, FaucetError>> + Send + 'a {
     let cfg = src.config();
     async_stream::try_stream! {
         let env = build_environment(&cfg.auth).await?;
@@ -135,7 +160,7 @@ fn read_batches(
         // Arrow path, which is precisely where a large result needs it.
         let table = match cfg.read_table.as_deref() {
             Some(t) if !t.is_empty() => resolve_table(&cfg.project_id, Some(t))?,
-            _ => src.query_destination_table().await?,
+            _ => src.query_destination_table(context).await?,
         };
         let read_options = TableReadOptions {
             selected_fields: cfg.selected_fields.clone(),
@@ -154,9 +179,8 @@ fn read_batches(
             max_stream_count: cfg.max_streams.max(1),
             ..Default::default()
         };
-        let created = client
-            .create_read_session(request)
-            .await
+        let created = within(client.create_read_session(request), "CreateReadSession")
+            .await?
             .map_err(|e| FaucetError::Source(format!("BigQuery CreateReadSession failed: {e}")))?
             .into_inner();
 
@@ -177,18 +201,16 @@ fn read_batches(
             let name = stream.name.clone();
             readers.push(Box::pin(async_stream::try_stream! {
                 let rr = ReadRowsRequest { read_stream: name, offset: 0 };
-                let mut responses = client
-                    .read_rows(rr)
-                    .await
+                let mut responses = within(client.read_rows(rr), "ReadRows")
+                    .await?
                     .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows failed: {e}")))?
                     .into_inner();
                 // Per stream, not shared: each stream's messages carry their
                 // own schema, and a batch decoded against a neighbour's schema
                 // would be silently wrong rather than an error.
                 let mut schema_bytes: Option<Vec<u8>> = None;
-                while let Some(msg) = responses
-                    .message()
-                    .await
+                while let Some(msg) = within(responses.message(), "ReadRows message")
+                    .await?
                     .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows stream error: {e}")))?
                 {
                     if let Some(Schema::ArrowSchema(s)) = msg.schema {
@@ -221,9 +243,21 @@ fn read_batches(
 pub fn stream_batches_arrow(
     src: &BigQuerySource,
 ) -> Pin<Box<dyn Stream<Item = Result<ColumnarPage, FaucetError>> + Send + '_>> {
+    stream_batches_arrow_with(src, &NO_CONTEXT)
+}
+
+static NO_CONTEXT: std::sync::LazyLock<HashMap<String, Value>> =
+    std::sync::LazyLock::new(HashMap::new);
+
+/// [`stream_batches_arrow`] with a parent-record context, bound into the query
+/// the same way the REST path binds it.
+pub fn stream_batches_arrow_with<'a>(
+    src: &'a BigQuerySource,
+    context: &'a HashMap<String, Value>,
+) -> Pin<Box<dyn Stream<Item = Result<ColumnarPage, FaucetError>> + Send + 'a>> {
     let cfg = src.config();
     Box::pin(async_stream::try_stream! {
-        let inner = read_batches(src);
+        let inner = read_batches(src, context);
         futures::pin_mut!(inner);
         while let Some(batch) = inner.next().await {
             yield ColumnarPage::new(batch?, None);
@@ -237,12 +271,20 @@ pub fn stream_batches_arrow(
 pub fn stream_pages_arrow(
     src: &BigQuerySource,
 ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + '_>> {
+    stream_pages_arrow_with(src, &NO_CONTEXT)
+}
+
+/// [`stream_pages_arrow`] with a parent-record context.
+pub fn stream_pages_arrow_with<'a>(
+    src: &'a BigQuerySource,
+    context: &'a HashMap<String, Value>,
+) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
     let cfg = src.config();
     let batch_size = cfg.batch_size;
     Box::pin(async_stream::try_stream! {
         let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
         let mut buffer: Vec<Value> = Vec::new();
-        let inner = read_batches(src);
+        let inner = read_batches(src, context);
         futures::pin_mut!(inner);
         while let Some(batch) = inner.next().await {
             let batch = batch?;
@@ -263,6 +305,20 @@ pub fn stream_pages_arrow(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn grpc_waits_are_bounded() {
+        let ok = super::within(async { 1 }, "x").await.unwrap();
+        assert_eq!(ok, 1);
+        let err = super::within_for(
+            std::time::Duration::from_millis(5),
+            futures::future::pending::<()>(),
+            "ReadRows",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("ReadRows"), "{err}");
+    }
+
     use super::*;
 
     #[test]

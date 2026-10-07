@@ -62,15 +62,16 @@ pub struct MssqlTls {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MssqlTlsMode {
-    /// Encrypt the connection if the server supports it (the safe modern
-    /// default). Maps to `tiberius` `EncryptionLevel::On`.
+    /// The default; encrypts the connection and **fails** against a server
+    /// that offers no encryption (there is no plaintext fallback — tiberius
+    /// cannot negotiate one without panicking). Same as `require`.
     #[default]
     Prefer,
     /// Require encryption; fail if the server does not offer it. Maps to
     /// `EncryptionLevel::Required`.
     Require,
     /// Encrypt and accept the server certificate without validating its chain
-    /// (self-signed dev servers). Maps to `EncryptionLevel::On` + `trust_cert()`.
+    /// (self-signed dev servers); `ca_cert_path` cannot be combined with it.
     /// **Insecure against MITM — never use in production.**
     TrustServerCertificate,
     /// No transport encryption. Maps to `EncryptionLevel::NotSupported`.

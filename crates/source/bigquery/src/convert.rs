@@ -108,11 +108,50 @@ fn scalar_or_record(payload: &Value, field: &TableFieldSchema) -> Value {
         FieldType::Float | FieldType::Float64 => parse_float(s),
         FieldType::Boolean | FieldType::Bool => parse_bool(s),
         FieldType::Json => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_owned())),
-        // STRING, BYTES, TIMESTAMP, DATE, TIME, DATETIME, NUMERIC,
+        FieldType::Timestamp => {
+            Value::String(timestamp_to_rfc3339(s).unwrap_or_else(|| s.to_owned()))
+        }
+        // STRING, BYTES, DATE, TIME, DATETIME, NUMERIC,
         // BIGNUMERIC, GEOGRAPHY, INTERVAL — keep as string for
         // round-trip safety.
         _ => Value::String(s.to_owned()),
     }
+}
+
+/// A REST-API TIMESTAMP cell — epoch seconds as decimal text, often in
+/// scientific notation (`"1.7019216E9"`) — as RFC 3339 UTC with the
+/// microseconds BigQuery stores. The text is shifted to microseconds
+/// digit by digit, never through `f64`. `None` when it is not a decimal.
+pub(crate) fn timestamp_to_rfc3339(s: &str) -> Option<String> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (mantissa, exp) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (body, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int.is_empty() && frac.is_empty()
+        || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{int}{frac}");
+    // value = digits × 10^(exp − frac.len()); micros = value × 10^6.
+    let shift = exp + 6 - i32::try_from(frac.len()).ok()?;
+    let mut micros: i128 = digits.parse().ok()?;
+    if shift >= 0 {
+        micros = micros.checked_mul(10i128.checked_pow(shift.unsigned_abs())?)?;
+    } else {
+        micros /= 10i128.checked_pow(shift.unsigned_abs())?;
+    }
+    if neg {
+        micros = -micros;
+    }
+    let dt = chrono::DateTime::from_timestamp_micros(i64::try_from(micros).ok()?)?;
+    Some(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
 }
 
 /// Decode a RECORD/STRUCT cell. The payload is itself a `TableRow`-shaped
@@ -209,10 +248,34 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_passes_through_as_string() {
+    fn timestamp_renders_as_rfc3339() {
         let row = cells(vec![json!("1.7e9")]);
         let fields = vec![field("ts", FieldType::Timestamp)];
-        assert_eq!(row_to_json(&row, &fields), json!({"ts": "1.7e9"}));
+        assert_eq!(
+            row_to_json(&row, &fields),
+            json!({"ts": "2023-11-14T22:13:20Z"})
+        );
+        assert_eq!(
+            timestamp_to_rfc3339("1.701921612345678E9").as_deref(),
+            Some("2023-12-07T04:00:12.345678Z")
+        );
+        assert_eq!(
+            timestamp_to_rfc3339("1700000000.5").as_deref(),
+            Some("2023-11-14T22:13:20.500Z")
+        );
+        assert_eq!(
+            timestamp_to_rfc3339("-1.5").as_deref(),
+            Some("1969-12-31T23:59:58.500Z")
+        );
+        assert_eq!(
+            timestamp_to_rfc3339("+0").as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+        for bad in ["", ".", "x", "1e", "1.2.3", "1e999999"] {
+            assert_eq!(timestamp_to_rfc3339(bad), None, "{bad}");
+        }
+        let row = cells(vec![json!("not-a-time")]);
+        assert_eq!(row_to_json(&row, &fields), json!({"ts": "not-a-time"}));
     }
 
     #[test]

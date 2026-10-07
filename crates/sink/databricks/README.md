@@ -21,8 +21,11 @@ For landing files in object storage without a warehouse, use
   with the sink's own token) or to S3 / GCS / ADLS behind the `staging` feature.
 - **One typing rule on both paths** — every value travels as a string cell and
   is cast to the column's *declared* type on the server (`CAST(… AS <type>)`,
-  `from_json` for `STRUCT`/`ARRAY`/`MAP`, `parse_json` for `VARIANT`), so the
-  insert and staged paths can never land a value differently.
+  `from_json(…, map('mode', 'FAILFAST'))` for `STRUCT`/`ARRAY`/`MAP` — a value
+  that does not fit fails the statement instead of being nulled field by field
+  — and `parse_json` over the value's JSON text for `VARIANT`, so a JSON string
+  stays a string), so the insert and staged paths can never land a value
+  differently.
 - **Write modes** — `append`, `upsert` / `delete` via `MERGE` (with
   `delete_marker`), and `overwrite` via a staging table and an atomic swap.
 - **Exactly-once** — a `_faucet_commit_token` watermark plus a data write that
@@ -54,7 +57,7 @@ For landing files in object storage without a warehouse, use
 | `batch_size` | int | `1000` | rows per `INSERT` / `MERGE` statement on the insert path; `0` = bounded by bytes only |
 | `max_statement_bytes` | int | `8388608` | statement-text bound on the insert path (API limit 16 MiB) |
 | `wait_timeout_secs` | int | `50` | server wait before async (`0` or `5`–`50`) |
-| `poll_interval_ms` | int | `1000` | poll cadence while queued / running |
+| `poll_interval_ms` | int | `1000` | poll cadence while queued / running; must be > 0 |
 | `statement_timeout_secs` | int | `3600` | client deadline per statement, then cancel (`0` = none) |
 | `max_retries` | int | `5` | `429`/`503` and Delta conflict retries |
 | `retry_backoff_ms` | int | `1000` | exponential backoff base |
@@ -140,7 +143,9 @@ need the crate's `staging` feature.
   `DEFAULT`.
 - **overwrite** — `begin` drops any leftover `<table>__faucet_ovw` and creates
   it `LIKE` the target; every page lands in it; `commit` runs one
-  `INSERT OVERWRITE TABLE t SELECT * FROM <staging>` (a single Delta commit —
+  `INSERT OVERWRITE TABLE t SELECT * FROM <staging>` (with an explicit column
+  list leaving out `GENERATED ALWAYS` identity / generated columns, which the
+  target computes) (a single Delta commit —
   readers see the old or the new contents, never a mix) and drops the staging
   table; `abort` drops it. On a first run (no target yet, `create_table: true`)
   the first page creates the staging table and `commit` renames it into place.

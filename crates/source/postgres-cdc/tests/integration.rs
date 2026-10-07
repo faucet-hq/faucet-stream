@@ -173,6 +173,23 @@ async fn update_and_delete_emit_before_after() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn check_reports_a_passing_server_version_probe() {
+    use faucet_core::check::{CheckContext, ProbeStatus};
+    let (_pg, url) = start_postgres().await;
+    let source = PostgresCdcSource::new(cfg(&url, "doctor_slot", "faucet_pub"))
+        .await
+        .expect("source");
+    let report = source.check(&CheckContext::default()).await.expect("check");
+    let version = report
+        .probes
+        .iter()
+        .find(|p| p.name == "server_version")
+        .expect("server_version probe");
+    assert!(matches!(version.status, ProbeStatus::Pass), "{version:?}");
+    assert!(report.probes.iter().any(|p| p.name == "slot"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn missing_slot_with_create_if_missing_creates_it() {
     let (_pg, url) = start_postgres().await;
     ddl(

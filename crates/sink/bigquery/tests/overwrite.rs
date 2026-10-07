@@ -279,6 +279,36 @@ async fn scoped_overwrite_commit_deletes_in_window_not_truncate() {
 }
 
 #[tokio::test]
+async fn scoped_overwrite_bound_with_backslash_quote_stays_inside_the_literal() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_and_job(&server, "job-s").await;
+    mount_staging_present(&server).await;
+
+    let mut config = config_overwrite();
+    config.scope = Some(OverwriteScope::Window {
+        column: "posting_date".into(),
+        from: json!("x\\' OR TRUE;--"),
+        to: json!("z"),
+    });
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("write");
+    sink.commit_overwrite().await.expect("commit");
+
+    let qs = queries(&server).await;
+    assert!(
+        qs.iter()
+            .any(|q| q
+                .contains(r"WHERE `posting_date` >= 'x\\\' OR TRUE;--' AND `posting_date` < 'z'")),
+        "bound escaped GoogleSQL-style: {qs:?}"
+    );
+}
+
+#[tokio::test]
 async fn overwrite_abort_drops_staging_without_swap() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
@@ -497,8 +527,8 @@ async fn append_creates_table_when_missing_by_default() {
     let qs = queries(&server).await;
     assert!(
         qs.iter()
-            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
-        "append path must create the missing table: {qs:?}"
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
+        "append path must create the missing table (IF NOT EXISTS, SQL-98): {qs:?}"
     );
 }
 
@@ -1069,6 +1099,68 @@ impl wiremock::Match for FinalChunk {
     }
 }
 
+/// A resumable session that answers each mid chunk with a 308 whose `Range`
+/// reports what it kept: everything, or (when `partial`) only half of the
+/// first chunk, as the protocol allows (SQL-180).
+struct EchoRange {
+    partial: std::sync::atomic::AtomicBool,
+}
+impl EchoRange {
+    fn full() -> Self {
+        Self {
+            partial: false.into(),
+        }
+    }
+    fn half_of_first() -> Self {
+        Self {
+            partial: true.into(),
+        }
+    }
+}
+impl wiremock::Respond for EchoRange {
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        let (start, end) = content_range(req).expect("mid chunk carries a byte range");
+        let kept_end = if self
+            .partial
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            start + (end - start).div_ceil(2) - 1
+        } else {
+            end
+        };
+        ResponseTemplate::new(308).insert_header("range", format!("bytes=0-{kept_end}"))
+    }
+}
+
+fn content_range(req: &wiremock::Request) -> Option<(u64, u64)> {
+    let v = req.headers.get("content-range")?.to_str().ok()?;
+    let (a, b) = v
+        .strip_prefix("bytes ")?
+        .split_once('/')?
+        .0
+        .split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// The session's bytes rebuilt from each PUT's `Content-Range`, so a resent
+/// suffix overwrites rather than duplicates.
+async fn session_stream(server: &MockServer, session_path: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in server.received_requests().await.expect("recording enabled") {
+        if r.method.as_str() != "PUT" || r.url.path() != session_path {
+            continue;
+        }
+        let Some((start, _)) = content_range(&r) else {
+            continue;
+        };
+        let start = start as usize;
+        out.truncate(start);
+        assert_eq!(out.len(), start, "PUT must start at the persisted offset");
+        out.extend_from_slice(&r.body);
+    }
+    out
+}
+
 fn done_job(job_id: &str) -> serde_json::Value {
     json!({"jobReference": {"projectId": PROJECT_ID, "jobId": job_id},
            "status": {"state": "DONE"}})
@@ -1113,7 +1205,7 @@ async fn resumable_multi_chunk_streams_and_reassembles() {
     Mock::given(method("PUT"))
         .and(path("/rz/mc"))
         .and(MidChunk)
-        .respond_with(ResponseTemplate::new(308))
+        .respond_with(EchoRange::full())
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
@@ -1145,6 +1237,71 @@ async fn resumable_multi_chunk_streams_and_reassembles() {
         body.contains("\"id\":0") && body.contains("\"id\":19999"),
         "reassembled stream missing rows"
     );
+}
+
+/// A 308 that persisted only part of a chunk (SQL-180): the next PUT resumes
+/// at the offset the server reported, so the stream it holds is contiguous and
+/// complete instead of being rejected for a gap.
+#[tokio::test]
+async fn resumable_chunk_resumes_from_the_persisted_range() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_init(&server, "/rz/part").await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/part"))
+        .and(MidChunk)
+        .respond_with(EchoRange::half_of_first())
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/part"))
+        .and(FinalChunk)
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-part")))
+        .mount(&server)
+        .await;
+    mount_jobs_get_done(&server, "load-part").await;
+
+    let mut config = direct_media_config(&server);
+    config.resumable_chunk = Some(512);
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.begin_overwrite().await.expect("begin");
+    let rows = bulky_rows(20_000);
+    sink.write_batch(&rows).await.expect("write");
+    sink.flush().await.expect("flush");
+
+    let body = gunzip(&session_stream(&server, "/rz/part").await);
+    assert_eq!(
+        body.lines().count(),
+        20_000,
+        "every row reaches the session once"
+    );
+    assert!(body.contains("\"id\":0") && body.contains("\"id\":19999"));
+}
+
+/// A session that never persists anything gives up instead of looping.
+#[tokio::test]
+async fn resumable_chunk_without_progress_errors() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_init(&server, "/rz/stuck").await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/stuck"))
+        .and(MidChunk)
+        .respond_with(ResponseTemplate::new(308))
+        .mount(&server)
+        .await;
+
+    let mut config = direct_media_config(&server);
+    config.resumable_chunk = Some(512);
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.begin_overwrite().await.expect("begin");
+    let err = sink
+        .write_batch(&bulky_rows(20_000))
+        .await
+        .expect_err("a session that persists nothing must fail");
+    assert!(err.to_string().contains("no progress"), "got: {err}");
 }
 
 /// A mid-stream chunk PUT that returns something other than 308 surfaces the
@@ -1832,7 +1989,7 @@ async fn append_creates_table_when_missing_under_the_default_load_path() {
         queries(&server)
             .await
             .iter()
-            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
         "create_table must still run before the load: {:?}",
         queries(&server).await
     );

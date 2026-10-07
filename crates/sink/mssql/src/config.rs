@@ -205,6 +205,16 @@ impl MssqlSinkConfig {
                 self.write.write_mode.as_str()
             )));
         }
+        if self.staging.is_some()
+            && matches!(self.column_mapping, MssqlColumnMapping::JsonColumn { .. })
+        {
+            return Err(FaucetError::Config(
+                "MSSQL sink: `staging:` loads record fields as CSV columns, so it needs \
+                 `column_mapping: auto_columns` — `json_column` stores the whole record \
+                 in one column"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -328,6 +338,14 @@ mod tests {
         let mut cfg = MssqlSinkConfig::new("mssql://sa:pw@h/db", "dbo.t");
         cfg.staging =
             Some(serde_json::from_value(json!({"location": "az://c/p", "format": "csv"})).unwrap());
+        cfg.column_mapping = MssqlColumnMapping::JsonColumn {
+            column: "data".into(),
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("auto_columns"), "{err}");
+        cfg.column_mapping = MssqlColumnMapping::AutoColumns {
+            on_unknown_field: OnUnknownField::Warn,
+        };
         assert!(cfg.validate().is_ok());
         for mode in ["overwrite", "upsert", "delete"] {
             cfg.write = serde_json::from_value(json!({"write_mode": mode, "key": ["id"]})).unwrap();

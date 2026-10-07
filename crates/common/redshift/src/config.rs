@@ -128,11 +128,37 @@ pub struct RedshiftConnection {
     /// Authentication credentials.
     pub credentials: RedshiftCredentials,
     /// Whether to require TLS. Defaults to `true` (Redshift clusters require SSL
-    /// by default). `true` maps to `sslmode=require`; `false` maps to
-    /// `sslmode=prefer` (opportunistic TLS with plaintext fallback) — it never
-    /// forbids encryption outright.
+    /// by default). `true` maps to `sslmode=require` (encrypted, but the server
+    /// certificate is **not** verified); `false` maps to `sslmode=prefer`
+    /// (opportunistic TLS with plaintext fallback). Ignored when `tls_mode` is
+    /// set.
     #[serde(default = "default_tls")]
     pub tls: bool,
+    /// Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check
+    /// the server certificate against `ssl_root_cert` (or the system roots),
+    /// the latter also its host name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_mode: Option<RedshiftTlsMode>,
+    /// PEM file of the CA that signed the server certificate (the Redshift CA
+    /// bundle), for `tls_mode: verify_ca | verify_full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_root_cert: Option<String>,
+}
+
+/// How a Redshift connection uses TLS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RedshiftTlsMode {
+    /// Plaintext only.
+    Disable,
+    /// TLS when the server offers it, else plaintext.
+    Prefer,
+    /// TLS required; the certificate is not verified.
+    Require,
+    /// TLS required and the certificate chain verified.
+    VerifyCa,
+    /// As `verify_ca`, plus the certificate must name the host.
+    VerifyFull,
 }
 
 impl RedshiftConnection {
@@ -152,6 +178,8 @@ impl RedshiftConnection {
                 password: password.into(),
             },
             tls: true,
+            tls_mode: None,
+            ssl_root_cert: None,
         }
     }
 }

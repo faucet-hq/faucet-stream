@@ -66,7 +66,7 @@ async fn write_batch_idempotent_sends_one_atomic_multi_statement_transaction() {
         .unwrap();
     assert_eq!(written, 2);
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert_eq!(requests.len(), 2, "ensure-table + transaction");
 
     // Request 1: the watermark-table DDL, its own request (DDL auto-commits;
@@ -120,7 +120,7 @@ async fn ensure_table_runs_exactly_once_across_writes() {
         .await
         .unwrap();
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert_eq!(requests.len(), 3, "1 ensure-table + 2 transactions");
     let create_count = requests
         .iter()
@@ -167,7 +167,7 @@ async fn failed_ensure_table_is_retried_on_the_next_write() {
         .unwrap();
     assert_eq!(written, 1);
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     let create_count = requests
         .iter()
         .filter(|r| {
@@ -195,7 +195,7 @@ async fn empty_page_still_commits_the_token() {
         .unwrap();
     assert_eq!(written, 0);
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert_eq!(requests.len(), 2, "ensure-table + commit-only transaction");
     let tx: Value = serde_json::from_slice(&requests[1].body).unwrap();
     let tx_sql = tx["statement"].as_str().unwrap();
@@ -237,7 +237,7 @@ async fn last_committed_token_returns_the_stored_token() {
     assert_eq!(token.as_deref(), Some(stored));
 
     // The SELECT bound the scope as positional binding 1.
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     let select: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
     assert!(
         select["statement"].as_str().unwrap().starts_with("SELECT"),
@@ -325,7 +325,7 @@ async fn idempotent_write_polls_an_async_202_to_completion() {
         .unwrap();
     assert_eq!(written, 3);
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     // ensure-table POST + transaction POST + poll GET.
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[2].method.as_str(), "GET");
@@ -378,7 +378,7 @@ async fn idempotent_write_rejects_non_object_records_with_a_typed_error() {
 
     // Only the ensure-table request went out — no transaction was submitted
     // for the malformed page.
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     assert_eq!(requests.len(), 1);
 }
 
@@ -467,7 +467,7 @@ async fn exactly_once_creates_the_target_table() {
         .await
         .unwrap();
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = without_describe(server.received_requests().await.unwrap());
     let sqls: Vec<String> = requests
         .iter()
         .map(|r| {
@@ -492,4 +492,13 @@ async fn exactly_once_creates_the_target_table() {
         "{}",
         sqls[2]
     );
+}
+
+/// Requests other than the sink's one-time `information_schema` column
+/// lookup, which these tests do not count.
+fn without_describe(requests: Vec<wiremock::Request>) -> Vec<wiremock::Request> {
+    requests
+        .into_iter()
+        .filter(|r| !String::from_utf8_lossy(&r.body).contains("information_schema.columns"))
+        .collect()
 }

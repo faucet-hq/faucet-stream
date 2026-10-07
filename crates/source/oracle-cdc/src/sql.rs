@@ -19,7 +19,7 @@ pub(crate) fn contents_sql(n_tables: usize) -> String {
          ROW_ID, ROLLBACK, TO_CHAR(TIMESTAMP, 'YYYY-MM-DD HH24:MI:SS'), INFO \
          FROM V$LOGMNR_CONTENTS \
          WHERE SCN > :1 AND SCN <= :2 AND (OPERATION_CODE IN (6, 7, 36) \
-         OR ((SEG_OWNER, TABLE_NAME) IN ({}) AND OPERATION_CODE IN (1, 2, 3, 5, 10, 11, 255)))",
+         OR ((SEG_OWNER, TABLE_NAME) IN ({}) AND OPERATION_CODE IN (1, 2, 3, 5, 10, 11, 68, 70, 71, 255)))",
         table_filter(n_tables, 3)
     )
 }
@@ -46,7 +46,17 @@ pub(crate) fn log_groups_sql(n_tables: usize) -> String {
 /// Archived logs overlapping `(:1, :2]`.
 pub(crate) const ARCHIVED_LOGS_SQL: &str = "SELECT NAME, THREAD#, SEQUENCE#, FIRST_CHANGE#, \
     NEXT_CHANGE# FROM V$ARCHIVED_LOG WHERE NAME IS NOT NULL AND STANDBY_DEST = 'NO' \
-    AND DELETED = 'NO' AND STATUS = 'A' AND NEXT_CHANGE# > :1 AND FIRST_CHANGE# <= :2";
+    AND DELETED = 'NO' AND STATUS = 'A' AND NEXT_CHANGE# > :1 AND FIRST_CHANGE# <= :2 \
+    AND RESETLOGS_CHANGE# = (SELECT RESETLOGS_CHANGE# FROM V$DATABASE)";
+
+/// Open redo threads and the lowest checkpoint SCN among them. On RAC the
+/// redo flush only reaches the connected instance's log writer; a checkpoint
+/// SCN is a point every change below which is already in that thread's redo.
+pub(crate) const THREADS_SQL: &str =
+    "SELECT COUNT(*), MIN(CHECKPOINT_CHANGE#) FROM V$THREAD WHERE STATUS = 'OPEN'";
+
+/// The current incarnation's `RESETLOGS_CHANGE#`.
+pub(crate) const RESETLOGS_SQL: &str = "SELECT RESETLOGS_CHANGE# FROM V$DATABASE";
 
 /// Online logs overlapping `(:1, :2]` (one member per group is enough).
 pub(crate) const ONLINE_LOGS_SQL: &str = "SELECT MIN(f.MEMBER), l.THREAD#, l.SEQUENCE#, \
@@ -189,6 +199,11 @@ mod tests {
         let q = contents_sql(1);
         assert!(q.contains("SCN > :1 AND SCN <= :2"), "{q}");
         assert!(q.contains("IN ((:3, :4))"), "{q}");
+        assert!(
+            q.contains("68, 70, 71"),
+            "binary XMLType rows reach on_unsupported: {q}"
+        );
+        assert!(ARCHIVED_LOGS_SQL.contains("RESETLOGS_CHANGE# = (SELECT RESETLOGS_CHANGE#"));
         assert!(columns_sql(1).ends_with("IN ((:1, :2))"));
         assert!(log_groups_sql(2).contains("(:1, :2), (:3, :4)"));
         assert!(flush_table_ddl("F").contains("CREATE TABLE \"F\" (SCN NUMBER(19))"));

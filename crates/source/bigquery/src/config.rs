@@ -142,6 +142,12 @@ pub struct BigQuerySourceConfig {
     /// memory knob.
     #[serde(default = "default_stream_concurrency")]
     pub stream_concurrency: usize,
+    /// BigQuery API host for requests made outside the typed client (the
+    /// schema-tolerant fallback, SQL-172). Defaults to the real endpoint;
+    /// overridden in tests to point at a mock server. Not user-facing.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub api_host: Option<String>,
 }
 
 fn default_stream_concurrency() -> usize {
@@ -198,6 +204,7 @@ impl BigQuerySourceConfig {
             row_restriction: None,
             selected_fields: Vec::new(),
             max_streams: default_max_streams(),
+            api_host: None,
             stream_concurrency: default_stream_concurrency(),
         }
     }

@@ -21,6 +21,9 @@ pub struct ClickHouseSink {
     /// small page is not merely slow — it trips "too many parts", a hard
     /// failure. Merging pages is the fix the engine actually wants.
     pub(crate) pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
+    /// The target's column names, loaded once; `Some(None)` when the table
+    /// could not be described.
+    known_columns: tokio::sync::Mutex<Option<Option<std::collections::HashSet<String>>>>,
     pub(crate) config: ClickHouseSinkConfig,
     pub(crate) client: reqwest::Client,
     /// Resolved once in [`ClickHouseSink::new`] so the hot path never re-parses.
@@ -108,6 +111,9 @@ fn insert_params(
             if wait_for_async_insert { "1" } else { "0" },
         ));
     }
+    // A field with no column is an error, never silently dropped (newer
+    // servers default this setting to 1).
+    settings.push(("input_format_skip_unknown_fields", "0"));
     settings.push(("query", statement));
     query_params(database, &settings)
 }
@@ -128,6 +134,59 @@ pub(crate) fn staged_request(
         .query(&params)
         .body(statement.to_string());
     apply_auth(req, connection)
+}
+
+/// `SELECT name FROM system.columns` for `table` (`db.table` or a bare name
+/// in the session database), one `{"name": …}` object per line.
+fn columns_query(table: &str) -> String {
+    let (db, name) = match table.split_once('.') {
+        Some((db, name)) => (
+            faucet_common_clickhouse::sql_literal(&Value::String(db.to_string())),
+            name,
+        ),
+        None => ("currentDatabase()".to_string(), table),
+    };
+    format!(
+        "SELECT name FROM system.columns WHERE database = {db} AND table = {} FORMAT JSONEachRow",
+        faucet_common_clickhouse::sql_literal(&Value::String(name.to_string()))
+    )
+}
+
+/// Parse a [`columns_query`] response.
+fn parse_columns(body: &str) -> std::collections::HashSet<String> {
+    body.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
+/// Record fields (first-seen order) that are not in `known`.
+fn missing_fields(records: &[Value], known: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in records
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.keys())
+    {
+        if !known.contains(key) && !out.contains(key) {
+            out.push(key.clone());
+        }
+    }
+    out
+}
+
+/// `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for a field first seen after the
+/// table existed, typed like an auto-created column.
+fn add_column_sql(table: &str, column: &faucet_core::PlannedColumn) -> String {
+    let def = faucet_core::render_columns(
+        std::slice::from_ref(column),
+        faucet_common_clickhouse::quote_ident,
+        clickhouse_type,
+    );
+    format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {def}",
+        quote_table(table)
+    )
 }
 
 impl ClickHouseSink {
@@ -193,12 +252,47 @@ impl ClickHouseSink {
         Ok(())
     }
 
-    /// Run one DDL/DML statement through the HTTP interface.
-    async fn execute_statement(&self, sql: &str) -> Result<(), FaucetError> {
-        // The statement rides the **body**, not the `query` param: a POST with
-        // no body has neither `Content-Length` nor chunked encoding, which
-        // ClickHouse rejects with HTTP 411. Sending the SQL as the body is
-        // also the shape that avoids URL-length limits on a long statement.
+    /// Make every field of `records` a column before the page is buffered:
+    /// with `create_table` a missing one is added (typed from the page),
+    /// without it the write fails naming the fields.
+    async fn ensure_columns(&self, records: &[Value]) -> Result<(), FaucetError> {
+        let mut known = self.known_columns.lock().await;
+        if known.is_none() {
+            let body = self.query_text(&columns_query(&self.config.table)).await?;
+            let cols = parse_columns(&body);
+            *known = Some((!cols.is_empty()).then_some(cols));
+        }
+        let Some(Some(cols)) = known.as_mut() else {
+            return Ok(());
+        };
+        let missing = missing_fields(records, cols);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if !self.config.create_table {
+            return Err(FaucetError::Sink(format!(
+                "clickhouse: table {} has no column for field(s) {}; add them, drop the \
+                 fields with a transform, or set `create_table: true`",
+                self.config.table,
+                missing.join(", ")
+            )));
+        }
+        let planned = faucet_core::plan_columns(records).unwrap_or_default();
+        for column in planned.iter().filter(|c| missing.contains(&c.name)) {
+            self.execute_statement(&add_column_sql(&self.config.table, column))
+                .await?;
+            cols.insert(column.name.clone());
+        }
+        Ok(())
+    }
+
+    /// Run one statement and return the response body.
+    ///
+    /// The statement rides the **body**, not the `query` param: a POST with
+    /// no body has neither `Content-Length` nor chunked encoding, which
+    /// ClickHouse rejects with HTTP 411. Sending the SQL as the body is also
+    /// the shape that avoids URL-length limits on a long statement.
+    async fn query_text(&self, sql: &str) -> Result<String, FaucetError> {
         let params: Vec<(String, String)> =
             vec![("database".into(), self.config.connection.database.clone())];
         let req = self
@@ -206,10 +300,14 @@ impl ClickHouseSink {
             .post(&self.base_url)
             .query(&params)
             .body(sql.to_string());
-        let req = apply_auth(req, &self.config.connection);
-        let resp = req.send().await?;
-        check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        Ok(())
+        let resp = apply_auth(req, &self.config.connection).send().await?;
+        let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+        resp.text().await.map_err(FaucetError::Http)
+    }
+
+    /// Run one DDL/DML statement through the HTTP interface.
+    async fn execute_statement(&self, sql: &str) -> Result<(), FaucetError> {
+        self.query_text(sql).await.map(|_| ())
     }
 
     /// Validate the config and build the reusable HTTP client.
@@ -219,6 +317,7 @@ impl ClickHouseSink {
         let client = build_client(&config.connection)?;
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            known_columns: tokio::sync::Mutex::new(None),
             pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
                 config.commit_bytes,
@@ -340,6 +439,7 @@ impl Sink for ClickHouseSink {
         }
         self.flush().await?;
         self.ensure_table_ready(records).await?;
+        self.ensure_columns(records).await?;
         if self.config.staging.is_some() {
             self.write_batch(records).await?;
             return Ok(records.iter().map(|_| Ok(())).collect());
@@ -369,6 +469,7 @@ impl Sink for ClickHouseSink {
             return Ok(0);
         }
         self.ensure_table_ready(records).await?;
+        self.ensure_columns(records).await?;
 
         // Staged bulk load (#528): stage the whole page and let the server pull
         // it — no row body, no `batch_size` re-chunking.
@@ -548,7 +649,9 @@ mod tests {
     fn insert_params_without_async_insert() {
         let params = insert_params("analytics", "INSERT INTO x FORMAT JSONEachRow", false, true);
         assert_eq!(params[0], ("database".to_string(), "analytics".to_string()));
-        assert_eq!(params.len(), 3);
+        // database, the timestamp parser, the unknown-field guard and the
+        // query when async insert is off.
+        assert_eq!(params.len(), 4);
         assert_eq!(
             params[1],
             (
@@ -558,6 +661,13 @@ mod tests {
         );
         assert_eq!(
             params[2],
+            (
+                "input_format_skip_unknown_fields".to_string(),
+                "0".to_string()
+            )
+        );
+        assert_eq!(
+            params[3],
             (
                 "query".to_string(),
                 "INSERT INTO x FORMAT JSONEachRow".to_string()
@@ -579,6 +689,25 @@ mod tests {
         assert!(url.contains("date_time_input_format=best_effort"), "{url}");
         let body = req.body().and_then(|b| b.as_bytes()).unwrap();
         assert_eq!(body, stmt.as_bytes());
+    }
+
+    #[test]
+    fn column_helpers() {
+        assert_eq!(
+            columns_query("db.t"),
+            "SELECT name FROM system.columns WHERE database = 'db' AND table = 't' FORMAT JSONEachRow"
+        );
+        assert!(columns_query("t").contains("database = currentDatabase() AND table = 't'"));
+        let cols = parse_columns("{\"name\":\"id\"}\nnot json\n{\"x\":1}\n");
+        assert_eq!(cols, ["id".to_string()].into());
+        let recs = vec![json!({"id": 1, "b": true}), json!({"b": false}), json!(1)];
+        assert_eq!(missing_fields(&recs, &cols), vec!["b"]);
+        let planned = faucet_core::plan_columns(&recs[..1]).unwrap();
+        let b = planned.iter().find(|c| c.name == "b").unwrap();
+        assert_eq!(
+            add_column_sql("db.t", b),
+            "ALTER TABLE \"db\".\"t\" ADD COLUMN IF NOT EXISTS \"b\" Nullable(Bool)"
+        );
     }
 
     #[test]

@@ -46,7 +46,7 @@ fn base_cfg() -> SnowflakeSinkConfig {
     )
 }
 
-/// The provider's bearer token must be forwarded as `Snowflake Token="INJECTED"`.
+/// The provider's bearer token must be forwarded as `Bearer INJECTED`.
 /// The mock only responds to that exact header; any other value ⇒ no mock
 /// match ⇒ wiremock returns 404 ⇒ test fails.
 #[tokio::test]
@@ -56,7 +56,7 @@ async fn injected_provider_supplies_oauth_token() {
 
     Mock::given(method("POST"))
         .and(path("/api/v2/statements"))
-        .and(header("Authorization", "Snowflake Token=\"INJECTED\""))
+        .and(header("Authorization", "Bearer INJECTED"))
         .and(header("X-Snowflake-Authorization-Token-Type", "OAUTH"))
         .respond_with(ResponseTemplate::new(200).set_body_json(success_response()))
         .mount(&server)
@@ -80,7 +80,7 @@ async fn token_credential_maps_to_oauth() {
 
     Mock::given(method("POST"))
         .and(path("/api/v2/statements"))
-        .and(header("Authorization", "Snowflake Token=\"TOKEN-CRED\""))
+        .and(header("Authorization", "Bearer TOKEN-CRED"))
         .respond_with(ResponseTemplate::new(200).set_body_json(success_response()))
         .mount(&server)
         .await;
@@ -132,7 +132,7 @@ async fn one_provider_shared_across_two_sinks() {
     let endpoint = format!("{}/api/v2/statements", server.uri());
 
     Mock::given(method("POST"))
-        .and(header("Authorization", "Snowflake Token=\"SHARED\""))
+        .and(header("Authorization", "Bearer SHARED"))
         .respond_with(ResponseTemplate::new(200).set_body_json(success_response()))
         .mount(&server)
         .await;

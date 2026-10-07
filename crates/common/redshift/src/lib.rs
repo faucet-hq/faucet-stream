@@ -23,5 +23,5 @@
 mod config;
 mod pool;
 
-pub use config::{DEFAULT_PORT, RedshiftConnection, RedshiftCredentials};
+pub use config::{DEFAULT_PORT, RedshiftConnection, RedshiftCredentials, RedshiftTlsMode};
 pub use pool::{build_connect_options, build_pool, build_pool_lazy, resolve_password};

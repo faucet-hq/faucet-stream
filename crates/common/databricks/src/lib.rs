@@ -23,5 +23,5 @@ pub use auth::{DatabricksAuth, resolve_authorization};
 pub use statement::{
     ErrorSide, Manifest, ResultColumn, ResultSchema, StatementClient, StatementError,
     StatementOptions, StatementParam, StatementRequest, StatementResponse, StatementState,
-    StatementStatus, backoff_delay, value_to_param_string,
+    StatementStatus, backoff_delay, http_client, value_to_param_string,
 };

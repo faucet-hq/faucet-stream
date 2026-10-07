@@ -84,16 +84,44 @@ async fn append_round_trips_all_types() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn append_duplicate_pk_fails_the_batch() {
-    let (sink, _conn) = sink_for("em-appdup", append_spec()).await;
+async fn append_replay_of_committed_rows_converges() {
+    // A replayed page (an earlier chunk committed, or a crash before the
+    // bookmark) must not fail every retry on ALREADY_EXISTS (SQL-67).
+    let (sink, conn) = sink_for("em-appdup", append_spec()).await;
     sink.write_batch(&[json!({"id": 1, "v": "a"})])
         .await
         .expect("first");
-    let err = sink
-        .write_batch(&[json!({"id": 1, "v": "b"})])
+    sink.write_batch(&[json!({"id": 1, "v": "a"}), json!({"id": 2, "v": "b"})])
         .await
-        .expect_err("duplicate insert must fail");
-    assert!(matches!(err, FaucetError::Sink(_)));
+        .expect("replay converges");
+    assert_eq!(fetch_row(&conn, 1).await.unwrap()["v"], json!("a"));
+    assert_eq!(fetch_row(&conn, 2).await.unwrap()["v"], json!("b"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_created_table_takes_numbers_without_drift() {
+    // Auto-created columns are STRING(MAX); numbers and booleans encode into
+    // them, so the drift diff must not call them incompatible (SQL-112).
+    let conn = support::create_database("em-autodrift", vec![]).await;
+    let mut cfg = SpannerSinkConfig::new(
+        conn.project_id.clone(),
+        conn.instance.clone(),
+        conn.database.clone(),
+        "auto",
+    );
+    cfg.connection.emulator_host = conn.emulator_host.clone();
+    cfg.write = upsert_spec();
+    let sink = SpannerSink::new(cfg).await.expect("sink");
+    let page = vec![json!({"id": 1, "n": 2, "ok": true, "s": "x"})];
+    sink.write_batch(&page).await.expect("auto-create + write");
+    let dest = sink.current_schema().await.unwrap().unwrap();
+    let inferred = faucet_core::schema::infer_schema(&page);
+    let diff = faucet_core::drift::diff_schema(&dest, &inferred, true);
+    assert!(diff.incompatible.is_empty(), "{diff:?}");
+    assert!(
+        diff.additions.is_empty() && diff.widenings.is_empty(),
+        "{diff:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -230,7 +258,9 @@ async fn evolve_schema_adds_column_then_write_uses_it() {
     let schema = sink.current_schema().await.expect("schema").expect("some");
     assert_eq!(
         schema["properties"]["extra"]["type"],
-        json!(["string", "null"])
+        json!([
+            "string", "number", "integer", "boolean", "object", "array", "null"
+        ])
     );
 }
 
@@ -273,6 +303,16 @@ async fn check_reports_auth_and_schema_probes() {
         "missing_table",
     );
     cfg.connection.emulator_host = conn.emulator_host.clone();
+    // With the default `create_table: true` it is created on the first
+    // write, so doctor must not fail it (SQL-138)…
+    let missing = SpannerSink::new(cfg.clone()).await.expect("sink");
+    let report = missing
+        .check(&faucet_core::check::CheckContext::default())
+        .await
+        .expect("check");
+    assert_eq!(report.failed_count(), 0);
+    // …and without it the schema probe fails.
+    cfg.create_table = false;
     let missing = SpannerSink::new(cfg).await.expect("sink");
     let report = missing
         .check(&faucet_core::check::CheckContext::default())
@@ -491,7 +531,12 @@ async fn evolve_widens_nullability_relaxes_not_null_and_rejects_base_type_change
         .await
         .expect("NULL lands after relax");
     let schema = sink.current_schema().await.expect("schema").expect("some");
-    assert_eq!(schema["properties"]["v"]["type"], json!(["string", "null"]));
+    assert_eq!(
+        schema["properties"]["v"]["type"],
+        json!([
+            "string", "number", "integer", "boolean", "object", "array", "null"
+        ])
+    );
 }
 
 /// SQL-31: keys written in a non-canonical text form (`"007"`, `"1.50"`,

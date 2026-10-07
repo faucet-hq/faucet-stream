@@ -20,5 +20,5 @@ pub mod sink;
 pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{RedshiftCopyFormat, RedshiftSinkConfig, RedshiftWriteStrategy};
-pub use faucet_common_redshift::{RedshiftConnection, RedshiftCredentials};
+pub use faucet_common_redshift::{RedshiftConnection, RedshiftCredentials, RedshiftTlsMode};
 pub use sink::RedshiftSink;

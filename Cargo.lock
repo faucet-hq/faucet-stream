@@ -4944,10 +4944,12 @@ version = "1.1.0"
 dependencies = [
  "faucet-core",
  "gcp-bigquery-client",
+ "reqwest 0.12.28",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5126,6 +5128,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "socket2 0.6.3",
  "tiberius",
  "tokio",
  "tracing",
@@ -5236,11 +5239,14 @@ dependencies = [
  "base64 0.22.1",
  "faucet-core",
  "jsonwebtoken 9.3.1",
+ "reqwest 0.13.3",
  "rsa 0.9.10",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5570,6 +5576,7 @@ name = "faucet-sink-duckdb"
 version = "1.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "duckdb",
  "faucet-conformance",
  "faucet-core",
@@ -5864,6 +5871,7 @@ version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "faucet-common-oracle",
  "faucet-conformance",
  "faucet-core",
@@ -6067,6 +6075,7 @@ dependencies = [
  "arrow 58.3.0",
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "faucet-common-snowflake",
  "faucet-conformance",
  "faucet-core",
@@ -6191,6 +6200,7 @@ dependencies = [
  "arrow 58.3.0",
  "async-stream",
  "async-trait",
+ "chrono",
  "faucet-common-bigquery",
  "faucet-conformance",
  "faucet-core",
@@ -6985,6 +6995,7 @@ dependencies = [
  "faucet-common-snowflake",
  "faucet-conformance",
  "faucet-core",
+ "flate2",
  "futures",
  "reqwest 0.13.3",
  "schemars 1.2.1",

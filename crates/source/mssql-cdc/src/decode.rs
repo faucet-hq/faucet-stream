@@ -20,14 +20,32 @@ use tiberius::{ColumnData, Row};
 pub fn row_to_json(row: &Row) -> Result<Value, FaucetError> {
     let mut map = Map::with_capacity(row.columns().len());
     let names: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
-    for (i, (_col, data)) in row.cells().enumerate() {
-        let value = match scalar_to_json(data) {
-            Some(v) => v,
-            None => decode_temporal(row, i, data)?,
+    for (i, (col, data)) in row.cells().enumerate() {
+        let money = matches!(
+            col.column_type(),
+            tiberius::ColumnType::Money | tiberius::ColumnType::Money4
+        );
+        let value = match (money, data) {
+            (true, ColumnData::F64(Some(f))) => Value::String(money_text(*f)),
+            _ => match scalar_to_json(data) {
+                Some(v) => v,
+                None => decode_temporal(row, i, data)?,
+            },
         };
         map.insert(names[i].clone(), value);
     }
     Ok(Value::Object(map))
+}
+
+/// A `MONEY` / `SMALLMONEY` value as an exact 4-decimal string. The driver
+/// hands MONEY over as `f64`; every MONEY value of magnitude below 2^53 / 10^4
+/// (about 900 billion) round-trips exactly through `value × 10^4`, which is
+/// rendered as integer digits rather than through float formatting.
+pub(crate) fn money_text(f: f64) -> String {
+    let units = (f * 1e4).round() as i128;
+    let sign = if units < 0 { "-" } else { "" };
+    let abs = units.unsigned_abs();
+    format!("{sign}{}.{:04}", abs / 10_000, abs % 10_000)
 }
 
 /// Convert a non-temporal [`ColumnData`] to JSON. Returns `Some(Value::Null)`
@@ -113,6 +131,15 @@ pub(crate) fn numeric_to_string(n: Numeric) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn money_renders_exact_decimal_text() {
+        assert_eq!(super::money_text(12.3456), "12.3456");
+        assert_eq!(super::money_text(-0.5), "-0.5000");
+        assert_eq!(super::money_text(0.0), "0.0000");
+        assert_eq!(super::money_text(900000000000.1234), "900000000000.1234");
+        assert_eq!(super::money_text(-214748.3648), "-214748.3648");
+    }
+
     use super::*;
     use std::borrow::Cow;
 

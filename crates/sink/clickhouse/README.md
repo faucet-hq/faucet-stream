@@ -106,10 +106,16 @@ first written page's inferred columns when it does not exist — a first-ever
 sync cannot assume the destination is already there. Every inferred column is
 created **nullable**: a column present in page 1 is not required forever, and a
 `NOT NULL` inferred from one page fails page 2 the first time a record omits
-the field (narrowing later is the `schema:` drift policy's job). The table is created `MergeTree ORDER BY tuple()` — faucet has no basis to pick a sort key, so define the table yourself and set `create_table: false` when the sort key matters.
+the field. The table is created `MergeTree ORDER BY tuple()` — faucet has no basis to pick a sort key, so define the table yourself and set `create_table: false` when the sort key matters. A field first seen on a later page (or missing from a pre-existing table) is added with `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, typed the same way, before the page is buffered. (`schema:` drift policies do not apply: this sink reports no destination schema.)
 
-Set `create_table: false` to require a pre-existing target; a missing one then
-fails fast with the same error every table sink raises, naming both ways out.
+Set `create_table: false` to require a pre-existing target; a missing table
+surfaces from the first INSERT, and a record field the table has no column for
+fails the write naming the field. Every insert also sends
+`input_format_skip_unknown_fields=0`, so the server rejects an unknown field
+instead of dropping it.
+
+The HTTP client uses a 30 s connect and a 300 s idle-read timeout, so a
+half-open connection fails the request instead of hanging the run.
 
 
 ## Commit accumulation (`commit_rows` / `commit_bytes`)

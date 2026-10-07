@@ -135,6 +135,7 @@ async fn upload_bodies(server: &MockServer) -> Vec<String> {
 async fn load_native_ndjson_streams_session_with_explicit_string_schema() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
     mount_resumable(&server, "/session/native-1", "job-native-1").await;
     let (sink, _sa) = build_sink(&server, native_config(&server)).await;
 
@@ -287,6 +288,7 @@ async fn load_native_overwrite_first_batch_truncates_once_per_object() {
 async fn load_native_streaming_payload_feeds_session_chunk_by_chunk() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
     mount_resumable(&server, "/session/native-3", "job-native-3").await;
     let (sink, _sa) = build_sink(&server, native_config(&server)).await;
 
@@ -456,6 +458,7 @@ async fn load_native_rejects_an_unsupported_format() {
 async fn load_native_appends_after_a_flush_stream_rows() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
     mount_resumable(&server, "/session/native-4", "job-native-4").await;
     Mock::given(method("POST"))
         .and(path(format!(
@@ -532,6 +535,7 @@ async fn load_native_appends_after_a_flush_stream_rows() {
 async fn load_native_streamed_rows_reject_malformed_ndjson() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
+    mount_target(&server, None).await;
     mount_resumable(&server, "/session/native-5", "job-native-5").await;
     let (sink, _sa) = build_sink(&server, native_config(&server)).await;
     let ctx = NativeLoadContext {
@@ -650,5 +654,79 @@ async fn load_native_streamed_overwrite_infers_a_missing_tables_schema() {
     assert!(
         body.contains("\"name\":\"Id\",\"type\":\"STRING\""),
         "{body:.400}"
+    );
+}
+
+/// SQL-134: an append into an existing typed table loads with that table's own
+/// schema, not an all-STRING one BigQuery would refuse as a mismatch.
+#[tokio::test]
+async fn load_native_append_into_a_typed_table_keeps_its_schema() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_resumable(&server, "/session/native-typed", "job-native-typed").await;
+    mount_target(
+        &server,
+        Some(serde_json::json!([{"name": "Id", "type": "INTEGER", "mode": "NULLABLE"}])),
+    )
+    .await;
+    let (sink, _sa) = build_sink(&server, native_config(&server)).await;
+    sink.load_native(
+        NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec())
+            .with_records(Some(1)),
+        "p::row",
+        NativeLoadContext {
+            write_mode: WriteMode::Append,
+            first_batch: true,
+        },
+    )
+    .await
+    .expect("feed");
+    sink.flush().await.expect("flush");
+    let body = upload_bodies(&server).await.join("\n");
+    assert!(body.contains("\"WRITE_APPEND\""), "{body}");
+    assert!(body.contains("\"type\":\"INTEGER\""), "{body}");
+    assert!(!body.contains("\"type\":\"STRING\""), "{body}");
+}
+
+/// SQL-126: the sink's explicit `schema` types the native load, and
+/// `create_table: false` makes the load `CREATE_NEVER` so it cannot create the
+/// table the config says must already exist.
+#[tokio::test]
+async fn load_native_uses_the_explicit_schema_and_honours_create_table_false() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_resumable(&server, "/session/native-explicit", "job-native-explicit").await;
+    mount_target(&server, None).await;
+    let mut config = native_config(&server);
+    config.create_table = false;
+    config.schema = Some(json!({
+        "type": "object",
+        "properties": {"Id": {"type": "integer"}, "When": {"type": "string", "format": "date"}}
+    }));
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.load_native(
+        NativeBatch::bytes(
+            NativeFormat::NdJson,
+            b"{\"Id\":\"1\",\"When\":\"2024-01-01\"}\n".to_vec(),
+        )
+        .with_records(Some(1)),
+        "p::row",
+        NativeLoadContext {
+            write_mode: WriteMode::Append,
+            first_batch: true,
+        },
+    )
+    .await
+    .expect("feed");
+    sink.flush().await.expect("flush");
+    let body = upload_bodies(&server).await.join("\n");
+    assert!(
+        body.contains("\"createDisposition\":\"CREATE_NEVER\""),
+        "{body}"
+    );
+    assert!(
+        body.contains("\"name\":\"Id\",\"type\":\"INTEGER\"")
+            && body.contains("\"name\":\"When\",\"type\":\"DATE\""),
+        "{body}"
     );
 }

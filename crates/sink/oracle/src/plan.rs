@@ -36,6 +36,10 @@ pub(crate) struct ColumnInfo {
     pub nullable: bool,
     /// `false` for virtual columns and `GENERATED ALWAYS` identities.
     pub insertable: bool,
+    /// An identity column (`GENERATED … AS IDENTITY`).
+    pub identity: bool,
+    /// The column's `DEFAULT` expression, if any.
+    pub default: Option<String>,
 }
 
 /// How a value is bound for a destination column.
@@ -154,6 +158,14 @@ pub(crate) fn clamp_fraction(s: &str) -> String {
     format!("{}{}", &s[..dot + 10], &s[dot + 1 + digits..])
 }
 
+/// An ISO 8601 date-time carrying an offset as UTC wall time. A tz-less
+/// `DATE`/`TIMESTAMP` bind keeps only the wall-clock fields, so without this
+/// `…-08:00` and `…Z` values would land as inconsistent instants.
+pub(crate) fn utc_wall_time(s: &str) -> Option<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).ok()?;
+    Some(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+}
+
 /// Encode one record value as the text bound for a column of `kind`.
 /// `Ok(None)` binds SQL `NULL` — also for `""`, which Oracle stores as `NULL`
 /// anyway (and a zero-length `CLOB` bind is rejected); `Err` names why the
@@ -185,9 +197,11 @@ pub(crate) fn value_to_text(v: &Value, kind: BindKind) -> Result<Option<String>,
         (BindKind::Raw | BindKind::Blob, other) => {
             return Err(format!("{other} is not a base64 binary value"));
         }
-        (BindKind::Date | BindKind::Timestamp | BindKind::TimestampTz, Value::String(s)) => {
-            clamp_fraction(s)
+        (BindKind::Date | BindKind::Timestamp, Value::String(s)) => {
+            let s = clamp_fraction(s);
+            utc_wall_time(&s).unwrap_or(s)
         }
+        (BindKind::TimestampTz, Value::String(s)) => clamp_fraction(s),
         (BindKind::Date | BindKind::Timestamp | BindKind::TimestampTz, other) => {
             return Err(format!("{other} is not a date-time string"));
         }
@@ -377,19 +391,36 @@ pub(crate) fn column_type(t: SqlBaseType, is_key: bool) -> &'static str {
     }
 }
 
+/// Character width of each text key column when `n` of them share a primary
+/// key: an index key must fit about 6,400 bytes at an 8 KB block, and an
+/// AL32UTF8 character takes up to 4 bytes, so the key's text columns share
+/// 1,500 characters (at most 1,000 each).
+pub(crate) fn key_text_width(n: usize) -> usize {
+    (1500 / n.max(1)).min(1000)
+}
+
 /// `CREATE TABLE` for `auto_columns`, from the first page's planned columns.
 pub(crate) fn create_table_sql(
     table: &str,
     columns: &[PlannedColumn],
     key: &[String],
 ) -> Result<String, FaucetError> {
+    let text_keys = columns
+        .iter()
+        .filter(|c| {
+            key.contains(&c.name) && matches!(c.base_type, SqlBaseType::Text | SqlBaseType::Json)
+        })
+        .count();
     let mut defs = Vec::with_capacity(columns.len() + 1);
     for c in columns {
-        defs.push(format!(
-            "{} {}",
-            quote_ident_oracle(&c.name)?,
-            column_type(c.base_type, key.contains(&c.name))
-        ));
+        let is_key = key.contains(&c.name);
+        let ty = match c.base_type {
+            SqlBaseType::Text | SqlBaseType::Json if is_key => {
+                format!("VARCHAR2({} CHAR)", key_text_width(text_keys))
+            }
+            t => column_type(t, is_key).to_string(),
+        };
+        defs.push(format!("{} {ty}", quote_ident_oracle(&c.name)?));
     }
     if !key.is_empty() {
         defs.push(format!("PRIMARY KEY ({})", quote_all(key)?.join(", ")));
@@ -460,22 +491,30 @@ pub(crate) const TABLE_EXISTS_SQL: &str = "SELECT COUNT(*) FROM ALL_TABLES \
 
 /// Column metadata (`:1` owner or NULL, `:2` table).
 pub(crate) const COLUMNS_SQL: &str = "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.DATA_PRECISION, \
-    c.DATA_SCALE, c.NULLABLE, c.VIRTUAL_COLUMN, NVL(i.GENERATION_TYPE, 'NONE') \
+    c.DATA_SCALE, c.NULLABLE, c.VIRTUAL_COLUMN, NVL(i.GENERATION_TYPE, 'NONE'), c.DATA_DEFAULT \
     FROM ALL_TAB_COLS c LEFT JOIN ALL_TAB_IDENTITY_COLS i \
       ON i.OWNER = c.OWNER AND i.TABLE_NAME = c.TABLE_NAME AND i.COLUMN_NAME = c.COLUMN_NAME \
     WHERE c.OWNER = NVL(:1, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) AND c.TABLE_NAME = :2 \
       AND c.HIDDEN_COLUMN = 'NO' ORDER BY c.COLUMN_ID";
 
+/// One [`COLUMNS_SQL`] row: name, type, precision, scale, nullable,
+/// virtual, identity generation, default.
+pub(crate) type ColumnRow = (
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+
 /// Build a [`ColumnInfo`] from one [`COLUMNS_SQL`] row.
-pub(crate) fn column_from_row(
-    name: String,
-    data_type: String,
-    precision: Option<i64>,
-    scale: Option<i64>,
-    nullable: &str,
-    virtual_column: &str,
-    generation: &str,
-) -> ColumnInfo {
+pub(crate) fn column_from_row(row: ColumnRow) -> ColumnInfo {
+    let (name, data_type, precision, scale, nullable, virtual_column, generation, data_default) =
+        row;
+    let identity = generation != "NONE";
     ColumnInfo {
         name,
         data_type,
@@ -483,6 +522,11 @@ pub(crate) fn column_from_row(
         scale,
         nullable: nullable != "N",
         insertable: virtual_column != "YES" && generation != "ALWAYS",
+        identity,
+        // An identity's sequence default is not a copyable expression.
+        default: data_default
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty() && !identity && virtual_column != "YES"),
     }
 }
 
@@ -560,6 +604,29 @@ pub(crate) fn clone_table_sql(staging: &str, target: &str) -> String {
     format!("CREATE TABLE {staging} AS SELECT * FROM {target} WHERE 1 = 0")
 }
 
+/// What `CREATE TABLE … AS SELECT` drops from the clone, put back: a
+/// writable identity column becomes nullable (the writer never supplies it,
+/// and the clone kept its `NOT NULL`), and each column `DEFAULT` is copied so
+/// a record that omits the column gets the target's default, not `NULL`.
+pub(crate) fn staging_fixups_sql(
+    staging: &str,
+    target_cols: &[ColumnInfo],
+) -> Result<Vec<String>, FaucetError> {
+    let mut out = Vec::new();
+    for c in target_cols.iter().filter(|c| c.insertable) {
+        let col = quote_ident_oracle(&c.name)?;
+        if c.identity {
+            out.push(ignoring(
+                &format!("ALTER TABLE {staging} MODIFY ({col} NULL)"),
+                &[ORA_ALREADY_NULL],
+            ));
+        } else if let Some(d) = &c.default {
+            out.push(format!("ALTER TABLE {staging} MODIFY ({col} DEFAULT {d})"));
+        }
+    }
+    Ok(out)
+}
+
 /// Drop a table if it exists.
 pub(crate) fn drop_table_sql(table: &str) -> String {
     ignoring(&format!("DROP TABLE {table} PURGE"), &[ORA_TABLE_MISSING])
@@ -585,6 +652,34 @@ pub(crate) fn swap_sql(
         format!("DELETE FROM {target}"),
         format!("INSERT INTO {target} ({list}) SELECT {list} FROM {staging}"),
     ])
+}
+
+/// The overwrite swap for the target's writable columns: delete, then copy
+/// staging back. A writable identity column is copied only where staging has
+/// a value; rows without one are inserted without it so the target generates
+/// it (a table has at most one identity column).
+pub(crate) fn overwrite_swap_sql(
+    target: &str,
+    staging: &str,
+    target_cols: &[ColumnInfo],
+) -> Result<Vec<String>, FaucetError> {
+    let cols: Vec<String> = target_cols
+        .iter()
+        .filter(|c| c.insertable)
+        .map(|c| c.name.clone())
+        .collect();
+    let [delete, insert] = swap_sql(target, staging, &cols)?;
+    let Some(id) = target_cols.iter().find(|c| c.insertable && c.identity) else {
+        return Ok(vec![delete, insert]);
+    };
+    let id_q = quote_ident_oracle(&id.name)?;
+    let rest: Vec<String> = cols.into_iter().filter(|c| c != &id.name).collect();
+    let mut out = vec![delete, format!("{insert} WHERE {id_q} IS NOT NULL")];
+    if !rest.is_empty() {
+        let [_, without] = swap_sql(target, staging, &rest)?;
+        out.push(format!("{without} WHERE {id_q} IS NULL"));
+    }
+    Ok(out)
 }
 
 /// Apply the identifier case rule to every record's top-level keys.
@@ -860,6 +955,8 @@ mod tests {
             scale,
             nullable: true,
             insertable: true,
+            identity: false,
+            default: None,
         }
     }
 
@@ -922,6 +1019,30 @@ mod tests {
         assert_eq!(
             clamp_fraction("2024-01-02T03:04:05.123456789012+01:00"),
             "2024-01-02T03:04:05.123456789+01:00"
+        );
+    }
+
+    #[test]
+    fn offset_timestamps_land_in_utc_for_tzless_columns() {
+        let v = serde_json::json!("2024-01-02T03:04:05-08:00");
+        assert_eq!(
+            value_to_text(&v, BindKind::Timestamp).unwrap().as_deref(),
+            Some("2024-01-02T11:04:05")
+        );
+        assert_eq!(
+            value_to_text(&v, BindKind::Date).unwrap().as_deref(),
+            Some("2024-01-02T11:04:05")
+        );
+        assert_eq!(
+            value_to_text(&v, BindKind::TimestampTz).unwrap().as_deref(),
+            Some("2024-01-02T03:04:05-08:00")
+        );
+        let naive = serde_json::json!("2024-01-02 03:04:05.123456789012");
+        assert_eq!(
+            value_to_text(&naive, BindKind::Timestamp)
+                .unwrap()
+                .as_deref(),
+            Some("2024-01-02 03:04:05.123456789")
         );
     }
 
@@ -1074,6 +1195,59 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_keeps_identity_and_defaults() {
+        let mut id = col("ID", "NUMBER", None, Some(0));
+        id.identity = true;
+        let mut gen_always = col("G", "NUMBER", None, Some(0));
+        gen_always.identity = true;
+        gen_always.insertable = false;
+        let mut def = col("STATUS", "VARCHAR2", None, None);
+        def.default = Some("'new'".into());
+        let doc = col("DOC", "CLOB", None, None);
+        let cols = vec![id.clone(), gen_always, def, doc];
+        let fix = staging_fixups_sql("\"S\"", &cols).unwrap();
+        assert_eq!(fix.len(), 2);
+        assert!(
+            fix[0].contains("ALTER TABLE \"S\" MODIFY (\"ID\" NULL)"),
+            "{}",
+            fix[0]
+        );
+        assert_eq!(
+            fix[1],
+            "ALTER TABLE \"S\" MODIFY (\"STATUS\" DEFAULT 'new')"
+        );
+
+        let swap = overwrite_swap_sql("\"T\"", "\"S\"", &cols).unwrap();
+        assert_eq!(
+            swap,
+            vec![
+                "DELETE FROM \"T\"".to_string(),
+                "INSERT INTO \"T\" (\"ID\", \"STATUS\", \"DOC\") SELECT \"ID\", \"STATUS\", \"DOC\" FROM \"S\" WHERE \"ID\" IS NOT NULL".to_string(),
+                "INSERT INTO \"T\" (\"STATUS\", \"DOC\") SELECT \"STATUS\", \"DOC\" FROM \"S\" WHERE \"ID\" IS NULL".to_string(),
+            ]
+        );
+        assert_eq!(
+            overwrite_swap_sql("\"T\"", "\"S\"", &[id]).unwrap().len(),
+            2
+        );
+        let plain =
+            overwrite_swap_sql("\"T\"", "\"S\"", &[col("A", "NUMBER", None, None)]).unwrap();
+        assert_eq!(plain.len(), 2);
+    }
+
+    #[test]
+    fn composite_text_keys_fit_the_index_limit() {
+        assert_eq!(key_text_width(0), 1000);
+        assert_eq!(key_text_width(1), 1000);
+        assert_eq!(key_text_width(2), 750);
+        assert_eq!(key_text_width(3), 500);
+        let planned = faucet_core::plan_columns(&[json!({"A": "x", "B": "y", "N": 1})]).unwrap();
+        let sql = create_table_sql("\"T\"", &planned, &["A".to_string(), "B".to_string()]).unwrap();
+        assert!(sql.contains("\"A\" VARCHAR2(750 CHAR)"), "{sql}");
+        assert!(sql.contains("\"B\" VARCHAR2(750 CHAR)"), "{sql}");
+    }
+
+    #[test]
     fn watermark_statements() {
         assert_eq!(
             token_table("APP.T").unwrap(),
@@ -1138,29 +1312,56 @@ mod tests {
 
     #[test]
     fn column_rows_and_case() {
-        let c = column_from_row(
+        let c = column_from_row((
             "A".into(),
             "NUMBER".into(),
             Some(5),
             Some(0),
-            "N",
-            "NO",
-            "ALWAYS",
-        );
+            "N".into(),
+            "NO".into(),
+            "ALWAYS".into(),
+            None,
+        ));
         assert!(!c.nullable);
         assert!(!c.insertable);
-        let v = column_from_row("V".into(), "NUMBER".into(), None, None, "Y", "YES", "NONE");
+        let v = column_from_row((
+            "V".into(),
+            "NUMBER".into(),
+            None,
+            None,
+            "Y".into(),
+            "YES".into(),
+            "NONE".into(),
+            Some("1".into()),
+        ));
+        assert_eq!(
+            v.default, None,
+            "a virtual column's expression is not a default"
+        );
         assert!(!v.insertable);
-        let ok = column_from_row(
+        let ok = column_from_row((
             "B".into(),
             "NUMBER".into(),
             None,
             None,
-            "Y",
-            "NO",
-            "BY DEFAULT",
-        );
-        assert!(ok.insertable && ok.nullable);
+            "Y".into(),
+            "NO".into(),
+            "BY DEFAULT".into(),
+            Some("\"ISEQ$$_1\".nextval".into()),
+        ));
+        assert!(ok.insertable && ok.nullable && ok.identity);
+        assert_eq!(ok.default, None);
+        let d = column_from_row((
+            "D".into(),
+            "VARCHAR2".into(),
+            None,
+            None,
+            "N".into(),
+            "NO".into(),
+            "NONE".into(),
+            Some(" 'x' \n".into()),
+        ));
+        assert_eq!(d.default.as_deref(), Some("'x'"));
 
         let recs = vec![json!({"id": 1}), json!(5)];
         assert_eq!(case_records(&recs, true)[0], json!({"ID": 1}));
@@ -1188,6 +1389,8 @@ mod tests {
             scale: None,
             nullable: true,
             insertable,
+            identity: false,
+            default: None,
         }
     }
 

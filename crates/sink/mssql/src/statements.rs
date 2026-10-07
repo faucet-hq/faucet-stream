@@ -5,6 +5,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use faucet_common_mssql::quote_ident_mssql;
 use faucet_core::{FaucetError, KeyTuple};
 use serde_json::Value;
 
@@ -44,13 +45,106 @@ pub(crate) fn writable(
     )))
 }
 
-/// Writable (non-IDENTITY) column names, in table order.
+/// Writable column names, in table order: not IDENTITY, computed or
+/// `rowversion`.
 pub(crate) fn insertable(infos: &[ColumnInfo]) -> Vec<String> {
     infos
         .iter()
-        .filter(|c| !c.is_identity)
+        .filter(|c| !c.is_identity && copyable(c))
         .map(|c| c.name.clone())
         .collect()
+}
+
+/// A column a value can be written to at all: not computed, not `rowversion`.
+fn copyable(c: &ColumnInfo) -> bool {
+    !c.is_computed && c.type_name != "timestamp"
+}
+
+/// Overwrite staging: a clone of the target's writable columns (computed and
+/// `rowversion` columns left out) without the IDENTITY property — a `UNION`
+/// in `SELECT … INTO` drops it — so record identity values can land.
+pub(crate) fn staging_create_sql(
+    staging: &str,
+    target: &str,
+    target_infos: &[ColumnInfo],
+) -> Result<String, FaucetError> {
+    let cols = target_infos
+        .iter()
+        .filter(|c| copyable(c))
+        .map(|c| quote_ident_mssql(&c.name))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    Ok(format!(
+        "SELECT {cols} INTO {staging} FROM (SELECT {cols} FROM {target} WHERE 1 = 0 \
+         UNION ALL SELECT {cols} FROM {target} WHERE 1 = 0) AS t"
+    ))
+}
+
+/// Make the target's IDENTITY column nullable in staging, so a record without
+/// it still stages (the target generates it at the swap).
+pub(crate) fn staging_relax_sql(
+    staging: &str,
+    target_infos: &[ColumnInfo],
+) -> Result<Option<String>, FaucetError> {
+    let Some(id) = target_infos.iter().find(|c| c.is_identity) else {
+        return Ok(None);
+    };
+    let ty = id.declared_type().ok_or_else(|| {
+        FaucetError::Sink(format!(
+            "mssql overwrite: identity column '{}' has an unsupported type {}",
+            id.name, id.type_name
+        ))
+    })?;
+    Ok(Some(format!(
+        "ALTER TABLE {staging} ALTER COLUMN {} {ty} NULL",
+        quote_ident_mssql(&id.name)?
+    )))
+}
+
+/// The overwrite swap, column lists built from the **target**: computed and
+/// `rowversion` columns are never copied; the IDENTITY column is copied with
+/// `IDENTITY_INSERT` where staging has a value (so identities survive the
+/// overwrite) and generated where it does not.
+pub(crate) fn overwrite_swap_sql(
+    target: &str,
+    staging: &str,
+    target_infos: &[ColumnInfo],
+) -> Result<Vec<String>, FaucetError> {
+    let list = |cols: &[&ColumnInfo]| -> Result<String, FaucetError> {
+        Ok(cols
+            .iter()
+            .map(|c| quote_ident_mssql(&c.name))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", "))
+    };
+    let plain: Vec<&ColumnInfo> = target_infos
+        .iter()
+        .filter(|c| !c.is_identity && copyable(c))
+        .collect();
+    let mut out = vec![format!("DELETE FROM {target}")];
+    let Some(id) = target_infos.iter().find(|c| c.is_identity) else {
+        let cols = list(&plain)?;
+        out.push(format!(
+            "INSERT INTO {target} ({cols}) SELECT {cols} FROM {staging}"
+        ));
+        return Ok(out);
+    };
+    let id_q = quote_ident_mssql(&id.name)?;
+    let mut with_id = vec![id];
+    with_id.extend(plain.iter().copied());
+    let all = list(&with_id)?;
+    out.push(format!("SET IDENTITY_INSERT {target} ON"));
+    out.push(format!(
+        "INSERT INTO {target} ({all}) SELECT {all} FROM {staging} WHERE {id_q} IS NOT NULL"
+    ));
+    out.push(format!("SET IDENTITY_INSERT {target} OFF"));
+    if !plain.is_empty() {
+        let cols = list(&plain)?;
+        out.push(format!(
+            "INSERT INTO {target} ({cols}) SELECT {cols} FROM {staging} WHERE {id_q} IS NULL"
+        ));
+    }
+    Ok(out)
 }
 
 /// Refuse every write once a timed-out connection could not be replaced: it
@@ -273,7 +367,51 @@ mod tests {
             collation: None,
             is_nullable: true,
             is_identity: identity,
+            is_computed: false,
         }
+    }
+
+    #[test]
+    fn overwrite_skips_computed_and_rowversion_and_keeps_identity() {
+        let mut computed = info("TOTAL", "int", false);
+        computed.is_computed = true;
+        let cols = vec![
+            info("ID", "int", true),
+            info("NAME", "nvarchar", false),
+            computed,
+            info("RV", "timestamp", false),
+        ];
+        assert_eq!(insertable(&cols), vec!["NAME".to_string()]);
+        let swap = overwrite_swap_sql("[t]", "[s]", &cols).unwrap();
+        assert_eq!(
+            swap,
+            vec![
+                "DELETE FROM [t]".to_string(),
+                "SET IDENTITY_INSERT [t] ON".to_string(),
+                "INSERT INTO [t] ([ID], [NAME]) SELECT [ID], [NAME] FROM [s] WHERE [ID] IS NOT NULL"
+                    .to_string(),
+                "SET IDENTITY_INSERT [t] OFF".to_string(),
+                "INSERT INTO [t] ([NAME]) SELECT [NAME] FROM [s] WHERE [ID] IS NULL".to_string(),
+            ]
+        );
+        let no_id = overwrite_swap_sql("[t]", "[s]", &cols[1..]).unwrap();
+        assert_eq!(no_id[1], "INSERT INTO [t] ([NAME]) SELECT [NAME] FROM [s]");
+        assert_eq!(
+            overwrite_swap_sql("[t]", "[s]", &cols[..1]).unwrap().len(),
+            4
+        );
+        assert_eq!(
+            staging_relax_sql("[s]", &cols).unwrap().as_deref(),
+            Some("ALTER TABLE [s] ALTER COLUMN [ID] int NULL")
+        );
+        assert_eq!(staging_relax_sql("[s]", &cols[1..]).unwrap(), None);
+        let odd = vec![info("ID", "geography", true)];
+        assert!(staging_relax_sql("[s]", &odd).is_err());
+        assert_eq!(
+            staging_create_sql("[s]", "[t]", &cols).unwrap(),
+            "SELECT [ID], [NAME] INTO [s] FROM (SELECT [ID], [NAME] FROM [t] WHERE 1 = 0 \
+             UNION ALL SELECT [ID], [NAME] FROM [t] WHERE 1 = 0) AS t"
+        );
     }
 
     fn table() -> Vec<ColumnInfo> {

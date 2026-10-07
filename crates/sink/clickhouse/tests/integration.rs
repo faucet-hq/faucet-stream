@@ -434,3 +434,34 @@ async fn auto_create_quotes_hostile_column_names() {
     .await;
     assert_eq!(engine[0]["engine"], json!("MergeTree"));
 }
+
+/// SQL-82: a field first seen after the table existed becomes a column with
+/// `create_table`, and fails loudly (never silently dropped) without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_field_becomes_a_column_or_fails_loudly() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "evolving")).expect("sink");
+    sink.write_batch(&[json!({"id": 1})]).await.expect("page 1");
+    sink.write_batch(&[json!({"id": 2, "extra": "x"})])
+        .await
+        .expect("page 2");
+    sink.flush().await.expect("flush");
+    let rows = read_rows(&base, "SELECT id, extra FROM evolving ORDER BY id").await;
+    assert_eq!(rows[1]["extra"], json!("x"));
+
+    http_exec(
+        &base,
+        "CREATE TABLE fixed (id Int64) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let sink =
+        ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "fixed").with_create_table(false))
+            .expect("sink");
+    let err = sink
+        .write_batch(&[json!({"id": 1, "surprise": 2})])
+        .await
+        .expect_err("no column for the field");
+    assert!(err.to_string().contains("surprise"), "{err}");
+}

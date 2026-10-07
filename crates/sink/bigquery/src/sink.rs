@@ -4,7 +4,7 @@ use crate::config::BigQuerySinkConfig;
 use crate::idempotent;
 use crate::merge;
 use async_trait::async_trait;
-use faucet_common_bigquery::{BigQueryCredentials, build_client};
+use faucet_common_bigquery::build_client;
 use faucet_core::FaucetError;
 use faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL;
 use gcp_bigquery_client::Client;
@@ -23,23 +23,64 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// Max wall-clock spent polling an idempotent-write / token-read job to
-/// completion before giving up. Exactly-once pages are small, so this is a
-/// generous safety cap, not a steady-state wait.
-const IDEMPOTENT_JOB_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// Server-side long-poll window per `getQueryResults` completion check —
 /// BigQuery holds the connection open up to this long, so we don't busy-wait.
 const JOB_POLL_LONG_POLL_MS: i32 = 10_000;
 
-/// OAuth scope minted for the `media_load` upload endpoint (which is not covered
-/// by the `gcp_bigquery_client` client's own authenticator surface).
-const BQ_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
+/// Attempts (including the first) for a transaction BigQuery aborted for a
+/// concurrent update (SQL-95).
+const TXN_CONFLICT_ATTEMPTS: u32 = 6;
 
-/// Max wall-clock spent polling a media-upload **load** job to completion.
-/// A bucket-free page load is a single job; this is a generous safety cap so a
-/// wedged job can't hang the run forever.
-const LOAD_JOB_TIMEOUT: Duration = Duration::from_secs(600);
+/// Whether a failed job is a transaction BigQuery aborted because another
+/// transaction or DML statement changed the same table. BigQuery reports this
+/// only through the message (its `reason` is the generic `invalidQuery`).
+fn is_concurrent_txn_abort(err: &gcp_bigquery_client::model::error_proto::ErrorProto) -> bool {
+    let msg = err.message.as_deref().unwrap_or("").to_ascii_lowercase();
+    msg.contains("aborted due to concurrent update")
+        || msg.contains("could not serialize access to table")
+}
+
+/// Up to half of `delay`, so concurrent writers that collided do not retry in
+/// lockstep.
+fn txn_jitter(delay: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let half = (delay.as_millis() as u64 / 2).max(1);
+    Duration::from_millis(u64::from(nanos) % half)
+}
+
+/// Whether a job polled since `started` has outlived `limit` (`0` = never).
+pub(crate) fn job_timed_out(limit: Duration, started: std::time::Instant) -> bool {
+    !limit.is_zero() && started.elapsed() >= limit
+}
+
+/// Best-effort `jobs.cancel` for a job that outlived `job_timeout`, returning
+/// the error the write fails with (SQL-96).
+pub(crate) async fn cancel_timed_out_job(
+    client: &Client,
+    config: &BigQuerySinkConfig,
+    kind: &str,
+    job_id: &str,
+    location: Option<&str>,
+) -> FaucetError {
+    let secs = config.job_timeout.as_secs();
+    let cancelled = match client
+        .job()
+        .cancel_job(&config.project_id, job_id, location)
+        .await
+    {
+        Ok(_) => "cancelled".to_string(),
+        Err(e) => {
+            tracing::warn!(job_id, error = %e, "BigQuery jobs.cancel failed after job_timeout");
+            format!("cancel failed: {e}")
+        }
+    };
+    FaucetError::Sink(format!(
+        "BigQuery {kind} job '{job_id}' did not complete within job_timeout ({secs}s); \
+         {cancelled}. Raise `job_timeout` (0 = no limit) for long-running jobs"
+    ))
+}
 
 /// `true` when a `tables.get` error is a 404 (table does not exist) — used by
 /// `current_schema` to report a not-yet-created target as `Ok(None)` rather
@@ -181,9 +222,8 @@ fn records_to_ndjson(records: &[Value]) -> Result<String, FaucetError> {
 }
 
 /// Build the BigQuery load-job resource JSON for a `NEWLINE_DELIMITED_JSON`
-/// media upload into `project.dataset.table`. `ignoreUnknownValues` mirrors the
-/// typed `INSERT … SELECT` path (which projects only the target columns), so a
-/// page carrying an extra field never fails the load.
+/// media upload into `project.dataset.table`. `ignoreUnknownValues` is off, so a
+/// field the table has no column for fails the load instead of being dropped.
 fn build_load_job_json(
     project: &str,
     dataset: &str,
@@ -213,8 +253,7 @@ fn build_load_job_json(
 /// row that doesn't match that inferred type fails the whole load ("JSON table
 /// encountered too many errors"). An explicit all-`STRING` schema matches the
 /// `Value` write path exactly (CSV fields are all strings) and never mis-types.
-/// `autodetect` is the fallback only when no schema can be derived. Keeps
-/// `ignoreUnknownValues` so an extra column never fails a load.
+/// `autodetect` is the fallback only when no schema can be derived.
 #[allow(clippy::too_many_arguments)]
 fn build_load_job_json_fmt(
     project: &str,
@@ -259,9 +298,9 @@ fn build_load_job_json_full(
         },
         "sourceFormat": source_format,
         "writeDisposition": write_disposition,
-        // A truncating load must not silently drop fields the schema lacks
-        // (SQL-35): they would be gone from the refreshed table.
-        "ignoreUnknownValues": write_disposition != "WRITE_TRUNCATE",
+        // A field the table has no column for fails the load rather than
+        // vanishing (SQL-35 for truncate, SQL-94 for append).
+        "ignoreUnknownValues": false,
     });
     match schema {
         // Explicit schema wins; autodetect must be off or BigQuery ignores the schema.
@@ -324,6 +363,30 @@ fn all_string_schema<I: IntoIterator<Item = String>>(columns: I) -> Option<Value
     } else {
         Some(serde_json::json!({ "fields": fields }))
     }
+}
+
+/// `schema`'s fields re-ordered to a CSV header's `columns` (a CSV load maps
+/// columns by position): a header column the schema lacks becomes a nullable
+/// `STRING`, so the load fails on it rather than shifting every later column.
+fn schema_in_column_order(schema: &Value, columns: &[String]) -> Value {
+    let fields = schema
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ordered: Vec<Value> = columns
+        .iter()
+        .map(|c| {
+            fields
+                .iter()
+                .find(|f| f.get("name").and_then(Value::as_str) == Some(c.as_str()))
+                .cloned()
+                .unwrap_or_else(
+                    || serde_json::json!({"name": c, "type": "STRING", "mode": "NULLABLE"}),
+                )
+        })
+        .collect();
+    serde_json::json!({ "fields": ordered })
 }
 
 /// Convert an `infer_schema`-shaped JSON Schema (`{"type":"object","properties":
@@ -489,6 +552,26 @@ const RESUMABLE_CHUNK: usize = 8 * 1024 * 1024;
 /// Resumable-upload chunk alignment: every non-final `Content-Range` upper bound
 /// must be a multiple of 256 KiB.
 const RESUMABLE_ALIGN: usize = 256 * 1024;
+/// Consecutive 308s without progress tolerated before a chunk PUT gives up.
+const RESUMABLE_MAX_STALLS: u32 = 3;
+
+/// Bytes a resumable session has persisted, from a 308's `Range` header
+/// (`bytes=0-N` → `N + 1`); an absent header means none (SQL-180).
+fn persisted_bytes(range: Option<&str>) -> Result<u64, FaucetError> {
+    let Some(range) = range else {
+        return Ok(0);
+    };
+    range
+        .trim()
+        .strip_prefix("bytes=0-")
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .map(|last| last + 1)
+        .ok_or_else(|| {
+            FaucetError::Sink(format!(
+                "resumable upload: unreadable Range header `{range}` on 308"
+            ))
+        })
+}
 
 /// An in-flight BigQuery **resumable upload** session for a single load job fed
 /// incrementally across many source pages (so peak memory is O(chunk + one
@@ -553,16 +636,7 @@ impl UploadSession {
                 .get_mut()
                 .drain(..n)
                 .collect();
-            let end = self.offset + chunk.len() as u64 - 1;
-            let range = format!("bytes {}-{}/*", self.offset, end);
-            let resp = self
-                .http
-                .put(&self.session_uri)
-                .header(reqwest::header::CONTENT_RANGE, range)
-                .body(chunk.clone())
-                .send()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("resumable chunk PUT failed: {e}")))?;
+            let resp = self.put_range(self.offset, &chunk, None).await?;
             if resp.status().as_u16() != 308 {
                 let s = resp.status();
                 let t = resp.text().await.unwrap_or_default();
@@ -573,6 +647,67 @@ impl UploadSession {
             self.offset += chunk.len() as u64;
         }
         Ok(())
+    }
+
+    /// PUT `data` (which starts at stream offset `start`) to the session. A 308
+    /// whose `Range` header reports fewer bytes than were sent is resumed from
+    /// the persisted offset (SQL-180) until the server holds all of `data`.
+    /// Returns the last response; `total` is the stream length on the final PUT.
+    async fn put_range(
+        &self,
+        start: u64,
+        data: &[u8],
+        total: Option<u64>,
+    ) -> Result<reqwest::Response, FaucetError> {
+        let end = start + data.len() as u64;
+        let mut pos = start;
+        let mut stalls = 0;
+        loop {
+            let body = data[(pos - start) as usize..].to_vec();
+            let size = total.map_or_else(|| "*".to_string(), |t| t.to_string());
+            let range = if body.is_empty() {
+                format!("bytes */{size}")
+            } else {
+                format!("bytes {pos}-{}/{size}", end - 1)
+            };
+            let resp = self
+                .http
+                .put(&self.session_uri)
+                .header(reqwest::header::CONTENT_RANGE, range)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("resumable chunk PUT failed: {e}")))?;
+            if resp.status().as_u16() != 308 {
+                return Ok(resp);
+            }
+            let persisted = persisted_bytes(
+                resp.headers()
+                    .get(reqwest::header::RANGE)
+                    .and_then(|v| v.to_str().ok()),
+            )?;
+            if persisted >= end {
+                return Ok(resp);
+            }
+            if persisted < start {
+                return Err(FaucetError::Sink(format!(
+                    "resumable upload: server reports {persisted} bytes persisted, below the \
+                     {start} it had already confirmed"
+                )));
+            }
+            if persisted <= pos {
+                stalls += 1;
+                if stalls > RESUMABLE_MAX_STALLS {
+                    return Err(FaucetError::Sink(format!(
+                        "resumable upload made no progress past byte {pos} after \
+                         {RESUMABLE_MAX_STALLS} retries"
+                    )));
+                }
+            } else {
+                stalls = 0;
+            }
+            pos = persisted;
+        }
     }
 
     /// Finish the gzip stream, returning the final bytes (remaining buffered
@@ -635,6 +770,26 @@ pub struct BigQuerySink {
     roundtrips: faucet_core::observability::RecorderSlot,
 }
 
+/// Connect timeout of the upload clients.
+pub(crate) const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Idle-read timeout of the upload clients: a response that sends nothing for
+/// this long fails instead of hanging on a half-open connection.
+pub(crate) const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A `reqwest` builder with the upload clients' timeouts.
+pub(crate) fn upload_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+}
+
+/// The client media and multipart load uploads use.
+pub(crate) fn upload_client() -> Result<reqwest::Client, FaucetError> {
+    upload_builder()
+        .build()
+        .map_err(|e| FaucetError::Sink(format!("BigQuery: cannot build upload client: {e}")))
+}
+
 impl BigQuerySink {
     /// Create a new BigQuery sink from the given configuration.
     ///
@@ -643,6 +798,10 @@ impl BigQuerySink {
     pub async fn new(config: BigQuerySinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         config.write.validate()?;
+        #[cfg(feature = "arrow")]
+        if let Some(load) = &config.bulk_load {
+            load.validate()?;
+        }
         if config.media_load && config.insert_id_field.is_some() {
             tracing::warn!(
                 insert_id_field = config.insert_id_field.as_deref(),
@@ -814,11 +973,12 @@ impl BigQuerySink {
     /// schemaless table); a missing table surfaces as the client's `BQError`.
     async fn fetch_schema_fields(&self) -> Result<Vec<idempotent::FieldSpec>, BQError> {
         let table = retry_control_plane("tables.get (schema)", || {
-            self.client.table().get(
+            faucet_common_bigquery::raw::tolerant_get_table(
+                &self.client,
+                self.raw_target(),
                 &self.config.project_id,
                 &self.config.dataset_id,
                 &self.config.table_id,
-                None,
             )
         })
         .await?;
@@ -846,11 +1006,12 @@ impl BigQuerySink {
         infer: impl FnOnce() -> Option<Value>,
     ) -> Result<Option<Value>, FaucetError> {
         let existing = retry_control_plane("tables.get (truncate schema)", || {
-            self.client.table().get(
+            faucet_common_bigquery::raw::tolerant_get_table(
+                &self.client,
+                self.raw_target(),
                 &self.config.project_id,
                 &self.config.dataset_id,
                 table_id,
-                None,
             )
         })
         .await;
@@ -861,6 +1022,35 @@ impl BigQuerySink {
                 "BigQuery tables.get (truncate schema) failed: {e}"
             ))),
         }
+    }
+
+    /// The load schema for a native byte load (SQL-126, SQL-134): the sink's
+    /// explicit `schema`, else the existing table's own schema (so a typed
+    /// table is neither retyped to `STRING` nor refused for a mismatched
+    /// schema), else `infer` (the payload's columns, all `STRING`).
+    async fn native_load_schema(
+        &self,
+        table_id: &str,
+        infer: impl FnOnce() -> Option<Value>,
+    ) -> Result<Option<Value>, FaucetError> {
+        if let Some(explicit) = self
+            .config
+            .schema
+            .as_ref()
+            .and_then(json_schema_to_load_schema)
+        {
+            return Ok(Some(explicit));
+        }
+        self.truncate_schema(table_id, infer).await
+    }
+
+    /// `CREATE_NEVER` on a load job when `create_table` is off, so a load
+    /// never creates the table the config says must already exist (SQL-126).
+    fn apply_create_disposition(&self, mut job: Value) -> Value {
+        if !self.config.create_table {
+            job["configuration"]["load"]["createDisposition"] = Value::from("CREATE_NEVER");
+        }
+        job
     }
 
     /// Fetch (once) and cache the target table's schema as
@@ -1001,6 +1191,7 @@ impl BigQuerySink {
             return Ok(records.len());
         }
         let columns = self.target_schema().await?;
+        self.reject_unknown_fields(&columns, records)?;
         let payload = serde_json::to_string(records).map_err(|e| {
             FaucetError::Sink(format!("BigQuery overwrite: serialize page payload: {e}"))
         })?;
@@ -1033,53 +1224,7 @@ impl BigQuerySink {
     /// `gcp_bigquery_client::Client` handles auth for every other call itself.
     /// The token value is never logged.
     async fn access_token(&self) -> Result<String, FaucetError> {
-        use gcp_bigquery_client::yup_oauth2::{
-            self, ApplicationDefaultCredentialsAuthenticator,
-            ApplicationDefaultCredentialsFlowOpts, ServiceAccountAuthenticator,
-            authenticator::ApplicationDefaultCredentialsTypes,
-        };
-
-        let scopes = [BQ_OAUTH_SCOPE];
-        let token = match &self.config.auth {
-            BigQueryCredentials::ServiceAccountKey { json } => {
-                let key = yup_oauth2::parse_service_account_key(json)
-                    .map_err(|e| FaucetError::Auth(format!("invalid service account JSON: {e}")))?;
-                let auth = ServiceAccountAuthenticator::builder(key)
-                    .build()
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery auth failed: {e}")))?;
-                auth.token(&scopes)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
-            }
-            BigQueryCredentials::ServiceAccountKeyPath { path } => {
-                let key = yup_oauth2::read_service_account_key(path)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("read service account key: {e}")))?;
-                let auth = ServiceAccountAuthenticator::builder(key)
-                    .build()
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery auth failed: {e}")))?;
-                auth.token(&scopes)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
-            }
-            BigQueryCredentials::ApplicationDefault => {
-                let opts = ApplicationDefaultCredentialsFlowOpts::default();
-                let auth = match ApplicationDefaultCredentialsAuthenticator::builder(opts).await {
-                    ApplicationDefaultCredentialsTypes::ServiceAccount(b) => b.build().await,
-                    ApplicationDefaultCredentialsTypes::InstanceMetadata(b) => b.build().await,
-                }
-                .map_err(|e| FaucetError::Auth(format!("BigQuery ADC auth failed: {e}")))?;
-                auth.token(&scopes)
-                    .await
-                    .map_err(|e| FaucetError::Auth(format!("BigQuery token mint failed: {e}")))?
-            }
-        };
-        token
-            .token()
-            .map(str::to_string)
-            .ok_or_else(|| FaucetError::Auth("BigQuery access token had no value".to_string()))
+        faucet_common_bigquery::access_token(&self.config.auth).await
     }
 
     /// Load one page into `table_id` via a bucket-free BigQuery **load job**:
@@ -1097,14 +1242,15 @@ impl BigQuerySink {
             return Ok(());
         }
         let ndjson = records_to_ndjson(records)?;
-        let job_json = build_load_job_json(
-            &self.config.project_id,
-            &self.config.dataset_id,
-            table_id,
-            write_disposition,
-            self.config.location.as_deref(),
-        )
-        .to_string();
+        let job_json = self
+            .apply_create_disposition(build_load_job_json(
+                &self.config.project_id,
+                &self.config.dataset_id,
+                table_id,
+                write_disposition,
+                self.config.location.as_deref(),
+            ))
+            .to_string();
         let media = gzip(ndjson.as_bytes())?;
         self.load_media(&job_json, &media).await.map(|_| ())
     }
@@ -1127,7 +1273,7 @@ impl BigQuerySink {
             self.upload_base(),
             self.config.project_id
         );
-        let client = reqwest::Client::new();
+        let client = upload_client()?;
         let resp = client
             .post(&url)
             .bearer_auth(&token)
@@ -1176,12 +1322,15 @@ impl BigQuerySink {
         let started = std::time::Instant::now();
         loop {
             self.roundtrips.record("job");
-            let job = self
-                .client
-                .job()
-                .get_job(&self.config.project_id, job_id, location)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))?;
+            let job = faucet_common_bigquery::raw::tolerant_get_job(
+                &self.client,
+                self.raw_target(),
+                &self.config.project_id,
+                job_id,
+                location,
+            )
+            .await
+            .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))?;
             let (state, error_result) = {
                 let status = job.status.as_ref().ok_or_else(|| {
                     FaucetError::Sink(format!(
@@ -1201,14 +1350,62 @@ impl BigQuerySink {
                 }
                 return Ok(load_output_rows(&job));
             }
-            if started.elapsed() >= LOAD_JOB_TIMEOUT {
-                return Err(FaucetError::Sink(format!(
-                    "BigQuery load job '{job_id}' did not complete within {}s",
-                    LOAD_JOB_TIMEOUT.as_secs()
-                )));
+            if self.job_timed_out(started) {
+                return Err(self.cancel_timed_out_job("load", job_id, location).await);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Fail a typed `INSERT … SELECT` / `MERGE` page carrying fields the table
+    /// has no column for: the statement projects only the table's columns, so
+    /// they would be dropped without a trace (SQL-94).
+    fn reject_unknown_fields(
+        &self,
+        columns: &[idempotent::FieldSpec],
+        records: &[Value],
+    ) -> Result<(), FaucetError> {
+        let unknown = idempotent::unknown_fields(columns, records);
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        Err(FaucetError::Sink(format!(
+            "BigQuery: field(s) {} are not columns of {}.{}.{} and would be dropped. Add \
+             them to the table (`schema: {{on_drift: evolve}}`), or drop them explicitly \
+             (`schema: {{on_drift: ignore}}` or a `drop` transform)",
+            unknown
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.config.project_id,
+            self.config.dataset_id,
+            self.config.table_id
+        )))
+    }
+
+    /// Where schema-tolerant fallback requests go (SQL-172).
+    fn raw_target(&self) -> faucet_common_bigquery::raw::RawTarget<'_> {
+        faucet_common_bigquery::raw::RawTarget {
+            creds: &self.config.auth,
+            host: Some(self.upload_base()),
+        }
+    }
+
+    /// Whether a job started at `started` has outlived `job_timeout` (SQL-96).
+    fn job_timed_out(&self, started: std::time::Instant) -> bool {
+        job_timed_out(self.config.job_timeout, started)
+    }
+
+    /// Cancel a job that outlived `job_timeout` and build the run's error, so
+    /// the job cannot commit after the write was reported failed (SQL-96).
+    async fn cancel_timed_out_job(
+        &self,
+        kind: &str,
+        job_id: &str,
+        location: Option<&str>,
+    ) -> FaucetError {
+        cancel_timed_out_job(&self.client, &self.config, kind, job_id, location).await
     }
 
     /// Base URL for the media/resumable **upload** endpoint. Fixed Google host in
@@ -1231,18 +1428,19 @@ impl BigQuerySink {
         write_disposition: &str,
         schema: Option<Value>,
     ) -> Result<UploadSession, FaucetError> {
-        let job_json = build_load_job_json_full(
-            &self.config.project_id,
-            &self.config.dataset_id,
-            table_id,
-            write_disposition,
-            self.config.location.as_deref(),
-            "NEWLINE_DELIMITED_JSON",
-            None,
-            schema,
-            false,
-        )
-        .to_string();
+        let job_json = self
+            .apply_create_disposition(build_load_job_json_full(
+                &self.config.project_id,
+                &self.config.dataset_id,
+                table_id,
+                write_disposition,
+                self.config.location.as_deref(),
+                "NEWLINE_DELIMITED_JSON",
+                None,
+                schema,
+                false,
+            ))
+            .to_string();
         let token = self.access_token().await?;
         let url = format!(
             "{}/upload/bigquery/v2/projects/{}/jobs?uploadType=resumable",
@@ -1250,7 +1448,7 @@ impl BigQuerySink {
             self.config.project_id
         );
         // Redirects disabled: a 308 "Resume Incomplete" must not be auto-followed.
-        let http = reqwest::Client::builder()
+        let http = upload_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| FaucetError::Sink(format!("resumable HTTP client: {e}")))?;
@@ -1398,17 +1596,8 @@ impl BigQuerySink {
             }
             let remaining = sess.finish()?;
             let total = sess.offset + remaining.len() as u64;
-            let range = if remaining.is_empty() {
-                format!("bytes */{total}")
-            } else {
-                format!("bytes {}-{}/{}", sess.offset, total - 1, total)
-            };
             let resp = sess
-                .http
-                .put(&sess.session_uri)
-                .header(reqwest::header::CONTENT_RANGE, range)
-                .body(remaining)
-                .send()
+                .put_range(sess.offset, &remaining, Some(total))
                 .await
                 .map_err(|e| FaucetError::Sink(format!("resumable finalize PUT failed: {e}")))?;
             let status = resp.status();
@@ -1549,11 +1738,12 @@ impl BigQuerySink {
         // `Table` type has a non-optional `schema`, so a narrower field mask would
         // yield a response it can't deserialize.
         match retry_control_plane("tables.get (exists)", || {
-            self.client.table().get(
+            faucet_common_bigquery::raw::tolerant_get_table(
+                &self.client,
+                self.raw_target(),
                 &self.config.project_id,
                 &self.config.dataset_id,
                 table_id,
-                None,
             )
         })
         .await
@@ -1602,6 +1792,14 @@ impl BigQuerySink {
             ))
         })?;
         self.ensure_dataset().await?;
+        // Replace only a table verified to exist without a schema; a missing
+        // one is created IF NOT EXISTS, so a concurrent first writer's rows
+        // are never dropped by a second writer's late CREATE OR REPLACE.
+        let ddl = if self.table_exists(&self.config.table_id).await? {
+            ddl
+        } else {
+            idempotent::create_if_missing(&ddl)
+        };
         self.run_ddl(ddl).await?;
         *self.schema_cache.write().await = None;
         Ok(())
@@ -1665,7 +1863,18 @@ impl BigQuerySink {
     /// authoritative terminal-failure signal; the `errors` array can also carry
     /// non-fatal warnings, so it must not be treated as failure on its own.
     async fn await_query_job(&self, initial: QueryResponse) -> Result<Job, FaucetError> {
-        let (job_id, location) = Self::job_reference(&initial)?;
+        self.await_query_job_classified(initial)
+            .await
+            .map_err(|(e, _)| e)
+    }
+
+    /// [`await_query_job`](Self::await_query_job) that also says whether a
+    /// failed job was a transaction BigQuery aborted for a concurrent update.
+    async fn await_query_job_classified(
+        &self,
+        initial: QueryResponse,
+    ) -> Result<Job, (FaucetError, bool)> {
+        let (job_id, location) = Self::job_reference(&initial).map_err(|e| (e, false))?;
 
         // Phase 1 — wait for completion via server-side long-poll (not a busy wait).
         if !initial.job_complete.unwrap_or(false) {
@@ -1683,16 +1892,20 @@ impl BigQuerySink {
                     .get_query_results(&self.config.project_id, &job_id, params)
                     .await
                     .map_err(|e| {
-                        FaucetError::Sink(format!("BigQuery jobs.getQueryResults failed: {e}"))
+                        (
+                            FaucetError::Sink(format!("BigQuery jobs.getQueryResults failed: {e}")),
+                            false,
+                        )
                     })?;
                 if resp.job_complete.unwrap_or(false) {
                     break;
                 }
-                if started.elapsed() >= IDEMPOTENT_JOB_TIMEOUT {
-                    return Err(FaucetError::Sink(format!(
-                        "BigQuery job '{job_id}' did not complete within {}s",
-                        IDEMPOTENT_JOB_TIMEOUT.as_secs()
-                    )));
+                if self.job_timed_out(started) {
+                    return Err((
+                        self.cancel_timed_out_job("query", &job_id, location.as_deref())
+                            .await,
+                        false,
+                    ));
                 }
                 // The server long-poll normally blocks until completion, but if
                 // it returns early, back off so a still-running job can't turn
@@ -1709,12 +1922,20 @@ impl BigQuerySink {
         // (returning `Ok` here would advance the bookmark over data that may
         // never have landed, the silent-data-loss failure mode).
         self.roundtrips.record("job");
-        let job = self
-            .client
-            .job()
-            .get_job(&self.config.project_id, &job_id, location.as_deref())
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")))?;
+        let job = faucet_common_bigquery::raw::tolerant_get_job(
+            &self.client,
+            self.raw_target(),
+            &self.config.project_id,
+            &job_id,
+            location.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            (
+                FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")),
+                false,
+            )
+        })?;
         if let Some(b) = job
             .statistics
             .as_ref()
@@ -1728,26 +1949,63 @@ impl BigQuerySink {
         // itself can be handed back to the caller.
         let (state, error_result) = {
             let status = job.status.as_ref().ok_or_else(|| {
-                FaucetError::Sink(format!(
-                    "BigQuery job '{job_id}' returned no status; cannot confirm durable commit"
-                ))
+                (
+                    FaucetError::Sink(format!(
+                        "BigQuery job '{job_id}' returned no status; cannot confirm durable commit"
+                    )),
+                    false,
+                )
             })?;
-            (
-                status.state.clone(),
-                status.error_result.as_ref().map(|e| e.to_string()),
-            )
+            (status.state.clone(), status.error_result.clone())
         };
         if let Some(err) = error_result {
-            return Err(FaucetError::Sink(format!(
-                "BigQuery query job '{job_id}' failed: {err}"
-            )));
+            return Err((
+                FaucetError::Sink(format!("BigQuery query job '{job_id}' failed: {err}")),
+                is_concurrent_txn_abort(&err),
+            ));
         }
         match state.as_deref() {
             Some("DONE") => Ok(job),
-            other => Err(FaucetError::Sink(format!(
-                "BigQuery job '{job_id}' is in state {other:?}, not DONE; cannot confirm durable commit"
-            ))),
+            other => Err((
+                FaucetError::Sink(format!(
+                    "BigQuery job '{job_id}' is in state {other:?}, not DONE; cannot confirm durable commit"
+                )),
+                false,
+            )),
         }
+    }
+
+    /// Submit a transactional query and wait for it, re-submitting it when
+    /// BigQuery aborts the transaction for a concurrent update on the same
+    /// table (SQL-95): an aborted transaction committed nothing, so running it
+    /// again is safe. A retry gets a fresh `requestId`, or BigQuery would hand
+    /// back the aborted job.
+    async fn run_transaction(&self, mut req: QueryRequest, what: &str) -> Result<Job, FaucetError> {
+        let base_id = req.request_id.clone();
+        let mut delay = Duration::from_millis(200);
+        for attempt in 1..=TXN_CONFLICT_ATTEMPTS {
+            self.roundtrips.record("query");
+            let resp = self
+                .client
+                .job()
+                .query(&self.config.project_id, req.clone())
+                .await
+                .map_err(|e| FaucetError::Sink(format!("{what} failed: {e}")))?;
+            match self.await_query_job_classified(resp).await {
+                Ok(job) => return Ok(job),
+                Err((e, true)) if attempt < TXN_CONFLICT_ATTEMPTS => {
+                    tracing::warn!(
+                        what, attempt, error = %e,
+                        "BigQuery aborted the transaction for a concurrent update; retrying"
+                    );
+                    tokio::time::sleep(delay + txn_jitter(delay)).await;
+                    delay = (delay * 2).min(Duration::from_secs(10));
+                    req.request_id = base_id.as_ref().map(|id| format!("{id}-r{attempt}"));
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        unreachable!("the final attempt returns")
     }
 
     /// Extract `(job_id, location)` from a query response's job reference.
@@ -1776,6 +2034,7 @@ impl BigQuerySink {
     ) -> Result<usize, FaucetError> {
         let columns = self.target_schema().await?;
         merge::validate_keys_present(&columns, &self.config.write.key)?;
+        self.reject_unknown_fields(&columns, &plan.upserts)?;
 
         let has_upserts = !plan.upserts.is_empty();
         let has_deletes = !plan.deletes.is_empty();
@@ -1841,15 +2100,7 @@ impl BigQuerySink {
         }
         req.query_parameters = Some(params);
 
-        self.roundtrips.record("query");
-
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("bigquery upsert write failed: {e}")))?;
-        self.await_query_complete(resp).await?;
+        self.run_transaction(req, "bigquery upsert write").await?;
 
         Ok(plan.upserts.len() + plan.deletes.len())
     }
@@ -1902,15 +2153,7 @@ impl BigQuerySink {
             Self::string_param("keys", &keys_payload),
         ]);
 
-        self.roundtrips.record("query");
-
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("bigquery cleanup delete failed: {e}")))?;
-        let job = self.await_query_job(resp).await?;
+        let job = self.run_transaction(req, "bigquery cleanup delete").await?;
         let deleted = dml_affected_rows(&job);
 
         tracing::info!(
@@ -1995,6 +2238,11 @@ impl faucet_core::Sink for BigQuerySink {
 
         let probe = match result {
             Ok(Ok(_table)) => Probe::pass("auth", started.elapsed()),
+            // A 404 proves the credentials work; the table is created on the
+            // first write.
+            Ok(Err(e)) if self.config.create_table && is_table_not_found(&e) => {
+                Probe::pass("auth", started.elapsed())
+            }
             Ok(Err(e)) => Probe::fail_hint(
                 "auth",
                 started.elapsed(),
@@ -2264,17 +2512,14 @@ impl faucet_core::Sink for BigQuerySink {
                     }
                     // The explicit all-STRING schema (from the first chunk) opens the
                     // session; later chunks pass `None` (session already open).
-                    let schema = if !first {
-                        None
-                    } else if write_disposition == "WRITE_TRUNCATE" {
-                        self.truncate_schema(&table, || {
+                    let schema = if first {
+                        self.native_load_schema(&table, || {
                             native_batch_columns(&chunk, faucet_core::NativeFormat::NdJson, b',')
                                 .and_then(all_string_schema)
                         })
                         .await?
                     } else {
-                        native_batch_columns(&chunk, faucet_core::NativeFormat::NdJson, b',')
-                            .and_then(all_string_schema)
+                        None
                     };
                     rows += chunk.iter().filter(|&&b| b == b'\n').count();
                     self.feed_session_bytes(&table, write_disposition, schema, &chunk)
@@ -2300,11 +2545,7 @@ impl faucet_core::Sink for BigQuerySink {
                     native_batch_columns(&raw, faucet_core::NativeFormat::NdJson, b',')
                         .and_then(all_string_schema)
                 };
-                let schema = if write_disposition == "WRITE_TRUNCATE" {
-                    self.truncate_schema(&table, inferred).await?
-                } else {
-                    inferred()
-                };
+                let schema = self.native_load_schema(&table, inferred).await?;
                 self.feed_session_bytes(&table, write_disposition, schema, &raw)
                     .await?;
                 Ok(rows)
@@ -2317,29 +2558,29 @@ impl faucet_core::Sink for BigQuerySink {
                 }
                 let rows = batch.records.unwrap_or(0) as usize;
                 let skip_rows = if csv.has_header { Some(1) } else { None };
-                let inferred = || {
-                    native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter)
-                        .and_then(all_string_schema)
-                };
-                let schema = if write_disposition == "WRITE_TRUNCATE" {
-                    self.truncate_schema(&table, inferred).await?
-                } else {
-                    inferred()
+                let header =
+                    native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter);
+                let inferred = || header.clone().and_then(all_string_schema);
+                let schema = self.native_load_schema(&table, inferred).await?;
+                let schema = match (schema, csv.has_header, &header) {
+                    (Some(s), true, Some(cols)) => Some(schema_in_column_order(&s, cols)),
+                    (s, _, _) => s,
                 };
                 let autodetect_fallback = schema.is_none();
                 let media = gzip(&raw)?;
-                let job_json = build_load_job_json_full(
-                    &self.config.project_id,
-                    &self.config.dataset_id,
-                    &table,
-                    write_disposition,
-                    self.config.location.as_deref(),
-                    "CSV",
-                    skip_rows,
-                    schema,
-                    autodetect_fallback,
-                )
-                .to_string();
+                let job_json = self
+                    .apply_create_disposition(build_load_job_json_full(
+                        &self.config.project_id,
+                        &self.config.dataset_id,
+                        &table,
+                        write_disposition,
+                        self.config.location.as_deref(),
+                        "CSV",
+                        skip_rows,
+                        schema,
+                        autodetect_fallback,
+                    ))
+                    .to_string();
                 self.load_media(&job_json, &media).await?;
                 Ok(rows)
             }
@@ -2444,7 +2685,7 @@ impl faucet_core::Sink for BigQuerySink {
                 idempotent::build_scoped_overwrite_commit_sql(
                     &self.table_ref(),
                     &temp,
-                    &scope.render_where_literal(&col),
+                    &scope.render_where_with(&col, idempotent::sql_literal),
                 )
             }
             None => idempotent::build_overwrite_commit_sql(&self.table_ref(), &temp),
@@ -2585,6 +2826,7 @@ impl faucet_core::Sink for BigQuerySink {
         }
 
         let columns = self.target_schema().await?;
+        self.reject_unknown_fields(&columns, records)?;
 
         let payload = serde_json::to_string(records).map_err(|e| {
             FaucetError::Sink(format!(
@@ -2608,15 +2850,8 @@ impl faucet_core::Sink for BigQuerySink {
             Self::string_param("token", token),
         ]);
 
-        self.roundtrips.record("query");
-
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery idempotent write failed: {e}")))?;
-        self.await_query_complete(resp).await?;
+        self.run_transaction(req, "BigQuery idempotent write")
+            .await?;
 
         tracing::info!(
             table = %format!(
@@ -2785,13 +3020,86 @@ impl faucet_core::Sink for BigQuerySink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_update_aborts_are_recognised_and_jitter_is_bounded() {
+        use gcp_bigquery_client::model::error_proto::ErrorProto;
+        let e = |m: &str| ErrorProto {
+            message: Some(m.into()),
+            ..Default::default()
+        };
+        assert!(super::is_concurrent_txn_abort(&e(
+            "Transaction is aborted due to concurrent update against table p:d.t"
+        )));
+        assert!(super::is_concurrent_txn_abort(&e(
+            "Could not serialize access to table p:d.t due to concurrent update"
+        )));
+        assert!(!super::is_concurrent_txn_abort(&e("Bad cast")));
+        assert!(!super::is_concurrent_txn_abort(&ErrorProto::default()));
+        let d = std::time::Duration::from_millis(200);
+        assert!(super::txn_jitter(d) < std::time::Duration::from_millis(100));
+        assert_eq!(
+            super::txn_jitter(std::time::Duration::ZERO),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn csv_schema_follows_the_header_order() {
+        let schema = json!({"fields": [
+            {"name": "b", "type": "INTEGER", "mode": "REQUIRED"},
+            {"name": "a", "type": "DATE", "mode": "NULLABLE"}
+        ]});
+        let ordered = super::schema_in_column_order(&schema, &["a".into(), "b".into(), "c".into()]);
+        let f = ordered["fields"].as_array().unwrap();
+        assert_eq!(f[0]["name"], "a");
+        assert_eq!(f[0]["type"], "DATE");
+        assert_eq!(f[1]["type"], "INTEGER");
+        assert_eq!(
+            f[2],
+            json!({"name": "c", "type": "STRING", "mode": "NULLABLE"})
+        );
+    }
+
+    #[test]
+    fn job_timeout_zero_never_expires() {
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        assert!(!super::job_timed_out(std::time::Duration::ZERO, long_ago));
+        assert!(super::job_timed_out(
+            std::time::Duration::from_secs(1),
+            long_ago
+        ));
+        assert!(!super::job_timed_out(
+            std::time::Duration::from_secs(60),
+            std::time::Instant::now()
+        ));
+    }
+
+    #[test]
+    fn persisted_bytes_reads_the_308_range_header() {
+        assert_eq!(super::persisted_bytes(None).unwrap(), 0);
+        assert_eq!(
+            super::persisted_bytes(Some("bytes=0-262143")).unwrap(),
+            262_144
+        );
+        assert_eq!(super::persisted_bytes(Some(" bytes=0-0 ")).unwrap(), 1);
+        for bad in ["bytes=5-9", "bytes=0-x", "0-9"] {
+            assert!(super::persisted_bytes(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn upload_client_builds() {
+        assert!(super::upload_client().is_ok());
+    }
+
     use super::{
-        BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema, appends_via_media_load,
-        build_load_job_json, build_load_job_json_fmt, build_load_job_json_full,
-        build_multipart_related, deletes_to_payload, dml_affected_rows, existing_load_schema, gzip,
-        is_direct_overwrite, json_schema_to_load_schema, media_boundary, multipart_boundary,
-        native_batch_columns, records_to_ndjson, scope_to_payload,
+        BigQuerySinkConfig, Job, all_string_schema, appends_via_media_load, build_load_job_json,
+        build_load_job_json_fmt, build_load_job_json_full, build_multipart_related,
+        deletes_to_payload, dml_affected_rows, existing_load_schema, gzip, is_direct_overwrite,
+        json_schema_to_load_schema, media_boundary, multipart_boundary, native_batch_columns,
+        records_to_ndjson, scope_to_payload,
     };
+    use faucet_common_bigquery::BigQueryCredentials;
     use faucet_core::{FaucetError, KeyTuple};
     use serde_json::json;
 
@@ -2927,7 +3235,10 @@ mod tests {
         let load = &job["configuration"]["load"];
         assert_eq!(load["sourceFormat"], "NEWLINE_DELIMITED_JSON");
         assert_eq!(load["writeDisposition"], "WRITE_APPEND");
-        assert_eq!(load["ignoreUnknownValues"], true);
+        assert_eq!(
+            load["ignoreUnknownValues"], false,
+            "an append must not drop fields the table lacks (SQL-94)"
+        );
         assert_eq!(load["destinationTable"]["projectId"], "proj");
         assert_eq!(load["destinationTable"]["datasetId"], "ds");
         assert_eq!(load["destinationTable"]["tableId"], "tbl");
@@ -2967,7 +3278,10 @@ mod tests {
         );
         let append =
             build_load_job_json_fmt("p", "d", "t", "WRITE_APPEND", None, "CSV", None, true);
-        assert_eq!(append["configuration"]["load"]["ignoreUnknownValues"], true);
+        assert_eq!(
+            append["configuration"]["load"]["ignoreUnknownValues"],
+            false
+        );
     }
 
     #[test]

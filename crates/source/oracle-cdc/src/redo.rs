@@ -543,7 +543,29 @@ pub fn parse_lob_change(sql: &str) -> Result<LobChange, String> {
     })
 }
 
-/// Apply LOB pieces to a column's current value.
+/// Whether `change` rewrites the whole value: contiguous writes from offset 1
+/// and no trim, so the result does not depend on the value it replaced.
+pub fn is_full_rewrite(change: &LobChange) -> bool {
+    if change.trim.is_some() || change.writes.is_empty() {
+        return false;
+    }
+    let mut end = 1u64;
+    for w in &change.writes {
+        if w.offset > end {
+            return false;
+        }
+        let len = match &w.data {
+            Resolved::Bytes(b) => b.len(),
+            Resolved::Text(t) => t.encode_utf16().count(),
+            _ => 0,
+        } as u64;
+        end = end.max(w.offset + len);
+    }
+    true
+}
+
+/// Apply LOB pieces to a column's current value. CLOB offsets and lengths are
+/// UTF-16 code units, as Oracle counts them.
 pub fn apply_lob(current: &Resolved, change: &LobChange) -> Resolved {
     let binary = matches!(current, Resolved::Bytes(_))
         || change
@@ -572,25 +594,25 @@ pub fn apply_lob(current: &Resolved, change: &LobChange) -> Resolved {
         }
         return Resolved::Bytes(bytes);
     }
-    let mut chars: Vec<char> = match current {
-        Resolved::Text(t) => t.chars().collect(),
+    let mut units: Vec<u16> = match current {
+        Resolved::Text(t) => t.encode_utf16().collect(),
         _ => Vec::new(),
     };
     for w in &change.writes {
-        let data: Vec<char> = match &w.data {
-            Resolved::Text(t) => t.chars().collect(),
+        let data: Vec<u16> = match &w.data {
+            Resolved::Text(t) => t.encode_utf16().collect(),
             _ => Vec::new(),
         };
         let at = (w.offset - 1) as usize;
-        if chars.len() < at + data.len() {
-            chars.resize(at + data.len(), ' ');
+        if units.len() < at + data.len() {
+            units.resize(at + data.len(), u16::from(b' '));
         }
-        chars[at..at + data.len()].copy_from_slice(&data);
+        units[at..at + data.len()].copy_from_slice(&data);
     }
     if let Some(n) = change.trim {
-        chars.truncate(n as usize);
+        units.truncate(n as usize);
     }
-    Resolved::Text(chars.into_iter().collect())
+    Resolved::Text(String::from_utf16_lossy(&units))
 }
 
 fn truncate(s: &str) -> String {
@@ -721,6 +743,46 @@ mod tests {
         assert_eq!(apply_lob(&t("xy"), &c), t("xyaa'b"));
         assert_eq!(apply_lob(&Resolved::EmptyLob, &c), t("  aa'b"));
         assert_eq!(apply_lob(&t("0123456789"), &c), t("01aa'b6789"));
+    }
+
+    #[test]
+    fn full_rewrite_and_utf16_offsets() {
+        let piece = |offset, s: &str| LobPiece { offset, data: t(s) };
+        let mk = |writes, trim| LobChange {
+            owner: "A".into(),
+            table: "T".into(),
+            column: "C".into(),
+            conditions: vec![],
+            writes,
+            trim,
+        };
+        assert!(is_full_rewrite(&mk(
+            vec![piece(1, "ab"), piece(3, "c")],
+            None
+        )));
+        assert!(!is_full_rewrite(&mk(
+            vec![piece(1, "ab"), piece(4, "c")],
+            None
+        )));
+        assert!(!is_full_rewrite(&mk(vec![piece(2, "ab")], None)));
+        assert!(!is_full_rewrite(&mk(vec![piece(1, "ab")], Some(1))));
+        assert!(!is_full_rewrite(&mk(vec![], None)));
+        assert!(is_full_rewrite(&mk(
+            vec![
+                LobPiece {
+                    offset: 1,
+                    data: Resolved::Bytes(vec![1, 2])
+                },
+                LobPiece {
+                    offset: 3,
+                    data: Resolved::Null
+                },
+            ],
+            None
+        )));
+        // An emoji is two UTF-16 units, so the write at 4 lands after it.
+        let c = mk(vec![piece(4, "x")], None);
+        assert_eq!(apply_lob(&t("a😀b"), &c), t("a😀x"));
     }
 
     #[test]

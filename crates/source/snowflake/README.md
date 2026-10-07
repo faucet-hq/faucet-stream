@@ -16,7 +16,7 @@ Reach for it when you want to pull tables, aggregates, or ad-hoc query results o
 - **Native streaming** — overrides `Source::stream_pages`: partitions are re-framed into `batch_size`-sized pages on the fly, so peak memory is `O(batch_size)` regardless of total row count.
 - **Async-statement aware** — when the initial `POST` returns `202 Accepted` (the statement is still running), the source polls the statement handle until the result is ready, bounded by `poll_timeout` so a stuck statement fails cleanly instead of hanging forever.
 - **Typed positional bind parameters** — `params` from config plus any `${parent.path}` matrix-context values are sent as Snowflake bind variables, typed from the JSON value (`FIXED` for integers, `REAL` for floats, `BOOLEAN` for bools, `TEXT` otherwise) so a numeric or boolean bind compares correctly against a typed column.
-- **Type-aware row decoding** — `FIXED`, `REAL`, `BOOLEAN`, and `VARIANT`/`OBJECT`/`ARRAY` columns are parsed into native JSON shapes; everything else (timestamps, dates, binary) passes through as strings. **Full precision is preserved for `NUMBER`/`DECIMAL`/`NUMERIC`:** a fractional column (any `NUMBER(p,s)` with scale `s > 0`, including all monetary/decimal columns) is decoded as a **string** carrying the exact decimal text, since a JSON number is an `f64` and would silently lose precision — matching the BigQuery source's `NUMERIC`/`BIGNUMERIC` handling. Scale-0 (`NUMBER(p,0)`) values are JSON integers, except a value beyond `u64` which is likewise kept as a string.
+- **Type-aware row decoding** — `FIXED`, `REAL`, `BOOLEAN`, and `VARIANT`/`OBJECT`/`ARRAY` columns are parsed into native JSON shapes; `DATE` → `YYYY-MM-DD`, `TIME` → `HH:MM:SS[.fff…]`, `TIMESTAMP_NTZ` → ISO 8601 without an offset, `TIMESTAMP_LTZ` → UTC ISO 8601 (`…Z`), `TIMESTAMP_TZ` → ISO 8601 with the value's own `+HH:MM` offset (fractional seconds are kept exactly as Snowflake sent them); everything else (text, binary) passes through as strings. **Full precision is preserved for `NUMBER`/`DECIMAL`/`NUMERIC`:** a fractional column (any `NUMBER(p,s)` with scale `s > 0`, including all monetary/decimal columns) is decoded as a **string** carrying the exact decimal text, since a JSON number is an `f64` and would silently lose precision — matching the BigQuery source's `NUMERIC`/`BIGNUMERIC` handling. Scale-0 (`NUMBER(p,0)`) values are JSON integers, except a value beyond `u64` which is likewise kept as a string.
 - **Shared auth catalog** — OAuth tokens can come from the CLI's top-level `auth:` catalog via `auth: { ref: <name> }`, so many matrix rows hitting one IdP share a single token with single-flight refresh.
 
 ## Installation
@@ -83,7 +83,7 @@ faucet run pipeline.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `statement_timeout` | int (seconds) | `60` | Per-statement server-side timeout, passed as the `timeout` field on the `POST /api/v2/statements` body. Independent of the HTTP-level request timeout. |
+| `statement_timeout` | int (seconds) | `0` | Server-side statement timeout, passed as the `timeout` field on the `POST /api/v2/statements` body. Snowflake **cancels** a statement that runs longer (error `000630`); `0` means Snowflake's maximum. It does not control when the submit goes async — use `poll_timeout` for a client-side cap. |
 | `poll_timeout` | int (seconds) | `300` | Max wall-clock time the source spends polling an asynchronous statement (one whose initial `POST` returned HTTP 202) before failing with `FaucetError::Source`. **`0` disables the cap** (poll forever). |
 
 ### Batching
@@ -98,7 +98,7 @@ faucet run pipeline.yaml
 
 | `type` | `config` | Use when |
 |--------|----------|----------|
-| `oauth` | `{ token: <string> }` | You have an OAuth bearer token from Snowflake or an external IdP. Sent as `Authorization: Snowflake Token="..."` with `X-Snowflake-Authorization-Token-Type: OAUTH`. |
+| `oauth` | `{ token: <string> }` | You have an OAuth bearer token from Snowflake or an external IdP. Sent as `Authorization: Bearer ...` with `X-Snowflake-Authorization-Token-Type: OAUTH`. |
 | `key_pair` | `{ user: <string>, private_key_pem: <pem> }` | You authenticate with an RSA key pair registered on the Snowflake user. A fresh RS256 JWT (1-hour expiry) is minted per request and sent as `Authorization: Bearer <jwt>` with `X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT`. |
 
 ### OAuth bearer token
@@ -207,13 +207,15 @@ source:
       GROUP BY country
     params:
       - "${now.date}"           # resolved per run, e.g. 2026-06-17
-    statement_timeout: 30       # return fast; if not done, poll…
-    poll_timeout: 600           # …for up to 10 minutes before failing
+    statement_timeout: 1800     # Snowflake cancels the query after 30 minutes
+    poll_timeout: 600           # stop polling (and cancel) after 10 minutes
 ```
 
 ## Streaming & batching
 
 The source overrides `Source::stream_pages`. It submits the statement, then walks the result partitions reported by Snowflake (the first partition arrives inline in the `POST` response; subsequent partitions are fetched via `GET /api/v2/statements/{handle}?partition=N`). Decoded rows accumulate in a buffer and are yielded as a `StreamPage` every time the buffer reaches `batch_size`, so peak memory is one page. With `batch_size: 0` the entire result set is buffered and emitted in a single page.
+
+Every request mints its own `Authorization` header, so a key-pair JWT or a rotated OAuth token never goes stale across a long partition download. The HTTP client gzip-decodes partitions and uses a 30 s connect / 300 s idle-read timeout, so a dropped connection fails the read instead of hanging it. A statement abandoned by `poll_timeout` or by a cancelled run is cancelled server-side (`POST /api/v2/statements/{handle}/cancel`, best effort).
 
 This is a one-shot query source — it has no incremental bookmark / resume support, so each run re-executes the query. For incremental loads, encode the watermark in the query (e.g. `WHERE created_at >= ?`) and drive it from a `params` entry, a matrix context, or a `${now.*}` token.
 
@@ -263,7 +265,7 @@ println!("got {} rows", rows.len());
 ## How it works
 
 1. `new()` builds the reusable HTTPS client and derives the API base URL from `account`.
-2. `POST /api/v2/statements` submits the SQL with `statement_timeout` as the body `timeout`, the session `warehouse` / `database` / `schema` / `role`, and any positional bindings (typed from their JSON values). The `Authorization` header is minted per request — a fresh RS256 JWT for key-pair auth, or the OAuth bearer token wrapped as `Snowflake Token="..."`.
+2. `POST /api/v2/statements` submits the SQL with `statement_timeout` as the body `timeout`, the session `warehouse` / `database` / `schema` / `role`, and any positional bindings (typed from their JSON values). The `Authorization` header is minted per request — a fresh RS256 JWT for key-pair auth, or the OAuth token sent as `Bearer ...`.
 3. If the statement is still running, Snowflake returns `202 Accepted` with a handle; the source polls the handle until the result is ready or `poll_timeout` elapses.
 4. Result partitions are walked via `?partition=N`; each cell is decoded by its column metadata into a typed JSON value (full precision preserved for large `NUMBER`s).
 5. Rows are re-framed into `batch_size` pages and streamed to the pipeline.
@@ -282,7 +284,8 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 |---------|--------------------|
 | `Auth` error / 401 | OAuth token expired or invalid, or the key-pair public key isn't registered on the Snowflake user. Refresh the token, or confirm `ALTER USER … SET RSA_PUBLIC_KEY` matches your `private_key_pem`. |
 | `403` / "insufficient privileges" | The session role can't read the queried objects, or `warehouse` access is denied. Set `role` to one with `USAGE` on the warehouse and `SELECT` on the objects. |
-| Statement hangs, then fails with `FaucetError::Source: poll timeout` | The statement ran longer than `poll_timeout` (default 300 s). Raise `poll_timeout` (or set `0` to poll indefinitely), and/or resize the warehouse so the query finishes sooner. |
+| Statement hangs, then fails with `FaucetError::Source: poll timeout` | The statement ran longer than `poll_timeout` (default 300 s); the source cancels it server-side. Raise `poll_timeout` (or set `0` to poll indefinitely), and/or resize the warehouse so the query finishes sooner. |
+| `000630` / "statement reached its statement or warehouse timeout" | `statement_timeout` (or the account's `STATEMENT_TIMEOUT_IN_SECONDS`) cancelled the query. Raise it or set `0`. |
 | `390201` / "no active warehouse" | `warehouse` is misspelled, suspended, or the role lacks `USAGE` on it. Verify the warehouse name and grants. |
 | Account / host not found (DNS or 404) | `account` is wrong. Use the full account identifier including region/cloud (e.g. `xy12345.us-east-1`, or `orgname-accountname`), not the login URL. |
 | A `NUMBER`/`DECIMAL` column arrives as a string | Intentional — a fractional `NUMBER(p,s)` (scale `s > 0`) and a scale-0 value beyond `u64` are decoded as strings to preserve full precision (a JSON number is an `f64`). Cast in a downstream transform if you need a JSON number and can accept the precision loss. |

@@ -102,6 +102,20 @@ impl Lsn {
         }
         None
     }
+
+    /// The LSN immediately before this one, or `None` for the zero LSN.
+    pub fn decrement(&self) -> Option<Self> {
+        let mut arr = self.0;
+        for byte in arr.iter_mut().rev() {
+            if *byte == 0 {
+                *byte = u8::MAX;
+            } else {
+                *byte -= 1;
+                return Some(Lsn(arr));
+            }
+        }
+        None
+    }
 }
 
 impl fmt::Debug for Lsn {
@@ -118,6 +132,17 @@ impl fmt::Display for Lsn {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decrement_borrows_and_stops_at_zero() {
+        let l = Lsn::from_hex("00000000000000000100").unwrap();
+        assert_eq!(l.decrement().unwrap().to_hex(), "000000000000000000ff");
+        assert_eq!(l.decrement().unwrap().increment().unwrap(), l);
+        assert_eq!(
+            Lsn::from_hex("00000000000000000000").unwrap().decrement(),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

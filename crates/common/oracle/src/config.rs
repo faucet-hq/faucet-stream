@@ -157,6 +157,17 @@ impl OracleConnectionConfig {
                     (Some(s), None) => check_descriptor_value("service_name", s)?,
                     (None, Some(s)) => check_descriptor_value("sid", s)?,
                 }
+                if !self.tls.enabled
+                    && (self.tls.wallet_location.is_some()
+                        || self.tls.server_cert_dn.is_some()
+                        || !self.tls.server_dn_match)
+                {
+                    return Err(cfg_err(
+                        "the `tls` block sets wallet / certificate options but not \
+                         `enabled: true`, so the connection would run over plain TCP; set \
+                         `tls.enabled: true` (or remove the options)",
+                    ));
+                }
                 if let Some(w) = &self.tls.wallet_location {
                     check_descriptor_value("tls.wallet_location", w)?;
                 }
@@ -449,6 +460,24 @@ mod tests {
             ..host_cfg()
         };
         assert!(bad_dn.validate().is_err());
+        for tls in [
+            OracleTls {
+                wallet_location: Some("/w".into()),
+                ..Default::default()
+            },
+            OracleTls {
+                server_cert_dn: Some("CN=db".into()),
+                ..Default::default()
+            },
+            OracleTls {
+                server_dn_match: false,
+                ..Default::default()
+            },
+        ] {
+            let disabled = OracleConnectionConfig { tls, ..host_cfg() };
+            let err = disabled.validate().unwrap_err().to_string();
+            assert!(err.contains("enabled: true"), "{err}");
+        }
     }
 
     #[test]

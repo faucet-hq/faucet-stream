@@ -445,9 +445,28 @@ fn commit_token_ddl() -> String {
 fn current_schema_json(meta: &TableMeta) -> Value {
     let mut props = serde_json::Map::new();
     for (name, ty, nullable) in &meta.columns {
-        props.insert(name.clone(), spanner_type_to_json_schema(ty, *nullable));
+        props.insert(name.clone(), accepted_schema(ty, *nullable));
     }
     serde_json::json!({ "type": "object", "properties": props })
+}
+
+/// The JSON types the encoder writes into a column of `ty`, as the drift pass
+/// should see them: a `STRING` or `JSON` column takes any value (scalars as
+/// their text, containers as JSON), `NUMERIC` takes numbers and decimal text.
+/// Reporting `STRING` as string-only made every number or boolean field of an
+/// auto-created (all-`STRING`) table look incompatible.
+fn accepted_schema(ty: &SpannerType, nullable: bool) -> Value {
+    let any = ["string", "number", "integer", "boolean", "object", "array"];
+    let types: Vec<&str> = match ty {
+        SpannerType::String | SpannerType::Json => any.to_vec(),
+        SpannerType::Numeric => vec!["string", "number", "integer"],
+        _ => return spanner_type_to_json_schema(ty, nullable),
+    };
+    let mut types: Vec<Value> = types.into_iter().map(Value::from).collect();
+    if nullable {
+        types.push(Value::from("null"));
+    }
+    serde_json::json!({ "type": types })
 }
 
 fn sink_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -590,6 +609,7 @@ impl SpannerSink {
         &self,
         records: &[Value],
         meta: &TableMeta,
+        append_op: WriteOp,
     ) -> Result<(Vec<Planned>, usize), FaucetError> {
         let table = &self.config.table_name;
         let mut warned = self
@@ -600,10 +620,9 @@ impl SpannerSink {
         if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
             let mut planned = Vec::with_capacity(records.len());
             for (idx, record) in records.iter().enumerate() {
-                let p = build_row_mutation(table, record, meta, WriteOp::Insert, &mut warned)
-                    .map_err(|msg| {
-                        FaucetError::Sink(format!("spanner append: row {idx}: {msg}"))
-                    })?;
+                let p = build_row_mutation(table, record, meta, append_op, &mut warned).map_err(
+                    |msg| FaucetError::Sink(format!("spanner append: row {idx}: {msg}")),
+                )?;
                 planned.push(p);
             }
             let count = planned.len();
@@ -688,7 +707,7 @@ impl SpannerSink {
             .collect();
         let pk: Vec<String> = key.iter().map(|k| quote_ident_spanner(k)).collect();
         let ddl = format!(
-            "CREATE TABLE {} ({}) PRIMARY KEY ({})",
+            "CREATE TABLE IF NOT EXISTS {} ({}) PRIMARY KEY ({})",
             quote_ident_spanner(&self.config.table_name),
             cols.join(", "),
             pk.join(", ")
@@ -1097,11 +1116,18 @@ impl faucet_core::Sink for SpannerSink {
                     }
                 }
             }
+            Ok(Ok(None)) if self.config.create_table => Probe::skip(
+                "schema",
+                format!(
+                    "table `{}` does not exist yet; it will be created on first write",
+                    self.config.table_name
+                ),
+            ),
             Ok(Ok(None)) => Probe::fail_hint(
                 "schema",
                 started.elapsed(),
                 format!("table `{}` does not exist", self.config.table_name),
-                "create the table (Spanner mutations require an existing table)",
+                "create the table, or set `create_table: true`",
             ),
             Ok(Err(e)) => Probe::fail("schema", started.elapsed(), e.to_string()),
             Err(_) => Probe::fail("schema", started.elapsed(), "timed out"),
@@ -1114,14 +1140,16 @@ impl faucet_core::Sink for SpannerSink {
 
     /// Write records as batched mutations, one atomic commit per chunk
     /// (`batch_size` rows and ≤60,000 cells per commit). Append mode uses
-    /// `Insert` (a duplicate PK fails the commit); upsert/delete are planned
-    /// via [`faucet_core::plan_writes`].
+    /// `InsertOrUpdate`, so replaying a page whose earlier chunk already
+    /// committed (or that committed before a crash) converges instead of
+    /// failing every retry on `ALREADY_EXISTS`; upsert/delete are planned via
+    /// [`faucet_core::plan_writes`].
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
         let meta = self.require_meta(records).await?;
-        let (planned, count) = self.plan_page(records, &meta)?;
+        let (planned, count) = self.plan_page(records, &meta, WriteOp::InsertOrUpdate)?;
         for chunk in chunk_by_cells(planned, self.config.batch_size, CELL_BUDGET) {
             self.client
                 .apply(chunk)
@@ -1249,8 +1277,10 @@ impl faucet_core::Sink for SpannerSink {
     ) -> Result<usize, FaucetError> {
         self.ensure_token_table().await?;
         let meta = self.require_meta(records).await?;
-        // Plan before the transaction so planning failures abort cleanly.
-        let (planned, count) = self.plan_page(records, &meta)?;
+        // Plan before the transaction so planning failures abort cleanly. The
+        // page commits atomically with its token and a committed page is never
+        // replayed, so append keeps `Insert` and a real duplicate key fails.
+        let (planned, count) = self.plan_page(records, &meta, WriteOp::Insert)?;
 
         let mut mutations: Vec<Mutation> = planned.into_iter().map(|p| p.mutation).collect();
         let scope_owned = scope.to_string();
@@ -1530,13 +1560,33 @@ mod tests {
     }
 
     #[test]
+    fn accepted_schema_lets_string_and_json_columns_take_any_value() {
+        let any = json!({"type": ["string", "number", "integer", "boolean", "object", "array"]});
+        assert_eq!(accepted_schema(&SpannerType::String, false), any);
+        assert_eq!(
+            accepted_schema(&SpannerType::Json, true),
+            json!({"type": ["string", "number", "integer", "boolean", "object", "array", "null"]})
+        );
+        assert_eq!(
+            accepted_schema(&SpannerType::Numeric, false),
+            json!({"type": ["string", "number", "integer"]})
+        );
+        assert_eq!(
+            accepted_schema(&SpannerType::Int64, true),
+            json!({"type": ["integer", "null"]})
+        );
+    }
+
+    #[test]
     fn current_schema_json_shape() {
         let schema = current_schema_json(&meta());
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["id"]["type"], "integer");
         assert_eq!(
             schema["properties"]["name"]["type"],
-            json!(["string", "null"])
+            json!([
+                "string", "number", "integer", "boolean", "object", "array", "null"
+            ])
         );
         assert_eq!(
             schema["properties"]["score"]["type"],

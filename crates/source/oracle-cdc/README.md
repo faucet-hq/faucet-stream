@@ -54,7 +54,7 @@ Connection fields are documented in [`faucet-common-oracle`](https://crates.io/c
 | `idle_timeout` | `30` | End the fetch cycle after this many quiet seconds once mining has reached the current SCN. Re-mining redo from `restart_scn` (held back by the oldest open transaction in the database) never counts as quiet, so a long-open transaction cannot stall capture. |
 | `max_scn_window` | `500000` | Largest SCN range per LogMiner session. |
 | `max_staged_records` | unbounded | Abort when one open transaction buffers more changes. |
-| `batch_size` | `1000` | `0` = one trailing page with everything; otherwise a page per transaction. |
+| `batch_size` | `1000` | `0` = transactions are aggregated into pages of up to 100,000 records (emitted at least every `idle_timeout`, each with its bookmark); otherwise a page per transaction. |
 | `max_connections` | `2` | Pooled sessions. |
 | `statement_timeout_secs` | `600` | Per-round-trip call timeout (`0` disables). |
 | `flush_table` | `FAUCET_LOGMNR_FLUSH` | Table committed to before each window to force the log writer to flush redo up to the window's end. Created if missing. |
@@ -95,7 +95,11 @@ Transactions committed below `commit_scn`, or at it and listed in `committed_xid
 
 - **Missing redo** — if the logs covering the resume range were recycled or deleted, the run fails with the missing SCN range. Re-snapshot the tables, then restart capture.
 - **Dictionary mismatch** — mining uses the current data dictionary (`DICT_FROM_ONLINE_CATALOG`). Redo written *before* a DDL on a captured table cannot be rendered after it; if a restart has to re-mine such redo the run fails (or skips, with `on_unsupported: skip`). Mining near real time avoids this; after DDL during downtime, re-snapshot the table.
-- **Unsupported changes** (`UNSUPPORTED` operations, types LogMiner cannot render) fail by default.
+- **Unsupported changes** (`UNSUPPORTED` operations, types LogMiner cannot render, binary `XMLType` changes) fail by default.
+- **Partial LOB writes** — an append, a write at an offset above 1, or a trim on a LOB whose current value is not part of the same transaction cannot be reassembled (LogMiner logs only the piece). It is treated as an unsupported change rather than emitted as a padded or truncated value. CLOB offsets are applied in UTF-16 code units, as Oracle counts them.
+- **DDL** — column metadata is reloaded at the DDL row, so later changes in the same mining window are typed by the new columns.
+- **RESETLOGS** — the bookmark records the database incarnation (`resetlogs_scn`); only archived logs of the current incarnation are mined, and resuming a bookmark from another incarnation (after a point-in-time recovery or flashback) fails instead of mining an abandoned branch.
+- **RAC** — the redo flush reaches only the connected instance, so with several open redo threads the mining window never passes the lowest thread checkpoint SCN (`V$THREAD`). Changes from other instances therefore arrive once their thread checkpoints past them.
 
 ## Source lag
 

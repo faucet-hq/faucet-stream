@@ -14,6 +14,8 @@ pub(crate) struct ColumnInfo {
     pub collation: Option<String>,
     pub is_nullable: bool,
     pub is_identity: bool,
+    /// A computed column (never writable).
+    pub is_computed: bool,
 }
 
 impl ColumnInfo {
@@ -90,7 +92,7 @@ fn is_binary(t: &str) -> bool {
 pub(crate) const COLUMN_INFO_SQL: &str = "SELECT c.name AS name, \
      LOWER(TYPE_NAME(c.system_type_id)) AS type_name, c.max_length AS max_length, \
      c.precision AS precision, c.scale AS scale, c.collation_name AS collation, \
-     c.is_nullable AS is_nullable, c.is_identity AS is_identity \
+     c.is_nullable AS is_nullable, c.is_identity AS is_identity, c.is_computed AS is_computed \
      FROM sys.columns c WHERE c.object_id = OBJECT_ID(@P1) ORDER BY c.column_id";
 
 /// The `CAST` targets for `columns`, looked up by name in `infos`. A column
@@ -137,6 +139,7 @@ mod tests {
             collation: None,
             is_nullable: true,
             is_identity: false,
+            is_computed: false,
         }
     }
 

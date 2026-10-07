@@ -107,11 +107,22 @@ impl OverwriteScope {
     /// literals have their single quotes doubled, so a crafted bound cannot
     /// break out of the quotes.
     pub fn render_where_literal(&self, quoted_col: &str) -> String {
+        self.render_where_with(quoted_col, sql_literal)
+    }
+
+    /// [`render_where_literal`](Self::render_where_literal) with a
+    /// dialect-specific literal renderer, for dialects whose string literals
+    /// give some other character (BigQuery's backslash) escape meaning.
+    pub fn render_where_with(
+        &self,
+        quoted_col: &str,
+        literal: impl Fn(&Value) -> String,
+    ) -> String {
         match self {
             OverwriteScope::Window { from, to, .. } => format!(
                 "{quoted_col} >= {} AND {quoted_col} < {}",
-                sql_literal(from),
-                sql_literal(to)
+                literal(from),
+                literal(to)
             ),
         }
     }
@@ -122,9 +133,10 @@ impl OverwriteScope {
 /// through in their canonical form, and anything else becomes `NULL`.
 ///
 /// This is the house escaper for every dialect that follows the ANSI rule —
-/// Postgres (with `standard_conforming_strings`, the default since 9.1), BigQuery
-/// string literals built by the overwrite/cleanup planners, MySQL under
-/// `NO_BACKSLASH_ESCAPES`, SQL Server, and SQLite. **Public so connectors escape
+/// Postgres (with `standard_conforming_strings`, the default since 9.1), MySQL
+/// under `NO_BACKSLASH_ESCAPES`, SQL Server, and SQLite. **Not BigQuery**:
+/// GoogleSQL treats `\'` as an escaped quote, so a trailing backslash would
+/// close the literal early. **Public so connectors escape
 /// through one audited implementation instead of hand-rolling a third
 /// convention** (#654 M14): the copies that existed before it was exported each
 /// invented their own rules, so a fix to one reached none of the others.
@@ -685,6 +697,17 @@ mod tests {
         };
         let whr = scope.render_where_literal("\"c\"");
         assert!(whr.contains("'x'' OR ''1''=''1'"), "{whr}");
+    }
+
+    #[test]
+    fn render_where_with_uses_the_dialect_renderer() {
+        let scope = OverwriteScope::Window {
+            column: "c".into(),
+            from: json!("a"),
+            to: json!(5),
+        };
+        let whr = scope.render_where_with("`c`", |v| format!("<{v}>"));
+        assert_eq!(whr, "`c` >= <\"a\"> AND `c` < <5>");
     }
 
     #[test]
