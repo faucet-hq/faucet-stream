@@ -10,5 +10,5 @@ pub mod stream;
 
 pub use faucet_core::{FaucetError, Source};
 
-pub use config::WebhookSourceConfig;
+pub use config::{SignatureAlgorithm, SignatureEncoding, WebhookSignature, WebhookSourceConfig};
 pub use stream::WebhookSource;

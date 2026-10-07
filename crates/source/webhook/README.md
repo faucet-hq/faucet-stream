@@ -16,7 +16,7 @@ Reach for it to capture push-style events — GitHub/GitLab hooks, payment event
 - **Lenient body parsing** — JSON bodies become native JSON values; non-JSON-but-UTF-8 bodies become JSON strings; non-UTF-8 bodies are rejected with `400`.
 - **Request-size guard** — `max_body_bytes` (default 1 MiB) rejects oversized POSTs with `413` before buffering them.
 - **Optional shared secret** — `auth_token` requires a token in the `Authorization` header (raw or `Bearer <token>`); the comparison is **constant-time** (no timing side-channel).
-- **Exact payload cap** — under concurrent arrivals the in-memory buffer never exceeds `max_payloads`; surplus in-flight POSTs are dropped, not stored.
+- **Exact payload cap** — under concurrent arrivals the in-memory buffer never exceeds `max_payloads`; a surplus POST, or one arriving as the window closes, is refused with `503` + `Retry-After` so the sender retries it, never acknowledged and dropped.
 - **Fast preflight** — `faucet doctor` verifies the listen address is bindable without booting the receive loop.
 
 ## Installation
@@ -70,7 +70,7 @@ The server listens on `127.0.0.1:8080/webhook`, collects up to 100 POSTed payloa
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen_addr` | string | `"127.0.0.1:8080"` | Address to bind the HTTP server to. Defaults to **loopback only**; bind `0.0.0.0` only behind a trusted gateway (and set `auth_token`). |
-| `path` | string | `"/webhook"` | Endpoint path that accepts `POST` requests. Supports matrix-context substitution — e.g. `path: /hooks/${row.id}` resolves per row at runtime. |
+| `path` | string | `"/webhook"` | Endpoint path that accepts `POST` requests. Supports matrix-context substitution — e.g. `path: /hooks/${row.id}` resolves per row at runtime; `{key}` context values are percent-encoded into one segment. Must start with `/`; `?`, `#`, whitespace, `:`/`*`-prefixed segments and braces other than a whole `{name}` segment are rejected at config load. |
 
 ### Termination
 
@@ -87,6 +87,7 @@ The receive window ends as soon as **any** configured condition is met; the serv
 |-------|------|---------|-------------|
 | `max_body_bytes` | int | `1048576` | Max accepted request body size (1 MiB). Larger POSTs are rejected with `413 Payload Too Large` before buffering, so one huge request can't exhaust memory. |
 | `auth_token` | string \| null | `null` | Optional shared secret. When set, requests must carry it in the `Authorization` header (raw value or `Bearer <token>`); others get `401`. Comparison is constant-time. Strongly recommended whenever `listen_addr` isn't loopback. |
+| `signature` | object \| null | `null` | HMAC verification of the raw body for senders that sign requests: `header` (signature header), `secret`, `algorithm` (`sha256` default / `sha512`), `encoding` (`hex` default, case-insensitive / `base64`), optional `prefix` (e.g. `sha256=`), optional `timestamp_header` (then the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` — default 300 — from now is refused). Checked in constant time; failures get `401`. |
 
 ### Batching
 
@@ -192,7 +193,8 @@ Every page carries `bookmark: None` — there is no incremental-replication or r
 | Non-UTF-8 bytes | *(not stored)* | `400 Bad Request` |
 | Larger than `max_body_bytes` | *(not stored)* | `413 Payload Too Large` |
 | Missing/wrong `auth_token` (when set) | *(not stored)* | `401 Unauthorized` |
-| Accepted after `max_payloads` reached | *(dropped, cap is exact)* | `200 OK` |
+| Missing/invalid `signature` (when set) | *(not stored)* | `401 Unauthorized` |
+| Arriving after `max_payloads` is reached or the window closed | *(not stored)* | `503 Service Unavailable` + `Retry-After: 60` |
 
 Only `POST` is routed; other methods on the path return `405 Method Not Allowed` from `axum`.
 

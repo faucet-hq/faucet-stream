@@ -7061,15 +7061,19 @@ version = "1.2.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "faucet-conformance",
  "faucet-core",
+ "hmac 0.12.1",
  "reqwest 0.13.3",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "subtle",
  "tokio",
  "tracing",
+ "urlencoding",
 ]
 
 [[package]]
