@@ -23,7 +23,7 @@ pub fn xml_to_json(xml: &str) -> Result<Value, FaucetError> {
                 let mut obj = Map::new();
 
                 // Collect attributes.
-                for attr in e.attributes().flatten() {
+                for attr in e.attributes().with_checks(false).flatten() {
                     let key = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
                     let val = String::from_utf8_lossy(&attr.value).into_owned();
                     obj.insert(key, Value::String(val));
@@ -111,7 +111,7 @@ pub fn xml_to_json(xml: &str) -> Result<Value, FaucetError> {
             Ok(Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let mut obj = Map::new();
-                for attr in e.attributes().flatten() {
+                for attr in e.attributes().with_checks(false).flatten() {
                     let key = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
                     let val = String::from_utf8_lossy(&attr.value).into_owned();
                     obj.insert(key, Value::String(val));
@@ -223,7 +223,7 @@ pub fn stream_extract<F: FnMut(Value)>(
             Ok(Event::Start(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let mut obj = Map::new();
-                for attr in e.attributes().flatten() {
+                for attr in e.attributes().with_checks(false).flatten() {
                     let key = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
                     let val = String::from_utf8_lossy(&attr.value).into_owned();
                     obj.insert(key, Value::String(val));
@@ -249,7 +249,7 @@ pub fn stream_extract<F: FnMut(Value)>(
             Ok(Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let mut obj = Map::new();
-                for attr in e.attributes().flatten() {
+                for attr in e.attributes().with_checks(false).flatten() {
                     let key = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
                     let val = String::from_utf8_lossy(&attr.value).into_owned();
                     obj.insert(key, Value::String(val));

@@ -5,16 +5,48 @@
 [advisories]
 version = 2
 # Security advisories from the RustSec database. Yanked crates are denied by
-# default. "unmaintained" is a warning, not an error — those advisories are
-# noisy (e.g. proc-macro helpers) and rarely actionable for transitive deps.
+# default. "unmaintained" covers only workspace crates (transitive helpers are
+# noisy and rarely actionable).
 #
-# NOTE: in CI the `advisories` check runs as an *informational* step
-# (non-blocking) because nearly every advisory here lives in a transitive
-# dependency we don't control (the AWS SDK's pinned rustls, a DNS library,
-# `paste`), and the RustSec database updates daily — gating hard on it would
-# break CI on days nothing changed. License / bans / sources ARE hard-gated.
+# The check is a HARD gate in CI (#789 SUPPLY-03): a new advisory fails the
+# build until it is fixed (bump to a fixed version) or triaged here with a
+# dated reason. A scheduled workflow (`advisories.yml`) re-runs it daily and
+# opens an issue, so an advisory published between merges is not missed.
+# Re-triage every entry when its dependency moves; drop it once fixed.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # 2026-10-07 — no fixed release (Marvin timing side channel). Reached by
+    # local key-pair JWT signing (snowflake key-pair auth, jsonwebtoken via
+    # gcloud-auth) and russh client auth; an attacker needs precise timing of
+    # many signatures on the signing host.
+    { id = "RUSTSEC-2023-0071", reason = "no fix; signing-host timing only (2026-10-07)" },
+    # 2026-10-07 — rustls 0.21 / rustls-webpki 0.101 are compiled into the AWS
+    # SDK's legacy hyper-0.14 connector; the SDK runs on its hyper-1 / rustls
+    # 0.23 client, so this stack is never used for a connection.
+    { id = "RUSTSEC-2026-0098", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
+    { id = "RUSTSEC-2026-0099", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
+    { id = "RUSTSEC-2026-0104", reason = "AWS SDK legacy connector, unused at run time (2026-10-07)" },
+    # 2026-10-07 — h2 0.3 has no fixed release; same legacy AWS connector as
+    # above (the live client uses h2 0.4.20).
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 only in the unused AWS legacy connector; 0.4 is fixed (2026-10-07)" },
+    # 2026-10-07 — azure_core 0.21 / http-types / quick-xml 0.31 come only from
+    # azure_storage_blobs, a dev-dependency of the azure-blob sink tests.
+    { id = "RUSTSEC-2026-0275", reason = "dev-dependency only (azure-blob tests) (2026-10-07)" },
+    { id = "RUSTSEC-2026-0174", reason = "dev-dependency only (azure-blob tests) (2026-10-07)" },
+    # 2026-10-07 — tokio-postgres / postgres-protocol are dev-dependencies of
+    # the postgres-cdc tests and the CLI tests only.
+    { id = "RUSTSEC-2026-0178", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
+    { id = "RUSTSEC-2026-0179", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
+    { id = "RUSTSEC-2026-0180", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
+    # 2026-10-07 — quick-xml: the fix (0.41) changes how entity references are
+    # reported and needs a parser rewrite in core/xml/rest; until then every
+    # call site turns the quadratic duplicate-attribute check off
+    # (`with_checks(false)`). 0.39 comes from object_store, which parses the
+    # configured storage endpoint's list responses. `NsReader` (0195) is used
+    # nowhere.
+    { id = "RUSTSEC-2026-0194", reason = "duplicate checks disabled at every call site; object_store pins 0.39 (2026-10-07)" },
+    { id = "RUSTSEC-2026-0195", reason = "NsReader is not used (2026-10-07)" },
+]
 
 [licenses]
 version = 2

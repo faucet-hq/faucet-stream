@@ -406,7 +406,7 @@ duckdb = "1.10503"
 # WebAssembly runtime for the `wasm` transform (issue #124). Lean embedding:
 # JIT via Cranelift + the runtime, on std platforms (native signal traps). We
 # drive core-wasm modules only — no component model, async, cache, or GC.
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "49", default-features = false, features = ["cranelift", "runtime", "std"] }
 # WAT → wasm assembler, used to build tiny fixture modules in `transform-wasm`
 # tests without a wasm toolchain on the CI runner.
 wat = "1"

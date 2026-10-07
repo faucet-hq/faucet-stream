@@ -383,7 +383,7 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
 
     fn attrs(e: &quick_xml::events::BytesStart) -> Map<String, Value> {
         let mut m = Map::new();
-        for a in e.attributes().flatten() {
+        for a in e.attributes().with_checks(false).flatten() {
             let k = String::from_utf8_lossy(a.key.as_ref())
                 .rsplit(':')
                 .next()
