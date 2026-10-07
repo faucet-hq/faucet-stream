@@ -6,7 +6,9 @@
 use crate::config::{DynamoDbSourceConfig, OnGap, ReadMode};
 use crate::envelope::snapshot_envelope;
 use crate::lag::{LagTracker, now_ms, probe_starts};
-use crate::lineage::{Planner, capture_bookmark, detect_gaps, ids_and_parents, start_for};
+use crate::lineage::{
+    Planner, capture_bookmark, detect_gaps, ids_and_parents, stale_empty_shards, start_for,
+};
 use crate::scan::{ScanEvent, expressions, run_segment};
 use crate::sched::Scheduler;
 use crate::state::{ScanBookmark, SegmentCursor, StreamBookmark, state_key};
@@ -285,6 +287,9 @@ impl DynamoDbSource {
 
             let mut gaps = detect_gaps(&bm, &arn, &described);
             if gaps.is_empty() {
+                gaps.extend(stale_empty_shards(&bm, &described, crate::state::unix_now()));
+            }
+            if gaps.is_empty() {
                 let (ids, _) = ids_and_parents(&described);
                 for (id, seq) in bm.shards.iter().filter(|(id, s)| !s.is_empty() && ids.contains(*id)) {
                     let start = crate::lineage::StartAt::After(seq.clone());
@@ -377,7 +382,6 @@ impl DynamoDbSource {
                 };
                 match event {
                     Some(ShardEvent::Records { shard_id, records }) => {
-                        last_record = Instant::now();
                         if let Some(ts) = records.iter().filter_map(|(_, r)| r["ts_ms"].as_i64()).max() {
                             self.with_lag(|t| t.observe(&shard_id, ts));
                         }
@@ -399,10 +403,12 @@ impl DynamoDbSource {
                                 break 'consume;
                             }
                         }
+                        last_record = Instant::now();
                     }
                     Some(ShardEvent::Yielded { lease, delay, caught_up }) => {
                         if caught_up {
                             self.with_lag(|t| t.caught_up(&lease.shard_id));
+                            bm.verify_empty(&lease.shard_id, crate::state::unix_now());
                         }
                         sched.yielded(lease, Instant::now() + delay);
                     }
@@ -997,6 +1003,50 @@ mod tests {
             .unwrap();
         let e = source.fetch_all().await.unwrap_err().to_string();
         assert!(e.contains("trimmed past sequence 5"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_shard_unverified_past_retention_is_a_gap() {
+        let server = MockServer::start().await;
+        on(
+            &server,
+            "DynamoDBStreams_20120810.DescribeStream",
+            ok(json!({"StreamDescription": {"Shards": [{"ShardId": "s1"}]}})),
+            1,
+        )
+        .await;
+        let mut cfg = streams_config();
+        cfg.stream_arn = Some("arn".into());
+        let source = mock_source(&server.uri(), cfg);
+        source
+            .apply_start_bookmark(
+                json!({"stream_arn": "arn", "shards": {"s1": ""}, "verified_at": {"s1": 0}}),
+            )
+            .await
+            .unwrap();
+        let e = source.fetch_all().await.unwrap_err().to_string();
+        assert!(e.contains("shard s1 was last read"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn sink_time_between_pages_is_not_idleness() {
+        let server = MockServer::start().await;
+        mock_stream(&server, json!([{"ShardId": "a"}])).await;
+        mock_shard(&server, "a", true).await;
+        let mut cfg = one_worker();
+        cfg.max_messages = Some(4);
+        cfg.batch_size = 1;
+        cfg.idle_termination_secs = Some(1);
+        let source = mock_source(&server.uri(), cfg);
+        let ctx = std::collections::HashMap::new();
+        let mut pages = faucet_core::Source::stream_pages(&source, &ctx, 1);
+        let mut records = 0;
+        while let Some(page) = futures::StreamExt::next(&mut pages).await {
+            let page = page.unwrap();
+            records += page.records.len();
+            tokio::time::sleep(Duration::from_millis(1300)).await;
+        }
+        assert_eq!(records, 4);
     }
 
     async fn mock_shard(server: &MockServer, id: &str, open: bool) {

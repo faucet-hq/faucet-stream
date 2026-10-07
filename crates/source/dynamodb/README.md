@@ -88,11 +88,19 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
 - **Bookmarks** — every page carries `{stream_arn, shards: {id: seq}, finished}`
   (state key `dynamodb-streams:<table>`). A shard opened but not yet read is
   recorded with an empty sequence and resumes from its trim horizon, so nothing
-  between runs is skipped. A child of a shard that was read always starts at its
-  trim horizon.
+  between runs is skipped; `verified_at` records when such a shard was last
+  known to hold nothing unread. A child of a shard that was read always starts at
+  its trim horizon. A `latest` shard whose iterator expires before its first
+  record is re-read from its trim horizon, keeping records created since about
+  when it was first opened, instead of jumping to a new `latest`.
+- **Idle termination** — `idle_termination_secs` counts only time spent waiting
+  for records; time the sink spends writing a page does not end the run.
 - **Gaps** — Streams keep 24 hours of changes. Resuming fails with the gap named
   when the stream was replaced, a bookmarked shard expired, a shard's parent
-  expired unread, or a bookmarked position was trimmed. With
+  expired unread, a bookmarked position was trimmed, or a shard bookmarked with
+  no position was last known empty more than 23 hours ago (its trim horizon
+  never reports trimming, so records written and trimmed since would be lost
+  silently). With
   `on_gap: resnapshot` the source instead scans the whole table (emitted as
   `op: "r"` envelopes, no bookmark until the scan completes) and then replays the
   retained stream from the trim horizon; on an upsert sink this converges.
