@@ -232,7 +232,9 @@ fn mongodb_scope_matches_snapshot(
         return Err(CliError::Config(format!(
             "a multi-table mongodb-cdc mirror watches one database: set \
              pipeline.source.config.scope to {{ type: database, database: <name> }} (got {})",
-            scope.map_or("the default cluster scope".to_string(), |s| format!("scope.type: {s}"))
+            scope.map_or("the default cluster scope".to_string(), |s| format!(
+                "scope.type: {s}"
+            ))
         )));
     }
     let watched = cdc.pointer("/scope/database").and_then(|v| v.as_str());
@@ -566,7 +568,10 @@ mirror:
         assert!(e.contains("scope.type: cluster"), "{e}");
         let e = compile_err(&mongo(", scope: { type: database, database: crm }", "shop"));
         assert!(e.contains("'crm'") && e.contains("'shop'"), "{e}");
-        let ok = cfg(&mongo(", scope: { type: database, database: shop }", "shop"));
+        let ok = cfg(&mongo(
+            ", scope: { type: database, database: shop }",
+            "shop",
+        ));
         let r = CompiledReplication::compile(ok.replication.as_ref().unwrap(), &ok).unwrap();
         assert_eq!(r.tables.expect("tables mode").cdc_kind, "mongodb-cdc");
     }
