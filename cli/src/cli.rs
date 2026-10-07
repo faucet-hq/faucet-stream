@@ -975,9 +975,19 @@ pub struct NotifyTestArgs {
     /// Path to a `.yaml`, `.yml`, or `.json` pipeline config with a
     /// `notifications:` block. If omitted, auto-discover in cwd.
     pub config: Option<PathBuf>,
-    /// Which event to synthesize (defaults to `run_failure`).
+    /// Which event to synthesize (defaults to `run_failure`). One of
+    /// `run_failure`, `run_success`, `sla_breach`, `circuit_open`,
+    /// `contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`,
+    /// `change_requested`, `budget_exceeded`, `connection_needs_reauth`.
     #[arg(long, default_value = "run_failure")]
     pub event: String,
+    /// Leave the PagerDuty incident a failure-class test event opens. By
+    /// default it is resolved right after the trigger.
+    #[arg(long)]
+    pub keep_open: bool,
+    /// Select a named overlay from the config's `profiles:` block.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
     /// Path to a `.env` file for `${env:VAR}` interpolation.
     #[arg(long, conflicts_with = "no_env_file")]
     pub env_file: Option<PathBuf>,

@@ -1130,7 +1130,12 @@ Fires one **synthetic** event through the config's `notifications:` rules using
 the real delivery path (no pipeline runs) — the fast way to confirm a Slack /
 PagerDuty / webhook channel is wired correctly. `--event` accepts any event
 kind (`run_failure`, `run_success`, `sla_breach`, `circuit_open`,
-`contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`). See the
+`contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`,
+`change_requested`, `budget_exceeded`, `connection_needs_reauth`). The event
+carries the row `faucet-notify-test`, so it never shares a real run's PagerDuty
+dedup key; a failure-class test incident is resolved right after the trigger
+unless `--keep-open`. Exits non-zero when no rule delivered the event or any
+delivery failed. `--profile` / `FAUCET_PROFILE` selects an overlay. See the
 [Notifications](../cookbook/notifications.md) cookbook page.
 
 ## `mirror`

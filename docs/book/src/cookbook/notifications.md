@@ -99,7 +99,13 @@ channel:
 
 Uses the Events API v2. A failure-class event **opens** an incident; the next
 `run_success` on the same pipeline/row automatically sends a matching
-**resolve** (correlated by dedup key), so incidents self-close.
+**resolve** (correlated by dedup key `<pipeline>:<row>`), so incidents
+self-close. The resolve does not depend on the process that saw the failure: a
+success sends it through every PagerDuty rule whose `on:` admits a
+failure-class event (PagerDuty ignores a resolve with nothing open), so
+incidents opened by an earlier `faucet run` or another serve run close too.
+`dedupe_window_secs` coalesces within one process only — PagerDuty itself
+folds repeats on the dedup key into the open incident.
 
 ```yaml
 channel:
@@ -194,7 +200,16 @@ faucet notify test pipeline.yaml --event run_failure
 ```
 
 `--event` accepts any event kind (`run_failure`, `run_success`, `sla_breach`,
-`circuit_open`, `contract_abort`, `dlq_threshold`, `scheduler_stuck`).
+`circuit_open`, `contract_abort`, `dlq_threshold`, `scheduler_stuck`,
+`profile_drift`, `change_requested`, `budget_exceeded`,
+`connection_needs_reauth`); `--profile` selects a `profiles:` overlay.
+
+The synthetic event uses the row `faucet-notify-test`, so its PagerDuty dedup
+key (`<pipeline>:faucet-notify-test`) never matches a real run's, and a
+failure-class test incident is resolved right after it is triggered (pass
+`--keep-open` to leave it open). The command prints what each rule did and
+exits non-zero when no rule took the event or any delivery failed, so it can
+gate a deploy.
 
 ## Metrics
 
