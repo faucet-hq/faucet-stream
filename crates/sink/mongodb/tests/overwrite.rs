@@ -291,3 +291,18 @@ async fn append_isolates_a_rejected_document_per_row() {
     got.sort();
     assert_eq!(got, vec!["a", "a", "c", "c", "existing"]);
 }
+
+/// The sink's catalog identity drops the URI's path and options, matching
+/// the source's identity for the same collection (#789 MSG-92).
+#[tokio::test(flavor = "multi_thread")]
+async fn dataset_uri_is_host_database_collection() {
+    let (_c, uri) = start_mongo().await;
+    let sink = MongoSink::new(MongoSinkConfig::new(
+        format!("{uri}/admin?appName=t"),
+        "testdb",
+        "docs",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(sink.dataset_uri(), format!("{uri}/testdb/docs"));
+}

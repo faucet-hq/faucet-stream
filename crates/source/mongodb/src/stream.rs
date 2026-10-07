@@ -268,11 +268,10 @@ impl faucet_core::Source for MongoSource {
     }
 
     fn dataset_uri(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            faucet_core::redact_uri_credentials(&self.config.connection_uri),
-            self.config.database,
-            self.config.collection
+        collection_uri(
+            &self.config.connection_uri,
+            &self.config.database,
+            &self.config.collection,
         )
     }
 
@@ -281,7 +280,7 @@ impl faucet_core::Source for MongoSource {
     }
 
     /// Enumerate the collections in the configured database (excluding
-    /// `system.*`), with a row estimate from `estimated_document_count`
+    /// `system.*` and faucet's own collections), with a row estimate from `estimated_document_count`
     /// (collection metadata — no scan) and a schema inferred from a bounded
     /// `DISCOVER_SAMPLE_SIZE`-document sample per collection.
     async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
@@ -291,7 +290,7 @@ impl faucet_core::Source for MongoSource {
             .await
             .map_err(|e| FaucetError::Source(format!("mongodb: catalog discovery failed: {e}")))?
             .into_iter()
-            .filter(|name| !name.starts_with("system."))
+            .filter(|name| is_discoverable(name))
             .collect();
         names.sort();
 
@@ -406,6 +405,33 @@ fn bson_document_to_json_value(doc: &Document) -> Result<Value, FaucetError> {
     Ok(relaxed)
 }
 
+/// Whether discovery lists a collection: not a `system.*` collection and not
+/// one faucet maintains (the exactly-once watermark, the rollback journal, an
+/// overwrite's staging collection), which a wildcard `include` would
+/// otherwise pick up as data (#789 MSG-92).
+fn is_discoverable(name: &str) -> bool {
+    !(name.starts_with("system.")
+        || name == faucet_core::idempotency::COMMIT_TOKEN_TABLE
+        || name == faucet_core::RUN_JOURNAL_TABLE
+        || name.contains(faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX))
+}
+
+/// `mongodb://hosts/<db>/<collection>` with the URI's credentials, path
+/// (auth database) and query options removed, so a URI carrying options
+/// still yields one well-formed, stable catalog identity (#789 MSG-92).
+pub(crate) fn collection_uri(connection_uri: &str, database: &str, collection: &str) -> String {
+    let redacted = faucet_core::redact_uri_credentials(connection_uri);
+    let base = match redacted.find("://") {
+        Some(i) => {
+            let rest = &redacted[i + 3..];
+            let end = rest.find(['/', '?']).unwrap_or(rest.len());
+            &redacted[..i + 3 + end]
+        }
+        None => redacted.as_str(),
+    };
+    format!("{base}/{database}/{collection}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,15 +504,34 @@ mod tests {
     // dataset_uri is a pure-config method; MongoSource requires an async
     // constructor with a live server, so we verify the logic directly.
     #[test]
-    fn dataset_uri_strips_credentials() {
-        let config = MongoSourceConfig::new("mongodb://u:p@h:27017", "mydb", "events");
-        let uri = format!(
-            "{}/{}/{}",
-            faucet_core::redact_uri_credentials(&config.connection_uri),
-            config.database,
-            config.collection
+    fn dataset_uri_strips_credentials_path_and_options() {
+        assert_eq!(
+            collection_uri("mongodb://u:p@h:27017", "mydb", "events"),
+            "mongodb://h:27017/mydb/events"
         );
-        assert_eq!(uri, "mongodb://h:27017/mydb/events");
+        assert_eq!(
+            collection_uri(
+                "mongodb://u:p@h1:27017,h2:27017/admin?replicaSet=rs0&tls=true",
+                "mydb",
+                "events"
+            ),
+            "mongodb://h1:27017,h2:27017/mydb/events"
+        );
+        assert_eq!(
+            collection_uri("mongodb+srv://c.example.net/?retryWrites=true", "d", "c"),
+            "mongodb+srv://c.example.net/d/c"
+        );
+        assert_eq!(collection_uri("weird", "d", "c"), "weird/d/c");
+    }
+
+    #[test]
+    fn faucet_internal_collections_are_not_discovered() {
+        assert!(is_discoverable("orders"));
+        assert!(!is_discoverable("system.views"));
+        assert!(!is_discoverable("_faucet_commit_token"));
+        assert!(!is_discoverable("_faucet_run_journal"));
+        assert!(!is_discoverable("orders__faucet_ovw"));
+        assert!(!is_discoverable("orders__faucet_ovw_old"));
     }
 
     // --- substitute_optional_value (the private context-interpolation helper) ---
