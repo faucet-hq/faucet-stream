@@ -198,6 +198,7 @@ pub struct ColumnLineageDatasetFacet {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ColumnLineageFieldEntry {
+    #[serde(rename = "inputFields")]
     pub input_fields: Vec<ColumnLineageInputField>,
 }
 

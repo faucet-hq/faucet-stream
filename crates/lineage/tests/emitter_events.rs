@@ -183,15 +183,15 @@ async fn column_lineage_facet_emitted_for_supported_ops() {
     let events = read_lines(&path);
     let fields = &events[0]["outputs"][0]["facets"]["columnLineage"]["fields"];
     // `contact` derives from input field `email` in the input dataset.
-    // (`ColumnLineageFieldEntry` serializes `input_fields` as-is, not camelCase.)
-    assert_eq!(fields["contact"]["input_fields"][0]["field"], "email");
+    assert!(fields["contact"].get("input_fields").is_none());
+    assert_eq!(fields["contact"]["inputFields"][0]["field"], "email");
     assert_eq!(
-        fields["contact"]["input_fields"][0]["name"],
+        fields["contact"]["inputFields"][0]["name"],
         "postgres://h/db"
     );
-    assert_eq!(fields["contact"]["input_fields"][0]["namespace"], "ns");
+    assert_eq!(fields["contact"]["inputFields"][0]["namespace"], "ns");
     // `id` survives select, maps to itself.
-    assert_eq!(fields["id"]["input_fields"][0]["field"], "id");
+    assert_eq!(fields["id"]["inputFields"][0]["field"], "id");
     // `name` was dropped by select → not present.
     assert!(fields.get("name").is_none());
 }
@@ -221,7 +221,7 @@ async fn column_lineage_set_literal_has_no_input_edge() {
     // The literal `created_at` has no upstream edge → suppressed in the facet.
     assert!(fields.get("created_at").is_none());
     // `id` (identity passthrough) is present.
-    assert_eq!(fields["id"]["input_fields"][0]["field"], "id");
+    assert_eq!(fields["id"]["inputFields"][0]["field"], "id");
 }
 
 #[tokio::test]
