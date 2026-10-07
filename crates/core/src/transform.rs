@@ -1388,7 +1388,7 @@ pub fn compile(t: &RecordTransform) -> Result<CompiledTransform, FaucetError> {
             // the first row for a given key wins.
             let mut index = HashMap::with_capacity(reference.len());
             for row in reference {
-                if let Some(k) = row.get(on_ref).map(value_to_key) {
+                if let Some(k) = row.get(on_ref).and_then(value_to_key) {
                     index.entry(k).or_insert_with(|| row.clone());
                 }
             }
@@ -1403,14 +1403,23 @@ pub fn compile(t: &RecordTransform) -> Result<CompiledTransform, FaucetError> {
     }
 }
 
-/// Scalar-string key form for [`RecordTransform::Lookup`] matching, so `42`
-/// matches `"42"`. `null` maps to the empty string.
+/// Scalar-string key form for [`RecordTransform::Lookup`] matching, so `42`,
+/// `42.0` and `"42"` all match. `null` is no key at all: it never matches,
+/// so a null record key goes to `on_missing` (CORE-94).
 #[cfg(feature = "transform-lookup")]
-fn value_to_key(v: &Value) -> String {
+fn value_to_key(v: &Value) -> Option<String> {
     match v {
-        Value::String(s) => s.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
+        Value::String(s) => Some(s.clone()),
+        Value::Null => None,
+        Value::Number(n) if n.is_f64() => {
+            let f = n.as_f64().unwrap_or(f64::NAN);
+            if f.fract() == 0.0 && f.abs() < 9.007_199_254_740_992e15 {
+                Some(format!("{}", f as i64))
+            } else {
+                Some(n.to_string())
+            }
+        }
+        other => Some(other.to_string()),
     }
 }
 
@@ -1432,9 +1441,7 @@ fn apply_one(value: Value, t: &CompiledTransform) -> Result<Value, FaucetError> 
         #[cfg(feature = "transform-flatten")]
         CompiledTransform::Flatten { separator } => flatten(value, separator),
         #[cfg(feature = "transform-rename-keys")]
-        CompiledTransform::RenameKeys { re, replacement } => {
-            Ok(rename_keys(value, re, replacement))
-        }
+        CompiledTransform::RenameKeys { re, replacement } => rename_keys(value, re, replacement),
         #[cfg(feature = "transform-keys-case")]
         CompiledTransform::KeysCase { mode, on_collision } => {
             keys_case(value, *mode, *on_collision)
@@ -1568,25 +1575,33 @@ fn flatten_into(
 
 // ── Rename keys ───────────────────────────────────────────────────────────────
 
+/// Recursively rename every key matching `re`. Two keys in one object that
+/// rename to the same name fail the record rather than one silently
+/// overwriting the other (CORE-31).
 #[cfg(feature = "transform-rename-keys")]
-fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Value {
+fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Result<Value, FaucetError> {
     match value {
         Value::Object(map) => {
-            let new_map: Map<String, Value> = map
-                .into_iter()
-                .map(|(k, v)| {
-                    let new_k = re.replace_all(&k, replacement).into_owned();
-                    (new_k, rename_keys(v, re, replacement))
-                })
-                .collect();
-            Value::Object(new_map)
+            let mut new_map = Map::with_capacity(map.len());
+            for (k, v) in map {
+                let new_k = re.replace_all(&k, replacement).into_owned();
+                let new_v = rename_keys(v, re, replacement)?;
+                if new_map.contains_key(&new_k) {
+                    return Err(FaucetError::Transform(format!(
+                        "rename_keys produced a duplicate key '{new_k}' (from '{k}'); two \
+                         distinct keys rename to the same name"
+                    )));
+                }
+                new_map.insert(new_k, new_v);
+            }
+            Ok(Value::Object(new_map))
         }
-        Value::Array(arr) => Value::Array(
+        Value::Array(arr) => Ok(Value::Array(
             arr.into_iter()
                 .map(|v| rename_keys(v, re, replacement))
-                .collect(),
-        ),
-        other => other,
+                .collect::<Result<_, _>>()?,
+        )),
+        other => Ok(other),
     }
 }
 
@@ -2280,7 +2295,7 @@ fn lookup_field(
     let Value::Object(map) = &mut value else {
         return Ok(value);
     };
-    let key = map.get(on_record).map(value_to_key);
+    let key = map.get(on_record).and_then(value_to_key);
     let matched = key.as_deref().and_then(|k| index.get(k));
     match matched {
         Some(row) => {
@@ -2610,6 +2625,19 @@ mod tests {
             }]),
         );
         assert_eq!(result["x"]["x"], 42);
+    }
+
+    #[cfg(feature = "transform-rename-keys")]
+    #[test]
+    fn test_rename_keys_collision_is_an_error() {
+        let t = compiled(&[RecordTransform::RenameKeys {
+            pattern: r"[^a-z]".into(),
+            replacement: "".into(),
+        }]);
+        let err = super::apply_all(json!({"a1": 1, "a2": 2}), &t).unwrap_err();
+        assert!(err.to_string().contains("duplicate key 'a'"), "{err}");
+        let err = super::apply_all(json!({"x": [{"b1": 1, "b2": 2}]}), &t).unwrap_err();
+        assert!(err.to_string().contains("duplicate key 'b'"), "{err}");
     }
 
     #[cfg(feature = "transform-rename-keys")]
@@ -5147,6 +5175,30 @@ mod tests {
         // Record carries numeric 42; reference key is "42" — matched by scalar form.
         let out = apply_all(json!({"code": 42}), &compiled(&[spec]));
         assert_eq!(out["label"], json!("answer"));
+    }
+
+    #[cfg(feature = "transform-lookup")]
+    #[test]
+    fn lookup_null_key_is_missing_and_whole_floats_match() {
+        let spec = RecordTransform::Lookup {
+            reference: ref_rows(json!([
+                {"code": "", "label": "blank"},
+                {"code": "42", "label": "answer"},
+                {"code": 7.5, "label": "frac"}
+            ])),
+            on_record: "code".into(),
+            on_ref: "code".into(),
+            add: vec![("label".into(), "label".into())],
+            on_missing: LookupOnMissing::Null,
+        };
+        let c = compiled(&[spec]);
+        assert_eq!(apply_all(json!({"code": null}), &c)["label"], json!(null));
+        assert_eq!(apply_all(json!({}), &c)["label"], json!(null));
+        assert_eq!(
+            apply_all(json!({"code": 42.0}), &c)["label"],
+            json!("answer")
+        );
+        assert_eq!(apply_all(json!({"code": 7.5}), &c)["label"], json!("frac"));
     }
 
     #[cfg(feature = "transform-lookup")]
