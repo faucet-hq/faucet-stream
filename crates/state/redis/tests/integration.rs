@@ -226,7 +226,10 @@ async fn reconnects_after_a_dropped_connection_and_lists_every_page() {
         .expect("client kill");
     assert!(killed >= 1, "the store's connection must have been killed");
 
-    assert_eq!(store.get("before").await.expect("get after kill"), Some(json!(1)));
+    assert_eq!(
+        store.get("before").await.expect("get after kill"),
+        Some(json!(1))
+    );
     store.put("after", &json!(2)).await.expect("put after kill");
 
     let entries: Vec<(String, serde_json::Value)> = (0..1_200)

@@ -22,8 +22,8 @@
 //! guarantees on the other side.  This choice is documented in the crate
 //! README.
 
-use crate::config::{CdcTls, MysqlCdcSourceConfig, StartPosition};
 use crate::batch::PageBuilder;
+use crate::config::{CdcTls, MysqlCdcSourceConfig, StartPosition};
 use crate::convert::{binlog_row_to_json_hinted, column_hints, primary_key_columns};
 use crate::query::{QueryKind, classify_query, parse_xa_prepare};
 use crate::state::{Bookmark, state_key};
@@ -824,7 +824,11 @@ const PAGE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The key columns of a delete's before-image, for `include_columns: false`
 /// (the whole image when the table declares no primary key).
-fn key_image(full: Value, row: &mysql_async::binlog::row::BinlogRow, key_columns: &[usize]) -> Value {
+fn key_image(
+    full: Value,
+    row: &mysql_async::binlog::row::BinlogRow,
+    key_columns: &[usize],
+) -> Value {
     if key_columns.is_empty() {
         return full;
     }

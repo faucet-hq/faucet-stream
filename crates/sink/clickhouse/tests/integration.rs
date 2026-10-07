@@ -416,7 +416,9 @@ async fn auto_create_quotes_hostile_column_names() {
     let mut row = serde_json::Map::new();
     row.insert(evil.to_string(), json!("v"));
     row.insert("trail\\".to_string(), json!("w"));
-    sink.write_batch(&[Value::Object(row)]).await.expect("write_batch");
+    sink.write_batch(&[Value::Object(row)])
+        .await
+        .expect("write_batch");
     sink.flush().await.expect("flush");
     let cols = read_rows(
         &base,

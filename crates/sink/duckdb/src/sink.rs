@@ -677,7 +677,13 @@ mod tests {
 
         let outcomes = sink.write_batch_partial(&page).await.unwrap();
         assert!(outcomes[0].is_ok());
-        assert!(outcomes[1].as_ref().unwrap_err().to_string().contains("record 1"));
+        assert!(
+            outcomes[1]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("record 1")
+        );
         assert_eq!(count(&sink, "t"), 1);
 
         let json_sink = sink_with_table(
@@ -708,7 +714,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(sink.write_batch(&[json!({"id": 1, "extra": "x"})]).await.unwrap(), 1);
+        assert_eq!(
+            sink.write_batch(&[json!({"id": 1, "extra": "x"})])
+                .await
+                .unwrap(),
+            1
+        );
         assert_eq!(count(&sink, "analytics.events"), 1);
         assert_eq!(count(&sink, "main.events"), 0);
 
@@ -719,12 +730,15 @@ mod tests {
             DuckdbColumnMapping::AutoMap,
         )
         .await;
-        assert_eq!(plain.write_batch(&[json!({"id": 1, "ghost": "g"})]).await.unwrap(), 1);
-        assert_eq!(count(&plain, "t"), 1);
         assert_eq!(
-            split_qualified("db.s.t"),
-            (Some("db"), Some("s"), "t")
+            plain
+                .write_batch(&[json!({"id": 1, "ghost": "g"})])
+                .await
+                .unwrap(),
+            1
         );
+        assert_eq!(count(&plain, "t"), 1);
+        assert_eq!(split_qualified("db.s.t"), (Some("db"), Some("s"), "t"));
     }
 
     #[tokio::test]

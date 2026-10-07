@@ -34,9 +34,12 @@ async fn times_decimals_floats_and_session_timeout() {
     }
     pool.close().await;
 
-    let source = MysqlSource::new(MysqlSourceConfig::new(&url, "SELECT t, d, f FROM v ORDER BY id"))
-        .await
-        .expect("source");
+    let source = MysqlSource::new(MysqlSourceConfig::new(
+        &url,
+        "SELECT t, d, f FROM v ORDER BY id",
+    ))
+    .await
+    .expect("source");
     let rows = source.fetch_all().await.expect("fetch");
     assert_eq!(
         rows[0],

@@ -408,7 +408,11 @@ async fn text_that_looks_like_a_json_scalar_stays_text() {
             serde_json::json!("{bad"),
         ]
     );
-    assert_eq!(rows[0]["flag"], serde_json::json!(2), "a non-0/1 value is kept");
+    assert_eq!(
+        rows[0]["flag"],
+        serde_json::json!(2),
+        "a non-0/1 value is kept"
+    );
     assert_eq!(rows[1]["flag"], serde_json::json!(true));
     assert_eq!(rows[2]["flag"], serde_json::json!(false));
 }
@@ -432,7 +436,10 @@ async fn duplicate_column_names_are_refused() {
         .await
         .expect("source");
     let err = source.fetch_all().await.expect_err("duplicate names");
-    assert!(err.to_string().contains("two columns named \"id\""), "{err}");
+    assert!(
+        err.to_string().contains("two columns named \"id\""),
+        "{err}"
+    );
 
     let ctx: HashMap<String, serde_json::Value> = HashMap::new();
     let mut stream = source.stream_pages(&ctx, 10);

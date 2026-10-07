@@ -101,7 +101,9 @@ fn naive_ts(dt: Option<chrono::NaiveDateTime>, v: i64, tz: bool) -> Value {
 }
 
 fn time_text(t: Option<chrono::NaiveTime>) -> Value {
-    t.map_or(Value::Null, |t| Value::String(t.format("%H:%M:%S%.f").to_string()))
+    t.map_or(Value::Null, |t| {
+        Value::String(t.format("%H:%M:%S%.f").to_string())
+    })
 }
 
 /// Convert one column into one JSON value per row (nulls included).
@@ -131,23 +133,33 @@ pub(crate) fn array_to_values(array: &ArrayRef, duck_type: &str) -> Result<Vec<V
         }
         DataType::Decimal128(..) => {
             let a = array.as_primitive::<Decimal128Type>();
-            (0..n).map(|i| Value::String(a.value_as_string(i))).collect()
+            (0..n)
+                .map(|i| Value::String(a.value_as_string(i)))
+                .collect()
         }
         DataType::Decimal256(..) => {
             let a = array.as_primitive::<Decimal256Type>();
-            (0..n).map(|i| Value::String(a.value_as_string(i))).collect()
+            (0..n)
+                .map(|i| Value::String(a.value_as_string(i)))
+                .collect()
         }
         DataType::Utf8 => {
             let a = array.as_string::<i32>();
-            (0..n).map(|i| Value::String(a.value(i).to_owned())).collect()
+            (0..n)
+                .map(|i| Value::String(a.value(i).to_owned()))
+                .collect()
         }
         DataType::LargeUtf8 => {
             let a = array.as_string::<i64>();
-            (0..n).map(|i| Value::String(a.value(i).to_owned())).collect()
+            (0..n)
+                .map(|i| Value::String(a.value(i).to_owned()))
+                .collect()
         }
         DataType::Utf8View => {
             let a = array.as_string_view();
-            (0..n).map(|i| Value::String(a.value(i).to_owned())).collect()
+            (0..n)
+                .map(|i| Value::String(a.value(i).to_owned()))
+                .collect()
         }
         DataType::Binary => {
             let a = array.as_binary::<i32>();
@@ -206,17 +218,18 @@ pub(crate) fn array_to_values(array: &ArrayRef, duck_type: &str) -> Result<Vec<V
         DataType::Time64(_) => {
             prim::<Time64MicrosecondType, _>(array, |v| time_text(tc::time64us_to_time(v)))
         }
-        DataType::Interval(IntervalUnit::MonthDayNano) => {
-            prim::<IntervalMonthDayNanoType, _>(array, |v| {
-                json!({ "months": v.months, "days": v.days, "nanos": v.nanoseconds })
-            })
-        }
-        DataType::Interval(IntervalUnit::DayTime) => prim::<IntervalDayTimeType, _>(array, |v| {
-            json!({ "months": 0, "days": v.days, "nanos": i64::from(v.milliseconds) * 1_000_000 })
-        }),
-        DataType::Interval(IntervalUnit::YearMonth) => {
-            prim::<IntervalYearMonthType, _>(array, |v| json!({ "months": v, "days": 0, "nanos": 0 }))
-        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => prim::<IntervalMonthDayNanoType, _>(
+            array,
+            |v| json!({ "months": v.months, "days": v.days, "nanos": v.nanoseconds }),
+        ),
+        DataType::Interval(IntervalUnit::DayTime) => prim::<IntervalDayTimeType, _>(
+            array,
+            |v| json!({ "months": 0, "days": v.days, "nanos": i64::from(v.milliseconds) * 1_000_000 }),
+        ),
+        DataType::Interval(IntervalUnit::YearMonth) => prim::<IntervalYearMonthType, _>(
+            array,
+            |v| json!({ "months": v, "days": 0, "nanos": 0 }),
+        ),
         DataType::List(_) => {
             let a = array.as_list::<i32>();
             let values = array_to_values(a.values(), "")?;
@@ -321,11 +334,21 @@ where
     T: duckdb::arrow::datatypes::ArrowPrimitiveType,
     F: Fn(T::Native) -> Value,
 {
-    array.as_primitive::<T>().values().iter().map(|v| f(*v)).collect()
+    array
+        .as_primitive::<T>()
+        .values()
+        .iter()
+        .map(|v| f(*v))
+        .collect()
 }
 
 fn slice(values: &[Value], start: usize, end: usize) -> Value {
-    Value::Array(values.get(start..end).map(<[Value]>::to_vec).unwrap_or_default())
+    Value::Array(
+        values
+            .get(start..end)
+            .map(<[Value]>::to_vec)
+            .unwrap_or_default(),
+    )
 }
 
 fn base64(bytes: &[u8]) -> Value {
@@ -336,10 +359,10 @@ fn base64(bytes: &[u8]) -> Value {
 mod tests {
     use super::*;
     use duckdb::arrow::array::{
-        BinaryViewArray, Date64Array, Decimal256Array, FixedSizeBinaryArray,
+        BinaryViewArray, Date64Array, Decimal256Array, DurationSecondArray, FixedSizeBinaryArray,
         IntervalDayTimeArray, IntervalYearMonthArray, LargeBinaryArray, LargeListArray,
         LargeStringArray, NullArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
-        Time64NanosecondArray, TimestampMillisecondArray, DurationSecondArray,
+        Time64NanosecondArray, TimestampMillisecondArray,
     };
     use duckdb::arrow::datatypes::{Int32Type as I32, IntervalDayTime, i256};
     use std::sync::Arc;
@@ -350,7 +373,10 @@ mod tests {
 
     #[test]
     fn arrow_types_duckdb_does_not_emit_still_convert() {
-        assert_eq!(conv(Arc::new(NullArray::new(2))), vec![Value::Null, Value::Null]);
+        assert_eq!(
+            conv(Arc::new(NullArray::new(2))),
+            vec![Value::Null, Value::Null]
+        );
         assert_eq!(
             conv(
                 duckdb::arrow::compute::cast(
@@ -404,7 +430,9 @@ mod tests {
             vec![json!("00:00:00.000000001")]
         );
         assert_eq!(
-            conv(Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime::new(2, 3)]))),
+            conv(Arc::new(IntervalDayTimeArray::from(vec![
+                IntervalDayTime::new(2, 3)
+            ]))),
             vec![json!({"months": 0, "days": 2, "nanos": 3_000_000})]
         );
         assert_eq!(
@@ -419,13 +447,14 @@ mod tests {
             )),
             vec![json!("123.45")]
         );
-        let large = LargeListArray::from_iter_primitive::<I32, _, _>(vec![
-            Some(vec![Some(1), None]),
-            None,
-        ]);
+        let large =
+            LargeListArray::from_iter_primitive::<I32, _, _>(vec![Some(vec![Some(1), None]), None]);
         assert_eq!(conv(Arc::new(large)), vec![json!([1, null]), Value::Null]);
-        let err = array_to_values(&(Arc::new(DurationSecondArray::from(vec![1])) as ArrayRef), "")
-            .unwrap_err();
+        let err = array_to_values(
+            &(Arc::new(DurationSecondArray::from(vec![1])) as ArrayRef),
+            "",
+        )
+        .unwrap_err();
         assert!(err.contains("CAST it to VARCHAR"), "{err}");
     }
 

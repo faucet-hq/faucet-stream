@@ -160,7 +160,9 @@ pub(crate) fn wrap_nul(value: &Value) -> Result<std::borrow::Cow<'_, Value>, Fau
     }
     let text = serde_json::to_string(value)
         .map_err(|e| FaucetError::State(format!("failed to serialize state: {e}")))?;
-    Ok(std::borrow::Cow::Owned(serde_json::json!({ NUL_ENVELOPE_KEY: text })))
+    Ok(std::borrow::Cow::Owned(
+        serde_json::json!({ NUL_ENVELOPE_KEY: text }),
+    ))
 }
 
 /// The inverse of [`wrap_nul`].
@@ -336,7 +338,10 @@ mod tests {
         assert!(!holds_nul(&wrapped));
         assert_eq!(unwrap_nul(wrapped).unwrap(), v);
         let plain = serde_json::json!({"cursor": "ab"});
-        assert!(matches!(wrap_nul(&plain).unwrap(), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            wrap_nul(&plain).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
         assert_eq!(unwrap_nul(plain.clone()).unwrap(), plain);
         let other = serde_json::json!({ NUL_ENVELOPE_KEY: 3 });
         assert_eq!(unwrap_nul(other.clone()).unwrap(), other);

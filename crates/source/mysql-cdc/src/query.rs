@@ -37,7 +37,10 @@ pub(crate) enum QueryKind {
 fn strip_leading_comments(mut s: &str) -> &str {
     loop {
         s = s.trim_start();
-        match s.strip_prefix("/*").and_then(|r| r.find("*/").map(|i| &r[i + 2..])) {
+        match s
+            .strip_prefix("/*")
+            .and_then(|r| r.find("*/").map(|i| &r[i + 2..]))
+        {
             Some(rest) => s = rest,
             None => return s,
         }
@@ -255,19 +258,34 @@ mod tests {
         assert_eq!(classify_query("  /* app */ COMMIT", "d"), QueryKind::Commit);
         assert_eq!(classify_query("ROLLBACK", "d"), QueryKind::Commit);
         assert_eq!(classify_query("rollback work", "d"), QueryKind::Commit);
-        assert_eq!(classify_query("SAVEPOINT `s1`", "d"), QueryKind::InTransaction);
+        assert_eq!(
+            classify_query("SAVEPOINT `s1`", "d"),
+            QueryKind::InTransaction
+        );
         assert_eq!(
             classify_query("ROLLBACK TO SAVEPOINT s1", "d"),
             QueryKind::InTransaction
         );
-        assert_eq!(classify_query("ROLLBACK TO s1", "d"), QueryKind::InTransaction);
+        assert_eq!(
+            classify_query("ROLLBACK TO s1", "d"),
+            QueryKind::InTransaction
+        );
         assert_eq!(
             classify_query("RELEASE SAVEPOINT s1", "d"),
             QueryKind::InTransaction
         );
-        assert_eq!(classify_query("XA START X'61',X'',1", "d"), QueryKind::Begin);
-        assert_eq!(classify_query("XA END X'61',X'',1", "d"), QueryKind::InTransaction);
-        assert_eq!(classify_query("ALTER TABLE t ADD c INT", "d"), QueryKind::Ddl);
+        assert_eq!(
+            classify_query("XA START X'61',X'',1", "d"),
+            QueryKind::Begin
+        );
+        assert_eq!(
+            classify_query("XA END X'61',X'',1", "d"),
+            QueryKind::InTransaction
+        );
+        assert_eq!(
+            classify_query("ALTER TABLE t ADD c INT", "d"),
+            QueryKind::Ddl
+        );
         assert_eq!(classify_query("", "d"), QueryKind::Ddl);
         assert_eq!(classify_query("/* unterminated", "d"), QueryKind::Ddl);
     }

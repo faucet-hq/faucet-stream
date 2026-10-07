@@ -188,7 +188,7 @@ impl StateStore for RedisStateStore {
             async move { c.get(rkey).await }
         })
         .await
-            .map_err(|e| FaucetError::State(format!("Redis GET for key '{key}' failed: {e}")))?;
+        .map_err(|e| FaucetError::State(format!("Redis GET for key '{key}' failed: {e}")))?;
         match raw {
             None => Ok(None),
             Some(s) => {
@@ -213,7 +213,7 @@ impl StateStore for RedisStateStore {
             async move { c.set(rkey, serialized).await }
         })
         .await
-            .map_err(|e| FaucetError::State(format!("Redis SET for key '{key}' failed: {e}")))?;
+        .map_err(|e| FaucetError::State(format!("Redis SET for key '{key}' failed: {e}")))?;
         tracing::debug!(key, namespace = %self.namespace, "state written to Redis");
         Ok(())
     }
@@ -226,7 +226,7 @@ impl StateStore for RedisStateStore {
             async move { c.del(rkey).await }
         })
         .await
-            .map_err(|e| FaucetError::State(format!("Redis DEL for key '{key}' failed: {e}")))?;
+        .map_err(|e| FaucetError::State(format!("Redis DEL for key '{key}' failed: {e}")))?;
         Ok(())
     }
 
@@ -294,7 +294,7 @@ impl StateStore for RedisStateStore {
             async move { c.mset(&pairs).await }
         })
         .await
-            .map_err(|e| FaucetError::State(format!("Redis MSET failed: {e}")))?;
+        .map_err(|e| FaucetError::State(format!("Redis MSET failed: {e}")))?;
         Ok(())
     }
 

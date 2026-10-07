@@ -8,8 +8,8 @@
 //! materializing the whole result set.
 
 use crate::config::DuckdbSourceConfig;
-use async_trait::async_trait;
 use crate::convert;
+use async_trait::async_trait;
 use duckdb::arrow::array::{Array as _, StringArray};
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::types::Value as DuckValue;
@@ -676,11 +676,17 @@ mod tests {
         )
         .await;
         assert_eq!(row["u"], json!("340282366920938463463374607431768211455"));
-        assert_eq!(row["u127"], json!("170141183460469231731687303715884105728"));
+        assert_eq!(
+            row["u127"],
+            json!("170141183460469231731687303715884105728")
+        );
         assert_eq!(row["b"], json!("101"));
         assert_eq!(row["g"], json!("12345678901234567890123456789"));
         assert_eq!(row["h"], json!(42));
-        assert_eq!(row["hmax"], json!("170141183460469231731687303715884105727"));
+        assert_eq!(
+            row["hmax"],
+            json!("170141183460469231731687303715884105727")
+        );
         assert_eq!(row["ub"], json!(18446744073709551615u64));
         assert_eq!(row["uu"], json!("11111111-1111-1111-1111-111111111111"));
         assert_eq!(row["r"], json!(0.1));
@@ -698,7 +704,10 @@ mod tests {
         .await
         .unwrap();
         let err = source.fetch_all().await.expect_err("duplicate names");
-        assert!(err.to_string().contains("two columns named \"id\""), "{err}");
+        assert!(
+            err.to_string().contains("two columns named \"id\""),
+            "{err}"
+        );
         assert!(check_unique(["a", "b", "a"].into_iter()).is_err());
     }
 

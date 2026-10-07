@@ -767,11 +767,19 @@ mod tests {
         tokio::time::pause();
         let err = bounded_read(1, slow).await.unwrap_err();
         assert!(err.to_string().contains("read_timeout_secs"), "{err}");
-        assert_eq!(bounded_read(0, async { Ok::<_, sqlx::Error>(2) }).await.unwrap(), 2);
+        assert_eq!(
+            bounded_read(0, async { Ok::<_, sqlx::Error>(2) })
+                .await
+                .unwrap(),
+            2
+        );
         let failed = bounded_read(5, async { Err::<i32, _>(sqlx::Error::RowNotFound) })
             .await
             .unwrap_err();
-        assert!(failed.to_string().contains("PostgreSQL query failed"), "{failed}");
+        assert!(
+            failed.to_string().contains("PostgreSQL query failed"),
+            "{failed}"
+        );
     }
 
     #[test]

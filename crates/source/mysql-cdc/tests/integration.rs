@@ -670,7 +670,9 @@ async fn savepoints_xa_truncate_binary_and_batched_pages() {
             "DELETE FROM test.t WHERE id = 3",
             "TRUNCATE TABLE test.t",
         ] {
-            c.query_drop(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            c.query_drop(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
         }
     });
 
@@ -689,12 +691,23 @@ async fn savepoints_xa_truncate_binary_and_batched_pages() {
         .collect();
     assert_eq!(ids, vec![json!(1), json!(3), json!(11)], "{records:?}");
     let first = records.iter().find(|r| r["after"]["id"] == 1).unwrap();
-    assert_eq!(first["after"]["raw"], json!("QQ=="), "binary is always base64");
-    assert_eq!(first["after"]["flag"], json!("AQ=="), "BIT is base64 like the snapshot");
+    assert_eq!(
+        first["after"]["raw"],
+        json!("QQ=="),
+        "binary is always base64"
+    );
+    assert_eq!(
+        first["after"]["flag"],
+        json!("AQ=="),
+        "BIT is base64 like the snapshot"
+    );
     assert_eq!(first["after"]["label"], json!("a"));
     let delete = records.iter().find(|r| r["op"] == "d").expect("delete");
     assert_eq!(delete["before"], json!({"id": 3}), "a delete keeps its key");
-    let truncate = records.iter().find(|r| r["op"] == "truncate").expect("truncate");
+    let truncate = records
+        .iter()
+        .find(|r| r["op"] == "truncate")
+        .expect("truncate");
     assert_eq!(truncate["schema"], "test");
     assert_eq!(truncate["table"], "t");
     let with_records = pages.iter().filter(|p| !p.records.is_empty()).count();

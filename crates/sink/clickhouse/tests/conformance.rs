@@ -22,7 +22,10 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 /// Start a ClickHouse container, or `None` when Docker is unavailable.
 async fn start_clickhouse() -> Option<(ContainerAsync<ClickHouse>, String)> {
     let started = async {
-        let container = ClickHouse::default().start().await.map_err(|e| e.to_string())?;
+        let container = ClickHouse::default()
+            .start()
+            .await
+            .map_err(|e| e.to_string())?;
         let port = container
             .get_host_port_ipv4(8123)
             .await

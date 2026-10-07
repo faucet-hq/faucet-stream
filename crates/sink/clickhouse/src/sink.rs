@@ -70,8 +70,11 @@ fn clickhouse_type(t: faucet_core::SqlBaseType) -> &'static str {
 /// operator who cares about the sort key defines the table and sets
 /// `create_table: false`.
 fn build_create_table_sql(table: &str, columns: &[faucet_core::PlannedColumn]) -> String {
-    let cols =
-        faucet_core::render_columns(columns, faucet_common_clickhouse::quote_ident, clickhouse_type);
+    let cols = faucet_core::render_columns(
+        columns,
+        faucet_common_clickhouse::quote_ident,
+        clickhouse_type,
+    );
     format!(
         "CREATE TABLE IF NOT EXISTS {} ({cols}) ENGINE = MergeTree ORDER BY tuple()",
         quote_table(table)

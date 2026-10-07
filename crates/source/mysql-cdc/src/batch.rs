@@ -73,7 +73,12 @@ impl PageBuilder {
     /// A transaction committed at `bookmark`. Returns the pages it completes.
     /// Holding it behind an undecided XA transaction past `max_records`
     /// records an error for [`Self::take_error`] instead.
-    pub(crate) fn commit(&mut self, rows: Vec<Value>, bookmark: Bookmark, now: Instant) -> Vec<ReadyPage> {
+    pub(crate) fn commit(
+        &mut self,
+        rows: Vec<Value>,
+        bookmark: Bookmark,
+        now: Instant,
+    ) -> Vec<ReadyPage> {
         if !self.prepared.is_empty() {
             if let Err(e) = self.check_capacity(rows.len()) {
                 self.error.get_or_insert(e);
@@ -121,7 +126,11 @@ impl PageBuilder {
     ) -> (bool, Vec<ReadyPage>) {
         let rows = self.prepared.remove(xid);
         let known = rows.is_some();
-        let rows = if commit { rows.unwrap_or_default() } else { Vec::new() };
+        let rows = if commit {
+            rows.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if !self.prepared.is_empty() {
             self.held.push((rows, bookmark));
             return (known, Vec::new());

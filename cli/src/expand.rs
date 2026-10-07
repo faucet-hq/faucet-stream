@@ -3826,7 +3826,9 @@ pipeline:
 "#;
         let cfg = parse_with_extension(yaml, "yaml").unwrap();
         match expand(&cfg).unwrap_err() {
-            CliError::Config(msg) => assert!(msg.contains("postgres-cdc needs a `state:`"), "{msg}"),
+            CliError::Config(msg) => {
+                assert!(msg.contains("postgres-cdc needs a `state:`"), "{msg}")
+            }
             other => panic!("expected Config error, got {other:?}"),
         }
         let with_memory = format!("{yaml}  state: {{ type: memory, config: {{}} }}\n");
