@@ -1433,10 +1433,12 @@ This boundary covers faucet's own output only — connector libraries that
 debug-log deserialized config fields are outside it; never enable debug logging
 on connectors that hold resolved secrets.
 
-**Known limitation:** secret directives are resolved in connector configs,
-transforms, state, dlq, and matrix rows. They are **not** resolved in the
-top-level `auth:` catalog or `vars:` block. Put secrets in a connector's inline
-`auth:` config instead of the shared catalog until this is lifted.
+**Where directives resolve:** connector configs (sources, sinks, topology
+nodes, the mirror snapshot source and table overrides, the `verify` /
+`reconcile` read-back connectors), transforms, state, dlq, matrix rows, the
+top-level `auth:` catalog and `vars:` block, `pipeline.masking` (the hash key),
+`lineage`, `notifications`, `catalog` and `observability`. A secret directive
+left anywhere else fails the load instead of being sent as a literal.
 
 See the [docs-site secrets cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html)
 for full examples and details.
