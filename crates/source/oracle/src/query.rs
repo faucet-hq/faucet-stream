@@ -2,7 +2,6 @@
 //! grouping and state-key derivation. No driver calls.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use faucet_common_oracle::{TypeFamily, quote_ident_oracle};
 use faucet_core::replication::{filter_incremental, max_replication_value, max_value};
@@ -195,12 +194,10 @@ pub(crate) fn apply_incremental(
 
 /// Derive a stable state key from the database scope and a query fingerprint.
 pub(crate) fn default_state_key(config: &OracleSourceConfig) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.query.hash(&mut hasher);
     format!(
         "oracle:{}:{:016x}",
         config.connection.scope_label(),
-        hasher.finish()
+        faucet_core::shard::shard_hash(&config.query)
     )
 }
 
@@ -444,6 +441,10 @@ mod tests {
         let k = default_state_key(&c);
         assert_eq!(k, default_state_key(&c));
         assert!(k.starts_with("oracle:FREEPDB1:"), "{k}");
+        assert!(k.ends_with(&format!(
+            "{:016x}",
+            faucet_core::shard::shard_hash(&c.query)
+        )));
         faucet_core::state::validate_state_key(&k).unwrap();
     }
 

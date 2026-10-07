@@ -2,7 +2,6 @@
 //! streaming, and incremental-replication bookkeeping.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -248,9 +247,8 @@ fn default_state_key(config: &MssqlSourceConfig) -> String {
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_else(|| "mssql".to_string());
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.query.hash(&mut hasher);
-    let fingerprint = hasher.finish();
+    // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
+    let fingerprint = faucet_core::shard::shard_hash(&config.query);
     // Host may contain dots (allowed mid-key); sanitise anything else.
     let host: String = host
         .chars()
@@ -906,6 +904,7 @@ mod tests {
         let k2 = default_state_key(&cfg);
         assert_eq!(k1, k2);
         assert!(k1.starts_with("mssql:db.example.com:"));
+        assert!(k1.contains(&format!("{:x}", faucet_core::shard::shard_hash(&cfg.query))));
         faucet_core::state::validate_state_key(&k1).expect("derived key must be valid");
     }
 

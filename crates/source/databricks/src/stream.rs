@@ -7,8 +7,6 @@
 //! `reqwest` over the shared-auth bearer token.
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -349,11 +347,15 @@ fn decode_arrow_ipc(data: bytes::Bytes) -> Result<Vec<arrow::array::RecordBatch>
 
 /// Derive a stable state key from the workspace, warehouse, and query.
 fn default_state_key(config: &DatabricksSourceConfig) -> String {
-    let mut h = DefaultHasher::new();
-    config.workspace_url.hash(&mut h);
-    config.warehouse_id.hash(&mut h);
-    config.sql.hash(&mut h);
-    format!("databricks:{:016x}", h.finish())
+    // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
+    let material = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        config.workspace_url, config.warehouse_id, config.sql
+    );
+    format!(
+        "databricks:{:016x}",
+        faucet_core::shard::shard_hash(&material)
+    )
 }
 
 /// Decode a raw result chunk.
@@ -745,6 +747,15 @@ mod tests {
         let k2 = source(cfg()).state_key().unwrap();
         assert_eq!(k1, k2);
         assert!(k1.starts_with("databricks:"));
+        let c = cfg();
+        let material = format!("{}\u{1f}{}\u{1f}{}", c.workspace_url, c.warehouse_id, c.sql);
+        assert_eq!(
+            k1,
+            format!(
+                "databricks:{:016x}",
+                faucet_core::shard::shard_hash(&material)
+            )
+        );
     }
 
     #[tokio::test]
