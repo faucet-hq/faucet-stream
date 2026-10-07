@@ -18,13 +18,18 @@ behave identically on both sides.
     client with either currently returns a typed
     `FaucetError::Config`.
 - **`RedshiftConnection`** — `host`, `port` (default `5439`), `database`,
-  `user`, `credentials`, and a `tls` toggle (default `true`). Flattened into
-  both end configs.
+  `user`, `credentials`, a `tls` toggle (default `true`), and the optional
+  `tls_mode` (`disable` | `prefer` | `require` | `verify_ca` | `verify_full`,
+  overrides `tls`) + `ssl_root_cert` (CA PEM path for the verifying modes).
+  Flattened into both end configs.
 
 ## Helpers
 
 - `build_connect_options(&RedshiftConnection)` — pure `PgConnectOptions` builder.
-  `tls: true` → `sslmode=require`; `tls: false` → `sslmode=prefer`.
+  `tls: true` → `sslmode=require` (encrypted, certificate **not** verified);
+  `tls: false` → `sslmode=prefer`. Set `tls_mode: verify_full` with
+  `ssl_root_cert` (the Redshift CA bundle) to verify the server certificate and
+  host name; `ssl_root_cert` with a non-verifying mode is a config error.
 - `build_pool_lazy(conn, max)` — lazily-connected pool (no I/O at construction).
 - `build_pool(conn, max)` — eagerly validated pool (fails fast on bad creds).
 - `resolve_password(&RedshiftCredentials)` — extracts the password.
@@ -40,7 +45,8 @@ credentials:
   type: password
   config:
     password: ${env:REDSHIFT_PASSWORD}
-tls: true
+tls_mode: verify_full
+ssl_root_cert: /etc/ssl/redshift-ca-bundle.crt
 ```
 
 License: MIT OR Apache-2.0

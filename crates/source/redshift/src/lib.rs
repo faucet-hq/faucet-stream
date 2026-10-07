@@ -16,5 +16,5 @@ pub mod stream;
 pub use faucet_core::{FaucetError, Source};
 
 pub use config::{RedshiftReplication, RedshiftSourceConfig};
-pub use faucet_common_redshift::{RedshiftConnection, RedshiftCredentials};
+pub use faucet_common_redshift::{RedshiftConnection, RedshiftCredentials, RedshiftTlsMode};
 pub use stream::RedshiftSource;

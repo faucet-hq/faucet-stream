@@ -17,7 +17,9 @@ rows as JSON objects with `O(batch_size)` memory. It supports **full** and
 | `database` | yes | Database name. |
 | `user` | yes | Database user. |
 | `credentials` | yes | `{ type: password, config: { password: … } }`. `iam` / `redshift_data_api` are reserved (not yet supported). |
-| `tls` | no | Require TLS (default `true`; `false` → `sslmode=prefer`). |
+| `tls` | no | Require TLS (default `true`, certificate not verified; `false` → `sslmode=prefer`). |
+| `tls_mode` | no | `disable` \| `prefer` \| `require` \| `verify_ca` \| `verify_full`; overrides `tls`. |
+| `ssl_root_cert` | no | CA PEM path for `verify_ca` / `verify_full`. |
 | `query` | yes | SQL query. May contain `${field.path}` context tokens and, for incremental mode, `${bookmark}`. |
 | `params` | no | Positional bind values (`$1, $2, …`) applied before context/bookmark values. |
 | `max_connections` | no | Pool size (default `10`). |

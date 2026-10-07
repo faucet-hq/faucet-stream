@@ -251,15 +251,51 @@ async fn insert_with_no_matching_columns_errors() {
         .await
         .expect("create table");
 
-    let sink = RedshiftSink::new(insert_config(port, "events", 1000))
+    let mut config = insert_config(port, "events", 1000);
+    config.create_table = false;
+    let sink = RedshiftSink::new(config).await.expect("sink builds");
+    let err = sink
+        .write_batch(&[json!({"unknown": 1})])
+        .await
+        .expect_err("no column for the field");
+    assert!(err.to_string().contains("unknown"), "{err}");
+    sink.flush().await.expect("nothing was buffered");
+    assert_eq!(row_count(&pool, "events").await, 0);
+    pool.close().await;
+}
+
+/// A field first seen after the table existed becomes a column instead of
+/// being dropped on every page (SQL-82); discovery ignores same-named tables
+/// in other schemas and the table name's case (SQL-163).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_field_becomes_a_column() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE SCHEMA other")
+        .execute(&pool)
+        .await
+        .expect("schema");
+    sqlx::query("CREATE TABLE other.events (id BIGINT, foreign_col TEXT)")
+        .execute(&pool)
+        .await
+        .expect("decoy table");
+
+    let sink = RedshiftSink::new(insert_config(port, "Events", 1000))
         .await
         .expect("sink builds");
-    sink.write_batch(&[json!({"unknown": 1})])
+    sink.write_batch(&[json!({"id": 1})]).await.expect("page 1");
+    sink.write_batch(&[json!({"id": 2, "extra": "x"})])
         .await
-        .expect("buffered");
-    let err = sink.flush().await.expect_err("no matching column");
-    assert!(err.to_string().contains("matches a column"), "{err}");
-    assert_eq!(row_count(&pool, "events").await, 0);
+        .expect("page 2");
+    sink.flush().await.expect("flush");
+
+    let rows: Vec<(i64, Option<String>)> =
+        sqlx::query_as("SELECT id, extra FROM \"Events\" ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("read back");
+    assert_eq!(rows, vec![(1, None), (2, Some("x".to_string()))]);
     pool.close().await;
 }
 
