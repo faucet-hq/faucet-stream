@@ -302,26 +302,26 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
         ..
     } = register_prelude(store, &req).await?;
 
-    // A description describes the *template*, not the build, so carry the previous
-    // version's forward when the caller omits one. Without this, a deploy that
-    // re-registers without `--description` blanks the listing for everybody.
-    let description = match &req.description {
-        Some(d) => Some(d.clone()),
-        None => store
+    // A hub template carries its own `description:` — the document is the
+    // source of truth, so an edit to it shows on re-register (and sync). For a
+    // pipeline, a description describes the *template*, not the build, so carry
+    // the previous version's forward when the caller omits one; without this, a
+    // deploy that re-registers without `--description` blanks the listing.
+    let own = match kind {
+        TemplateKind::SourceTemplate | TemplateKind::SinkTemplate | TemplateKind::Deployment => doc
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        TemplateKind::Pipeline => None,
+    };
+    let description = match (own, &req.description) {
+        (Some(d), _) => Some(d),
+        (None, Some(d)) => Some(d.clone()),
+        (None, None) => store
             .template_get(id.as_str(), None)
             .await
             .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
-            .and_then(|prev| prev.description)
-            .or_else(|| match kind {
-                // Hub templates carry their own description.
-                TemplateKind::SourceTemplate
-                | TemplateKind::SinkTemplate
-                | TemplateKind::Deployment => doc
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                TemplateKind::Pipeline => None,
-            }),
+            .and_then(|prev| prev.description),
     };
 
     let draft = TemplateDraft {
@@ -2186,16 +2186,20 @@ write_mode_aliases:
                 .map(|v| v.is_string()),
             Some(true)
         );
-        // The template's own description is used when the request carries none.
+        // A hub template's own description wins, so an edited one shows on
+        // re-register.
         let mut no_desc = req(&source_template(dir.path()));
         no_desc.description = None;
         let again = register(&s, no_desc).await.unwrap();
         assert_eq!(again.version, 2);
         assert_eq!(
             again.description.as_deref(),
-            Some("test"),
-            "previous description carries forward"
+            Some("Acme — orders and customers exports"),
         );
+        let edited = source_template(dir.path())
+            .replace("Acme — orders and customers exports", "Acme — orders only");
+        let third = register(&s, req(&edited)).await.unwrap();
+        assert_eq!(third.description.as_deref(), Some("Acme — orders only"));
 
         let mut fresh = req_launched(&sink_template(dir.path()));
         fresh.description = None;
