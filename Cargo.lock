@@ -6746,6 +6746,7 @@ dependencies = [
  "faucet-core",
  "futures",
  "hex",
+ "percent-encoding",
  "pgwire-replication",
  "schemars 1.2.1",
  "serde",

@@ -19,11 +19,11 @@ const OID_FLOAT8: u32 = 701;
 const OID_NUMERIC: u32 = 1700;
 const OID_JSON: u32 = 114;
 const OID_JSONB: u32 = 3802;
-// Types passed through as their Postgres ISO text form (stable under the
-// default `DateStyle ISO` / `IntervalStyle`): date/time/timestamp/
-// timestamptz/uuid/interval. Downstream consumers don't agree on a single
-// binary encoding, and the text form is already ISO-8601-ish, so we keep
-// the string verbatim rather than risk a lossy reformat.
+const OID_DATE: u32 = 1082;
+const OID_TIME: u32 = 1083;
+const OID_TIMESTAMP: u32 = 1114;
+const OID_TIMESTAMPTZ: u32 = 1184;
+// uuid/interval and other text types pass through verbatim.
 
 /// Map a built-in Postgres *array* type OID to its element type OID, so a
 /// `{...}` array literal can be decoded element-by-element instead of being
@@ -105,6 +105,7 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
             let bytes = hex_decode(stripped)?;
             Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
+        OID_DATE | OID_TIME | OID_TIMESTAMP | OID_TIMESTAMPTZ => temporal_json(type_oid, text)?,
         OID_JSON | OID_JSONB => serde_json::from_str(text).map_err(|e| {
             FaucetError::Source(format!("pgoutput: json/jsonb parse {text:?}: {e}"))
         })?,
@@ -128,6 +129,56 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
                 Value::String(text.into())
             }
         }
+    })
+}
+
+/// Re-render a temporal value the way the `postgres` query source does —
+/// `timestamptz` as RFC 3339 in UTC, `timestamp` / `date` / `time` in chrono's
+/// ISO form — so a snapshot and the change stream spell one value one way.
+///
+/// The server renders these in the session's `DateStyle`, which the
+/// replication connection cannot pin. Under any style but `ISO` a date is
+/// ambiguous (`04/03/2026`) and a `timestamptz` carries a zone abbreviation, so
+/// a value that is not ISO fails the run instead of being passed on as text a
+/// sink would misread (#789 SQL-119). `infinity`, `-infinity` and BC dates
+/// pass through as the server spells them.
+fn temporal_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, Utc};
+    if matches!(text, "infinity" | "-infinity") || text.ends_with(" BC") {
+        return Ok(Value::String(text.into()));
+    }
+    let rendered = match type_oid {
+        OID_DATE => NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .ok()
+            .map(|d| d.to_string()),
+        OID_TIME => NaiveTime::parse_from_str(text, "%H:%M:%S%.f")
+            .ok()
+            .map(|t| t.to_string()),
+        OID_TIMESTAMP => NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+            .ok()
+            .map(|t| t.to_string()),
+        _ => DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z")
+            .ok()
+            .map(|t| {
+                t.with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, false)
+            }),
+    };
+    // Still ISO but outside these patterns (a seconds offset on a historic
+    // timestamptz): keep the server's spelling.
+    let iso_like = text.len() >= 10
+        && text.as_bytes()[4] == b'-'
+        && text.as_bytes()[7] == b'-'
+        && text[..4].bytes().all(|b| b.is_ascii_digit());
+    if rendered.is_none() && iso_like {
+        return Ok(Value::String(text.into()));
+    }
+    rendered.map(Value::String).ok_or_else(|| {
+        FaucetError::Source(format!(
+            "pgoutput: date/time value {text:?} (oid={type_oid}) is not in ISO format — set \
+             DateStyle to ISO for the replication role or database \
+             (ALTER ROLE … SET datestyle = 'ISO, MDY')"
+        ))
     })
 }
 
@@ -388,6 +439,43 @@ mod tests {
     }
 
     #[test]
+    fn temporal_values_are_normalised_or_refused() {
+        assert_eq!(
+            text_to_json(1184, "2026-03-04 10:00:00.12+05:30").unwrap(),
+            json!("2026-03-04T04:30:00.120+00:00")
+        );
+        assert_eq!(
+            text_to_json(1184, "2026-03-04 10:00:00-03").unwrap(),
+            json!("2026-03-04T13:00:00+00:00")
+        );
+        assert_eq!(
+            text_to_json(1114, "2026-03-04 10:00:00.5").unwrap(),
+            json!("2026-03-04 10:00:00.500")
+        );
+        assert_eq!(
+            text_to_json(1082, "2026-03-04").unwrap(),
+            json!("2026-03-04")
+        );
+        assert_eq!(text_to_json(1083, "23:59:59").unwrap(), json!("23:59:59"));
+        for raw in ["infinity", "-infinity", "0044-03-15 BC"] {
+            assert_eq!(text_to_json(1082, raw).unwrap(), json!(raw));
+        }
+        assert_eq!(
+            text_to_json(1184, "1890-01-01 00:00:00+05:53:28").unwrap(),
+            json!("1890-01-01 00:00:00+05:53:28"),
+            "ISO with a seconds offset passes through"
+        );
+        for (oid, raw) in [
+            (1082, "04/03/2026"),
+            (1184, "Wed Mar 04 10:00:00 2026 IST"),
+            (1114, "04.03.2026 10:00:00"),
+        ] {
+            let err = text_to_json(oid, raw).unwrap_err().to_string();
+            assert!(err.contains("DateStyle"), "{err}");
+        }
+    }
+
+    #[test]
     fn datetime_arrays_decode_to_strings() {
         // _timestamp (1115), _timestamptz (1185), _date (1182), _time (1183)
         // all map to text-passthrough element types. Commas-free literals so
@@ -398,7 +486,7 @@ mod tests {
         );
         assert_eq!(
             text_to_json(1185, r#"{"2026-05-17 12:34:56+00"}"#).unwrap(),
-            json!(["2026-05-17 12:34:56+00"])
+            json!(["2026-05-17T12:34:56+00:00"])
         );
         assert_eq!(
             text_to_json(1182, "{2026-05-17}").unwrap(),

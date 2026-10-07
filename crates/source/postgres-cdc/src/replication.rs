@@ -58,10 +58,73 @@ pub struct Client {
     _private: (),
 }
 
-/// Live replication stream.  Wraps [`pgwire_replication::ReplicationClient`].
-/// Obtained from [`start_replication`].
+/// Live replication stream. Obtained from [`start_replication`].
+///
+/// A pump task owns the [`pgwire_replication::ReplicationClient`] and drains
+/// its events into a local buffer the whole time, so the client's worker —
+/// which sends the Standby Status Updates — never blocks on a full channel
+/// while the pipeline is busy writing a page. Without it, a sink write longer
+/// than the server's `wal_sender_timeout` during catch-up got the replication
+/// connection killed (#789 SQL-88). The buffer holds at most
+/// `max_buffered_events`; past that the pump stops reading until the consumer
+/// catches up.
 pub struct Duplex {
-    inner: ReplicationClient,
+    events: tokio::sync::mpsc::UnboundedReceiver<Result<Option<ReplicationEvent>, FaucetError>>,
+    buffered: std::sync::Arc<tokio::sync::Semaphore>,
+    applied: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Duplex {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
+}
+
+impl Duplex {
+    fn spawn(mut client: ReplicationClient, max_buffered: usize) -> Self {
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let buffered = std::sync::Arc::new(tokio::sync::Semaphore::new(max_buffered.max(1)));
+        let applied = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (permits, lsn) = (buffered.clone(), applied.clone());
+        let pump = tokio::spawn(async move {
+            loop {
+                let Ok(permit) = permits.clone().acquire_owned().await else {
+                    return;
+                };
+                permit.forget();
+                let current = lsn.load(std::sync::atomic::Ordering::Acquire);
+                if current > 0 {
+                    client.update_applied_lsn(Lsn::from_u64(current));
+                }
+                let next = client
+                    .recv()
+                    .await
+                    .map_err(|e| pgwire_err("postgres-cdc recv", e));
+                let last = !matches!(next, Ok(Some(_)));
+                if tx.send(next).is_err() || last {
+                    return;
+                }
+            }
+        });
+        Self {
+            events,
+            buffered,
+            applied,
+            pump,
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<Option<ReplicationEvent>, FaucetError> {
+        let next = self.events.recv().await;
+        self.buffered.add_permits(1);
+        match next {
+            Some(event) => event,
+            None => Err(FaucetError::Source(
+                "postgres-cdc: replication reader stopped unexpectedly".into(),
+            )),
+        }
+    }
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────
@@ -94,6 +157,8 @@ pub struct ReplicationParams<'a> {
     pub slot_type: crate::config::SlotType,
     /// TLS settings for the replication connection.
     pub tls: &'a crate::config::CdcTls,
+    /// Events read ahead of the consumer while it is busy (see [`Duplex`]).
+    pub max_buffered_events: usize,
 }
 
 // ── Helper: parse a postgres URL into (host, port, user, password, dbname) ─
@@ -130,7 +195,26 @@ fn parse_url(url: &str) -> Result<PgCoords, FaucetError> {
         })?
         .to_owned();
     let port = parsed.port().unwrap_or(5432);
-    let user = parsed.username().to_owned();
+    // The `url` crate returns userinfo and path percent-encoded; libpq (and
+    // the sqlx control connections) decode them, and let `?user=`,
+    // `?password=` and `?dbname=` override them (#789 SQL-86).
+    let decode = |s: &str| -> Result<String, FaucetError> {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8()
+            .map(|c| c.into_owned())
+            .map_err(|e| FaucetError::Config(format!("postgres-cdc: connection URL: {e}")))
+    };
+    let mut user = decode(parsed.username())?;
+    let mut password = decode(parsed.password().unwrap_or(""))?;
+    let mut dbname = decode(parsed.path().trim_start_matches('/'))?;
+    for (k, v) in parsed.query_pairs() {
+        match k.as_ref() {
+            "user" => user = v.into_owned(),
+            "password" => password = v.into_owned(),
+            "dbname" => dbname = v.into_owned(),
+            _ => {}
+        }
+    }
     if user.is_empty() {
         return Err(FaucetError::Config(
             "postgres-cdc: connection URL is missing a user (expected \
@@ -138,8 +222,6 @@ fn parse_url(url: &str) -> Result<PgCoords, FaucetError> {
                 .to_owned(),
         ));
     }
-    let password = parsed.password().unwrap_or("").to_owned();
-    let dbname = parsed.path().trim_start_matches('/').to_owned();
     let dbname = if dbname.is_empty() {
         "postgres".to_owned()
     } else {
@@ -292,7 +374,10 @@ pub async fn drop_slot(
 /// TLS-downgrade / MITM window on the same credentials the replication stream
 /// guards (audit #321 M5). The explicit policy overrides any `sslmode=` in the
 /// URL (the config is authoritative).
-fn apply_cdc_tls(opts: PgConnectOptions, tls: &crate::config::CdcTls) -> PgConnectOptions {
+pub(crate) fn apply_cdc_tls(
+    opts: PgConnectOptions,
+    tls: &crate::config::CdcTls,
+) -> PgConnectOptions {
     use crate::config::CdcTls;
     use sqlx::postgres::PgSslMode;
     match tls {
@@ -340,8 +425,11 @@ fn tls_config(tls: &crate::config::CdcTls) -> TlsConfig {
 /// `confirmed_flush_lsn` — the client-supplied start LSN does not filter
 /// transactions that committed below it — so the only way to skip consumed
 /// changes is to move `confirmed_flush_lsn` forward here, while the slot is
-/// inactive. `pg_replication_slot_advance` never moves a slot backwards or
-/// past the server's insert pointer, so a stale or zero `lsn` is a safe no-op.
+/// inactive. `pg_replication_slot_advance` refuses to move a slot backwards,
+/// so an `lsn` at or below the slot's `confirmed_flush_lsn` is not sent: equal
+/// is the normal resume, and behind (a restored older bookmark, a `start_lsn`
+/// override) is logged — the changes in between were already confirmed and a
+/// slot cannot replay them; re-reading them needs a new slot (#789 SQL-154).
 ///
 /// The slot must be inactive, which it is between [`ensure_slot`] and
 /// [`start_replication`].
@@ -365,6 +453,32 @@ pub async fn advance_slot(
         .await
         .map_err(|e| pg_err("postgres-cdc advance_slot connect", e))?;
 
+    let confirmed: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+    )
+    .bind(slot_name)
+    .fetch_optional(&mut conn)
+    .await
+    .map_err(|e| pg_err("postgres-cdc slot lsn lookup", e))?;
+    let confirmed = confirmed
+        .and_then(|(c,)| c)
+        .map(|c| crate::state::parse_lsn(&c))
+        .transpose()?;
+    match advance_decision(lsn, confirmed) {
+        AdvanceDecision::Advance => {}
+        AdvanceDecision::AtSlot => return Ok(()),
+        AdvanceDecision::BehindSlot(at) => {
+            tracing::warn!(
+                slot = slot_name,
+                resume = %crate::state::format_lsn(lsn),
+                slot_confirmed = %crate::state::format_lsn(at),
+                "postgres-cdc: the resume position is behind the slot; the changes in between \
+                 were already confirmed and cannot be replayed from this slot — resuming from \
+                 the slot. Re-reading them needs a new slot and a fresh snapshot"
+            );
+            return Ok(());
+        }
+    }
     // Bind the slot name and the LSN (as pg_lsn text) as parameters — no string
     // interpolation into the SQL. `format_lsn` emits Postgres' canonical
     // `X/X` text form.
@@ -377,6 +491,23 @@ pub async fn advance_slot(
 
     debug!("postgres-cdc: advanced slot '{slot_name}' confirmed_flush_lsn to {lsn:#x}");
     Ok(())
+}
+
+/// What [`advance_slot`] does for a resume `lsn` against the slot's
+/// `confirmed_flush_lsn`.
+#[derive(Debug, PartialEq, Eq)]
+enum AdvanceDecision {
+    Advance,
+    AtSlot,
+    BehindSlot(u64),
+}
+
+fn advance_decision(lsn: u64, confirmed: Option<u64>) -> AdvanceDecision {
+    match confirmed {
+        Some(c) if lsn == c => AdvanceDecision::AtSlot,
+        Some(c) if lsn < c => AdvanceDecision::BehindSlot(c),
+        _ => AdvanceDecision::Advance,
+    }
 }
 
 /// Ensure the slot exists, then return the slot's **own consistent point** —
@@ -530,9 +661,9 @@ pub async fn start_replication(
 
     let inner = ReplicationClient::connect(cfg)
         .await
-        .map_err(|e| FaucetError::Source(format!("postgres-cdc start_replication: {e}")))?;
+        .map_err(|e| pgwire_err("postgres-cdc start_replication", e))?;
 
-    Ok(Duplex { inner })
+    Ok(Duplex::spawn(inner, params.max_buffered_events))
 }
 
 /// Report progress to the server (Standby Status Update).
@@ -550,8 +681,8 @@ pub async fn send_status_update(
     _reply_requested: bool,
 ) -> Result<(), FaucetError> {
     duplex
-        .inner
-        .update_applied_lsn(Lsn::from_u64(confirmed_lsn));
+        .applied
+        .fetch_max(confirmed_lsn, std::sync::atomic::Ordering::AcqRel);
     Ok(())
 }
 
@@ -579,12 +710,7 @@ pub async fn send_status_update(
 /// converted to `Ok(None)`.
 pub async fn recv(duplex: &mut Duplex) -> Result<Option<ReplicationEvent>, FaucetError> {
     loop {
-        match duplex
-            .inner
-            .recv()
-            .await
-            .map_err(|e| FaucetError::Source(format!("postgres-cdc recv: {e}")))?
-        {
+        match duplex.next_event().await? {
             None => return Ok(None),
 
             Some(ReplicationEvent::StoppedAt { .. }) => {
@@ -712,6 +838,29 @@ pub(crate) fn pg_err(context: &str, e: sqlx::Error) -> FaucetError {
     }))
 }
 
+/// Map a replication-client failure, keeping the server's SQLSTATE (which
+/// the client renders as a trailing `(SQLSTATE xxxxx)`) so the slot-active
+/// retry can recognise `START_REPLICATION` failures (#789 SQL-137).
+pub(crate) fn pgwire_err(context: &str, e: pgwire_replication::PgWireError) -> FaucetError {
+    let message = e.to_string();
+    let sqlstate = match &e {
+        pgwire_replication::PgWireError::Server(text) => sqlstate_suffix(text),
+        _ => None,
+    };
+    FaucetError::Custom(Box::new(PostgresError {
+        sqlstate,
+        context: context.to_string(),
+        message,
+    }))
+}
+
+/// The five-character code of a trailing `(SQLSTATE xxxxx)`.
+fn sqlstate_suffix(text: &str) -> Option<String> {
+    let rest = text.trim_end().strip_suffix(')')?;
+    let code = &rest[rest.rfind("(SQLSTATE ")? + "(SQLSTATE ".len()..];
+    (code.len() == 5 && code.chars().all(|c| c.is_ascii_alphanumeric())).then(|| code.to_string())
+}
+
 /// The SQLSTATE carried by a [`PostgresError`], if this error is one.
 fn sqlstate_of(err: &FaucetError) -> Option<&str> {
     match err {
@@ -773,6 +922,37 @@ mod tests {
     /// hop into `FaucetError`, because once the error is stringified the code
     /// cannot be recovered. A non-database `sqlx::Error` has no code, and must
     /// therefore carry `None` rather than a guess.
+    #[test]
+    fn advance_skips_positions_at_or_behind_the_slot() {
+        assert_eq!(advance_decision(10, Some(10)), AdvanceDecision::AtSlot);
+        assert_eq!(
+            advance_decision(5, Some(10)),
+            AdvanceDecision::BehindSlot(10)
+        );
+        assert_eq!(advance_decision(15, Some(10)), AdvanceDecision::Advance);
+        assert_eq!(advance_decision(15, None), AdvanceDecision::Advance);
+    }
+
+    #[test]
+    fn pgwire_server_errors_keep_their_sqlstate() {
+        let err = pgwire_err(
+            "postgres-cdc start_replication",
+            pgwire_replication::PgWireError::Server(
+                "replication slot \"s\" is active for PID 7 (SQLSTATE 55006)".into(),
+            ),
+        );
+        assert!(is_slot_active_error(&err));
+        let other = pgwire_err(
+            "x",
+            pgwire_replication::PgWireError::Server("boom (SQLSTATE 42P01)".into()),
+        );
+        assert!(!is_slot_active_error(&other));
+        let io = pgwire_err("x", pgwire_replication::PgWireError::Protocol("eof".into()));
+        assert_eq!(sqlstate_of(&io), None);
+        assert_eq!(sqlstate_suffix("no code here"), None);
+        assert_eq!(sqlstate_suffix("bad (SQLSTATE 55)"), None);
+    }
+
     #[test]
     fn pg_err_preserves_context_and_message_without_a_sqlstate() {
         let err = pg_err("postgres-cdc slot lookup", sqlx::Error::PoolTimedOut);
@@ -923,6 +1103,22 @@ mod tests {
         assert_eq!(c.user, "alice");
         assert_eq!(c.password, "secret");
         assert_eq!(c.dbname, "analytics");
+    }
+
+    #[test]
+    fn parse_url_percent_decodes_and_honours_query_overrides() {
+        let c = parse_url("postgres://al%40ice:p%40ss%2Fw@db:5432/my%20db").unwrap();
+        assert_eq!(c.user, "al@ice");
+        assert_eq!(c.password, "p@ss/w");
+        assert_eq!(c.dbname, "my db");
+        let c = parse_url("postgres://db/x?user=bob&password=s%26t&dbname=other&sslmode=require")
+            .unwrap();
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("bob", "s&t"));
+        assert_eq!(c.dbname, "other");
+        assert!(
+            parse_url("postgres://u:%FF@db/x").is_err(),
+            "invalid UTF-8 is refused"
+        );
     }
 
     #[test]

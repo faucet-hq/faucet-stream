@@ -21,6 +21,10 @@ fn default_idle_timeout() -> Duration {
 fn default_status_update_interval() -> Duration {
     Duration::from_secs(10)
 }
+fn default_max_buffered_events() -> usize {
+    100_000
+}
+
 fn default_tcp_keepalive() -> Duration {
     Duration::from_secs(60)
 }
@@ -54,15 +58,14 @@ pub struct PostgresCdcSourceConfig {
     #[serde(default = "default_true")]
     pub create_slot_if_missing: bool,
 
-    /// Whether a newly-created slot is `permanent` (survives disconnect) or
-    /// `temporary` (auto-dropped when the replication connection closes).
+    /// Lifetime of a newly-created slot. Only `permanent` (the default) is
+    /// accepted: a `temporary` slot is dropped with the session that creates
+    /// it, before replication can start on its own connection, so it is
+    /// refused at config load.
     ///
-    /// Default `permanent` (back-compatible). **A permanent slot pins WAL on
-    /// the server until it is consumed or dropped** — an abandoned permanent
-    /// slot fills `pg_wal` and can take the whole instance down. Use
-    /// `temporary` for ephemeral / test runs (note: a temporary slot resets on
-    /// reconnect, so bookmark-based resume across runs requires a permanent
-    /// slot). Drop an unused permanent slot explicitly with
+    /// **A permanent slot pins WAL on the server until it is consumed or
+    /// dropped** — an abandoned permanent slot fills `pg_wal` and can take the
+    /// whole instance down. Drop an unused slot explicitly with
     /// [`PostgresCdcSource::drop_slot`](crate::PostgresCdcSource::drop_slot).
     #[serde(default)]
     pub slot_type: SlotType,
@@ -156,6 +159,16 @@ pub struct PostgresCdcSourceConfig {
     #[serde(default)]
     pub max_staged_records: Option<usize>,
 
+    /// Replication events read ahead while the pipeline is busy writing a
+    /// page. Reading ahead keeps the replication client sending its status
+    /// updates, so a long sink write does not let the server's
+    /// `wal_sender_timeout` (default 60 s) end the connection. Past this many
+    /// buffered events reading pauses until the pipeline catches up — keep a
+    /// page write well under `wal_sender_timeout`, or raise it, if a page
+    /// write can outlast that much change volume. Default 100 000.
+    #[serde(default = "default_max_buffered_events")]
+    pub max_buffered_events: usize,
+
     /// Interval at which Standby Status Update keepalives are sent to the
     /// server. Must be shorter than `idle_timeout` and well under the
     /// server's `wal_sender_timeout` (default 60 s). Default: 10 s.
@@ -166,7 +179,10 @@ pub struct PostgresCdcSourceConfig {
     #[schemars(with = "u64")]
     pub status_update_interval: Duration,
 
-    /// TCP keepalive for the replication connection. Default: 60 s.
+    /// Accepted for compatibility and ignored: the replication client sets no
+    /// socket keepalive (a non-default value logs a warning). A dead
+    /// replication connection is detected through `status_update_interval`
+    /// and the server's `wal_sender_timeout`. Default: 60 s.
     #[serde(
         default = "default_tcp_keepalive",
         with = "faucet_core::config::duration_secs"
@@ -199,7 +215,8 @@ pub enum SlotType {
     /// Survives disconnect; pins WAL until consumed or dropped. Default.
     #[default]
     Permanent,
-    /// Auto-dropped by the server when the replication connection closes.
+    /// Refused at config load: dropped with the session that creates it,
+    /// before replication starts.
     Temporary,
 }
 
@@ -312,6 +329,24 @@ impl PostgresCdcSourceConfig {
                 "postgres-cdc: idle_timeout must be > 0".into(),
             ));
         }
+        if self.slot_type == SlotType::Temporary {
+            // A temporary slot belongs to the session that created it, and the
+            // replication client cannot create one on its own connection: the
+            // slot was dropped before START_REPLICATION ran (#789 SQL-47).
+            return Err(FaucetError::Config(
+                "postgres-cdc: slot_type: temporary is not supported — a temporary slot is \
+                 dropped with the session that creates it, before replication starts. Use a \
+                 permanent slot and drop it when done (PostgresCdcSource::drop_slot)"
+                    .into(),
+            ));
+        }
+        if self.tcp_keepalive != default_tcp_keepalive() {
+            tracing::warn!(
+                "postgres-cdc: tcp_keepalive has no effect — the replication client sets no \
+                 socket keepalive; a dead connection is detected through status updates and \
+                 the server's wal_sender_timeout"
+            );
+        }
         if self.status_update_interval >= self.idle_timeout {
             return Err(FaucetError::Config(format!(
                 "postgres-cdc: status_update_interval ({}s) must be \
@@ -414,6 +449,7 @@ mod tests {
             max_messages: None,
             max_cycle_duration: default_max_cycle_duration(),
             max_staged_records: None,
+            max_buffered_events: default_max_buffered_events(),
             status_update_interval: std::time::Duration::from_secs(10),
             tcp_keepalive: std::time::Duration::from_secs(60),
             batch_size: DEFAULT_BATCH_SIZE,

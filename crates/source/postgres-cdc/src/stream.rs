@@ -283,7 +283,9 @@ impl Source for PostgresCdcSource {
 
         // A bad connection URL is a config error, not an unreachable server.
         let opts: PgConnectOptions = match self.config.connection_url.parse() {
-            Ok(o) => o,
+            // The probe authenticates under the same TLS policy as every other
+            // connection, never sqlx's downgradable default (#789 SQL-87).
+            Ok(o) => crate::replication::apply_cdc_tls(o, &self.config.tls),
             Err(e) => {
                 return Ok(CheckReport::single(Probe::fail_hint(
                     "auth",
@@ -396,6 +398,7 @@ impl PostgresCdcSource {
                 tcp_keepalive: self.config.tcp_keepalive,
                 slot_type: self.config.slot_type,
                 tls: &self.config.tls,
+                max_buffered_events: self.config.max_buffered_events,
             };
             let client = replication::connect(&params).await?;
             replication::ensure_slot(
@@ -460,10 +463,18 @@ impl PostgresCdcSource {
             let mut total_records: usize = 0;
             let mut last_message_at = Instant::now();
             let cycle_started = Instant::now();
+            // Committed transactions waiting to go out as one page (#789
+            // SQL-118): pages are cut at `batch_size` records — never inside a
+            // transaction — or after `status_update_interval`, so a stream of
+            // small (or empty) commits costs one flush + state put per page,
+            // not per commit.
+            let mut batch = CommitBatch::default();
+            let flush_after = self.config.status_update_interval;
 
             loop {
                 let idle_deadline = last_message_at + idle_timeout;
-                let budget = idle_deadline
+                let deadline = batch.deadline(flush_after).map_or(idle_deadline, |d| d.min(idle_deadline));
+                let budget = deadline
                     .checked_duration_since(Instant::now())
                     .unwrap_or(Duration::ZERO);
 
@@ -516,6 +527,7 @@ impl PostgresCdcSource {
                             Ok(Err(e)) => {
                                 fatal = Some(e);
                             }
+                            Err(_timeout) if Instant::now() < idle_deadline => {}
                             Err(_timeout) => {
                                 tracing::debug!(
                                     "postgres-cdc: idle_timeout reached, stopping"
@@ -546,13 +558,7 @@ impl PostgresCdcSource {
                     // Postgres to discard WAL for changes that were never written
                     // downstream — a crash in that window loses data (#78/#1).
                     if per_transaction {
-                        self.emitted_lsn
-                            .fetch_max(lsn, std::sync::atomic::Ordering::Relaxed);
-                        let bookmark = Some(Bookmark::from_u64(lsn).to_value()?);
-                        yield StreamPage {
-                            records: drained,
-                            bookmark,
-                        };
+                        batch.push(lsn, drained);
                     } else {
                         agg_records.extend(drained);
                     }
@@ -566,6 +572,16 @@ impl PostgresCdcSource {
                 if cycle_ended(max_cycle, cycle_started.elapsed(), state.in_txn) {
                     tracing::debug!("postgres-cdc: max_cycle_duration reached, stopping");
                     stop = true;
+                }
+
+                if per_transaction
+                    && (stop || batch.is_due(batch_size, flush_after))
+                    && let Some((records, lsn)) = batch.take()
+                {
+                    self.emitted_lsn
+                        .fetch_max(lsn, std::sync::atomic::Ordering::Relaxed);
+                    let bookmark = Some(Bookmark::from_u64(lsn).to_value()?);
+                    yield StreamPage { records, bookmark };
                 }
 
                 if stop {
@@ -596,6 +612,44 @@ impl PostgresCdcSource {
                 "postgres-cdc: stream complete",
             );
         })
+    }
+}
+
+/// Committed transactions collected into the next page.
+#[derive(Default)]
+struct CommitBatch {
+    records: Vec<Value>,
+    lsn: Option<u64>,
+    since: Option<Instant>,
+}
+
+impl CommitBatch {
+    /// Add one committed transaction (possibly empty — its LSN still moves
+    /// the bookmark).
+    fn push(&mut self, lsn: u64, records: Vec<Value>) {
+        self.records.extend(records);
+        self.lsn = Some(lsn);
+        self.since.get_or_insert_with(Instant::now);
+    }
+
+    /// When the batch must go out by, if it holds anything.
+    fn deadline(&self, flush_after: Duration) -> Option<Instant> {
+        self.since.map(|t| t + flush_after)
+    }
+
+    /// Full (`batch_size` records, `0` = cut at every commit) or old enough.
+    fn is_due(&self, batch_size: usize, flush_after: Duration) -> bool {
+        self.lsn.is_some()
+            && (batch_size == 0
+                || self.records.len() >= batch_size
+                || self.since.is_some_and(|t| t.elapsed() >= flush_after))
+    }
+
+    /// The batch's records and commit LSN, emptying it.
+    fn take(&mut self) -> Option<(Vec<Value>, u64)> {
+        let lsn = self.lsn.take()?;
+        self.since = None;
+        Some((std::mem::take(&mut self.records), lsn))
     }
 }
 
@@ -916,6 +970,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn commit_batch_cuts_whole_transactions_by_size_or_age() {
+        let mut b = CommitBatch::default();
+        assert!(!b.is_due(2, Duration::from_secs(60)));
+        assert!(b.deadline(Duration::from_secs(1)).is_none());
+        b.push(10, vec![serde_json::json!(1)]);
+        assert!(!b.is_due(2, Duration::from_secs(60)));
+        b.push(11, vec![]);
+        assert!(
+            !b.is_due(2, Duration::from_secs(60)),
+            "an empty commit only moves the bookmark"
+        );
+        b.push(12, vec![serde_json::json!(2), serde_json::json!(3)]);
+        assert!(b.is_due(2, Duration::from_secs(60)));
+        assert_eq!(
+            b.take(),
+            Some((
+                vec![
+                    serde_json::json!(1),
+                    serde_json::json!(2),
+                    serde_json::json!(3)
+                ],
+                12
+            ))
+        );
+        assert_eq!(b.take(), None);
+        b.push(13, vec![]);
+        assert!(b.deadline(Duration::from_secs(1)).is_some());
+        assert!(b.is_due(100, Duration::ZERO), "old enough");
+        assert!(b.is_due(0, Duration::from_secs(60)));
+    }
 
     #[test]
     fn a_cycle_ends_at_its_bound_only_outside_a_transaction() {
