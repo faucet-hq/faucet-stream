@@ -1192,6 +1192,22 @@ pub async fn submit(
             release_orphaned_claim(&state, &req, &run_id).await;
             return Err(ServeError::Internal(e.to_string()));
         }
+        // The admission lock is per instance, so two instances can both have
+        // admitted the last slot: re-count with the record in place and back
+        // out (#789 SERVE-43). Racing submitters may both back out — the safe
+        // direction; either retries.
+        #[cfg(feature = "tenants")]
+        if let Some(t) = rec.tenant.as_deref()
+            && let Some(msg) = crate::serve::tenants::over_limit(&state, t).await?
+            && state
+                .history()
+                .cancel_pending(&run_id)
+                .await
+                .unwrap_or(false)
+        {
+            release_orphaned_claim(&state, &req, &run_id).await;
+            return Err(ServeError::TooManyRequests(msg));
+        }
         // Release the local queue reservation (cluster runs are bounded by the
         // claim loop + semaphore, not the submit-side queue).
         drop(reservation);

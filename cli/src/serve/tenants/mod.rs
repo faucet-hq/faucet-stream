@@ -384,6 +384,24 @@ pub async fn admit(
     Ok(Admission { _guard: guard })
 }
 
+/// Whether `tenant` is past its `max_concurrent_runs` now that a new run is
+/// recorded (the cluster re-check after admission). `Some(message)` when it is.
+pub async fn over_limit(state: &ServerState, tenant: &str) -> Result<Option<String>, ServeError> {
+    let rec = get_tenant(state, tenant).await?;
+    let Some(max) = rec.limits.max_concurrent_runs else {
+        return Ok(None);
+    };
+    let active = active_runs(state, tenant, max as usize + 1).await?;
+    if active > max as usize {
+        metrics::record_limit_rejection(tenant, "max_concurrent_runs");
+        return Ok(Some(format!(
+            "tenant '{tenant}' already has {max} run(s) queued or running across the cluster \
+             (limit max_concurrent_runs = {max})"
+        )));
+    }
+    Ok(None)
+}
+
 /// Runs for `tenant` that are queued, pending, running or sharded, counted
 /// up to `cap`.
 pub async fn active_runs(
@@ -960,6 +978,30 @@ mod tests {
         ));
         let v = state.tenants().vault.clone().unwrap();
         (state, v)
+    }
+
+    #[tokio::test]
+    async fn over_limit_counts_runs_already_recorded_across_the_cluster() {
+        let (state, _) = state_with_vault();
+        let mut t = tenant("acme");
+        state.history().tenant_upsert(&t).await.unwrap();
+        assert!(
+            over_limit(&state, "acme").await.unwrap().is_none(),
+            "no limit"
+        );
+        t.limits.max_concurrent_runs = Some(1);
+        state.history().tenant_upsert(&t).await.unwrap();
+        for id in ["r1", "r2"] {
+            let mut rec = RunRecord::queued(id.into(), None, Default::default(), None, Utc::now());
+            rec.tenant = Some("acme".into());
+            state.history().upsert(&rec).await.unwrap();
+            state.history().tenant_run_link(id, "acme").await.unwrap();
+        }
+        let msg = over_limit(&state, "acme")
+            .await
+            .unwrap()
+            .expect("two runs, limit one");
+        assert!(msg.contains("across the cluster"), "{msg}");
     }
 
     #[tokio::test]
