@@ -803,12 +803,13 @@ pub async fn materialize(
         }
         TemplateKind::Deployment => return Err(not_runnable_deployment(id)),
     }
-    let doc = parse_body(&record.body, record.format)?;
+    let mut doc = parse_body(&record.body, record.format)?;
+    let name = default_name(&mut doc, &record.id);
     let (body, bound) = bind_document_for_run(doc, supplied, env_overrides, mode)?;
     Ok(MaterializedConfig {
         template_id: record.id.clone(),
         version: record.version,
-        name: record.name.clone(),
+        name: Some(name),
         body,
         params_redacted: bound.redacted(),
         used_secret_params: bound.has_supplied_secrets(),
@@ -1105,6 +1106,20 @@ async fn fetch_version(store: &TemplateStore, id: &str, version: u32) -> CliResu
 /// The shared tail of materialization: (Local only) resolve load-time
 /// directives with the env overlay, bind `${param.*}` strictly, drop the
 /// `params:` block, and re-serialize as JSON.
+/// A pipeline template without `name:` runs as its template id: the name is
+/// the state-key namespace, and the run paths' own fallbacks (`pipeline` for
+/// the CLI, `serve` for a server) would make every unnamed template share
+/// bookmarks, and one template key differently on each path.
+fn default_name(doc: &mut Value, id: &str) -> String {
+    if let Some(name) = doc.get("name").and_then(Value::as_str) {
+        return name.to_string();
+    }
+    if let Some(map) = doc.as_object_mut() {
+        map.insert("name".into(), Value::String(id.to_string()));
+    }
+    id.to_string()
+}
+
 fn bind_document_for_run(
     mut doc: Value,
     supplied: &SuppliedParams,
@@ -1689,6 +1704,28 @@ pipeline:
         assert_eq!(out.params_redacted["tenant_id"], json!("acme"));
         assert_eq!(out.params_redacted["page"], json!(100));
         assert!(!out.used_secret_params);
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_template_runs_under_its_id() {
+        let s = store();
+        let body = "version: 1\npipeline:\n  source: { type: csv, config: { path: a.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n";
+        let mut r = req_launched(body);
+        r.id = Some("orders-sync".into());
+        register(&s, r).await.unwrap();
+        let out = materialize(
+            &s,
+            "orders-sync",
+            1,
+            &SuppliedParams::new(),
+            &BTreeMap::new(),
+            Materialize::Local,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.name.as_deref(), Some("orders-sync"));
+        let doc: Value = serde_json::from_str(&out.body).unwrap();
+        assert_eq!(doc["name"], "orders-sync");
     }
 
     #[tokio::test]

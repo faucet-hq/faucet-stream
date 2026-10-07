@@ -142,6 +142,11 @@ under the same id with a different kind is refused. A document without `kind:`
 is still accepted as a pipeline but prints a deprecation notice — add
 `kind: pipeline` to a complete config.
 
+A pipeline template's `name:` is its state-key namespace (`{name}::{row}`).
+One registered without a `name:` runs under its **template id** — the same on
+`faucet template run`, a server trigger and MCP — so two unnamed templates
+sharing a state store never read each other's bookmarks.
+
 ```bash
 faucet template register hub/source-templates/acme/billing.yaml --launch    # id = acme/billing
 faucet template register hub/sink-templates/faucet-hq/bigquery.yaml --launch  # id = faucet-hq/bigquery
