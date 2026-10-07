@@ -33,6 +33,10 @@ cargo install faucet-cli --features source-postgres-cdc
 
 ## Postgres setup (one-time)
 
+**PostgreSQL 14 or newer is required**: the replication stream is opened with
+the pgoutput `messages` option, which PostgreSQL 13 and older reject.
+`faucet doctor` reports the server version as a `server_version` probe.
+
 Logical replication is off by default and requires a server restart to enable. Run this once as a superuser before pointing faucet at the database:
 
 ```sql

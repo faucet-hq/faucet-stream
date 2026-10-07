@@ -306,6 +306,20 @@ impl Source for PostgresCdcSource {
                 )
             })?;
 
+            let version = match sqlx::query_scalar::<_, String>(
+                "SELECT current_setting('server_version_num')",
+            )
+            .fetch_one(&mut conn)
+            .await
+            {
+                Ok(v) => server_version_probe(&v, start.elapsed()),
+                Err(e) => Probe::fail(
+                    "server_version",
+                    start.elapsed(),
+                    format!("could not read server_version_num: {e}"),
+                ),
+            };
+
             let row: Option<(String,)> = sqlx::query_as(
                 "SELECT slot_name::text FROM pg_replication_slots WHERE slot_name = $1",
             )
@@ -320,28 +334,58 @@ impl Source for PostgresCdcSource {
                 )
             })?;
 
-            Ok::<Probe, Probe>(match row {
-                Some(_) => Probe::pass("slot", start.elapsed()),
-                None => Probe::skip(
-                    "slot",
-                    format!(
-                        "replication slot {} does not exist yet (faucet run can create it)",
-                        self.config.slot_name
+            Ok::<Vec<Probe>, Probe>(vec![
+                version,
+                match row {
+                    Some(_) => Probe::pass("slot", start.elapsed()),
+                    None => Probe::skip(
+                        "slot",
+                        format!(
+                            "replication slot {} does not exist yet (faucet run can create it)",
+                            self.config.slot_name
+                        ),
                     ),
-                ),
-            })
+                },
+            ])
         };
 
-        let probe = match tokio::time::timeout(ctx.timeout, probe).await {
-            Ok(Ok(p)) | Ok(Err(p)) => p,
-            Err(_elapsed) => Probe::fail_hint(
+        let probes = match tokio::time::timeout(ctx.timeout, probe).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(p)) => vec![p],
+            Err(_elapsed) => vec![Probe::fail_hint(
                 "auth",
                 start.elapsed(),
                 "connection timed out",
                 "the database did not respond within the check timeout",
-            ),
+            )],
         };
-        Ok(CheckReport::single(probe))
+        Ok(CheckReport { probes })
+    }
+}
+
+/// Oldest server the replication protocol works against: `START_REPLICATION`
+/// passes the pgoutput `messages` option, which PostgreSQL 13 rejects (SQL-153).
+const MIN_SERVER_VERSION_NUM: i64 = 140_000;
+
+/// The `server_version` doctor probe for a `server_version_num` value.
+fn server_version_probe(
+    version_num: &str,
+    elapsed: std::time::Duration,
+) -> faucet_core::check::Probe {
+    use faucet_core::check::Probe;
+    match version_num.trim().parse::<i64>() {
+        Ok(n) if n >= MIN_SERVER_VERSION_NUM => Probe::pass("server_version", elapsed),
+        Ok(n) => Probe::fail_hint(
+            "server_version",
+            elapsed,
+            format!("PostgreSQL server_version_num {n} is older than 14"),
+            "postgres-cdc needs PostgreSQL 14 or newer (pgoutput `messages` option)",
+        ),
+        Err(_) => Probe::fail(
+            "server_version",
+            elapsed,
+            format!("unreadable server_version_num `{version_num}`"),
+        ),
     }
 }
 
@@ -880,6 +924,29 @@ fn cycle_ended(max_cycle: Duration, elapsed: Duration, in_txn: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn server_version_probe_requires_postgres_14() {
+        use faucet_core::check::ProbeStatus;
+        let d = std::time::Duration::ZERO;
+        assert!(matches!(
+            super::server_version_probe("140000", d).status,
+            ProbeStatus::Pass
+        ));
+        assert!(matches!(
+            super::server_version_probe(" 160004", d).status,
+            ProbeStatus::Pass
+        ));
+        let old = super::server_version_probe("130012", d);
+        assert!(
+            matches!(&old.status, ProbeStatus::Fail { reason } if reason.contains("130012")),
+            "{old:?}"
+        );
+        assert!(matches!(
+            super::server_version_probe("x", d).status,
+            ProbeStatus::Fail { .. }
+        ));
+    }
 
     #[tokio::test]
     async fn routes_by_schema_table_and_orders_by_lsn() {
