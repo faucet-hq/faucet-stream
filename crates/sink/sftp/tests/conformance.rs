@@ -55,7 +55,7 @@ fn conformance_connector_name_nonempty() {
 
 // ── Check 5: capabilities truthful (Docker) ─────────────────────────────────
 
-async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
+async fn start_sftp_inner() -> Option<(ContainerAsync<GenericImage>, u16)> {
     let image = GenericImage::new("atmoz/sftp", "latest")
         .with_exposed_port(22.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
@@ -124,4 +124,15 @@ async fn conformance_capabilities_truthful() {
     // The honest branch must leave the append-only sink non-idempotent.
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
+}
+
+/// [`start_sftp_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
+/// is set — CI provides Docker, so an unavailable backend is a failure there.
+async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    let started = start_sftp_inner().await;
+    assert!(
+        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+        "start_sftp: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
+    );
+    started
 }

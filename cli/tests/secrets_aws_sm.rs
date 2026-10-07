@@ -11,6 +11,10 @@
 #[ignore = "requires LocalStack (set AWS_SM_TEST=1 and run with --ignored)"]
 async fn resolves_aws_secret_field_end_to_end() {
     if std::env::var("AWS_SM_TEST").as_deref() != Ok("1") {
+        assert!(
+            std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+            "AWS_SM_TEST is unset and FAUCET_REQUIRE_BACKENDS is set"
+        );
         return;
     }
     use faucet_cli::config::PipelineConfig;

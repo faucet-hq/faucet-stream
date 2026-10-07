@@ -15,7 +15,7 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 
-async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {
+async fn spawn_fake_gcs_inner() -> Option<(ContainerAsync<GenericImage>, String, String)> {
     let image = GenericImage::new("fsouza/fake-gcs-server", "latest")
         .with_exposed_port(4443.tcp())
         .with_wait_for(WaitFor::message_on_stderr("server started at"))
@@ -158,4 +158,15 @@ async fn sink_rolls_files_per_max_records_per_file() {
         pages.push(p.unwrap());
     }
     assert_eq!(pages.len(), 3, "expected 3 rolled files");
+}
+
+/// [`spawn_fake_gcs_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
+/// is set — CI provides Docker, so an unavailable backend is a failure there.
+async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {
+    let started = spawn_fake_gcs_inner().await;
+    assert!(
+        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+        "spawn_fake_gcs: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
+    );
+    started
 }

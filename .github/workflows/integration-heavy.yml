@@ -1,0 +1,115 @@
+# Nightly run of the integration suites too heavy for every PR (#789 SUPPLY-09):
+# the `#[ignore]`d SQL Server CDC tests (~2 GB image), the secrets-manager
+# end-to-end tests (live Vault + LocalStack) and the scaffold build (a nested
+# `cargo test`). FAUCET_REQUIRE_BACKENDS turns a backend that fails to start
+# into a test failure, so a broken image or service shows up here instead of a
+# silent skip.
+name: Integration (heavy)
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-C debuginfo=0"
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  FAUCET_REQUIRE_BACKENDS: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-heavy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mssql-cdc:
+    name: SQL Server CDC (ignored suites)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run the ignored SQL Server CDC suites
+        run: >-
+          scripts/retry-on-image-pull.sh cargo test -p faucet-source-mssql-cdc --all-features
+          -- --include-ignored --test-threads=1
+
+  secrets:
+    name: Secrets managers (Vault + LocalStack)
+    runs-on: ubuntu-latest
+    services:
+      vault:
+        image: hashicorp/vault:1.17
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: root
+        ports:
+          - 8200:8200
+        options: --cap-add=IPC_LOCK
+      localstack:
+        image: localstack/localstack:3.8
+        env:
+          SERVICES: secretsmanager
+        ports:
+          - 4566:4566
+    env:
+      VAULT_TEST: "1"
+      VAULT_ADDR: http://127.0.0.1:8200
+      VAULT_TOKEN: root
+      AWS_SM_TEST: "1"
+      AWS_ENDPOINT_URL: http://127.0.0.1:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.96.0"
+      - name: Install librdkafka prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Seed the secrets
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            curl -fsS "$VAULT_ADDR/v1/sys/health" >/dev/null && break
+            sleep 2
+          done
+          curl -fsS -H "X-Vault-Token: $VAULT_TOKEN" -X POST \
+            -d '{"data":{"token":"live-token-value"}}' \
+            "$VAULT_ADDR/v1/secret/data/faucet/api"
+          for _ in $(seq 1 60); do
+            aws --endpoint-url "$AWS_ENDPOINT_URL" secretsmanager list-secrets >/dev/null 2>&1 && break
+            sleep 2
+          done
+          aws --endpoint-url "$AWS_ENDPOINT_URL" secretsmanager create-secret \
+            --name prod/faucet --secret-string '{"token":"aws-live-token"}'
+      - name: Run the ignored secrets tests
+        run: >-
+          cargo test -p faucet-cli --features secrets-vault,secrets-aws-sm
+          --test secrets_vault --test secrets_aws_sm -- --ignored
+
+  scaffold:
+    name: Connector scaffold builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.96.0"
+      - name: Install librdkafka prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run the ignored scaffold build tests
+        run: cargo test -p faucet-cli --test scaffold_build -- --ignored

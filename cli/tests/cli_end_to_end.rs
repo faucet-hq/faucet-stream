@@ -582,6 +582,10 @@ fn run_schema_drift_fail_fires_through_a_schema_reporting_sink() {
 
     // Pre-create the destination table as a STRICT SUBSET of the source rows.
     if !sqlite_exec(&db, "CREATE TABLE t (id INTEGER);") {
+        assert!(
+            std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+            "sqlite3 CLI not available and FAUCET_REQUIRE_BACKENDS is set"
+        );
         eprintln!("skipping: sqlite3 CLI not available");
         return;
     }
@@ -638,6 +642,10 @@ fn run_schema_drift_ignore_strips_unknown_columns_through_sqlite() {
     fs::write(&csv, "id,name\n1,alice\n2,bob\n").unwrap();
 
     if !sqlite_exec(&db, "CREATE TABLE t (id INTEGER);") {
+        assert!(
+            std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+            "sqlite3 CLI not available and FAUCET_REQUIRE_BACKENDS is set"
+        );
         eprintln!("skipping: sqlite3 CLI not available");
         return;
     }

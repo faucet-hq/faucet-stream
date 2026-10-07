@@ -102,6 +102,10 @@ async fn every_writable_format_takes_every_option_on_sftp() {
     let container = match image.start().await {
         Ok(c) => c,
         Err(e) => {
+            assert!(
+                std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+                "Docker unavailable and FAUCET_REQUIRE_BACKENDS is set: {e}"
+            );
             eprintln!("Skipping: Docker not available ({e})");
             return;
         }

@@ -23,7 +23,7 @@ const USER: &str = "faucet";
 const PASS: &str = "secret";
 
 /// Seed the server with `files` (name → raw bytes, so binary formats work).
-async fn start_sftp(files: &[(String, Vec<u8>)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
+async fn start_sftp_inner(files: &[(String, Vec<u8>)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
     let mut image = GenericImage::new("atmoz/sftp", "alpine")
         .with_exposed_port(22.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
@@ -253,4 +253,15 @@ async fn parquet_files_decode_and_project() {
     assert_eq!(total, 4);
     let all = src.fetch_all().await.unwrap();
     assert!(all.iter().all(|r| r.as_object().unwrap().len() == 1));
+}
+
+/// [`start_sftp_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
+/// is set — CI provides Docker, so an unavailable backend is a failure there.
+async fn start_sftp(files: &[(String, Vec<u8>)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
+    let started = start_sftp_inner(files).await;
+    assert!(
+        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+        "start_sftp: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
+    );
+    started
 }
