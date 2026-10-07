@@ -196,8 +196,11 @@ curl -X POST localhost:8080/v1/templates/crm-contacts/fanout \
 tenant runs as itself; the response has one entry per tenant —
 `submitted` (with `run_id`), `pending_approval`, `skipped` (a missing or
 revoked connection, a suspended tenant, a tenant at its limit — with the
-reason) or `failed`. An `idempotency_key` is suffixed `:<tenant>`, and every
-run carries a `fanout` label with the fan-out's id.
+reason) or `failed` (including an `idempotency_key` reused with a different
+body). An `idempotency_key` is suffixed `:<tenant>`, and every run carries a
+`fanout` label with the fan-out's id — derived from the key when one is given,
+so retrying a keyed fan-out after a lost response answers with the same
+`fanout_id` and every tenant's original `run_id`.
 
 A fan-out body is a trigger body, so it takes a `selection` too — every tenant
 runs the same subset of the template's streams:

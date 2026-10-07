@@ -609,7 +609,28 @@ pub struct FanoutResponse {
 /// than a real failure: a missing or revoked connection, a suspended tenant,
 /// or a tenant at its concurrency limit.
 fn is_skip(e: &ServeError) -> bool {
-    matches!(e, ServeError::Conflict(_) | ServeError::TooManyRequests(_))
+    match e {
+        // A reused idempotency key with another payload is a caller error,
+        // not a tenant to skip (#789 SERVE-36).
+        ServeError::Conflict(m) => m != crate::serve::runner::IDEMPOTENCY_CONFLICT,
+        ServeError::TooManyRequests(_) => true,
+        _ => false,
+    }
+}
+
+/// The fan-out id: derived from the caller's idempotency key when one is
+/// given, so a retried fan-out replays every tenant's run instead of
+/// conflicting on a fresh label.
+fn fanout_id_for(body: &FanoutBody) -> String {
+    use sha2::{Digest, Sha256};
+    match &body.trigger.idempotency_key {
+        Some(k) => {
+            let digest = Sha256::digest(k.as_bytes());
+            let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+            format!("key-{hex}")
+        }
+        None => uuid::Uuid::now_v7().to_string(),
+    }
 }
 
 /// Trigger a template once per tenant, at most `concurrency` at a time.
@@ -691,7 +712,7 @@ pub async fn fanout_template(
     Path(id): Path<String>,
     Json(body): Json<FanoutBody>,
 ) -> Result<Json<FanoutResponse>, ServeError> {
-    let fanout_id = uuid::Uuid::now_v7().to_string();
+    let fanout_id = fanout_id_for(&body);
     let results = fan_out(&state, &actor, &id, body, &fanout_id).await?;
     crate::serve::audit::write(
         &state,

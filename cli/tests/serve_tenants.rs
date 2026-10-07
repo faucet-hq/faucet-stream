@@ -401,6 +401,46 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     assert_eq!(acme_runs.len(), 2, "{page}");
     assert!(acme_runs.iter().all(|r| r["tenant"] == "acme"));
 
+    // A retried keyed fan-out replays every tenant's run (#789 SERVE-36).
+    let keyed = json!({"tenants": "all", "idempotency_key": "fan-1"});
+    let (_, first) = api
+        .post(
+            "op-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            keyed.clone(),
+        )
+        .await;
+    let (_, again) = api
+        .post("op-tok", &format!("/v1/templates/{id}/fanout"), keyed)
+        .await;
+    assert_eq!(first["fanout_id"], again["fanout_id"], "{again}");
+    for (a, b) in first["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(again["results"].as_array().unwrap())
+    {
+        assert_eq!(b["status"], "submitted", "{again}");
+        assert_eq!(a["run_id"], b["run_id"], "{again}");
+        api.wait_run(a["run_id"].as_str().unwrap()).await;
+    }
+    // The same key with another payload is a failure, not a skip.
+    let (_, other) = api
+        .post(
+            "op-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            json!({"tenants": "all", "idempotency_key": "fan-1", "labels": {"x": "y"}}),
+        )
+        .await;
+    assert!(
+        other["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["status"] == "failed"),
+        "{other}"
+    );
+
     // ── Tenant-scoped principal ────────────────────────────────────────────
     let (_, mine) = api.get("acme-tok", "/v1/runs").await;
     assert!(
@@ -421,6 +461,32 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     let (code, tenants) = api.get("acme-tok", "/v1/tenants").await;
     assert_eq!(code, 200);
     assert_eq!(tenants.as_array().unwrap().len(), 1);
+    // The rows endpoint shows a tenant no shared state or run history
+    // (#789 SERVE-31); an admin still sees it.
+    let (code, rows) = api
+        .get("acme-tok", &format!("/v1/templates/{id}/rows"))
+        .await;
+    assert_eq!(code, 200, "{rows}");
+    assert!(
+        rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r.get("state").is_none()),
+        "{rows}"
+    );
+    assert!(
+        rows.to_string()
+            .contains("not shown to a tenant-scoped principal"),
+        "{rows}"
+    );
+    let (_, rows) = api
+        .get("admin-tok", &format!("/v1/templates/{id}/rows"))
+        .await;
+    assert!(
+        !rows.to_string().contains("tenant-scoped principal"),
+        "{rows}"
+    );
     let (code, _) = api.get("acme-tok", "/v1/audit").await;
     assert_eq!(code, 403);
     // An operator-level route outside the tenant's scope is refused for the
@@ -1171,6 +1237,31 @@ async fn tenant_notification_secrets_are_sealed_and_masked_and_run_credentials_a
         )
         .await;
     assert_eq!(code, 400);
+    // A run whose tenant mapping cannot be written is not recorded at all
+    // (#789 SERVE-29): no stranded `queued` record behind a 500.
+    {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db.display()))
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE faucet_tenant_runs")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+    let cfg = format!(
+        "version: 1\nname: linkfail\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: http://127.0.0.1:9\n      path: /x\n  sink:\n    type: jsonl\n    config:\n      path: {}/l.jsonl\n",
+        dir.path().display()
+    );
+    let (code, r) = api
+        .post("op-tok", "/v1/tenants/acme/runs", json!({ "config": cfg }))
+        .await;
+    assert_eq!(code, 500, "{r}");
+    let (_, page) = api.get("admin-tok", "/v1/runs").await;
+    assert!(
+        !page.to_string().contains("linkfail"),
+        "no record was written: {page}"
+    );
     drop(api);
     let conn = rusqlite_free_read(&db, "acme");
     assert!(

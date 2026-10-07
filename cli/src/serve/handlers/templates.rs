@@ -512,11 +512,23 @@ pub async fn template_rows(
                     version: q.overlay_version.unwrap_or_default(),
                 }),
             selection: selection.as_ref(),
-            state: q.state.unwrap_or(true),
+            // The state and run history behind a row are every tenant's
+            // (state keys and run labels are shared by everyone running the
+            // template), so a tenant-scoped principal gets the rows without
+            // them (#789 SERVE-31).
+            state: q.state.unwrap_or(true) && actor.tenant.is_none(),
         },
     )
     .await
     .map_err(map_err)?;
+    let mut report = report;
+    if actor.tenant.is_some() && q.state.unwrap_or(true) {
+        report.notes.push(
+            "state omitted: run state and history are not shown to a tenant-scoped principal; \
+             list your runs with GET /v1/runs"
+                .to_string(),
+        );
+    }
     crate::serve::audit::write(&state, &actor, "template.rows", None, None, "ok").await;
     Ok(Json(report))
 }

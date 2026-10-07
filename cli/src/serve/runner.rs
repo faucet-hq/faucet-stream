@@ -149,6 +149,9 @@ pub async fn submit_gated(
     Ok(SubmitOutcome::Accepted(submit(state, req, actor).await?))
 }
 
+/// The 409 message of an idempotency key reused with a different payload.
+pub(crate) const IDEMPOTENCY_CONFLICT: &str = "idempotency key reused with a different payload";
+
 /// Refuse a write that would bypass `--require-approval run` (#789
 /// SERVE-18): verify repair and DLQ replay write to a sink outside the run
 /// queue, so under approval they must be proposed as a `run` change instead.
@@ -1115,9 +1118,7 @@ pub async fn submit(
                 return replay_response(&state, &actor, &existing).await;
             }
             Claim::Conflict => {
-                return Err(ServeError::Conflict(
-                    "idempotency key reused with a different payload".into(),
-                ));
+                return Err(ServeError::Conflict(IDEMPOTENCY_CONFLICT.into()));
             }
         }
         // A `Fresh` claim is recorded BEFORE the record upsert below. The memory
@@ -1170,6 +1171,12 @@ pub async fn submit(
         rec.timeout_secs = req.timeout_secs;
         rec.clock = req.clock.clone();
         rec.concurrency = req.concurrency;
+        // The tenant link goes first (#789 SERVE-29): once the record exists
+        // a peer may claim and run it, so nothing may fail after that.
+        if let Err(e) = link_tenant_run(&state, &rec).await {
+            release_orphaned_claim(&state, &req, &run_id).await;
+            return Err(e);
+        }
         if let Err(e) = state.history().upsert(&rec).await {
             // The record write that should follow a `Fresh` claim failed — release
             // the orphaned claim so a replay starts fresh instead of 404-ing for
@@ -1177,7 +1184,6 @@ pub async fn submit(
             release_orphaned_claim(&state, &req, &run_id).await;
             return Err(ServeError::Internal(e.to_string()));
         }
-        link_tenant_run(&state, &rec).await?;
         // Release the local queue reservation (cluster runs are bounded by the
         // claim loop + semaphore, not the submit-side queue).
         drop(reservation);
@@ -1198,12 +1204,15 @@ pub async fn submit(
         });
     }
 
+    if let Err(e) = link_tenant_run(&state, &rec).await {
+        release_orphaned_claim(&state, &req, &run_id).await;
+        return Err(e);
+    }
     if let Err(e) = state.history().upsert(&rec).await {
         // See the cluster path above: release the orphaned claim (F21).
         release_orphaned_claim(&state, &req, &run_id).await;
         return Err(ServeError::Internal(e.to_string()));
     }
-    link_tenant_run(&state, &rec).await?;
 
     let run_token = CancellationToken::new();
     state.registry().register(run_id.clone(), run_token.clone());
@@ -1368,9 +1377,7 @@ async fn replay_response(
         .map_err(|e| ServeError::Internal(e.to_string()))?
         .ok_or(ServeError::NotFound)?;
     if !actor.sees_tenant(rec.tenant.as_deref()) {
-        return Err(ServeError::Conflict(
-            "idempotency key reused with a different payload".into(),
-        ));
+        return Err(ServeError::Conflict(IDEMPOTENCY_CONFLICT.into()));
     }
     Ok(SubmitResponse {
         run_id: rec.run_id,

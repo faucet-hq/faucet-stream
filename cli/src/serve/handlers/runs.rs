@@ -315,6 +315,23 @@ pub async fn list_runs(
     }))
 }
 
+/// The state-key prefix a serve run's markers live under: the config's
+/// `name` (else `serve`, as the runner names it), behind the tenant
+/// namespace for a tenant run.
+fn rollback_pipeline_name(loaded: &crate::serve::load::LoadedSubmission) -> String {
+    let base = loaded
+        .cfg
+        .name
+        .clone()
+        .unwrap_or_else(|| "serve".to_string());
+    loaded
+        .tenant
+        .as_ref()
+        .map(|t| t.state_scope())
+        .unwrap_or_default()
+        .prefix(&base)
+}
+
 /// `POST /v1/runs/{id}/rollback` request body (#706).
 #[derive(Debug, Deserialize, Default)]
 pub struct RollbackRequest {
@@ -412,23 +429,16 @@ pub async fn rollback_run(
             });
         }
     };
-    let loaded = crate::serve::load::load_submission(
-        &config,
-        format,
-        state.default_base().as_ref(),
-        crate::serve::runner::server_policy(&state).as_deref(),
-        origin,
-    )
-    .await?;
+    // Load as the run was executed: under its tenant (connections, state
+    // namespace) when it had one (#789 SERVE-27).
+    let loaded =
+        crate::serve::runner::load_for(&state, &config, format, rec.tenant.as_deref(), origin)
+            .await?;
     loaded.require_matrix()?;
-    let auth = crate::auth_catalog::build_auth_catalog(loaded.cfg.auth.as_ref())
+    let auth = loaded
+        .auth_catalog()
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
-    let pipeline_name = loaded
-        .cfg
-        .name
-        .clone()
-        .or(rec.name.clone())
-        .unwrap_or_else(|| "pipeline".to_string());
+    let pipeline_name = rollback_pipeline_name(&loaded);
     let (node, store, marker) = crate::rollback::locate(
         &loaded.nodes,
         &pipeline_name,
