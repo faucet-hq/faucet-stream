@@ -694,3 +694,114 @@ async fn a_quiet_first_cycle_anchors_and_a_filtered_drop_ends_the_stream() {
         .await
         .expect("resuming past the invalidate finishes");
 }
+
+async fn seed(uri: &str, docs: Vec<Document>) {
+    let client = Client::with_uri_str(uri).await.expect("seed client");
+    client
+        .database(DB)
+        .collection::<Document>(COLL)
+        .insert_many(docs)
+        .await
+        .expect("seed insert");
+}
+
+/// A cycle that delivers nothing (every change filtered out) still ends with
+/// a bookmark at the stream's post-batch token, past the filtered changes, so
+/// a quiet stream's position never falls out of the oplog window (#789
+/// MSG-33).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_filtered_cycle_advances_the_bookmark_past_filtered_changes() {
+    let (_container, uri) = start_repl_set().await;
+    seed(&uri, vec![doc! { "_id": 0 }]).await;
+    let mut cfg = config(&uri);
+    cfg.operation_types = vec!["delete".into()];
+    let source = MongoCdcSource::new(cfg.clone()).await.expect("source");
+    let (records, first) = drain(&source).await;
+    assert!(records.is_empty());
+    let first = first.expect("the anchor / post-batch bookmark");
+
+    seed(&uri, (1..=5).map(|i| doc! { "_id": i }).collect()).await;
+    let source = MongoCdcSource::new(cfg).await.expect("source");
+    source.apply_start_bookmark(first.clone()).await.unwrap();
+    let (records, second) = drain(&source).await;
+    assert!(records.is_empty(), "inserts are filtered out: {records:?}");
+    let second = second.expect("an idle cycle still yields its bookmark");
+    let wrap = |b: &Value| json!({ "resume_token": b["resume_token"].clone() });
+    assert_eq!(
+        source.position_le(&wrap(&first), &wrap(&second)),
+        Some(true)
+    );
+    assert_ne!(
+        first, second,
+        "the bookmark moved past the filtered inserts"
+    );
+}
+
+/// An explicit `start_from` places only a fresh run: once a bookmark exists
+/// the next run resumes from it instead of replaying from the fixed point
+/// (#789 MSG-32). `earliest` opens at the oldest oplog entry (#789 MSG-74).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bookmark_wins_over_an_explicit_start_from() {
+    let (_container, uri) = start_repl_set().await;
+    seed(&uri, vec![doc! { "_id": 0 }]).await;
+    for start in [
+        json!({"type": "timestamp", "timestamp_secs": 1}),
+        json!({"type": "earliest"}),
+    ] {
+        let mut cfg = config(&uri);
+        cfg.start_from = serde_json::from_value(start).unwrap();
+        let source = MongoCdcSource::new(cfg.clone()).await.expect("source");
+        let (records, bookmark) = drain(&source).await;
+        assert!(
+            records.iter().any(|r| r["document_key"]["_id"] == json!(0)),
+            "a fresh run starts at the explicit point: {records:?}"
+        );
+        let source = MongoCdcSource::new(cfg).await.expect("source");
+        source
+            .apply_start_bookmark(bookmark.unwrap())
+            .await
+            .unwrap();
+        let (again, _) = drain(&source).await;
+        assert!(
+            again.iter().all(|r| r["document_key"]["_id"] != json!(0)),
+            "the resumed run must not replay from start_from: {again:?}"
+        );
+    }
+}
+
+/// A page that fills up in the middle of a multi-document transaction waits
+/// for the rest of the transaction (#789 MSG-92).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pages_never_split_a_source_transaction() {
+    let (_container, uri) = start_repl_set().await;
+    seed(&uri, vec![doc! { "_id": 0 }]).await;
+    let mut cfg = config(&uri);
+    cfg.batch_size = 2;
+    let source = MongoCdcSource::new(cfg).await.expect("source");
+    let writer_uri = uri.clone();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let client = Client::with_uri_str(&writer_uri).await.unwrap();
+        let coll = client.database(DB).collection::<Document>(COLL);
+        let mut session = client.start_session().await.unwrap();
+        session.start_transaction().await.unwrap();
+        for i in 10..13 {
+            coll.insert_one(doc! { "_id": i })
+                .session(&mut session)
+                .await
+                .unwrap();
+        }
+        session.commit_transaction().await.unwrap();
+    });
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 2);
+    let mut sizes = Vec::new();
+    while let Some(page) = pages.next().await {
+        let page = page.expect("page");
+        if !page.records.is_empty() {
+            sizes.push(page.records.len());
+        }
+    }
+    writer.await.unwrap();
+    assert_eq!(sizes, vec![3], "the 3-insert transaction is one page");
+}

@@ -7646,7 +7646,7 @@
           }
         },
         {
-          "description": "Start at the earliest retained oplog entry (errors if it has rolled).",
+          "description": "Start at the oldest entry still in the oplog.",
           "type": "object",
           "properties": {
             "type": {
@@ -7656,7 +7656,7 @@
           }
         },
         {
-          "description": "Resume after a specific opaque token. Overrides a persisted bookmark.",
+          "description": "Resume after a specific opaque token.",
           "type": "object",
           "properties": {
             "token": true,
@@ -7667,7 +7667,7 @@
           }
         },
         {
-          "description": "Start at a wall-clock second. Overrides a persisted bookmark.",
+          "description": "Start at a wall-clock second.",
           "type": "object",
           "properties": {
             "timestamp_secs": {
@@ -17027,7 +17027,7 @@
                       "default": "off"
                     },
                     "start_from": {
-                      "description": "Start position on a fresh run (ignored once a bookmark exists, except an\nexplicit `resume_token`/`timestamp` which overrides the bookmark).",
+                      "description": "Start position on a fresh run; ignored once a bookmark exists.",
                       "$ref": "#/$defs/source_mongodb-cdc__StartFrom",
                       "default": {
                         "type": "now"
