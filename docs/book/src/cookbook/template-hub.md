@@ -169,8 +169,10 @@ is refused. Set `if_exists: append`, or put a per-parent token in the path.
 ## Composition and the compatibility matrix
 
 `faucet run --source X --sink Y` (and `faucet validate --source X --sink Y`,
-`faucet hub compose`) build an ordinary config document:
+`faucet hub compose`) build an ordinary config document (shape only — the
+`<…>` parts stand for what each template contributes):
 
+<!-- faucet:no-validate -->
 ```yaml
 version: 1
 name: acme/billing                           # the source's hub id
@@ -456,7 +458,7 @@ records facts that help you choose, in `index.json` under each entry's `trust`:
 
 | Signal | What it is |
 |---|---|
-| `stars` | upvotes (↑) on the template's discussion in the catalog (**Discussions → Templates**). GitHub allows one upvote per account. |
+| `stars` | distinct GitHub accounts that reacted 👍, ❤️ or 🚀 on the template's discussion in the catalog (**Discussions → Templates**). Each account counts once however many of the three it uses; upvotes (↑) are not counted. |
 | `updated` / `stable_since` | when the newest version landed, and when the stable one did |
 | `open_issues` | open catalog issues labelled `template:<id>` |
 | `compatible_sinks` | how many sink templates the source composes with in full |
@@ -477,7 +479,8 @@ faucet run --source erp --sink faucet-hq/bigquery
 
 Variants are ranked official first, then by stars, then by recency. The
 [hub page](https://faucet-hq.github.io/hub) shows the same signals on every
-card and sorts by them. To star a template, upvote its discussion; to report a
+card and sorts by them. To star a template, react 👍, ❤️ or 🚀 on its discussion
+(the hub page's comment widget does this for you); to report a
 problem, open an issue with its `template:<id>` label.
 
 ### Mirror the hub into your server

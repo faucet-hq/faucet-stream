@@ -37,7 +37,7 @@ State is what makes a run resumable and what stands between a crash and a corrup
 - **`delivery: exactly_once` MUST satisfy one of two topologies** (enforced at config-load in `cli/src/expand.rs`, re-checked in `run_stream`):
   - **atomic-watermark:** an idempotent sink (`supports_idempotent_writes`) + a deterministic-replay source (`replay_guarantee`) + a durable (non-`memory`) state store + **no DLQ** (incompatible in this version); or
   - **keyed-upsert:** an upsert-capable sink configured with `write_mode: upsert|delete` + non-empty `key`, with any source and no state/DLQ requirement.
-- **Retries on a non-idempotent `write_batch` are forbidden** unless the sink reports `supports_idempotent_writes()` — a retried lost-response write silently duplicates rows. `run_stream`'s `with_retry_write!` enforces this. See [ADR 0007 — Retries](../adr/0007-retries.md).
+- **Retries on a plain `write_batch` are forbidden** unless the sink reports `write_batch_is_replay_safe()` (default: `dedups_by_key()`, i.e. a keyed upsert/delete config) — a retried lost-response write silently duplicates rows. `supports_idempotent_writes()` is not the gate: it covers only the token path. `run_stream`'s `with_retry_write!` enforces this. See [ADR 0007 — Retries](../adr/0007-retries.md).
 
 ## Related
 

@@ -19,7 +19,7 @@ The bookmark is read **before** each fetch and persisted **only after** the sink
 
 ## Who depends on this
 
-You only depend on `faucet-state-redis` directly if you are **building a pipeline in Rust** and want Redis-backed resume state. If you drive faucet-stream through the **`faucet` CLI**, you don't add this crate by hand — it's compiled in via the `state-redis` feature and selected with a `state:` block in your YAML config (see below).
+You only depend on `faucet-state-redis` directly if you are **building a pipeline in Rust** and want Redis-backed resume state. If you drive faucet-stream through the **`faucet` CLI**, you don't add this crate by hand — it's compiled in via the `state-redis` feature (on by default) and selected with a `state:` block in your YAML config (see below).
 
 ## Installation
 
@@ -28,11 +28,11 @@ You only depend on `faucet-state-redis` directly if you are **building a pipelin
 cargo add faucet-core
 cargo add faucet-state-redis
 
-# CLI — enable the Redis state backend (opt-in feature):
-cargo install faucet-cli --features state-redis
+# CLI — the Redis state backend is in the default build:
+cargo install faucet-cli
 ```
 
-The `state-redis` feature is **not** in the CLI's default build — enable it explicitly (or use `--features full`).
+The `state-redis` feature is part of the CLI's default build (through the `state` aggregate), so the stock `faucet` binary already accepts `state: { type: redis }`. A slim `--no-default-features` build needs `--features state-redis`.
 
 ## Configuration (CLI `state:` block)
 

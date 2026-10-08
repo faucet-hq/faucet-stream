@@ -9968,7 +9968,7 @@
       ]
     },
     "source_snowflake__SnowflakeAuth": {
-      "description": "Authentication method for Snowflake.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by\nevery faucet connector. `key_pair` is stateless (JWT minted locally);\n`o_auth` carries a bearer token (and can be supplied via a shared\n`auth: { ref }` provider).",
+      "description": "Authentication method for Snowflake.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by\nevery faucet connector. `key_pair` is stateless (JWT minted locally);\n`oauth` carries a bearer token (and can be supplied via a shared\n`auth: { ref }` provider).",
       "oneOf": [
         {
           "description": "JWT key-pair authentication.\n\nUses an RSA private key (PEM-encoded) to generate JWT tokens for the\nSnowflake SQL REST API.",
@@ -10706,7 +10706,7 @@
       ]
     },
     "sink_snowflake__SnowflakeAuth": {
-      "description": "Authentication method for Snowflake.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by\nevery faucet connector. `key_pair` is stateless (JWT minted locally);\n`o_auth` carries a bearer token (and can be supplied via a shared\n`auth: { ref }` provider).",
+      "description": "Authentication method for Snowflake.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by\nevery faucet connector. `key_pair` is stateless (JWT minted locally);\n`oauth` carries a bearer token (and can be supplied via a shared\n`auth: { ref }` provider).",
       "oneOf": [
         {
           "description": "JWT key-pair authentication.\n\nUses an RSA private key (PEM-encoded) to generate JWT tokens for the\nSnowflake SQL REST API.",

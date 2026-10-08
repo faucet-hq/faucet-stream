@@ -107,8 +107,8 @@ pipeline:
       connection_url: ${env:PG_URL}
       table_name: users
       column_mapping:
-        type: jsonb
-        column: data
+        jsonb:
+          column: data
       batch_size: 500
       max_connections: 5
 

@@ -2,6 +2,7 @@
 
 A faucet config is a YAML or JSON document with this top-level shape:
 
+<!-- faucet:no-validate -->
 ```yaml
 version: 1                 # required, must be 1
 name: my_pipeline          # optional; used in state keys and metrics
@@ -26,7 +27,9 @@ selection:                 # optional; row-selection policy (see Row selection)
 > `source`/`sink`/`transform`/`state` spec, `matrix` rows, `execution`) reject
 > unrecognized fields, so a typo like `transorms:` or `parnet:` is a load-time
 > error rather than a silently-ignored field. A connector's own `config: { … }`
-> object is still passed through verbatim to that connector.
+> object is checked against the keys that connector declares (`faucet schema
+> source <type>` / `faucet schema sink <type>` lists them), so a misspelled
+> connector key is refused too.
 
 ## `pipeline`
 

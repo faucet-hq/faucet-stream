@@ -46,7 +46,10 @@ A run that was rate limited appends what it cost in time:
 `faucet run --output json` carries the full record under each row's `usage`,
 and a `faucet serve` run record does the same under each invocation.
 
-`faucet usage` aggregates what the catalog store holds:
+`faucet usage` aggregates what the catalog store holds. It is part of the
+`catalog` build feature, which the prebuilt binaries and the default
+`cargo install faucet-cli` leave out — install with
+`cargo install faucet-cli --features catalog` (or `full`) to get it:
 
 ```bash
 faucet usage --config pipeline.yaml                  # by pipeline, all time

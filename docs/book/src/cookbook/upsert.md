@@ -206,24 +206,55 @@ returns every association that contact currently has. That is a claim only the
 **source** can make — a sink sees a page of records and cannot tell a complete
 set from page 1 of 3.
 
-Declare the claim on the source and opt the sink in:
+Declare the claim on the **source template** and opt the sink in. The claim
+belongs to the connector definition — `pipeline.source` or a named template
+under `pipeline.sources` — not to a matrix row's `source:` override, which only
+picks a template (`ref`), its `type` and `config`:
 
 ```yaml
-matrix:
-  - id: associations
-    parent: contacts
-    source:
+version: 1
+name: crm
+pipeline:
+  sources:
+    contacts:
       type: rest
       config:
-        url: "https://api.example.com/contacts/${contacts.id}/associations"
+        base_url: https://api.example.com
+        path: /contacts
+    associations:
+      type: rest
+      config:
+        base_url: https://api.example.com
+        path: "/contacts/${contacts.id}/associations"
       complete_for:
         scope:
           contact_id: "${contacts.id}"   # destination column names
         on_missing: delete               # omit (or `ignore`) = claim is inert
-    sink:
-      ref: assoc
-      write_mode: upsert
-      key: [association_id]
+  sinks:
+    contacts:
+      type: postgres
+      config:
+        connection_url: postgres://localhost/crm
+        table_name: contacts
+        column_mapping: auto_map
+        write_mode: upsert
+        key: [id]
+    assoc:
+      type: postgres
+      config:
+        connection_url: postgres://localhost/crm
+        table_name: associations
+        column_mapping: auto_map
+        write_mode: upsert
+        key: [association_id]
+matrix:
+  - id: contacts
+    source: { ref: contacts }
+    sink: { ref: contacts }
+  - id: associations
+    parent: contacts
+    source: { ref: associations }
+    sink: { ref: assoc }
 ```
 
 After the run writes every page, faucet deletes the rows matching

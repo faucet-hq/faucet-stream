@@ -382,7 +382,7 @@ pipeline:
     config:
       connection_url: "${env:PG_URL}"
       table_name: users
-      column_mapping: { type: jsonb, column: data }
+      column_mapping: { jsonb: { column: data } }
       batch_size: 500
 ```
 

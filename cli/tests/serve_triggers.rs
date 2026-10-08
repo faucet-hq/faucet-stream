@@ -275,7 +275,7 @@ pipeline:
     config:
       connection_url: "${env:PG_URL}"
       table_name: events_raw
-      column_mapping: { type: jsonb, column: payload }
+      column_mapping: { jsonb: { column: payload } }
 "#,
     )
     .unwrap();

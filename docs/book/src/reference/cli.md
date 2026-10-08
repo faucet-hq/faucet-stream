@@ -965,7 +965,8 @@ dataset.
 
 ## `usage`
 
-*(requires the `catalog` build feature)*
+*(requires the `catalog` build feature — included in `full`, not in the
+default build or the prebuilt binaries)*
 
 ```bash
 faucet usage [--config PATH] [--since WHEN] [--until WHEN] [--pipeline NAME] \

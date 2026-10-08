@@ -48,15 +48,20 @@ flowchart TD
 This is the single most important line in the retry design (`with_retry_write!` in
 `crates/core/src/pipeline.rs`):
 
-> A non-idempotent `write_batch` is retried **only** when the sink reports
-> `supports_idempotent_writes()`. Otherwise the write falls through to a bare
-> `.await` with no retry.
+> A plain `write_batch` / `write_batch_partial` is retried **only** when the
+> sink reports `write_batch_is_replay_safe()` — by default, when it is configured
+> to dedup by key (`write_mode: upsert|delete` + `key`). Otherwise the write
+> falls through to a bare `.await` with no retry.
 
 The reasoning: a bare `write_batch` makes no atomicity promise. If the request
 commits on the server but the response is lost, a pipeline-level retry re-sends
 every row — silent duplication. So faucet-stream *declines to retry* exactly those
-writes. The idempotent exactly-once path (`write_batch_idempotent`) is always safe
-to retry, because a replayed token-stamped write is a no-op. See
+writes. The gate is deliberately not `supports_idempotent_writes()`: that flag
+only says the sink can commit rows and a commit token together on the
+`write_batch_idempotent` path, and says nothing about its plain write (usually a
+multi-row `INSERT`). The idempotent exactly-once path is retried through
+`eo_write_once`, which re-reads the committed token before every attempt, so a
+page that already committed is skipped rather than written again. See
 [ADR 0007](../adr/0007-retries.md) and [pipeline](./pipeline.md).
 
 ## Backoff and jitter
@@ -81,7 +86,7 @@ retried — retrying it would only waste time and delay the real failure.
 
 ## Invariants
 
-- **A non-idempotent write is never retried.** (The duplication-safety rule.)
+- **A write whose replay would duplicate is never retried.** (The duplication-safety rule.)
 - **The no-policy path is unchanged.** Attaching no resilience policy leaves the
   write path allocation-free and identical to the pre-resilience code.
 - **Retries are gated on classification.** Non-transient errors fail fast.
@@ -100,9 +105,11 @@ retried — retrying it would only waste time and delay the real failure.
 
 ## Failure scenarios
 
-- **Sink commits, response lost, retry fires (idempotent sink)** → the re-sent
-  token-stamped write is a no-op; no duplication.
-- **Sink commits, response lost (non-idempotent sink)** → no retry; the run aborts
+- **Sink commits, response lost, retry fires (exactly-once path)** → the retry
+  re-reads the committed token first and skips the page; no duplication.
+- **Sink commits, response lost, retry fires (keyed upsert/delete)** → the
+  re-sent rows converge on the same keys; no duplication.
+- **Sink commits, response lost (append write)** → no retry; the run aborts
   and the page is replayed on the next run (bounded at-least-once duplication).
 - **Persistent 5xx** → retries exhaust `max_attempts`, then the circuit breaker may
   open — see [resilience](./resilience.md).

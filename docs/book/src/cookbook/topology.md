@@ -233,13 +233,32 @@ keyed-upsert alternative when the sink supports it:
 version: 1
 name: cdc-mirror
 delivery: exactly_once
-state: { type: file, config: { path: ./state } }
 pipeline:
+  state: { type: file, config: { path: ./state } }
   sources:
-    changes: { type: postgres-cdc, config: { ... } }
+    changes:
+      type: postgres-cdc
+      config:
+        connection_url: postgres://replicator@db/app
+        slot_name: faucet_mirror
+        publication_name: faucet_pub
   sinks:
-    warm: { type: postgres, config: { ..., write_mode: upsert, key: [id] } }
-    cold: { type: sqlite,   config: { ..., write_mode: upsert, key: [id] } }
+    warm:
+      type: sqlite
+      config:
+        database_url: "sqlite://./warm.db?mode=rwc"
+        table_name: orders
+        column_mapping: auto_map
+        write_mode: upsert
+        key: [id]
+    cold:
+      type: sqlite
+      config:
+        database_url: "sqlite://./cold.db?mode=rwc"
+        table_name: orders
+        column_mapping: auto_map
+        write_mode: upsert
+        key: [id]
   nodes:
     src:  { kind: source, ref: changes }
     fan:  { kind: tee, fanout: 2 }

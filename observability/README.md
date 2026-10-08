@@ -54,7 +54,7 @@ Enable the exporter in your pipeline config (default listen `127.0.0.1:9464`):
 ```yaml
 observability:
   prometheus:
-    listen_addr: 0.0.0.0:9464
+    listen: 0.0.0.0:9464
 ```
 
 Labels are low-cardinality by design (`pipeline`, `row`, `connector`) — never

@@ -56,7 +56,7 @@ config (the compose stack scrapes host port `9464`, the default):
 ```yaml
 observability:
   prometheus:
-    listen_addr: 0.0.0.0:9464
+    listen: 0.0.0.0:9464
 ```
 
 ## Importing into your own Grafana / Prometheus
