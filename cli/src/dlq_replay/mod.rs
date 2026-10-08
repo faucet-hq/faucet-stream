@@ -169,6 +169,8 @@ pub async fn replay(
 ) -> CliResult<ReplayOutcome> {
     let reason = validate_reason(inputs.reason)?;
     let files = expand_location(location)?;
+    let resolved = crate::partition::resolve_runtime(cfg).await?;
+    let cfg = &resolved;
     let failed = inputs
         .failed_dlq
         .map(PathBuf::from)

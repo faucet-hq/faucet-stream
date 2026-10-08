@@ -105,6 +105,40 @@ pub fn needs_probe(spec: &PartitionSpec) -> bool {
     )
 }
 
+/// `spec` with a probed bound replaced by a literal one chunk wide, so an
+/// offline plan has the shape of a real one without running the probe.
+pub fn placeholder_bounds(spec: &PartitionSpec) -> PartitionSpec {
+    match spec {
+        PartitionSpec::Integer {
+            from,
+            to: IntBound::Discovered(_),
+            chunk_size,
+            bounds,
+            to_unbounded,
+        } => PartitionSpec::Integer {
+            from: *from,
+            to: IntBound::Literal({
+                let width = i64::try_from(*chunk_size).unwrap_or(i64::MAX);
+                match bounds {
+                    crate::chunking::Bounds::Inclusive => from.saturating_add(width - 1),
+                    crate::chunking::Bounds::HalfOpen => from.saturating_add(width),
+                }
+            }),
+            chunk_size: *chunk_size,
+            bounds: *bounds,
+            to_unbounded: to_unbounded.or(Some(true)),
+        },
+        PartitionSpec::Offset {
+            total: CountBound::Discovered(_),
+            chunk_size,
+        } => PartitionSpec::Offset {
+            total: CountBound::Literal(*chunk_size),
+            chunk_size: *chunk_size,
+        },
+        other => other.clone(),
+    }
+}
+
 /// Whether a probed integer bound should default `to_unbounded` on.
 pub fn probe_implies_unbounded(spec: &PartitionSpec) -> bool {
     matches!(
@@ -211,6 +245,37 @@ fn as_u64(v: &Value, path: &str) -> CliResult<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An offline placeholder is one chunk wide for either bound style, and
+    /// a literal spec is left alone (#789 CLI-57).
+    #[test]
+    fn placeholders_plan_exactly_one_chunk() {
+        for bounds in [
+            crate::chunking::Bounds::Inclusive,
+            crate::chunking::Bounds::HalfOpen,
+        ] {
+            let spec = PartitionSpec::Integer {
+                from: 10,
+                to: IntBound::Discovered(probe()),
+                chunk_size: 5,
+                bounds,
+                to_unbounded: None,
+            };
+            let placeholder = placeholder_bounds(&spec);
+            assert!(!needs_probe(&placeholder));
+            assert_eq!(crate::partition::plan(&placeholder).unwrap().len(), 1);
+        }
+        let offset = placeholder_bounds(&PartitionSpec::Offset {
+            total: CountBound::Discovered(probe()),
+            chunk_size: 50,
+        });
+        assert_eq!(crate::partition::plan(&offset).unwrap().len(), 1);
+        let literal = PartitionSpec::Offset {
+            total: CountBound::Literal(7),
+            chunk_size: 5,
+        };
+        assert_eq!(placeholder_bounds(&literal), literal);
+    }
 
     fn probe() -> BoundProbe {
         BoundProbe {

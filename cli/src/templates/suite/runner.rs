@@ -324,7 +324,7 @@ async fn materialize_and_check(supplied: &SuppliedParams, target: &Target<'_>) -
     // Topology mode has no matrix to expand — its graph checks are the
     // equivalent gate, and skipping them would let a broken graph pass.
     if cfg.pipeline.nodes.is_empty() {
-        let nodes = crate::expand::expand(&cfg)?;
+        let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
         for n in &nodes {
             if !n.transforms.is_empty() {
                 crate::transforms::compile_transforms(&n.transforms).map_err(|e| {
@@ -370,7 +370,7 @@ async fn behavioral_inner(
     // set rather than to the template as a whole.
     let body = materialize_body(supplied, target).await?;
     let cfg = crate::config::PipelineConfig::from_text(&body, std::path::Path::new("suite.json"))?;
-    let nodes = crate::expand::expand(&cfg)?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
     let node = pick_row(&nodes, b)?;
 
     let input = crate::pipeline_test::fixtures::load_input(

@@ -278,7 +278,7 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         })
         .collect();
 
-    let mut nodes = expand(&cfg)?;
+    let mut nodes = expand(&crate::partition::offline(&cfg))?;
 
     if !unprobed.is_empty() && !args.json {
         println!(

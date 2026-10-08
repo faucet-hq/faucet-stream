@@ -77,7 +77,8 @@ impl Reload {
 struct Rows {
     nodes: Vec<ExpandedNode>,
     topology: Option<std::sync::Arc<PipelineConfig>>,
-    /// A `fan_out:` config, whose rows are discovered afresh every tick.
+    /// A `fan_out:` or probed-partition config, whose rows are planned afresh
+    /// every tick (discovery and bound probes run each time).
     fanout: Option<std::sync::Arc<PipelineConfig>>,
 }
 
@@ -92,7 +93,8 @@ impl Rows {
                 fanout: None,
             });
         }
-        if crate::dynamic_fanout::has_fanout_source(cfg)? {
+        if crate::dynamic_fanout::has_fanout_source(cfg)? || crate::partition::has_probes(cfg) {
+            expand(&crate::partition::offline(cfg))?;
             return Ok(Self {
                 nodes: Vec::new(),
                 topology: None,
@@ -137,7 +139,7 @@ async fn run_rows(rows: Rows, opts: ExecuteOptions) -> CliResult<RunSummary> {
         None => match rows.fanout {
             Some(cfg) => {
                 let mut cfg = (*cfg).clone();
-                crate::dynamic_fanout::resolve_dynamic_fanout(&mut cfg, &opts.auth).await?;
+                crate::partition::resolve_runtime_with(&mut cfg, &opts.auth).await?;
                 run_expanded(expand(&cfg)?, opts).await
             }
             None => run_expanded(rows.nodes, opts).await,

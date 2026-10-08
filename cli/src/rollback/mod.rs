@@ -251,7 +251,7 @@ impl RollbackReport {
 
 /// Undo `inputs.run_id` on the row that wrote it.
 pub async fn rollback(cfg: &PipelineConfig, inputs: RollbackInputs) -> CliResult<RollbackReport> {
-    let nodes = expand(cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(cfg).await?)?;
     let (node, store, marker) = locate(
         &nodes,
         &inputs.pipeline_name,
@@ -438,7 +438,7 @@ pub async fn list(
     pipeline_name: &str,
     row: Option<&str>,
 ) -> CliResult<Vec<RunMarker>> {
-    let nodes = expand(cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(cfg).await?)?;
     let mut out = Vec::new();
     for node in nodes
         .iter()

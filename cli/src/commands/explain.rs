@@ -69,7 +69,7 @@ pub async fn run(args: ExplainArgs) -> CliResult<()> {
     // never touches the network. `${env:…}` is resolved at load time, so the
     // narration only ever surfaces the safe allowlist below, never raw config.
     let cfg = PipelineConfig::from_path_tolerating_secrets(&path, args.profile.as_deref())?;
-    let nodes = expand(&cfg)?;
+    let nodes = expand(&crate::partition::offline(&cfg))?;
     let report = build_report(&cfg, &nodes);
 
     if args.json {

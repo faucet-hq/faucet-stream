@@ -208,7 +208,7 @@ async fn roots(
     pipeline_name: &str,
     row: Option<&str>,
 ) -> CliResult<Vec<(ExpandedNode, Arc<dyn StateStore>, String)>> {
-    let nodes = expand(cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(cfg).await?)?;
     let selected: Vec<&ExpandedNode> = nodes
         .iter()
         .filter(|n| matches!(n.role, NodeRole::Root) && row.is_none_or(|r| n.id == r))

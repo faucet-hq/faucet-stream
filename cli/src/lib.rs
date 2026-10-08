@@ -399,7 +399,7 @@ pub async fn run_from_yaml_str_selected(
         )
         .await;
     }
-    let nodes = expand::expand(&cfg)?;
+    let nodes = expand::expand(&crate::partition::resolve_runtime(&cfg).await?)?;
     let nodes = match selection {
         Some(sel) => sel.apply(&cfg, nodes)?,
         None => nodes,

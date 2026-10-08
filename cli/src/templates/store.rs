@@ -277,7 +277,7 @@ pub async fn preview_register(
         .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
         .map(|r| r.version);
     let rows = match &prelude.pipeline {
-        Some(cfg) => crate::expand::expand(cfg)?
+        Some(cfg) => crate::expand::expand(&crate::partition::offline(cfg))?
             .iter()
             .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
             .map(crate::commands::plan::build_plan_report)
@@ -404,7 +404,7 @@ pub(crate) fn validate_pipeline_body(doc: &Value) -> CliResult<crate::config::Pi
         // Compile each row's transform chain too — `expand` only checks an entry's
         // shape, so without this a template with a misspelled transform field
         // registers cleanly and fails at trigger time instead.
-        for node in crate::expand::expand(&cfg)? {
+        for node in crate::expand::expand(&crate::partition::offline(&cfg))? {
             // Deserialize each connector's `config` into its typed struct
             // (#609). `expand` leaves it an opaque `Value`, so without this a
             // structurally wrong config — the wrong nesting under a flattened

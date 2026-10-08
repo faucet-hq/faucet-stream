@@ -368,7 +368,7 @@ pub async fn run_backfill(
     cfg: &PipelineConfig,
     opts: BackfillOptions,
 ) -> CliResult<BackfillOutcome> {
-    let nodes = expand(cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(cfg).await?)?;
     let root = select_root(nodes, opts.row.as_deref())?;
     let mut root = root;
 

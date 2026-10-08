@@ -103,7 +103,7 @@ async fn resolve_case(
             } else {
                 PipelineConfig::from_path_tolerating_secrets(&config_path, args.profile.as_deref())?
             };
-            let nodes = expand(&cfg)?;
+            let nodes = expand(&crate::partition::offline(&cfg))?;
             let node = match &case.row {
                 Some(row) => nodes.iter().find(|n| &n.id == row).ok_or_else(|| {
                     at(format!(

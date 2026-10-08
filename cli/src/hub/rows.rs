@@ -232,7 +232,7 @@ fn placeholder_nodes(doc: &Value) -> CliResult<(PipelineConfig, Option<Vec<Expan
     if crate::topology::is_topology(&cfg) {
         return Ok((cfg, None));
     }
-    let nodes = crate::expand::expand(&cfg)?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
     Ok((cfg, Some(nodes)))
 }
 

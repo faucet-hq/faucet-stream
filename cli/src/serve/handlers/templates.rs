@@ -163,7 +163,7 @@ pub async fn register_template(
         };
         if let Ok(doc) = parsed
             && let Ok(cfg) = crate::templates::store::validate_pipeline_body(&doc)
-            && let Ok(nodes) = crate::expand::expand(&cfg)
+            && let Ok(nodes) = crate::expand::expand(&crate::partition::offline(&cfg))
             && let Ok(report) = crate::policy::evaluate_nodes(&policy, &nodes, &Default::default())
             && report.violated()
         {

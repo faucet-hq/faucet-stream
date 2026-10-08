@@ -112,7 +112,7 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
     }
     let cfg_ms = t_cfg.elapsed().as_millis();
 
-    let nodes = expand(&cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(&cfg).await?)?;
 
     // `--offline`: run only the static config lints — no connectors built, no
     // network, no credentials. Fast, CI-friendly, and credential-free.
