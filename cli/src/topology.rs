@@ -114,6 +114,7 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
     }
     refuse_graph_blocks(cfg)?;
     refuse_destructive_sources(cfg)?;
+    validate_governance(cfg)?;
     let spec = &cfg.pipeline;
     let mut known: Vec<String> = spec.nodes.keys().cloned().collect();
     known.sort_unstable();
@@ -124,6 +125,61 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
                     name: endpoint.clone(),
                     known: known.clone(),
                 });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compile the governance blocks and apply the gates a matrix row gets at
+/// expand time, so a topology that cannot run fails `validate` (and fails
+/// before any lineage START is emitted) rather than mid-run: a quarantining
+/// quality / contract / drift policy needs a `dlq:`, and `on_drift: evolve`
+/// needs every sink node to support schema evolution (#789 CLI-83).
+fn validate_governance(cfg: &PipelineConfig) -> CliResult<()> {
+    build_governance(cfg)?;
+    let mut quarantines: Vec<&str> = Vec::new();
+    #[cfg(feature = "quality")]
+    if let Some(q) = cfg.pipeline.quality.as_ref()
+        && faucet_core::CompiledQuality::compile(q)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("quality");
+    }
+    #[cfg(feature = "contract")]
+    if let Some(c) = cfg.pipeline.contract.as_ref()
+        && faucet_core::CompiledContract::compile(c)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("contract");
+    }
+    let drift = cfg
+        .pipeline
+        .schema
+        .as_ref()
+        .map(faucet_core::SchemaDriftPolicy::compile);
+    if drift.as_ref().is_some_and(|d| d.requires_dlq()) {
+        quarantines.push("schema");
+    }
+    if !quarantines.is_empty() && cfg.pipeline.dlq.is_none() {
+        return Err(CliError::Config(format!(
+            "topology: the {} block quarantines records, which needs a `dlq:` block to route \
+             them to",
+            quarantines.join(" / ")
+        )));
+    }
+    if drift
+        .as_ref()
+        .is_some_and(|d| d.on_drift == faucet_core::OnDrift::Evolve)
+    {
+        for (id, kind, _) in sink_nodes(cfg)? {
+            if !crate::registry::sink_supports_schema_evolution(&kind) {
+                return Err(CliError::Config(format!(
+                    "sink node '{id}': schema.on_drift: evolve is not supported by sink \
+                     '{kind}' — use warn, ignore, quarantine or fail"
+                )));
             }
         }
     }
@@ -1124,6 +1180,7 @@ pub async fn run_topology(
         opts = opts.with_dlq(crate::executor::build_dlq_config(dlq).await?);
     }
 
+    let governance = build_governance(cfg)?;
     // Lineage START, one per sink node — a topology's analogue of an invocation.
     // Built before the run so a crash still leaves a START on record.
     #[cfg(feature = "lineage")]
@@ -1156,7 +1213,6 @@ pub async fn run_topology(
     }
 
     let state_store = opts.state_store.clone();
-    let governance = build_governance(cfg)?;
     // Run lease + run-outcome marker per sink node (#732 / #735), like a
     // matrix invocation's.
     let mut markers: Vec<(String, String, crate::pipeline_state::markers::RunMarkers)> = Vec::new();
@@ -1907,6 +1963,30 @@ mod tests {
             "transport": { "type": "file", "config": { "path": "/tmp/ol.jsonl" } },
         }))
         .expect("valid lineage config")
+    }
+
+    /// `validate_topology_spec` compiles the governance blocks and applies
+    /// the DLQ / evolve gates a matrix row gets (#789 CLI-83).
+    #[test]
+    fn topology_validation_applies_governance_gates() {
+        let with = |extra: &str| cfg(&format!("{LINEAR}{extra}"));
+        assert!(validate_topology_spec(&cfg(LINEAR)).is_ok());
+        let err = validate_topology_spec(&with("  schema: { on_drift: evolve }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("evolve is not supported by sink 'jsonl'"), "{err}");
+        let err = validate_topology_spec(&with("  schema: { on_drift: quarantine }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a `dlq:` block"), "{err}");
+        #[cfg(feature = "masking")]
+        assert!(
+            validate_topology_spec(&with(
+                "  masking: { rules: [ { match: { field_pattern: \"(\" }, action: { type: redact } } ] }\n"
+            ))
+            .is_err(),
+            "a bad masking regex fails validation, not the run"
+        );
     }
 
     const LINEAR: &str = r#"version: 1
