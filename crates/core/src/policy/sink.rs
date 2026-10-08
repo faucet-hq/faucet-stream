@@ -72,8 +72,12 @@ impl PolicySink {
 
     /// Classify one record's scalar leaves (by name and by value) and evaluate
     /// the rules; returns the violations with the harshest runtime action.
-    fn check_record(&self, record: &Value) -> (Vec<ColumnFacts>, Vec<Violation>) {
-        let columns = classify_record_masked(&self.policy, record, self.masking.as_deref());
+    fn check_record(
+        &self,
+        record: &Value,
+        names: &mut NameLabels,
+    ) -> (Vec<ColumnFacts>, Vec<Violation>) {
+        let columns = classify_cached(&self.policy, record, self.masking.as_deref(), names);
         if columns.is_empty() {
             return (columns, Vec::new());
         }
@@ -111,8 +115,9 @@ impl PolicySink {
     /// every violated rule quarantines, `Err` when any asks to fail the run.
     fn screen(&self, records: &[Value]) -> Result<Vec<(usize, Violation)>, FaucetError> {
         let mut offending = Vec::new();
+        let mut names = NameLabels::new();
         for (i, r) in records.iter().enumerate() {
-            let (columns, mut violations) = self.check_record(r);
+            let (columns, mut violations) = self.check_record(r, &mut names);
             if violations.is_empty() {
                 continue;
             }
@@ -172,8 +177,21 @@ pub fn classify_record_masked(
     record: &Value,
     masking: Option<&CompiledMasking>,
 ) -> Vec<ColumnFacts> {
+    classify_cached(policy, record, masking, &mut NameLabels::new())
+}
+
+/// Labels each dot-path earns by name, memoized across the records of a page
+/// so the classification regexes run once per path, not once per record.
+type NameLabels = std::collections::HashMap<String, BTreeSet<String>>;
+
+fn classify_cached(
+    policy: &CompiledPolicy,
+    record: &Value,
+    masking: Option<&CompiledMasking>,
+    names: &mut NameLabels,
+) -> Vec<ColumnFacts> {
     let mut out: BTreeMap<String, (BTreeSet<String>, &'static str)> = BTreeMap::new();
-    walk(policy, "", record, &BTreeSet::new(), &mut out);
+    walk(policy, "", record, &BTreeSet::new(), &mut out, names);
     out.into_iter()
         .map(|(name, (labels, via))| ColumnFacts {
             masked: masking
@@ -193,30 +211,35 @@ fn walk(
     value: &Value,
     inherited: &BTreeSet<String>,
     out: &mut BTreeMap<String, (BTreeSet<String>, &'static str)>,
+    names: &mut NameLabels,
 ) {
-    let container_labels = |path: &str| {
-        let mut labels = inherited.clone();
-        if !path.is_empty() {
-            labels.extend(policy.labels_for_name(path));
+    let mut by_name = |path: &str| -> BTreeSet<String> {
+        if path.is_empty() {
+            return BTreeSet::new();
         }
-        labels
+        names
+            .entry(path.to_string())
+            .or_insert_with(|| policy.labels_for_name(path))
+            .clone()
     };
     match value {
         Value::Object(map) => {
-            let labels = container_labels(path);
+            let mut labels = inherited.clone();
+            labels.extend(by_name(path));
             for (k, v) in map {
                 let child = if path.is_empty() {
                     k.clone()
                 } else {
                     format!("{path}.{k}")
                 };
-                walk(policy, &child, v, &labels, out);
+                walk(policy, &child, v, &labels, out, names);
             }
         }
         Value::Array(items) => {
-            let labels = container_labels(path);
+            let mut labels = inherited.clone();
+            labels.extend(by_name(path));
             for (i, v) in items.iter().enumerate() {
-                walk(policy, &format!("{path}.{i}"), v, &labels, out);
+                walk(policy, &format!("{path}.{i}"), v, &labels, out, names);
             }
         }
         Value::Null => {}
@@ -224,7 +247,7 @@ fn walk(
             if path.is_empty() {
                 return;
             }
-            let mut labels = policy.labels_for_name(path);
+            let mut labels = by_name(path);
             labels.extend(inherited.iter().cloned());
             let mut via = "name";
             let by_value = policy.labels_for_scalar(scalar);

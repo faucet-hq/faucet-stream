@@ -53,13 +53,19 @@ pub fn instrumented_apply_quality(
                 histogram!("faucet_quality_check_duration_seconds", base_labels)
                     .record(t.elapsed.as_secs_f64());
             }
+            // One registry lookup per distinct (check, field) per page rather
+            // than one per quarantined record (CORE-64).
+            let mut quarantined: std::collections::BTreeMap<(&str, &str), u64> =
+                std::collections::BTreeMap::new();
             for q in &outcome.quarantined {
-                let mut lbl = base(q.check);
-                lbl.push(Label::new(
-                    "field",
-                    SharedString::from(q.field.clone().unwrap_or_default()),
-                ));
-                counter!("faucet_quality_records_quarantined_total", lbl).increment(1);
+                *quarantined
+                    .entry((q.check, q.field.as_deref().unwrap_or("")))
+                    .or_default() += 1;
+            }
+            for ((check, field), n) in quarantined {
+                let mut lbl = base(check);
+                lbl.push(Label::new("field", SharedString::from(field.to_string())));
+                counter!("faucet_quality_records_quarantined_total", lbl).increment(n);
             }
         }
         Err(FaucetError::QualityFailure { check, .. }) => {

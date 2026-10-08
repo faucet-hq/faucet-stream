@@ -96,14 +96,21 @@ fn mask_node(node: &mut Value, path: &str, m: &CompiledMasking, hits: &mut Vec<M
     match node {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
-                let child = child_path(path, k);
-                mask_node(v, &child, m, hits);
+                // No name rule → the path is never read, so build none.
+                if m.needs_paths {
+                    mask_node(v, &child_path(path, k), m, hits);
+                } else {
+                    mask_node(v, UNTRACKED_PATH, m, hits);
+                }
             }
         }
         Value::Array(items) => {
             for (i, v) in items.iter_mut().enumerate() {
-                let child = child_path(path, &i.to_string());
-                mask_node(v, &child, m, hits);
+                if m.needs_paths {
+                    mask_node(v, &child_path(path, &i.to_string()), m, hits);
+                } else {
+                    mask_node(v, UNTRACKED_PATH, m, hits);
+                }
             }
         }
         _ => {}
@@ -209,6 +216,9 @@ fn scalar_to_string(v: &Value) -> Option<String> {
         _ => None,
     }
 }
+
+/// The path of a non-root node when no rule matches by name.
+const UNTRACKED_PATH: &str = "*";
 
 fn child_path(prefix: &str, key: &str) -> String {
     if prefix.is_empty() {
