@@ -135,3 +135,38 @@ async fn an_unreadable_response_fails_the_write_without_retrying() {
     assert!(err.contains("failed after 1 attempts"), "{err}");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn an_explicit_hash_key_outside_the_kinesis_range_fails_only_its_row() {
+    let server = MockServer::start().await;
+    put_records(&server, 1, json!([ok()])).await;
+    let mut cfg = config(&server.uri(), 500);
+    cfg.explicit_hash_key =
+        serde_json::from_value(json!({ "type": "field", "name": "h" })).unwrap();
+    let sink = KinesisSink::new(cfg).await.unwrap();
+
+    let out = sink
+        .write_batch_partial(&[
+            json!({"k": "a", "h": "340282366920938463463374607431768211456"}),
+            json!({"k": "b", "h": "not-a-number"}),
+            json!({"k": "c", "h": "5"}),
+        ])
+        .await
+        .unwrap();
+    for bad in &out[..2] {
+        let err = bad.as_ref().unwrap_err().to_string();
+        assert!(
+            err.contains("explicit hash key must be a decimal integer in [0, 2^128)"),
+            "{err}"
+        );
+    }
+    assert!(out[2].is_ok(), "{:?}", out[2]);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let entries = sent["Records"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "the rejected rows are never sent");
+    assert_eq!(entries[0]["PartitionKey"], "c");
+    assert_eq!(entries[0]["ExplicitHashKey"], "5");
+}
