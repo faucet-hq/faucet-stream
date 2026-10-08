@@ -173,12 +173,9 @@ pub fn build_replay_node(
         )));
     }
 
-    let nodes = expand(cfg)?;
-    let original_dlq = nodes
-        .iter()
-        .find(|n| matches!(n.role, NodeRole::Root))
-        .and_then(|n| n.dlq.clone());
-    let mut node = select_replay_node(nodes, row)?;
+    let mut node = select_replay_node(expand(cfg)?, row)?;
+    // The replayed row's own DLQ policy and key, not the first root's.
+    let original_dlq = node.dlq.clone();
 
     let sealing = decryptor.sealing_value().or_else(|| {
         original_dlq
@@ -732,6 +729,43 @@ pipeline:
             replay_node(&cfg).masking.is_none(),
             "the payload in the envelope is already masked"
         );
+    }
+
+    /// The replayed row's own `dlq:` (policy and seal) carries over, not the
+    /// first root's (#789 CLI-96).
+    #[test]
+    fn replay_keeps_the_selected_rows_dlq_policy() {
+        let cfg = PipelineConfig::from_text(
+            r#"version: 1
+name: p
+pipeline:
+  source: { type: csv, config: { path: ./in.csv } }
+  sink: { type: jsonl, config: { path: ./out.jsonl } }
+  dlq: { sink: { type: jsonl, config: { path: ./a-dlq.jsonl } } }
+matrix:
+  - id: a
+    sink: { config: { path: ./a.jsonl } }
+  - id: b
+    sink: { config: { path: ./b.jsonl } }
+    dlq:
+      sink: { type: jsonl, config: { path: ./b-dlq.jsonl, encryption: { key: "${env:B_DLQ_KEY}" } } }
+      max_failures_total: 7
+"#,
+            Path::new("p.yaml"),
+        )
+        .unwrap();
+        let node = build_replay_node(
+            &cfg,
+            vec![PathBuf::from("./b-dlq.jsonl")],
+            None,
+            Path::new("./failed.jsonl"),
+            Some("b"),
+            DlqDecryptor::default(),
+        )
+        .expect("builds");
+        let dlq = node.dlq.expect("a fresh DLQ");
+        assert_eq!(dlq.max_failures_total, Some(7));
+        assert!(dlq.sink.config.get("encryption").is_some());
     }
 
     /// Quality is a pure check, so a replay keeps enforcing it.

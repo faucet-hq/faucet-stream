@@ -182,12 +182,8 @@ pub async fn replay(
     let decryptor = if inputs.decryptor.is_active() {
         inputs.decryptor.clone()
     } else {
-        let nodes = crate::expand::expand(cfg)?;
-        let original_dlq = nodes
-            .iter()
-            .find(|n| matches!(n.role, crate::expand::NodeRole::Root))
-            .and_then(|n| n.dlq.as_ref());
-        DlqDecryptor::from_config_value(plan::dlq_encryption_value(original_dlq))?
+        let node = plan::select_replay_node(crate::expand::expand(cfg)?, inputs.row)?;
+        DlqDecryptor::from_config_value(plan::dlq_encryption_value(node.dlq.as_ref()))?
     };
 
     let node = build_replay_node(
