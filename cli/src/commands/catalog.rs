@@ -12,7 +12,7 @@ use crate::cli::{
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
 use crate::serve::history::catalog::{
-    CatalogDataset, CatalogDatasetDetail, CatalogLineageEdge, CatalogListFilter,
+    CatalogDatasetDetail, CatalogLineageEdge, CatalogListFilter,
 };
 
 /// Pretty-print any serializable value (JSON output mode).
