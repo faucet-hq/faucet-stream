@@ -423,6 +423,7 @@ pub struct TopologyResult {
 /// the channel.
 struct InEdge {
     label: Option<String>,
+    from: String,
     rx: mpsc::Receiver<StreamPage>,
 }
 
@@ -886,6 +887,7 @@ impl Topology {
             outs.entry(e.from.clone()).or_default().push(tx);
             ins.entry(e.to.clone()).or_default().push(InEdge {
                 label: e.label.clone(),
+                from: e.from.clone(),
                 rx,
             });
         }
@@ -953,6 +955,18 @@ impl Topology {
                     )) as NodeFut)
                 }
                 NodeKind::Join(j) => {
+                    // Every node feeding the build side: a failure among them
+                    // leaves the hash table incomplete.
+                    let build_upstream: HashSet<String> = node_ins
+                        .iter()
+                        .find(|ie| ie.label.as_deref() == Some(j.build_edge.as_str()))
+                        .map(|ie| {
+                            let mut set =
+                                facts.ancestors.get(&ie.from).cloned().unwrap_or_default();
+                            set.insert(ie.from.clone());
+                            set
+                        })
+                        .unwrap_or_default();
                     let build_rx = take_by_label(&mut node_ins, &j.build_edge);
                     let probe_rx = take_by_label(&mut node_ins, &j.probe_edge);
                     match (build_rx, probe_rx) {
@@ -960,8 +974,12 @@ impl Topology {
                             id.clone(),
                             pipeline,
                             j,
-                            b,
-                            p,
+                            JoinInputs {
+                                build_rx: b,
+                                probe_rx: p,
+                                build_upstream,
+                                failed: Arc::clone(&failed),
+                            },
                             node_outs,
                             cancel,
                         )) as NodeFut),
@@ -1034,6 +1052,10 @@ impl Topology {
         // every abandon path below aborts explicitly.
         let aborts: Vec<tokio::task::AbortHandle> =
             handles.iter().map(|h| h.abort_handle()).collect();
+        // A dropped run future (serve cancel / timeout past its flush grace)
+        // must not leave node tasks writing and persisting bookmarks for a
+        // run already reported as cancelled.
+        let _abort_on_drop = AbortOnDrop(aborts.clone());
         let abort_all = || {
             for a in &aborts {
                 a.abort();
@@ -1603,6 +1625,17 @@ struct ResumePlan {
     sinks: HashMap<String, SinkResume>,
 }
 
+/// Aborts every node task when dropped; a no-op for tasks that finished.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for a in &self.0 {
+            a.abort();
+        }
+    }
+}
+
 /// Read every sink node's stored bookmark and decide the source's resume point.
 ///
 /// Returns `Some(bookmark)` only when it is provably safe to resume there;
@@ -2047,16 +2080,29 @@ async fn run_merge_node(
     Ok(NodeOutcome::Other)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// A join node's two inputs, plus what it needs to tell a finished build side
+/// from one cut short by a failure.
+struct JoinInputs {
+    build_rx: mpsc::Receiver<StreamPage>,
+    probe_rx: mpsc::Receiver<StreamPage>,
+    build_upstream: HashSet<String>,
+    failed: FailedNodes,
+}
+
 async fn run_join_node(
     node_id: String,
     pipeline: String,
     j: JoinNode,
-    mut build_rx: mpsc::Receiver<StreamPage>,
-    mut probe_rx: mpsc::Receiver<StreamPage>,
+    inputs: JoinInputs,
     mut outs: Vec<mpsc::Sender<StreamPage>>,
     cancel: CancellationToken,
 ) -> Result<NodeOutcome, FaucetError> {
+    let JoinInputs {
+        mut build_rx,
+        mut probe_rx,
+        build_upstream,
+        failed,
+    } = inputs;
     let mode = j.config.mode;
     let mut join = HashJoin::new(j.config);
 
@@ -2064,6 +2110,16 @@ async fn run_join_node(
     let build_start = std::time::Instant::now();
     while let Some(page) = recv_or_cancel(&mut build_rx, &cancel).await {
         join.add_build_page(page.records)?;
+    }
+    // A closed build channel is also what a failed upstream looks like; never
+    // probe against a partial hash table (inner joins would drop rows, left
+    // joins emit them unenriched). A failed node is recorded before its
+    // senders close, so this check cannot race the close.
+    if let Some((node, error)) = failed_upstream(&failed, &build_upstream) {
+        return Err(FaucetError::Source(format!(
+            "join '{node_id}': build-side node '{node}' failed, so its hash table is \
+             incomplete and nothing was probed: {error}"
+        )));
     }
     if cancel.is_cancelled() {
         return Ok(NodeOutcome::Other);
@@ -2853,6 +2909,79 @@ mod tests {
                 .iter()
                 .any(|r| r["order"] == json!("A") && r["tier"] == json!("gold"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_side_is_never_probed() {
+        /// One page, then a failure.
+        struct HalfSource;
+        #[async_trait]
+        impl Source for HalfSource {
+            async fn fetch_with_context(
+                &self,
+                _c: &std::collections::HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(Vec::new())
+            }
+            fn stream_pages<'a>(
+                &'a self,
+                _c: &'a std::collections::HashMap<String, Value>,
+                _b: usize,
+            ) -> Pin<Box<dyn crate::Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>>
+            {
+                Box::pin(futures::stream::iter(vec![
+                    Ok(StreamPage {
+                        records: vec![json!({"id": 1, "tier": "gold"})],
+                        bookmark: None,
+                    }),
+                    Err(FaucetError::Source("build side broke".into())),
+                ]))
+            }
+        }
+        for on_error in [TopologyOnError::Continue, TopologyOnError::Propagate] {
+            let (sink, store) = CollectSink::new();
+            let jn = JoinNode {
+                config: JoinConfig {
+                    mode: JoinMode::Left,
+                    build_key: "id".into(),
+                    probe_key: "cust".into(),
+                    projections: vec![Projection {
+                        from: "tier".into(),
+                        as_: "tier".into(),
+                    }],
+                    ..Default::default()
+                },
+                build_edge: "customers".into(),
+                probe_edge: "orders".into(),
+            };
+            let topo = Topology::builder()
+                .source("c", Box::new(HalfSource))
+                .source(
+                    "o",
+                    VecSource::boxed(vec![
+                        json!({"order": "A", "cust": 1}),
+                        json!({"order": "B", "cust": 2}),
+                    ]),
+                )
+                .join("j", jn)
+                .sink("k", Box::new(sink))
+                .labelled_edge("c", "j", "customers")
+                .labelled_edge("o", "j", "orders")
+                .edge("j", "k")
+                .build()
+                .unwrap();
+            let mut opts = TopologyOptions::new("p");
+            opts.on_error = on_error;
+            let (run, err) = topo
+                .run_attributed(opts, TopologyGovernance::default())
+                .await;
+            let errors = format!("{err:?} {:?}", run.result.errors);
+            assert!(errors.contains("build side broke"), "{errors}");
+            assert!(
+                store.lock().unwrap().is_empty(),
+                "{on_error:?}: nothing probed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3873,6 +4002,47 @@ mod graph_safety_tests {
             .to_string();
         assert!(err.contains("join 'j'"), "{err}");
         assert!(err.contains("'s'") || err.contains("'t'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_run_future_aborts_its_node_tasks() {
+        struct Wedged {
+            alive: Arc<()>,
+            entered: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl Sink for Wedged {
+            async fn write_batch(&self, _: &[Value]) -> Result<usize, FaucetError> {
+                let _hold = Arc::clone(&self.alive);
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+        let alive = Arc::new(());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let topology = Topology::builder()
+            .source("s", VecSource::boxed(recs(2)))
+            .sink(
+                "k",
+                Box::new(Wedged {
+                    alive: Arc::clone(&alive),
+                    entered: Arc::clone(&entered),
+                }),
+            )
+            .edge("s", "k")
+            .build()
+            .unwrap();
+        let run = tokio::spawn(topology.run(TopologyOptions::default()));
+        entered.notified().await;
+        run.abort();
+        let _ = run.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&alive) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the wedged sink node must be aborted with the run");
     }
 
     #[tokio::test]
