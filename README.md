@@ -13,6 +13,7 @@
   <a href="deny.toml"><img src="https://img.shields.io/badge/deps-cargo--deny-blue" alt="Dependencies"></a>
   <a href="#license"><img src="https://img.shields.io/crates/l/faucet-stream.svg" alt="License"></a>
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep%20a%20changelog-orange" alt="Changelog"></a>
+  <a href="https://www.linkedin.com/company/faucet-stream"><img src="https://img.shields.io/badge/LinkedIn-follow-0A66C2?logo=linkedin" alt="LinkedIn"></a>
 </p>
 
 # faucet-stream
