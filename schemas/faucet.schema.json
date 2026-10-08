@@ -2024,7 +2024,7 @@
           "const": "skip"
         },
         {
-          "description": "Fail the record with a typed error.",
+          "description": "Fail the join node — and with it the run — with a typed error.",
           "type": "string",
           "const": "error"
         }

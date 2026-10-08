@@ -31,11 +31,11 @@
 //! ## State
 //!
 //! Each terminal sink owns its bookmark under `{pipeline}::{node_id}`. On
-//! restart the source resumes from the **minimum** across every sink's stored
-//! bookmark (so the slowest sink catches up), applied only when *every* sink
-//! has a stored bookmark; otherwise the source replays in full. Sinks whose
-//! bookmarks have diverged must therefore be idempotent — a faster sink will
-//! re-see already-written pages.
+//! restart the source resumes from the sinks' stored bookmark only when *every*
+//! sink has one and they all agree (exactly-once orders committed positions
+//! instead — see below); otherwise the source replays in full, so sinks that
+//! may diverge must be idempotent — a faster sink will re-see already-written
+//! pages. A state-store read error fails the run rather than replaying.
 //!
 //! Resuming is deliberately conservative, because the only safe direction to err
 //! is *replay* (duplicates) and never *skip* (loss) — see [`start_bookmark`]:
@@ -1700,7 +1700,10 @@ async fn compute_resume(
                 Some(src) => crate::state_version::resolve_for_source(&key, &v, src)?.data,
                 None => crate::state_version::peel_versioned(&v),
             }),
-            _ => None,
+            Ok(None) => None,
+            // A transient read error is not "no bookmark": replaying in full
+            // on it would be a silent re-sync.
+            Err(e) => return Err(e),
         };
         stored.push((id.clone(), value));
     }
@@ -2909,6 +2912,35 @@ mod tests {
                 .iter()
                 .any(|r| r["order"] == json!("A") && r["tier"] == json!("gold"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_state_read_error_fails_the_run_instead_of_replaying() {
+        struct Unreadable;
+        #[async_trait]
+        impl StateStore for Unreadable {
+            async fn get(&self, _k: &str) -> Result<Option<Value>, FaucetError> {
+                Err(FaucetError::State("store unreachable".into()))
+            }
+            async fn put(&self, _k: &str, _v: &Value) -> Result<(), FaucetError> {
+                Ok(())
+            }
+            async fn delete(&self, _k: &str) -> Result<(), FaucetError> {
+                Ok(())
+            }
+        }
+        let (sink, store) = CollectSink::new();
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(2)))
+            .sink("k", Box::new(sink))
+            .edge("s", "k")
+            .build()
+            .unwrap();
+        let mut opts = TopologyOptions::new("p");
+        opts.state_store = Some(Arc::new(Unreadable));
+        let err = topo.run(opts).await.unwrap_err();
+        assert!(err.to_string().contains("store unreachable"), "{err}");
+        assert!(store.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
