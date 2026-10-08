@@ -675,13 +675,16 @@ fail again go to a *fresh* DLQ, never back to the source.
 | `--json` | Emit a JSON result. |
 | `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
 
-**`faucet dlq discard <location>`** — remove processed envelopes.
+**`faucet dlq discard <location>`** — remove processed envelopes from the
+backlog. The DLQ file is never rewritten (a running pipeline may be appending
+to it): discarded envelopes are listed in a `<file>.discarded` sidecar that
+every reader skips.
 
 | Flag | Effect |
 |------|--------|
 | `--reason <r>` | Only discard envelopes with this reason. |
 | `--before <when>` | Only discard envelopes older than an RFC 3339 timestamp or a relative age (`7d` / `24h` / `30m`). |
-| `--delete` | Permanently delete instead of archiving to a `<file>.archived.jsonl` sibling. |
+| `--delete` | Only record the discard, without copying the envelopes to a `<file>.archived` sibling. |
 | `--encryption-key <k>` | Key for a sealed DLQ (repeatable). Kept/archived lines stay sealed verbatim; decryption happens only in memory for filtering. |
 | `--encryption-key-file <path>` | Read a DLQ key from a file (repeatable). `FAUCET_DLQ_ENCRYPTION_KEY` also supplies `--encryption-key`; both keep the key out of `ps` and shell history. Keys are redacted from faucet's output. |
 | `--json` | Emit a JSON result. |

@@ -265,11 +265,13 @@ pub async fn replay(
 
 /// Discard (archive or delete) DLQ envelopes matching a reason / age filter.
 ///
-/// Only DLQ envelopes matching the filter are removed; blank, malformed, and
-/// non-envelope lines are preserved verbatim. By default discarded envelopes
-/// are appended to a `<file>.archived` sibling before being removed from
-/// the source; `delete = true` removes them without archiving. A file is
-/// rewritten only when it actually lost lines.
+/// Only DLQ envelopes matching the filter are discarded; blank, malformed, and
+/// non-envelope lines are never touched. The DLQ file itself is never
+/// rewritten — a running pipeline may be appending to it, and a rewrite would
+/// lose whatever it appends meanwhile — so each discarded envelope's
+/// [`reader::line_id`] is appended to a `<file>.discarded` sidecar that every
+/// reader skips. By default discarded envelopes are also appended to a
+/// `<file>.archived` sibling; `delete = true` only records them.
 pub fn discard(
     location: &str,
     reason: Option<&str>,
@@ -288,19 +290,23 @@ pub fn discard(
         let text = std::fs::read_to_string(file).map_err(|e| {
             CliError::Internal(format!("reading DLQ file '{}': {e}", file.display()))
         })?;
-        let mut kept = String::new();
+        let mut already = reader::discarded_lines(file)?;
+        let mut ids = String::new();
         let mut removed = String::new();
         let mut file_discarded = 0usize;
         for line in text.lines() {
-            if plan::discard_keep_line(line, dec, reason.as_deref(), before_ms) {
-                kept.push_str(line);
-                kept.push('\n');
-            } else {
-                file_discarded += 1;
-                if !delete {
-                    removed.push_str(line);
-                    removed.push('\n');
-                }
+            let id = reader::line_id(line);
+            if already.contains(&id) || plan::discard_keep_line(line, dec, reason.as_deref(), before_ms)
+            {
+                continue;
+            }
+            file_discarded += 1;
+            ids.push_str(&id);
+            ids.push('\n');
+            already.insert(id);
+            if !delete {
+                removed.push_str(line);
+                removed.push('\n');
             }
         }
         if file_discarded == 0 {
@@ -312,7 +318,7 @@ pub fn discard(
             append_to(&archive, &removed)?;
             archived_to.push(archive.to_string_lossy().into_owned());
         }
-        atomic_rewrite(file, kept.as_bytes())?;
+        append_to(&reader::discard_sidecar(file), &ids)?;
         files_rewritten += 1;
     }
 
@@ -321,31 +327,6 @@ pub fn discard(
         files_rewritten,
         archived_to,
     })
-}
-
-/// Rewrite `file` atomically: write the surviving lines to a temp file in the
-/// same directory, then `rename` it over the original. A process kill mid-write
-/// leaves the original intact (the incomplete write lands only in the temp
-/// file), so the un-discarded kept envelopes can never be lost to a truncated
-/// prefix — unlike a direct `fs::write` truncate-then-write (audit #321 L3).
-fn atomic_rewrite(file: &std::path::Path, contents: &[u8]) -> CliResult<()> {
-    let parent = file.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let name = file
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("dlq.jsonl");
-    // Same-directory temp so the rename is atomic (same filesystem). The pid
-    // keeps concurrent discards on the same file from colliding on the temp name.
-    let tmp = parent.join(format!(".{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, contents).map_err(|e| {
-        CliError::Internal(format!("writing temp DLQ file '{}': {e}", tmp.display()))
-    })?;
-    std::fs::rename(&tmp, file).map_err(|e| {
-        // Best-effort cleanup of the temp file if the rename failed.
-        let _ = std::fs::remove_file(&tmp);
-        CliError::Internal(format!("rewriting DLQ file '{}': {e}", file.display()))
-    })?;
-    Ok(())
 }
 
 /// The archive sibling for a DLQ file: `dlq.jsonl` → `dlq.jsonl.archived`.
@@ -461,24 +442,44 @@ mod tests {
         assert_eq!(out.discarded, 1);
         assert_eq!(out.files_rewritten, 1);
         assert_eq!(out.archived_to.len(), 1);
-        // The quality envelope is gone; the contract one and the non-envelope
-        // line remain.
-        let remaining = std::fs::read_to_string(&path).unwrap();
-        assert!(!remaining.contains("\"id\":1") && !remaining.contains("\"id\": 1"));
-        assert!(remaining.contains("ContractViolation"));
-        assert!(remaining.contains("other"));
+        // The live file is untouched (#789 CLI-48); readers see only the
+        // contract envelope and the non-envelope line.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        let scan = reader::scan_files(&[path.clone()], &DlqDecryptor::default()).unwrap();
+        assert_eq!(scan.envelopes.len(), 1);
+        assert_eq!(scan.envelopes[0].error_kind.as_deref(), Some("ContractViolation"));
+        assert_eq!(scan.non_envelope, 1);
         // The archive holds the discarded envelope.
         let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
         assert!(archived.contains("QualityFailure"));
-        // #321 L3: the atomic rewrite leaves no lingering temp file behind.
-        let leftover: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
-            .collect();
+    }
+
+    /// An envelope a running pipeline appends while (or after) a discard runs
+    /// is kept, and a second discard never double-archives (#789 CLI-48).
+    #[test]
+    fn discard_never_loses_envelopes_appended_by_a_live_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = env_line("quality", "QualityFailure", 1, json!({"id": 1}));
+        let path = write(dir.path(), "dlq.jsonl", &format!("{first}\n"));
+        let mut live = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        discard(path.to_str().unwrap(), None, None, false, &DlqDecryptor::default()).unwrap();
+        use std::io::Write;
+        let late = env_line("quality", "QualityFailure", 2, json!({"id": 2}));
+        writeln!(live, "{late}").unwrap();
+        drop(live);
+        let scan = reader::scan_files(&[path.clone()], &DlqDecryptor::default()).unwrap();
+        assert_eq!(scan.envelopes.len(), 1, "the late envelope survives");
+        let again =
+            discard(path.to_str().unwrap(), None, None, false, &DlqDecryptor::default()).unwrap();
+        assert_eq!(again.discarded, 1, "only the late one is new");
+        let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
+        assert_eq!(archived.lines().count(), 2);
+        assert!(reader::is_archive(&reader::discard_sidecar(&path)));
         assert!(
-            leftover.is_empty(),
-            "no .tmp file should remain: {leftover:?}"
+            reader::scan_files(&[path], &DlqDecryptor::default())
+                .unwrap()
+                .envelopes
+                .is_empty()
         );
     }
 
@@ -549,8 +550,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.discarded, 1);
-        let remaining = std::fs::read_to_string(&path).unwrap();
-        assert!(remaining.contains("\"id\":2") || remaining.contains("\"id\": 2"));
+        let scan = reader::scan_files(&[path], &DlqDecryptor::default()).unwrap();
+        assert_eq!(scan.envelopes.len(), 1);
+        assert_eq!(scan.envelopes[0].ts_ms, Some(5000));
     }
 
     #[test]
