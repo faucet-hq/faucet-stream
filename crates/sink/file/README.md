@@ -62,9 +62,16 @@ only after that flush, so:
 File-system calls run on Tokio's blocking pool, so a hung disk (or a FIFO
 nobody writes) never blocks a caller's timeout or cancellation.
 A file that keeps growing across several flushes in one run stays complete at
-every step: JSON Lines and raw text are copied and extended (a compressed file
-gains a new gzip/zstd member; on a copy-on-write file system the copy is a
-clone, elsewhere it costs one read of the file per flush), CSV keeps its rows in a side file and rewrites
+every flush. JSON Lines and raw text are renamed into place once and then
+extended in place: each later flush appends only its own lines (a compressed
+file gains a new gzip/zstd member, a per-line encrypted file a new trailer) and
+`fsync`s, so a flush costs its own size, not the file's. A run killed during
+that append can leave a torn last line; the next `append` run cuts it, and a
+`replace` run writes a new file anyway. The other formats are rewritten whole
+to continue a file, so a long run with frequent flushes into one file costs
+time and I/O that grow with the square of its size — the sink warns once per
+file, and a `{part}` template or `max_records_per_file` keeps each file small.
+CSV keeps its rows in a side file and rewrites
 the header in front of them (so a later record can still add a column),
 Parquet copies its row groups into a new file, and the whole-document formats
 (JSON array, XML, Excel, Avro) re-encode the file's records, which they keep in
@@ -122,7 +129,8 @@ file id and closes with a sealed trailer line holding the record count and a
 SHA-256 digest of every record line in order; each record line is bound so it
 can not be read as a line of an older, header-less file. A reader verifies the
 file whole, so a line dropped, duplicated, reordered or copied in from another
-file — or a file cut short at a line boundary — fails the read. Appending cuts
+file — or a file cut short anywhere but at the end of an earlier flush (which
+is just that flush's complete version of the file) — fails the read. Appending cuts
 the trailer, continues the digest and writes a new one; a file written before
 this layout (by the `jsonl` sink, or an older faucet) is continued line by
 line. Every other file, compressed JSON Lines included, is

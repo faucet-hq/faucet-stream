@@ -124,9 +124,9 @@ impl Ctx<'_> {
         if let Some(enc) = self.encryption
             && self.seals_lines()
         {
-            use crate::sealed_lines::{Opened, open};
+            use crate::sealed_lines::{Opened, open_for_append};
             let raw = std::fs::read(tmp).map_err(|e| io_err("reading", tmp, e))?;
-            return match open(&raw, enc)
+            return match open_for_append(&raw, enc)
                 .map_err(|e| FaucetError::Sink(format!("file sink: continuing '{label}': {e}")))?
             {
                 Opened::Sealed { seal, body_len, .. } => {
@@ -179,6 +179,14 @@ impl Ctx<'_> {
     pub fn seals_lines(&self) -> bool {
         matches!(self.format, FileFormat::JsonLines | FileFormat::RawText)
             && self.codec == Compression::None
+    }
+
+    /// Whether a published file can be extended by appending each flush's
+    /// bytes: a line format (a compressed one gains a member) not sealed as
+    /// a whole file.
+    pub(crate) fn appends_in_place(&self) -> bool {
+        matches!(self.format, FileFormat::JsonLines | FileFormat::RawText)
+            && (!self.encrypted() || self.seals_lines())
     }
 
     /// Whether scratch files hold plaintext of an encrypted output, so they
@@ -479,6 +487,12 @@ pub(crate) struct OpenFile {
     pub stream: Option<Box<dyn PartStream>>,
     /// Whole-file integrity of a per-line sealed file while it is open.
     seal: Option<Seal>,
+    /// The published local file this one is extended in place: after its
+    /// first publish an appendable line file gets only each flush's new
+    /// lines appended, instead of a copy of the whole file renamed over it.
+    pub delta: Option<PathBuf>,
+    /// Whether rewriting the whole file to continue it was warned about.
+    pub rewrite_warned: bool,
 }
 
 impl OpenFile {
@@ -509,6 +523,8 @@ impl OpenFile {
             parts: None,
             stream: None,
             seal: None,
+            delta: None,
+            rewrite_warned: false,
         };
         file.enc = match ctx.format {
             FileFormat::JsonLines | FileFormat::RawText => {
@@ -544,7 +560,7 @@ impl OpenFile {
             return false;
         }
         match &self.enc {
-            Enc::Lines(slot) => slot.is_none(),
+            Enc::Lines(slot) => slot.is_none() && self.delta.is_none(),
             #[cfg(feature = "file-format-csv")]
             Enc::CsvSealed => true,
             #[cfg(feature = "file-format-parquet")]
@@ -579,10 +595,18 @@ impl OpenFile {
         match &mut self.enc {
             Enc::Lines(slot) => {
                 if slot.is_none() {
-                    let (w, seal) =
-                        open_lines(ctx, &self.label, &tmp, existing, None).map_err(clean)?;
-                    *slot = Some(w);
-                    self.seal = seal;
+                    if self.delta.is_some() {
+                        let f = create_scratch(&tmp, ctx.private()).map_err(clean)?;
+                        *slot = Some(Box::new(sync_compress_writer(
+                            BufWriter::new(LineOut::File(f)),
+                            ctx.codec,
+                        )));
+                    } else {
+                        let (w, seal) =
+                            open_lines(ctx, &self.label, &tmp, existing, None).map_err(clean)?;
+                        *slot = Some(w);
+                        self.seal = seal;
+                    }
                 }
                 let buf = ctx.line_bytes(records, self.seal.as_mut()).map_err(clean)?;
                 let w = slot.as_mut().expect("opened above");
@@ -642,8 +666,8 @@ impl OpenFile {
                 let Some(mut w) = slot.take() else {
                     return Ok(Closed::Nothing);
                 };
-                if let Some(seal) = self.seal.take() {
-                    w.write_all(&ctx.seal_trailer(&seal))
+                if let Some(seal) = &self.seal {
+                    w.write_all(&ctx.seal_trailer(seal))
                         .map_err(|e| io_err("writing", &tmp, e))?;
                 }
                 let buffered = w.finish().map_err(|e| io_err("finishing", &tmp, e))?;
@@ -758,7 +782,11 @@ fn open_lines(
         if ctx.seals_lines() {
             ctx.check_line_sealing(existing, label)?;
             copy_or_move(existing, tmp)?;
-            resumed = Some(ctx.resume_seal(tmp, label)?);
+            if ctx.encrypted() {
+                resumed = Some(ctx.resume_seal(tmp, label)?);
+            } else {
+                cut_torn_line(tmp)?;
+            }
         } else if ctx.encrypted() {
             let stored = ctx.read_stored(existing, label);
             remove_fetched(existing);
@@ -781,6 +809,63 @@ fn open_lines(
         Some(seal) => Ok((w, seal)),
         None => start(w, ctx.new_seal()),
     }
+}
+
+/// Cut bytes after the last newline — a line torn by a run that stopped
+/// mid-write — so appended lines start on a line boundary.
+fn cut_torn_line(path: &Path) -> Result<(), FaucetError> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| io_err("opening", path, e))?;
+    let len = f.metadata().map_err(|e| io_err("reading", path, e))?.len();
+    let mut end = len;
+    let mut buf = vec![0u8; 8192];
+    let keep = loop {
+        if end == 0 {
+            break 0;
+        }
+        let start = end.saturating_sub(buf.len() as u64);
+        let n = (end - start) as usize;
+        f.seek(SeekFrom::Start(start))
+            .and_then(|_| f.read_exact(&mut buf[..n]))
+            .map_err(|e| io_err("reading", path, e))?;
+        if let Some(i) = buf[..n].iter().rposition(|b| *b == b'\n') {
+            break start + i as u64 + 1;
+        }
+        end = start;
+    };
+    if keep < len {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = len - keep,
+            "file sink: cutting a partial last line left by an interrupted write"
+        );
+        f.set_len(keep).map_err(|e| io_err("truncating", path, e))?;
+    }
+    Ok(())
+}
+
+/// Append the finished scratch file `delta` to the published file `dest`
+/// and make it durable; the scratch file is removed.
+pub(crate) fn append_published(delta: &Path, dest: &Path, label: &str) -> Result<(), FaucetError> {
+    let mut out = match OpenOptions::new().append(true).open(dest) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(FaucetError::Sink(format!(
+                "file sink: '{label}' was published earlier in this run but is gone, so it \
+                 cannot be continued"
+            )));
+        }
+        Err(e) => return Err(io_err("opening", dest, e)),
+    };
+    let mut src = File::open(delta).map_err(|e| io_err("opening", delta, e))?;
+    std::io::copy(&mut src, &mut out).map_err(|e| io_err("appending to", dest, e))?;
+    out.sync_all().map_err(|e| io_err("syncing", dest, e))?;
+    let _ = std::fs::remove_file(delta);
+    Ok(())
 }
 
 /// Make `to` a copy of `from`: a rename when `from` is a fetched copy, a

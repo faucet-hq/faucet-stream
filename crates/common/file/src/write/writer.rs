@@ -476,6 +476,19 @@ impl FileWriter {
         op: impl FnOnce(&mut OpenFile, &Ctx<'_>, Option<&Path>) -> Result<(), Failure>,
     ) -> Result<(), FaucetError> {
         let need = Existing::of(st.current.as_ref().expect("a file is open"));
+        if !matches!(need, Existing::Unneeded) {
+            let cur = st.current.as_mut().expect("a file is open");
+            if !cur.rewrite_warned {
+                cur.rewrite_warned = true;
+                tracing::warn!(
+                    file = %cur.label,
+                    "file sink: continuing this file after a flush rewrites it whole (its \
+                     format or storage can not be appended to), so a long run with frequent \
+                     flushes costs time and I/O that grow with the square of its size — add \
+                     `{{part}}` to the path, or set max_records_per_file / max_bytes_per_file"
+                );
+            }
+        }
         let existing = self.existing_copy(need).await?;
         let cur = st.current.as_mut().expect("a file is open");
         let ctx = self.ctx();
@@ -515,12 +528,21 @@ impl FileWriter {
         let ctx = self.ctx();
         match blocking(|| f.close(&ctx))? {
             Closed::Nothing => {}
-            Closed::File => {
-                if keep {
-                    f.keep_copy();
+            Closed::File => match f.delta.clone() {
+                Some(dest) => {
+                    let (tmp, label) = (f.tmp.clone(), f.label.clone());
+                    blocking(|| super::encode::append_published(&tmp, &dest, &label))?;
                 }
-                self.backend.publish(&f.tmp, f.area, &f.name).await?;
-            }
+                None => {
+                    if keep {
+                        f.keep_copy();
+                    }
+                    self.backend.publish(&f.tmp, f.area, &f.name).await?;
+                    if ctx.appends_in_place() {
+                        f.delta = self.backend.local_path(f.area, &f.name);
+                    }
+                }
+            },
             Closed::Parts(parts) if f.stream.is_none() && parts.len() <= 1 => {
                 f.spill(parts.first().map_or(&[][..], Vec::as_slice))?;
                 self.backend.publish(&f.tmp, f.area, &f.name).await?;

@@ -1034,3 +1034,135 @@ mod sealed_line_integrity {
         assert!(e.contains("integrity"), "{e}");
     }
 }
+
+/// #789 FILE-19: a local line file is extended in place after its first
+/// publish, so each flush writes only its own lines.
+mod in_place {
+    use super::*;
+
+    #[cfg(unix)]
+    fn inode(p: &Path) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap())
+    }
+
+    #[tokio::test]
+    async fn flushes_append_to_the_published_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(dir.path(), "o.jsonl", jsonl());
+        let out = dir.path().join("o.jsonl");
+        w.write_rows(&rows(2)).await.unwrap();
+        w.flush().await.unwrap();
+        #[cfg(unix)]
+        let first = inode(&out);
+        for _ in 0..3 {
+            w.write_rows(&rows(1)).await.unwrap();
+            w.flush().await.unwrap();
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            inode(&out),
+            first,
+            "extended in place, not replaced by a copy"
+        );
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text.lines().count(), 5);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "o.jsonl")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        w.write_rows(&rows(1)).await.unwrap();
+        std::fs::remove_file(&out).unwrap();
+        let e = w.flush().await.unwrap_err().to_string();
+        assert!(e.contains("is gone"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_compressed_file_gains_a_member_per_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(
+            dir.path(),
+            "o.jsonl.gz",
+            WriteSettings::new(FileFormat::JsonLines, Compression::Gzip),
+        );
+        for _ in 0..3 {
+            w.write_rows(&rows(2)).await.unwrap();
+            w.flush().await.unwrap();
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut faucet_core::compression::wrap_sync_reader(
+                std::fs::File::open(dir.path().join("o.jsonl.gz")).unwrap(),
+                Compression::Gzip,
+            ),
+            &mut text,
+        )
+        .unwrap();
+        assert_eq!(text.lines().count(), 6);
+    }
+
+    #[tokio::test]
+    async fn appending_to_a_file_with_a_torn_last_line_cuts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.jsonl"), "{\"i\":7}\n{\"i\":8,\"na").unwrap();
+        let mut s = jsonl();
+        s.if_exists = IfExists::Append;
+        let w = local(dir.path(), "t.jsonl", s);
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("t.jsonl")).unwrap(),
+            "{\"i\":7}\n{\"i\":0}\n"
+        );
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn a_sealed_file_extended_in_place_verifies_and_recovers_a_crash_tail() {
+        use crate::sealed_lines::{open, plaintext};
+        let spec: faucet_core::EncryptionSpec =
+            serde_json::from_value(json!({"key": "k"})).unwrap();
+        let enc = faucet_core::CompiledEncryption::compile(&spec).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = jsonl();
+        s.if_exists = IfExists::Append;
+        s.encryption = Some(spec);
+        let w = local(dir.path(), "s.jsonl", s.clone());
+        for _ in 0..3 {
+            w.write_rows(&rows(1)).await.unwrap();
+            w.flush().await.unwrap();
+        }
+        drop(w);
+        let out = dir.path().join("s.jsonl");
+        assert!(open(&std::fs::read(&out).unwrap(), &enc).is_ok());
+        let mut crashed = std::fs::read(&out).unwrap();
+        crashed.extend_from_slice(b"RkNUAQIDtorn");
+        std::fs::write(&out, &crashed).unwrap();
+        let w = local(dir.path(), "s.jsonl", s);
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        let plain = plaintext(&std::fs::read(&out).unwrap(), &enc).unwrap();
+        assert_eq!(String::from_utf8(plain).unwrap().lines().count(), 4);
+    }
+
+    #[cfg(feature = "file-format-csv")]
+    #[tokio::test]
+    async fn a_format_that_is_rewritten_still_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(
+            dir.path(),
+            "c.csv",
+            WriteSettings::new(FileFormat::Csv, Compression::None),
+        );
+        for _ in 0..2 {
+            w.write_rows(&rows(1)).await.unwrap();
+            w.flush().await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("c.csv")).unwrap(),
+            "i\n0\n0\n"
+        );
+    }
+}

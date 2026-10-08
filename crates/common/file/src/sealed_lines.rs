@@ -3,9 +3,11 @@
 //! A file opens with a sealed header line naming a random file id, every
 //! record line is sealed on its own (so the file stays appendable), and a
 //! sealed trailer line closes it with the record count and a SHA-256 digest
-//! of every record line in order. A reader requires the trailer, so a line
-//! dropped, duplicated, reordered or moved in from another file, and a file
-//! cut short at a line boundary, all fail to open. Files written before the
+//! of every record line in order. A file extended in place gains one trailer
+//! per flush, each verifying the lines before it. A reader requires the file
+//! to end on a verifying trailer, so a line dropped, duplicated, reordered or
+//! moved in from another file, and a file cut short anywhere but at an
+//! earlier flush (that flush's complete version), all fail to open. Files written before the
 //! header existed open line by line, with a warning that they carry no
 //! whole-file check.
 
@@ -156,9 +158,28 @@ fn damaged(what: &str) -> FaucetError {
 }
 
 /// Open a per-line sealed file, verifying it whole when it has a header.
+///
+/// A file continued in place carries one trailer per flush; every trailer
+/// must verify against the lines before it and the file must end with one.
 pub fn open(raw: &[u8], enc: &CompiledEncryption) -> Result<Opened, FaucetError> {
-    let text = std::str::from_utf8(raw)
-        .map_err(|e| FaucetError::Source(format!("encrypted lines are not UTF-8: {e}")))?;
+    scan(raw, enc, false)
+}
+
+/// [`open`] for a writer about to continue the file: a tail after the last
+/// verifying trailer — the unfinished flush of a run that crashed, never
+/// reported as written — is dropped (`body_len` then points at that
+/// trailer) instead of failing.
+pub fn open_for_append(raw: &[u8], enc: &CompiledEncryption) -> Result<Opened, FaucetError> {
+    scan(raw, enc, true)
+}
+
+fn scan(raw: &[u8], enc: &CompiledEncryption, recover: bool) -> Result<Opened, FaucetError> {
+    let text = String::from_utf8_lossy(raw);
+    if !recover && std::str::from_utf8(raw).is_err() {
+        return Err(FaucetError::Source(
+            "encrypted lines are not UTF-8".to_string(),
+        ));
+    }
     let mut offset = 0usize;
     let mut lines = Vec::new();
     for (i, line) in text.split_inclusive('\n').enumerate() {
@@ -187,47 +208,75 @@ pub fn open(raw: &[u8], enc: &CompiledEncryption) -> Result<Opened, FaucetError>
         digest: Sha256::new(),
     };
     let mut plain = Vec::new();
-    for (k, &(number, start, line)) in lines.iter().enumerate().skip(1) {
-        match enc.open_line(&sealed_bytes(line, number)?)? {
-            SealedLine::Data(body) => {
+    // The state at the last verifying trailer: (seal, plaintext length, offset).
+    let mut settled: Option<(LineSeal, usize, usize)> = None;
+    let mut ended_on_trailer = false;
+    for &(number, start, line) in lines.iter().skip(1) {
+        let opened = sealed_bytes(line, number).and_then(|b| enc.open_line(&b));
+        let step = match opened {
+            Ok(SealedLine::Data(body)) => {
                 seal.digest.update(line.as_bytes());
                 seal.digest.update(b"\n");
                 seal.count += 1;
                 plain.extend_from_slice(&body);
                 plain.push(b'\n');
+                ended_on_trailer = false;
+                Ok(())
             }
-            SealedLine::Header(_) => {
-                return Err(damaged(&format!("line {number} is a second header")));
-            }
-            SealedLine::Trailer(body) => {
-                if k + 1 != lines.len() {
-                    return Err(damaged(&format!(
-                        "line {number} is the trailer, but lines follow it"
-                    )));
-                }
-                let t: Trailer = serde_json::from_slice(&body)
-                    .map_err(|_| damaged("its trailer is unreadable"))?;
-                if t.file != seal.file {
-                    return Err(damaged("its trailer belongs to another file"));
-                }
-                if t.count != seal.count || t.sha256 != hex(&seal.digest.clone().finalize()) {
-                    return Err(damaged(&format!(
-                        "the trailer records {} line(s), the file holds {} — lines were \
-                         dropped, added, reordered or altered",
-                        t.count, seal.count
-                    )));
-                }
-                return Ok(Opened::Sealed {
-                    plain,
-                    seal,
-                    body_len: start,
-                });
-            }
+            Ok(SealedLine::Header(_)) => Err(damaged(&format!("line {number} is a second header"))),
+            Ok(SealedLine::Trailer(body)) => verify_trailer(&body, &seal).map(|()| {
+                settled = Some((seal.clone(), plain.len(), start));
+                ended_on_trailer = true;
+            }),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = step {
+            return match settled.take() {
+                Some(s) if recover => Ok(recovered(s, plain)),
+                _ => Err(e),
+            };
         }
     }
-    Err(damaged(
-        "it ends without its trailer — the file was cut short",
-    ))
+    match settled {
+        Some((seal, _, body_len)) if ended_on_trailer => Ok(Opened::Sealed {
+            plain,
+            seal,
+            body_len,
+        }),
+        Some(s) if recover => Ok(recovered(s, plain)),
+        _ => Err(damaged(
+            "it ends without its trailer — the file was cut short",
+        )),
+    }
+}
+
+fn verify_trailer(body: &[u8], seal: &LineSeal) -> Result<(), FaucetError> {
+    let t: Trailer =
+        serde_json::from_slice(body).map_err(|_| damaged("a trailer is unreadable"))?;
+    if t.file != seal.file {
+        return Err(damaged("a trailer belongs to another file"));
+    }
+    if t.count != seal.count || t.sha256 != hex(&seal.digest.clone().finalize()) {
+        return Err(damaged(&format!(
+            "a trailer records {} line(s) where the file holds {} — lines were dropped, \
+             added, reordered or altered",
+            t.count, seal.count
+        )));
+    }
+    Ok(())
+}
+
+fn recovered((seal, kept, body_len): (LineSeal, usize, usize), mut plain: Vec<u8>) -> Opened {
+    plain.truncate(kept);
+    tracing::warn!(
+        "encrypted JSON Lines file: dropping the unfinished flush after its last trailer \
+         (left by a run that stopped mid-write)"
+    );
+    Opened::Sealed {
+        plain,
+        seal,
+        body_len,
+    }
 }
 
 fn open_legacy(
@@ -357,6 +406,49 @@ mod tests {
         assert!(open(&transplanted.concat(), &enc).is_err());
         assert!(open(b"{\"plain\":1}\n", &enc).is_err());
         assert!(open(&[0xff], &enc).is_err());
+    }
+
+    #[test]
+    fn flushes_in_place_leave_verifying_trailers_and_a_crash_tail_is_recovered() {
+        let enc = enc();
+        let mut seal = LineSeal::new();
+        let mut raw = seal.header(&enc);
+        raw.extend(seal.seal(&enc, b"1"));
+        raw.extend(seal.trailer(&enc));
+        raw.extend(seal.seal(&enc, b"2"));
+        raw.extend(seal.trailer(&enc));
+        assert_eq!(plaintext(&raw, &enc).unwrap(), b"1\n2\n");
+        let settled = raw.len();
+        let mut crashed = raw.clone();
+        crashed.extend(seal.seal(&enc, b"3"));
+        crashed.extend_from_slice(b"RkNUAQ");
+        assert!(
+            open(&crashed, &enc).is_err(),
+            "a reader refuses the unfinished tail"
+        );
+        let Opened::Sealed {
+            plain,
+            seal: resumed,
+            body_len,
+        } = open_for_append(&crashed, &enc).unwrap()
+        else {
+            panic!("sealed")
+        };
+        assert_eq!(plain, b"1\n2\n");
+        assert_eq!(resumed.count(), 2);
+        assert_eq!(body_len, settled - seal.trailer(&enc).len());
+        let mut forged = raw[..settled].to_vec();
+        forged.extend(LineSeal::new().trailer(&enc));
+        assert!(
+            open_for_append(&forged, &enc).is_ok(),
+            "a foreign trailer is only a tail"
+        );
+        assert!(open(&forged, &enc).is_err());
+        let mut lone = LineSeal::new();
+        let mut no_trailer = lone.header(&enc);
+        no_trailer.extend(lone.seal(&enc, b"x"));
+        assert!(open_for_append(&no_trailer, &enc).is_err());
+        assert!(open_for_append(&[0xff, b'\n'], &enc).is_err());
     }
 
     #[test]

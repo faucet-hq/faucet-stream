@@ -110,7 +110,7 @@ before decoding, because those formats need random access or a whole stream.
 decompressed; JSON Lines or raw text sealed line by line is read whole and
 then decrypted a line at a time, its header and trailer verified: a line
 dropped, duplicated, reordered or moved in from another file, or a file cut
-short, fails the read. A sealed file written before the header and trailer
+short anywhere but at an earlier flush's trailer, fails the read. A sealed file written before the header and trailer
 existed is read line by line with a warning that no whole-file check applies.
 A file or line that is not sealed fails the read rather than being trusted as
 plaintext.
