@@ -126,12 +126,12 @@ fn match_records(
             })
             .collect();
         let mut owner: Vec<Option<usize>> = vec![None; actual.len()];
-        for i in 0..expected.len() {
+        for (i, exp) in expected.iter().enumerate() {
             let mut seen = vec![false; actual.len()];
             if !augment(i, &edges, &mut owner, &mut seen) {
                 failures.push(format!(
                     "{label}[{i}]: no unmatched actual record equals {}",
-                    compact(&expected[i])
+                    compact(exp)
                 ));
             }
         }

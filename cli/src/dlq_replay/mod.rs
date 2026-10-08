@@ -444,7 +444,8 @@ mod tests {
         // The live file is untouched (#789 CLI-48); readers see only the
         // contract envelope and the non-envelope line.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
-        let scan = reader::scan_files(&[path.clone()], &DlqDecryptor::default()).unwrap();
+        let scan =
+            reader::scan_files(std::slice::from_ref(&path), &DlqDecryptor::default()).unwrap();
         assert_eq!(scan.envelopes.len(), 1);
         assert_eq!(
             scan.envelopes[0].error_kind.as_deref(),
@@ -479,7 +480,8 @@ mod tests {
         let late = env_line("quality", "QualityFailure", 2, json!({"id": 2}));
         writeln!(live, "{late}").unwrap();
         drop(live);
-        let scan = reader::scan_files(&[path.clone()], &DlqDecryptor::default()).unwrap();
+        let scan =
+            reader::scan_files(std::slice::from_ref(&path), &DlqDecryptor::default()).unwrap();
         assert_eq!(scan.envelopes.len(), 1, "the late envelope survives");
         let again = discard(
             path.to_str().unwrap(),

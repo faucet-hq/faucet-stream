@@ -194,7 +194,7 @@ async fn dlq_endpoints_inspect_replay_discard_with_rbac() {
     // The source file is left as written (a live pipeline may append to it,
     // #789 CLI-48); its discard sidecar hides every envelope from readers.
     let scan = faucet_cli::dlq_replay::reader::scan_files(
-        &[dlq.clone()],
+        std::slice::from_ref(&dlq),
         &faucet_cli::dlq_replay::reader::DlqDecryptor::default(),
     )
     .unwrap();

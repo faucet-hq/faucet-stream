@@ -1277,7 +1277,8 @@ per_stream:
         write_catalog(dir.path());
         let cat = Catalog::load(dir.path()).unwrap();
         let base = cat.source("acme").unwrap().clone();
-        let cases: Vec<(&str, Box<dyn Fn(&mut SourceTemplate)>)> = vec![
+        type Mutation = Box<dyn Fn(&mut SourceTemplate)>;
+        let cases: Vec<(&str, Mutation)> = vec![
             (
                 "apiToken",
                 Box::new(|s| s.source.config["apiToken"] = json!("sk-live-123")),

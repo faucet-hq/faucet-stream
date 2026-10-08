@@ -390,6 +390,7 @@ impl GithubFetcher {
         self.dirs()[0]
     }
 
+    #[cfg(test)]
     fn contents_url(&self, name: Option<&str>) -> String {
         self.contents_url_in(self.dir(), name)
     }
