@@ -177,9 +177,14 @@ const OWNER_FILE: &str = ".owner";
 /// faucet that predates the lock) is treated as abandoned.
 const UNOWNED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
+/// Lock the owner file under a private name and only then rename it into
+/// place, so a concurrent sweep never sees an unlocked `.owner` in a live
+/// directory and removes it.
 fn lock_owner(dir: &Path) -> std::io::Result<std::fs::File> {
-    let file = std::fs::File::create(dir.join(OWNER_FILE))?;
+    let pending = dir.join(".owner.pending");
+    let file = std::fs::File::create(&pending)?;
     file.try_lock().map_err(std::io::Error::other)?;
+    std::fs::rename(&pending, dir.join(OWNER_FILE))?;
     Ok(file)
 }
 
@@ -852,6 +857,36 @@ pub(crate) mod tests {
         assert!(!scratch_is_orphaned(next.scratch_dir()));
         assert!(!scratch_is_orphaned(&young));
         drop(live);
+    }
+
+    #[test]
+    fn concurrent_backends_never_sweep_each_others_scratch() {
+        let parent = Arc::new(tempfile::tempdir().unwrap());
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let parent = parent.clone();
+                std::thread::spawn(move || {
+                    let mem = Arc::new(Mem::default());
+                    for _ in 0..100 {
+                        let b = RemoteBackend::new(
+                            mem.clone(),
+                            "a/",
+                            &template("x"),
+                            Some(parent.path()),
+                        )
+                        .expect("a fresh scratch directory locks");
+                        assert!(
+                            b.scratch_dir().join(OWNER_FILE).exists(),
+                            "a live run's scratch survives a concurrent sweep"
+                        );
+                        assert!(!b.scratch_dir().join(".owner.pending").exists());
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
     }
 
     #[tokio::test]
