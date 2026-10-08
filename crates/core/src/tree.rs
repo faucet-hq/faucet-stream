@@ -496,7 +496,7 @@ fn scalar_string(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        other => other.to_string(),
+        other => crate::util::canonical_json(other),
     }
 }
 

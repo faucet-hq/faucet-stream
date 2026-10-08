@@ -402,7 +402,7 @@ fn serialize_csv(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
                 Some(Value::String(s)) => csv_field(s),
                 Some(Value::Bool(b)) => b.to_string(),
                 Some(Value::Number(n)) => n.to_string(),
-                Some(other) => csv_field(&other.to_string()),
+                Some(other) => csv_field(&crate::util::canonical_json(other)),
             })
             .collect::<Vec<_>>()
             .join(",");

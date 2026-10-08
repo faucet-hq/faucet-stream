@@ -687,7 +687,7 @@ pub fn cell_text(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        other => serde_json::to_string(other).unwrap_or_default(),
+        other => crate::util::canonical_json(other),
     }
 }
 

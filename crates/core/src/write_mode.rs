@@ -364,7 +364,7 @@ fn key_scalar_text(v: &Value) -> String {
             _ => n.to_string(),
         },
         Value::Bool(b) => b.to_string(),
-        other => other.to_string(),
+        other => crate::util::canonical_json(other),
     }
 }
 
@@ -386,11 +386,11 @@ pub fn key_to_doc_id(k: &KeyTuple, separator: &str) -> String {
     if k.0.len() == 1 {
         return match &k.0[0].1 {
             Value::String(s) => s.clone(),
-            other => other.to_string(),
+            other => crate::util::canonical_json(other),
         };
     }
-    let values: Vec<&Value> = k.0.iter().map(|(_, v)| v).collect();
-    serde_json::to_string(&values).expect("a Vec<&serde_json::Value> always serializes")
+    let values: Vec<Value> = k.0.iter().map(|(_, v)| v.clone()).collect();
+    crate::util::canonical_json(&Value::Array(values))
 }
 
 /// Build a Mongo/ES filter document `{ col: value, … }` from a key tuple.
