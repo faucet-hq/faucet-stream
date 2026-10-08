@@ -95,6 +95,7 @@ jobs:
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
 
       - name: Run release-plz
+        id: release-plz
         uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
         with:
           command: release-pr
@@ -108,6 +109,32 @@ jobs:
           # App token to get CI on the release PR.
           # No CARGO_REGISTRY_TOKEN: release-pr only reads the public index.
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # release-plz bumps Cargo manifests only. The Helm chart's image tag
+      # defaults to its appVersion, so the release PR must carry the new
+      # faucet-cli version there too (#830); CI's Doc counts job fails when the
+      # two differ. The subject deliberately is not `chore: release`, which the
+      # release gate above treats as a release commit.
+      - name: Sync the Helm chart appVersion on the release PR
+        env:
+          PR: ${{ steps.release-plz.outputs.pr }}
+          PUSH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          branch=$(jq -r '.head_branch // empty' <<<"${PR:-"{}"}")
+          if [ -z "$branch" ]; then
+            echo "No release PR opened or updated."
+            exit 0
+          fi
+          git fetch --quiet origin "$branch"
+          git switch --quiet -C "$branch" FETCH_HEAD
+          python3 scripts/helm-app-version.py --write
+          if git diff --quiet; then
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -am "chore: sync the Helm chart appVersion with faucet-cli"
+          git push --quiet "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${branch}"
 
   release-plz-release:
     name: Publish to crates.io
