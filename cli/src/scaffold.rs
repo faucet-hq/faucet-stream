@@ -129,6 +129,10 @@ impl ConnectorScaffold {
                 path: format!("{base}/src/{impl_file}"),
                 contents: self.impl_rs(),
             },
+            GeneratedFile {
+                path: format!("{base}/tests/conformance.rs"),
+                contents: self.conformance_rs(),
+            },
         ];
         if self.with_common {
             let cbase = self.common_crate_name();
@@ -179,6 +183,8 @@ faucet-core = "1"
 schemars = "1"
 
 [dev-dependencies]
+# The connector-SDK conformance battery `tests/conformance.rs` runs.
+faucet-conformance = "1"
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
 
 # Renders the complete feature-gated API (with per-item feature badges) on
@@ -244,6 +250,91 @@ pub struct {config_ty} {{
 }}
 "#
         )
+    }
+
+    /// `tests/conformance.rs`: the `faucet-conformance` checks a fresh
+    /// scaffold already passes, with the ones to add as the connector grows.
+    fn conformance_rs(&self) -> String {
+        let name = &self.name;
+        let krate = self.crate_name().replace('-', "_");
+        let config_ty = self.config_type();
+        let conn_ty = self.connector_type();
+        match self.kind {
+            ConnectorKind::Source => format!(
+                r#"//! The `faucet-conformance` battery for the {name} source — run it with
+//! `cargo test --test conformance`.
+//!
+//! Add checks as the connector grows: `assert_bounded_memory` once
+//! `stream_pages` pages natively, `assert_bookmark_roundtrip` once it is
+//! resumable, `assert_errors_not_panics` against a config that must fail.
+
+use faucet_conformance::{{
+    assert_config_schema_valid, assert_connector_name_nonempty, assert_preflight_check_wellformed,
+}};
+use faucet_core::check::CheckContext;
+use {krate}::{{{config_ty}, {conn_ty}}};
+
+fn source() -> {conn_ty} {{
+    {conn_ty}::new({config_ty} {{ example_setting: None }})
+}}
+
+#[test]
+fn conformance_config_schema_valid() {{
+    assert_config_schema_valid(&source());
+}}
+
+#[test]
+fn conformance_connector_name_nonempty() {{
+    assert_connector_name_nonempty(&source());
+}}
+
+#[tokio::test]
+async fn conformance_preflight_check_wellformed() {{
+    assert_preflight_check_wellformed(&source(), &CheckContext::default()).await;
+}}
+"#
+            ),
+            ConnectorKind::Sink => format!(
+                r#"//! The `faucet-conformance` battery for the {name} sink — run it with
+//! `cargo test --test conformance`.
+//!
+//! Add checks as the connector grows: `assert_capabilities_truthful` once the
+//! sink writes somewhere a test can count, `assert_write_modes_truthful` once
+//! it supports upsert/delete, `assert_idempotent_replay` once it supports
+//! exactly-once writes.
+
+use faucet_conformance::{{
+    assert_batch_atomicity_declared, assert_config_schema_valid_value,
+    assert_connector_name_nonempty_value, assert_sink_preflight_check_wellformed,
+}};
+use faucet_core::check::CheckContext;
+use faucet_core::Sink;
+use {krate}::{{{config_ty}, {conn_ty}}};
+
+fn sink() -> {conn_ty} {{
+    {conn_ty}::new({config_ty} {{ example_setting: None }})
+}}
+
+#[test]
+fn conformance_config_schema_valid() {{
+    let sink = sink();
+    assert_config_schema_valid_value(&sink.config_schema(), sink.connector_name());
+}}
+
+#[test]
+fn conformance_connector_name_nonempty() {{
+    let sink = sink();
+    assert_connector_name_nonempty_value(sink.connector_name(), sink.connector_name());
+    assert_batch_atomicity_declared(&sink);
+}}
+
+#[tokio::test]
+async fn conformance_preflight_check_wellformed() {{
+    assert_sink_preflight_check_wellformed(&sink(), &CheckContext::default()).await;
+}}
+"#
+            ),
+        }
     }
 
     fn impl_rs(&self) -> String {
@@ -571,6 +662,53 @@ mod tests {
         assert!(cargo.contains("[package.metadata.docs.rs]"));
         assert!(cargo.contains("all-features = true"));
         assert!(cargo.contains("faucet-core = \"1\""));
+    }
+
+    /// #824: the scaffold wires the conformance battery a third-party crate
+    /// runs with `cargo test` (`faucet conformance` scores built-ins only).
+    #[test]
+    fn conformance_battery_is_wired_for_both_kinds() {
+        for (kind, conn, imports) in [
+            (
+                ConnectorKind::Source,
+                "AcmeSource",
+                "assert_preflight_check_wellformed",
+            ),
+            (
+                ConnectorKind::Sink,
+                "AcmeSink",
+                "assert_sink_preflight_check_wellformed",
+            ),
+        ] {
+            let s = ConnectorScaffold::new("acme", kind, false).unwrap();
+            let files = s.files();
+            let file = |suffix: &str| {
+                files
+                    .iter()
+                    .find(|f| f.path.ends_with(suffix))
+                    .unwrap_or_else(|| panic!("{suffix} generated"))
+                    .contents
+                    .clone()
+            };
+            let crate_name = s.crate_name();
+            let conformance = file("tests/conformance.rs");
+            assert!(
+                files
+                    .iter()
+                    .any(|f| f.path == format!("{crate_name}/tests/conformance.rs"))
+            );
+            assert!(conformance.contains(imports), "{conformance}");
+            assert!(
+                conformance.contains(&format!(
+                    "use {}::{{{conn}Config, {conn}}};",
+                    crate_name.replace('-', "_")
+                )),
+                "{conformance}"
+            );
+            assert!(conformance.contains("example_setting: None"));
+            assert!(conformance.contains("cargo test --test conformance"));
+            assert!(file("Cargo.toml").contains("faucet-conformance = \"1\""));
+        }
     }
 
     #[test]

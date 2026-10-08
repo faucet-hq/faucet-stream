@@ -11,6 +11,37 @@ pub async fn run(args: NewArgs) -> CliResult<()> {
     }
 }
 
+/// What to do after scaffolding: build, then the conformance battery the
+/// scaffold wired into `tests/conformance.rs`. `faucet conformance` only scores
+/// connectors compiled into a faucet binary, so it is named for built-ins only
+/// (#824).
+fn next_steps(scaffold: &ConnectorScaffold, root: &std::path::Path) -> String {
+    let dir = root.join(scaffold.crate_name());
+    let (impl_file, grow) = match scaffold.kind {
+        ConnectorKind::Source => (
+            "stream.rs",
+            "native streaming (assert_bounded_memory) + resumable bookmarks \
+             (assert_bookmark_roundtrip)",
+        ),
+        ConnectorKind::Sink => (
+            "sink.rs",
+            "durable writes (assert_capabilities_truthful), then upsert \
+             (assert_write_modes_truthful) / exactly-once (assert_idempotent_replay)",
+        ),
+    };
+    format!(
+        "\nNext:\n  cd {dir}\n  cargo test          # the generated passthrough compiles & tests green\n  \
+         # then implement the TODOs in src/config.rs and src/{impl_file}\n\n\
+         Conformance: tests/conformance.rs runs the faucet-conformance battery.\n  \
+         cargo test --test conformance\n\
+         Extend it as the connector grows: {grow}.\n\
+         (`faucet conformance {name}` scores connectors compiled into a faucet binary —\n \
+         it applies once this connector is built into one.)",
+        dir = dir.display(),
+        name = scaffold.name,
+    )
+}
+
 /// Scaffold a connector crate.
 async fn run_connector(args: NewConnectorArgs) -> CliResult<()> {
     let kind = ConnectorKind::parse(&args.kind).map_err(CliError::Config)?;
@@ -45,36 +76,45 @@ async fn run_connector(args: NewConnectorArgs) -> CliResult<()> {
     for f in &files {
         println!("  {}", root.join(&f.path).display());
     }
-    println!(
-        "\nNext:\n  cd {}\n  cargo test          # the generated passthrough compiles & tests green\n  # then implement the TODOs in src/config.rs and src/{}",
-        root.join(scaffold.crate_name()).display(),
-        match kind {
-            ConnectorKind::Source => "stream.rs",
-            ConnectorKind::Sink => "sink.rs",
-        }
-    );
-    // Conformance tier: a fresh scaffold has a real config schema but is not yet
-    // registered/documented, so it starts at ⚪ Draft. Show the path to Stable.
-    let cap = match kind {
-        ConnectorKind::Source => "native streaming (override stream_pages) + resumable bookmarks",
-        ConnectorKind::Sink => "idempotent writes + upsert / schema evolution",
-    };
-    println!(
-        "\nConformance tier: ⚪ Draft → reach 🟢 Stable by\n  \
-         [ ] adding a verified entry to cli/connectors/registry.json\n  \
-         [ ] a complete config_schema() (already scaffolded)\n  \
-         [ ] a one-line description in the connector catalog\n  \
-         [ ] {cap}\n  \
-         [ ] unit + integration tests (run the faucet-conformance battery)\n\
-         Check your score any time with `faucet conformance {}`.",
-        scaffold.crate_name(),
-    );
+    println!("{}", next_steps(&scaffold, root));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #824: the printed command works for a third-party crate; `faucet
+    /// conformance` is only offered as the built-in path.
+    #[test]
+    fn next_steps_point_at_the_wired_conformance_battery() {
+        let root = std::path::Path::new("/work");
+        for kind in [ConnectorKind::Source, ConnectorKind::Sink] {
+            let s = ConnectorScaffold::new("acme", kind, false).unwrap();
+            let text = next_steps(&s, root);
+            assert!(
+                text.contains(&format!("cd /work/{}", s.crate_name())),
+                "{text}"
+            );
+            assert!(text.contains("cargo test --test conformance"), "{text}");
+            assert!(text.contains("tests/conformance.rs"), "{text}");
+            assert!(
+                !text.contains(&format!("faucet conformance {}`", s.crate_name())),
+                "{text}"
+            );
+            assert!(text.contains("compiled into a faucet binary"), "{text}");
+        }
+        let src = next_steps(
+            &ConnectorScaffold::new("acme", ConnectorKind::Source, false).unwrap(),
+            root,
+        );
+        assert!(src.contains("src/stream.rs") && src.contains("assert_bounded_memory"));
+        let sink = next_steps(
+            &ConnectorScaffold::new("acme", ConnectorKind::Sink, false).unwrap(),
+            root,
+        );
+        assert!(sink.contains("src/sink.rs") && sink.contains("assert_capabilities_truthful"));
+    }
 
     #[tokio::test]
     async fn scaffolds_a_source_crate_to_disk() {
