@@ -22,7 +22,11 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
   `Coverage` and Kafka CI jobs set it, so an unavailable backend fails CI
   instead of passing silently. Suites too heavy for every PR stay `#[ignore]`d
   and run nightly in `.github/workflows/integration-heavy.yml` (SQL Server CDC,
-  the secrets managers, the scaffold build).
+  the secrets managers, the scaffold build). The Oracle Free container is
+  the one exception on PRs: it does not start on the hosted runners, so its
+  start failure is fatal only under `FAUCET_REQUIRE_ORACLE`, which the nightly
+  job sets (the Instant Client check still honours
+  `FAUCET_REQUIRE_BACKENDS`).
 - **Cross-connector tests** (a source↔sink round trip, a parity check against
   an older connector, a sink test that reads its output back with a source)
   live in `crates/interop-tests/tests/`, which is never published. A connector
