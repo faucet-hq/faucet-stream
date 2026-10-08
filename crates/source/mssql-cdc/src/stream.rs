@@ -920,6 +920,13 @@ mod tests {
         Lsn::from_hex(hex).unwrap()
     }
 
+    fn query_of(step: InstanceStep) -> ChangeQuery {
+        match step {
+            InstanceStep::Query(q) => q,
+            _ => panic!("expected a query"),
+        }
+    }
+
     fn query(ci: &str) -> ChangeQuery {
         ChangeQuery {
             ci: ci.into(),
@@ -1028,34 +1035,34 @@ mod tests {
             start: None,
         };
         let mut marks = Bookmarks::new();
-        let InstanceStep::Query(q) = plan_instance(
-            "dbo_Orders",
-            &tables,
-            bounds,
-            &mut marks,
-            StartPosition::Earliest,
-            OnGap::Fail,
-        )
-        .unwrap() else {
-            panic!("expected a query");
-        };
+        let q = query_of(
+            plan_instance(
+                "dbo_Orders",
+                &tables,
+                bounds,
+                &mut marks,
+                StartPosition::Earliest,
+                OnGap::Fail,
+            )
+            .unwrap(),
+        );
         assert_eq!((q.schema.as_str(), q.table.as_str()), ("sales", "Orders"));
         assert_eq!(
             (q.from, q.to),
             (lsn("00000000000000000010"), lsn("00000000000000000020"))
         );
 
-        let InstanceStep::Query(unknown) = plan_instance(
-            "dbo_Other",
-            &tables,
-            bounds,
-            &mut Bookmarks::new(),
-            StartPosition::Earliest,
-            OnGap::Fail,
-        )
-        .unwrap() else {
-            panic!("expected a query");
-        };
+        let unknown = query_of(
+            plan_instance(
+                "dbo_Other",
+                &tables,
+                bounds,
+                &mut Bookmarks::new(),
+                StartPosition::Earliest,
+                OnGap::Fail,
+            )
+            .unwrap(),
+        );
         assert_eq!(
             (unknown.schema.as_str(), unknown.table.as_str()),
             ("", "dbo_Other")
@@ -1085,17 +1092,17 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.to_string().contains("purged"), "{err}");
-        let InstanceStep::Query(q) = plan_instance(
-            "dbo_t",
-            &HashMap::new(),
-            bounds,
-            &mut behind(),
-            StartPosition::Current,
-            OnGap::Skip,
-        )
-        .unwrap() else {
-            panic!("expected a query");
-        };
+        let q = query_of(
+            plan_instance(
+                "dbo_t",
+                &HashMap::new(),
+                bounds,
+                &mut behind(),
+                StartPosition::Current,
+                OnGap::Skip,
+            )
+            .unwrap(),
+        );
         assert_eq!(q.from, lsn("00000000000000000050"));
     }
 
