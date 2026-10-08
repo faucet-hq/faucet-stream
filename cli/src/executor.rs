@@ -561,6 +561,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
     let cancel = opts.cancel.clone().unwrap_or_default();
     let opts = Arc::new(opts);
     let dlq_sinks: DlqSinkCache = Arc::default();
+    let state_stores: StateStoreCache = Arc::default();
 
     // We execute level-by-level. Each level is "every node whose parent is
     // already done." Roots are level 0. For each level, we spawn one task per
@@ -983,21 +984,25 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             // of them (#789 CLI-54).
             let unit_cancel = level_cancel.child_token();
             let dlq_sinks = Arc::clone(&dlq_sinks);
-            let handle = joinset.spawn(DLQ_SINKS.scope(dlq_sinks, async move {
-                let _permit = sem.acquire().await.expect("semaphore not closed");
-                run_unit(
-                    &unit,
-                    capture,
-                    &captured,
-                    &discovered,
-                    &collected,
-                    &opts2,
-                    unit_cancel,
-                    suppress_overwrite,
-                    overwrite_grouped,
-                )
-                .await
-            }));
+            let state_stores = Arc::clone(&state_stores);
+            let handle = joinset.spawn(STATE_STORES.scope(
+                state_stores,
+                DLQ_SINKS.scope(dlq_sinks, async move {
+                    let _permit = sem.acquire().await.expect("semaphore not closed");
+                    run_unit(
+                        &unit,
+                        capture,
+                        &captured,
+                        &discovered,
+                        &collected,
+                        &opts2,
+                        unit_cancel,
+                        suppress_overwrite,
+                        overwrite_grouped,
+                    )
+                    .await
+                }),
+            ));
             task_meta.insert(handle.id(), meta);
         }
 
@@ -3389,6 +3394,44 @@ async fn build_state_for_node(
     node: &ExpandedNode,
     state_path_override: Option<&Path>,
 ) -> CliResult<Option<Arc<dyn StateStore>>> {
+    // One store per backend for the whole run (#789 CLI-99): a fan-out of N
+    // invocations opens one postgres / redis pool, not N. `memory` stays
+    // per invocation, as before.
+    let shareable = node.state.as_ref().is_some_and(|s| s.kind != "memory");
+    let cache = if shareable {
+        STATE_STORES.try_with(Arc::clone).ok()
+    } else {
+        None
+    };
+    let Some(cache) = cache else {
+        return build_state_uncached(node, state_path_override).await;
+    };
+    let key = format!(
+        "{}\u{0}{}\u{0}{}",
+        node.state.as_ref().map(|s| s.kind.as_str()).unwrap_or(""),
+        node.state
+            .as_ref()
+            .map(|s| serde_json::to_string(&s.config).unwrap_or_default())
+            .unwrap_or_default(),
+        state_path_override
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
+    let mut map = cache.lock().await;
+    if let Some(store) = map.get(&key) {
+        return Ok(Some(Arc::clone(store)));
+    }
+    let store = build_state_uncached(node, state_path_override).await?;
+    if let Some(store) = &store {
+        map.insert(key, Arc::clone(store));
+    }
+    Ok(store)
+}
+
+async fn build_state_uncached(
+    node: &ExpandedNode,
+    state_path_override: Option<&Path>,
+) -> CliResult<Option<Arc<dyn StateStore>>> {
     match (&node.state, state_path_override) {
         (Some(spec), None) => Ok(Some(build_state_store(spec).await?)),
         (None, Some(path)) => Ok(Some(state_from_override(path))),
@@ -3474,8 +3517,13 @@ pub async fn build_dlq_config(spec: &crate::config::DlqSpec) -> CliResult<DlqCon
 /// config (#789 CLI-03).
 type DlqSinkCache = Arc<Mutex<HashMap<String, Arc<dyn Sink>>>>;
 
+/// State stores shared by every invocation of one `run_expanded`, keyed by
+/// backend kind + config (#789 CLI-99).
+type StateStoreCache = Arc<Mutex<HashMap<String, Arc<dyn StateStore>>>>;
+
 tokio::task_local! {
     static DLQ_SINKS: DlqSinkCache;
+    static STATE_STORES: StateStoreCache;
 }
 
 /// Classify a pipeline error into a notification event (#280). A circuit-breaker
@@ -6552,6 +6600,42 @@ matrix:
         assert_eq!(cfg.max_failures_per_page, Some(7));
         assert_eq!(cfg.max_failures_total, Some(42));
         assert!(!cfg.include_original_payload);
+    }
+
+    #[tokio::test]
+    async fn state_stores_are_shared_within_a_run_except_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = stub_node(Some(crate::config::StateStoreSpec {
+            kind: "file".into(),
+            config: json!({ "path": dir.path() }),
+        }));
+        let cache: StateStoreCache = Arc::default();
+        let (a, b) = STATE_STORES
+            .scope(Arc::clone(&cache), async {
+                (
+                    build_state_for_node(&node, None).await.unwrap().unwrap(),
+                    build_state_for_node(&node, None).await.unwrap().unwrap(),
+                )
+            })
+            .await;
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(cache.lock().await.len(), 1);
+        let outside = build_state_for_node(&node, None).await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&a, &outside));
+
+        node.state = Some(crate::config::StateStoreSpec {
+            kind: "memory".into(),
+            config: json!({}),
+        });
+        let (m1, m2) = STATE_STORES
+            .scope(Arc::clone(&cache), async {
+                (
+                    build_state_for_node(&node, None).await.unwrap().unwrap(),
+                    build_state_for_node(&node, None).await.unwrap().unwrap(),
+                )
+            })
+            .await;
+        assert!(!Arc::ptr_eq(&m1, &m2));
     }
 
     #[tokio::test]
