@@ -176,4 +176,27 @@ async fn a_persistent_catalog_clash_is_reported_after_bounded_retries() {
     let msg = err.to_string();
     assert!(msg.contains("CREATE SCHEMA/TABLE failed"), "{msg}");
     assert!(msg.contains("already exists"), "{msg}");
+
+    // The same for the commit-token table in the default schema.
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    sqlx::raw_sql("CREATE TYPE _faucet_commit_token AS ENUM ('a')")
+        .execute(&pool)
+        .await
+        .expect("setup");
+    pool.close().await;
+    let c =
+        PostgresSinkConfig::new(&url, "eo_target").column_mapping(PostgresColumnMapping::AutoMap);
+    let sink = PostgresSink::new(c).await.expect("sink");
+    let err = sink
+        .write_batch_idempotent(
+            &[json!({"id": 1})],
+            "scope",
+            &faucet_core::idempotency::format_token(1),
+        )
+        .await
+        .expect_err("a type owns the commit-table name");
+    assert!(
+        err.to_string().contains("commit-table create failed"),
+        "{err}"
+    );
 }
