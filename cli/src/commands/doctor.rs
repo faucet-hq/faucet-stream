@@ -112,12 +112,15 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
     }
     let cfg_ms = t_cfg.elapsed().as_millis();
 
-    let nodes = expand(&crate::partition::resolve_runtime(&cfg).await?)?;
-
     // `--offline`: run only the static config lints — no connectors built, no
-    // network, no credentials. Fast, CI-friendly, and credential-free.
+    // network (not even a partition probe), no credentials. Fast, CI-friendly,
+    // and credential-free. The vars lint reads the composed document, so a
+    // reference in an `extends:` / `!include` file counts.
     if args.offline {
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let nodes = expand(&crate::partition::offline(&cfg))?;
+        let raw = crate::compose::compose(&path, args.profile.as_deref())
+            .or_else(|_| std::fs::read_to_string(&path))
+            .unwrap_or_default();
         let findings = lint_config(&cfg, &nodes, &raw);
         let errors = render_lints(&path, &findings, args.json);
         if errors > 0 {
@@ -125,6 +128,7 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
         }
         return Ok(());
     }
+    let nodes = expand(&crate::partition::resolve_runtime(&cfg).await?)?;
 
     let auth = build_auth_catalog(cfg.auth.as_ref())?;
     let ctx = CheckContext {
@@ -972,7 +976,9 @@ pub(crate) fn lint_config(
 ) -> Vec<LintFinding> {
     let mut out = Vec::new();
 
-    // Every `auth: { ref: NAME }` referenced by any node's source or sink.
+    // Every `auth: { ref: NAME }` anywhere in the config — rows, templates,
+    // the DLQ sink, a mirror snapshot, topology nodes — plus every expanded
+    // node's source and sink.
     let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for n in nodes {
         for spec in [&n.source, &n.sink] {
@@ -980,6 +986,10 @@ pub(crate) fn lint_config(
                 referenced.insert(name);
             }
         }
+    }
+    if let Ok(serde_json::Value::Object(mut doc)) = serde_json::to_value(cfg) {
+        doc.remove("auth");
+        collect_auth_refs(&serde_json::Value::Object(doc), &mut referenced);
     }
     let catalog: std::collections::BTreeSet<String> = cfg
         .auth
@@ -1040,6 +1050,24 @@ pub(crate) fn lint_config(
     }
 
     out
+}
+
+/// Collect every `auth: { ref: NAME }` under `v`.
+fn collect_auth_refs(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(name) = m
+                .get("auth")
+                .and_then(|a| a.get("ref"))
+                .and_then(serde_json::Value::as_str)
+            {
+                out.insert(name.to_string());
+            }
+            m.values().for_each(|x| collect_auth_refs(x, out));
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_auth_refs(x, out)),
+        _ => {}
+    }
 }
 
 /// Render lint findings (human or `--json`) and return the number of *errors*
@@ -1336,6 +1364,46 @@ pipeline:
             !f.iter()
                 .any(|x| x.code == "unused-var" && x.message.contains("vars.used"))
         );
+    }
+
+    /// A var used only in an `extends:` base, and a provider used only by a
+    /// mirror snapshot source, are not reported (#789 CLI-128).
+    #[test]
+    fn lints_see_auth_used_outside_rows() {
+        let cfg = r#"
+version: 1
+vars:
+  base: "https://x"
+pipeline:
+  source: { type: rest, config: { base_url: "${vars.base}" } }
+  sink: { type: jsonl, config: { path: out.jsonl } }
+replication:
+  mode: snapshot_then_cdc
+  snapshot:
+    source: { type: rest, config: { base_url: "https://snap", auth: { ref: dlq_idp } } }
+auth:
+  dlq_idp: { type: static, config: { token: "t" } }
+"#;
+        let f = lint_yaml(cfg);
+        assert!(!has(&f, "unused-var"), "{f:?}");
+        assert!(!has(&f, "unreferenced-auth-provider"), "{f:?}");
+    }
+
+    #[tokio::test]
+    async fn offline_lints_scan_the_composed_document() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.yaml"),
+            "pipeline:\n  source: { type: rest, config: { base_url: \"${vars.host}\" } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+        )
+        .unwrap();
+        let path = dir.path().join("p.yaml");
+        std::fs::write(&path, "extends: base.yaml\nversion: 1\nvars:\n  host: https://x\n").unwrap();
+        let raw = crate::compose::compose(&path, None).unwrap();
+        let cfg = PipelineConfig::from_path(&path, None).unwrap();
+        let nodes = expand(&cfg).unwrap();
+        assert!(!has(&lint_config(&cfg, &nodes, &raw), "unused-var"));
+        super::run(offline_args(path)).await.expect("clean lint");
     }
 
     #[test]
