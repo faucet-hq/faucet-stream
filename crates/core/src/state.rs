@@ -737,7 +737,7 @@ impl StateStore for FileStateStore {
 
     /// Atomic across processes sharing the directory: the read-compare-write
     /// runs while holding `<key>.json.lock`, created with `O_EXCL`. A lock
-    /// left by a crashed writer is broken after [`STALE_LOCK`].
+    /// left by a crashed writer is broken after 30 seconds.
     async fn compare_and_put(
         &self,
         key: &str,
