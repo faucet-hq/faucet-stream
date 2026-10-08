@@ -907,7 +907,11 @@ Every mutation prints the plan (before / after) first and needs `--yes`, an
 interactive confirmation on a terminal, or `--dry-run` to stop at the plan.
 It refuses while a run holds the row — a live run lease in the state store, or
 a run of the pipeline in flight in the config's `catalog:` store — unless
-`--force`.
+`--force`. Every invocation that writes a bookmark holds a lease: a row's
+fan-out children, backfill units and multi-table mirror tables included, so
+`set` / `reset` also refuse while a child of the row, a backfill or a mirror of
+the pipeline is running, and `import` refuses while any run of the pipeline
+holds a lease.
 
 ## `catalog`
 

@@ -1434,7 +1434,7 @@ async fn run_unit(
         markers_store(&unit.node, opts).await,
         &unit.state_key,
         &run_id,
-        matches!(unit.node.role, NodeRole::Root | NodeRole::Product { .. }),
+        true,
         opts.force_lease,
     )
     .await
