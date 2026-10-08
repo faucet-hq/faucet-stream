@@ -28,7 +28,7 @@ running/billed compute and no Python.
 | `storage_options` | map | `{}` | Passed verbatim to delta-rs; explicit keys win over `credentials` |
 | `create_if_not_missing` | bool | `true` | Create the table + schema on first write |
 | `partition_by` | string[] | `[]` | Partition columns (applied only on create) |
-| `schema_sample_size` | int | `100` | Records sampled to infer the schema on create; an existing table's own schema is always used |
+| `schema_sample_size` | int | `100` | Records sampled to infer the schema on create (a field null in every sampled record becomes a nullable string column); an existing table's own schema is always used |
 | `batch_size` | int | `1000` | Arrow record-batch write size; `0` = no re-chunk |
 | `target_file_size` | int? | *(unset)* | Commit early once the in-memory parquet buffer reaches this many bytes, which both caps output data-file size and bounds peak memory to roughly this value. Unset means one commit per run and a buffer that grows with the whole dataset — fine for small loads, an OOM risk on a large table, since a bulk source emits no bookmarks and so triggers no intermediate flush. Expect a few commits per run when set: that is the trade the knob exists to let you make. |
 
@@ -64,7 +64,7 @@ License: MIT OR Apache-2.0.
 
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic**, unless `target_file_size` is set and `batch_size` splits a page (then **best-effort**) — a page is one Delta commit unless target_file_size commits part of a chunked page early. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** — every `batch_size` chunk of a page is decoded before any is buffered, so a record that does not fit fails the page with none of it written — unless `target_file_size` is set and `batch_size` splits a page (then **best-effort**) — a page is one Delta commit unless target_file_size commits part of a chunked page early. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

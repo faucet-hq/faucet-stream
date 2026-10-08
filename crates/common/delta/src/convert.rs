@@ -86,6 +86,9 @@ fn make_nullable(field: &Field) -> Field {
         }
         DataType::List(inner) => DataType::List(Arc::new(make_nullable(inner.as_ref()))),
         DataType::LargeList(inner) => DataType::LargeList(Arc::new(make_nullable(inner.as_ref()))),
+        // Null in every sampled record: a nullable string column (no format
+        // can store a Null-typed one).
+        DataType::Null => DataType::Utf8,
         other => other.clone(),
     };
     Field::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
