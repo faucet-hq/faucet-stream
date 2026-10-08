@@ -819,7 +819,22 @@ pub fn compile_transforms(specs: &[TransformSpec]) -> CliResult<Vec<TransformSta
 
 fn compile_one(spec: &TransformSpec) -> CliResult<TransformStage> {
     match registry().into_iter().find(|t| t.kind == spec.kind) {
-        Some(def) => (def.compile_fn)(&spec.kind, spec.config.clone()),
+        Some(def) => {
+            let config = crate::interpolate::unescaped(spec.config.clone());
+            if let Some((unknown, hint)) =
+                crate::registry::unknown_config_keys(&config, &(def.schema_fn)())
+            {
+                return Err(CliError::InvalidTransform {
+                    name: spec.kind.clone(),
+                    message: format!(
+                        "unknown config key(s): {unknown}{hint} — run `faucet schema transform \
+                         {}` for the full list",
+                        spec.kind
+                    ),
+                });
+            }
+            (def.compile_fn)(&spec.kind, config)
+        }
         None => Err(unknown_transform(&spec.kind)),
     }
 }
@@ -1001,6 +1016,25 @@ fn decode_wasm(kind: &str, config: Value) -> CliResult<faucet_transform_wasm::Wa
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(feature = "transforms")]
+    #[test]
+    fn a_misspelt_transform_key_is_refused() {
+        let spec = TransformSpec {
+            kind: "hash".into(),
+            config: json!({ "fields": ["email"], "slat": "pepper" }),
+        };
+        let err = compile_transforms(&[spec]).unwrap_err().to_string();
+        assert!(
+            err.contains("`slat`") && err.contains("did you mean `salt`"),
+            "{err}"
+        );
+        let ok = TransformSpec {
+            kind: "hash".into(),
+            config: json!({ "fields": ["email"], "salt": "pepper" }),
+        };
+        compile_transforms(&[ok]).unwrap();
+    }
 
     #[test]
     fn empty_list_compiles_to_empty() {

@@ -45,8 +45,27 @@ pub async fn record(
     let dataset_id = crate::serve::history::catalog::dataset_id(&ctx.dataset_uri);
     let mut written = 0;
     for out in outputs {
+        // A relative path is stored resolved against this process's working
+        // directory, so a sweeper elsewhere deletes the file that was written
+        // (#789 CLI-45). Unresolvable → not recorded, the safe direction.
+        let path = if out.path.is_absolute() {
+            out.path.clone()
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(&out.path),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %out.path.display(),
+                        error = %e,
+                        "could not resolve a relative local sink output — it will not be \
+                         reclaimed by the retention GC; run unaffected"
+                    );
+                    continue;
+                }
+            }
+        };
         let obs = LocalOutputObservation {
-            path: out.path.clone(),
+            path,
             dataset_uri: ctx.dataset_uri.clone(),
             dataset_id: dataset_id.clone(),
             kind: ctx.kind.clone(),
@@ -96,6 +115,20 @@ mod tests {
             retention_days: None,
             observed_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn relative_paths_are_recorded_resolved() {
+        let store = MemoryHistory::new(Duration::from_secs(60));
+        let n = record(&store, &[LocalOutput::created("out/rel.jsonl")], &ctx()).await;
+        assert_eq!(n, 1);
+        let rows = store
+            .local_output_list(&LocalOutputFilter::default())
+            .await
+            .unwrap();
+        let expected = std::env::current_dir().unwrap().join("out/rel.jsonl");
+        assert_eq!(rows[0].path, expected.to_string_lossy());
+        assert_eq!(rows[0].host, crate::local_outputs::local_host());
     }
 
     #[tokio::test]

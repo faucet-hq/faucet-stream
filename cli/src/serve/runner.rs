@@ -192,6 +192,7 @@ pub(crate) fn apply_request_budget(mut req: SubmitRequest) -> Result<SubmitReque
         ConfigFormatWire::Json => serde_json::from_str(&req.config)
             .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,
     };
+    let kinds = crate::budget::sink_template_kinds_in_doc(&doc);
     let Some(obj) = doc.as_object_mut() else {
         return Err(ServeError::BadConfig("config must be a mapping".into()));
     };
@@ -199,7 +200,7 @@ pub(crate) fn apply_request_budget(mut req: SubmitRequest) -> Result<SubmitReque
         Some(existing) => {
             let own: faucet_core::BudgetSpec = serde_json::from_value(existing.clone())
                 .map_err(|e| ServeError::BadConfig(format!("budget: {e}")))?;
-            own.merge(&extra)
+            own.merge_with(&extra, &|name: &str| kinds.get(name).cloned())
         }
         None => extra,
     };
@@ -322,7 +323,10 @@ fn run_budget(
     tenant: Option<&crate::serve::load::TenantScope>,
 ) -> Option<faucet_core::BudgetSpec> {
     match (cfg.budget.clone(), tenant.and_then(|t| t.budget.clone())) {
-        (Some(a), Some(b)) => Some(a.merge(&b)),
+        (Some(a), Some(b)) => {
+            let kinds = crate::budget::sink_template_kinds(cfg);
+            Some(a.merge_with(&b, &|name: &str| kinds.get(name).cloned()))
+        }
         (a, b) => a.or(b),
     }
 }

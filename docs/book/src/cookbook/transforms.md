@@ -8,6 +8,11 @@ order you want them to run, and the CLI wires them up for you.
 This page is a tour of the standard transforms exposed in YAML. All of
 them are listed in `faucet list` and dispatchable as `type:` values.
 
+A `config:` key the transform does not declare is refused at load time
+(`faucet validate` reports it, with a `did you mean` hint), so a typo such as
+`slat:` for `salt:` never silently runs with the option off. `faucet schema
+transform <name>` lists every key.
+
 ## At a glance
 
 | Kind | Purpose | Shape |

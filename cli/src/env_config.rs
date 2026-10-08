@@ -190,19 +190,20 @@ pub fn build_transforms(env: &HashMap<String, String>) -> CliResult<Vec<Transfor
 pub fn build_named_sources(
     env: &HashMap<String, String>,
 ) -> CliResult<HashMap<String, ConnectorSpec>> {
-    build_named_catalog(env, "FAUCET_SOURCES_")
+    build_named_catalog(env, "FAUCET_SOURCES_", &crate::registry::source_kinds())
 }
 
 /// Same as [`build_named_sources`] but for sinks via `FAUCET_SINKS_<NAME>_*`.
 pub fn build_named_sinks(
     env: &HashMap<String, String>,
 ) -> CliResult<HashMap<String, ConnectorSpec>> {
-    build_named_catalog(env, "FAUCET_SINKS_")
+    build_named_catalog(env, "FAUCET_SINKS_", &crate::registry::sink_kinds())
 }
 
 fn build_named_catalog(
     env: &HashMap<String, String>,
     prefix: &str,
+    known_kinds: &[&str],
 ) -> CliResult<HashMap<String, ConnectorSpec>> {
     // First sweep: find each template's `<NAME>` by spotting
     // `<prefix><NAME>_TYPE`.
@@ -219,6 +220,16 @@ fn build_named_catalog(
         }
         kinds.insert(name_upper.to_ascii_lowercase(), value.clone());
     }
+    // A `*_TYPE` var nested under another template whose value is no
+    // connector kind is that template's field (`PG_SLOT_TYPE=temporary` is
+    // `pg`'s `slot_type`), not a template of its own (#789 CLI-138).
+    let candidates: Vec<String> = kinds.keys().cloned().collect();
+    kinds.retain(|name, kind| {
+        known_kinds.contains(&kind.as_str())
+            || !candidates
+                .iter()
+                .any(|other| other != name && name.starts_with(&format!("{other}_")))
+    });
     // All template scope prefixes, so each env var can be assigned to its
     // LONGEST matching prefix. Without this, a template like `users` would
     // absorb `users_api`'s vars, since `FAUCET_SOURCES_USERS_` is a prefix of
@@ -442,6 +453,27 @@ mod tests {
     use serde_json::json;
 
     #[cfg(unix)]
+    #[test]
+    fn a_nested_type_field_is_not_a_phantom_template() {
+        let env: HashMap<String, String> = [
+            ("FAUCET_SOURCES_PG_TYPE", "sqlite"),
+            ("FAUCET_SOURCES_PG_SLOT_TYPE", "temporary"),
+            ("FAUCET_SOURCES_PG_PATH", "a.db"),
+            ("FAUCET_SOURCES_PG_API_TYPE", "sqlite"),
+            ("FAUCET_SOURCES_PG_API_PATH", "b.db"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let out = build_named_catalog(&env, "FAUCET_SOURCES_", &["sqlite"]).unwrap();
+        let mut names: Vec<&String> = out.keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["pg", "pg_api"]);
+        assert_eq!(out["pg"].config["slot_type"], "temporary");
+        assert_eq!(out["pg"].config["path"], "a.db");
+        assert_eq!(out["pg_api"].config["path"], "b.db");
+    }
+
     #[test]
     fn non_utf8_variables_are_skipped_unless_they_are_faucet_ones() {
         use std::os::unix::ffi::OsStringExt as _;

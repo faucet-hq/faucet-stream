@@ -1500,3 +1500,118 @@ pipeline:
         "per-source volume, not the sink total: {edges:?}"
     );
 }
+
+/// #789 CLI-85: a sink node failed by `profiling.on_drift: fail` is not
+/// catalogued as a successful run (its profile still is).
+#[tokio::test]
+#[cfg(all(feature = "catalog", feature = "serve-history-sqlite"))]
+async fn a_node_failed_by_profile_drift_is_not_catalogued_as_a_run() {
+    let dir = TempDir::new().unwrap();
+    let csv = dir.path().join("orders.csv");
+    let out = dir.path().join("o.jsonl");
+    let state = dir.path().join("state");
+    let store = dir.path().join("catalog.db");
+    let config = |on_drift: &str| {
+        parse(&format!(
+            r#"version: 1
+name: topo_prof_cat
+catalog: {{ url: "sqlite:{store}" }}
+profiling: {{ min_history: 2, window: 5, on_drift: {on_drift} }}
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: jsonl, config: {{ path: {out}, append: false }} }}
+  state: {{ type: file, config: {{ path: {state} }} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+            csv = csv.display(),
+            out = out.display(),
+            state = state.display(),
+            store = store.display()
+        ))
+    };
+    let auth = build_auth_catalog(None).unwrap();
+    for _ in 0..2 {
+        write(&csv, "id,country\n1,US\n2,US\n3,IN\n4,DE\n");
+        let s = faucet_cli::topology::run_topology(&config("warn"), &auth, Default::default())
+            .await
+            .unwrap();
+        assert!(!s.had_failures(), "{s:?}");
+    }
+    write(&csv, "id,country\n1,BR\n2,BR\n3,BR\n4,BR\n");
+    let s = faucet_cli::topology::run_topology(&config("fail"), &auth, Default::default())
+        .await
+        .unwrap();
+    assert!(s.had_failures(), "{s:?}");
+
+    let cfg = config("warn");
+    let handle = faucet_cli::catalog::connect_from_spec(cfg.catalog.as_ref().unwrap())
+        .await
+        .unwrap();
+    let page = handle
+        .store
+        .catalog_list_datasets(&faucet_cli::serve::history::catalog::CatalogListFilter {
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let sink = page
+        .datasets
+        .iter()
+        .find(|d| d.uri.ends_with("o.jsonl"))
+        .expect("sink dataset");
+    assert_eq!(sink.runs, 2, "the drift-failed run is not counted");
+}
+
+/// #789 CLI-81: a topology `--dry-run` writes no dead letters.
+#[tokio::test]
+#[cfg(feature = "contract")]
+async fn a_topology_dry_run_writes_no_dead_letters() {
+    let dir = TempDir::new().unwrap();
+    let csv = dir.path().join("in.csv");
+    write(&csv, "status\nopen\nweird\n");
+    let out = dir.path().join("o.jsonl");
+    let dlq = dir.path().join("dlq.jsonl");
+    let cfg = parse(&format!(
+        r#"version: 1
+name: topo_dry_dlq
+pipeline:
+  source: {{ type: csv, config: {{ path: {csv} }} }}
+  sink: {{ type: jsonl, config: {{ path: {out} }} }}
+  dlq: {{ sink: {{ type: jsonl, config: {{ path: {dlq} }} }} }}
+  contract:
+    version: "1"
+    on_breach: quarantine
+    fields:
+      - {{ name: status, type: string, enum: [open] }}
+  nodes:
+    s: {{ kind: source }}
+    w: {{ kind: sink }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+        csv = csv.display(),
+        out = out.display(),
+        dlq = dlq.display()
+    ));
+    let auth = build_auth_catalog(None).unwrap();
+    let summary = faucet_cli::topology::run_topology(
+        &cfg,
+        &auth,
+        faucet_cli::topology::TopologyRunOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    assert!(!dlq.exists(), "a preview must not write the DLQ");
+    assert!(!out.exists());
+}

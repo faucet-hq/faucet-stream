@@ -160,7 +160,7 @@ pub async fn load_sync_file(path: &Path) -> CliResult<SyncFile> {
             path.display()
         ))
     })?;
-    let text = crate::interpolate::interpolate(&text)?;
+    let text = crate::interpolate::unescape(&crate::interpolate::interpolate(&text)?);
     let file = parse_sync_file(&text, path)?;
     file.validate()?;
     for o in &file.origins {

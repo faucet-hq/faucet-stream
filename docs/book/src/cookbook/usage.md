@@ -139,7 +139,9 @@ budget:
 
 `faucet run --max-records N --max-bytes B --max-duration-secs S --allowed-sink
 X` merges with the config's block — the stricter of each ceiling and the
-intersection of the sink lists. A budget applies to every runtime (`run`,
+intersection of the sink lists (a sink template on one side matches its
+connector kind on the other). Two lists with nothing in common allow **no**
+sink, so the run is refused rather than left unrestricted. A budget applies to every runtime (`run`,
 `schedule`, `serve`); a backfill is bounded by its window instead. The
 verdict is `FaucetError::BudgetExceeded` (error kind `budget_exceeded`,
 `InvocationErrorKind::BudgetExceeded` on the outcome). `faucet schema budget`

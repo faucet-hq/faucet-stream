@@ -120,10 +120,11 @@ pub fn parse_window(s: &str) -> CliResult<WindowStep> {
             "window '{s}' must be a positive duration"
         )));
     }
+    let out_of_range = || CliError::Config(format!("window '{s}' is too large"));
     let step = match unit {
-        "s" => WindowStep::Absolute(Duration::seconds(n)),
-        "m" => WindowStep::Absolute(Duration::minutes(n)),
-        "h" => WindowStep::Absolute(Duration::hours(n)),
+        "s" => WindowStep::Absolute(Duration::try_seconds(n).ok_or_else(out_of_range)?),
+        "m" => WindowStep::Absolute(Duration::try_minutes(n).ok_or_else(out_of_range)?),
+        "h" => WindowStep::Absolute(Duration::try_hours(n).ok_or_else(out_of_range)?),
         "d" => WindowStep::Days(n),
         "w" => WindowStep::Weeks(n),
         _ => return Err(err()),
@@ -155,8 +156,9 @@ fn advance_calendar(cursor: DateTime<Utc>, tz: chrono_tz::Tz, days: i64) -> Opti
 }
 
 /// Parse a range boundary: RFC3339 (`2026-06-01T00:00:00Z`) or a bare date
-/// (`2026-06-01`, interpreted as midnight in `tz`). A date that falls in a DST
-/// gap resolves to the earliest valid instant.
+/// (`2026-06-01`, interpreted as midnight in `tz`). A midnight that falls in a
+/// DST gap resolves to the earliest valid instant after the gap; an ambiguous
+/// midnight resolves to the earlier of its two instants.
 pub fn parse_boundary(s: &str, tz: chrono_tz::Tz) -> CliResult<DateTime<FixedOffset>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&tz).fixed_offset());
@@ -165,9 +167,9 @@ pub fn parse_boundary(s: &str, tz: chrono_tz::Tz) -> CliResult<DateTime<FixedOff
         let midnight = date
             .and_hms_opt(0, 0, 0)
             .ok_or_else(|| CliError::Config(format!("'{s}' has no valid midnight in {tz}")))?;
-        let local = tz
-            .from_local_datetime(&midnight)
-            .earliest()
+        let local = (0..=180)
+            .filter_map(|m| midnight.checked_add_signed(Duration::minutes(m)))
+            .find_map(|t| tz.from_local_datetime(&t).earliest())
             .ok_or_else(|| {
                 CliError::Config(format!("'{s}' midnight does not exist in {tz} (DST gap)"))
             })?;
@@ -254,8 +256,8 @@ pub enum Bounds {
 /// One independent slice of an integer range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntChunk {
-    /// Stable id, zero-padded so chunk ids sort lexicographically in the order
-    /// they were planned (state keys and log lines both benefit).
+    /// Stable id: the chunk's plan index, unpadded so it does not change when
+    /// the chunk count crosses a power of ten (it keys the chunk's state).
     pub id: String,
     /// Inclusive lower bound.
     pub start: i64,
@@ -307,8 +309,6 @@ pub fn plan_int_chunks(
              (max {MAX_UNITS}) — use a larger chunk_size"
         )));
     }
-    let width = (count.max(1) - 1).to_string().len();
-
     let mut out = Vec::with_capacity(count as usize);
     let mut cursor = from as i128;
     for i in 0..count {
@@ -321,7 +321,7 @@ pub fn plan_int_chunks(
             Bounds::HalfOpen => next.min(to as i128),
         };
         out.push(IntChunk {
-            id: format!("{:0width$}", i, width = width),
+            id: i.to_string(),
             start: cursor as i64,
             end: raw_end as i64,
             is_last,
@@ -362,10 +362,9 @@ pub fn plan_offset_chunks(total: u64, chunk_size: u64) -> CliResult<Vec<OffsetCh
              (max {MAX_UNITS}) — use a larger chunk_size"
         )));
     }
-    let width = (count - 1).to_string().len();
     Ok((0..count)
         .map(|i| OffsetChunk {
-            id: format!("{:0width$}", i, width = width),
+            id: i.to_string(),
             offset: i * chunk_size,
             limit: chunk_size.min(total - i * chunk_size),
         })
@@ -696,18 +695,40 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_zero_padded_so_they_sort_in_plan_order() {
-        let chunks = plan_int_chunks(0, 99, 1, Bounds::Inclusive).unwrap();
-        let mut ids: Vec<&str> = chunks.iter().map(|c| c.id.as_str()).collect();
-        let planned = ids.clone();
-        ids.sort_unstable();
-        assert_eq!(ids, planned, "lexicographic order must match plan order");
+    fn ids_do_not_depend_on_the_chunk_count() {
+        let nine = plan_int_chunks(0, 8, 1, Bounds::Inclusive).unwrap();
+        let hundred = plan_int_chunks(0, 99, 1, Bounds::Inclusive).unwrap();
+        for (a, b) in nine.iter().zip(&hundred) {
+            assert_eq!(a.id, b.id, "a chunk keeps its id when the plan grows");
+        }
+        assert_eq!(hundred[42].id, "42");
+        let offsets9 = plan_offset_chunks(9, 1).unwrap();
+        let offsets11 = plan_offset_chunks(11, 1).unwrap();
+        assert_eq!(offsets9[3].id, offsets11[3].id);
+        assert_eq!(offsets11[3].id, "3");
     }
 
     #[test]
     fn rejects_inverted_and_empty_ranges() {
         assert!(plan_int_chunks(10, 5, 10, Bounds::Inclusive).is_err());
         assert!(plan_int_chunks(10, 10, 10, Bounds::HalfOpen).is_err());
+    }
+
+    #[test]
+    fn a_window_too_large_for_a_duration_is_a_usage_error_not_a_panic() {
+        for w in ["99999999999999999s", "999999999999999m", "99999999999999h"] {
+            let err = parse_window(w).unwrap_err();
+            assert!(err.to_string().contains("too large"), "{w}: {err}");
+        }
+        assert!(parse_window("5é").is_err());
+    }
+
+    #[test]
+    fn a_midnight_in_a_dst_gap_resolves_to_the_first_instant_after_it() {
+        // Santiago springs forward at 00:00 → 01:00 on 2023-09-03.
+        let tz: chrono_tz::Tz = "America/Santiago".parse().unwrap();
+        let b = parse_boundary("2023-09-03", tz).unwrap();
+        assert_eq!(b.to_rfc3339(), "2023-09-03T01:00:00-03:00");
     }
 
     #[test]

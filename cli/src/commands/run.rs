@@ -56,7 +56,8 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
     // guessing would be wrong either way (#610).
     if args.concurrency == Some(0) {
         return Err(CliError::Config(
-            "--concurrency must be greater than 0 (it is a connection/fetch count,              not a `0 = unlimited` sentinel)"
+            "--concurrency must be greater than 0 (it is a connection/fetch count, \
+             not a `0 = unlimited` sentinel)"
                 .into(),
         ));
     }
@@ -281,7 +282,7 @@ pub(crate) async fn execute(
                 dry_run: args.dry_run,
                 limit: args.limit,
                 clock: Some(resolve_run_clock(args.clock.as_deref())?),
-                budget: crate::budget::effective_budget(
+                budget: crate::budget::effective_budget_with_kinds(
                     cfg.budget.as_ref(),
                     crate::budget::BudgetFlags {
                         max_records: args.max_records,
@@ -290,6 +291,7 @@ pub(crate) async fn execute(
                         allowed_sinks: args.allowed_sinks.clone(),
                     }
                     .into_spec(),
+                    &crate::budget::sink_template_kinds(&cfg),
                 )
                 .map_err(CliError::Config)?,
                 run_id: None,
@@ -402,7 +404,7 @@ pub(crate) async fn execute(
             catalog,
             usage: crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), config_dir.as_deref())
                 .map_err(CliError::Config)?,
-            budget: crate::budget::effective_budget(
+            budget: crate::budget::effective_budget_with_kinds(
                 cfg.budget.as_ref(),
                 crate::budget::BudgetFlags {
                     max_records: args.max_records,
@@ -411,6 +413,7 @@ pub(crate) async fn execute(
                     allowed_sinks: args.allowed_sinks.clone(),
                 }
                 .into_spec(),
+                &crate::budget::sink_template_kinds(&cfg),
             )
             .map_err(CliError::Config)?,
         },

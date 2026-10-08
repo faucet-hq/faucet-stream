@@ -64,6 +64,9 @@ pub struct BoundParams {
     /// Params whose value came from the caller — supplied, or computed from a
     /// supplied param. Their text may never form a new directive.
     pub caller_supplied: BTreeSet<String>,
+    /// Required params filled with a type-shaped placeholder (placeholder
+    /// mode only). A `${map:}` switching on one falls back to its first case.
+    pub placeholders: BTreeSet<String>,
 }
 
 impl BoundParams {
@@ -192,7 +195,13 @@ pub fn resolve(
                 // directive-checked.
                 Some(d) => spec::coerce(name, p.kind, d)?,
                 None => match mode {
-                    BindMode::Placeholder => p.kind.placeholder(),
+                    BindMode::Placeholder => match p.values.first() {
+                        Some(v) => spec::coerce(name, p.kind, v)?,
+                        None => {
+                            bound.placeholders.insert(name.clone());
+                            p.kind.placeholder()
+                        }
+                    },
                     BindMode::Strict => {
                         return Err(CliError::MissingParam {
                             name: name.clone(),
@@ -246,7 +255,7 @@ fn resolve_computed(spec: &ParamsSpec, bound: &mut BoundParams) -> CliResult<()>
         for (name, expr) in remaining {
             let refs = referenced_params(&expr);
             if refs.iter().all(|r| bound.values.contains_key(r)) {
-                let value = eval_computed_expr(&name, &expr, &bound.values)?;
+                let value = eval_computed_expr(&name, &expr, &bound.values, &bound.placeholders)?;
                 // Derived from a secret, the computed value is one too.
                 if refs.iter().any(|r| bound.secret_names.contains(r)) {
                     crate::secrets::registry::register(&value);
@@ -315,6 +324,7 @@ fn eval_computed_expr(
     name: &str,
     expr: &str,
     bound: &BTreeMap<String, Value>,
+    lenient: &BTreeSet<String>,
 ) -> CliResult<String> {
     let mut out = String::new();
     let mut rest = expr;
@@ -327,7 +337,7 @@ fn eval_computed_expr(
             ))
         })?;
         let body = &after[..end];
-        out.push_str(&resolve_computed_token(name, body, bound)?);
+        out.push_str(&resolve_computed_token(name, body, bound, lenient)?);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
@@ -339,6 +349,7 @@ fn resolve_computed_token(
     owner: &str,
     body: &str,
     bound: &BTreeMap<String, Value>,
+    lenient: &BTreeSet<String>,
 ) -> CliResult<String> {
     if let Some(pname) = body.strip_prefix("param.") {
         let pname = pname.trim();
@@ -349,7 +360,7 @@ fn resolve_computed_token(
         return Ok(value_to_string(v));
     }
     if let Some(spec) = body.strip_prefix("map:") {
-        return resolve_map(owner, spec, bound);
+        return resolve_map(owner, spec, bound, lenient);
     }
     Err(CliError::Config(format!(
         "computed param '{owner}': `${{{body}}}` is not allowed — a computed expression may only \
@@ -360,7 +371,12 @@ fn resolve_computed_token(
 /// Resolve a `map:NAME|case=value|…|*=default` body: look up the bound value of
 /// `NAME`, return the value of the matching case, or the `*` default. No match
 /// and no `*` is a typed load-time error.
-fn resolve_map(owner: &str, spec: &str, bound: &BTreeMap<String, Value>) -> CliResult<String> {
+fn resolve_map(
+    owner: &str,
+    spec: &str,
+    bound: &BTreeMap<String, Value>,
+    lenient: &BTreeSet<String>,
+) -> CliResult<String> {
     let mut parts = spec.split('|');
     let input_name = parts
         .next()
@@ -382,6 +398,7 @@ fn resolve_map(owner: &str, spec: &str, bound: &BTreeMap<String, Value>) -> CliR
 
     let mut default: Option<String> = None;
     let mut matched: Option<String> = None;
+    let mut first: Option<String> = None;
     for pair in parts {
         let (case, value) = pair.split_once('=').ok_or_else(|| {
             CliError::Config(format!(
@@ -389,13 +406,17 @@ fn resolve_map(owner: &str, spec: &str, bound: &BTreeMap<String, Value>) -> CliR
             ))
         })?;
         let case = case.trim();
+        if first.is_none() {
+            first = Some(value.to_string());
+        }
         if case == "*" {
             default = Some(value.to_string());
         } else if case == input_str {
             matched = Some(value.to_string());
         }
     }
-    matched.or(default).ok_or_else(|| {
+    let fallback = lenient.contains(input_name).then_some(first).flatten();
+    matched.or(default).or(fallback).ok_or_else(|| {
         CliError::Config(format!(
             "computed param '{owner}': map has no case for '{input_name}' = '{input_str}' and no \
              `*` default"
@@ -422,7 +443,7 @@ pub fn bind_document(
     // with a registered template.
     let stashed = doc.get_mut(PARAMS_KEY).map(std::mem::take);
     let inert = inert_values(&bound);
-    let result = substitute(doc, &bound.values, inert.as_ref());
+    let result = substitute(doc, &bound.values, &bound.placeholders, inert.as_ref());
     if let (Some(block), Some(map)) = (stashed, doc.as_object_mut()) {
         map.insert(PARAMS_KEY.to_string(), block);
     }
@@ -473,15 +494,16 @@ fn inert_values(bound: &BoundParams) -> Option<BTreeMap<String, Value>> {
 fn substitute(
     v: &mut Value,
     bound: &BTreeMap<String, Value>,
+    lenient: &BTreeSet<String>,
     inert: Option<&BTreeMap<String, Value>>,
 ) -> CliResult<()> {
     if let Value::String(s) = v {
-        let replaced = match whole_token(s, bound, bound)? {
+        let replaced = match whole_token(s, bound, bound, lenient)? {
             Some(typed) => typed,
-            None => Value::String(rewrite_text(s, bound, bound)?),
+            None => Value::String(rewrite_text(s, bound, bound, lenient)?),
         };
         if let (Some(inert), Value::String(out)) = (inert, &replaced) {
-            refuse_new_directives(s, out, bound, inert)?;
+            refuse_new_directives(s, out, bound, lenient, inert)?;
         }
         *v = replaced;
         return Ok(());
@@ -489,7 +511,7 @@ fn substitute(
     match v {
         Value::Array(items) => {
             for item in items.iter_mut() {
-                substitute(item, bound, inert)?;
+                substitute(item, bound, lenient, inert)?;
             }
         }
         Value::Object(map) => {
@@ -497,10 +519,10 @@ fn substitute(
             // map so a rewritten key is honoured — mirrors `interpolate_value`.
             let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
             for (key, mut val) in entries {
-                substitute(&mut val, bound, inert)?;
-                let new_key = rewrite_text(&key, bound, bound)?;
+                substitute(&mut val, bound, lenient, inert)?;
+                let new_key = rewrite_text(&key, bound, bound, lenient)?;
                 if let Some(inert) = inert {
-                    refuse_new_directives(&key, &new_key, bound, inert)?;
+                    refuse_new_directives(&key, &new_key, bound, lenient, inert)?;
                 }
                 map.insert(new_key, val);
             }
@@ -516,11 +538,12 @@ fn refuse_new_directives(
     src: &str,
     out: &str,
     bound: &BTreeMap<String, Value>,
+    lenient: &BTreeSet<String>,
     inert: &BTreeMap<String, Value>,
 ) -> CliResult<()> {
-    let baseline = match whole_token(src, inert, bound)? {
+    let baseline = match whole_token(src, inert, bound, lenient)? {
         Some(v) => value_to_string(&v),
-        None => rewrite_text(src, inert, bound)?,
+        None => rewrite_text(src, inert, bound, lenient)?,
     };
     let mut allowed: Vec<&str> = iter_directives(&baseline).map(|(t, _)| t).collect();
     for (token, _) in iter_directives(out) {
@@ -548,6 +571,7 @@ fn whole_token(
     s: &str,
     bound: &BTreeMap<String, Value>,
     maps: &BTreeMap<String, Value>,
+    lenient: &BTreeSet<String>,
 ) -> CliResult<Option<Value>> {
     let mut tokens = iter_directives(s);
     let Some((token, dir)) = tokens.next() else {
@@ -563,7 +587,9 @@ fn whole_token(
         Directive::LoadTime {
             prefix: "map",
             body,
-        } => Ok(Some(Value::String(resolve_map(token, body, maps)?))),
+        } => Ok(Some(Value::String(resolve_map(
+            token, body, maps, lenient,
+        )?))),
         _ => Ok(None),
     }
 }
@@ -574,6 +600,7 @@ fn rewrite_text(
     s: &str,
     bound: &BTreeMap<String, Value>,
     maps: &BTreeMap<String, Value>,
+    lenient: &BTreeSet<String>,
 ) -> CliResult<String> {
     rewrite(s, |body| match classify_directive(body) {
         Directive::Deferred { id, path } if id == PARAM_ID => {
@@ -585,7 +612,7 @@ fn rewrite_text(
             body: map_body,
         } => {
             let token = format!("${{{body}}}");
-            Ok(Some(resolve_map(&token, map_body, maps)?))
+            Ok(Some(resolve_map(&token, map_body, maps, lenient)?))
         }
         _ => Ok(None),
     })
@@ -1153,7 +1180,14 @@ mod tests {
             "pipeline": { "note": "$${param.a}" }
         });
         bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
-        assert_eq!(doc["pipeline"]["note"], "${param.a}");
+        // The escape is kept until the value is consumed, so binding it again
+        // (or any later pass) still leaves it literal (#789 CLI-100).
+        assert_eq!(doc["pipeline"]["note"], "$${param.a}");
+        bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
+        assert_eq!(
+            crate::interpolate::unescape(doc["pipeline"]["note"].as_str().unwrap()),
+            "${param.a}"
+        );
     }
 
     #[test]
@@ -1305,6 +1339,39 @@ mod tests {
         let cfg = &doc["pipeline"]["source"]["config"];
         assert_eq!(cfg["url"], "https://x/<param>");
         assert_eq!(cfg["n"], json!(0));
+    }
+
+    #[test]
+    fn placeholder_mode_uses_the_value_set_and_the_first_map_case() {
+        let mut doc = json!({
+            "params": {
+                "env": { "required": true, "values": ["prod", "dev"] },
+                "n": { "type": "int", "required": true, "values": [5, 9] },
+                "region": { "required": true },
+                "host": { "computed": "${map:region|eu=e.example|us=u.example}" }
+            },
+            "pipeline": { "source": { "config": {
+                "e": "${param.env}", "n": "${param.n}",
+                "h": "${param.host}",
+                "m": "${map:region|eu=1|us=2}"
+            } } }
+        });
+        let bound = bind_document(&mut doc, &SuppliedParams::new(), BindMode::Placeholder).unwrap();
+        let cfg = &doc["pipeline"]["source"]["config"];
+        assert_eq!(cfg["e"], "prod");
+        assert_eq!(cfg["n"], json!(5));
+        assert_eq!(cfg["h"], "e.example");
+        assert_eq!(cfg["m"], "1");
+        assert_eq!(
+            bound.placeholders.iter().collect::<Vec<_>>(),
+            vec!["region"]
+        );
+
+        let mut strict = json!({
+            "params": { "region": { "default": "ap" } },
+            "x": "${map:region|eu=1|us=2}"
+        });
+        assert!(bind_document(&mut strict, &SuppliedParams::new(), BindMode::Placeholder).is_err());
     }
 
     #[test]

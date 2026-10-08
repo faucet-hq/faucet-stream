@@ -176,6 +176,14 @@ fn skip_reason(
     if rec.pre_existing {
         return Some(SkipReason::PreExisting);
     }
+    if !rec.fs_path().is_absolute() {
+        return Some(SkipReason::RelativePath);
+    }
+    if let (Some(writer), Some(here)) = (&rec.host, super::local_host())
+        && *writer != here
+    {
+        return Some(SkipReason::OtherHost);
+    }
     if opts.in_flight.contains(&rec.run_id) {
         return Some(SkipReason::InFlight);
     }
@@ -403,6 +411,23 @@ mod tests {
     }
 
     // ── select(): scope ──────────────────────────────────────────────────────
+
+    #[test]
+    fn relative_and_other_host_rows_are_never_collected() {
+        let rel = rec("out/x.jsonl", "2026-08-01T00:00:00Z");
+        let sel = select(std::slice::from_ref(&rel), &SweepScope::All, &opts());
+        assert_eq!(sel[0].skip, Some(SkipReason::RelativePath));
+
+        let mut theirs = rec("/tmp/theirs.jsonl", "2026-08-01T00:00:00Z");
+        theirs.host = Some("some-other-host.invalid".into());
+        let sel = select(std::slice::from_ref(&theirs), &SweepScope::All, &opts());
+        assert_eq!(sel[0].skip, Some(SkipReason::OtherHost));
+
+        let mine = rec("/tmp/mine.jsonl", "2026-08-01T00:00:00Z");
+        assert_eq!(mine.host, crate::local_outputs::local_host());
+        let sel = select(std::slice::from_ref(&mine), &SweepScope::All, &opts());
+        assert_eq!(sel[0].skip, None);
+    }
 
     #[test]
     fn expired_scope_selects_only_rows_past_their_window() {

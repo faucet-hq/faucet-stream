@@ -166,6 +166,10 @@ Three stages resolve placeholders:
 
 Reference cycles surface as a clear `InterpolationCycle` error.
 
+Write `$${` for a literal `${`. The escape holds through every stage — a
+`$${param.x}`, `$${now.date}` or `$${vault:…}` is never resolved — and becomes
+`${` only in the value the connector or transform finally receives.
+
 ### `${now.*}` — run-clock interpolation
 
 `${now.*}` tokens inject the current wall time into **source and sink config
@@ -329,8 +333,9 @@ identically. A type mismatch, a missing `required` param, an undeclared
 `--param`, or an undeclared `${param.x}` reference is an error naming the param.
 
 **Validation.** `faucet validate` with no `--param` binds required params to
-type-shaped placeholders, so a parameterized config validates in CI without
-inventing values; passing any `--param` switches to strict binding. `faucet
+type-shaped placeholders (the first entry of a `values:` set, and a
+`${map:}` switching on a placeholder takes its first case), so a parameterized
+config validates in CI without inventing values; passing any `--param` switches to strict binding. `faucet
 schema params` prints the JSON Schema for one entry.
 
 Persisting a parameterized config for register-once / trigger-by-id use is the
@@ -343,6 +348,12 @@ replace). A row with `parent:` runs once per parent record. See the
 [matrix DAG tutorial](../tutorials/matrix-dag.md). For DRY configs with many
 rows, define named templates under `pipeline.sources` / `pipeline.sinks` and
 select them per row with `ref:`.
+
+A row `id` may contain only letters, digits, `_` and `-` (it is part of the
+row's state key and of `${id.field}` tokens). A row may reference another row's
+record with `${id.field}` only when `id` is its `parent:` (or, for a
+`for_each:` row, one of its dimensions) — any other row's token would reach the
+connector unresolved, so it is refused at load time.
 
 ### `depends_on` — completion ordering between rows
 
@@ -437,9 +448,11 @@ Semantics:
   per-invocation without multiplying the matrix.
 - Each dimension is folded into the row's `depends_on`, so readiness, the skip
   cascade, and cycle detection reuse the ordering machinery. Per-tuple state
-  keys (`{name}::{row}::alias=value&…`) let every cell resume independently.
+  keys (`{name}::{row}::alias:value/…`; a value outside `[A-Za-z0-9_.-]` or longer
+  than 64 characters is replaced by a readable prefix plus a hash) let every cell resume independently.
 - Guards (all at load time via `faucet validate`): `for_each` must name
-  `fan_out:` rows; a `fan_out:` row can't carry a sink or `parent:`;
+  `fan_out:` rows; a `fan_out:` row can't carry a sink or `parent:`, and
+  no row can name one in `parent:` (use `for_each:`);
   `for_each` can't combine with `parent:` (v1). The product is
   bounded by `MAX_MATRIX_PRODUCT` (10 000) — a larger cross-product fails
   rather than spawning an unbounded fleet.
@@ -496,18 +509,23 @@ declare an explicit graph of typed nodes (`source` / `transform` / `tee` /
 with `matrix:` — both non-empty is a load-time error. `faucet run` / `validate`
 / `preview` all understand it. See
 [Topology mode](../cookbook/topology.md) for the full grammar, the `join:`
-node, state semantics, and runnable examples.
+node, state semantics, and runnable examples. A node entry accepts only its
+kind's keys — a misspelt key (`confg:`) is a load-time error — and `${vars.*}` /
+`${sources.*}` / `${sinks.*}` resolve inside node overrides and transform nodes
+as they do elsewhere.
 
 **What applies in topology mode.** Each block is scoped to the node where it
 makes sense. The per-page governance passes — `pipeline.masking`,
 `pipeline.quality`, `pipeline.contract`, `schema:` — are enforced per sink node,
 and `resilience:` applies to its writes. `sla:` keeps per-sink-node history under
-`{pipeline}::{node_id}`; `notifications:` reports per sink node; `lineage:` emits
+`{pipeline}::{node_id}` (staleness and volume checks, like `profiling:`, need a
+durable `state:` block, as in matrix mode); `notifications:` reports per sink node; `lineage:` emits
 one job per sink node (`{pipeline}.{node_id}`) whose inputs are every source that
 reaches it; `catalog:` records a dataset per source and per sink plus an edge for
 each pair the graph connects. `budget:`, `metadata_columns:` and `reconcile:`
 apply per sink node too. So do `--dry-run` / `--limit`, `${now.*}` / `--clock`,
-`state:`, and `dlq:`. `verify:` and `rollback:` are refused (a graph sink has no
+`state:`, and `dlq:` (a `--dry-run` counts would-be dead letters without writing them,
+and a preview runs at-least-once). `verify:` and `rollback:` are refused (a graph sink has no
 single source to verify against, and runs are undone per matrix row), and
 `usage:` is accepted but not applied. See the
 [applies-per-node table](../cookbook/topology.md#observability) for the detail.
@@ -1201,7 +1219,7 @@ reconcile:
     config:
       connection_url: ${secret:PG_URL}
       query: "SELECT count(*) AS n FROM orders WHERE updated_at >= '${now.date}'"
-    count_field: n             # optional; defaults to the first numeric field
+    count_field: n             # required when the probe row has more than one numeric field
   tolerance_pct: 0.0           # allow this % shortfall before failing (default 0)
 ```
 
@@ -1209,7 +1227,10 @@ The count probe is any faucet source (a SQL `count(*)`, an OData `$count`
 endpoint via `rest`, …); its first returned record supplies the count. The run
 fails when `rows_written < authoritative × (1 − tolerance_pct/100)`. Compares
 rows **written** to the destination, so it is most meaningful for straight
-loads / full-refreshes. Schema: `faucet schema` (the `reconcile` block).
+loads / full-refreshes. The count describes one dataset, so `reconcile:` is
+refused on a config with more than one root row or a partitioned row (each
+invocation would be compared with the whole dataset's count). Schema: `faucet
+schema` (the `reconcile` block).
 
 ## `verify`
 

@@ -177,3 +177,46 @@ async fn allowed_sinks_refuses_the_run_before_it_starts() {
     assert!(summary.invocations[0].error.is_none());
     assert_eq!(summary.invocations[0].records_written, 5);
 }
+
+#[tokio::test]
+async fn a_budget_crossing_stops_only_its_own_invocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = write_input(dir.path());
+    let small = dir.path().join("small.csv");
+    std::fs::write(&small, "id,name\n1,zed\n").unwrap();
+    let out_big = dir.path().join("big.jsonl");
+    let out_small = dir.path().join("small.jsonl");
+    let yaml = format!(
+        r#"version: 1
+name: usage_test
+execution: {{ max_concurrent: 1 }}
+budget: {{ max_records: 2 }}
+pipeline:
+  source: {{ type: csv, config: {{ path: "{big}" }} }}
+  sink: {{ type: jsonl, config: {{ path: "{out_big}" }} }}
+matrix:
+  - id: big
+  - id: small
+    source: {{ config: {{ path: "{small}" }} }}
+    sink: {{ config: {{ path: "{out_small}" }} }}
+"#,
+        big = big.display(),
+        small = small.display(),
+        out_big = out_big.display(),
+        out_small = out_small.display(),
+    );
+    let cfg = PipelineConfig::from_text(&yaml, Path::new("usage.yaml")).unwrap();
+    let nodes = expand(&cfg).unwrap();
+    let summary = run_expanded(nodes, opts(cfg.budget.clone())).await.unwrap();
+    let by_row = |id: &str| summary.invocations.iter().find(|o| o.row_id == id).unwrap();
+    assert_eq!(
+        by_row("big").error_kind,
+        Some(InvocationErrorKind::BudgetExceeded)
+    );
+    let small = by_row("small");
+    assert!(small.error.is_none(), "{small:?}");
+    assert_eq!(
+        small.records_written, 1,
+        "a sibling's budget crossing must not cancel this invocation"
+    );
+}

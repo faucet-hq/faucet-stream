@@ -631,7 +631,10 @@ the `catalog` feature.
 `skipped` reason: `pre_existing` (faucet did not create the file — never
 deleted, by any scope), `in_flight` (the file may still be being written; retried
 later), `not_on_disk` (already gone — a no-op, and the record is marked expired),
-`already_deleted`, or `delete_failed`.
+`already_deleted`, `delete_failed`, `relative_path` (a row recorded before paths
+were stored absolute — it would resolve against the sweeper's directory, not the
+writer's), or `other_host` (another host wrote the file; each row records its
+writer's host, and only a sweeper there deletes it).
 
 `in_flight` covers two cases, because one is not enough: the output's ledger row
 names a run that is currently executing, **or** the file itself was touched

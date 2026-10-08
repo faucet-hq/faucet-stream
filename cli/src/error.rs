@@ -130,7 +130,10 @@ pub enum CliError {
     TransformIndexGap { missing: u32 },
 
     /// A matrix row id collides with a load-time interpolation prefix.
-    #[error("matrix row id '{id}' is reserved (env, file, secret, matrix, pipeline)")]
+    #[error(
+        "matrix row id '{id}' is reserved ({})",
+        crate::expand::RESERVED_IDS.join(", ")
+    )]
     ReservedRowId { id: String },
 
     /// Two matrix rows declared the same id.

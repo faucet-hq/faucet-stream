@@ -435,3 +435,137 @@ pipeline:
         "error should explain the quarantine incompatibility: {err}"
     );
 }
+
+const SQLITE_UPSERT: &str = r#"
+  sink:
+    type: sqlite
+    config:
+      database_url: "sqlite://x.db"
+      table_name: t
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [id]
+"#;
+
+#[test]
+fn cleanup_on_a_partitioned_row_is_rejected() {
+    // #789 CLI-23: each chunk would delete the other chunks' rows.
+    let err = expand_err(&format!(
+        r#"
+version: 1
+pipeline:
+  source:
+    type: csv
+    config: {{ path: "./x-${{partition.id}}.csv" }}
+    complete_for:
+      scope: {{ group_id: 1 }}
+      on_missing: delete
+{SQLITE_UPSERT}
+partition: {{ kind: integer, from: 0, to: 19, chunk_size: 10, bounds: inclusive }}
+"#
+    ));
+    assert!(
+        err.contains("cannot be combined with `partition:`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn cleanup_on_a_bookmarked_incremental_read_is_rejected() {
+    // #789 CLI-25: run 2 reads only the delta and would delete the rest.
+    let yaml = |state: &str| {
+        format!(
+            r#"
+version: 1
+pipeline:
+  source:
+    type: file
+    config: {{ path: "./x.csv", incremental: {{ by: mtime }} }}
+    complete_for:
+      scope: {{ group_id: 1 }}
+      on_missing: delete
+{SQLITE_UPSERT}{state}"#
+        )
+    };
+    let err = expand_err(&yaml("  state: { type: file, config: { path: ./st } }\n"));
+    assert!(err.contains("resumes from its stored bookmark"), "{err}");
+    let cfg = PipelineConfig::from_text(&yaml(""), std::path::Path::new("p.yaml")).unwrap();
+    assert!(
+        expand(&cfg).is_ok(),
+        "without state every run reads everything"
+    );
+}
+
+#[test]
+fn a_child_cleanup_scope_needs_its_parents_token() {
+    // #789 CLI-25: a static scope on a fan-out row deletes the siblings' rows.
+    let yaml = |scope: &str| {
+        format!(
+            r#"
+version: 1
+pipeline:
+  sources:
+    parents: {{ type: csv, config: {{ path: ./p.csv }} }}
+    child:
+      type: csv
+      config: {{ path: "./c-${{p.id}}.csv" }}
+      complete_for:
+        scope: {{ contact_id: {scope} }}
+        on_missing: delete
+  sinks:
+    trash: {{ type: jsonl, config: {{ path: ./p.jsonl }} }}
+    dst:
+      type: sqlite
+      config:
+        database_url: "sqlite://x.db"
+        table_name: t
+        column_mapping: auto_map
+        write_mode: upsert
+        key: [id]
+matrix:
+  - id: p
+    source: {{ ref: parents }}
+    sink: {{ ref: trash }}
+  - id: c
+    parent: p
+    source: {{ ref: child }}
+    sink: {{ ref: dst }}
+"#
+        )
+    };
+    let err = expand_err(&yaml("7"));
+    assert!(err.contains("carries no per-invocation token"), "{err}");
+    let ok =
+        PipelineConfig::from_text(&yaml("\"${p.id}\""), std::path::Path::new("p.yaml")).unwrap();
+    expand(&ok).expect("a scope narrowed by the parent token is accepted");
+}
+
+#[test]
+fn overwrite_on_a_bookmarked_incremental_read_is_rejected() {
+    // #789 CLI-20: each run would swap the table for the delta.
+    let yaml = |state: &str| {
+        format!(
+            r#"
+version: 1
+pipeline:
+  source:
+    type: file
+    config: {{ path: "./x.csv", incremental: {{ by: mtime }} }}
+  sink:
+    type: sqlite
+    config:
+      database_url: "sqlite://x.db"
+      table_name: t
+      column_mapping: auto_map
+      write_mode: overwrite
+{state}"#
+        )
+    };
+    let err = expand_err(&yaml("  state: { type: file, config: { path: ./st } }\n"));
+    assert!(
+        err.contains("only the rows changed since the last one"),
+        "{err}"
+    );
+    let cfg = PipelineConfig::from_text(&yaml(""), std::path::Path::new("p.yaml")).unwrap();
+    assert!(expand(&cfg).is_ok());
+}

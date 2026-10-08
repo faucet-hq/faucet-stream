@@ -66,7 +66,8 @@ impl BackfillSpec {
 
 /// Whether a serialized source config references a window-scoping token.
 pub fn has_scoping_tokens(serialized_config: &str) -> bool {
-    serialized_config.contains("${backfill.") || serialized_config.contains("${now.")
+    crate::interpolate::contains_unescaped(serialized_config, "${backfill.")
+        || crate::interpolate::contains_unescaped(serialized_config, "${now.")
 }
 
 /// Parse an IANA timezone name.

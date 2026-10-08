@@ -28,8 +28,8 @@ const PREFIX: &str = "${partition.";
 /// One planned chunk: a stable id plus the tokens its invocation substitutes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionChunk {
-    /// Stable id, used as the state-key suffix and in log lines. Zero-padded so
-    /// chunk ids sort in plan order.
+    /// Stable id, used as the state-key suffix and in log lines. Unpadded, so
+    /// it stays the same when the plan grows past a power of ten.
     pub id: String,
     /// Token name → rendered value, e.g. `start` → `"10000"`.
     pub tokens: BTreeMap<String, String>,
@@ -59,7 +59,8 @@ pub fn plan(spec: &PartitionSpec) -> CliResult<Vec<PartitionChunk>> {
                 IntBound::Literal(v) => *v,
                 IntBound::Discovered(_) => {
                     return Err(CliError::Internal(
-                        "partition: an undiscovered bound reached the planner —                          `resolve_bounds` must run before `plan`"
+                        "partition: an undiscovered bound reached the planner — \
+                         `resolve_bounds` must run before `plan`"
                             .into(),
                     ));
                 }
@@ -127,7 +128,8 @@ pub fn plan(spec: &PartitionSpec) -> CliResult<Vec<PartitionChunk>> {
                 CountBound::Literal(v) => *v,
                 CountBound::Discovered(_) => {
                     return Err(CliError::Internal(
-                        "partition: an undiscovered total reached the planner —                          `resolve_bounds` must run before `plan`"
+                        "partition: an undiscovered total reached the planner — \
+                         `resolve_bounds` must run before `plan`"
                             .into(),
                     ));
                 }
@@ -173,7 +175,7 @@ pub fn substitute(value: &mut Value, chunk: &PartitionChunk) -> CliResult<()> {
 fn substitute_in_str(input: &str, chunk: &PartitionChunk) -> CliResult<String> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
-    while let Some(pos) = rest.find(PREFIX) {
+    while let Some(pos) = crate::interpolate::find_unescaped(rest, PREFIX) {
         out.push_str(&rest[..pos]);
         let after = &rest[pos + PREFIX.len()..];
         let close = after.find('}').ok_or_else(|| {
@@ -198,7 +200,7 @@ fn substitute_in_str(input: &str, chunk: &PartitionChunk) -> CliResult<String> {
 /// A `partition:` block on a row whose source ignores the tokens would run the
 /// same query N times, so this gates the config at load time.
 pub fn references_partition(serialized: &str) -> bool {
-    serialized.contains(PREFIX)
+    crate::interpolate::contains_unescaped(serialized, PREFIX)
 }
 
 /// The `end` predicate for an open-ended final chunk is the caller's problem —

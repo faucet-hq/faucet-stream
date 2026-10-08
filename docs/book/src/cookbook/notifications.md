@@ -19,7 +19,7 @@ block, nothing changes.
 
 | Event | Fires when | Severity |
 |-------|-----------|----------|
-| `run_failure` | a run (or its final flush) failed | error |
+| `run_failure` | a run (or its final flush) failed — a rule on `run_failure` also hears `circuit_open`, `contract_abort` and `budget_exceeded`, which are run failures too | error |
 | `run_success` | a run completed successfully | info |
 | `sla_breach` | a post-run SLA check was violated (staleness / min_rows / volume) | warning |
 | `circuit_open` | the resilience circuit breaker tripped | critical |
@@ -97,9 +97,13 @@ channel:
 
 ### PagerDuty
 
-Uses the Events API v2. A failure-class event **opens** an incident; the next
-`run_success` on the same pipeline/row automatically sends a matching
-**resolve** (correlated by dedup key), so incidents self-close.
+Uses the Events API v2. A failure-class event (`run_failure`,
+`circuit_open`, `contract_abort`, `budget_exceeded`) **opens** one incident per
+pipeline/row; any other kind (`sla_breach`, `dlq_threshold`, `profile_drift`,
+…) opens its own incident, keyed by kind, so a warning never merges into a
+failure. The next `run_success` on the same pipeline/row sends a matching
+**resolve** for every incident it opened (correlated by dedup key), so
+incidents self-close.
 
 ```yaml
 channel:

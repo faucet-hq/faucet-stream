@@ -3269,6 +3269,7 @@ components:
         last_written_at: { type: string, format: date-time, description: "The instant retention is measured from." }
         deleted_at: { type: string, format: date-time, nullable: true, description: "When the GC collected the file. The record is kept." }
         deleted_bytes: { type: integer, nullable: true, description: "Bytes reclaimed when it was collected." }
+        host: { type: string, nullable: true, description: "The host that last wrote the file; a sweeper on another host never deletes it." }
         state:
           type: string
           enum: [present, expired, external, replaced]
@@ -3302,13 +3303,16 @@ components:
         skipped:
           type: string
           nullable: true
-          enum: [pre_existing, already_deleted, not_on_disk, in_flight, delete_failed]
+          enum: [pre_existing, already_deleted, not_on_disk, in_flight, delete_failed, relative_path, other_host]
           description: >
             Why the file was left alone. `pre_existing` = faucet did not create
             it; `not_on_disk` = already gone (a no-op, and the record is marked
             expired); `in_flight` = the file may still be being written — either
             its run is executing, or the file was touched inside the server's
-            in-flight grace window — so it is retried later.
+            in-flight grace window — so it is retried later; `relative_path` =
+            a row recorded before paths were stored absolute (it would resolve
+            against the sweeper's directory); `other_host` = another host wrote
+            it.
         error: { type: string, nullable: true, description: "Detail for a delete_failed outcome." }
     SweepReport:
       type: object

@@ -285,6 +285,7 @@ pub async fn build_source(
     auth: &AuthCatalog,
     retry_policy: Option<&faucet_core::RetryPolicy>,
 ) -> CliResult<Box<dyn Source>> {
+    let config = crate::interpolate::unescaped(config);
     // Third-party connectors registered via `PluginRegistry` win first. Names
     // can never collide with a built-in (registration rejects that), so this is
     // safe to check ahead of the built-in `match`. Custom factories receive the
@@ -642,6 +643,7 @@ pub async fn build_source(
 /// carries `auth: { ref: <name> }`, the named provider is resolved from `auth`
 /// (the catalog) and injected into the connector.
 pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliResult<Box<dyn Sink>> {
+    let config = crate::interpolate::unescaped(config);
     if let Some(entry) = global().sinks.get(kind) {
         reject_unknown_config_keys("sink", kind, kind, &config, &(entry.schema)())?;
         return (entry.factory)(config);
@@ -1016,11 +1018,9 @@ pub const UPSERT_SINK_KINDS: &[&str] = &[
 /// the run did not write. Kept in sync with each sink's `supports_cleanup()`
 /// override; `cli/tests/registry_capability_parity.rs` asserts they agree.
 ///
-/// Currently the same set as [`UPSERT_SINK_KINDS`]: cleanup is only meaningful
-/// alongside `write_mode: upsert`, which is exactly what those sinks support.
-/// They are separate constants because that coincidence is not a guarantee — a
-/// future upsert-capable sink whose backend cannot express a scoped delete would
-/// belong in one list and not the other.
+/// A subset of [`UPSERT_SINK_KINDS`]: cleanup is only meaningful alongside
+/// `write_mode: upsert`, but not every upsert-capable sink can express a scoped
+/// delete (`dynamodb`, `databricks` and `oracle` cannot), so the lists differ.
 pub const CLEANUP_SINK_KINDS: &[&str] = &[
     "postgres",
     "sqlite",
@@ -1302,6 +1302,30 @@ pub fn source_kind_consumes_destructively(kind: &str, config: &Value) -> bool {
     }
 }
 
+/// Whether a source configured this way resumes from a stored bookmark, so a
+/// run with `state:` reads only what changed since the last one: an
+/// incremental `replication_method`, the file source's `incremental:` block,
+/// an incremental Iceberg / DynamoDB-streams read, or a change-stream / log
+/// source. A full refresh (`write_mode: overwrite`) from such a source would
+/// replace the destination with only the delta (#789 CLI-20).
+pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
+    let incremental_method = match config.get("replication_method") {
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("incremental"),
+        Some(Value::Object(o)) => o
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case("incremental")),
+        _ => false,
+    };
+    let mode = config.get("mode").and_then(Value::as_str);
+    incremental_method
+        || (kind == "file" && config.get("incremental").is_some_and(|v| !v.is_null()))
+        || (kind == "iceberg" && mode == Some("incremental"))
+        || (kind == "dynamodb" && mode == Some("streams"))
+        || kind.ends_with("-cdc")
+        || matches!(kind, "kafka" | "kinesis")
+}
+
 /// See [`EXACTLY_ONCE_SOURCE_KINDS`].
 pub fn source_supports_exactly_once(kind: &str) -> bool {
     source_replay_guarantee(kind) == faucet_core::ReplayGuarantee::Deterministic
@@ -1356,8 +1380,10 @@ pub fn sink_supported_write_modes(kind: &str) -> &'static [faucet_core::WriteMod
     }
 }
 
-/// Return the JSON Schema for the named source's config struct.
-/// Deserialize a connector config and discard it — the point is the error.
+/// Keys the executor itself injects into a connector config — hidden from the
+/// schema, so the unknown-key gate must not refuse them (#789 CLI-72).
+const CLI_INJECTED_KEYS: &[&str] = &["_overwrite_staging", "_activate_version"];
+
 /// Reject connector-config keys the connector does not declare (#654 H9).
 ///
 /// `deny_unknown_fields` closes this at the serde layer, but serde refuses it
@@ -1381,26 +1407,36 @@ fn reject_unknown_config_keys(
     config: &Value,
     schema: &Value,
 ) -> CliResult<()> {
-    let Some(given) = config.as_object() else {
+    let Some((unknown, hint)) = unknown_config_keys(config, schema) else {
         return Ok(());
     };
+    Err(CliError::InvalidConnectorConfig {
+        kind: if role == "source" { "source" } else { "sink" },
+        name: name.to_owned(),
+        message: format!(
+            "unknown {role} `{kind}` config key(s): {unknown}{hint}. A key the connector does \
+             not declare is silently ignored, so an integrity or batching knob would read as \
+             set while doing nothing — run `faucet schema {role} {kind}` for the full list."
+        ),
+    })
+}
+
+/// Keys of `config` its JSON Schema does not declare, rendered as a
+/// backticked list plus a `did you mean` hint; `None` when every key is known
+/// or the schema declares a catch-all.
+pub(crate) fn unknown_config_keys(config: &Value, schema: &Value) -> Option<(String, String)> {
+    let given = config.as_object()?;
     let mut known = BTreeSet::new();
-    if !collect_schema_keys(schema, schema, &mut known, 0) {
-        // Somewhere in the schema a genuine catch-all is declared, or the
-        // shape is one we don't model — say nothing rather than reject a
-        // legitimate config.
-        return Ok(());
-    }
-    if known.is_empty() {
-        return Ok(());
+    if !collect_schema_keys(schema, schema, &mut known, 0) || known.is_empty() {
+        return None;
     }
     let unknown: Vec<&str> = given
         .keys()
         .map(String::as_str)
-        .filter(|k| !known.contains(*k))
+        .filter(|k| !known.contains(*k) && !CLI_INJECTED_KEYS.contains(k))
         .collect();
     if unknown.is_empty() {
-        return Ok(());
+        return None;
     }
     let suggestions: Vec<String> = unknown
         .iter()
@@ -1409,24 +1445,17 @@ fn reject_unknown_config_keys(
         })
         .collect();
     let hint = if suggestions.is_empty() {
-        String::new()
+        let declared: Vec<String> = known.iter().map(|k| format!("`{k}`")).collect();
+        format!(" (declared: {})", declared.join(", "))
     } else {
         format!(" ({})", suggestions.join("; "))
     };
-    Err(CliError::InvalidConnectorConfig {
-        kind: if role == "source" { "source" } else { "sink" },
-        name: name.to_owned(),
-        message: format!(
-            "unknown {role} `{kind}` config key(s): {}{hint}. A key the connector does not \
-             declare is silently ignored, so an integrity or batching knob would read as set \
-             while doing nothing — run `faucet schema {role} {kind}` for the full list.",
-            unknown
-                .iter()
-                .map(|k| format!("`{k}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    })
+    let list = unknown
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((list, hint))
 }
 
 /// Collect every top-level key `schema` can accept into `out`.
@@ -1633,6 +1662,7 @@ where
 /// passing silently, so a slim build never reports a config valid that it
 /// simply could not read.
 pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResult<()> {
+    let config = crate::interpolate::unescaped(config);
     // A plugin-registered connector is validated by building it — the factory
     // is the only thing that knows its config shape.
     if let Some(entry) = global().sources.get(kind) {
@@ -1751,11 +1781,14 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
         #[cfg(feature = "source-singer")]
         "singer" => check::<faucet_source_singer::SingerSourceConfig>("singer", name, config),
         #[cfg(feature = "source-elasticsearch")]
-        "elasticsearch" => check::<faucet_source_elasticsearch::ElasticsearchSourceConfig>(
-            "elasticsearch",
-            name,
-            config,
-        ),
+        "elasticsearch" => {
+            check_with::<faucet_source_elasticsearch::ElasticsearchSourceConfig, _, _>(
+                "elasticsearch",
+                name,
+                config,
+                |c| c.validate(),
+            )
+        }
         #[cfg(feature = "source-kafka")]
         "kafka" => {
             check_with::<faucet_source_kafka::KafkaSourceConfig, _, _>("kafka", name, config, |c| {
@@ -2041,6 +2074,7 @@ pub fn sink_batch_atomicity(kind: &str, config: &Value) -> Option<faucet_core::B
 /// passing silently, so a slim build never reports a config valid that it
 /// simply could not read.
 pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<()> {
+    let config = crate::interpolate::unescaped(config);
     // A plugin-registered connector is validated by building it — the factory
     // is the only thing that knows its config shape.
     if let Some(entry) = global().sinks.get(kind) {
@@ -2102,7 +2136,9 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
             |c| c.validate(),
         ),
         #[cfg(feature = "sink-sftp")]
-        "sftp" => check::<faucet_sink_sftp::SftpSinkConfig>("sftp", name, config),
+        "sftp" => check_with::<faucet_sink_sftp::SftpSinkConfig, _, _>("sftp", name, config, |c| {
+            c.validate()
+        }),
         #[cfg(feature = "sink-singer")]
         "singer" => {
             check_with::<faucet_sink_singer::SingerSinkConfig, _, _>("singer", name, config, |c| {
@@ -2185,9 +2221,12 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
             |c| c.validate(),
         ),
         #[cfg(feature = "sink-azure-blob")]
-        "azure-blob" => {
-            check::<faucet_sink_azure_blob::AzureBlobSinkConfig>("azure-blob", name, config)
-        }
+        "azure-blob" => check_with::<faucet_sink_azure_blob::AzureBlobSinkConfig, _, _>(
+            "azure-blob",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "sink-dynamodb")]
         "dynamodb" => check_with::<faucet_sink_dynamodb::DynamoDbSinkConfig, _, _>(
             "dynamodb",
@@ -2462,7 +2501,7 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "source-sftp")]
     v.push((
         "sftp",
-        "SFTP source. Lists/globs a remote directory and streams JSONL / JSON-array / raw-text files over SSH.",
+        "SFTP source. Lists/globs a remote directory and reads its files over SSH, format and compression resolved per file (JSONL, JSON, CSV, Parquet, Avro, …).",
     ));
     #[cfg(feature = "source-file")]
     v.push((
@@ -2500,7 +2539,7 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "source-azure-blob")]
     v.push((
         "azure-blob",
-        "Azure Blob Storage / ADLS Gen2 source — JSONL, JSON array, or raw text",
+        "Azure Blob Storage / ADLS Gen2 source — format and compression resolved per object (JSONL, JSON, CSV, Parquet, Avro, …)",
     ));
     #[cfg(feature = "source-redis")]
     v.push(("redis", "Redis (streams, lists, keys) source"));
@@ -2543,7 +2582,7 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "source-gcs")]
     v.push((
         "gcs",
-        "Google Cloud Storage source — JSONL, JSON array, or raw text",
+        "Google Cloud Storage source — format and compression resolved per object (JSONL, JSON, CSV, Parquet, Avro, …)",
     ));
     #[cfg(feature = "source-bigquery")]
     v.push((
@@ -2572,7 +2611,10 @@ pub fn sink_descriptions() -> Vec<(&'static str, &'static str)> {
 fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&'static str, &'static str)> = Vec::new();
     #[cfg(feature = "sink-bigquery")]
-    v.push(("bigquery", "Google BigQuery streaming-insert sink"));
+    v.push((
+        "bigquery",
+        "Google BigQuery sink — streaming inserts, upsert/delete via MERGE, overwrite, exactly-once",
+    ));
     #[cfg(feature = "sink-iceberg")]
     v.push((
         "iceberg",
@@ -2616,7 +2658,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-sftp")]
     v.push((
         "sftp",
-        "SFTP sink. Writes JSONL files over SSH with atomic temp-then-rename uploads.",
+        "SFTP sink. Writes JSONL, JSON, CSV, XML, Excel, Avro or Parquet files over SSH with atomic temp-then-rename uploads.",
     ));
     #[cfg(feature = "sink-singer")]
     v.push((
@@ -2624,7 +2666,10 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
         "Singer target bridge. Runs a Singer target executable and feeds it SCHEMA/RECORD/STATE messages; bookmarks advance only after the target confirms (echoed STATE or clean exit).",
     ));
     #[cfg(feature = "sink-s3")]
-    v.push(("s3", "AWS S3 object sink"));
+    v.push((
+        "s3",
+        "AWS S3 sink — JSONL, JSON, CSV, XML, Excel, Avro or Parquet objects",
+    ));
     #[cfg(feature = "sink-mongodb")]
     v.push(("mongodb", "MongoDB insert sink"));
     #[cfg(feature = "sink-redis")]
@@ -2650,7 +2695,10 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-delta")]
     v.push(("delta", "Apache Delta Lake sink (local FS or S3/Azure/GCS). Append-only, schema-inferred table creation, one commit per flush."));
     #[cfg(feature = "sink-gcs")]
-    v.push(("gcs", "Google Cloud Storage sink — JSONL files"));
+    v.push((
+        "gcs",
+        "Google Cloud Storage sink — JSONL, JSON, CSV, XML, Excel, Avro or Parquet objects",
+    ));
     #[cfg(feature = "sink-redshift")]
     v.push((
         "redshift",
@@ -2669,7 +2717,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-azure-blob")]
     v.push((
         "azure-blob",
-        "Azure Blob Storage / ADLS Gen2 sink — JSONL files",
+        "Azure Blob Storage / ADLS Gen2 sink — JSONL, JSON, CSV, XML, Excel, Avro or Parquet blobs",
     ));
     #[cfg(feature = "sink-dynamodb")]
     v.push((
@@ -3728,6 +3776,52 @@ mod tests {
         assert_eq!(nearest_key("batch_sze", known.iter()), Some("batch_size"));
         // Not a typo of anything here — better to say nothing than to guess.
         assert_eq!(nearest_key("region", known.iter()), None);
+    }
+
+    /// #789 CLI-136: validate runs each config's own `validate()` for these
+    /// kinds too, so a config refused at run time is not reported valid.
+    #[cfg(all(
+        feature = "source-elasticsearch",
+        feature = "sink-sftp",
+        feature = "sink-azure-blob"
+    ))]
+    #[test]
+    fn validate_runs_the_connector_validate_for_es_sftp_and_azure() {
+        let es = serde_json::to_value(faucet_source_elasticsearch::ElasticsearchSourceConfig::new(
+            "http://localhost:9200",
+            "",
+        ))
+        .unwrap();
+        let err = validate_source_config("elasticsearch", "r", es).unwrap_err();
+        assert!(err.to_string().contains("non-empty `index`"), "{err}");
+
+        let mut az =
+            serde_json::to_value(faucet_sink_azure_blob::AzureBlobSinkConfig::new("c")).unwrap();
+        validate_sink_config("azure-blob", "r", az.clone()).unwrap();
+        az["batch_size"] = json!(2_000_000);
+        assert!(validate_sink_config("azure-blob", "r", az).is_err());
+
+        let conn = faucet_common_sftp::SftpConnectionConfig::with_password("h", "u", "p");
+        let mut sftp =
+            serde_json::to_value(faucet_sink_sftp::SftpSinkConfig::new(conn, "/o")).unwrap();
+        validate_sink_config("sftp", "r", sftp.clone()).unwrap();
+        sftp["batch_size"] = json!(2_000_000);
+        assert!(validate_sink_config("sftp", "r", sftp).is_err());
+    }
+
+    /// #789 CLI-72: the executor's own `_overwrite_staging` flag passes the
+    /// unknown-key gate, so a grouped BigQuery overwrite can be built.
+    #[cfg(feature = "sink-bigquery")]
+    #[test]
+    fn executor_injected_keys_pass_the_unknown_key_gate() {
+        let schema = sink_schema("bigquery").unwrap();
+        let cfg = json!({
+            "project_id": "p", "dataset_id": "d", "table_id": "t",
+            "write_mode": "overwrite", "_overwrite_staging": true
+        });
+        reject_unknown_config_keys("sink", "bigquery", "row", &cfg, &schema).unwrap();
+        let typo = json!({ "project_id": "p", "_overwrite_stagin": true });
+        assert!(reject_unknown_config_keys("sink", "bigquery", "row", &typo, &schema).is_err());
     }
 
     #[test]

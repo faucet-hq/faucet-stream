@@ -384,6 +384,7 @@ pub async fn run_from_yaml_str_selected(
     // caller-supplied values on this convenience path, so a required param is a
     // clear error rather than a token leaking into a connector config.
     params::bind_document(&mut value, &Default::default(), params::BindMode::Strict)?;
+    interpolate::unescape_document(&mut value);
     let interpolated = serde_yaml::to_string(&value).map_err(|e| CliError::ParseConfig {
         path: std::path::PathBuf::from("<yaml-string>"),
         message: e.to_string(),

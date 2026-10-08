@@ -46,7 +46,7 @@ impl TenantValues {
 fn bind_str(s: &str, tenant: &TenantValues) -> Result<String, String> {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(start) = rest.find(PREFIX) {
+    while let Some(start) = crate::interpolate::find_unescaped(rest, PREFIX) {
         out.push_str(&rest[..start]);
         let after = &rest[start + PREFIX.len()..];
         let Some(end) = after.find('}') else {
@@ -63,7 +63,7 @@ fn bind_str(s: &str, tenant: &TenantValues) -> Result<String, String> {
 /// any token is an error naming why: the run was not started for a tenant.
 pub fn bind_document(doc: &mut Value, tenant: Option<&TenantValues>) -> Result<(), String> {
     match doc {
-        Value::String(s) if s.contains(PREFIX) => match tenant {
+        Value::String(s) if crate::interpolate::contains_unescaped(s, PREFIX) => match tenant {
             Some(t) => {
                 *s = bind_str(s, t)?;
                 Ok(())
@@ -88,10 +88,9 @@ fn unbound_message(s: &str) -> String {
 /// but a tenant run reaches the executor with them unbound).
 pub fn reject_unbound(value: &Value, owner: &str) -> CliResult<()> {
     match value {
-        Value::String(s) if s.contains(PREFIX) => Err(CliError::Config(format!(
-            "the {owner} config: {}",
-            unbound_message(s)
-        ))),
+        Value::String(s) if crate::interpolate::contains_unescaped(s, PREFIX) => Err(
+            CliError::Config(format!("the {owner} config: {}", unbound_message(s))),
+        ),
         Value::Array(a) => a.iter().try_for_each(|v| reject_unbound(v, owner)),
         Value::Object(m) => m.values().try_for_each(|v| reject_unbound(v, owner)),
         _ => Ok(()),

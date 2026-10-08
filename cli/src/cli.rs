@@ -1544,6 +1544,10 @@ pub struct StateSetArgs {
     /// the sink's position instead of this bookmark.
     #[arg(long)]
     pub skip_watermark_check: bool,
+    /// Write the pre-versioning bookmark shape, for a rolling upgrade while a
+    /// cluster member older than the state envelope is still running.
+    #[arg(long)]
+    pub legacy_format: bool,
     #[command(flatten)]
     pub mutate: StateMutateArgs,
     #[command(flatten)]
@@ -1574,6 +1578,10 @@ pub struct StateResetArgs {
     /// Exactly-once rows: skip reading the sink's watermark.
     #[arg(long)]
     pub skip_watermark_check: bool,
+    /// Write the pre-versioning bookmark shape, for a rolling upgrade while a
+    /// cluster member older than the state envelope is still running.
+    #[arg(long)]
+    pub legacy_format: bool,
     #[command(flatten)]
     pub mutate: StateMutateArgs,
     #[command(flatten)]

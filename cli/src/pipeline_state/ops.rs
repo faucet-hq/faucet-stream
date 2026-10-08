@@ -296,6 +296,15 @@ pub fn row_codec(row: &RowTarget) -> faucet_core::state_version::StateCodec {
     crate::registry::state_codec_for(row.source.as_ref().map(|(k, c)| (k.as_str(), c)))
 }
 
+/// [`row_codec`], writing the legacy shape when `legacy` is set — the same
+/// decision the executor takes from `legacy_state_writes`.
+pub fn row_codec_with(row: &RowTarget, legacy: bool) -> faucet_core::state_version::StateCodec {
+    faucet_core::state_version::StateCodec {
+        legacy,
+        ..row_codec(row)
+    }
+}
+
 /// Read every row's state (optionally one row).
 pub async fn show(
     target: &PipelineTarget,
@@ -625,6 +634,9 @@ pub struct SetRequest {
     pub force: bool,
     pub dry_run: bool,
     pub skip_watermark_check: bool,
+    /// Write the pre-versioning bookmark shape, for a cluster that still has
+    /// a member older than the state envelope (#789 CLI-165).
+    pub legacy_format: bool,
 }
 
 /// What `set` did (or would do).
@@ -680,7 +692,7 @@ pub async fn set(
     } else {
         (req.bookmark.clone(), None)
     };
-    let after = row_codec(row).encode(&after);
+    let after = row_codec_with(row, req.legacy_format).encode(&after);
     if !req.dry_run {
         store.put(&key, &after).await?;
     }
@@ -709,6 +721,8 @@ pub struct ResetRequest {
     /// Exactly-once rows: also delete the sink's commit token, instead of
     /// keeping the committed sequence in the state store.
     pub rewind_token: bool,
+    /// Write the pre-versioning bookmark shape (see [`SetRequest`]).
+    pub legacy_format: bool,
 }
 
 /// One key a reset changes.
@@ -805,7 +819,10 @@ pub async fn reset(
             changes.push(KeyChange {
                 key: e.key.key.clone(),
                 before: e.value.clone(),
-                after: Some(row_codec(row).encode(&wrap_state(None, adj.written_seq))),
+                after: Some(
+                    row_codec_with(row, req.legacy_format)
+                        .encode(&wrap_state(None, adj.written_seq)),
+                ),
             });
             exactly_once = Some(adj);
         } else {
@@ -1150,6 +1167,7 @@ matrix:
             force: false,
             dry_run: false,
             skip_watermark_check: false,
+            legacy_format: false,
         };
         let dry = SetRequest {
             dry_run: true,
@@ -1201,6 +1219,40 @@ matrix:
     }
 
     #[tokio::test]
+    async fn set_and_reset_write_the_legacy_shape_when_asked() {
+        let t = target("");
+        let (s, store) = stores(&t).await;
+        let req = SetRequest {
+            row: "a".into(),
+            parent_key: None,
+            bookmark: json!({"id": 5}),
+            force: false,
+            dry_run: false,
+            skip_watermark_check: false,
+            legacy_format: true,
+        };
+        set(&t, &s, &AuthCatalog::new(), &req, now()).await.unwrap();
+        assert_eq!(
+            store.get("orders::a").await.unwrap(),
+            Some(json!({"id": 5}))
+        );
+        set(
+            &t,
+            &s,
+            &AuthCatalog::new(),
+            &SetRequest {
+                legacy_format: false,
+                ..req
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        let stored = store.get("orders::a").await.unwrap().unwrap();
+        assert_ne!(stored, json!({"id": 5}), "default writes the envelope");
+    }
+
+    #[tokio::test]
     async fn mutations_refuse_a_live_lease_unless_forced() {
         let t = target("");
         let (s, store) = stores(&t).await;
@@ -1215,6 +1267,7 @@ matrix:
             force: false,
             dry_run: false,
             skip_watermark_check: false,
+            legacy_format: false,
         };
         let err = set(&t, &s, &auth, &req, now())
             .await
@@ -1254,6 +1307,7 @@ matrix:
             force: false,
             dry_run: true,
             skip_watermark_check: false,
+            legacy_format: false,
         };
         let child = lease::acquire(Arc::clone(&store), "orders::kid::7", "child-run")
             .await
@@ -1403,6 +1457,7 @@ matrix:
                 force: false,
                 dry_run: false,
                 skip_watermark_check: true,
+                legacy_format: false,
             },
             now(),
         )
@@ -1429,6 +1484,7 @@ matrix:
             force: false,
             dry_run: false,
             skip_watermark_check: false,
+            legacy_format: false,
         };
         // The stdout sink has no watermark, so probing succeeds with no token.
         let o = set(&t, &s, &AuthCatalog::new(), &req, now()).await.unwrap();

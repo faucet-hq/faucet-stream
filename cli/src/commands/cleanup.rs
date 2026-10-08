@@ -196,6 +196,12 @@ fn explain(reason: SkipReason, outcome: &crate::local_outputs::SweepOutcome) -> 
             "could not delete: {}",
             outcome.error.as_deref().unwrap_or("unknown error")
         ),
+        SkipReason::RelativePath => {
+            "recorded with a relative path, so it can not be located safely".to_string()
+        }
+        SkipReason::OtherHost => {
+            "written on another host; only a sweep there may delete it".to_string()
+        }
     }
 }
 
@@ -350,6 +356,8 @@ mod tests {
             SkipReason::NotOnDisk,
             SkipReason::InFlight,
             SkipReason::DeleteFailed,
+            SkipReason::RelativePath,
+            SkipReason::OtherHost,
         ] {
             let text = explain(r, &outcome);
             assert!(!text.is_empty(), "{}", r.as_str());
@@ -357,6 +365,7 @@ mod tests {
         assert!(explain(SkipReason::DeleteFailed, &outcome).contains("permission denied"));
         // The guardrail's explanation must actually explain it.
         assert!(explain(SkipReason::PreExisting, &outcome).contains("did not create"));
+        assert!(explain(SkipReason::OtherHost, &outcome).contains("another host"));
     }
 
     #[test]
