@@ -131,7 +131,7 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
                     .into(),
             ));
         }
-        crate::env_config::from_process_env()?
+        Box::pin(crate::env_config::load_from_process_env()).await?
     } else {
         // Typed run params (#444): `--param name=value` / `--param-env NAME[=V]`
         // are bound before the typed parse, so `${param.*}` never reaches a
