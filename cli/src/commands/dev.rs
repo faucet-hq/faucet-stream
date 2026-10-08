@@ -289,7 +289,11 @@ mod tests {
         });
         let start = Instant::now();
         assert!(wait_quiet(&mut rx, Duration::from_millis(80)).await);
-        assert!(start.elapsed() >= Duration::from_millis(100), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "{:?}",
+            start.elapsed()
+        );
         let tx = sender.await.unwrap();
         drop(tx);
         assert!(!wait_quiet(&mut rx, Duration::from_millis(80)).await);

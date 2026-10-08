@@ -394,19 +394,29 @@ mod tests {
         let once = ConfigFormat::Yaml.format(text, p).unwrap();
         assert!(once.contains("!include sink.yaml"), "{once}");
         assert!(once.starts_with("version: 1"), "{once}");
-        assert!(once.find("source").unwrap() < once.find("sink").unwrap(), "{once}");
+        assert!(
+            once.find("source").unwrap() < once.find("sink").unwrap(),
+            "{once}"
+        );
         assert_eq!(ConfigFormat::Yaml.format(&once, p).unwrap(), once);
         let json = ConfigFormat::Json
             .format("{\"pipeline\": {}, \"version\": 1}", Path::new("f.json"))
             .unwrap();
-        assert!(json.find("version").unwrap() < json.find("pipeline").unwrap(), "{json}");
+        assert!(
+            json.find("version").unwrap() < json.find("pipeline").unwrap(),
+            "{json}"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.yaml");
         std::fs::write(&path, "old").unwrap();
         write_atomically(&path, "new\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp left");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temp left"
+        );
     }
 
     #[test]

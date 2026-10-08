@@ -11,9 +11,7 @@ use crate::cli::{
 };
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
-use crate::serve::history::catalog::{
-    CatalogDatasetDetail, CatalogLineageEdge, CatalogListFilter,
-};
+use crate::serve::history::catalog::{CatalogDatasetDetail, CatalogLineageEdge, CatalogListFilter};
 
 /// Pretty-print any serializable value (JSON output mode).
 fn to_pretty<T: serde::Serialize>(value: &T) -> CliResult<String> {
@@ -152,12 +150,14 @@ async fn resolve_dataset(
 
 async fn show(args: CatalogShowArgs) -> CliResult<()> {
     let handle = connect(&args.common).await?;
-    let detail = resolve_dataset(&handle, &args.id, true).await?.ok_or_else(|| {
-        CliError::Config(format!(
-            "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
-            args.id
-        ))
-    })?;
+    let detail = resolve_dataset(&handle, &args.id, true)
+        .await?
+        .ok_or_else(|| {
+            CliError::Config(format!(
+                "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
+                args.id
+            ))
+        })?;
     if args.common.json {
         println!("{}", to_pretty(&detail)?);
         return Ok(());
@@ -340,12 +340,14 @@ pub(crate) fn parse_consumer_flag(raw: &str) -> CliResult<(String, Option<String
 async fn annotate(args: CatalogAnnotateArgs) -> CliResult<()> {
     use crate::serve::history::catalog::{CatalogAnnotation, CatalogConsumer};
     let handle = connect(&args.common).await?;
-    let detail = resolve_dataset(&handle, &args.id, false).await?.ok_or_else(|| {
-        CliError::Config(format!(
-            "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
-            args.id
-        ))
-    })?;
+    let detail = resolve_dataset(&handle, &args.id, false)
+        .await?
+        .ok_or_else(|| {
+            CliError::Config(format!(
+                "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
+                args.id
+            ))
+        })?;
     let id = detail.dataset.id.clone();
     let now = chrono::Utc::now();
     let mut consumers = Vec::new();
@@ -458,9 +460,8 @@ mod tests {
     #[tokio::test]
     async fn prefix_resolution_sees_every_page_and_writes_need_full_ids() {
         use crate::serve::history::RunHistory;
-        let store = crate::serve::history::memory::MemoryHistory::new(
-            std::time::Duration::from_secs(60),
-        );
+        let store =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
         let obs = |uri: String, role| DatasetObservation {
             uri,
             kind: "jsonl".into(),
@@ -509,7 +510,14 @@ mod tests {
         assert!(!rest.datasets.is_empty());
         let prefix = (1..16)
             .flat_map(|n| rest.datasets.iter().map(move |d| d.id[..n].to_string()))
-            .find(|p| first.datasets.iter().filter(|d| d.id.starts_with(p.as_str())).count() == 1)
+            .find(|p| {
+                first
+                    .datasets
+                    .iter()
+                    .filter(|d| d.id.starts_with(p.as_str()))
+                    .count()
+                    == 1
+            })
             .expect("a prefix shared across the pages");
         let err = resolve_dataset(&handle, &prefix, true).await.unwrap_err();
         assert!(err.to_string().contains("ambiguous"), "{err}");
@@ -517,13 +525,29 @@ mod tests {
         let unique = (4..full.len())
             .map(|n| &full[..n])
             .find(|p| {
-                first.datasets.iter().chain(&rest.datasets).filter(|d| d.id.starts_with(p)).count() == 1
+                first
+                    .datasets
+                    .iter()
+                    .chain(&rest.datasets)
+                    .filter(|d| d.id.starts_with(p))
+                    .count()
+                    == 1
             })
             .unwrap();
-        assert!(resolve_dataset(&handle, unique, true).await.unwrap().is_some());
+        assert!(
+            resolve_dataset(&handle, unique, true)
+                .await
+                .unwrap()
+                .is_some()
+        );
         let err = resolve_dataset(&handle, unique, false).await.unwrap_err();
         assert!(err.to_string().contains("not a full dataset id"), "{err}");
-        assert!(resolve_dataset(&handle, full, false).await.unwrap().is_some());
+        assert!(
+            resolve_dataset(&handle, full, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
     use crate::serve::history::catalog::{
         CatalogUpdate, DatasetObservation, DatasetRole, apply_edge,

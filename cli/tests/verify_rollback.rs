@@ -1217,8 +1217,10 @@ async fn verify_falls_back_to_a_full_comparison_for_a_text_key() {
 #[tokio::test]
 async fn verify_takes_the_run_clock_for_a_dated_destination() {
     let d = fresh().await;
-    let yaml = config_yaml(&d.src, &d.dst, &d.state, "upsert", "")
-        .replace("table_name: dst", "table_name: dst_${now.year}\n      create_table: true");
+    let yaml = config_yaml(&d.src, &d.dst, &d.state, "upsert", "").replace(
+        "table_name: dst",
+        "table_name: dst_${now.year}\n      create_table: true",
+    );
     let path = d._dir.path().join("dated.yaml");
     std::fs::write(&path, &yaml).unwrap();
     let cfg = load(&yaml);

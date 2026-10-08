@@ -444,7 +444,10 @@ mod tests {
         a.executable = Some("/nonexistent/tap".into());
         let err = super::run(a).await.unwrap_err();
         assert!(matches!(err, CliError::ScaffoldExists { .. }), "{err}");
-        assert_eq!(std::fs::read_to_string(dir.path().join("catalog.json")).unwrap(), "{}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("catalog.json")).unwrap(),
+            "{}"
+        );
     }
 
     #[test]

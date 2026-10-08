@@ -141,7 +141,10 @@ mod tests {
     fn adjacent_tokens_fold_as_one_run() {
         let raw = json!({"path": "./out/dt=${now.year}${now.month}${now.day}/x.jsonl"});
         let uri = canonicalize_uri("file://./out/dt=20260706/x.jsonl", &raw, clock());
-        assert_eq!(uri, "file://./out/dt=${now.year}${now.month}${now.day}/x.jsonl");
+        assert_eq!(
+            uri,
+            "file://./out/dt=${now.year}${now.month}${now.day}/x.jsonl"
+        );
         let raw = json!({"path": "./out/${now.year}${now.month}"});
         assert_eq!(
             canonicalize_uri("file://./out/202607", &raw, clock()),

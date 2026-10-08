@@ -356,7 +356,10 @@ matrix:
         )
         .unwrap();
         let out = render_summary(&spec, &destinations(&overridden).unwrap());
-        assert!(out.contains("- archive (rows b) [file]: (no rules apply)"), "{out}");
+        assert!(
+            out.contains("- archive (rows b) [file]: (no rules apply)"),
+            "{out}"
+        );
 
         let topo = PipelineConfig::from_text(
             r#"version: 1

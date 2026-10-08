@@ -887,7 +887,10 @@ mod tests {
         let secret = build_pipeline_config(&env(&[
             ("FAUCET_SOURCE", "rest"),
             ("FAUCET_SOURCE_REST_BASE_URL", "https://x"),
-            ("FAUCET_SOURCE_REST_HEADERS_JSON", r#"{"x-key": "${vault:secret/data/api#key}"}"#),
+            (
+                "FAUCET_SOURCE_REST_HEADERS_JSON",
+                r#"{"x-key": "${vault:secret/data/api#key}"}"#,
+            ),
             ("FAUCET_SINK", "jsonl"),
             ("FAUCET_SINK_JSONL_PATH", "./o.jsonl"),
         ]))

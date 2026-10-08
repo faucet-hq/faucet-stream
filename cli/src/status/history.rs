@@ -127,9 +127,8 @@ mod tests {
     /// are still found (#789 CLI-167).
     #[tokio::test]
     async fn reads_past_other_pipelines_runs() {
-        let store = crate::serve::history::memory::MemoryHistory::new(
-            std::time::Duration::from_secs(3600),
-        );
+        let store =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(3600));
         let base = Utc::now() - chrono::Duration::hours(1);
         let mut mine = record("mine", RunStatus::Completed, vec![inv("a", None, None)]);
         mine.submitted_at = base;

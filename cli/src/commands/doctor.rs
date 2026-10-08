@@ -1137,12 +1137,14 @@ mod tests {
         let invs = probe_roots(&nodes, &AuthCatalog::new(), &ctx, None, None, "d").await;
         assert_eq!(count_failures(&invs), 0, "{:?}", invs[0].probes);
 
-        let source: ConnectorSpec =
-            serde_json::from_value(serde_json::json!({"type": "csv", "config": {"path": "x-${backfill.start}.csv"}}))
-                .unwrap();
-        let sink: ConnectorSpec =
-            serde_json::from_value(serde_json::json!({"type": "jsonl", "config": {"path": "o.jsonl"}}))
-                .unwrap();
+        let source: ConnectorSpec = serde_json::from_value(
+            serde_json::json!({"type": "csv", "config": {"path": "x-${backfill.start}.csv"}}),
+        )
+        .unwrap();
+        let sink: ConnectorSpec = serde_json::from_value(
+            serde_json::json!({"type": "jsonl", "config": {"path": "o.jsonl"}}),
+        )
+        .unwrap();
         let clock = chrono::Utc::now().fixed_offset();
         let inv = match resolve_probe_configs(source.clone(), sink.clone(), clock) {
             Err(u) => u.into_invocation("r".into()),
@@ -1398,7 +1400,11 @@ auth:
         )
         .unwrap();
         let path = dir.path().join("p.yaml");
-        std::fs::write(&path, "extends: base.yaml\nversion: 1\nvars:\n  host: https://x\n").unwrap();
+        std::fs::write(
+            &path,
+            "extends: base.yaml\nversion: 1\nvars:\n  host: https://x\n",
+        )
+        .unwrap();
         let raw = crate::compose::compose(&path, None).unwrap();
         let cfg = PipelineConfig::from_path(&path, None).unwrap();
         let nodes = expand(&cfg).unwrap();
