@@ -1635,7 +1635,7 @@ faucet fmt pipeline.yaml --stdout   # print, don't write
 faucet fmt pipeline.yaml --check    # exit non-zero if not already canonical (CI)
 ```
 
-Comments are not preserved (the file is parsed and re-serialized).
+Comments are not preserved (the file is parsed and re-serialized); `!include` tags are kept, the output is the same from every build, and the file is replaced atomically.
 
 ## `explain`
 
