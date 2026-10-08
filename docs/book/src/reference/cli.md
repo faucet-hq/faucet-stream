@@ -65,6 +65,12 @@ faucet run pipeline.yaml --clock 2026-03-01          # backfill: set ${now.*} cl
 faucet run pipeline.yaml --clock 2026-03-01T02:00:00-08:00  # backfill: precise RFC 3339 timestamp
 ```
 
+Stopping a run — SIGTERM (Kubernetes, systemd, `docker stop`), Ctrl-C, or `q`
+under `--tui` — cancels it cooperatively: each row stops at its next page
+boundary and flushes its sink (Parquet footers, multipart uploads, overwrite
+staging), bookmarks stay at the last committed page, and the command exits
+**130**. A second signal exits at once.
+
 Flags:
 
 | Flag | Purpose |
@@ -85,7 +91,7 @@ Flags:
 | `--source-hub` / `--sink-hub` / `--overlay-hub <hub>` | Look that side up in its own hub (e.g. a private source catalog next to the public sinks). See [`hub`](#hub). |
 | `--trust <owner\|id>` | Let hub templates from that owner (or that template id) use `${env:}` / `${file:}` / secret directives. A template outside `faucet-hq` that reads this machine's environment, files or secrets is refused otherwise — pass credentials to it with `--param` / `--param-env`. Repeatable; `'*'` trusts all. |
 | `--overlay <id\|path>` | With `--source` / `--sink`: apply a `kind: deployment` overlay — state, DLQ, notifications, SLA and other operational blocks — over the composition. A path, or an id under `<hub>/deployments/`. See [Deployment overlays](../cookbook/template-hub.md#deployment-overlays). |
-| `--tui` | Show a live full-screen terminal UI while the pipeline runs: per-invocation source→sink route, records in/out, records/s, errors, DLQ counts, bookmark age, and a scrolling log pane. Press `q` (or `Ctrl-C`) to cancel cooperatively — in-flight invocations stop at their next page boundary and flush their sinks. Requires a binary built with the `cli-tui` feature (`cargo install faucet-cli --features cli-tui`); on a non-TTY stdout (CI, pipes) the flag logs a notice and runs normally. When the config has an `observability.prometheus` block, the `/metrics` endpoint stays up alongside the TUI; OTLP *metrics* export is skipped under `--tui` (traces are unaffected). |
+| `--tui` | Show a live full-screen terminal UI while the pipeline runs: per-invocation source→sink route, records in/out, records/s, errors, DLQ counts, bookmark age, and a scrolling log pane. Press `q` (or `Ctrl-C`) to cancel cooperatively — in-flight invocations stop at their next page boundary and flush their sinks, and the command exits 130. Requires a binary built with the `cli-tui` feature (`cargo install faucet-cli --features cli-tui`); on a non-TTY stdout (CI, pipes) the flag logs a notice and runs normally. When the config has an `observability.prometheus` block, the `/metrics` endpoint stays up alongside the TUI; OTLP *metrics* export is skipped under `--tui` (traces are unaffected). |
 | `--quiet` | Suppress the inline live progress line. |
 | `--force` | Start even though another process holds a row's live run lease. Without it, a row whose lease is live (another `faucet run` / `schedule` process is running it against the same `state:` store) fails with the holder's run id, pid and lease expiry, because two runs would start from the same bookmark and race it. A crashed run's lease expires a minute after it stops renewing. Use only when that run is known to be gone. |
 

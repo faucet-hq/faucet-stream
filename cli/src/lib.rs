@@ -207,6 +207,10 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
             }
             // `status` printed its screen; 1 = degraded / unknown, 2 = failed.
             Err(CliError::StatusUnhealthy { code, .. }) => ExitCode::from(code),
+            Err(CliError::Cancelled) => {
+                eprintln!("faucet: cancelled — rows stopped at a page boundary and flushed");
+                ExitCode::from(130)
+            }
             Err(err) => {
                 commands::report(&err);
                 ExitCode::from(1)

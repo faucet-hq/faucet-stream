@@ -204,6 +204,7 @@ pub(crate) async fn execute(
     #[cfg(feature = "cli-tui")]
     let tui_active = crate::tui::is_tui_session(args.tui);
     #[cfg(not(feature = "cli-tui"))]
+    #[cfg_attr(not(feature = "cli-progress"), allow(unused_variables))]
     let tui_active = false;
 
     // Exactly one observability install. A live view (the full-screen `--tui`
@@ -273,11 +274,12 @@ pub(crate) async fn execute(
             }
         }
         let started_at = Utc::now();
+        let stop = StopSignal::install();
         let summary = crate::topology::run_topology(
             &cfg,
             &auth,
             crate::topology::TopologyRunOptions {
-                cancel: None,
+                cancel: Some(stop.token()),
                 dry_run: args.dry_run,
                 limit: args.limit,
                 clock: Some(resolve_run_clock(args.clock.as_deref())?),
@@ -298,13 +300,14 @@ pub(crate) async fn execute(
         )
         .await?;
         let finished_at = Utc::now();
-        return finish_topology_run(
+        let outcome = finish_topology_run(
             &pipeline_name,
             started_at,
             finished_at,
             &summary,
             args.output,
         );
+        return stop.finish(outcome);
     }
 
     #[cfg(feature = "lineage")]
@@ -360,12 +363,11 @@ pub(crate) async fn execute(
             return Err(report.error());
         }
     }
-    // The TUI wires `q` / Ctrl-C to this token: in-flight invocations stop at
-    // their next page boundary and flush (#146 H16). Plain runs keep `None`.
+    // SIGTERM / Ctrl-C (and the TUI's `q`) cancel this token: in-flight
+    // invocations stop at their next page boundary and flush (#146 H16).
+    let stop = StopSignal::install();
     #[cfg(feature = "cli-tui")]
-    let tui_cancel = tui_active.then(faucet_core::CancellationToken::new);
-    #[cfg(not(feature = "cli-tui"))]
-    let tui_cancel: Option<faucet_core::CancellationToken> = None;
+    let tui_cancel = tui_active.then(|| stop.token());
     let started_at = Utc::now();
     let run_fut = run_expanded(
         nodes,
@@ -383,10 +385,7 @@ pub(crate) async fn execute(
             shard: None,
             auth,
             clock: resolve_run_clock(args.clock.as_deref())?,
-            // Plain runs have no external cancel signal (the executor still
-            // cooperatively cancels in-flight rows on `on_error: stop`); a
-            // TUI session cancels via `q` / Ctrl-C.
-            cancel: tui_cancel.clone(),
+            cancel: Some(stop.token()),
             resilience,
             sla: cfg.sla.clone(),
             reconcile: cfg.reconcile.clone(),
@@ -617,10 +616,61 @@ pub(crate) async fn execute(
     // the `otel` feature). Done on both the success and failure exit paths.
     faucet_core::shutdown_otel();
 
-    if summary.had_failures() {
-        return Err(CliError::PipelineHadFailures { count: failed });
+    let outcome = if summary.had_failures() {
+        Err(CliError::PipelineHadFailures { count: failed })
+    } else {
+        Ok(())
+    };
+    stop.finish(outcome)
+}
+
+/// The stop signals of a one-shot run: the first SIGTERM / Ctrl-C cancels the
+/// run cooperatively (each row finishes its page and flushes), a second one
+/// exits at once.
+struct StopSignal {
+    token: faucet_core::CancellationToken,
+    watcher: tokio::task::JoinHandle<()>,
+}
+
+impl StopSignal {
+    fn install() -> Self {
+        let token = faucet_core::CancellationToken::new();
+        let first = crate::signals::wait_for_termination();
+        let cancel = token.clone();
+        let watcher = tokio::spawn(async move {
+            first.await;
+            tracing::warn!(
+                "stop signal received: finishing the current page and flushing (signal again to \
+                 exit at once)"
+            );
+            cancel.cancel();
+            crate::signals::wait_for_termination().await;
+            std::process::exit(130);
+        });
+        Self { token, watcher }
     }
-    Ok(())
+
+    fn token(&self) -> faucet_core::CancellationToken {
+        self.token.clone()
+    }
+
+    /// The run's result, or [`CliError::Cancelled`] when it was stopped.
+    fn finish(self, outcome: CliResult<()>) -> CliResult<()> {
+        cancelled_outcome(self.token.is_cancelled(), outcome)
+    }
+}
+
+impl Drop for StopSignal {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
+
+fn cancelled_outcome(cancelled: bool, outcome: CliResult<()>) -> CliResult<()> {
+    if cancelled {
+        return Err(CliError::Cancelled);
+    }
+    outcome
 }
 
 /// One matrix row's line in a `--output json`/`ndjson` summary (#390). Every
@@ -797,6 +847,30 @@ fn finish_topology_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SIGTERM cancels the run's token instead of killing the process, and a
+    /// cancelled run reports `Cancelled` (exit 130) whatever its rows did
+    /// (#789 CLI-50, CLI-169).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_cancels_the_run_cooperatively() {
+        let stop = StopSignal::install();
+        let token = stop.token();
+        assert!(!token.is_cancelled());
+        std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), token.cancelled())
+            .await
+            .expect("the token is cancelled by SIGTERM");
+        assert!(matches!(stop.finish(Ok(())), Err(CliError::Cancelled)));
+        assert!(cancelled_outcome(false, Ok(())).is_ok());
+        assert!(matches!(
+            cancelled_outcome(true, Err(CliError::PipelineHadFailures { count: 1 })),
+            Err(CliError::Cancelled)
+        ));
+    }
 
     /// A `faucet run` invocation's future is awaited on the caller's stack —
     /// a 2 MiB test thread in CI. Keep it well under that whatever passes are
