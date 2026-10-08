@@ -1405,18 +1405,28 @@ fn reject_unknown_config_keys(
     config: &Value,
     schema: &Value,
 ) -> CliResult<()> {
-    let Some(given) = config.as_object() else {
+    let Some((unknown, hint)) = unknown_config_keys(config, schema) else {
         return Ok(());
     };
+    Err(CliError::InvalidConnectorConfig {
+        kind: if role == "source" { "source" } else { "sink" },
+        name: name.to_owned(),
+        message: format!(
+            "unknown {role} `{kind}` config key(s): {unknown}{hint}. A key the connector does \
+             not declare is silently ignored, so an integrity or batching knob would read as \
+             set while doing nothing — run `faucet schema {role} {kind}` for the full list."
+        ),
+    })
+}
+
+/// Keys of `config` its JSON Schema does not declare, rendered as a
+/// backticked list plus a `did you mean` hint; `None` when every key is known
+/// or the schema declares a catch-all.
+pub(crate) fn unknown_config_keys(config: &Value, schema: &Value) -> Option<(String, String)> {
+    let given = config.as_object()?;
     let mut known = BTreeSet::new();
-    if !collect_schema_keys(schema, schema, &mut known, 0) {
-        // Somewhere in the schema a genuine catch-all is declared, or the
-        // shape is one we don't model — say nothing rather than reject a
-        // legitimate config.
-        return Ok(());
-    }
-    if known.is_empty() {
-        return Ok(());
+    if !collect_schema_keys(schema, schema, &mut known, 0) || known.is_empty() {
+        return None;
     }
     let unknown: Vec<&str> = given
         .keys()
@@ -1424,7 +1434,7 @@ fn reject_unknown_config_keys(
         .filter(|k| !known.contains(*k) && !CLI_INJECTED_KEYS.contains(k))
         .collect();
     if unknown.is_empty() {
-        return Ok(());
+        return None;
     }
     let suggestions: Vec<String> = unknown
         .iter()
@@ -1437,20 +1447,12 @@ fn reject_unknown_config_keys(
     } else {
         format!(" ({})", suggestions.join("; "))
     };
-    Err(CliError::InvalidConnectorConfig {
-        kind: if role == "source" { "source" } else { "sink" },
-        name: name.to_owned(),
-        message: format!(
-            "unknown {role} `{kind}` config key(s): {}{hint}. A key the connector does not \
-             declare is silently ignored, so an integrity or batching knob would read as set \
-             while doing nothing — run `faucet schema {role} {kind}` for the full list.",
-            unknown
-                .iter()
-                .map(|k| format!("`{k}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    })
+    let list = unknown
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((list, hint))
 }
 
 /// Collect every top-level key `schema` can accept into `out`.
