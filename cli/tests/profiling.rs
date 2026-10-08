@@ -233,10 +233,11 @@ async fn on_drift_fail_marks_the_run_failed_after_writing() {
     let err = summary.invocations[0].error.clone().unwrap();
     assert!(err.contains("Profile drift on columns"), "{err}");
     assert!(err.contains("amount"), "{err}");
-    // The data was written before the verdict, and the run joined the baseline.
+    // The data was written before the verdict, but the failing run stays out
+    // of the baseline (#789 CLI-173).
     let written = std::fs::read_to_string(dir.path().join("out.jsonl")).unwrap();
     assert_eq!(written.lines().count(), 120);
-    assert_eq!(history(dir.path()).await.runs.len(), 4);
+    assert_eq!(history(dir.path()).await.runs.len(), 3);
 }
 
 #[cfg(feature = "masking")]
