@@ -74,6 +74,7 @@ fn serve_args(
         triggers,
         templates_sync: None,
         policy: None,
+        otel_config: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

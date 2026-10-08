@@ -166,8 +166,21 @@ to both exporters.
 
 Traces are exported whenever `export` lists `traces`, with or without an
 `observability.tracing` level, by `run`, `schedule`, `replicate`/`mirror` and
-the other commands that load a config. `faucet serve` has no process-level
-`observability:` block, so it does not export OTLP.
+the other commands that load a config. `faucet serve` takes no config, so it
+reads the same block from its own file: `faucet serve --otel-config otel.yaml`
+(or `FAUCET_SERVE_OTEL_CONFIG`), a YAML/JSON document shaped like
+`observability.otel` (`${env:…}` / `${file:…}` resolved, header values kept out
+of logs). Traces cover every run the server executes; with `export: [metrics]`
+the metrics `/metrics` serves are also pushed over OTLP.
+
+```yaml
+# otel.yaml
+endpoint: http://otel-collector:4318
+protocol: http
+export: [traces, metrics]
+service_name: faucet-serve
+headers: { authorization: "Bearer ${env:OTLP_TOKEN}" }
+```
 
 **Reliability:** export is best-effort. An unreachable or slow collector
 **never** fails or delays a pipeline run. Export failures increment

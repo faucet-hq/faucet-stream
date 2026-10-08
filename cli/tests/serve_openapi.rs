@@ -277,6 +277,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         triggers: None,
         templates_sync: None,
         policy: None,
+        otel_config: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

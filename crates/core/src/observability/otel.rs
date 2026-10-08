@@ -314,8 +314,23 @@ mod sdk {
         GUARD.set(guard).is_ok()
     }
 
+    static EXTRA_METER: OnceLock<SdkMeterProvider> = OnceLock::new();
+
+    /// Keep a meter provider a host installed outside
+    /// [`install_observability`](crate::install_observability) alive for the
+    /// process, so [`shutdown_otel`] flushes it. A second one is shut down.
+    pub(crate) fn keep_meter_provider(mp: SdkMeterProvider) {
+        if let Err(mp) = EXTRA_METER.set(mp) {
+            let _ = mp.shutdown();
+        }
+    }
+
     /// Flush + shut down installed providers. Idempotent.
     pub fn shutdown_otel() {
+        if let Some(m) = EXTRA_METER.get() {
+            let _ = m.force_flush();
+            let _ = m.shutdown();
+        }
         if let Some(g) = GUARD.get() {
             if let Some(t) = g.tracer.as_ref() {
                 let _ = t.force_flush();
@@ -374,7 +389,7 @@ pub use sdk::{
     install_propagator, register_trace_layer_slot, set_guard, shutdown_otel,
 };
 #[cfg(feature = "otel")]
-pub(crate) use sdk::{fill_trace_slot, tracer_installed};
+pub(crate) use sdk::{fill_trace_slot, keep_meter_provider, tracer_installed};
 
 /// No-op `shutdown_otel` when the `otel` feature is disabled, so CLI call sites
 /// compile in every build.

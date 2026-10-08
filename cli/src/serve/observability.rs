@@ -16,18 +16,16 @@ use std::sync::OnceLock;
 /// captured by the live subscriber.
 static LOG_HUB: OnceLock<LogHub> = OnceLock::new();
 
-/// Install the recorder + tracing subscriber. Returns the Prometheus render
-/// handle (when this call installed the recorder; `None` if one was already
-/// present) and the process-global [`LogHub`] wired into the subscriber's
-/// `RunLogLayer`.
-pub fn install(level: &str, format: crate::cli::LogFormat) -> (Option<PrometheusHandle>, LogHub) {
-    let handle = match PrometheusBuilder::new().install_recorder() {
-        Ok(h) => Some(h),
-        Err(e) => {
-            tracing::warn!("Prometheus recorder already installed or failed: {e}");
-            None
-        }
-    };
+/// Install the recorder + tracing subscriber, and OTLP export when `otel` is
+/// set (`--otel-config`). Returns the Prometheus render handle (when this
+/// call installed the recorder; `None` if one was already present) and the
+/// process-global [`LogHub`] wired into the subscriber's `RunLogLayer`.
+pub fn install(
+    level: &str,
+    format: crate::cli::LogFormat,
+    otel: Option<&faucet_core::OtelConfig>,
+) -> (Option<PrometheusHandle>, LogHub) {
+    let handle = install_recorder(otel);
     // Register faucet_build_info into whatever recorder is now global.
     faucet_core::register_build_info();
 
@@ -35,7 +33,72 @@ pub fn install(level: &str, format: crate::cli::LogFormat) -> (Option<Prometheus
     // Only the first call's `try_init` succeeds; subsequent calls leave the
     // already-installed subscriber (which holds this same hub) in place.
     install_subscriber(level, format, hub.clone());
+    if let Some(otel) = otel {
+        install_otel_traces(otel);
+    }
     (handle, hub)
+}
+
+/// The Prometheus recorder `/metrics` renders — fanned out to the OTLP
+/// exporter when `otel` exports metrics.
+fn install_recorder(otel: Option<&faucet_core::OtelConfig>) -> Option<PrometheusHandle> {
+    #[cfg(feature = "otel")]
+    if let Some(otel) = otel.filter(|o| o.exports(faucet_core::OtelSignal::Metrics)) {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        return match faucet_core::observability::install_prometheus_with_otel_metrics(
+            recorder, otel,
+        ) {
+            Ok(exported) => {
+                if exported {
+                    tracing::info!("OTLP export enabled: metrics");
+                }
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::warn!("Prometheus recorder already installed or failed: {e}");
+                None
+            }
+        };
+    }
+    let _ = otel;
+    match PrometheusBuilder::new().install_recorder() {
+        Ok(h) => Some(h),
+        Err(e) => {
+            tracing::warn!("Prometheus recorder already installed or failed: {e}");
+            None
+        }
+    }
+}
+
+/// OTLP traces through the trace-layer slot at the bottom of the serve
+/// subscriber.
+#[cfg(feature = "otel")]
+fn install_otel_traces(otel: &faucet_core::OtelConfig) {
+    if !otel.exports(faucet_core::OtelSignal::Traces) {
+        return;
+    }
+    let cfg = faucet_core::ObservabilityConfig {
+        otel: Some(faucet_core::OtelConfig {
+            export: vec![faucet_core::OtelSignal::Traces],
+            ..otel.clone()
+        }),
+        ..Default::default()
+    };
+    match faucet_core::install_observability(&cfg) {
+        Ok(report) if report.otel_signals.contains(&"traces") => {
+            tracing::info!("OTLP export enabled: traces");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("OTLP trace export not installed: {e}"),
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+fn install_otel_traces(_otel: &faucet_core::OtelConfig) {
+    tracing::warn!(
+        "--otel-config is set but this binary was built without --features otel; OTLP export is disabled"
+    );
 }
 
 #[cfg(feature = "observability")]
@@ -53,11 +116,13 @@ fn install_subscriber(level: &str, format: crate::cli::LogFormat, hub: LogHub) {
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter);
     let initialised = match format {
         crate::cli::LogFormat::Text => tracing_subscriber::registry()
+            .with(crate::trace_layer_slot())
             .with(filter)
             .with(stderr_layer)
             .with(RunLogLayer::new(hub))
             .try_init(),
         crate::cli::LogFormat::Json => tracing_subscriber::registry()
+            .with(crate::trace_layer_slot())
             .with(filter)
             .with(
                 stderr_layer

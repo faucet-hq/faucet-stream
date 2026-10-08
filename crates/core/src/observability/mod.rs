@@ -30,6 +30,8 @@ pub use cleanup::{cleanup_deleted, cleanup_run};
 pub use contract::instrumented_apply_contract;
 pub use decorator::{InstrumentedSink, InstrumentedSource};
 pub use drift::schema_drift;
+#[cfg(all(feature = "observability-install", feature = "otel"))]
+pub use install::install_prometheus_with_otel_metrics;
 pub use install::{
     InstallError, InstallReport, ObservabilityConfig, PrometheusConfig, TracingConfig,
     install_observability, register_build_info,

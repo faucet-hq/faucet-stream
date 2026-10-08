@@ -2075,6 +2075,12 @@ pub struct ServeArgs {
     /// build with the `policy` feature.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<std::path::PathBuf>,
+    /// OTLP export for the server (a YAML/JSON file in the shape of a
+    /// pipeline config's `observability.otel` block): traces of every run and
+    /// request, and — with `export: [metrics]` — the metrics `/metrics` serves.
+    /// Requires a build with the `otel` feature.
+    #[arg(long, value_name = "PATH", env = "FAUCET_SERVE_OTEL_CONFIG")]
+    pub otel_config: Option<std::path::PathBuf>,
     /// Require an approved change request (#703) before these kinds of
     /// actions happen: `run` (`POST /v1/runs` and template triggers answer
     /// with a pending change request instead of a run; backfills are

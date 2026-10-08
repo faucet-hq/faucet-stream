@@ -427,6 +427,44 @@ fn install_fanout(
     Ok(())
 }
 
+/// Install, as the global metrics recorder, a fanout to `prometheus` — a
+/// recorder the host built (e.g. `PrometheusBuilder::build_recorder`) and
+/// renders through its own handle — and an OTLP metrics exporter built from
+/// `otel`. For a host such as an HTTP server that serves `/metrics` itself and
+/// so cannot use [`install_observability`]'s listener.
+///
+/// Returns `Ok(true)` when OTLP metrics are exported, `Ok(false)` when the
+/// exporter could not be built (the Prometheus recorder is installed alone, so
+/// `/metrics` keeps working), and an error when a global recorder is already
+/// installed. The meter provider lives for the process and is flushed by
+/// [`shutdown_otel`](crate::observability::otel::shutdown_otel).
+#[cfg(all(feature = "observability-install", feature = "otel"))]
+pub fn install_prometheus_with_otel_metrics(
+    prometheus: metrics_exporter_prometheus::PrometheusRecorder,
+    otel: &crate::observability::otel::OtelConfig,
+) -> Result<bool, InstallError> {
+    use metrics_util::layers::FanoutBuilder;
+    let already =
+        || InstallError::PrometheusInstall("a metrics recorder is already installed".into());
+    match crate::observability::otel::build_meter_provider(otel) {
+        Ok((mp, otel_recorder)) => {
+            let fanout = FanoutBuilder::default()
+                .add_recorder(prometheus)
+                .add_recorder(otel_recorder)
+                .build();
+            metrics::set_global_recorder(fanout).map_err(|_| already())?;
+            crate::observability::otel::keep_meter_provider(mp);
+            crate::observability::otel::describe();
+            Ok(true)
+        }
+        Err(e) => {
+            tracing::warn!("OTLP metrics exporter init failed; Prometheus-only: {e}");
+            metrics::set_global_recorder(prometheus).map_err(|_| already())?;
+            Ok(false)
+        }
+    }
+}
+
 /// Non-`observability-install` stub. Returns an empty report, never panics.
 #[cfg(not(feature = "observability-install"))]
 pub fn install_observability(_cfg: &ObservabilityConfig) -> Result<InstallReport, InstallError> {

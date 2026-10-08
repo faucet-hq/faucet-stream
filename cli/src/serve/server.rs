@@ -634,8 +634,11 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
 /// Boot the server: install observability, build state + router, bind, serve
 /// until SIGTERM/SIGINT, then drain in-flight runs up to the grace window.
 pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> CliResult<()> {
-    let (prom, log_hub) =
-        crate::serve::observability::install(&config.log_level, config.log_format);
+    let (prom, log_hub) = crate::serve::observability::install(
+        &config.log_level,
+        config.log_format,
+        config.otel.as_ref(),
+    );
     crate::serve::callback::set_allow_hosts(config.callback_allow_hosts.clone());
     crate::serve::metrics::set_cluster_enabled(config.cluster.enabled);
     if let Some(h) = &prom {

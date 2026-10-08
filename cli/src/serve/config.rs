@@ -133,6 +133,8 @@ pub struct ServeConfig {
     /// Path to a `--policy` file (#702). Loaded + validated at startup; every
     /// submission is checked against it (gated on the `policy` feature).
     pub policy_path: Option<PathBuf>,
+    /// OTLP export settings from `--otel-config`. `None` = no OTLP export.
+    pub otel: Option<faucet_core::OtelConfig>,
     /// Allowlist of hosts a per-run completion callback may target (#481).
     /// Empty = any host except link-local / cloud-metadata addresses.
     pub callback_allow_hosts: Vec<String>,
@@ -392,6 +394,11 @@ impl ServeConfig {
             triggers_path: args.triggers,
             templates_sync_path: args.templates_sync,
             policy_path: args.policy,
+            otel: args
+                .otel_config
+                .as_deref()
+                .map(load_otel_config)
+                .transpose()?,
             callback_allow_hosts: args.callback_allow_host,
             require_approval,
             approval_expiry: Duration::from_secs(args.approval_expiry_secs),
@@ -411,9 +418,59 @@ impl ServeConfig {
     }
 }
 
+/// Read a `--otel-config` file: a pipeline config's `observability.otel`
+/// block on its own, `${env:…}` / `${file:…}` directives resolved (collector
+/// headers often carry a token), validated as `faucet run` validates it.
+pub fn load_otel_config(path: &std::path::Path) -> CliResult<faucet_core::OtelConfig> {
+    let bad = |e: String| CliError::Config(format!("--otel-config {}: {e}", path.display()));
+    let text = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
+    let mut doc: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| bad(e.to_string()))?;
+    crate::interpolate::interpolate_value(&mut doc)?;
+    crate::interpolate::unescape_value(&mut doc);
+    let spec: crate::config::OtelSpec =
+        serde_json::from_value(doc).map_err(|e| bad(e.to_string()))?;
+    let cfg = spec.to_core().map_err(bad)?;
+    for v in cfg.headers.values() {
+        crate::secrets::registry::register(v);
+    }
+    Ok(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn otel_config_file_loads_resolves_env_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("otel.yaml");
+        // SAFETY: test-local variable name, read back immediately.
+        unsafe { std::env::set_var("FAUCET_TEST_SERVE_OTEL_TOKEN", "tok-123") };
+        std::fs::write(
+            &ok,
+            "endpoint: http://collector:4318\nprotocol: http\nexport: [traces]\n\
+             headers: { authorization: \"Bearer ${env:FAUCET_TEST_SERVE_OTEL_TOKEN}\" }\n",
+        )
+        .unwrap();
+        let cfg = load_otel_config(&ok).unwrap();
+        assert_eq!(cfg.endpoint, "http://collector:4318");
+        assert_eq!(cfg.headers["authorization"], "Bearer tok-123");
+        assert!(cfg.exports(faucet_core::OtelSignal::Traces));
+
+        let unknown = dir.path().join("bad.yaml");
+        std::fs::write(&unknown, "endpoint: http://c:4317\nprometheus: {}\n").unwrap();
+        let err = load_otel_config(&unknown).unwrap_err().to_string();
+        assert!(err.contains("--otel-config"), "{err}");
+
+        let missing = load_otel_config(&dir.path().join("nope.yaml")).unwrap_err();
+        assert!(missing.to_string().contains("nope.yaml"), "{missing}");
+
+        let mut args = base_args();
+        args.no_auth = true;
+        args.otel_config = Some(ok);
+        let sc = ServeConfig::from_args(args).unwrap();
+        assert_eq!(sc.otel.unwrap().endpoint, "http://collector:4318");
+    }
     use std::net::SocketAddr;
 
     #[test]
@@ -493,6 +550,7 @@ mod tests {
             triggers: None,
             templates_sync: None,
             policy: None,
+            otel_config: None,
             callback_allow_host: Vec::new(),
             mcp: false,
             mcp_allow_mutations: false,

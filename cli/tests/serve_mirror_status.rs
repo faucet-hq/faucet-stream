@@ -62,6 +62,7 @@ async fn spawn_server(port: u16, dir: &Path) {
         triggers: None,
         templates_sync: None,
         policy: None,
+        otel_config: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

@@ -263,6 +263,7 @@ FAUCET_SERVE_AUTH_TOKEN=s3cret faucet serve --listen 0.0.0.0:8080      # bearer 
 faucet serve --no-auth                                                 # explicit no-auth opt-in (required if no token)
 faucet serve --history sqlite:/var/lib/faucet/runs.db                  # durable run history
 faucet serve --default-config defaults.yaml                            # merge workspace defaults under every run
+faucet serve --otel-config otel.yaml                                   # OTLP traces + metrics (an `observability.otel` block; `otel` feature)
 ```
 
 Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** without `--no-auth`, startup fails (an unauthenticated server is never accidental). The default bind is loopback.
