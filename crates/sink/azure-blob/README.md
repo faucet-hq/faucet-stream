@@ -15,7 +15,7 @@ Connection fields come from `faucet-common-azure` and are set at the top level:
 |---|---|---|
 | `container` | string | **Required.** Blob container / ADLS filesystem (must already exist). |
 | `account` | string | Storage-account name (optional with a connection string / emulator). |
-| `auth` | `{ type, config }` | `account_key` / `sas_token` / `connection_string` / `managed_identity` / `service_principal` / `default`. |
+| `auth` | `{ type, config }` | `account_key` / `sas_token` / `connection_string` / `managed_identity` / `service_principal` / `default`. With any explicit `auth`, `AZURE_*` credential variables in the environment are ignored (only `default` uses the environment's credential chain). A `connection_string` honours `EndpointSuffix`, `DefaultEndpointsProtocol` and `UseDevelopmentStorage=true`. |
 | `endpoint` | string | Custom blob endpoint (emulator / sovereign cloud). |
 | `allow_http` | bool | Permit plaintext HTTP (Azurite). |
 | `use_emulator` | bool | Target the Azurite emulator. |
