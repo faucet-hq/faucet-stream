@@ -56,6 +56,21 @@ pub(crate) fn json_fragment_to_iceberg_type(fragment: &Value) -> Result<Type, Fa
     Ok(Type::Primitive(prim))
 }
 
+/// Top-level record fields `schema` does not have — the JSON decoder drops
+/// them.
+pub fn unknown_fields<'a>(schema: &SchemaRef, records: &'a [Value]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = records
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|m| m.keys())
+        .filter(|k| schema.field_with_name(k).is_err())
+        .map(String::as_str)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Infer an Arrow schema from up to `sample` JSON records.
 ///
 /// Every inferred field is forced to be nullable so missing keys in later
@@ -189,7 +204,13 @@ fn arrow_base_type(dt: &DataType) -> &'static str {
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64 => "integer",
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => "number",
+        DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..) => "number",
         DataType::Boolean => "boolean",
         DataType::Utf8 | DataType::LargeUtf8 => "string",
         DataType::Struct(_) => "object",
@@ -220,6 +241,9 @@ fn make_nullable(field: &Field) -> Field {
         }
         DataType::List(inner) => DataType::List(Arc::new(make_nullable(inner.as_ref()))),
         DataType::LargeList(inner) => DataType::LargeList(Arc::new(make_nullable(inner.as_ref()))),
+        // Null in every sampled record: a nullable string column (no format
+        // can store a Null-typed one).
+        DataType::Null => DataType::Utf8,
         other => other.clone(),
     };
     Field::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
@@ -240,6 +264,41 @@ mod tests {
             Type::Primitive(p) => p,
             other => panic!("expected primitive, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decimals_report_as_numbers_and_unknown_fields_are_listed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(18, 2), true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        assert_eq!(
+            arrow_to_json_schema(&schema)["properties"]["amount"],
+            serde_json::json!({"type": ["number", "null"]})
+        );
+        let records = [
+            serde_json::json!({"id": 1, "extra": 1, "b": 2}),
+            serde_json::json!({"id": 2, "extra": 3}),
+            serde_json::json!(5),
+        ];
+        assert_eq!(unknown_fields(&schema, &records), vec!["b", "extra"]);
+    }
+
+    #[test]
+    fn a_column_null_in_the_sample_becomes_a_nullable_string() {
+        let schema = infer_arrow_schema(
+            &[serde_json::json!({"id": 1, "gone": null, "tags": []})],
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            schema.field_with_name("gone").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        arrow_to_iceberg_schema(&schema).expect("an iceberg schema");
+        let batch =
+            json_to_record_batch(&[serde_json::json!({"id": 2, "gone": "back"})], &schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
     }
 
     #[test]

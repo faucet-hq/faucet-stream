@@ -89,6 +89,14 @@ struct SinkState {
     /// Exactly-once commit token to stamp onto the next committed snapshot.
     /// Set by `write_batch_idempotent` and consumed (cleared) by `commit_pending`.
     pending_commit: Option<(String, String)>,
+
+    /// Set when a write failed after part of it may have reached the open
+    /// writer: everything uncommitted is discarded and every later write and
+    /// flush fails, so nothing partial is ever committed.
+    poisoned: Option<String>,
+
+    /// Record fields the table schema lacks, already warned about once.
+    warned_fields: std::collections::HashSet<String>,
 }
 
 impl SinkState {
@@ -98,8 +106,47 @@ impl SinkState {
             writer: None,
             pending_files: Vec::new(),
             pending_commit: None,
+            poisoned: None,
+            warned_fields: std::collections::HashSet::new(),
         }
     }
+
+    /// Fail when an earlier write poisoned the sink.
+    fn check_poisoned(&self) -> Result<(), FaucetError> {
+        match &self.poisoned {
+            Some(cause) => Err(FaucetError::Sink(format!(
+                "iceberg: an earlier write failed part-way ({cause}); nothing written since the \
+                 last commit is kept, so the run must restart from its last bookmark"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Discard everything uncommitted and refuse further writes.
+    fn poison(&mut self, cause: &FaucetError) {
+        self.writer = None;
+        self.pending_files.clear();
+        self.pending_commit = None;
+        self.poisoned = Some(cause.to_string());
+    }
+
+    /// Warn once per record field the table schema does not have.
+    fn warn_dropped_fields(&mut self, schema: &arrow::datatypes::SchemaRef, records: &[Value]) {
+        for field in crate::schema::unknown_fields(schema, records) {
+            if self.warned_fields.insert(field.to_string()) {
+                tracing::warn!(
+                    field = %field,
+                    "iceberg sink: dropping a field the table schema does not have"
+                );
+            }
+        }
+    }
+}
+
+/// The table property that carries `scope`'s last committed token, so the
+/// watermark outlives the expiry of the snapshot that recorded it.
+pub(crate) fn token_property(scope: &str) -> String {
+    format!("{}.{scope}", faucet_core::idempotency::ICEBERG_TOKEN_PROP)
 }
 
 // ── IcebergSink ───────────────────────────────────────────────────────────────
@@ -303,15 +350,17 @@ impl IcebergSink {
         Ok(())
     }
 
-    /// Write a single chunk of `Value` records to the open writer.
-    ///
-    /// Converts `records` to an Arrow `RecordBatch` against the table's arrow
-    /// schema, then calls `writer.write(batch)`.
-    async fn write_chunk(
+    /// Write a page to the open writer, `chunk` records per Arrow batch (`0` =
+    /// one batch). Every chunk is decoded before any is written, so a record
+    /// that does not fit the table leaves nothing of the page behind; a writer
+    /// failure part-way poisons the sink.
+    async fn write_page(
         &self,
         state: &mut SinkState,
         records: &[Value],
+        chunk: usize,
     ) -> Result<usize, FaucetError> {
+        state.check_poisoned()?;
         if records.is_empty() {
             return Ok(0);
         }
@@ -321,12 +370,22 @@ impl IcebergSink {
 
         // Convert to Arrow using the table's current schema.
         let arrow_schema = iceberg_to_arrow_schema(table.metadata().current_schema())?;
-        let batch = json_to_record_batch(records, &arrow_schema)?;
-        let row_count = batch.num_rows();
+        state.warn_dropped_fields(&arrow_schema, records);
+        let chunk = if chunk == 0 { records.len() } else { chunk };
+        let batches = records
+            .chunks(chunk)
+            .map(|c| json_to_record_batch(c, &arrow_schema))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let writer = state.writer.as_mut().expect("writer is set above");
-        writer.write(batch).await?;
-
+        let mut row_count = 0;
+        for batch in batches {
+            row_count += batch.num_rows();
+            let writer = state.writer.as_mut().expect("writer is set above");
+            if let Err(e) = writer.write(batch).await {
+                state.poison(&e);
+                return Err(e);
+            }
+        }
         Ok(row_count)
     }
 
@@ -410,6 +469,7 @@ impl IcebergSink {
         // The token is taken out of state so it is stamped exactly once, atomically
         // with the data files in this fast_append commit.
         let mut props = self.config.snapshot_properties.clone();
+        let carried = state.pending_commit.clone();
         if let Some((scope, token)) = state.pending_commit.take() {
             props.insert(
                 faucet_core::idempotency::ICEBERG_SCOPE_PROP.to_string(),
@@ -426,6 +486,29 @@ impl IcebergSink {
             action = action.set_snapshot_properties(props);
         }
 
+        let tx = match carried {
+            Some((scope, token)) => match tx
+                .update_table_properties()
+                .set(token_property(&scope), token)
+                .apply(tx)
+            {
+                Ok(tx) => tx,
+                Err(e) => {
+                    maybe_cleanup_orphans(
+                        table.file_io(),
+                        &self.config.table,
+                        self.config.cleanup_orphans_on_failure,
+                        true,
+                        &file_paths,
+                    )
+                    .await;
+                    return Err(FaucetError::Sink(format!(
+                        "iceberg: recording the commit token as a table property failed: {e}"
+                    )));
+                }
+            },
+            None => tx,
+        };
         let tx = match action.apply(tx) {
             Ok(tx) => tx,
             Err(e) => {
@@ -777,10 +860,22 @@ impl faucet_core::Sink for IcebergSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        let n = self.write_batch(records).await?;
         let mut state = self.state.lock().await;
-        state.pending_commit = Some((scope.to_string(), token.to_string()));
-        Ok(n)
+        match self
+            .write_page(&mut state, records, self.config.batch_size)
+            .await
+        {
+            Ok(n) => {
+                state.pending_commit = Some((scope.to_string(), token.to_string()));
+                Ok(n)
+            }
+            Err(e) => {
+                // Uncommitted pages carry no token: committing them on the
+                // error unwind's flush would make the resume replay them.
+                state.poison(&e);
+                Err(e)
+            }
+        }
     }
 
     /// Return the last commit token recorded for `scope` in this table's
@@ -803,6 +898,7 @@ impl faucet_core::Sink for IcebergSink {
         };
 
         let meta = table.metadata();
+        let carried = meta.properties().get(&token_property(scope));
         let props = meta.snapshots().map(|s| {
             let summary = s.summary();
             (
@@ -817,7 +913,10 @@ impl faucet_core::Sink for IcebergSink {
             )
         });
 
-        Ok(max_token_for_scope(props, scope))
+        Ok(max_token_for_scope(
+            props.chain(carried.map(|t| (Some(scope), Some(t.as_str())))),
+            scope,
+        ))
     }
 
     /// Write a batch of records to the Iceberg table.
@@ -830,17 +929,9 @@ impl faucet_core::Sink for IcebergSink {
         }
 
         let mut state = self.state.lock().await;
-
-        let chunk_size = self.config.batch_size;
-        let mut total = 0usize;
-
-        if chunk_size == 0 || records.len() <= chunk_size {
-            total += self.write_chunk(&mut state, records).await?;
-        } else {
-            for chunk in records.chunks(chunk_size) {
-                total += self.write_chunk(&mut state, chunk).await?;
-            }
-        }
+        let total = self
+            .write_page(&mut state, records, self.config.batch_size)
+            .await?;
 
         tracing::debug!(
             table = %self.config.table,
@@ -858,6 +949,7 @@ impl faucet_core::Sink for IcebergSink {
     /// 3. Commit via `Transaction::fast_append`.
     async fn flush(&self) -> Result<(), FaucetError> {
         let mut state = self.state.lock().await;
+        state.check_poisoned()?;
 
         // Step 1: close the open writer and collect its data files.
         Self::close_writer(&mut state).await?;
@@ -892,11 +984,13 @@ impl faucet_core::Sink for IcebergSink {
         }
 
         let mut state = self.state.lock().await;
+        state.check_poisoned()?;
 
         // Resolve table (and potentially create it) from the full record set so
         // schema inference uses all records.
         let table = self.resolve_table(&mut state, records).await?;
         let arrow_schema = iceberg_to_arrow_schema(table.metadata().current_schema())?;
+        state.warn_dropped_fields(&arrow_schema, records);
 
         // Try to convert each record individually so we can give per-row errors.
         let mut outcomes: Vec<faucet_core::RowOutcome> = Vec::with_capacity(records.len());
@@ -924,7 +1018,10 @@ impl faucet_core::Sink for IcebergSink {
             self.ensure_writer(&mut state, &table).await?;
             let batch = json_to_record_batch(&good_records, &arrow_schema)?;
             let writer = state.writer.as_mut().expect("writer set above");
-            writer.write(batch).await?;
+            if let Err(e) = writer.write(batch).await {
+                state.poison(&e);
+                return Err(e);
+            }
         }
 
         Ok(outcomes)
@@ -1009,6 +1106,18 @@ mod tests {
 
     // The compression helper is already tested in writer.rs; this test
     // ensures config→sink uses the right codec label.
+    #[test]
+    fn a_poisoned_state_drops_uncommitted_work_and_refuses_more() {
+        let mut state = SinkState::new(None);
+        state.pending_commit = Some(("s".into(), "t".into()));
+        assert!(state.check_poisoned().is_ok());
+        state.poison(&FaucetError::Sink("upload failed".into()));
+        assert!(state.pending_commit.is_none() && state.pending_files.is_empty());
+        let err = state.check_poisoned().unwrap_err();
+        assert!(err.to_string().contains("upload failed"), "{err}");
+        assert_eq!(token_property("p::r"), "faucet.commit-token.p::r");
+    }
+
     #[test]
     fn default_compression_parses_ok() {
         let cfg = minimal_config();
