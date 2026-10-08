@@ -161,6 +161,7 @@ pipeline:
       project_id: product-warehouse
       dataset_id: "tenant_${tenant.id}"        # one dataset per tenant
       table_id: contacts
+      auth: { type: application_default }
   state:
     type: postgres
     config: { url: "${env:STATE_URL}" }

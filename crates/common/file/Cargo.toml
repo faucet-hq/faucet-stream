@@ -26,6 +26,9 @@ base64 = { workspace = true, optional = true }
 # The remote backend (#777): the private scratch directory, run ids for object keys.
 tempfile.workspace = true
 uuid.workspace = true
+# Object-store listing filter (`include:` globs).
+glob.workspace = true
+sha2 = { workspace = true, optional = true }
 
 [features]
 # Formats the shared writer encodes that need a dependency. JSON Lines, JSON
@@ -37,7 +40,7 @@ file-format-avro = ["faucet-core/file-format-avro"]
 file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
 arrow = ["faucet-core/arrow", "dep:arrow"]
 # Encrypt output at rest.
-encryption = ["faucet-core/encryption", "dep:base64"]
+encryption = ["faucet-core/encryption", "dep:base64", "dep:sha2"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-parquet"]
 
 [dev-dependencies]

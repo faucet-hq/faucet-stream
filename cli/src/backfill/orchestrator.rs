@@ -184,6 +184,13 @@ fn build_unit_node(
     {
         n.delivery_guarantee = faucet_core::DeliveryGuarantee::AtLeastOnce;
     }
+    if n.cleanup_scope.take().is_some() {
+        tracing::warn!(
+            row = %root.id,
+            "backfill: the row's `complete_for` cleanup is skipped — a unit fetches one window, \
+             so a sweep would delete every in-scope row outside it"
+        );
+    }
     Ok(n)
 }
 
@@ -361,7 +368,7 @@ pub async fn run_backfill(
     cfg: &PipelineConfig,
     opts: BackfillOptions,
 ) -> CliResult<BackfillOutcome> {
-    let nodes = expand(cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(cfg).await?)?;
     let root = select_root(nodes, opts.row.as_deref())?;
     let mut root = root;
 
@@ -993,7 +1000,16 @@ matrix:
             start: crate::backfill::plan::parse_boundary("2026-06-01", tz).unwrap(),
             end: crate::backfill::plan::parse_boundary("2026-06-02", tz).unwrap(),
         };
-        let node = build_unit_node(&root, &unit, "0123456789abcdef", true).unwrap();
+        let mut scoped = root.clone();
+        scoped.cleanup_scope = Some(std::collections::BTreeMap::from([(
+            "tenant".to_string(),
+            json!("t1"),
+        )]));
+        let node = build_unit_node(&scoped, &unit, "0123456789abcdef", true).unwrap();
+        assert!(
+            node.cleanup_scope.is_none(),
+            "a window must never sweep the scope (#789 CLI-24)"
+        );
         assert_eq!(node.id, "backfill::0123456789abcdef::20260601T000000Z");
         assert_eq!(node.delivery, faucet_core::DeliveryMode::AtLeastOnce);
         let url = node.source.config["url"].as_str().unwrap();

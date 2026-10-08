@@ -11,13 +11,14 @@
 //! Run explicitly with:
 //! `cargo test -p faucet-sink-clickhouse --test integration`.
 
+mod common;
+
 use faucet_core::Sink as _;
 use faucet_core::check::{CheckContext, ProbeStatus};
 use faucet_sink_clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
 use serde_json::{Value, json};
 use testcontainers_modules::clickhouse::ClickHouse;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 // `cargo test` runs a binary's tests in parallel; serialize so at most one
 // container runs at a time on a small CI runner. Mirrors the mssql/postgres
@@ -25,16 +26,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn start_clickhouse() -> (ContainerAsync<ClickHouse>, String) {
-    let container = ClickHouse::default()
-        .start()
+    common::start_clickhouse()
         .await
-        .expect("start clickhouse container");
-    let port = container
-        .get_host_port_ipv4(8123)
-        .await
-        .expect("clickhouse host port");
-    let base = format!("http://127.0.0.1:{port}");
-    (container, base)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// POST a statement over the HTTP interface, asserting a 2xx. Used to run DDL

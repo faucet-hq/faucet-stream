@@ -144,8 +144,7 @@ pipeline:
     config:
       database_url: sqlite:./cache.db
       table_name: jobs
-      column_mapping:
-        type: auto_map
+      column_mapping: auto_map
       batch_size: 500
 ```
 

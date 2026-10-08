@@ -103,6 +103,7 @@ impl std::fmt::Debug for HttpAuth {
 pub struct ParentJob {
     pub namespace: String,
     pub name: String,
+    /// The parent's run id. Without it no parent facet is emitted.
     #[serde(default)]
     pub run_id: Option<String>,
 }

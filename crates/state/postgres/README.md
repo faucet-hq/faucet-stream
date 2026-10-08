@@ -21,7 +21,7 @@ The built-in `memory` store forgets everything on exit, and the built-in `file` 
 
 ## Who should use this crate
 
-- **End users** reference it indirectly: add the CLI's `state-postgres` feature and point a pipeline's `state:` block at `type: postgres` (see below). You never import this crate directly.
+- **End users** reference it indirectly: use the CLI (its `state-postgres` feature is on by default) and point a pipeline's `state:` block at `type: postgres` (see below). You never import this crate directly.
 - **Library authors** building their own pipeline runner construct [`PostgresStateStore`] and hand it to [`Pipeline::with_state_store`](https://docs.rs/faucet-core/latest/faucet_core/pipeline/struct.Pipeline.html) / `RunStreamOptions`.
 
 It implements the [`faucet_core::state::StateStore`] trait — nothing more — so it slots in anywhere a `StateStore` is accepted.
@@ -32,11 +32,11 @@ It implements the [`faucet_core::state::StateStore`] trait — nothing more — 
 # As a library (you also need faucet-core for the StateStore trait + Pipeline):
 cargo add faucet-core faucet-state-postgres
 
-# In the CLI (opt-in state backend):
-cargo install faucet-cli --features state-postgres
+# In the CLI (the postgres state backend is in the default build):
+cargo install faucet-cli
 ```
 
-The `postgres` state backend is **not** in the CLI default build — enable the `state-postgres` feature explicitly (it is included in the `full` aggregate). The built-in `memory` and `file` backends ship in `faucet-core` and need no feature.
+The `state-postgres` feature is part of the CLI default build (through the `state` aggregate), so the stock `faucet` binary already accepts `state: { type: postgres }`. A slim `--no-default-features` build needs `--features state-postgres`. The built-in `memory` and `file` backends ship in `faucet-core` and need no feature.
 
 ## CLI configuration
 

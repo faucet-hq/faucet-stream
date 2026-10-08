@@ -36,7 +36,7 @@ pub async fn run(args: PreviewArgs) -> CliResult<()> {
         return crate::topology::preview(&cfg, &auth, args.limit).await;
     }
 
-    let nodes = expand(&cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(&cfg).await?)?;
     // Apply runtime row selection so `preview` previews the first root of the
     // selected run set (#370/#371/#376/#377).
     let selection =

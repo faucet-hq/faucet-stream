@@ -227,12 +227,14 @@ fn placeholder_config(doc: &Value) -> CliResult<PipelineConfig> {
 }
 
 /// The config's expanded rows, placeholder-bound. `None` for a topology.
-fn placeholder_nodes(doc: &Value) -> CliResult<(PipelineConfig, Option<Vec<ExpandedNode>>)> {
+pub(crate) fn placeholder_nodes(
+    doc: &Value,
+) -> CliResult<(PipelineConfig, Option<Vec<ExpandedNode>>)> {
     let cfg = placeholder_config(doc)?;
     if crate::topology::is_topology(&cfg) {
         return Ok((cfg, None));
     }
-    let nodes = crate::expand::expand(&cfg)?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
     Ok((cfg, Some(nodes)))
 }
 
@@ -636,7 +638,8 @@ pub fn rows_for_source(
         if !narrowed.streams.is_empty() {
             let mut c = super::compose::compose_with(&narrowed, sink, supported)?;
             if let Some(o) = overlay {
-                c = c.apply_overlay(o)?;
+                let all: Vec<String> = src.streams.iter().map(|s| s.name.clone()).collect();
+                c = c.apply_overlay_within(o, &all)?;
             }
             let (_, real) = placeholder_nodes(&c.document)?;
             composed = Some(c.document);
@@ -1097,7 +1100,7 @@ kind: sink-template
 name: files
 params:
   out: { type: string, default: ./out }
-sink: { type: jsonl, config: { append: true } }
+sink: { type: acme-files, config: { append: true } }
 per_stream: { path: "${param.out}/${stream}.jsonl" }
 write_mode_aliases: { overwrite: append }
 "#;
@@ -1152,7 +1155,7 @@ write_mode_aliases: { overwrite: append }
         assert!(r.composed.is_some());
         let r = r.report;
         assert_eq!(r.sink.as_deref(), Some("files"));
-        assert_eq!(r.sink_kind.as_deref(), Some("jsonl"));
+        assert_eq!(r.sink_kind.as_deref(), Some("acme-files"));
         let accounts = row(&r, "accounts").write.clone().unwrap();
         assert_eq!(accounts.resolved, Some(WriteMode::Append));
         assert_eq!(accounts.supported, Some(true));

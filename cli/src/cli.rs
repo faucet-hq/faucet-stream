@@ -274,6 +274,11 @@ pub struct CleanupArgs {
     /// Emit the machine-readable sweep report instead of the human summary.
     #[arg(long)]
     pub json: bool,
+    /// Only clean outputs of this pipeline (its `name:`, or the config file's
+    /// stem). Defaults to the config's own pipeline when the ledger comes from a
+    /// config; with `--store` and no `--pipeline`, every pipeline is swept.
+    #[arg(long)]
+    pub pipeline: Option<String>,
     /// Ledger store URL (`sqlite:<path>`, `postgres://…`, or `memory`), instead
     /// of reading it from a config's `catalog:` block. Point this at the same URL
     /// `faucet serve --history` uses to clean a server's outputs.
@@ -298,7 +303,10 @@ pub struct CleanupArgs {
     #[arg(long)]
     pub all: bool,
     /// Retention window in days for the default (expired-only) sweep, overriding
-    /// the config's `local_outputs.retention_days`. `0` = keep forever. Distinct
+    /// the config's `local_outputs.retention_days`. Applies only to outputs that
+    /// recorded no window of their own — a pipeline whose run recorded
+    /// `retention_days` keeps it (use `--older-than-days` to purge regardless).
+    /// `0` = keep forever. Distinct
     /// from `--older-than-days`, which is a *scope selector* that ignores every
     /// retention setting.
     ///
@@ -348,6 +356,20 @@ pub struct MigrateArgs {
     /// With `--state`: emit the report as JSON.
     #[arg(long, requires = "state")]
     pub json: bool,
+    /// With `--state`: rewrite even while a run holds the pipeline's lease
+    /// (only when that run is gone).
+    #[arg(long, requires = "state")]
+    pub force: bool,
+    /// With `--state`: path to a `.env` file for `${env:VAR}` interpolation.
+    #[arg(long, requires = "state", conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// With `--state`: skip auto-loading `.env` from cwd.
+    #[arg(long, requires = "state")]
+    pub no_env_file: bool,
+    /// With `--state`: select a named overlay from the config's `profiles:`
+    /// block, so the deployed state store is the one migrated.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
 }
 
 /// `faucet fmt` arguments.
@@ -719,9 +741,9 @@ pub struct TemplateRegisterArgs {
     pub description: Option<String>,
     /// Point a named channel at the newly registered version, e.g.
     /// `--tag dev --tag test`. The version number itself always auto-increments;
-    /// channels come from a fixed set (`dev`, `test`, `staging`, `pre-prod`,
-    /// `canary`, `stable`, `prod`, `previous`). `latest` is derived and always
-    /// names the newest version, so it cannot be assigned.
+    /// assignable channels are `dev`, `test`, `staging`, `pre-prod`, `canary`
+    /// and `prod`. `stable`, `previous` and `newest` are derived and cannot be
+    /// assigned — `stable` moves only with `--launch` / `faucet template launch`.
     #[arg(long = "tag", value_name = "CHANNEL")]
     pub tag: Vec<String>,
     /// Launch the new version immediately, making it the one unpinned runs use.
@@ -854,7 +876,7 @@ pub struct TemplateShowArgs {
 pub struct TemplateDeleteArgs {
     /// Template id.
     pub id: String,
-    /// Delete only this version — a number, or a named channel (`latest`,
+    /// Delete only this version — a number, or a named channel (`newest`,
     /// `prod`, …) resolved to the version it points at. Omitted = delete every
     /// version of the template.
     #[arg(long)]
@@ -967,9 +989,19 @@ pub struct NotifyTestArgs {
     /// Path to a `.yaml`, `.yml`, or `.json` pipeline config with a
     /// `notifications:` block. If omitted, auto-discover in cwd.
     pub config: Option<PathBuf>,
-    /// Which event to synthesize (defaults to `run_failure`).
+    /// Which event to synthesize (defaults to `run_failure`). One of
+    /// `run_failure`, `run_success`, `sla_breach`, `circuit_open`,
+    /// `contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`,
+    /// `change_requested`, `budget_exceeded`, `connection_needs_reauth`.
     #[arg(long, default_value = "run_failure")]
     pub event: String,
+    /// Leave the PagerDuty incident a failure-class test event opens. By
+    /// default it is resolved right after the trigger.
+    #[arg(long)]
+    pub keep_open: bool,
+    /// Select a named overlay from the config's `profiles:` block.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
     /// Path to a `.env` file for `${env:VAR}` interpolation.
     #[arg(long, conflicts_with = "no_env_file")]
     pub env_file: Option<PathBuf>,
@@ -1339,6 +1371,11 @@ pub struct VerifyArgs {
     /// Report at most this many differences (the count keeps going).
     #[arg(long)]
     pub max_differences: Option<usize>,
+    /// The `${now.*}` clock the compared run used (RFC3339 like
+    /// `2026-01-31T00:00:00Z`, or a date `2026-01-31`), so a dated
+    /// destination from an earlier run can be verified. Default: now (UTC).
+    #[arg(long)]
+    pub clock: Option<String>,
     /// Emit the machine-readable report instead of the human summary.
     #[arg(long)]
     pub json: bool,
@@ -1544,6 +1581,10 @@ pub struct StateSetArgs {
     /// the sink's position instead of this bookmark.
     #[arg(long)]
     pub skip_watermark_check: bool,
+    /// Write the pre-versioning bookmark shape, for a rolling upgrade while a
+    /// cluster member older than the state envelope is still running.
+    #[arg(long)]
+    pub legacy_format: bool,
     #[command(flatten)]
     pub mutate: StateMutateArgs,
     #[command(flatten)]
@@ -1574,6 +1615,10 @@ pub struct StateResetArgs {
     /// Exactly-once rows: skip reading the sink's watermark.
     #[arg(long)]
     pub skip_watermark_check: bool,
+    /// Write the pre-versioning bookmark shape, for a rolling upgrade while a
+    /// cluster member older than the state envelope is still running.
+    #[arg(long)]
+    pub legacy_format: bool,
     #[command(flatten)]
     pub mutate: StateMutateArgs,
     #[command(flatten)]
@@ -2030,6 +2075,12 @@ pub struct ServeArgs {
     /// build with the `policy` feature.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<std::path::PathBuf>,
+    /// OTLP export for the server (a YAML/JSON file in the shape of a
+    /// pipeline config's `observability.otel` block): traces of every run and
+    /// request, and — with `export: [metrics]` — the metrics `/metrics` serves.
+    /// Requires a build with the `otel` feature.
+    #[arg(long, value_name = "PATH", env = "FAUCET_SERVE_OTEL_CONFIG")]
+    pub otel_config: Option<std::path::PathBuf>,
     /// Require an approved change request (#703) before these kinds of
     /// actions happen: `run` (`POST /v1/runs` and template triggers answer
     /// with a pending change request instead of a run; backfills are

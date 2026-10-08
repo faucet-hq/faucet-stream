@@ -3,8 +3,11 @@
 //!
 //! A [`Notifier`] is built once per process (`from_specs`) and shared via
 //! `Arc`. It holds the compiled rules, a reqwest client, and two pieces of
-//! in-process state: a leading-edge coalesce map and the set of currently-open
-//! PagerDuty incidents (so a later `run_success` sends a matching `resolve`).
+//! in-process state: a leading-edge coalesce map and the set of PagerDuty
+//! incidents it opened. A `run_success` sends a `resolve` on its incident key
+//! through every PagerDuty rule that could have opened one, whether or not
+//! this process saw the failure (PagerDuty ignores a resolve with nothing
+//! open), so one-shot runs and serve close incidents too.
 //!
 //! **`emit` never fails or blocks the pipeline.** Every delivery is bounded by
 //! a per-attempt timeout and a small retry; a channel outage is logged, counted
@@ -35,8 +38,9 @@ pub struct Notifier {
     timeout: Duration,
     /// (rule.name + dedupe_key) → last leading-edge send instant.
     dedupe: Mutex<HashMap<String, Instant>>,
-    /// (rule.name + incident_key) currently-open PagerDuty incidents.
-    incidents: Mutex<HashSet<String>>,
+    /// (rule.name + incident_key) → the PagerDuty `dedup_key`s triggered for
+    /// that (pipeline, row) and not yet resolved.
+    incidents: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl Notifier {
@@ -59,16 +63,25 @@ impl Notifier {
             client,
             timeout: DEFAULT_TIMEOUT,
             dedupe: Mutex::new(HashMap::new()),
-            incidents: Mutex::new(HashSet::new()),
+            incidents: Mutex::new(HashMap::new()),
         })))
     }
 
     /// Fire an event at every matching rule. Infallible.
     pub async fn emit(&self, event: NotifyEvent) {
-        // 1) PagerDuty auto-resolve: a success closes any incident a prior
-        //    failure opened on the same (pipeline, row).
+        let _ = self.emit_report(event).await;
+    }
+
+    /// [`Self::emit`], returning what happened per rule (deliveries, resolves,
+    /// coalesced drops). Still infallible: a failed delivery is an outcome.
+    pub async fn emit_report(&self, event: NotifyEvent) -> Vec<DeliveryOutcome> {
+        let mut out = Vec::new();
+        // 1) PagerDuty auto-resolve: a success closes any incident a failure
+        //    opened on the same (pipeline, row) — including one opened by
+        //    another process (one-shot runs, serve), so the resolve does not
+        //    depend on this notifier having seen the failure.
         if event.closes_incident() {
-            self.resolve_incidents(&event).await;
+            out.extend(self.resolve(&event).await);
         }
 
         // 2) Normal delivery.
@@ -86,28 +99,34 @@ impl Notifier {
             if self.coalesce(rule, &event) {
                 metrics::record_dropped(channel, "coalesced");
                 tracing::debug!(rule = %rule.name, kind = event.kind.as_str(), "notification coalesced");
+                out.push(DeliveryOutcome::new(rule, "coalesced", None));
                 continue;
             }
-            self.deliver(rule, &event).await;
+            let err = self.deliver(rule, &event).await.err();
+            out.push(DeliveryOutcome::new(rule, "trigger", err));
         }
+        out
     }
 
     /// Deliver a single (rule, event) as a trigger, then record incident state.
-    async fn deliver(&self, rule: &NotificationSpec, event: &NotifyEvent) {
+    async fn deliver(&self, rule: &NotificationSpec, event: &NotifyEvent) -> Result<(), String> {
         let channel = rule.channel.kind();
         let start = Instant::now();
+        let pd_key = event.pagerduty_key();
         let res = self
-            .send_with_retry(rule, event, PdAction::Trigger, &event.incident_key())
+            .send_with_retry(rule, event, PdAction::Trigger, &pd_key)
             .await;
         metrics::record_duration(channel, start.elapsed().as_secs_f64());
-        match res {
+        match &res {
             Ok(()) => {
                 metrics::record_sent(channel, event.kind.as_str(), true);
-                if matches!(rule.channel, ChannelSpec::Pagerduty(_)) && event.opens_incident() {
+                if matches!(rule.channel, ChannelSpec::Pagerduty(_)) {
                     self.incidents
                         .lock()
                         .unwrap()
-                        .insert(incident_id(&rule.name, event));
+                        .entry(incident_id(&rule.name, event))
+                        .or_default()
+                        .insert(pd_key);
                 }
             }
             Err(e) => {
@@ -122,32 +141,48 @@ impl Notifier {
                 tracing::warn!(rule = %rule.name, channel, error = %e, "notification delivery failed");
             }
         }
+        res
     }
 
-    /// Send a `resolve` for every PagerDuty rule with an open incident on this
-    /// event's key.
-    async fn resolve_incidents(&self, event: &NotifyEvent) {
-        let open: Vec<usize> = {
+    /// Send a PagerDuty `resolve` for every incident this event's (pipeline,
+    /// row) may have open: each key this notifier triggered, and — because a
+    /// resolve is stateless (PagerDuty ignores one for a key with nothing
+    /// open) — the key of every incident-opening kind the rule's selector
+    /// admits, so incidents opened by another process (a previous
+    /// `faucet run`, a serve run) close too.
+    pub async fn resolve(&self, event: &NotifyEvent) -> Vec<DeliveryOutcome> {
+        let open: Vec<(usize, String)> = {
             let inc = self.incidents.lock().unwrap();
-            self.rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| matches!(r.channel, ChannelSpec::Pagerduty(_)))
-                .filter(|(_, r)| inc.contains(&incident_id(&r.name, event)))
-                .map(|(i, _)| i)
-                .collect()
+            let mut open = Vec::new();
+            for (i, r) in self.rules.iter().enumerate() {
+                if !matches!(r.channel, ChannelSpec::Pagerduty(_)) {
+                    continue;
+                }
+                let mut keys: std::collections::BTreeSet<String> =
+                    stateless_resolve_keys(r, event).into_iter().collect();
+                if let Some(tracked) = inc.get(&incident_id(&r.name, event)) {
+                    keys.extend(tracked.iter().cloned());
+                }
+                open.extend(keys.into_iter().map(|k| (i, k)));
+            }
+            open
         };
-        for idx in open {
+        let mut out = Vec::new();
+        for (idx, key) in open {
             let rule = &self.rules[idx];
             let res = self
-                .send_with_retry(rule, event, PdAction::Resolve, &event.incident_key())
+                .send_with_retry(rule, event, PdAction::Resolve, &key)
                 .await;
-            match res {
+            match &res {
                 Ok(()) => {
-                    self.incidents
-                        .lock()
-                        .unwrap()
-                        .remove(&incident_id(&rule.name, event));
+                    let id = incident_id(&rule.name, event);
+                    let mut inc = self.incidents.lock().unwrap();
+                    if let Some(keys) = inc.get_mut(&id) {
+                        keys.remove(&key);
+                        if keys.is_empty() {
+                            inc.remove(&id);
+                        }
+                    }
                     metrics::record_sent(rule.channel.kind(), "resolve", true);
                 }
                 Err(e) => {
@@ -155,7 +190,9 @@ impl Notifier {
                     tracing::warn!(rule = %rule.name, error = %e, "notification resolve failed");
                 }
             }
+            out.push(DeliveryOutcome::new(rule, "resolve", res.err()));
         }
+        out
     }
 
     /// Bounded-retry, per-attempt-timeout delivery of one message.
@@ -232,8 +269,77 @@ impl Notifier {
     /// Test-only view of open incidents.
     #[cfg(test)]
     fn open_incident_count(&self) -> usize {
-        self.incidents.lock().unwrap().len()
+        self.incidents
+            .lock()
+            .unwrap()
+            .values()
+            .map(HashSet::len)
+            .sum()
     }
+}
+
+/// What one rule did with one event (`faucet notify test` reports these).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryOutcome {
+    pub rule: String,
+    pub channel: &'static str,
+    /// `trigger`, `resolve` or `coalesced`.
+    pub action: &'static str,
+    /// The delivery error, when it failed.
+    pub error: Option<String>,
+}
+
+impl DeliveryOutcome {
+    fn new(rule: &NotificationSpec, action: &'static str, error: Option<String>) -> Self {
+        Self {
+            rule: rule.name.clone(),
+            channel: rule.channel.kind(),
+            action,
+            error,
+        }
+    }
+}
+
+/// Every kind a PagerDuty trigger can carry, i.e. all but `run_success`.
+const TRIGGER_KINDS: [EventKind; 10] = [
+    EventKind::RunFailure,
+    EventKind::SlaBreach,
+    EventKind::CircuitOpen,
+    EventKind::ContractAbort,
+    EventKind::DlqThreshold,
+    EventKind::SchedulerStuck,
+    EventKind::ProfileDrift,
+    EventKind::ChangeRequested,
+    EventKind::BudgetExceeded,
+    EventKind::ConnectionNeedsReauth,
+];
+
+/// The PagerDuty dedup key of every incident `rule` could have opened for
+/// `event`'s (pipeline, row): one per kind its selector admits, failure-class
+/// kinds sharing the row's failure key.
+fn stateless_resolve_keys(rule: &NotificationSpec, event: &NotifyEvent) -> Vec<String> {
+    let kinds: Vec<EventKind> = if rule.on.is_empty() {
+        TRIGGER_KINDS.to_vec()
+    } else {
+        rule.on
+            .iter()
+            .copied()
+            .filter(|k| *k != EventKind::RunSuccess)
+            .collect()
+    };
+    let mut keys: Vec<String> = kinds
+        .into_iter()
+        .map(|kind| {
+            NotifyEvent {
+                kind,
+                ..event.clone()
+            }
+            .pagerduty_key()
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 fn incident_id(rule_name: &str, event: &NotifyEvent) -> String {
@@ -242,7 +348,10 @@ fn incident_id(rule_name: &str, event: &NotifyEvent) -> String {
 
 /// Pure rule/event match: kind selector + severity floor + DLQ threshold.
 fn rule_matches(rule: &NotificationSpec, event: &NotifyEvent) -> bool {
-    if !rule.on.is_empty() && !rule.on.contains(&event.kind) {
+    // Every failure-class event is a run failure, so `on: [run_failure]`
+    // hears a budget / circuit / contract failure too (#789 CLI-123).
+    let failure = event.opens_incident() && rule.on.contains(&EventKind::RunFailure);
+    if !rule.on.is_empty() && !rule.on.contains(&event.kind) && !failure {
         return false;
     }
     if event.severity < rule.min_severity {
@@ -407,11 +516,167 @@ mod tests {
         let mut r = rule("pd", vec![EventKind::RunFailure], pd);
         r.min_severity = Severity::Info;
         let n = Notifier::from_specs(&[r]).unwrap().unwrap();
-        n.incidents.lock().unwrap().insert("pd::p:r1".to_string());
+        n.incidents
+            .lock()
+            .unwrap()
+            .entry("pd::p:r1".to_string())
+            .or_default()
+            .insert("p:r1".to_string());
         assert_eq!(n.open_incident_count(), 1);
         n.emit(NotifyEvent::run_success("p", "r1", 1)).await;
         // resolve delivery failed (bad endpoint) → incident intentionally kept.
         assert_eq!(n.open_incident_count(), 1);
+    }
+
+    /// A success resolves on the PagerDuty dedup key even when this notifier
+    /// never saw the failure (one-shot runs and serve build a fresh notifier
+    /// per run), on the key of each incident the rule's selector could open.
+    #[tokio::test]
+    async fn a_fresh_notifier_resolves_on_success() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for key in ["p:r1", "sla_breach:p:r1"] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(serde_json::json!({
+                    "event_action": "resolve",
+                    "dedup_key": key
+                })))
+                .respond_with(ResponseTemplate::new(202))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let pd = |name: &str, on: Vec<EventKind>| {
+            rule(
+                name,
+                on,
+                ChannelSpec::Pagerduty(PagerdutyConfig {
+                    routing_key: "rk".into(),
+                    source: None,
+                    endpoint: Some(format!("{}/enqueue", server.uri())),
+                }),
+            )
+        };
+        let n = Notifier::from_specs(&[
+            pd("pd", vec![EventKind::RunFailure]),
+            pd("drift-only", vec![EventKind::SlaBreach]),
+        ])
+        .unwrap()
+        .unwrap();
+        let out = n.emit_report(NotifyEvent::run_success("p", "r1", 1)).await;
+        let rules: Vec<(&str, &str, bool)> = out
+            .iter()
+            .map(|o| (o.rule.as_str(), o.action, o.error.is_none()))
+            .collect();
+        assert_eq!(
+            rules,
+            vec![("pd", "resolve", true), ("drift-only", "resolve", true)],
+            "{out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_report_names_failed_and_coalesced_deliveries() {
+        let mut r = rule(
+            "s",
+            vec![],
+            ChannelSpec::Slack(SlackConfig {
+                webhook_url: "http://127.0.0.1:1/x".into(),
+                channel: None,
+                username: None,
+            }),
+        );
+        r.dedupe_window_secs = Some(3600);
+        let n = Notifier::from_specs(&[r.clone()]).unwrap().unwrap();
+        let e = NotifyEvent::run_failure("p", "", "s", "m");
+        assert!(!n.coalesce(&r, &e));
+        let out = n.emit_report(e.clone()).await;
+        assert_eq!(out[0].action, "coalesced");
+        n.uncoalesce(&r, &e);
+        let out = n.emit_report(e).await;
+        assert_eq!(out[0].action, "trigger");
+        assert!(out[0].error.is_some(), "{out:?}");
+    }
+
+    #[test]
+    fn run_failure_rules_hear_every_failure_class_event() {
+        let r = rule("r", vec![EventKind::RunFailure], slack());
+        assert!(rule_matches(
+            &r,
+            &NotifyEvent::budget_exceeded("p", "r", "records", 1, 2)
+        ));
+        assert!(!rule_matches(
+            &r,
+            &NotifyEvent::sla_breach("p", "r", "staleness", "m")
+        ));
+    }
+
+    #[test]
+    fn an_unrestricted_rule_resolves_every_kind_key_once() {
+        let r = rule("pd", vec![], slack());
+        let keys = stateless_resolve_keys(&r, &NotifyEvent::run_success("p", "r", 1));
+        assert_eq!(keys.len(), 7, "{keys:?}");
+        assert!(keys.contains(&"p:r".to_string()));
+        assert!(keys.contains(&"profile_drift:p:r".to_string()));
+        assert!(!keys.iter().any(|k| k.starts_with("run_success")));
+    }
+
+    #[tokio::test]
+    async fn success_resolves_every_triggered_pagerduty_key() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let pd = ChannelSpec::Pagerduty(PagerdutyConfig {
+            routing_key: "rk".into(),
+            source: None,
+            endpoint: Some(format!("{}/enqueue", server.uri())),
+        });
+        let on = vec![
+            EventKind::RunFailure,
+            EventKind::BudgetExceeded,
+            EventKind::SlaBreach,
+        ];
+        let n = Notifier::from_specs(&[rule("pd", on, pd)])
+            .unwrap()
+            .unwrap();
+        n.emit(NotifyEvent::budget_exceeded("p", "r1", "records", 1, 2))
+            .await;
+        n.emit(NotifyEvent::sla_breach("p", "r1", "staleness", "m"))
+            .await;
+        assert_eq!(n.open_incident_count(), 2);
+        n.emit(NotifyEvent::run_success("p", "r1", 1)).await;
+        assert_eq!(n.open_incident_count(), 0);
+
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        let pairs: Vec<(String, String)> = bodies
+            .iter()
+            .map(|b| {
+                (
+                    b["event_action"].as_str().unwrap().to_string(),
+                    b["dedup_key"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("trigger".to_string(), "p:r1".to_string()),
+                ("trigger".to_string(), "sla_breach:p:r1".to_string()),
+                ("resolve".to_string(), "p:r1".to_string()),
+                ("resolve".to_string(), "sla_breach:p:r1".to_string()),
+            ]
+        );
     }
 
     #[test]

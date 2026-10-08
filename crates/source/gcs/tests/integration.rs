@@ -439,6 +439,49 @@ async fn csv_objects_decode_through_the_shared_format_layer() {
     let rows = stream_all(&source).await;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[1]["name"], "bo");
+    let fetched = source.fetch_with_context(&HashMap::new()).await.unwrap();
+    assert_eq!(fetched, rows, "fetch_all reads CSV through the page stream");
+}
+
+#[tokio::test]
+async fn markers_are_skipped_and_whole_objects_are_capped() {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    seed_object(
+        &host,
+        &bucket,
+        "mk/a.json",
+        r#"[{"id":1}]"#,
+        "application/json",
+    )
+    .await;
+    seed_object(&host, &bucket, "mk/_SUCCESS", "", "text/plain").await;
+    seed_object(&host, &bucket, "mk/.a.json.crc", "crc", "text/plain").await;
+    let config = || {
+        GcsSourceConfig::new(&bucket)
+            .prefix("mk/")
+            .file_format(GcsFileFormat::JsonArray)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host)
+    };
+    let source = GcsSource::new(config()).await.unwrap();
+    assert_eq!(
+        source.fetch_with_context(&HashMap::new()).await.unwrap(),
+        vec![serde_json::json!({"id": 1})]
+    );
+    let mut capped = config();
+    capped.max_object_bytes = 4;
+    let err = GcsSource::new(capped)
+        .await
+        .unwrap()
+        .fetch_with_context(&HashMap::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
+    let mut bad = config();
+    bad.include = Some("[".into());
+    assert!(GcsSource::new(bad).await.is_err());
 }
 
 #[cfg(feature = "arrow")]
@@ -533,6 +576,64 @@ async fn parquet_reads_by_row_group_and_whole_object() {
         }
         assert_eq!(total, 5, "verify_checksum={verify_checksum}");
     }
+}
+
+/// Every ranged read is pinned to the generation that located the footer, so
+/// replacing the object mid-read fails the read instead of mixing versions.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn parquet_replaced_mid_read_fails_rather_than_mixing_versions() {
+    use futures::StreamExt;
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let rows: Vec<_> = (0..10).map(|i| serde_json::json!({"id": i})).collect();
+    seed_bytes(
+        &host,
+        &bucket,
+        "swap/a.parquet",
+        parquet_bytes(&rows, 2),
+        "application/octet-stream",
+    )
+    .await;
+    let source = GcsSource::new(
+        GcsSourceConfig::new(&bucket)
+            .prefix("swap/")
+            .file_format(GcsFileFormat::Parquet)
+            .with_batch_size(2)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host),
+    )
+    .await
+    .unwrap();
+    let ctx = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 2);
+    let first = pages.next().await.unwrap().unwrap();
+    assert_eq!(first.records[0]["id"], 0);
+    let replaced: Vec<_> = (100..110).map(|i| serde_json::json!({"id": i})).collect();
+    seed_bytes(
+        &host,
+        &bucket,
+        "swap/a.parquet",
+        parquet_bytes(&replaced, 2),
+        "application/octet-stream",
+    )
+    .await;
+    let mut failed = false;
+    while let Some(page) = pages.next().await {
+        match page {
+            Ok(p) => assert!(
+                p.records.iter().all(|r| r["id"].as_i64().unwrap() < 100),
+                "rows from the replacement leaked into the read: {:?}",
+                p.records
+            ),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed, "a replaced object must fail the read");
 }
 
 /// Objects under one prefix must share a schema on the columnar path.

@@ -49,8 +49,18 @@ lineage:
       url: http://marquez:5000/api/v1/lineage
 
 pipeline:
-  source: { type: postgres, config: { … } }
-  sink:   { type: bigquery, config: { … } }
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://localhost/app
+      query: SELECT * FROM orders
+  sink:
+    type: bigquery
+    config:
+      project_id: my-project
+      dataset_id: analytics
+      table_id: orders
+      auth: { type: application_default }
 ```
 
 ### Full field reference
@@ -88,8 +98,17 @@ lineage:
   parent_job:
     namespace: airflow.prod
     name: dag.etl_daily.extract_orders
-    run_id: ${env:AIRFLOW_RUN_ID}   # optional; set by orchestrators
+    run_id: ${env:AIRFLOW_RUN_ID}   # set by orchestrators
 ```
+
+OpenLineage's parent facet needs the parent's run id, so without `run_id` no
+parent facet is emitted and faucet warns once at start-up.
+
+#### Failure reasons and volumes
+
+`FAIL` and `ABORT` events carry the `errorMessage` run facet (the run's error,
+secrets redacted). `RUNNING`, `COMPLETE`, `ABORT` and `FAIL` events carry the
+`outputStatistics` output facet with the records written so far (`rowCount`).
 
 ## Transports
 

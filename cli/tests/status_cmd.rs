@@ -42,10 +42,12 @@ fn args(cfg: &Path) -> StatusArgs {
     }
 }
 
-/// csv → sqlite (row `good`) and csv → an unwritable sqlite path (row `bad`),
-/// with a file state store and a jsonl DLQ.
+/// csv → sqlite (row `good`) and csv → an unwritable sqlite path (row `bad`:
+/// its parent is a regular file, so no directory can be created), with a file
+/// state store and a jsonl DLQ.
 fn write_config(dir: &Path) -> PathBuf {
     std::fs::write(dir.join("in.csv"), "id,name\n1,x\n2,y\n").unwrap();
+    std::fs::write(dir.join("not-a-dir"), "").unwrap();
     let text = format!(
         r#"version: 1
 name: shop
@@ -66,7 +68,7 @@ matrix:
         db = s(&dir.join("out.db")),
         state = s(&dir.join("state")),
         dlq = s(&dir.join("dlq.jsonl")),
-        missing = s(&dir.join("no-such-dir")),
+        missing = s(&dir.join("not-a-dir")),
     );
     let path = dir.join("shop.yaml");
     std::fs::write(&path, text).unwrap();

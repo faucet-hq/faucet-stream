@@ -332,7 +332,9 @@ and all in `{ type, config }` form:
 
 - **BigQuery** — `service_account_key_path`, `service_account_key`
   (inline JSON), or `application_default`.
-- **Snowflake** — `key_pair` (JWT) or `oauth`.
+- **Snowflake** — `key_pair` (JWT minted locally; `config: { user, private_key_pem }`,
+  both required — `private_key_pem` is the PEM text, typically `${file:./key.pem}`)
+  or `oauth` (`config: { token }`).
 - **Kafka** — `sasl_plain` / `sasl_scram` / `ssl` / `sasl_ssl`.
 - **Elasticsearch** — `basic`, `api_key`, `bearer`, or `none`.
 - **GCS** — `service_account_json_file`, `service_account_json_inline`,

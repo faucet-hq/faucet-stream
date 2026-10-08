@@ -160,7 +160,6 @@ pub async fn load_sync_file(path: &Path) -> CliResult<SyncFile> {
             path.display()
         ))
     })?;
-    let text = crate::interpolate::interpolate(&text)?;
     let file = parse_sync_file(&text, path)?;
     file.validate()?;
     for o in &file.origins {
@@ -181,18 +180,58 @@ pub async fn load_sync_file(path: &Path) -> CliResult<SyncFile> {
     Ok(file)
 }
 
+/// Resolve directives inside each string. A string that is exactly one
+/// directive may resolve to a number or boolean (`interval_secs:
+/// ${env:SYNC_EVERY}`); anything else stays a string.
+fn interpolate_scalars(v: &mut serde_json::Value) -> CliResult<()> {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            let whole = t.starts_with("${") && t.ends_with('}') && t.matches("${").count() == 1;
+            let out = crate::interpolate::interpolate(s)?;
+            *v = match serde_yaml::from_str::<Value>(&out) {
+                Ok(typed @ (Value::Number(_) | Value::Bool(_))) if whole => typed,
+                _ => Value::String(crate::interpolate::unescape(&out)),
+            };
+        }
+        Value::Array(items) => {
+            for i in items {
+                interpolate_scalars(i)?;
+            }
+        }
+        Value::Object(map) => {
+            for (_, i) in map.iter_mut() {
+                interpolate_scalars(i)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Parse, then resolve `${env:…}` / `${file:…}` / `${secret:…}` per scalar —
+/// never over the raw text, where a value holding a newline could rewrite the
+/// file's structure.
 fn parse_sync_file(text: &str, path: &Path) -> CliResult<SyncFile> {
     let is_json = path
         .extension()
         .map(|e| e.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
-    if is_json {
+    let mut doc: serde_json::Value = if is_json {
         serde_json::from_str(text)
-            .map_err(|e| CliError::Config(format!("parsing templates-sync JSON: {e}")))
+            .map_err(|e| CliError::Config(format!("parsing templates-sync JSON: {e}")))?
     } else {
         serde_yaml::from_str(text)
-            .map_err(|e| CliError::Config(format!("parsing templates-sync YAML: {e}")))
-    }
+            .map_err(|e| CliError::Config(format!("parsing templates-sync YAML: {e}")))?
+    };
+    interpolate_scalars(&mut doc)?;
+    serde_json::from_value(doc).map_err(|e| {
+        CliError::Config(format!(
+            "parsing templates-sync {}: {e}",
+            if is_json { "JSON" } else { "YAML" }
+        ))
+    })
 }
 
 /// Snapshot the registry's view of every template under `prefix`.
@@ -223,16 +262,38 @@ pub async fn local_snapshot(store: &TemplateStore, prefix: &str) -> CliResult<Ve
             },
             None => None,
         };
+        let launched = store
+            .template_launches(&s.id)
+            .await
+            .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
+            .into_iter()
+            .map(|l| l.version)
+            .collect();
         out.push(LocalTemplate {
             newest_deprecated: newest.is_some_and(|v| state.version_deprecation(v).is_some()),
+            deprecated_by: state
+                .deprecation
+                .as_ref()
+                .and_then(|d| d.deprecated_by.clone()),
+            deprecation_reason: state.deprecation.as_ref().and_then(|d| d.reason.clone()),
             id: s.id,
             status: state.status,
             newest,
             newest_hash,
             stable: state.stable,
+            launched,
         });
     }
     Ok(out)
+}
+
+fn origin_lock(origin: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let map = LOCKS.get_or_init(Default::default);
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(origin.to_string()).or_default())
 }
 
 /// The `created_by` recorded for a pull.
@@ -257,6 +318,11 @@ pub async fn sync_origin(
 ) -> CliResult<SyncReport> {
     let labels = [("origin", origin.name.clone())];
     metrics::gauge!(METRIC_SYNC_LAST, &labels).set(now_secs());
+    // One pull per origin at a time in this process: an HTTP-triggered sync
+    // racing the interval pull would plan against the same snapshot and
+    // register the same body twice.
+    let lock = origin_lock(&origin.name);
+    let _guard = lock.lock().await;
     let result = sync_origin_inner(store, origin, dry_run, actor).await;
     let outcome = match &result {
         Ok(r) if r.failed() > 0 => "partial",
@@ -395,7 +461,7 @@ pub async fn publish(
         })?;
     let name = publish_name(id, origin, record.format)?;
     let publisher = fetch::publisher_for(&origin.source)?;
-    let location = publisher.put(&name, &record.body).await?;
+    let location = publisher.put_kind(&name, &record.body, record.kind).await?;
     tracing::info!(template = %id, version, origin = %origin.name, %location, "template published");
     Ok(PublishReport {
         id: id.to_string(),
@@ -922,6 +988,73 @@ mod tests {
                 .to_string()
                 .contains("extra")
         );
+    }
+
+    /// Directives resolve per scalar after parsing: an env value holding a
+    /// newline stays inside its string (#789 CLI-106), and a whole-value
+    /// directive can still produce a number.
+    #[tokio::test]
+    async fn load_sync_file_cannot_be_restructured_by_an_env_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sync.yaml");
+        // SAFETY (test): unique variable names, read only by this test.
+        unsafe {
+            std::env::set_var(
+                "FAUCET_TEST_SYNC_INJECT",
+                "tok\n    prefix: evil-\n    launch: always",
+            );
+            std::env::set_var("FAUCET_TEST_SYNC_EVERY", "300");
+        }
+        std::fs::write(
+            &p,
+            "version: 1\norigins:\n  - name: gh\n    source:\n      type: github\n      config: {repo: a/b, token: \"${env:FAUCET_TEST_SYNC_INJECT}\"}\n    prefix: gh-\n    interval_secs: ${env:FAUCET_TEST_SYNC_EVERY}\n",
+        )
+        .unwrap();
+        let f = load_sync_file(&p).await.unwrap();
+        let o = &f.origins[0];
+        assert_eq!(o.prefix, "gh-");
+        assert_eq!(o.launch, LaunchPolicy::Ignore);
+        assert_eq!(o.interval_secs, Some(300));
+        match &o.source {
+            OriginSource::Github(g) => assert!(g.token.as_deref().unwrap().contains("evil-")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A file that cannot be read this pull is skipped, never deprecated as
+    /// gone, and the rest of the origin still syncs (#789 CLI-113).
+    #[tokio::test]
+    async fn a_transient_read_failure_skips_one_template_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/tpl/contents/templates/flaky.yaml"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+        mount_repo(&server, &[("ok.yaml", BODY), ("flaky.yaml", BODY)]).await;
+        let s = store();
+        crate::templates::register(
+            &s,
+            crate::templates::RegisterRequest {
+                id: Some("flaky".into()),
+                body: BODY.into(),
+                format: ConfigFormat::Yaml,
+                description: None,
+                tags: Vec::new(),
+                launch: true,
+                created_by: None,
+            },
+        )
+        .await
+        .unwrap();
+        let o = github_origin(&server, "", LaunchPolicy::Ignore, PrunePolicy::Deprecate);
+        let report = sync_origin(&s, &o, false, None).await.unwrap();
+        let out = report.outcome.unwrap();
+        assert!(out.deprecated.is_empty(), "{out:?}");
+        assert_eq!(out.registered.len(), 1);
+        assert!(out.skipped.iter().any(|(n, _)| n == "flaky"), "{out:?}");
+        let flaky = crate::templates::template_state(&s, "flaky").await.unwrap();
+        assert_eq!(flaky.status, TemplateStatus::Launched);
     }
 
     #[tokio::test]

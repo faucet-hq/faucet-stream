@@ -36,9 +36,9 @@ pub struct DeltaSourceConfig {
     pub columns: Vec<String>,
 
     /// Page size hint for [`stream_pages`](faucet_core::Source::stream_pages).
-    /// Governs how many rows accumulate before a `StreamPage` is emitted; the
-    /// underlying parquet row-group size still bounds each read. `0` is the
-    /// "no batching" sentinel — one page per file.
+    /// Governs how many rows accumulate before a `StreamPage` is emitted. `0`
+    /// is the "no batching" sentinel — one page per data file, however many
+    /// row groups it holds.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 }

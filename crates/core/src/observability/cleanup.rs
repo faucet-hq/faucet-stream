@@ -20,7 +20,7 @@ pub fn describe() {
     );
     describe_counter!(
         "faucet_cleanup_runs_total",
-        "Scoped-cleanup passes, by outcome (applied / skipped_cancelled / refused_overflow)."
+        "Scoped-cleanup passes, by outcome (applied / skipped_cancelled / refused_overflow / failed)."
     );
 }
 
@@ -41,7 +41,8 @@ pub fn cleanup_deleted(pipeline: &str, row: &str, connector: &str, deleted: u64)
 
 /// Emit `faucet_cleanup_runs_total{pipeline,row,outcome}`.
 ///
-/// `outcome` is one of `applied`, `skipped_cancelled`, `refused_overflow`. A
+/// `outcome` is one of `applied`, `skipped_cancelled`, `refused_overflow`,
+/// `failed` (the sink's delete returned an error). A
 /// non-zero `refused_overflow` means stale rows were left behind, so it is worth
 /// alerting on.
 pub fn cleanup_run(pipeline: &str, row: &str, outcome: &'static str) {

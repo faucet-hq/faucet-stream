@@ -489,6 +489,9 @@ sink:
       write_disposition: WRITE_APPEND          # the only accepted value
 ```
 
+The staged Parquet upload declares its CRC32C up front, so the server refuses
+an object whose stored bytes differ from the encoded file.
+
 `bulk_load` is only present in `arrow` builds, and is now optional rather
 than the trigger for the columnar path. The Storage **Write** API (gRPC
 `AppendRows`) is a separate future enhancement.

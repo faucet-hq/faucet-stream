@@ -203,6 +203,14 @@ impl CompiledZipColumns {
                 self.columns_path
             )));
         }
+        let mut seen = std::collections::HashMap::with_capacity(names.len());
+        for (i, n) in names.iter().enumerate() {
+            if let Some(first) = seen.insert(n.as_str(), i) {
+                return Err(FaucetError::Transform(format!(
+                    "zip_columns: duplicate column '{n}' at positions {first} and {i}"
+                )));
+            }
+        }
         Ok(names)
     }
 
@@ -360,6 +368,19 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], json!({"day": "2026-01-01", "sessions": 12}));
         assert_eq!(out[1], json!({"day": "2026-01-02", "sessions": 7}));
+    }
+
+    #[test]
+    fn duplicate_column_names_are_refused() {
+        let rec = json!({
+            "columns": [{"name": "id"}, {"name": "v"}, {"name": "id"}],
+            "rows": [[1, 2, 3]],
+        });
+        let err = spec().apply(&rec).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate column 'id' at positions 0 and 2"),
+            "{err}"
+        );
     }
 
     #[test]

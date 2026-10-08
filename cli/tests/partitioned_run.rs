@@ -291,3 +291,71 @@ async fn a_closed_half_open_probe_reads_the_maximum_row() {
     );
     assert_eq!(probed_run("half_open", closed, 1, &[1]).await, 1);
 }
+
+/// A probed partition validates offline (no probe runs, so a missing probe
+/// file is fine), and every executing command plans the real chunks through
+/// the shared runtime pass (#789 CLI-57).
+#[cfg(feature = "source-sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probed_partitions_validate_offline_and_resolve_for_every_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("probe.csv");
+    let yaml = format!(
+        r#"
+version: 1
+name: probed
+pipeline:
+  source:
+    type: sqlite
+    config:
+      database_url: "sqlite://{db}?mode=rwc"
+      query: "SELECT 1 AS id WHERE ${{partition.start}} <= ${{partition.end}}"
+  sink: {{ type: jsonl, config: {{ path: "{out}", append: true }} }}
+partition:
+  kind: integer
+  from: 1
+  chunk_size: 100
+  bounds: inclusive
+  to:
+    from_source: {{ type: csv, config: {{ path: "{probe}" }} }}
+    value_path: "$.max_id"
+"#,
+        db = dir.path().join("src.db").display(),
+        out = dir.path().join("out.jsonl").display(),
+        probe = probe.display(),
+    );
+    let path = dir.path().join("p.yaml");
+    std::fs::write(&path, &yaml).unwrap();
+    let cfg = PipelineConfig::from_text(&yaml, &path).expect("config parses");
+    assert!(expand(&cfg).is_err(), "unresolved bounds cannot be planned");
+    assert_eq!(
+        expand(&faucet_cli::partition::offline(&cfg)).unwrap().len(),
+        1
+    );
+    let cli = <faucet_cli::cli::Cli as clap::Parser>::try_parse_from([
+        "faucet",
+        "validate",
+        path.to_str().unwrap(),
+        "--no-env-file",
+    ])
+    .unwrap();
+    faucet_cli::run_command(cli)
+        .await
+        .expect("validate needs no probe");
+
+    std::fs::write(&probe, "max_id\n250\n").unwrap();
+    let resolved = faucet_cli::partition::resolve_runtime(&cfg).await.unwrap();
+    assert_eq!(expand(&resolved).unwrap().len(), 3);
+    let plain = PipelineConfig::from_text(
+        "version: 1\nname: p\npipeline:\n  source: { type: csv, config: { path: a.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n",
+        &path,
+    )
+    .unwrap();
+    assert_eq!(
+        faucet_cli::partition::resolve_runtime(&plain)
+            .await
+            .unwrap()
+            .name,
+        plain.name
+    );
+}

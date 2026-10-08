@@ -30,43 +30,75 @@ pub async fn run(args: MaskingArgs) -> CliResult<()> {
     // Compile first so a malformed policy fails before anything is printed.
     CompiledMasking::compile(spec).map_err(|e| CliError::Config(format!("masking: {e}")))?;
 
-    let destinations = destinations(&cfg);
+    let destinations = destinations(&cfg)?;
     print!("{}", render_summary(spec, &destinations));
     Ok(())
 }
 
-/// The destination sinks declared in the config: each named template under
-/// `pipeline.sinks`, plus the legacy singular `pipeline.sink` as `default`.
-/// Returns `(template_name, connector_kind)` pairs, sorted for stable output.
-fn destinations(cfg: &PipelineConfig) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(sink) = &cfg.pipeline.sink {
-        out.push(("default".to_string(), sink.kind.clone()));
-    }
-    for (name, spec) in &cfg.pipeline.sinks {
-        out.push((name.clone(), spec.kind.clone()));
-    }
-    out.sort();
-    out.dedup();
-    out
+/// One place a run writes: a label for the report, the ids masking rules are
+/// scoped by (exactly the ones the executor / topology runtime pass), and the
+/// connector kind.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Destination {
+    label: String,
+    kind: String,
+    ids: Vec<String>,
 }
 
-/// Labels of the rules that apply to a sink identified by `name` + `kind`.
-fn applied_rules(spec: &MaskingSpec, name: &str, kind: &str) -> Vec<String> {
+/// Where the config's rows (or topology sink nodes) actually write — after
+/// each row's `type:` override — grouped by `(template, kind)`.
+fn destinations(cfg: &PipelineConfig) -> CliResult<Vec<Destination>> {
+    let mut out: Vec<Destination> = Vec::new();
+    if crate::topology::is_topology(cfg) {
+        for (node_id, ids) in crate::topology::sink_node_masking_ids(cfg) {
+            out.push(Destination {
+                label: format!("node {node_id}"),
+                kind: ids.get(2).cloned().unwrap_or_default(),
+                ids,
+            });
+        }
+    } else {
+        let mut grouped: std::collections::BTreeMap<(String, String), Vec<String>> =
+            Default::default();
+        for n in crate::expand::expand(&crate::partition::offline(cfg))? {
+            grouped
+                .entry((n.sink_ref.clone(), n.sink.kind.clone()))
+                .or_default()
+                .push(n.id.clone());
+        }
+        for ((sink_ref, kind), rows) in grouped {
+            let label = if rows.len() == 1 && rows[0].starts_with("row-") {
+                sink_ref.clone()
+            } else {
+                format!("{sink_ref} (rows {})", rows.join(", "))
+            };
+            out.push(Destination {
+                label,
+                ids: vec![sink_ref, kind.clone()],
+                kind,
+            });
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Labels of the rules that apply to a destination scoped by `ids`.
+fn applied_rules(spec: &MaskingSpec, ids: &[String]) -> Vec<String> {
     spec.rules
         .iter()
         .enumerate()
-        .filter(|(_, r)| rule_applies(r, name, kind))
+        .filter(|(_, r)| rule_applies(r, ids))
         .map(|(i, r)| r.name.clone().unwrap_or_else(|| format!("rule_{i}")))
         .collect()
 }
 
-fn rule_applies(rule: &MaskRule, name: &str, kind: &str) -> bool {
-    rule.applies_to.is_empty() || rule.applies_to.iter().any(|t| t == name || t == kind)
+fn rule_applies(rule: &MaskRule, ids: &[String]) -> bool {
+    rule.applies_to.is_empty() || rule.applies_to.iter().any(|t| ids.contains(t))
 }
 
 /// Render the human summary. Pure — returned as a string for testability.
-fn render_summary(spec: &MaskingSpec, destinations: &[(String, String)]) -> String {
+fn render_summary(spec: &MaskingSpec, destinations: &[Destination]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let n = spec.rules.len();
@@ -110,8 +142,9 @@ fn render_summary(spec: &MaskingSpec, destinations: &[(String, String)]) -> Stri
         );
     } else {
         let _ = writeln!(out, "  destinations:");
-        for (name, kind) in destinations {
-            let applied = applied_rules(spec, name, kind);
+        for d in destinations {
+            let (name, kind) = (&d.label, &d.kind);
+            let applied = applied_rules(spec, &d.ids);
             let list = if applied.is_empty() {
                 "(no rules apply)".to_string()
             } else {
@@ -155,6 +188,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn d(label: &str, kind: &str) -> Destination {
+        Destination {
+            label: label.into(),
+            kind: kind.into(),
+            ids: vec![label.into(), kind.into()],
+        }
+    }
+
     fn spec() -> MaskingSpec {
         serde_json::from_value(json!({
             "description": "customer PII",
@@ -173,10 +214,7 @@ mod tests {
 
     #[test]
     fn summary_lists_rules_key_and_scope() {
-        let dests = vec![
-            ("default".to_string(), "postgres".to_string()),
-            ("analytics".to_string(), "bigquery".to_string()),
-        ];
+        let dests = vec![d("default", "postgres"), d("analytics", "bigquery")];
         let out = render_summary(&spec(), &dests);
         assert!(out.contains("masking — valid (3 rules)"), "{out}");
         assert!(out.contains("description: customer PII"), "{out}");
@@ -197,10 +235,7 @@ mod tests {
 
     #[test]
     fn summary_shows_applied_rules_per_destination() {
-        let dests = vec![
-            ("default".to_string(), "postgres".to_string()),
-            ("analytics".to_string(), "bigquery".to_string()),
-        ];
+        let dests = vec![d("default", "postgres"), d("analytics", "bigquery")];
         let out = render_summary(&spec(), &dests);
         // default: unscoped rules (emails, rule_2) apply; ssn is analytics-only.
         assert!(
@@ -222,8 +257,9 @@ mod tests {
         }))
         .unwrap();
         // A rule scoped to the `bigquery` KIND applies to a template of that kind.
-        assert_eq!(applied_rules(&s, "warehouse", "bigquery"), vec!["rule_0"]);
-        assert!(applied_rules(&s, "warehouse", "postgres").is_empty());
+        let ids = |k: &str| vec!["warehouse".to_string(), k.to_string()];
+        assert_eq!(applied_rules(&s, &ids("bigquery")), vec!["rule_0"]);
+        assert!(applied_rules(&s, &ids("postgres")).is_empty());
     }
 
     #[test]
@@ -239,7 +275,7 @@ mod tests {
                         "action": { "type": "tokenize" } }]
         }))
         .unwrap();
-        let out = render_summary(&s, &[("default".into(), "jsonl".into())]);
+        let out = render_summary(&s, &[d("default", "jsonl")]);
         assert!(out.contains("masking — valid (1 rule)"), "{out}");
         assert!(out.contains("none (unkeyed SHA-256"), "{out}");
         assert!(
@@ -264,10 +300,7 @@ pipeline:
             Path::new("test.yaml"),
         )
         .unwrap();
-        assert_eq!(
-            destinations(&single),
-            vec![("default".into(), "jsonl".into())]
-        );
+        assert_eq!(destinations(&single).unwrap(), vec![d("default", "jsonl")]);
 
         // Named `sinks:` templates → one destination each, sorted.
         let named = PipelineConfig::from_text(
@@ -287,12 +320,64 @@ matrix:
             Path::new("test.yaml"),
         )
         .unwrap();
-        assert_eq!(
-            destinations(&named),
-            vec![
-                ("archive".into(), "jsonl".into()),
-                ("warehouse".into(), "bigquery".into()),
-            ]
+        let labels: Vec<String> = destinations(&named)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.label)
+            .collect();
+        assert_eq!(labels, ["archive (rows a)", "warehouse (rows w)"]);
+    }
+
+    /// The report scopes rules by the kind a row actually writes (after its
+    /// `type:` override) and by topology node id, like the run does
+    /// (#789 CLI-73).
+    #[test]
+    fn destinations_follow_row_kind_overrides_and_topology_nodes() {
+        use crate::config::PipelineConfig;
+        use std::path::Path;
+        let spec: MaskingSpec = serde_json::from_value(json!({
+            "rules": [{ "name": "j", "match": { "fields": ["x"] }, "action": { "type": "redact" },
+                        "applies_to": ["jsonl"] },
+                      { "name": "n", "match": { "fields": ["y"] }, "action": { "type": "redact" },
+                        "applies_to": ["w"] }]
+        }))
+        .unwrap();
+        let overridden = PipelineConfig::from_text(
+            r#"version: 1
+pipeline:
+  source: { type: csv, config: { path: ./in.csv } }
+  sinks:
+    archive: { type: jsonl, config: { path: ./a.jsonl } }
+matrix:
+  - id: b
+    sink: { ref: archive, type: file, config: { path: ./b.jsonl } }
+"#,
+            Path::new("test.yaml"),
+        )
+        .unwrap();
+        let out = render_summary(&spec, &destinations(&overridden).unwrap());
+        assert!(
+            out.contains("- archive (rows b) [file]: (no rules apply)"),
+            "{out}"
         );
+
+        let topo = PipelineConfig::from_text(
+            r#"version: 1
+pipeline:
+  sources:
+    a: { type: csv, config: { path: ./in.csv } }
+  sinks:
+    o: { type: jsonl, config: { path: ./o.jsonl } }
+  nodes:
+    s: { kind: source, ref: a }
+    w: { kind: sink, ref: o }
+  edges:
+    - { from: s, to: w }
+"#,
+            Path::new("test.yaml"),
+        )
+        .unwrap();
+        let out = render_summary(&spec, &destinations(&topo).unwrap());
+        assert!(out.contains("- node w [jsonl]: j, n"), "{out}");
     }
 }

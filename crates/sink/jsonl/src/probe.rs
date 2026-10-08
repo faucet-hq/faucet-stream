@@ -11,7 +11,9 @@ use faucet_core::check::Probe;
 /// removes it immediately. Never touches the configured output file itself.
 ///
 /// - Parent exists and a temp file can be created + removed → [`Probe::pass`].
-/// - Parent directory is missing → [`Probe::fail_hint`] naming the directory.
+/// - Parent directory is missing → the nearest existing ancestor is probed
+///   instead, since the sink creates the missing directories.
+/// - That ancestor is not a directory → [`Probe::fail_hint`] naming it.
 /// - Parent exists but the temp file cannot be created → [`Probe::fail_hint`]
 ///   surfacing the I/O error (e.g. permission denied, read-only filesystem).
 pub async fn probe_parent_writable(path: &Path, start: Instant) -> Probe {
@@ -22,13 +24,25 @@ pub async fn probe_parent_writable(path: &Path, start: Instant) -> Probe {
         _ => std::path::PathBuf::from("."),
     };
 
-    if !tokio::fs::try_exists(&parent).await.unwrap_or(false) {
+    // The sink creates missing parent directories, so a missing parent passes
+    // when its nearest existing ancestor is a writable directory.
+    let mut parent = parent;
+    while !tokio::fs::try_exists(&parent).await.unwrap_or(false) {
+        match parent.parent() {
+            Some(up) if !up.as_os_str().is_empty() => parent = up.to_path_buf(),
+            _ => {
+                parent = std::path::PathBuf::from(".");
+                break;
+            }
+        }
+    }
+    if !tokio::fs::metadata(&parent).await.is_ok_and(|m| m.is_dir()) {
         return Probe::fail_hint(
             "io",
             start.elapsed(),
-            format!("parent directory {} does not exist", parent.display()),
+            format!("{} is not a directory", parent.display()),
             format!(
-                "create the directory {} before running the pipeline",
+                "point the sink at a path under a directory, not under the file {}",
                 parent.display()
             ),
         );

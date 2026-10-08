@@ -453,3 +453,71 @@ async fn source_skips_a_sinks_unfinished_output() {
         .expect("fetch");
     assert_eq!(records, vec![json!({"id": 1})]);
 }
+
+// ── Listing: mid-segment prefixes, special-character names, markers, size cap ─
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listing_handles_partial_prefixes_special_names_markers_and_the_size_cap() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_azurite().await;
+    create_container(port).await;
+    let store = seed_store(port);
+
+    store
+        .put(
+            &ObjPath::parse("ex/part-[1]#a%.jsonl").expect("a raw blob name"),
+            PutPayload::from(b"{\"id\":1}\n".to_vec()),
+        )
+        .await
+        .expect("seed object");
+    put_object(&store, "ex/part-2.jsonl", b"{\"id\":2}\n".to_vec()).await;
+    put_object(&store, "ex/_SUCCESS", Vec::new()).await;
+    put_object(&store, "ex/part-3/.part.crc", b"crc".to_vec()).await;
+    put_object(&store, "ex/other.jsonl", b"{\"id\":99}\n".to_vec()).await;
+
+    let source = AzureBlobSource::new(source_config(port).prefix("ex/part-"))
+        .await
+        .expect("source new");
+    let mut ids: Vec<i64> = source
+        .fetch_with_context(&HashMap::new())
+        .await
+        .expect("fetch")
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "a mid-segment prefix lists its matches only"
+    );
+
+    let all = AzureBlobSource::new(source_config(port).prefix("ex/"))
+        .await
+        .expect("source new");
+    let (records, _) = drain_pages(&all).await;
+    assert_eq!(
+        records.len(),
+        3,
+        "_SUCCESS and .crc are not data: {records:?}"
+    );
+
+    let named =
+        AzureBlobSource::new(source_config(port).object_keys(vec!["ex/part-[1]#a%.jsonl".into()]))
+            .await
+            .expect("source new");
+    assert_eq!(drain_pages(&named).await.0, vec![json!({"id": 1})]);
+
+    put_object(&store, "big/rows.json", br#"[{"a":1},{"a":2}]"#.to_vec()).await;
+    let mut capped = source_config(port)
+        .prefix("big/")
+        .file_format(AzureFileFormat::JsonArray);
+    capped.max_object_bytes = 4;
+    let err = AzureBlobSource::new(capped)
+        .await
+        .expect("source new")
+        .fetch_with_context(&HashMap::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
+}

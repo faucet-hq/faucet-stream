@@ -71,7 +71,9 @@ schema:
 
 Raise a `SchemaDrift` error and abort the run the moment drift is detected. Use
 this when any divergence is a real incident that a human must look at before more
-data flows.
+data flows. Nothing from the drifting page is written or checkpointed, so the
+page is read again once the schema is fixed; with a `dlq:` block, rows the
+page's quality or contract checks already quarantined still reach the DLQ first.
 
 ```yaml
 schema:

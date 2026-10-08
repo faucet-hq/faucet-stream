@@ -481,13 +481,13 @@ pub async fn load_submission_scoped(
         build_catalog(tenant.as_deref(), &cfg).map_err(|e| ServeError::BadConfig(e.to_string()))?;
     tokio::time::timeout(
         SUBMIT_DISCOVERY_TIMEOUT,
-        crate::dynamic_fanout::resolve_dynamic_fanout(&mut cfg, &auth),
+        crate::partition::resolve_runtime_with(&mut cfg, &auth),
     )
     .await
     .map_err(|_| ServeError::Unprocessable {
         message: format!(
-            "discovery fan-out did not complete within {}s — the source's describe \
-             endpoint is slow or unreachable",
+            "partition bound probes / discovery fan-out did not complete within {}s — the \
+             source is slow or unreachable",
             SUBMIT_DISCOVERY_TIMEOUT.as_secs()
         ),
         details: None,

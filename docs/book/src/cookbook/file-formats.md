@@ -66,7 +66,11 @@ A repeated header name fails the read — rows are keyed by header, so a
 duplicate would silently drop a column. With `flexible: false` a row with more
 or fewer fields than the header fails naming its line. The object-store and
 REST sources are lenient by default; the `file` source is strict, like the
-`csv` source.
+`csv` source. When lenient, the reader logs how many ragged rows it accepted,
+and a long row whose extra field would land on a header literally named
+`column_<i>` fails rather than overwriting that column. An Excel sheet whose
+header row repeats a label (or leaves a cell blank where `column_<i>` is also a
+real header) fails the same way a CSV does.
 
 ```yaml
 source:
@@ -151,6 +155,11 @@ The two in bold worth planning around: **XML trims padding**, so quote-and-pad
 alignment does not survive a round trip; and **xlsx returns a big integer as a
 string**, which is visible and correctable, unlike a rounded number.
 
+Reading `json_lines` / `json_array`, a number literal that the parsed record
+cannot hold exactly — an integer beyond 2^64, or a decimal with more
+significant digits than a double keeps — fails the read naming the literal,
+rather than being rounded. Write such values as JSON strings.
+
 ## Streaming and memory
 
 Only `json_lines` can be built a record at a time. Every other format has a
@@ -217,9 +226,13 @@ source:
 
 **Many files, one shape.** Every file under the prefix is resolved against one
 reader schema: `avro.schema` when set, otherwise **the first file's writer
-schema**. Avro's schema resolution then applies. A later file that added a
-field has it dropped. A field the reader declares with a default is filled for
-files that lack it. Numeric promotions such as `int → long` apply. A file that
+schema**. Avro's schema resolution then applies. Without `avro.schema`, a
+later file that adds a top-level field fails the run naming the field, rather
+than having it silently dropped for the whole run — set `avro.schema` to a
+reader schema that includes it (with a default for the older files). With a
+configured reader schema, writer fields it does not declare are dropped, as
+you asked. A field the reader declares with a default is filled for files that
+lack it. Numeric promotions such as `int → long` apply. A file that
 cannot be resolved fails the run with an error naming both files:
 
 ```text
@@ -336,13 +349,19 @@ extension is skipped with a warning, or fails the run with `strict: true`.
 
 Incremental mode reads only new files. `by: mtime` reads files modified after
 the newest one the previous run read; `by: name` reads files whose path sorts
-after the last one read. The bookmark advances after each file. Over HTTP, the
+after the last one read. The bookmark advances after each file. `by: mtime` is a
+watermark: a file that arrives later but keeps an older modification time
+(`mv`, `cp -p`, `rsync -t`, archive extraction) is skipped — the run warns and
+names it — so have producers touch files as they publish them, or use
+`by: name`. Over HTTP, the
 `Last-Modified` header is the modification time. JSON Lines, Avro, ORC and
 Parquet stream, and so does CSV (with the `csv:` dialect above); the other
 formats are read whole per file. `parquet: { columns: [...] }` projects a
 Parquet read to those columns, and Parquet schemas are compared from the
 footers before the first row is read. `encryption:` decrypts files the `file`
-or `jsonl` sink encrypted. See the
+or `jsonl` sink encrypted; a JSON Lines file the `file` sink sealed line by line
+is verified whole against its trailer (record count and digest), so dropped,
+reordered or truncated lines fail the read. See the
 [crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/file)
 for sharding, discovery, HTTP retries and a field-by-field mapping from the
 `csv` and `parquet` sources, which the `file` source matches option for option.

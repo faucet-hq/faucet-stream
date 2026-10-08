@@ -129,13 +129,13 @@ impl MssqlSink {
             return Ok(());
         };
         let col = quote_ident_mssql(column)?;
-        let sql = format!(
+        let sql = tolerate_concurrent_create(&format!(
             "IF OBJECT_ID(N'{}', N'U') IS NULL \
              CREATE TABLE {} (id BIGINT IDENTITY(1,1) PRIMARY KEY, {} NVARCHAR(MAX))",
             self.config.table.replace('\'', "''"),
             self.table_quoted,
             col
-        );
+        ));
         self.run_ddl(&sql, "create_table").await
     }
 
@@ -195,7 +195,8 @@ impl MssqlSink {
         } else {
             build_create_table_sql(&self.config.table, &self.table_quoted, &columns, key)?
         };
-        self.run_ddl(&sql, "create_table").await?;
+        self.run_ddl(&tolerate_concurrent_create(&sql), "create_table")
+            .await?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -426,14 +427,14 @@ impl MssqlSink {
         // would be truncated" and broke exactly-once delivery (audit #321 C4).
         // The table / column names are the fixed constants — no user-controlled
         // input in this string.
-        let sql = format!(
+        let sql = tolerate_concurrent_create(&format!(
             "IF OBJECT_ID(N'{tbl}', N'U') IS NULL \
              CREATE TABLE [{tbl}] ([scope] NVARCHAR({w}) PRIMARY KEY, \
              [token] NVARCHAR(MAX) NOT NULL, \
              [updated_at] DATETIME2 DEFAULT SYSUTCDATETIME())",
             tbl = faucet_core::idempotency::COMMIT_TOKEN_TABLE,
             w = SCOPE_COL_WIDTH,
-        );
+        ));
         control(conn, &sql).await
     }
 
@@ -823,6 +824,14 @@ fn build_create_table_sql(
         table_literal.replace('\'', "''"),
         rendered.join(", ")
     ))
+}
+
+/// Wrap an `IF OBJECT_ID(...) IS NULL CREATE TABLE` so a concurrent creator
+/// winning between the probe and the `CREATE` is success, not error 2714
+/// ("There is already an object named …") — two backfill windows or matrix
+/// rows bootstrapping one table at once (#828). Every other error is rethrown.
+fn tolerate_concurrent_create(ddl: &str) -> String {
+    format!("BEGIN TRY {ddl} END TRY BEGIN CATCH IF ERROR_NUMBER() <> 2714 THROW; END CATCH")
 }
 
 /// `sp_rename` of a staging table onto the target's name. `sp_rename` takes the
@@ -1714,6 +1723,17 @@ mod tests {
         assert_eq!(
             mssql_key_keyword(faucet_core::SqlBaseType::Integer),
             mssql_keyword(faucet_core::SqlBaseType::Integer)
+        );
+    }
+
+    #[test]
+    fn concurrent_create_swallows_only_object_exists() {
+        let sql =
+            tolerate_concurrent_create("IF OBJECT_ID(N't', N'U') IS NULL CREATE TABLE [t] (a INT)");
+        assert_eq!(
+            sql,
+            "BEGIN TRY IF OBJECT_ID(N't', N'U') IS NULL CREATE TABLE [t] (a INT) END TRY \
+             BEGIN CATCH IF ERROR_NUMBER() <> 2714 THROW; END CATCH"
         );
     }
 

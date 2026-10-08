@@ -72,7 +72,10 @@ cardinality and never a Prometheus label.
   not create are never deleted). Distinct from `faucet_cleanup_*`, which counts
   destination *rows* removed by [scoped cleanup](../cookbook/upsert.md).
 - **Build:** `faucet_build_info{version}` is set to `1` — `group_left` it onto
-  other metrics to annotate dashboards with the running version.
+  other metrics to annotate dashboards with the running version. `version` is
+  the binary's own version (what `faucet --version` prints); a library
+  application sets its own with `faucet_core::set_build_version`, else the
+  label is `faucet-core`'s version.
 
 ## Reliability properties
 
@@ -156,11 +159,31 @@ to both exporters.
 **Protocol notes:**
 
 - `grpc` uses `tonic` (the default). The `faucet` CLI always runs inside a
-  tokio runtime, so gRPC works without any extra setup.
+  tokio runtime, so gRPC works without any extra setup. `headers` are sent as
+  gRPC metadata (names are lower-cased); an invalid header name or value
+  disables export with a warning.
 - `http` uses HTTP/Protobuf. When `endpoint` does not already end in a
   per-signal path (`/v1/traces`, `/v1/metrics`), faucet appends it
   automatically — point `endpoint` at the base URL of the collector (e.g.
   `http://localhost:4318`) and the right path is added per signal.
+
+Traces are exported whenever `export` lists `traces`, with or without an
+`observability.tracing` level, by `run`, `schedule`, `replicate`/`mirror` and
+the other commands that load a config. `faucet serve` takes no config, so it
+reads the same block from its own file: `faucet serve --otel-config otel.yaml`
+(or `FAUCET_SERVE_OTEL_CONFIG`), a YAML/JSON document shaped like
+`observability.otel` (`${env:…}` / `${file:…}` resolved, header values kept out
+of logs). Traces cover every run the server executes; with `export: [metrics]`
+the metrics `/metrics` serves are also pushed over OTLP.
+
+```yaml
+# otel.yaml
+endpoint: http://otel-collector:4318
+protocol: http
+export: [traces, metrics]
+service_name: faucet-serve
+headers: { authorization: "Bearer ${env:OTLP_TOKEN}" }
+```
 
 **Reliability:** export is best-effort. An unreachable or slow collector
 **never** fails or delays a pipeline run. Export failures increment

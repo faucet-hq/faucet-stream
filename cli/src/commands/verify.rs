@@ -8,7 +8,6 @@ use crate::cli::VerifyArgs;
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
 use crate::verify::{VerifyInputs, VerifyOutcome};
-use chrono::Utc;
 use faucet_core::diff::DifferenceKind;
 
 /// Execute the `verify` subcommand.
@@ -49,7 +48,7 @@ pub async fn run(args: VerifyArgs) -> CliResult<()> {
             pipeline_name,
             execution: cfg.execution.clone(),
             auth,
-            clock: Utc::now().fixed_offset(),
+            clock: crate::commands::run::resolve_run_clock(args.clock.as_deref())?,
         },
     )
     .await?;
@@ -65,9 +64,17 @@ pub async fn run(args: VerifyArgs) -> CliResult<()> {
     } else {
         print!("{}", render_human(&outcome));
     }
+    verdict(&outcome)
+}
+
+/// The command's exit: differing keys, or a scan that stopped before it
+/// covered everything — an incomplete verification is never a pass.
+fn verdict(outcome: &VerifyOutcome) -> CliResult<()> {
     let differences = outcome.differing_keys();
-    if differences > 0 {
-        return Err(CliError::VerifyFailed { differences });
+    if differences > 0 || !outcome.report.equal() {
+        return Err(CliError::VerifyFailed {
+            differences: differences.max(1),
+        });
     }
     Ok(())
 }
@@ -156,6 +163,21 @@ mod tests {
             report,
             dry_run,
         }
+    }
+
+    /// A truncated scan fails the command like the post-run pass does, even
+    /// with no difference found yet (#789 CLI-93).
+    #[test]
+    fn a_truncated_scan_is_not_a_pass() {
+        assert!(verdict(&outcome(VerifyReport::default(), false)).is_ok());
+        let truncated = VerifyReport {
+            truncated: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            verdict(&outcome(truncated, false)),
+            Err(CliError::VerifyFailed { differences: 1 })
+        ));
     }
 
     #[test]

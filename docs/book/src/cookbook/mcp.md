@@ -11,7 +11,10 @@ second front-door onto the operations `faucet serve` already implements. The
 MCP layer adds no pipeline capability — it re-exposes existing,
 schema-introspective surfaces in the shape an agent speaks.
 
-Build with the `mcp` feature (off by default; included in `full`):
+The prebuilt binaries (Homebrew, the `curl | sh` installer and the release
+archives — see [Installation](../getting-started/installation.md)) include it,
+so `faucet mcp` works out of the box. From crates.io it is the `mcp` feature
+(off in the default build; included in `full`):
 
 ```bash
 cargo install faucet-cli --features mcp

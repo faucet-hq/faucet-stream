@@ -37,6 +37,10 @@ pub fn from_records(records: &[RunRecord]) -> (Vec<HistoryRun>, Vec<String>) {
     (runs, active)
 }
 
+/// How many pages of the server's run history `faucet status` scans for one
+/// pipeline's runs.
+const MAX_PAGES: usize = 50;
+
 /// Whether a run record belongs to `pipeline`: its `pipeline` label (set by
 /// `faucet serve` on submit), else its run name.
 pub fn belongs_to(r: &RunRecord, pipeline: &str) -> bool {
@@ -61,19 +65,28 @@ pub async fn read_scoped(
     pipeline: &str,
     tenant: Option<&str>,
 ) -> Result<(Vec<HistoryRun>, Vec<String>), String> {
-    let page = store
-        .list(&ListFilter {
-            limit: HISTORY_LIMIT,
-            tenant: tenant.map(str::to_string),
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    let mine: Vec<RunRecord> = page
-        .runs
-        .into_iter()
-        .filter(|r| belongs_to(r, pipeline))
-        .collect();
+    // Page through the server's runs (newest first) until this pipeline's
+    // recent history is collected: on a busy server its runs can sit far
+    // behind other pipelines' (#789 CLI-167).
+    let mut mine: Vec<RunRecord> = Vec::new();
+    let mut cursor = None;
+    for _ in 0..MAX_PAGES {
+        let page = store
+            .list(&ListFilter {
+                limit: HISTORY_LIMIT,
+                tenant: tenant.map(str::to_string),
+                cursor: cursor.take(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        mine.extend(page.runs.into_iter().filter(|r| belongs_to(r, pipeline)));
+        match page.next_cursor {
+            Some(next) if mine.len() < HISTORY_LIMIT => cursor = Some(next),
+            _ => break,
+        }
+    }
+    mine.truncate(HISTORY_LIMIT);
     Ok(from_records(&mine))
 }
 
@@ -108,6 +121,31 @@ mod tests {
             batches: None,
             source_lag: None,
         }
+    }
+
+    /// A pipeline's runs behind more than one page of other pipelines' runs
+    /// are still found (#789 CLI-167).
+    #[tokio::test]
+    async fn reads_past_other_pipelines_runs() {
+        let store =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(3600));
+        let base = Utc::now() - chrono::Duration::hours(1);
+        let mut mine = record("mine", RunStatus::Completed, vec![inv("a", None, None)]);
+        mine.submitted_at = base;
+        store.upsert(&mine).await.unwrap();
+        for i in 0..(HISTORY_LIMIT + 20) {
+            let mut other = RunRecord::queued(
+                format!("o{i}"),
+                Some("other".into()),
+                Default::default(),
+                None,
+                base + chrono::Duration::seconds(i as i64 + 1),
+            );
+            other.status = RunStatus::Completed;
+            store.upsert(&other).await.unwrap();
+        }
+        let (runs, _) = read(&store, "p").await.unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
     }
 
     #[test]

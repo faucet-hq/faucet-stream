@@ -31,8 +31,10 @@ The composer resolves each stream's write preference against the sink's real
 capabilities (from the connector registry) in order — `overwrite` for a full
 refresh, `upsert` on the declared `primary_keys`, `append` — and fails
 **per stream**, naming both sides, when nothing fits. The pipeline `name` is
-the source template's, so state keys (`{source}::{stream}`) survive a sink
-swap.
+`{source}.{sink}`, so each pairing keeps its own bookmarks
+(`{source}.{sink}::{stream}`) and two destinations fed by one source never
+resume from each other's position; a deployment overlay with
+`state_scope: source` shares them across sinks instead.
 
 The matrix with a copy-paste command for every compatible pairing is generated
 into the docs site:

@@ -217,21 +217,36 @@ pub fn parse_step(s: &str) -> Result<Duration, FaucetError> {
             "window slicing: duration '{s}' must be positive"
         )));
     }
-    Ok(match unit {
-        "s" => Duration::seconds(n),
-        "m" => Duration::minutes(n),
-        "h" => Duration::hours(n),
-        "d" => Duration::days(n),
+    let d = match unit {
+        "s" => Duration::try_seconds(n),
+        "m" => Duration::try_minutes(n),
+        "h" => Duration::try_hours(n),
+        "d" => Duration::try_days(n),
         _ => return Err(err()),
-    })
+    };
+    match d {
+        Some(d) if d <= Duration::days(MAX_DURATION_DAYS) => Ok(d),
+        _ => Err(FaucetError::Config(format!(
+            "window slicing: duration '{s}' exceeds the {MAX_DURATION_DAYS}-day maximum"
+        ))),
+    }
 }
+
+/// The longest `step` / `granularity` / `lookback` accepted (100 years).
+const MAX_DURATION_DAYS: i64 = 36_525;
 
 impl WindowSpec {
     /// Validate the whole spec at config-load time.
     pub fn validate(&self) -> Result<(), FaucetError> {
         parse_step(&self.step)?;
-        if let Some(g) = &self.granularity {
-            parse_step(g)?;
+        if let Some(g) = &self.granularity
+            && parse_step(g)? > parse_step(&self.step)?
+        {
+            return Err(FaucetError::Config(format!(
+                "window slicing: `granularity` ({g}) must not be longer than `step` ({}), or \
+                 every window's upper bound would fall before its start",
+                self.step
+            )));
         }
         if let Some(l) = &self.lookback {
             parse_step(l)?;
@@ -324,7 +339,9 @@ pub fn enumerate_windows(
     max_windows: usize,
 ) -> (Vec<Window>, bool) {
     let mut cur = match lookback {
-        Some(lb) => start - lb,
+        Some(lb) => start
+            .checked_sub_signed(lb)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC),
         None => start,
     };
     let mut out = Vec::new();
@@ -334,7 +351,7 @@ pub fn enumerate_windows(
             truncated = true;
             break;
         }
-        let end = std::cmp::min(cur + step, now);
+        let end = cur.checked_add_signed(step).map_or(now, |e| e.min(now));
         // `parse_step` guarantees a positive step, so `cur + step > cur`; the
         // clamp to `now` also keeps `end > cur` because the loop guard is
         // `cur < now`. This guard is belt-and-braces against a degenerate clock.
@@ -551,6 +568,32 @@ mod tests {
         assert_eq!(spec.lower.template, WINDOW_PLACEHOLDER); // defaulted
         assert_eq!(spec.max_windows, DEFAULT_MAX_WINDOWS); // defaulted
         spec.validate().unwrap();
+    }
+
+    #[test]
+    fn absurd_durations_are_config_errors_not_panics() {
+        assert!(parse_step("9223372036854775807d").is_err());
+        assert!(parse_step("40000d").is_err());
+        assert!(parse_step("36525d").is_ok());
+        let now = Utc::now();
+        let (ws, _) = enumerate_windows(now, now, Duration::days(1), Some(Duration::MAX), 3);
+        assert_eq!(ws.len(), 3);
+        assert_eq!(ws[0].start, DateTime::<Utc>::MIN_UTC);
+        let start = now - Duration::days(2);
+        let (ws, _) = enumerate_windows(start, now, Duration::MAX, None, 10);
+        assert_eq!(ws, vec![Window { start, end: now }]);
+    }
+
+    #[test]
+    fn granularity_must_not_exceed_step() {
+        let mut spec = combined_spec();
+        spec.validate().unwrap();
+        spec.granularity = Some("7d".into());
+        spec.validate()
+            .expect("one granule per window: an inclusive upper bound equal to the start");
+        spec.granularity = Some("8d".into());
+        let err = spec.validate().unwrap_err();
+        assert!(err.to_string().contains("longer than `step`"), "{err}");
     }
 
     fn combined_spec() -> WindowSpec {

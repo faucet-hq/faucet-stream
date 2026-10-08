@@ -65,12 +65,18 @@ faucet run pipeline.yaml --clock 2026-03-01          # backfill: set ${now.*} cl
 faucet run pipeline.yaml --clock 2026-03-01T02:00:00-08:00  # backfill: precise RFC 3339 timestamp
 ```
 
+Stopping a run — SIGTERM (Kubernetes, systemd, `docker stop`), Ctrl-C, or `q`
+under `--tui` — cancels it cooperatively: each row stops at its next page
+boundary and flushes its sink (Parquet footers, multipart uploads, overwrite
+staging), bookmarks stay at the last committed page, and the command exits
+**130**. A second signal exits at once.
+
 Flags:
 
 | Flag | Purpose |
 |------|---------|
 | `--clock <value>` | Override the clock used by `${now.*}` tokens. Accepts an RFC 3339 timestamp (`2026-03-01T00:00:00Z`) or a bare date (`2026-03-01`, treated as midnight UTC). Default: process start time in UTC. Use this for backfills — run the same config with a different date without changing the file. It also bounds the REST source's datetime window slicing and async-job lookback, so a clocked run fetches the windows up to that instant. |
-| `--concurrency <n>` | Override this run's **connector** concurrency — how many concurrent connections/fetches the source and sink may use — whatever the config says. Maps onto whichever knob the connector declares (`max_connections` / `request_concurrency` / `partition_concurrency` / `shard_concurrency` / `concurrency`); a connector with none ignores it. Does **not** change matrix parallelism (`execution.max_concurrent`), and it caps only the *client* side — it cannot raise what the upstream will accept. Must be > 0. |
+| `--concurrency <n>` | Override this run's **connector** concurrency — how many concurrent connections/fetches the source and sink may use — whatever the config says. Maps onto whichever knob the connector declares (`max_connections` / `request_concurrency` / `partition_concurrency` / `shard_concurrency` / `concurrency`); a connector with none ignores it. Does **not** change matrix parallelism (`execution.max_concurrent`), and it caps only the *client* side — it cannot raise what the upstream will accept. Must be > 0. Refused for a topology config (`pipeline.nodes`), as is `--state-path`. |
 | `--profile <name>` | Select a named overlay from the config's `profiles:` block (see [Config composition](config.md#config-composition)). Overrides `FAUCET_PROFILE`. |
 | `--policy <path>` | Evaluate a [data-flow policy](../cookbook/policies.md) file on top of the config's own `policy:` block; a violation refuses the run before any connector is built (exit code = violation count). Also on `validate` / `plan` / `doctor`. |
 | `--env-file <path>` / `--no-env-file` | Same `.env` handling as `validate` / `preview`. |
@@ -85,7 +91,7 @@ Flags:
 | `--source-hub` / `--sink-hub` / `--overlay-hub <hub>` | Look that side up in its own hub (e.g. a private source catalog next to the public sinks). See [`hub`](#hub). |
 | `--trust <owner\|id>` | Let hub templates from that owner (or that template id) use `${env:}` / `${file:}` / secret directives. A template outside `faucet-hq` that reads this machine's environment, files or secrets is refused otherwise — pass credentials to it with `--param` / `--param-env`. Repeatable; `'*'` trusts all. |
 | `--overlay <id\|path>` | With `--source` / `--sink`: apply a `kind: deployment` overlay — state, DLQ, notifications, SLA and other operational blocks — over the composition. A path, or an id under `<hub>/deployments/`. See [Deployment overlays](../cookbook/template-hub.md#deployment-overlays). |
-| `--tui` | Show a live full-screen terminal UI while the pipeline runs: per-invocation source→sink route, records in/out, records/s, errors, DLQ counts, bookmark age, and a scrolling log pane. Press `q` (or `Ctrl-C`) to cancel cooperatively — in-flight invocations stop at their next page boundary and flush their sinks. Requires a binary built with the `cli-tui` feature (`cargo install faucet-cli --features cli-tui`); on a non-TTY stdout (CI, pipes) the flag logs a notice and runs normally. When the config has an `observability.prometheus` block, the `/metrics` endpoint stays up alongside the TUI; OTLP *metrics* export is skipped under `--tui` (traces are unaffected). |
+| `--tui` | Show a live full-screen terminal UI while the pipeline runs: per-invocation source→sink route, records in/out, records/s, errors, DLQ counts, bookmark age, and a scrolling log pane. Press `q` (or `Ctrl-C`) to cancel cooperatively — in-flight invocations stop at their next page boundary and flush their sinks, and the command exits 130. Requires a binary built with the `cli-tui` feature (`cargo install faucet-cli --features cli-tui`); on a non-TTY stdout (CI, pipes) the flag logs a notice and runs normally. When the config has an `observability.prometheus` block, the `/metrics` endpoint stays up alongside the TUI; OTLP *metrics* export is skipped under `--tui` (traces are unaffected). |
 | `--quiet` | Suppress the inline live progress line. |
 | `--force` | Start even though another process holds a row's live run lease. Without it, a row whose lease is live (another `faucet run` / `schedule` process is running it against the same `state:` store) fails with the holder's run id, pid and lease expiry, because two runs would start from the same bookmark and race it. A run that is cancelled or aborted releases its lease as it stops; a run whose process died on this host (same host name and PID namespace, pid no longer running) is taken over without `--force`, and the takeover is logged. A run on another host that crashed keeps its lease until it expires, a minute after it stops renewing. Use `--force` only when that run is known to be gone. Mirror, backfill and other orchestrators fail the whole run on a held lease rather than counting it as one failed table or unit. |
 
@@ -188,6 +194,10 @@ faucet validate pipeline.yaml --json
 Each row's `decision` is `"run"`/`"skip"` when a selector or the readiness ladder
 is active, otherwise `null`. A topology-mode config emits `"mode": "topology"`
 with `nodes`/`edges` counts and any inert-block `warnings`.
+
+In both modes validation is offline: each source/sink config is checked the way
+the connector would read it, but no connector is built — nothing connects to a
+database and no file (a SQLite database, say) is created.
 
 ### Composition flags
 
@@ -582,6 +592,12 @@ misconfiguration surfaces before a real run. For each root invocation it probes
 the source, sink, and state store and prints a green/red checklist with elapsed
 times; the **exit code equals the number of failed probes** (clamped to 255).
 
+Each root's source, sink and state store are built once, and every build and
+check is bounded by `--timeout-secs`. `${now.*}` tokens are rendered with the
+current time, as a run would; a row whose config still carries a
+`${backfill.*}` / `${partition.*}` token is listed as skipped. A probe that
+panics is reported as a failed probe.
+
 - **Sources** reuse the real read path — the probe pulls a single page and stops
   (never the full dataset). Sources whose first page would block or mutate use a
   targeted probe instead: `webhook` (port bindable), `websocket` (TCP connect),
@@ -675,13 +691,16 @@ fail again go to a *fresh* DLQ, never back to the source.
 | `--json` | Emit a JSON result. |
 | `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
 
-**`faucet dlq discard <location>`** — remove processed envelopes.
+**`faucet dlq discard <location>`** — remove processed envelopes from the
+backlog. The DLQ file is never rewritten (a running pipeline may be appending
+to it): discarded envelopes are listed in a `<file>.discarded` sidecar that
+every reader skips.
 
 | Flag | Effect |
 |------|--------|
 | `--reason <r>` | Only discard envelopes with this reason. |
 | `--before <when>` | Only discard envelopes older than an RFC 3339 timestamp or a relative age (`7d` / `24h` / `30m`). |
-| `--delete` | Permanently delete instead of archiving to a `<file>.archived.jsonl` sibling. |
+| `--delete` | Only record the discard, without copying the envelopes to a `<file>.archived` sibling. |
 | `--encryption-key <k>` | Key for a sealed DLQ (repeatable). Kept/archived lines stay sealed verbatim; decryption happens only in memory for filtering. |
 | `--encryption-key-file <path>` | Read a DLQ key from a file (repeatable). `FAUCET_DLQ_ENCRYPTION_KEY` also supplies `--encryption-key`; both keep the key out of `ps` and shell history. Keys are redacted from faucet's output. |
 | `--json` | Emit a JSON result. |
@@ -709,10 +728,13 @@ faucet verify pipeline.yaml --row orders --max-differences 50
 | `--allow-delete` | With `--repair`, also delete rows only the destination has. |
 | `--dry-run` | With `--repair`, plan without writing. |
 | `--max-differences <n>` | Report at most this many differences (the count keeps going). |
+| `--clock <when>` | The `${now.*}` clock the compared run used (RFC 3339 or a date), so a dated destination from an earlier run can be verified. Default: now. |
 | `--json` | Emit the machine-readable report. |
 | `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
 
-Rows are matched on the sink's `key` or `verify.key`; a keyless table is
+A scan that stops early (`max_rows_scanned`, or the report truncated at
+`max_differences`) is not a pass: the command exits non-zero even when no
+difference was found yet. Rows are matched on the sink's `key` or `verify.key`; a keyless table is
 refused. The `verify:` block (see [config](./config.md#verify)) also runs the
 comparison after every successful run. Cookbook: [Content
 verification](../cookbook/verify.md).
@@ -893,6 +915,10 @@ namespace `{name}::…` in the `state:` store(s):
   null bookmark at the sink-safe sequence; `--rewind-token` instead deletes
   the sink's commit token too (sinks that support it: postgres / sqlite /
   mysql).
+- `set` and `reset` take `--legacy-format` to write the pre-versioning bookmark
+  shape during a rolling upgrade while an older cluster member is still
+  running; `PUT` / `DELETE /v1/state` choose it the same way the server's runs
+  do.
 - **`export`** — the versioned document `{version: 1, pipeline, exported_at,
   keys}` (run leases excluded) on stdout or `-o FILE`.
 - **`import`** — restore an export into the config's store, or another with
@@ -922,7 +948,7 @@ faucet catalog datasets --config pipeline.yaml                 # list catalogued
 faucet catalog datasets --config pipeline.yaml --kind csv --q users --json
 faucet catalog show 3f2a9c1e0b7d4a55 --config pipeline.yaml    # detail (id prefix ok)
 faucet catalog lineage --config pipeline.yaml --root 3f2a9c1e0b7d4a55 --depth 3
-faucet catalog annotate 3f2a9c1e --config pipeline.yaml \
+faucet catalog annotate 3f2a9c1e0b7d4a55 --config pipeline.yaml \
   --owner team-bi --consumer revenue-dashboard=dashboard --contact "#bi" --columns amount,currency
 ```
 
@@ -936,11 +962,15 @@ cwd when omitted. `annotate` is the one write: it sets a dataset's owners
 (`--owner`, repeatable; replaces the list) and upserts declared consumers
 (`--consumer NAME[=KIND]`, repeatable, with `--contact` / `--columns` for the
 consumers named in that call; `--replace` drops the unlisted) — what
-[`plan --impact`](#plan) names. The others are read-only.
+[`plan --impact`](#plan) names, and takes the full dataset id (a prefix is
+refused, so a write can never land on the wrong dataset). The others are
+read-only and accept a unique id prefix, matched against every catalogued
+dataset.
 
 ## `usage`
 
-*(requires the `catalog` build feature)*
+*(requires the `catalog` build feature — included in `full`, not in the
+default build or the prebuilt binaries)*
 
 ```bash
 faucet usage [--config PATH] [--since WHEN] [--until WHEN] [--pipeline NAME] \
@@ -1089,10 +1119,10 @@ before it is ever registered. The exit code is the failed-case count, mirroring
 
 ```bash
 faucet hub list      [--hub ./hub] [--sort name|stars|updated] [--json]
-faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--overlay ops/prod.yaml]  # per-stream write modes; exit≠0 if incompatible
+faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--overlay ops/prod.yaml]  # per-stream write modes + typed config validation; exit≠0 if incompatible or invalid
 faucet hub compose   --source faucet-hq/example-rest-api --sink faucet-hq/sqlite [--overlay ops/prod.yaml] --out my-pipeline.yaml
 faucet hub matrix    --format table|markdown|json [--out FILE]
-faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint
+faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint + typed config validation
 faucet hub rows      faucet-hq/example-csv [--sink faucet-hq/jsonl] [--select …] [--state] [--json]  # streams + metadata, or a pipeline file's rows
 faucet run           --source faucet-hq/example-csv --sink faucet-hq/jsonl                   # runs offline
 faucet validate      --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--show-composed]
@@ -1134,7 +1164,12 @@ Fires one **synthetic** event through the config's `notifications:` rules using
 the real delivery path (no pipeline runs) — the fast way to confirm a Slack /
 PagerDuty / webhook channel is wired correctly. `--event` accepts any event
 kind (`run_failure`, `run_success`, `sla_breach`, `circuit_open`,
-`contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`). See the
+`contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`,
+`change_requested`, `budget_exceeded`, `connection_needs_reauth`). The event
+carries the row `faucet-notify-test`, so it never shares a real run's PagerDuty
+dedup key; a failure-class test incident is resolved right after the trigger
+unless `--keep-open`. Exits non-zero when no rule delivered the event or any
+delivery failed. `--profile` / `FAUCET_PROFILE` selects an overlay. See the
 [Notifications](../cookbook/notifications.md) cookbook page.
 
 ## `mirror`
@@ -1237,8 +1272,9 @@ Runs a pipeline on a recurring cron schedule in a **long-running foreground proc
 must contain a top-level `schedule:` block (without one, faucet errors and suggests `faucet run`).
 Requires the `schedule` Cargo feature (included in `full`).
 
-- Stop with Ctrl-C or SIGTERM; the in-flight run drains for up to `shutdown_grace_secs` (default 30)
-  before the process exits.
+- Stop with Ctrl-C or SIGTERM; an in-flight run is cancelled at its next page boundary and flushes
+  for up to `shutdown_grace_secs` (default 30), then the process exits 130 (0 when no run was in
+  flight).
 - `--once` ignores cron timing and runs the pipeline exactly once immediately — handy for testing
   a scheduled config or for one-shot container invocations.
 - Missed ticks are skipped, not backfilled. A run that starts late emits
@@ -1296,6 +1332,7 @@ Selected flags (`faucet serve --help` for the full list):
 | `--preview-local-outputs` | Serve **dataset previews** of the local files this server's sinks wrote — read their first N rows back into the console (env `FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS`). **Off by default**: it returns file *contents* over HTTP, so it is a local-testing convenience. See [Dataset preview](#dataset-preview-of-local-outputs). |
 | `--preview-default-rows <n>` | Rows a preview loads when the request omits `row_count_to_load` — the soft cap (default `500`; env `FAUCET_SERVE_PREVIEW_DEFAULT_ROWS`). `0` = the whole dataset by default. |
 | `--preview-max-rows <n>` | Ceiling on one preview's rows — the hard cap (default `5000`; env `FAUCET_SERVE_PREVIEW_MAX_ROWS`). A larger `row_count_to_load` is clamped to it, never honoured. **`0` lifts the ceiling**, which is what makes `row_count_to_load=all` load an entire dataset. |
+| `--otel-config <path>` | OTLP export for the server: a YAML/JSON file in the shape of a pipeline config's [`observability.otel`](../operations/observability.md) block (env `FAUCET_SERVE_OTEL_CONFIG`). Traces of every run, and with `export: [metrics]` the metrics `/metrics` serves. Requires the `otel` Cargo feature. |
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](./triggers.md). |
 | `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`) and cannot be combined with `--templates-sync`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
@@ -1573,6 +1610,9 @@ faucet migrate --state orders.yaml --row cdc --json
 | `--check` | Report without writing; exits non-zero when a key is not current. |
 | `--row <id>` | Only this matrix row. |
 | `--json` | Machine-readable report (`pipeline`, `check`, `keys[]` with `row`, `key`, `owner`, `action` = `current` / `enveloped` / `migrated` / `refused`, `from_schema`, `to_schema`, `detail`). |
+| `--force` | Rewrite even while a run holds a row's lease (only when that run is gone). Without it a live run makes the command fail, so a bookmark the run persists is never overwritten with the older one. |
+| `--profile <name>` | Select a `profiles:` overlay (also `FAUCET_PROFILE`), so the deployed state store is the one migrated. |
+| `--env-file <path>` / `--no-env-file` | The `.env` used for `${env:…}` in the config. |
 
 A key this release cannot read (written by a newer faucet, or by another
 source) is reported as `refused`, left untouched, and makes the command exit
@@ -1609,7 +1649,7 @@ faucet fmt pipeline.yaml --stdout   # print, don't write
 faucet fmt pipeline.yaml --check    # exit non-zero if not already canonical (CI)
 ```
 
-Comments are not preserved (the file is parsed and re-serialized).
+Comments are not preserved (the file is parsed and re-serialized); `!include` tags are kept, the output is the same from every build, and the file is replaced atomically.
 
 ## `explain`
 
@@ -1666,12 +1706,18 @@ The ledger of outputs lives in the config's `catalog:` store — the same one
 `faucet run` / `schedule` / `mirror` record into and `faucet serve --history`
 browses — so `--store` can point at a server's store directly.
 
+**Which pipeline's outputs.** With a config, every scope except `--output` is
+limited to that config's pipeline (its `name:`, else the file stem) — other
+pipelines sharing the store keep their files and their own retention.
+`--pipeline <name>` names another one; with `--store` and no `--pipeline`, the
+sweep covers every pipeline in the ledger.
+
 **`--retention-days` vs `--older-than-days`** — easy to conflate, and they do
 different things:
 
 | Flag | Kind | Meaning |
 |---|---|---|
-| `--retention-days <n>` | *policy* | The window the bare (expired-only) sweep measures against, overriding the config's `local_outputs.retention_days`. Reads `FAUCET_LOCAL_SINK_OUTPUT_RETENTION_DAYS` when unset, so it matches the `faucet serve` default. `0` = keep forever. Per-pipeline overrides still apply. |
+| `--retention-days <n>` | *policy* | The window the bare (expired-only) sweep measures against, overriding the config's `local_outputs.retention_days`. Reads `FAUCET_LOCAL_SINK_OUTPUT_RETENTION_DAYS` when unset, so it matches the `faucet serve` default. `0` = keep forever. It applies only to outputs that recorded no window of their own: a run that recorded `local_outputs.retention_days` keeps that window (use `--older-than-days` to purge regardless). |
 | `--older-than-days <n>` | *scope* | Selects everything older than `n` days **ignoring every retention setting**, including per-pipeline overrides. `0` matches every output and needs `--yes`. |
 
 So `--retention-days 3` means "treat 3 days as this store's policy and collect

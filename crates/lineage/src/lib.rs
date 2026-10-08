@@ -17,7 +17,7 @@ pub mod transport;
 
 pub use column::{ColumnLineage, ColumnOp, derive as derive_column_lineage};
 pub use config::{EmitOn, HttpAuth, LineageConfig, ParentJob, Transport};
-pub use emitter::LineageEmitter;
+pub use emitter::{HeartbeatGuard, LineageEmitter};
 pub use event::{EventType, RunEvent};
 pub use lifecycle::{DatasetRef, InferredSchema, RunLifecycle};
 pub use sampling::{SampleState, SamplingSink, SamplingSource};

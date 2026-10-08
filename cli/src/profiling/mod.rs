@@ -145,7 +145,19 @@ pub async fn evaluate_post_run(
         );
     }
     let mut persisted = false;
-    if let Some(s) = store {
+    // A run `on_drift: fail` rejects stays out of the baseline: folding it in
+    // would let retries of the same anomaly widen the baseline until it
+    // passes. Accepting the new shape is explicit (`faucet profiling reset`).
+    let rejected = spec.on_drift == OnProfileDrift::Fail && !drift.is_empty();
+    if rejected {
+        tracing::info!(
+            pipeline,
+            row,
+            "profile drift failed the run; its profile is kept out of the baseline \
+             (`faucet profiling reset` accepts a planned change)"
+        );
+    }
+    if let Some(s) = store.filter(|_| !rejected) {
         history.record(
             ProfileRecord {
                 run_id: run_id.to_string(),
@@ -208,7 +220,7 @@ async fn roots(
     pipeline_name: &str,
     row: Option<&str>,
 ) -> CliResult<Vec<(ExpandedNode, Arc<dyn StateStore>, String)>> {
-    let nodes = expand(cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(cfg).await?)?;
     let selected: Vec<&ExpandedNode> = nodes
         .iter()
         .filter(|n| matches!(n.role, NodeRole::Root) && row.is_none_or(|r| n.id == r))
@@ -437,6 +449,65 @@ mod tests {
         assert!(
             !history.latest().unwrap().drift.is_empty(),
             "the drift is stored with the run"
+        );
+    }
+
+    /// Under `on_drift: fail` a drifting run's profile never joins the
+    /// baseline, so a retried anomaly keeps failing (#789 CLI-173).
+    #[tokio::test]
+    async fn a_failing_drift_stays_out_of_the_baseline() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let spec = ProfilingSpec {
+            min_history: 3,
+            on_drift: OnProfileDrift::Fail,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            evaluate_post_run(
+                &spec,
+                Some(&store),
+                "p::r",
+                "p",
+                "r",
+                &format!("ok{i}"),
+                stable(i),
+                Utc::now(),
+            )
+            .await;
+        }
+        let nulls = || {
+            profile(
+                &(0..100u64)
+                    .map(|i| json!({"a": if i % 2 == 0 { Value::Null } else { json!(1.0) }, "c": "x"}))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for attempt in 0..3 {
+            let o = evaluate_post_run(
+                &spec,
+                Some(&store),
+                "p::r",
+                "p",
+                "r",
+                &format!("bad{attempt}"),
+                nulls(),
+                Utc::now(),
+            )
+            .await;
+            assert!(o.fails_run(&spec), "attempt {attempt}: {:?}", o.drift);
+            assert!(!o.persisted);
+        }
+        let history = ProfileHistory::from_value(
+            store
+                .get(&profiling_state_key("p::r"))
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            history.runs.len(),
+            3,
+            "only the healthy runs are the baseline"
         );
     }
 

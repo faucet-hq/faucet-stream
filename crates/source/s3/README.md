@@ -64,8 +64,8 @@ pipeline:
       connection_url: postgres://user:pass@localhost/warehouse
       table_name: events_raw
       column_mapping:
-        type: jsonb
-        column: payload
+        jsonb:
+          column: payload
 ```
 
 ```bash
@@ -93,7 +93,9 @@ finished: scratch objects (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`,
 | `region` | string | *(SDK chain)* | AWS region. `None` defers to the SDK default (env vars, profile, or instance metadata). |
 | `endpoint_url` | string | *(none)* | Custom endpoint URL for S3-compatible services (MinIO, LocalStack, R2). |
 | `file_format` | enum | `json_lines` | How object bodies are parsed — `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx`. See below. |
+| `include` | string | *(unset)* | Glob over the whole object key selecting what to read (e.g. `exports/*.parquet`). Without it, zero-byte folder markers and keys with a `_`- or `.`-prefixed segment below the prefix (`_SUCCESS`, `_temporary/…`, `.crc`) are skipped; with it, exactly the matching keys are read. |
 | `max_objects` | int | *(all)* | Cap on the number of objects read. `None` reads every matching object. |
+| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may reach; a larger one fails the run instead of exhausting memory. |
 | `concurrency` | int | `10` | Maximum number of objects fetched concurrently. Clamped to `≥ 1` at runtime. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. See [Streaming & batching](#streaming--batching). Rejected above `MAX_BATCH_SIZE` (1,000,000) by `faucet_core::validate_batch_size`. |
 | `compression` | enum | `auto` | *(requires the `compression` feature)* Per-object decompression codec — `none` / `gzip` / `zstd` / `auto`. |
@@ -253,7 +255,7 @@ Behaviour by format:
 
 > **Memory ceiling — `raw_text` / `json_array`.** Both formats hold one whole decoded object in memory at a time (inherent: `raw_text`'s record *is* the file, and a JSON array isn't valid until its closing `]`). Because objects are fetched concurrently, peak memory is roughly **`concurrency` × (largest object's decoded size)**, not `batch_size`. For large `raw_text` / `json_array` objects, lower `concurrency` to cap peak memory, or re-emit the data as `json_lines` upstream so it streams line-by-line.
 
-> **Parquet streams row groups.** A `file_format: parquet` object is read over byte ranges — its footer locates every row group, so peak memory is one Arrow batch (capped at `batch_size`), not the object. Two settings fall back to reading the whole object, because each is a guarantee worth more than the memory saving: `verify_checksum: true` (the checksum covers the whole object, so verifying it means streaming all of it) and a resolved `compression` codec (a compressed member is not randomly addressable). Records are identical either way.
+> **Parquet streams row groups.** A `file_format: parquet` object is read over byte ranges — its footer locates every row group, so peak memory is one Arrow batch (capped at `batch_size`), not the object. Two settings fall back to reading the whole object, because each is a guarantee worth more than the memory saving: `verify_checksum: true` (the checksum covers the whole object, so verifying it means streaming all of it) and a resolved `compression` codec (a compressed member is not randomly addressable). Records are identical either way. Every range read is pinned to its version (or, on an unversioned bucket, its ETag as an `If-Match` precondition) as the first metadata read saw it, so an object replaced mid-read fails the run instead of mixing row groups from two versions.
 
 
 The S3 source has **no incremental-replication mode** today, so every emitted page carries `bookmark: None`. It does not implement resume/state, effectively-once, write modes, or a dead-letter queue (those are sink- or CDC-source-specific capabilities).

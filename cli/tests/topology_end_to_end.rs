@@ -230,6 +230,75 @@ pipeline:
         .stdout(contains("2 node(s), 1 edge(s) — valid"));
 }
 
+/// #844: `validate --no-secrets` on a topology is offline — it checks each
+/// node's connector config without building the connector, so an unreachable
+/// Postgres host is never resolved and a SQLite database file is never created.
+#[cfg(all(feature = "sink-postgres", feature = "sink-sqlite"))]
+#[test]
+fn validate_builds_no_sink_connector() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let db = dir.path().join("fresh.db");
+    let cfg = dir.path().join("faucet.yaml");
+    write(
+        &cfg,
+        &format!(
+            r#"version: 1
+name: offline_validate
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    pg:
+      type: postgres
+      config:
+        connection_url: postgres://u:p@faucet-844.invalid:5432/db
+        table_name: orders
+        column_mapping: auto_map
+    lite:
+      type: sqlite
+      config:
+        database_url: "sqlite:{db}?mode=rwc"
+        table_name: orders
+        column_mapping: auto_map
+  nodes:
+    s: {{ kind: source, ref: o }}
+    t: {{ kind: tee }}
+    a: {{ kind: sink, ref: pg }}
+    b: {{ kind: sink, ref: lite }}
+  edges:
+    - {{ from: s, to: t }}
+    - {{ from: t, to: a }}
+    - {{ from: t, to: b }}
+"#,
+            csv = csv.display(),
+            db = db.display(),
+        ),
+    );
+
+    let started = std::time::Instant::now();
+    Command::cargo_bin("faucet")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["validate", "--no-secrets", "--no-env-file"])
+        .arg(&cfg)
+        .assert()
+        .success()
+        .stdout(contains("4 node(s), 3 edge(s) — valid"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "validation took {:?} — it must not wait on the network",
+        started.elapsed()
+    );
+    assert!(!db.exists(), "validate created the SQLite database file");
+    let leftovers: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "orders.csv" && n != "faucet.yaml")
+        .collect();
+    assert!(leftovers.is_empty(), "validate wrote files: {leftovers:?}");
+}
+
 #[test]
 fn preview_prints_source_records() {
     let dir = TempDir::new().unwrap();
@@ -543,10 +612,11 @@ pipeline:
         "{err}"
     );
     assert_eq!(summary.invocations[0].row_id, "w");
+    // The failing run stays out of the baseline (#789 CLI-173).
     let history =
         faucet_cli::profiling::ProfileHistory::from_value(store.get(&key).await.unwrap().unwrap());
-    assert_eq!(history.runs.len(), 3);
-    assert!(!history.latest().unwrap().drift.is_empty());
+    assert_eq!(history.runs.len(), 2);
+    assert!(history.latest().unwrap().drift.is_empty());
 
     // A preview never touches the baseline.
     let auth = build_auth_catalog(None).unwrap();
@@ -562,7 +632,7 @@ pipeline:
     .unwrap();
     let history =
         faucet_cli::profiling::ProfileHistory::from_value(store.get(&key).await.unwrap().unwrap());
-    assert_eq!(history.runs.len(), 3);
+    assert_eq!(history.runs.len(), 2);
 }
 
 #[tokio::test]
@@ -1499,4 +1569,119 @@ pipeline:
         vec![1, 2],
         "per-source volume, not the sink total: {edges:?}"
     );
+}
+
+/// #789 CLI-85: a sink node failed by `profiling.on_drift: fail` is not
+/// catalogued as a successful run (its profile still is).
+#[tokio::test]
+#[cfg(all(feature = "catalog", feature = "serve-history-sqlite"))]
+async fn a_node_failed_by_profile_drift_is_not_catalogued_as_a_run() {
+    let dir = TempDir::new().unwrap();
+    let csv = dir.path().join("orders.csv");
+    let out = dir.path().join("o.jsonl");
+    let state = dir.path().join("state");
+    let store = dir.path().join("catalog.db");
+    let config = |on_drift: &str| {
+        parse(&format!(
+            r#"version: 1
+name: topo_prof_cat
+catalog: {{ url: "sqlite:{store}" }}
+profiling: {{ min_history: 2, window: 5, on_drift: {on_drift} }}
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: jsonl, config: {{ path: {out}, append: false }} }}
+  state: {{ type: file, config: {{ path: {state} }} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+            csv = csv.display(),
+            out = out.display(),
+            state = state.display(),
+            store = store.display()
+        ))
+    };
+    let auth = build_auth_catalog(None).unwrap();
+    for _ in 0..2 {
+        write(&csv, "id,country\n1,US\n2,US\n3,IN\n4,DE\n");
+        let s = faucet_cli::topology::run_topology(&config("warn"), &auth, Default::default())
+            .await
+            .unwrap();
+        assert!(!s.had_failures(), "{s:?}");
+    }
+    write(&csv, "id,country\n1,BR\n2,BR\n3,BR\n4,BR\n");
+    let s = faucet_cli::topology::run_topology(&config("fail"), &auth, Default::default())
+        .await
+        .unwrap();
+    assert!(s.had_failures(), "{s:?}");
+
+    let cfg = config("warn");
+    let handle = faucet_cli::catalog::connect_from_spec(cfg.catalog.as_ref().unwrap())
+        .await
+        .unwrap();
+    let page = handle
+        .store
+        .catalog_list_datasets(&faucet_cli::serve::history::catalog::CatalogListFilter {
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let sink = page
+        .datasets
+        .iter()
+        .find(|d| d.uri.ends_with("o.jsonl"))
+        .expect("sink dataset");
+    assert_eq!(sink.runs, 2, "the drift-failed run is not counted");
+}
+
+/// #789 CLI-81: a topology `--dry-run` writes no dead letters.
+#[tokio::test]
+#[cfg(feature = "contract")]
+async fn a_topology_dry_run_writes_no_dead_letters() {
+    let dir = TempDir::new().unwrap();
+    let csv = dir.path().join("in.csv");
+    write(&csv, "status\nopen\nweird\n");
+    let out = dir.path().join("o.jsonl");
+    let dlq = dir.path().join("dlq.jsonl");
+    let cfg = parse(&format!(
+        r#"version: 1
+name: topo_dry_dlq
+pipeline:
+  source: {{ type: csv, config: {{ path: {csv} }} }}
+  sink: {{ type: jsonl, config: {{ path: {out} }} }}
+  dlq: {{ sink: {{ type: jsonl, config: {{ path: {dlq} }} }} }}
+  contract:
+    version: "1"
+    on_breach: quarantine
+    fields:
+      - {{ name: status, type: string, enum: [open] }}
+  nodes:
+    s: {{ kind: source }}
+    w: {{ kind: sink }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+        csv = csv.display(),
+        out = out.display(),
+        dlq = dlq.display()
+    ));
+    let auth = build_auth_catalog(None).unwrap();
+    let summary = faucet_cli::topology::run_topology(
+        &cfg,
+        &auth,
+        faucet_cli::topology::TopologyRunOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    assert!(!dlq.exists(), "a preview must not write the DLQ");
+    assert!(!out.exists());
 }

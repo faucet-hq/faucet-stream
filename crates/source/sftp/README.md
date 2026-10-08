@@ -20,12 +20,16 @@ Connection, authentication, and host-key verification come from
 | `port` | integer | `22` | Server port. |
 | `username` | string | — | SSH username. |
 | `type` / `config` | auth | — | `password` or `private_key` (see `faucet-common-sftp`). |
-| `known_hosts` | policy | `{ mode: accept_new }` | Host-key verification policy. |
+| `known_hosts` | policy | `{ mode: accept_new }` | Host-key verification policy. Wildcard host patterns and `@revoked` keys are honoured; a host trusted only through `@cert-authority` is refused (host certificates are not supported). |
+| `connect_timeout_secs` | integer | `30` | Seconds the TCP connect, SSH handshake and authentication together may take; a server that accepts and stalls fails the run. |
+| `keepalive_interval_secs` | integer | `15` | Seconds between SSH keepalives on a quiet connection; dropped after three unanswered. `0` disables them. |
 | `path` | string | — | Remote directory to list, or a single file. |
 | `glob` | string | none | Filename glob (`*` / `?`) applied to basenames when `path` is a directory. |
 | `format` | enum | `jsonl` | `jsonl` \| `json_array` \| `raw_text` \| `csv` \| `xml` \| `xlsx`. |
 | `batch_size` | integer | `1000` | Records per page; `0` = one page per file. |
 | `concurrency` | integer | `4` | Files read concurrently. The prefetch is ordered, so records stay in listing order and a failing file is still blamed at its own position; `0` is clamped to 1. Lower than the object-store sources' default because every read shares one SSH channel. For `jsonl` it overlaps only the `open` round-trip (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole files are resident. |
+
+Symlinks are followed: a link to a file is read, a link to a directory is skipped.
 
 `raw_text` emits one record per file: `{ "path": <remote path>, "content": <file text> }`.
 

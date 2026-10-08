@@ -133,6 +133,23 @@ pub struct SftpConnectionConfig {
     /// Host-key verification policy (default: `accept_new`).
     #[serde(default)]
     pub known_hosts: HostKeyPolicy,
+    /// Seconds the TCP connect, SSH handshake and authentication together may
+    /// take (default 30). A server that accepts and then stalls fails the run
+    /// instead of hanging it.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Seconds between SSH keepalives on a quiet connection (default 15); the
+    /// connection is dropped after three go unanswered. `0` disables them.
+    #[serde(default = "default_keepalive_interval_secs")]
+    pub keepalive_interval_secs: u64,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    30
+}
+
+fn default_keepalive_interval_secs() -> u64 {
+    15
 }
 
 impl SftpConnectionConfig {
@@ -150,6 +167,18 @@ impl SftpConnectionConfig {
                 password: password.into(),
             },
             known_hosts: HostKeyPolicy::default(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            keepalive_interval_secs: default_keepalive_interval_secs(),
+        }
+    }
+
+    /// The russh client settings: keepalives, dropped after three misses.
+    fn ssh_config(&self) -> russh::client::Config {
+        russh::client::Config {
+            keepalive_interval: (self.keepalive_interval_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.keepalive_interval_secs)),
+            keepalive_max: 3,
+            ..Default::default()
         }
     }
 
@@ -220,6 +249,19 @@ impl russh::client::Handler for ClientHandler {
                 Ok(true)
             }
             HostKeyPolicy::Strict { known_hosts_path } => {
+                let extras = known_hosts_extras(
+                    known_hosts_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from)
+                        .or_else(default_known_hosts_path)
+                        .as_deref(),
+                    &self.host,
+                    self.port,
+                );
+                extras.refuse_revoked(&self.host, self.port, server_public_key)?;
+                if extras.wildcard_keys.contains(server_public_key) {
+                    return Ok(true);
+                }
                 let found = match known_hosts_path {
                     Some(path) => russh::keys::check_known_hosts_path(
                         &self.host,
@@ -234,6 +276,12 @@ impl russh::client::Handler for ClientHandler {
                 .map_err(|e| HandlerError::HostKey(format!("known_hosts lookup failed: {e}")))?;
                 if found {
                     Ok(true)
+                } else if extras.cert_authority {
+                    Err(HandlerError::HostKey(format!(
+                        "known_hosts trusts a @cert-authority for {}:{}, but host certificates \
+                         are not supported; list the host key itself",
+                        self.host, self.port
+                    )))
                 } else {
                     Err(HandlerError::HostKey(format!(
                         "host key for {}:{} is not present in known_hosts (strict policy)",
@@ -299,11 +347,20 @@ fn accept_new_at(
     presented: &russh::keys::PublicKey,
     path: &std::path::Path,
 ) -> Result<bool, HandlerError> {
-    let recorded: Vec<_> = russh::keys::known_hosts::known_host_keys_path(host, port, path)
+    let extras = known_hosts_extras(Some(path), host, port);
+    extras.refuse_revoked(host, port, presented)?;
+    let mut recorded: Vec<_> = russh::keys::known_hosts::known_host_keys_path(host, port, path)
         .map_err(|e| HandlerError::HostKey(format!("known_hosts lookup failed: {e}")))?
         .into_iter()
         .map(|(_, key)| key)
         .collect();
+    recorded.extend(extras.wildcard_keys);
+    if extras.cert_authority && !recorded.contains(presented) {
+        return Err(HandlerError::HostKey(format!(
+            "known_hosts trusts a @cert-authority for {host}:{port}, but host certificates are \
+             not supported, so the key will not be learned; list the host key itself"
+        )));
+    }
     match accept_new_decision(&recorded, presented) {
         AcceptNewDecision::Known => Ok(true),
         AcceptNewDecision::Learn => {
@@ -329,6 +386,101 @@ fn accept_new_at(
             path.display()
         ))),
     }
+}
+
+/// The known_hosts entries russh's reader skips, for one `host:port`:
+/// `@revoked` keys, `@cert-authority` lines and wildcard host patterns.
+#[derive(Debug, Default)]
+struct KnownHostsExtras {
+    revoked: Vec<russh::keys::PublicKey>,
+    cert_authority: bool,
+    wildcard_keys: Vec<russh::keys::PublicKey>,
+}
+
+impl KnownHostsExtras {
+    fn refuse_revoked(
+        &self,
+        host: &str,
+        port: u16,
+        presented: &russh::keys::PublicKey,
+    ) -> Result<(), HandlerError> {
+        if self.revoked.contains(presented) {
+            return Err(HandlerError::HostKey(format!(
+                "the {} key presented by {host}:{port} is marked @revoked in known_hosts",
+                presented.algorithm()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn known_hosts_extras(path: Option<&std::path::Path>, host: &str, port: u16) -> KnownHostsExtras {
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| scan_known_hosts(&text, host, port))
+        .unwrap_or_default()
+}
+
+fn scan_known_hosts(text: &str, host: &str, port: u16) -> KnownHostsExtras {
+    let name = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let mut out = KnownHostsExtras::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(first) = fields.next() else { continue };
+        let (marker, hosts) = match first.strip_prefix('@') {
+            Some(m) => (Some(m), fields.next()),
+            None => (None, Some(first)),
+        };
+        let (Some(hosts), Some(_kind), Some(key)) = (hosts, fields.next(), fields.next()) else {
+            continue;
+        };
+        if !hosts_match(hosts, &name) {
+            continue;
+        }
+        let parsed = russh::keys::parse_public_key_base64(key).ok();
+        match (marker, parsed) {
+            (Some("revoked"), Some(k)) => out.revoked.push(k),
+            (Some("cert-authority"), _) => out.cert_authority = true,
+            (None, Some(k)) if hosts.contains(['*', '?']) => out.wildcard_keys.push(k),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// OpenSSH host-pattern matching: comma-separated `*` / `?` globs, and a
+/// matching `!pattern` excludes the host outright.
+fn hosts_match(patterns: &str, name: &str) -> bool {
+    let mut hit = false;
+    for p in patterns.split(',') {
+        match p.strip_prefix('!') {
+            Some(neg) if wildmatch(neg, name) => return false,
+            Some(_) => {}
+            None if wildmatch(p, name) => hit = true,
+            None => {}
+        }
+    }
+    hit
+}
+
+fn wildmatch(pattern: &str, name: &str) -> bool {
+    fn go(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => go(&p[1..], s) || (!s.is_empty() && go(p, &s[1..])),
+            (Some(b'?'), Some(_)) => go(&p[1..], &s[1..]),
+            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => go(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    go(pattern.as_bytes(), name.as_bytes())
 }
 
 /// Open an SSH transport to the configured server, authenticate, verify the
@@ -444,7 +596,27 @@ async fn probe_posix_rename(
 async fn authenticate(
     cfg: &SftpConnectionConfig,
 ) -> Result<russh::client::Handle<ClientHandler>, FaucetError> {
-    let config = Arc::new(russh::client::Config::default());
+    let limit = std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1));
+    tokio::time::timeout(limit, authenticate_unbounded(cfg))
+        .await
+        .map_err(|_| {
+            FaucetError::Custom(
+                format!(
+                    "SFTP connect to {}:{} did not finish the SSH handshake and \
+                     authentication within {}s (connect_timeout_secs)",
+                    cfg.host,
+                    cfg.port,
+                    limit.as_secs()
+                )
+                .into(),
+            )
+        })?
+}
+
+async fn authenticate_unbounded(
+    cfg: &SftpConnectionConfig,
+) -> Result<russh::client::Handle<ClientHandler>, FaucetError> {
+    let config = Arc::new(cfg.ssh_config());
     let handler = ClientHandler {
         policy: cfg.known_hosts.clone(),
         host: cfg.host.clone(),
@@ -735,6 +907,128 @@ mod tests {
             err.to_string().contains("failed to record new host key"),
             "{err}"
         );
+    }
+
+    fn body(s: &str) -> &str {
+        s.split_whitespace().nth(1).unwrap()
+    }
+
+    #[test]
+    fn known_hosts_markers_and_wildcards_are_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let (a, b) = (key(ED25519_A), key(ED25519_B));
+
+        std::fs::write(
+            &path,
+            format!("@revoked sftp.example ssh-ed25519 {}\n", body(ED25519_A)),
+        )
+        .unwrap();
+        let err = accept_new_at("sftp.example", 22, &a, &path).unwrap_err();
+        assert!(err.to_string().contains("@revoked"), "{err}");
+
+        std::fs::write(
+            &path,
+            format!(
+                "# pinned\n*.example,!skip.example ssh-ed25519 {}\n",
+                body(ED25519_B)
+            ),
+        )
+        .unwrap();
+        assert!(accept_new_at("sftp.example", 22, &b, &path).unwrap());
+        let err = accept_new_at("sftp.example", 22, &a, &path).unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert!(
+            accept_new_at("skip.example", 22, &a, &path).unwrap(),
+            "negated → learned"
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "@cert-authority *.example ssh-ed25519 {}\n",
+                body(ED25519_B)
+            ),
+        )
+        .unwrap();
+        let err = accept_new_at("sftp.example", 22, &a, &path).unwrap_err();
+        assert!(err.to_string().contains("cert-authority"), "{err}");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(body(ED25519_A))
+        );
+
+        assert!(hosts_match("[h?st]:2222", "[host]:2222"));
+        assert!(!hosts_match("other", "host"));
+        assert!(wildmatch("SFTP.*", "sftp.example"));
+        assert!(!wildmatch("a?", "a"));
+        let extras = scan_known_hosts("@revoked\nhost ssh-ed25519\n@bogus host t k\n", "host", 22);
+        assert!(extras.revoked.is_empty() && !extras.cert_authority);
+    }
+
+    #[tokio::test]
+    async fn strict_policy_rejects_revoked_and_accepts_wildcard_keys() {
+        use russh::client::Handler as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(
+            &path,
+            format!(
+                "sftp.example ssh-ed25519 {a}\n@revoked sftp.example ssh-ed25519 {a}\n*.wild ssh-ed25519 {b}\n@cert-authority ca.host ssh-ed25519 {b}\n",
+                a = body(ED25519_A),
+                b = body(ED25519_B)
+            ),
+        )
+        .unwrap();
+        let handler = |host: &str| ClientHandler {
+            policy: HostKeyPolicy::Strict {
+                known_hosts_path: Some(path.to_string_lossy().into_owned()),
+            },
+            host: host.into(),
+            port: 22,
+        };
+        let err = handler("sftp.example")
+            .check_server_key(&key(ED25519_A))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("@revoked"), "{err}");
+        assert!(
+            handler("a.wild")
+                .check_server_key(&key(ED25519_B))
+                .await
+                .unwrap()
+        );
+        let err = handler("ca.host")
+            .check_server_key(&key(ED25519_A))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cert-authority"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let mut cfg = SftpConnectionConfig::with_password("127.0.0.1", "u", "p").port(port);
+        cfg.connect_timeout_secs = 1;
+        let started = std::time::Instant::now();
+        let err = connect(&cfg).await.err().expect("a timeout");
+        assert!(err.to_string().contains("connect_timeout_secs"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        hold.abort();
+        let ssh = cfg.ssh_config();
+        assert_eq!(
+            ssh.keepalive_interval,
+            Some(std::time::Duration::from_secs(15))
+        );
+        cfg.keepalive_interval_secs = 0;
+        assert_eq!(cfg.ssh_config().keepalive_interval, None);
     }
 
     #[test]

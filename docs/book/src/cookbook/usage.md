@@ -46,7 +46,10 @@ A run that was rate limited appends what it cost in time:
 `faucet run --output json` carries the full record under each row's `usage`,
 and a `faucet serve` run record does the same under each invocation.
 
-`faucet usage` aggregates what the catalog store holds:
+`faucet usage` aggregates what the catalog store holds. It is part of the
+`catalog` build feature, which the prebuilt binaries and the default
+`cargo install faucet-cli` leave out — install with
+`cargo install faucet-cli --features catalog` (or `full`) to get it:
 
 ```bash
 faucet usage --config pipeline.yaml                  # by pipeline, all time
@@ -72,6 +75,14 @@ keeps one). The same report is
 `include_records`; `UsageRead`, viewer and up) and the **Usage** page of the
 web console.
 
+At most `--limit` (default 5000) of the newest invocations are read. When the
+window holds more, the report says so (a WARNING line; `truncated: true` in
+JSON) — raise `--limit` or narrow the window. Runs priced in different
+currencies (a server running configs with different `usage.pricing.currency`)
+are never summed together: each row key ends in its currency (`orders [EUR]`),
+`currency` is `mixed`, and the report prints one total per currency
+(`currency_totals` in JSON).
+
 ## Pricing
 
 Estimates use the `usage:` block's pricing table. Every rate has a shipped
@@ -80,7 +91,7 @@ apply to your deployment:
 
 ```yaml
 usage:
-  pricing_file: ./pricing.yaml         # optional, merged under the inline table
+  pricing_file: ./pricing.yaml         # optional, merged under the inline table (relative to the config file)
   pricing:
     currency: EUR
     egress_per_gb: 0.09                # bytes read, when source and sink are not both local files
@@ -139,7 +150,9 @@ budget:
 
 `faucet run --max-records N --max-bytes B --max-duration-secs S --allowed-sink
 X` merges with the config's block — the stricter of each ceiling and the
-intersection of the sink lists. A budget applies to every runtime (`run`,
+intersection of the sink lists (a sink template on one side matches its
+connector kind on the other). Two lists with nothing in common allow **no**
+sink, so the run is refused rather than left unrestricted. A budget applies to every runtime (`run`,
 `schedule`, `serve`); a backfill is bounded by its window instead. The
 verdict is `FaucetError::BudgetExceeded` (error kind `budget_exceeded`,
 `InvocationErrorKind::BudgetExceeded` on the outcome). `faucet schema budget`

@@ -56,7 +56,8 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
     // guessing would be wrong either way (#610).
     if args.concurrency == Some(0) {
         return Err(CliError::Config(
-            "--concurrency must be greater than 0 (it is a connection/fetch count,              not a `0 = unlimited` sentinel)"
+            "--concurrency must be greater than 0 (it is a connection/fetch count, \
+             not a `0 = unlimited` sentinel)"
                 .into(),
         ));
     }
@@ -131,7 +132,7 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
                     .into(),
             ));
         }
-        crate::env_config::from_process_env()?
+        Box::pin(crate::env_config::load_from_process_env()).await?
     } else {
         // Typed run params (#444): `--param name=value` / `--param-env NAME[=V]`
         // are bound before the typed parse, so `${param.*}` never reaches a
@@ -204,6 +205,7 @@ pub(crate) async fn execute(
     #[cfg(feature = "cli-tui")]
     let tui_active = crate::tui::is_tui_session(args.tui);
     #[cfg(not(feature = "cli-tui"))]
+    #[cfg_attr(not(feature = "cli-progress"), allow(unused_variables))]
     let tui_active = false;
 
     // Exactly one observability install. A live view (the full-screen `--tui`
@@ -263,6 +265,12 @@ pub(crate) async fn execute(
         if crate::select::SelectionRequest::from_flags(&args.selection)?.is_some() {
             return Err(CliError::Config(crate::select::TOPOLOGY_REFUSAL.into()));
         }
+        if let Some(flag) = topology_refused_flag(&args) {
+            return Err(CliError::Config(format!(
+                "{flag} does not apply to a topology config (`pipeline.nodes`): the graph keeps \
+                 its own `state:` store and runs every node concurrently — remove the flag"
+            )));
+        }
         #[cfg(feature = "policy")]
         if let Some(spec) = cfg.policy.as_ref() {
             let report = crate::policy::evaluate_topology(spec, &cfg)?;
@@ -273,15 +281,16 @@ pub(crate) async fn execute(
             }
         }
         let started_at = Utc::now();
+        let stop = StopSignal::install();
         let summary = crate::topology::run_topology(
             &cfg,
             &auth,
             crate::topology::TopologyRunOptions {
-                cancel: None,
+                cancel: Some(stop.token()),
                 dry_run: args.dry_run,
                 limit: args.limit,
                 clock: Some(resolve_run_clock(args.clock.as_deref())?),
-                budget: crate::budget::effective_budget(
+                budget: crate::budget::effective_budget_with_kinds(
                     cfg.budget.as_ref(),
                     crate::budget::BudgetFlags {
                         max_records: args.max_records,
@@ -290,6 +299,7 @@ pub(crate) async fn execute(
                         allowed_sinks: args.allowed_sinks.clone(),
                     }
                     .into_spec(),
+                    &crate::budget::sink_template_kinds(&cfg),
                 )
                 .map_err(CliError::Config)?,
                 run_id: None,
@@ -298,13 +308,14 @@ pub(crate) async fn execute(
         )
         .await?;
         let finished_at = Utc::now();
-        return finish_topology_run(
+        let outcome = finish_topology_run(
             &pipeline_name,
             started_at,
             finished_at,
             &summary,
             args.output,
         );
+        return stop.finish(outcome);
     }
 
     #[cfg(feature = "lineage")]
@@ -324,12 +335,10 @@ pub(crate) async fn execute(
     // Resolve discoverable partition bounds before planning (#479): `expand` is
     // synchronous and has no registry access, and it needs concrete bounds. A
     // config with no probes does no I/O here.
+    // Discovery-driven matrix fan-out (#647) follows: a source with a discovery
+    // block + `fan_out` generates the matrix before planning.
     let mut cfg = cfg;
-    crate::partition::resolve_config_bounds(&mut cfg, &auth).await?;
-    // Discovery-driven matrix fan-out (#647): a source with a discovery block
-    // (`discovery`/`odata`) + `fan_out` discovers its datasets live and generates
-    // the matrix before planning.
-    crate::dynamic_fanout::resolve_dynamic_fanout(&mut cfg, &auth).await?;
+    crate::partition::resolve_runtime_with(&mut cfg, &auth).await?;
     let nodes = expand(&cfg)?;
     // Capture the config-snapshot inputs (#374) before `nodes` / `catalog` are
     // moved into the executor; recorded after a fully-successful run below. The
@@ -338,6 +347,7 @@ pub(crate) async fn execute(
     #[cfg(feature = "catalog")]
     let snapshot_inputs = catalog
         .as_ref()
+        .filter(|_| records_snapshot(&args))
         .map(|handle| (handle.clone(), nodes.clone(), pipeline_name.clone()));
     // Runtime matrix-row selection (#370/#371/#376/#377): status gate → tag
     // narrowing → parent policy → skip. A plain config (no `status`/`tags`, no
@@ -360,12 +370,11 @@ pub(crate) async fn execute(
             return Err(report.error());
         }
     }
-    // The TUI wires `q` / Ctrl-C to this token: in-flight invocations stop at
-    // their next page boundary and flush (#146 H16). Plain runs keep `None`.
+    // SIGTERM / Ctrl-C (and the TUI's `q`) cancel this token: in-flight
+    // invocations stop at their next page boundary and flush (#146 H16).
+    let stop = StopSignal::install();
     #[cfg(feature = "cli-tui")]
-    let tui_cancel = tui_active.then(faucet_core::CancellationToken::new);
-    #[cfg(not(feature = "cli-tui"))]
-    let tui_cancel: Option<faucet_core::CancellationToken> = None;
+    let tui_cancel = tui_active.then(|| stop.token());
     let started_at = Utc::now();
     let run_fut = run_expanded(
         nodes,
@@ -383,10 +392,7 @@ pub(crate) async fn execute(
             shard: None,
             auth,
             clock: resolve_run_clock(args.clock.as_deref())?,
-            // Plain runs have no external cancel signal (the executor still
-            // cooperatively cancels in-flight rows on `on_error: stop`); a
-            // TUI session cancels via `q` / Ctrl-C.
-            cancel: tui_cancel.clone(),
+            cancel: Some(stop.token()),
             resilience,
             sla: cfg.sla.clone(),
             reconcile: cfg.reconcile.clone(),
@@ -402,7 +408,7 @@ pub(crate) async fn execute(
             catalog,
             usage: crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), config_dir.as_deref())
                 .map_err(CliError::Config)?,
-            budget: crate::budget::effective_budget(
+            budget: crate::budget::effective_budget_with_kinds(
                 cfg.budget.as_ref(),
                 crate::budget::BudgetFlags {
                     max_records: args.max_records,
@@ -411,6 +417,7 @@ pub(crate) async fn execute(
                     allowed_sinks: args.allowed_sinks.clone(),
                 }
                 .into_spec(),
+                &crate::budget::sink_template_kinds(&cfg),
             )
             .map_err(CliError::Config)?,
         },
@@ -617,10 +624,81 @@ pub(crate) async fn execute(
     // the `otel` feature). Done on both the success and failure exit paths.
     faucet_core::shutdown_otel();
 
-    if summary.had_failures() {
-        return Err(CliError::PipelineHadFailures { count: failed });
+    let outcome = if summary.had_failures() {
+        Err(CliError::PipelineHadFailures { count: failed })
+    } else {
+        Ok(())
+    };
+    stop.finish(outcome)
+}
+
+/// Whether this run may stand as the config's last successful run for
+/// `plan --diff` / impact analysis: a dry run or a `--limit` sample never
+/// does (#789 CLI-130).
+#[cfg(feature = "catalog")]
+fn records_snapshot(args: &RunArgs) -> bool {
+    !args.dry_run && args.limit.is_none()
+}
+
+/// A `run` flag that matrix mode honours and a topology run cannot, so it is
+/// refused instead of silently ignored (#789 CLI-64).
+fn topology_refused_flag(args: &RunArgs) -> Option<&'static str> {
+    if args.state_path.is_some() {
+        Some("--state-path")
+    } else if args.concurrency.is_some() {
+        Some("--concurrency")
+    } else {
+        None
     }
-    Ok(())
+}
+
+/// The stop signals of a one-shot run: the first SIGTERM / Ctrl-C cancels the
+/// run cooperatively (each row finishes its page and flushes), a second one
+/// exits at once.
+struct StopSignal {
+    token: faucet_core::CancellationToken,
+    watcher: tokio::task::JoinHandle<()>,
+}
+
+impl StopSignal {
+    fn install() -> Self {
+        let token = faucet_core::CancellationToken::new();
+        let first = crate::signals::wait_for_termination();
+        let cancel = token.clone();
+        let watcher = tokio::spawn(async move {
+            first.await;
+            tracing::warn!(
+                "stop signal received: finishing the current page and flushing (signal again to \
+                 exit at once)"
+            );
+            cancel.cancel();
+            crate::signals::wait_for_termination().await;
+            std::process::exit(130);
+        });
+        Self { token, watcher }
+    }
+
+    fn token(&self) -> faucet_core::CancellationToken {
+        self.token.clone()
+    }
+
+    /// The run's result, or [`CliError::Cancelled`] when it was stopped.
+    fn finish(self, outcome: CliResult<()>) -> CliResult<()> {
+        cancelled_outcome(self.token.is_cancelled(), outcome)
+    }
+}
+
+impl Drop for StopSignal {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
+
+fn cancelled_outcome(cancelled: bool, outcome: CliResult<()>) -> CliResult<()> {
+    if cancelled {
+        return Err(CliError::Cancelled);
+    }
+    outcome
 }
 
 /// One matrix row's line in a `--output json`/`ndjson` summary (#390). Every
@@ -797,6 +875,78 @@ fn finish_topology_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "catalog")]
+    #[test]
+    fn only_a_full_real_run_records_the_config_snapshot() {
+        assert!(records_snapshot(&RunArgs::default()));
+        assert!(!records_snapshot(&RunArgs {
+            dry_run: true,
+            ..Default::default()
+        }));
+        assert!(!records_snapshot(&RunArgs {
+            limit: Some(5),
+            ..Default::default()
+        }));
+    }
+
+    /// `--state-path` / `--concurrency` are refused for a topology config
+    /// rather than silently ignored (#789 CLI-64).
+    #[tokio::test]
+    async fn topology_refuses_state_path_and_concurrency() {
+        let cfg = crate::config::PipelineConfig::from_text(
+            "version: 1\nname: p\npipeline:\n  sources:\n    a: { type: csv, config: { path: /nonexistent/a.csv } }\n  sinks:\n    o: { type: jsonl, config: { path: /nonexistent/o.jsonl } }\n  nodes:\n    s: { kind: source, ref: a }\n    w: { kind: sink, ref: o }\n  edges:\n    - { from: s, to: w }\n",
+            std::path::Path::new("p.yaml"),
+        )
+        .unwrap();
+        for (args, flag) in [
+            (
+                RunArgs {
+                    state_path: Some("/tmp/scratch".into()),
+                    ..Default::default()
+                },
+                "--state-path",
+            ),
+            (
+                RunArgs {
+                    concurrency: Some(2),
+                    ..Default::default()
+                },
+                "--concurrency",
+            ),
+        ] {
+            let err = Box::pin(execute(cfg.clone(), args, None))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(flag), "{err}");
+        }
+        assert_eq!(topology_refused_flag(&RunArgs::default()), None);
+    }
+
+    /// SIGTERM cancels the run's token instead of killing the process, and a
+    /// cancelled run reports `Cancelled` (exit 130) whatever its rows did
+    /// (#789 CLI-50, CLI-169).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_cancels_the_run_cooperatively() {
+        let stop = StopSignal::install();
+        let token = stop.token();
+        assert!(!token.is_cancelled());
+        std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), token.cancelled())
+            .await
+            .expect("the token is cancelled by SIGTERM");
+        assert!(matches!(stop.finish(Ok(())), Err(CliError::Cancelled)));
+        assert!(cancelled_outcome(false, Ok(())).is_ok());
+        assert!(matches!(
+            cancelled_outcome(true, Err(CliError::PipelineHadFailures { count: 1 })),
+            Err(CliError::Cancelled)
+        ));
+    }
 
     /// A `faucet run` invocation's future is awaited on the caller's stack —
     /// a 2 MiB test thread in CI. Keep it well under that whatever passes are

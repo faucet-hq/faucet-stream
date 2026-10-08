@@ -93,6 +93,18 @@ pub fn circuit_opened(pipeline: &str, row: &str) {
     .set(1.0);
 }
 
+/// Mark the circuit breaker closed for a pipeline/row (state gauge 0): at
+/// run start and whenever a page succeeds, so a trip does not read as open
+/// for the rest of a long-lived process.
+pub fn circuit_closed(pipeline: &str, row: &str) {
+    gauge!(
+        "faucet_resilience_circuit_state",
+        "pipeline" => pipeline.to_string(),
+        "row" => row.to_string(),
+    )
+    .set(0.0);
+}
+
 /// Count `n` poison-pill rows resolved by a terminal `action` (`dlq` / `drop` /
 /// `fail`).
 pub fn poison_rows(pipeline: &str, row: &str, action: &'static str, n: u64) {
@@ -131,5 +143,30 @@ mod tests {
         poison_rows("p", "r", "dlq", 3);
         // n == 0 short-circuits without emitting; must also not panic.
         poison_rows("p", "r", "drop", 0);
+    }
+
+    #[test]
+    fn circuit_state_goes_back_to_closed() {
+        use metrics_util::debugging::DebugValue;
+        let _g = crate::observability::decorator::source_tests::LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let snap = crate::observability::decorator::source_tests::snapshotter();
+        let state = || {
+            snap.snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(k, _, _, v)| {
+                    let k = k.key();
+                    (k.name() == "faucet_resilience_circuit_state"
+                        && k.labels()
+                            .any(|l| l.key() == "row" && l.value() == "cb-row"))
+                    .then_some(v)
+                })
+        };
+        circuit_opened("p", "cb-row");
+        assert_eq!(state(), Some(DebugValue::Gauge(1.0.into())));
+        circuit_closed("p", "cb-row");
+        assert_eq!(state(), Some(DebugValue::Gauge(0.0.into())));
     }
 }

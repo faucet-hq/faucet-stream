@@ -106,6 +106,7 @@ mod tests {
             triggers_path: None,
             templates_sync_path: None,
             policy_path: None,
+            otel: None,
             callback_allow_hosts: Vec::new(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),

@@ -11,22 +11,14 @@ use iceberg::scan::FileScanTask;
 use iceberg::spec::{DataContentType, PrimitiveType, Schema, Type};
 use serde_json::{Value, json};
 
-/// Decode a batch into one JSON object per row, keeping explicit nulls.
+/// Decode a batch into one JSON object per row, keeping explicit nulls and
+/// every digit of a decimal (as a string).
 pub fn batch_to_rows(batch: &RecordBatch) -> Result<Vec<Value>, FaucetError> {
     if batch.num_rows() == 0 {
         return Ok(Vec::new());
     }
-    let mut buf = Vec::new();
-    let mut writer = arrow_json::writer::WriterBuilder::new()
-        .with_explicit_nulls(true)
-        .build::<_, arrow_json::writer::JsonArray>(&mut buf);
-    writer
-        .write(batch)
-        .and_then(|_| writer.finish())
-        .map_err(|e| FaucetError::Source(format!("iceberg: encoding rows as JSON failed: {e}")))?;
-    drop(writer);
-    serde_json::from_slice(&buf)
-        .map_err(|e| FaucetError::Source(format!("iceberg: decoding JSON rows failed: {e}")))
+    faucet_core::columnar::record_batch_to_values(batch)
+        .map_err(|e| FaucetError::Source(format!("iceberg: encoding rows as JSON failed: {e}")))
 }
 
 /// JSON Schema fragment for an Iceberg type (matching the row encoding).
@@ -180,6 +172,26 @@ mod tests {
             batch_to_rows(&RecordBatch::new_empty(schema))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn decimal_rows_keep_every_digit() {
+        use arrow::datatypes::{DataType, Field};
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "d",
+            DataType::Decimal128(38, 4),
+            true,
+        )]));
+        let d = arrow::array::Decimal128Array::from(vec![Some(
+            123_456_789_012_345_678_901_234_567_890i128,
+        )])
+        .with_precision_and_scale(38, 4)
+        .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(d)]).unwrap();
+        assert_eq!(
+            batch_to_rows(&batch).unwrap()[0]["d"],
+            "12345678901234567890123456.7890"
         );
     }
 

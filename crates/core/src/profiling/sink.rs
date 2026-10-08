@@ -32,6 +32,9 @@ impl ProfilingSink {
 
 #[async_trait]
 impl Sink for ProfilingSink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let n = self.inner.write_batch(records).await?;
         self.observe(records);
@@ -142,6 +145,12 @@ impl Sink for ProfilingSink {
     }
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
     }
     fn supports_rollback(&self) -> bool {
         self.inner.supports_rollback()
@@ -328,5 +337,20 @@ mod tests {
         );
         // Native loading is not advertised, so the pipeline profiles rows.
         assert!(sink.native_load_capabilities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn profiling_sink_forwards_every_hook_but_native() {
+        let probe = crate::sink_forwarding::HookSink::default();
+        let sink = ProfilingSink::new(
+            Box::new(probe.clone()),
+            Arc::new(Mutex::new(Profiler::new(ProfilingSpec::default()))),
+        );
+        crate::sink_forwarding::assert_forwards_every_hook(
+            &sink,
+            &probe,
+            &["native_load_capabilities", "load_native"],
+        )
+        .await;
     }
 }

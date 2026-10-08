@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// Serializes as `{ type: <method>, config: { … } }` (adjacent tagging,
 /// snake_case discriminators) — the consistent auth wire shape shared by
 /// every faucet connector. `key_pair` is stateless (JWT minted locally);
-/// `o_auth` carries a bearer token (and can be supplied via a shared
+/// `oauth` carries a bearer token (and can be supplied via a shared
 /// `auth: { ref }` provider).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]

@@ -486,6 +486,26 @@ pub struct SqliteSink {
     unmatched_warned: std::sync::atomic::AtomicBool,
 }
 
+/// Create the directory a database file lives in, so `./out/db.sqlite` works
+/// before `./out` exists — as every other file-writing sink does (#822).
+/// `create_if_missing` creates only the file. In-memory databases (and a bare
+/// file name in the working directory) have no directory to create.
+fn ensure_database_dir(filename: &std::path::Path) -> Result<(), FaucetError> {
+    if filename.as_os_str() == ":memory:" {
+        return Ok(());
+    }
+    match filename.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() && !dir.exists() => std::fs::create_dir_all(dir)
+            .map_err(|e| {
+                FaucetError::Sink(format!(
+                    "sqlite sink: cannot create the database directory {}: {e}",
+                    dir.display()
+                ))
+            }),
+        _ => Ok(()),
+    }
+}
+
 impl SqliteSink {
     /// Make sure the target table exists before the first write (#580).
     async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
@@ -589,6 +609,7 @@ impl SqliteSink {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(config.busy_timeout_secs));
+        ensure_database_dir(options.get_filename())?;
 
         let pool = SqlitePoolOptions::new()
             .max_connections(config.max_connections)
@@ -1658,6 +1679,19 @@ impl faucet_core::Sink for SqliteSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_dir_is_left_alone_for_memory_bare_and_existing_paths() {
+        use std::path::Path;
+        ensure_database_dir(Path::new(":memory:")).unwrap();
+        ensure_database_dir(Path::new("db.sqlite")).unwrap();
+        ensure_database_dir(Path::new("file:sqlx-in-memory-1")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        ensure_database_dir(&dir.path().join("db.sqlite")).unwrap();
+        let nested = dir.path().join("a").join("b").join("db.sqlite");
+        ensure_database_dir(&nested).unwrap();
+        assert!(nested.parent().unwrap().is_dir());
+    }
 
     #[test]
     fn staging_ddl_renames_only_the_table_of_any_quoting_style() {

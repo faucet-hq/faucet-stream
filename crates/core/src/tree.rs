@@ -131,7 +131,8 @@ pub struct TreeFlattenSpec {
     /// Also emit a row for a group node that carries its own cells (subtotals).
     #[serde(default)]
     pub emit_group_rows: bool,
-    /// Stack-overflow backstop; a branch deeper than this is truncated (logged).
+    /// Stack-overflow backstop; a tree deeper than this fails the record rather
+    /// than silently dropping the deeper rows.
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
 }
@@ -241,9 +242,10 @@ impl CompiledTreeFlatten {
         }
     }
 
-    /// [`apply`](Self::apply), failing on a record whose `groups` cannot be
-    /// zipped: a leaf missing a group's cell array, a group whose width differs
-    /// from its header count, or a column two groups both name.
+    /// [`apply`](Self::apply), failing on a record that cannot be flattened
+    /// without losing data: a leaf missing a group's cell array, a group whose
+    /// width differs from its header count, a column named twice, or a tree
+    /// deeper than `max_depth`.
     pub fn try_apply(&self, rec: Value) -> Result<Vec<Value>, FaucetError> {
         Ok(self.flatten(&rec)?.unwrap_or_else(|| vec![rec]))
     }
@@ -269,16 +271,8 @@ impl CompiledTreeFlatten {
 
         let mut out: Vec<Value> = Vec::new();
         let mut ancestors: Vec<Value> = Vec::new();
-        let mut depth_exceeded = false;
         for node in roots {
-            self.walk(
-                node,
-                &mut ancestors,
-                0,
-                &sources,
-                &mut out,
-                &mut depth_exceeded,
-            )?;
+            self.walk(node, &mut ancestors, 0, &sources, &mut out)?;
         }
         Ok(Some(out))
     }
@@ -354,17 +348,14 @@ impl CompiledTreeFlatten {
         depth: usize,
         sources: &[(&ColumnsSpec, Vec<String>)],
         out: &mut Vec<Value>,
-        depth_exceeded: &mut bool,
     ) -> Result<(), FaucetError> {
         if depth >= self.spec.max_depth {
-            if !*depth_exceeded {
-                *depth_exceeded = true;
-                tracing::error!(
-                    max_depth = self.spec.max_depth,
-                    "tree_flatten: max_depth exceeded — branch truncated (malformed or cyclic tree?)"
-                );
-            }
-            return Ok(());
+            // Truncating would silently drop every deeper row (CORE-32).
+            return Err(FaucetError::Transform(format!(
+                "tree_flatten: the tree is nested deeper than max_depth ({}) — raise \
+                 `max_depth` if the report is genuinely that deep",
+                self.spec.max_depth
+            )));
         }
         let children = path_get(node, &self.spec.children).and_then(Value::as_array);
         let has_children = children.is_some_and(|c| !c.is_empty());
@@ -388,7 +379,7 @@ impl CompiledTreeFlatten {
                 .unwrap_or(Value::Null);
             ancestors.push(label);
             for child in children {
-                self.walk(child, ancestors, depth + 1, sources, out, depth_exceeded)?;
+                self.walk(child, ancestors, depth + 1, sources, out)?;
             }
             ancestors.pop();
         }
@@ -458,6 +449,12 @@ impl CompiledTreeFlatten {
                     .cloned()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| format!("col_{i}"));
+                if row.contains_key(&name) {
+                    return Err(FaucetError::Transform(format!(
+                        "tree_flatten: row {row_index}: duplicate column '{name}' (header \
+                         labels repeat, or collide with an ancestor/path column)"
+                    )));
+                }
                 row.insert(name, value);
             }
         }
@@ -499,7 +496,7 @@ fn scalar_string(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        other => other.to_string(),
+        other => crate::util::canonical_json(other),
     }
 }
 
@@ -539,6 +536,19 @@ fn path_get<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An object inserted in reverse-sorted key order (#817).
+    fn login_then_id() -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("login".into(), json!("o"));
+        m.insert("id".into(), json!(2));
+        Value::Object(m)
+    }
+
+    #[test]
+    fn scalar_string_sorts_nested_object_keys() {
+        assert_eq!(scalar_string(&login_then_id()), r#"{"id":2,"login":"o"}"#);
+    }
 
     fn spec() -> TreeFlattenSpec {
         TreeFlattenSpec {
@@ -706,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn max_depth_guard_truncates_without_panicking() {
+    fn max_depth_guard_fails_instead_of_truncating() {
         // Build a chain deeper than max_depth.
         let mut node = json!({ "ColData": [ {"value": "leaf"} ] });
         for _ in 0..10 {
@@ -718,9 +728,32 @@ mod tests {
         s.columns.header = None;
         s.ancestors = None;
         s.max_depth = 3;
-        let out = s.compile().unwrap().apply(node);
-        // Truncated: the deep leaf is never reached, no panic.
-        assert!(out.is_empty());
+        let err = s.compile().unwrap().try_apply(node).unwrap_err();
+        assert!(
+            err.to_string().contains("deeper than max_depth (3)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_column_labels_fail_the_record() {
+        let node = json!({
+            "Header": {"ColData": [{"value": "a"}, {"value": "a"}]},
+            "ColData": [{"value": "1"}, {"value": "2"}]
+        });
+        let mut s = spec();
+        s.root = None;
+        s.children = "children".to_owned();
+        s.ancestors = None;
+        s.columns.header = Some("Header.ColData".to_owned());
+        s.columns.header_label = Some("value".to_owned());
+        let c = s.compile().unwrap();
+        let err = c.try_apply(node);
+        assert!(
+            err.as_ref()
+                .is_err_and(|e| e.to_string().contains("duplicate column")),
+            "{err:?}"
+        );
     }
 
     #[test]

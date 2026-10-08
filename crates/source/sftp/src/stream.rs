@@ -147,8 +147,23 @@ impl SftpSource {
 
         let mut files = Vec::new();
         for entry in entries {
-            if !entry.file_type().is_file() {
+            let kind = entry.file_type();
+            if kind.is_dir() {
                 continue;
+            }
+            // A symlink, or an entry whose READDIR omitted its permissions,
+            // is stat'ed (following links) to learn what it really is.
+            if !kind.is_file() {
+                let target = sftp.metadata(entry.path()).await.map_err(|e| {
+                    FaucetError::Source(format!("SFTP stat '{}' failed: {e}", entry.path()))
+                })?;
+                if !target.file_type().is_file() {
+                    tracing::debug!(
+                        path = %entry.path(),
+                        "SFTP source: skipping an entry that is not a regular file"
+                    );
+                    continue;
+                }
             }
             let name = entry.file_name();
             if faucet_common_file::write::is_scratch_name(&name) {
@@ -351,7 +366,7 @@ impl SftpSource {
         let shared = format
             .shared()
             .ok_or_else(|| FaucetError::Source(format!("SFTP '{path}': format has no decoder")))?;
-        let records = faucet_core::file_format::decode(&bytes, shared, opts)
+        let records = faucet_core::file_format::decode_owned(bytes, shared, opts)
             .await
             .map_err(|e| FaucetError::Source(format!("SFTP '{path}': {e}")))?;
         Ok(Fetched::Records(records))
@@ -432,12 +447,15 @@ impl faucet_core::Source for SftpSource {
                 let payload = payload?;
                 #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                 let payload = match payload {
-                    Fetched::Container(bytes) => Fetched::Records(
-                        container
-                            .as_mut()
+                    Fetched::Container(bytes) => {
+                        let (d, rows) = container
+                            .take()
                             .expect("a container file implies a container format")
-                            .decode_all(file, faucet_core::FileInput::Bytes(bytes))?,
-                    ),
+                            .decode_all_offloaded(file.to_string(), faucet_core::FileInput::Bytes(bytes))
+                            .await?;
+                        container = Some(d);
+                        Fetched::Records(rows)
+                    }
                     other => other,
                 };
                 match payload {

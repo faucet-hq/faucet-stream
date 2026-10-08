@@ -3,6 +3,7 @@
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
+use crate::upload::AbortableUpload;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -10,7 +11,6 @@ use faucet_core::FaucetError;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem};
 use parquet::arrow::AsyncArrowWriter;
-use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use parquet::file::properties::WriterProperties;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -81,7 +81,7 @@ struct WriterState {
     /// be accommodated — only at a file boundary (see `warned_fields`).
     schema: Option<SchemaRef>,
     /// `None` between rollovers and at construction.
-    writer: Option<AsyncArrowWriter<Box<dyn AsyncFileWriter>>>,
+    writer: Option<AsyncArrowWriter<AbortableUpload>>,
     /// Rows accepted by the current writer.
     rows_in_current_file: usize,
     /// Total files closed successfully (for diagnostics).
@@ -213,7 +213,7 @@ impl ParquetSink {
         &self,
         schema: SchemaRef,
         continuing: bool,
-    ) -> Result<AsyncArrowWriter<Box<dyn AsyncFileWriter>>, FaucetError> {
+    ) -> Result<AsyncArrowWriter<AbortableUpload>, FaucetError> {
         let (obj_path, local_path) = self.next_object_path()?;
         // Provenance for the retention GC (#587), recorded before the writer
         // creates the file so a destination that already held a file of this name
@@ -225,11 +225,10 @@ impl ParquetSink {
         {
             self.outputs.record_open_probing_with(local.clone(), true);
         }
-        let writer = ParquetObjectWriter::new(self.store.clone(), obj_path);
+        let writer = AbortableUpload::new(self.store.clone(), obj_path);
         self.opened
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let boxed: Box<dyn AsyncFileWriter> = Box::new(writer);
-        AsyncArrowWriter::try_new(boxed, schema, Some(self.writer_properties()))
+        AsyncArrowWriter::try_new(writer, schema, Some(self.writer_properties()))
             .map_err(|e| FaucetError::Sink(format!("could not open parquet writer: {e}")))
     }
 
@@ -375,10 +374,7 @@ impl ParquetSink {
     /// fields it still drops.
     async fn close_current(&self, state: &mut WriterState) -> Result<(), FaucetError> {
         if let Some(writer) = state.writer.take() {
-            writer
-                .close()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("could not close parquet writer: {e}")))?;
+            finish_or_abort(writer).await?;
             state.files_written += 1;
             state.rows_in_current_file = 0;
             state.schema = None;
@@ -394,10 +390,7 @@ impl ParquetSink {
         let Some(writer) = state.writer.take() else {
             return Ok(());
         };
-        writer
-            .close()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("could not close parquet writer: {e}")))?;
+        finish_or_abort(writer).await?;
         state.files_written += 1;
         state.rows_in_current_file = 0;
         state.schema = None;
@@ -904,6 +897,20 @@ async fn build_store(
     }
 }
 
+/// Write the footer and complete the upload; when that fails, abort the
+/// upload so an S3 multipart's parts are not left behind (billed, invisible).
+async fn finish_or_abort(mut writer: AsyncArrowWriter<AbortableUpload>) -> Result<(), FaucetError> {
+    if let Err(e) = writer.finish().await {
+        if let Err(abort) = writer.into_inner().abort().await {
+            tracing::warn!(error = %abort, "parquet sink: aborting the failed upload also failed");
+        }
+        return Err(FaucetError::Sink(format!(
+            "could not close parquet writer: {e}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,6 +960,200 @@ mod tests {
             uri.contains(tmp.path().to_str().unwrap()),
             "URI should contain the path"
         );
+    }
+
+    #[tokio::test]
+    async fn a_column_null_in_the_sample_takes_later_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sparse.parquet");
+        let sink = ParquetSink::new(cfg(&path)).await.unwrap();
+        sink.write_batch(&[json!({"id": 1, "deleted_at": null, "amount": null})])
+            .await
+            .unwrap();
+        sink.write_batch(&[json!({"id": 2, "deleted_at": "2026-10-01", "amount": "12.5"})])
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let batch = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let text = |name: &str| {
+            batch
+                .column(batch.schema().index_of(name).unwrap())
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("a string column")
+                .clone()
+        };
+        assert_eq!(text("deleted_at").value(1), "2026-10-01");
+        assert_eq!(text("amount").value(1), "12.5");
+        assert!(arrow::array::Array::is_null(&text("amount"), 0));
+    }
+
+    /// A store whose multipart uploads never complete and count their aborts.
+    #[derive(Debug, Default)]
+    struct FailingUploads {
+        inner: object_store::memory::InMemory,
+        aborts: Arc<std::sync::atomic::AtomicUsize>,
+        fail_parts: bool,
+    }
+
+    impl std::fmt::Display for FailingUploads {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("FailingUploads")
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingUpload(Arc<std::sync::atomic::AtomicUsize>, bool);
+
+    #[faucet_core::async_trait]
+    impl object_store::MultipartUpload for FailingUpload {
+        fn put_part(&mut self, _data: object_store::PutPayload) -> object_store::UploadPart {
+            let fail = self.1;
+            Box::pin(async move {
+                if fail {
+                    Err(object_store::Error::NotImplemented {
+                        operation: "put_part".into(),
+                        implementer: "FailingUploads".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            Err(object_store::Error::NotImplemented {
+                operation: "complete".into(),
+                implementer: "FailingUploads".into(),
+            })
+        }
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[faucet_core::async_trait]
+    impl object_store::ObjectStore for FailingUploads {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            _location: &ObjPath,
+            _opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Ok(Box::new(FailingUpload(
+                self.aborts.clone(),
+                self.fail_parts,
+            )))
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_close_aborts_the_multipart_upload() {
+        for fail_parts in [false, true] {
+            let store = Arc::new(FailingUploads {
+                fail_parts,
+                ..Default::default()
+            });
+            let aborts = store.aborts.clone();
+            let upload = AbortableUpload::with_part_size(store, ObjPath::from("out.parquet"), 16);
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            ]));
+            let mut writer = AsyncArrowWriter::try_new(upload, schema.clone(), None).unwrap();
+            let batch = arrow::array::RecordBatch::try_new(
+                schema,
+                vec![Arc::new(arrow::array::Int64Array::from(
+                    (0..1_000).collect::<Vec<i64>>(),
+                ))],
+            )
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            let err = finish_or_abort(writer).await.unwrap_err();
+            assert!(err.to_string().contains("could not close"), "{err}");
+            assert_eq!(
+                aborts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "fail_parts={fail_parts}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn small_and_large_uploads_complete() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        for (name, threshold) in [("small", 1 << 20), ("large", 8)] {
+            let path = ObjPath::from(name);
+            let mut upload =
+                AbortableUpload::with_part_size(store.clone(), path.clone(), threshold);
+            use parquet::arrow::async_writer::AsyncFileWriter as _;
+            upload
+                .write(bytes::Bytes::from_static(b"0123456789"))
+                .await
+                .unwrap();
+            upload
+                .write(bytes::Bytes::from_static(b"abc"))
+                .await
+                .unwrap();
+            upload.complete().await.unwrap();
+            assert!(upload.write(bytes::Bytes::from_static(b"x")).await.is_err());
+            upload.abort().await.unwrap();
+            let got = object_store::ObjectStoreExt::get(store.as_ref(), &path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(&got[..], b"0123456789abc");
+        }
     }
 
     #[tokio::test]

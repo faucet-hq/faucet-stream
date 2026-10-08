@@ -15,7 +15,7 @@ Connection fields come from `faucet-common-azure` and are set at the top level:
 |---|---|---|
 | `container` | string | **Required.** Blob container / ADLS filesystem (must already exist). |
 | `account` | string | Storage-account name (optional with a connection string / emulator). |
-| `auth` | `{ type, config }` | `account_key` / `sas_token` / `connection_string` / `managed_identity` / `service_principal` / `default`. |
+| `auth` | `{ type, config }` | `account_key` / `sas_token` / `connection_string` / `managed_identity` / `service_principal` / `default`. With any explicit `auth`, `AZURE_*` credential variables in the environment are ignored (only `default` uses the environment's credential chain). A `connection_string` honours `EndpointSuffix`, `DefaultEndpointsProtocol` and `UseDevelopmentStorage=true`. |
 | `endpoint` | string | Custom blob endpoint (emulator / sovereign cloud). |
 | `allow_http` | bool | Permit plaintext HTTP (Azurite). |
 | `use_emulator` | bool | Target the Azurite emulator. |
@@ -163,7 +163,7 @@ format and option the file sink does, with the same field names:
 | `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`**, like the S3 and GCS sinks — smaller objects to move; the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each blob's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
-| `scratch_dir` | a local directory | Where blobs are built before upload (default: the system temporary directory; a private subdirectory is created in it). JSON Lines and raw text go up as a block upload while they are written and need no scratch space; other formats need room for each blob being built (up to `concurrency` of them). Scratch files are not encrypted while the run is in progress. |
+| `scratch_dir` | a local directory | Where blobs are built before upload (default: the system temporary directory; a private subdirectory is created in it). JSON Lines and raw text go up as a block upload while they are written and need no scratch space; other formats need room for each blob being built (up to `concurrency` of them). Scratch files are not encrypted while the run is in progress; a run that crashed leaves its scratch directory behind, and the next run of any remote file sink using the same `scratch_dir` removes it. |
 
 `if_exists: append` / `error` and `write_mode: overwrite` need `path`: without it every run
 writes new, uniquely named blobs (`<run id>-<part><file_extension>`), so

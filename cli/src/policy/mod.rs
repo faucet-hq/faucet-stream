@@ -166,6 +166,15 @@ pub fn evaluate_nodes(
     })
 }
 
+/// The DLQ as a policy destination: quarantined records reach it in full.
+pub fn dlq_facts(dlq: &crate::config::DlqSpec) -> SinkFacts {
+    SinkFacts {
+        id: "dlq".into(),
+        kind: dlq.sink.kind.clone(),
+        attributes: dlq.sink.attributes.clone(),
+    }
+}
+
 /// The static verdict for one row.
 pub fn evaluate_node(
     policy: &CompiledPolicy,
@@ -183,7 +192,25 @@ pub fn evaluate_node(
         kind: node.sink.kind.clone(),
         attributes: node.sink.attributes.clone(),
     };
-    let violations = faucet_core::policy::evaluate(policy, &facts, &columns);
+    let mut violations = faucet_core::policy::evaluate(policy, &facts, &columns);
+    if let Some(dlq) = &node.dlq {
+        let quarantined: Vec<_> = violations
+            .iter()
+            .filter(|v| {
+                policy.rules().iter().any(|r| {
+                    r.name == v.rule
+                        && r.on_runtime == faucet_core::policy::RuntimeAction::Quarantine
+                })
+            })
+            .cloned()
+            .collect();
+        violations.extend(faucet_core::policy::dlq_violations(
+            policy,
+            &dlq_facts(dlq),
+            &columns,
+            &quarantined,
+        ));
+    }
     RowPolicyReport {
         row: node.id.clone(),
         sink: node.sink_ref.clone(),
@@ -839,6 +866,31 @@ pipeline:
             CliError::PolicyViolations { violations: 2 }
         ));
         assert!(quarantines(&policy()));
+    }
+
+    #[test]
+    fn a_quarantine_is_evaluated_against_the_dlq_too() {
+        let contract = "  contract:\n    version: \"1\"\n    fields:\n      - { name: amount_cents, type: integer }\n";
+        let dlq = |attrs: &str| {
+            mk_cfg(&format!(
+                "{contract}  dlq:\n    sink: {{ type: jsonl, config: {{ path: dlq.jsonl }}, attributes: {{ {attrs} }} }}\n"
+            ))
+        };
+        let report = |cfg: &PipelineConfig| {
+            evaluate_nodes(&policy(), &expand(cfg).unwrap(), &HashMap::new()).unwrap()
+        };
+        let r = report(&dlq("environment: prod"));
+        assert_eq!(r.violations, 2, "{r:?}");
+        assert!(
+            r.rows[0]
+                .violations
+                .iter()
+                .any(|v| v.sink == "dlq" && v.rule == "finance-no-prod-files")
+        );
+        let r = report(&dlq("environment: quarantine"));
+        assert_eq!(r.violations, 1, "{r:?}");
+        let r = report(&mk_cfg(contract));
+        assert_eq!(r.violations, 1, "{r:?}");
     }
 
     #[test]

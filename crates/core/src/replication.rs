@@ -518,7 +518,8 @@ pub enum BindTarget {
 /// (midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON
 /// number is read as **epoch seconds**. It is then re-emitted in the target
 /// representation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both
-/// work.
+/// work. A JSON number under `epoch_s` / `epoch_ms` is taken to be in that
+/// unit already and emitted as its integer value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BindFormat {
@@ -795,8 +796,22 @@ pub fn format_bookmark(value: &Value, format: BindFormat) -> Result<String, Fauc
             Ok(bookmark_instant(value)?.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
         }
         BindFormat::Date => Ok(bookmark_instant(value)?.format("%Y-%m-%d").to_string()),
+        BindFormat::EpochS | BindFormat::EpochMs if value.is_number() => Ok(epoch_number(value)),
         BindFormat::EpochS => Ok(bookmark_instant(value)?.timestamp().to_string()),
         BindFormat::EpochMs => Ok(bookmark_instant(value)?.timestamp_millis().to_string()),
+    }
+}
+
+/// A numeric bookmark under an epoch bind is already in the bind's unit (an
+/// `epoch_ms` cursor stores milliseconds), so it is emitted as the integer it
+/// holds rather than re-read as seconds and scaled.
+fn epoch_number(value: &Value) -> String {
+    match value.as_i64() {
+        Some(i) => i.to_string(),
+        None => match value.as_u64() {
+            Some(u) => u.to_string(),
+            None => (value.as_f64().unwrap_or(0.0).trunc() as i64).to_string(),
+        },
     }
 }
 
@@ -1349,6 +1364,26 @@ mod tests {
         // A composite / null bookmark cannot be parsed into an instant.
         assert!(format_bookmark(&json!({"a": 1}), BindFormat::Iso8601).is_err());
         assert!(format_bookmark(&json!(null), BindFormat::EpochS).is_err());
+    }
+
+    #[test]
+    fn numeric_bookmarks_keep_the_epoch_binds_unit() {
+        assert_eq!(
+            format_bookmark(&json!(1_717_200_000_000_i64), BindFormat::EpochMs).unwrap(),
+            "1717200000000"
+        );
+        assert_eq!(
+            format_bookmark(&json!(1_717_200_000), BindFormat::EpochS).unwrap(),
+            "1717200000"
+        );
+        assert_eq!(
+            format_bookmark(&json!(u64::MAX), BindFormat::EpochMs).unwrap(),
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            format_bookmark(&json!(1_717_200_000.9), BindFormat::EpochS).unwrap(),
+            "1717200000"
+        );
     }
 
     #[test]

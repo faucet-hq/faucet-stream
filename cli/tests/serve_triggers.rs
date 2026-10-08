@@ -43,6 +43,7 @@ fn test_config() -> ServeConfig {
         triggers_path: None,
         templates_sync_path: None,
         policy_path: None,
+        otel: None,
         callback_allow_hosts: Vec::new(),
         require_approval: Vec::new(),
         approval_expiry: std::time::Duration::from_secs(86_400),
@@ -274,7 +275,7 @@ pipeline:
     config:
       connection_url: "${env:PG_URL}"
       table_name: events_raw
-      column_mapping: { type: jsonb, column: payload }
+      column_mapping: { jsonb: { column: payload } }
 "#,
     )
     .unwrap();
@@ -712,6 +713,7 @@ async fn spawn_serve_with_triggers(
         triggers: Some(triggers_path.to_path_buf()),
         templates_sync: None,
         policy: None,
+        otel_config: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

@@ -39,7 +39,7 @@ fn substitute_in_str(input: &str, unit: &BackfillUnit) -> CliResult<String> {
     const PREFIX: &str = "${backfill.";
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
-    while let Some(pos) = rest.find(PREFIX) {
+    while let Some(pos) = crate::interpolate::find_unescaped(rest, PREFIX) {
         out.push_str(&rest[..pos]);
         let after = &rest[pos + PREFIX.len()..];
         let close = after.find('}').ok_or_else(|| {

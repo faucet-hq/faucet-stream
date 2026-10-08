@@ -96,6 +96,18 @@ pub fn should_refire(last: Option<Instant>, now: Instant, min_gap: Duration) -> 
     }
 }
 
+/// Wait until no event has arrived for `quiet`. `false` when the watcher
+/// channel closed.
+async fn wait_quiet(rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>, quiet: Duration) -> bool {
+    loop {
+        match tokio::time::timeout(quiet, rx.recv()).await {
+            Ok(Some(())) => continue,
+            Ok(None) => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
 /// Load an offline sample fixture (`.jsonl` or `.json` array).
 fn read_sample(path: &Path) -> CliResult<Vec<Value>> {
     let text = std::fs::read_to_string(path)?;
@@ -230,7 +242,6 @@ async fn watch_loop(args: DevArgs, sample: Vec<Value>, prev: &mut Vec<Value>) ->
     );
 
     let debounce = Duration::from_millis(args.debounce_ms);
-    let mut last_fire: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -241,13 +252,12 @@ async fn watch_loop(args: DevArgs, sample: Vec<Value>, prev: &mut Vec<Value>) ->
                 if recv.is_none() {
                     return Ok(());
                 }
-                // Coalesce a burst of events, then debounce.
-                while rx.try_recv().is_ok() {}
-                let now = Instant::now();
-                if !should_refire(last_fire, now, debounce) {
-                    continue;
+                // Trailing-edge debounce: run once the files have been quiet
+                // for `debounce`, so the last save of a burst is what runs.
+                // Events during the run stay queued and trigger another.
+                if !wait_quiet(&mut rx, debounce).await {
+                    return Ok(());
                 }
-                last_fire = Some(now);
                 match run_once(&args, &sample).await {
                     Ok((curr, err, dlq)) => {
                         render(Some(prev), &curr, &err, dlq);
@@ -264,6 +274,30 @@ async fn watch_loop(args: DevArgs, sample: Vec<Value>, prev: &mut Vec<Value>) ->
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The run waits for the burst to end, so a save inside the debounce
+    /// window is never dropped (#789 CLI-156).
+    #[tokio::test]
+    async fn the_debounce_waits_for_the_last_save() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let sender = tokio::spawn(async move {
+            for _ in 0..3 {
+                tx.send(()).unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tx
+        });
+        let start = Instant::now();
+        assert!(wait_quiet(&mut rx, Duration::from_millis(80)).await);
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "{:?}",
+            start.elapsed()
+        );
+        let tx = sender.await.unwrap();
+        drop(tx);
+        assert!(!wait_quiet(&mut rx, Duration::from_millis(80)).await);
+    }
 
     #[test]
     fn diff_records_detects_add_remove_keep() {

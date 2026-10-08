@@ -11,8 +11,9 @@ and `${secret:VAR}` (alias for `${env:}`).
 
 ## Build features
 
-None of the four backends are compiled in by default. Opt in per backend or take
-all four with the aggregate feature:
+The prebuilt binaries (Homebrew, the installer, the release archives) include
+all four backends. From crates.io none are compiled into the default build; opt
+in per backend or take all four with the aggregate feature:
 
 ```bash
 # All four backends
@@ -94,7 +95,7 @@ pipeline:
       project_id: my-gcp-project
       dataset_id: analytics
       table_id: events
-      credentials:
+      auth:
         type: application_default
 ```
 
@@ -127,7 +128,7 @@ pipeline:
     config:
       bucket: my-export-bucket
       prefix: exports/
-      credentials:
+      auth:
         type: application_default
 ```
 
@@ -167,7 +168,7 @@ pipeline:
       auth:
         type: oauth
         config:
-          access_token: "${azure-kv:my-vault/snowflake-token}"
+          token: "${azure-kv:my-vault/snowflake-token}"
 ```
 
 ## The `#field` JSON extractor

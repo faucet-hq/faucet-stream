@@ -3,9 +3,10 @@
 //! `FaucetError::Config` for arity mismatches in the inline `values` relation).
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use faucet_core::FaucetError;
 use serde_json::{Map, Value};
+use std::sync::Arc;
 
 /// Map any display-able error into a `FaucetError::Transform` with context.
 fn te<E: std::fmt::Display>(ctx: &str, e: E) -> FaucetError {
@@ -57,26 +58,281 @@ pub fn json_to_record_batch(
 
 /// Decode one or more [`RecordBatch`]es into JSON objects (one per row).
 ///
-/// Uses `arrow-json`'s array writer with **explicit nulls enabled**, so a
-/// null-valued column is emitted as `"key": null` rather than omitted from the
-/// object. Without this, `SELECT * FROM batch` silently deletes every
-/// explicit-null field — e.g. a CDC update `{"id":1,"email":null}` loses
-/// `email`, so a downstream upsert never nulls the column and the mirror
-/// diverges from the source (audit #321 H6). An empty input returns an empty
-/// `Vec`.
+/// Explicit nulls are kept (`"key": null`), so `SELECT *` never deletes an
+/// explicit-null field (audit #321 H6). Decimals are exact: a `DECIMAL` whose
+/// precision is at most [`EXACT_F64_DIGITS`] stays a JSON number, an integral
+/// `DECIMAL`/`HUGEINT` value that fits a 64-bit integer becomes a JSON
+/// integer, and anything wider is an exact decimal string — never an `f64`
+/// rounding. An empty input returns an empty `Vec`.
 pub fn record_batches_to_json(batches: &[RecordBatch]) -> Result<Vec<Value>, FaucetError> {
-    let mut buf = Vec::new();
-    {
-        let mut writer = arrow_json::writer::WriterBuilder::new()
-            .with_explicit_nulls(true)
-            .build::<_, arrow_json::writer::JsonArray>(&mut buf);
-        for b in batches {
-            writer.write(b).map_err(|e| te("json write", e))?;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let decimals = decimal_columns(batch.schema_ref());
+        let batch = integral_decimals_as_text(batch)?;
+        let mut part = faucet_core::columnar::record_batch_to_values(&batch)
+            .map_err(|e| te("json write", e))?;
+        if !decimals.is_empty() {
+            for row in &mut part {
+                for (name, precision, scale) in &decimals {
+                    if let Some(v) = row.get_mut(name.as_str()) {
+                        renumber_decimal(v, *precision, *scale);
+                    }
+                }
+            }
         }
-        writer.finish().map_err(|e| te("json finish", e))?;
+        rows.append(&mut part);
     }
-    let rows: Vec<Value> = serde_json::from_slice(&buf).map_err(|e| te("json parse", e))?;
     Ok(rows)
+}
+
+/// Render integral (`scale <= 0`) 128/256-bit decimal columns — `HUGEINT`
+/// among them — as text from their raw integers: a `HUGEINT` can carry 39
+/// digits, one more than `DECIMAL(38, 0)` formatting keeps.
+fn integral_decimals_as_text(batch: &RecordBatch) -> Result<RecordBatch, FaucetError> {
+    use arrow::array::{Array, ArrayRef, AsArray, StringArray};
+    use arrow::datatypes::{Decimal128Type, Decimal256Type};
+    let schema = batch.schema();
+    if !schema.fields().iter().any(|f| {
+        matches!(f.data_type(), DataType::Decimal128(_, s) | DataType::Decimal256(_, s) if *s <= 0)
+    }) {
+        return Ok(batch.clone());
+    }
+    let scaled = |digits: String, scale: i8| {
+        if scale < 0 && digits != "0" {
+            format!("{digits}{}", "0".repeat(scale.unsigned_abs() as usize))
+        } else {
+            digits
+        }
+    };
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (f, col) in schema.fields().iter().zip(batch.columns()) {
+        let text: Option<StringArray> = match f.data_type() {
+            DataType::Decimal128(_, s) if *s <= 0 => Some(
+                col.as_primitive::<Decimal128Type>()
+                    .iter()
+                    .map(|v| v.map(|x| scaled(x.to_string(), *s)))
+                    .collect(),
+            ),
+            DataType::Decimal256(_, s) if *s <= 0 => Some(
+                col.as_primitive::<Decimal256Type>()
+                    .iter()
+                    .map(|v| v.map(|x| scaled(x.to_string(), *s)))
+                    .collect(),
+            ),
+            _ => None,
+        };
+        match text {
+            Some(t) => {
+                fields.push(Field::new(
+                    f.name(),
+                    DataType::Utf8,
+                    f.is_nullable() || t.null_count() > 0,
+                ));
+                columns.push(Arc::new(t));
+            }
+            None => {
+                fields.push(f.as_ref().clone());
+                columns.push(col.clone());
+            }
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| te("decimal text", e))
+}
+
+/// Significant digits every `f64` round-trips exactly through its shortest text.
+pub const EXACT_F64_DIGITS: u8 = 15;
+
+fn decimal_columns(schema: &Schema) -> Vec<(String, u8, i8)> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| match f.data_type() {
+            DataType::Decimal32(p, s)
+            | DataType::Decimal64(p, s)
+            | DataType::Decimal128(p, s)
+            | DataType::Decimal256(p, s) => Some((f.name().clone(), *p, *s)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Turn an exact decimal string back into a JSON number when that is lossless.
+fn renumber_decimal(v: &mut Value, precision: u8, scale: i8) {
+    let Value::String(text) = v else { return };
+    let number = if scale <= 0 {
+        text.parse::<i64>()
+            .map(Value::from)
+            .or_else(|_| text.parse::<u64>().map(Value::from))
+            .ok()
+    } else if precision <= EXACT_F64_DIGITS {
+        text.parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number)
+    } else {
+        None
+    };
+    if let Some(n) = number {
+        *v = n;
+    }
+}
+
+/// Refuse field names that differ only by letter case: DuckDB identifiers are
+/// case-insensitive, so it would silently rename the second one (`A` → `A_1`).
+pub fn refuse_case_collisions(schema: &Schema) -> Result<(), FaucetError> {
+    check_case_collisions(schema.fields(), "")
+}
+
+fn check_case_collisions(fields: &Fields, path: &str) -> Result<(), FaucetError> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for f in fields {
+        if let Some(prev) = seen.insert(f.name().to_lowercase(), f.name()) {
+            return Err(FaucetError::Transform(format!(
+                "sql transform: fields '{path}{prev}' and '{path}{}' differ only by letter \
+                 case; SQL identifiers are case-insensitive, so DuckDB would rename one of \
+                 them — rename one upstream (e.g. with a rename_field transform)",
+                f.name()
+            )));
+        }
+        let child = format!("{path}{}.", f.name());
+        check_nested(f.data_type(), &child)?;
+    }
+    Ok(())
+}
+
+fn check_nested(dt: &DataType, path: &str) -> Result<(), FaucetError> {
+    match dt {
+        DataType::Struct(fields) => check_case_collisions(fields, path),
+        DataType::List(item) | DataType::LargeList(item) => check_nested(item.data_type(), path),
+        _ => Ok(()),
+    }
+}
+
+/// Replace every zero-field struct type (inferred from a field that is `{}` in
+/// every record) with `Utf8`, rewriting those values to the string `"{}"` —
+/// DuckDB cannot register a struct with no fields. Returns the rewritten
+/// schema, or `None` when the schema has none.
+pub fn stringify_empty_structs(schema: &Schema, records: &mut [Value]) -> Option<SchemaRef> {
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| has_empty_struct(f.data_type()))
+    {
+        return None;
+    }
+    for r in records.iter_mut() {
+        if let Some(o) = r.as_object_mut() {
+            for f in schema.fields() {
+                if let Some(v) = o.get_mut(f.name().as_str()) {
+                    rewrite_empty(f.data_type(), v, false);
+                }
+            }
+        }
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            f.as_ref()
+                .clone()
+                .with_data_type(without_empty(f.data_type()))
+        })
+        .collect();
+    Some(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+/// Restore `{}` in output columns that [`stringify_empty_structs`] rewrote,
+/// matched by top-level name against the original (pre-rewrite) schema.
+pub fn restore_empty_structs(original: &Schema, rows: &mut [Value]) {
+    let affected: Vec<&Field> = original
+        .fields()
+        .iter()
+        .filter(|f| has_empty_struct(f.data_type()))
+        .map(|f| f.as_ref())
+        .collect();
+    if affected.is_empty() {
+        return;
+    }
+    for r in rows.iter_mut() {
+        if let Some(o) = r.as_object_mut() {
+            for f in &affected {
+                if let Some(v) = o.get_mut(f.name().as_str()) {
+                    rewrite_empty(f.data_type(), v, true);
+                }
+            }
+        }
+    }
+}
+
+fn is_empty_struct(dt: &DataType) -> bool {
+    matches!(dt, DataType::Struct(f) if f.is_empty())
+}
+
+fn has_empty_struct(dt: &DataType) -> bool {
+    match dt {
+        DataType::Struct(fields) => {
+            fields.is_empty() || fields.iter().any(|f| has_empty_struct(f.data_type()))
+        }
+        DataType::List(item) | DataType::LargeList(item) => has_empty_struct(item.data_type()),
+        _ => false,
+    }
+}
+
+fn without_empty(dt: &DataType) -> DataType {
+    match dt {
+        d if is_empty_struct(d) => DataType::Utf8,
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|f| {
+                    f.as_ref()
+                        .clone()
+                        .with_data_type(without_empty(f.data_type()))
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        DataType::List(item) => DataType::List(Arc::new(
+            item.as_ref()
+                .clone()
+                .with_data_type(without_empty(item.data_type())),
+        )),
+        DataType::LargeList(item) => DataType::LargeList(Arc::new(
+            item.as_ref()
+                .clone()
+                .with_data_type(without_empty(item.data_type())),
+        )),
+        other => other.clone(),
+    }
+}
+
+/// Walk `v` along `dt`: forward turns `{}` into `"{}"`, `restore` turns it back.
+fn rewrite_empty(dt: &DataType, v: &mut Value, restore: bool) {
+    match (dt, &mut *v) {
+        (d, Value::Object(o)) if is_empty_struct(d) && !restore && o.is_empty() => {
+            *v = Value::String("{}".into());
+        }
+        (d, Value::String(s)) if is_empty_struct(d) && restore && s == "{}" => {
+            *v = Value::Object(Map::new());
+        }
+        (DataType::Struct(fields), Value::Object(o)) => {
+            for f in fields {
+                if let Some(child) = o.get_mut(f.name().as_str()) {
+                    rewrite_empty(f.data_type(), child, restore);
+                }
+            }
+        }
+        (DataType::List(item) | DataType::LargeList(item), Value::Array(items)) => {
+            for child in items {
+                rewrite_empty(item.data_type(), child, restore);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Hidden column listing the fields a record did not carry, so output rows can
@@ -193,6 +449,39 @@ mod tests {
         assert_eq!(back[0]["id"], json!(1));
         assert_eq!(back[0]["tags"], json!(["x", "y"]));
         assert_eq!(back[1]["name"], json!(null));
+    }
+
+    #[test]
+    fn integral_decimals_keep_every_digit_and_negative_scales_expand() {
+        use arrow::array::{Array, Decimal128Array, Decimal256Array};
+        use arrow::datatypes::i256;
+        let huge = Decimal128Array::from(vec![Some(i128::MAX), None, Some(-5)])
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        let shifted = Decimal128Array::from(vec![Some(12), Some(0), Some(7)])
+            .with_precision_and_scale(10, -2)
+            .unwrap();
+        let wide = Decimal256Array::from(vec![Some(i256::from_i128(3)), None, Some(i256::MAX)])
+            .with_precision_and_scale(76, 0)
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("huge", huge.data_type().clone(), true),
+            Field::new("shifted", shifted.data_type().clone(), false),
+            Field::new("wide", wide.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(huge), Arc::new(shifted), Arc::new(wide)],
+        )
+        .unwrap();
+        let rows = record_batches_to_json(&[batch]).unwrap();
+        assert_eq!(rows[0]["huge"], json!(i128::MAX.to_string()));
+        assert_eq!(rows[1]["huge"], json!(null));
+        assert_eq!(rows[2]["huge"], json!(-5));
+        assert_eq!(rows[0]["shifted"], json!(1200));
+        assert_eq!(rows[1]["shifted"], json!(0));
+        assert_eq!(rows[0]["wide"], json!(3));
+        assert_eq!(rows[2]["wide"], json!(i256::MAX.to_string()));
     }
 
     #[test]

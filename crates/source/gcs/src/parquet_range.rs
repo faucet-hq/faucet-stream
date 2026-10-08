@@ -34,6 +34,7 @@ pub(crate) struct GcsRangeReader {
     bucket_path: String,
     key: String,
     len: u64,
+    generation: Option<i64>,
     recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
 }
 
@@ -59,8 +60,18 @@ impl GcsRangeReader {
             bucket_path: bucket_path.to_string(),
             key: key.to_string(),
             len,
+            generation: None,
             recorder,
         })
+    }
+
+    /// Read every range from object generation `generation` (the one whose
+    /// size located the footer), so a replacement mid-read fails the read
+    /// instead of mixing row groups from two versions. `0` (unknown) pins
+    /// nothing.
+    pub(crate) fn pinned_to(mut self, generation: i64) -> Self {
+        self.generation = (generation != 0).then_some(generation);
+        self
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -75,10 +86,14 @@ impl GcsRangeReader {
         if let Some(r) = &self.recorder {
             r.record("get");
         }
-        let resp = self
+        let mut request = self
             .storage
             .read_object(&self.bucket_path, self.key.clone())
-            .set_read_range(ReadRange::segment(range.start, wanted))
+            .set_read_range(ReadRange::segment(range.start, wanted));
+        if let Some(generation) = self.generation {
+            request = request.set_generation(generation);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| failed(&self.key, &range, "", e))?;

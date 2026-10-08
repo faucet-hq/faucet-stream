@@ -131,7 +131,7 @@ fn load_expanded_from_dir(dir: &std::path::Path) -> Option<Vec<crate::expand::Ex
     let path = crate::env_loader::discover_config_path(dir)?;
     let text = std::fs::read_to_string(&path).ok()?;
     let cfg = crate::config::PipelineConfig::from_text(&text, &path).ok()?;
-    crate::expand::expand(&cfg).ok()
+    crate::expand::expand(&crate::partition::offline(&cfg)).ok()
 }
 
 #[cfg(test)]

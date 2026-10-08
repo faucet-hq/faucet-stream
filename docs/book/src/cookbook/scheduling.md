@@ -184,14 +184,19 @@ the scheduler handles missed/overlapping pods at the platform level.
 On SIGTERM or Ctrl-C:
 
 1. faucet stops accepting new ticks.
-2. If a run is in flight, it waits up to `shutdown_grace_secs` (default 30)
-   for it to finish.
-3. If the run finishes within the grace period, the process exits 0.
-4. If the run is still running after the grace period, it is aborted. The
+2. With no run in flight, the process exits 0.
+3. A run in flight is cancelled cooperatively: each row stops at its next page
+   boundary and flushes its sink (Parquet footers, multipart uploads,
+   overwrite staging). faucet waits up to `shutdown_grace_secs` (default 30)
+   for that, then exits 130 — the run was interrupted.
+4. If the run has not stopped after the grace period, it is aborted. The
    per-page `StateStore` bookmark means the next start resumes from the last
    confirmed write — no data is lost, but the partial page since the last
    bookmark is re-fetched on the next run. Whether that causes duplicates
    depends on your sink's idempotency.
+
+`run_timeout_secs` stops a run the same way: the run is cancelled at its next
+page boundary, given `shutdown_grace_secs` to flush, and counted as failed.
 
 Increase `shutdown_grace_secs` for long-running pages (e.g. a BigQuery batch
 that takes several minutes to flush):

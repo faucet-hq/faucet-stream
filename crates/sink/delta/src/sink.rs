@@ -211,11 +211,15 @@ impl DeltaSink {
             .ok_or_else(|| FaucetError::Sink("delta: json decoder produced no batch".to_string()))
     }
 
-    /// Write one chunk of records into the buffered writer.
-    async fn write_chunk(
+    /// Write a page into the buffered writer, `chunk` records per Arrow batch
+    /// (`0` = one batch). Every chunk is decoded before any is written, so a
+    /// record that does not fit the table fails the page with nothing of it
+    /// buffered — the page is all-or-nothing, as `batch_atomicity` reports.
+    async fn write_page(
         &self,
         state: &mut SinkState,
         records: &[Value],
+        chunk: usize,
     ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
@@ -226,8 +230,27 @@ impl DeltaSink {
                 .map_err(|e| FaucetError::Sink(format!("delta: {e}")))?;
         }
         let schema = state.schema.clone().expect("schema set");
-        let batch = self.encode_batch(&mut state.warned_fields, schema, records)?;
+        let chunk = if chunk == 0 { records.len() } else { chunk };
+        let batches = records
+            .chunks(chunk)
+            .map(|c| self.encode_batch(&mut state.warned_fields, schema.clone(), c))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut total = 0;
+        for batch in batches {
+            total += self.write_encoded(state, batch).await?;
+        }
+        Ok(total)
+    }
+
+    /// Write one decoded batch into the buffered writer.
+    async fn write_encoded(
+        &self,
+        state: &mut SinkState,
+        batch: RecordBatch,
+    ) -> Result<usize, FaucetError> {
         let rows = batch.num_rows();
+        let schema = state.schema.clone().expect("schema set");
+        self.ensure_table_writer(state, &schema).await?;
         let writer = state.writer.as_mut().expect("writer set");
         writer
             .write(batch)
@@ -363,16 +386,8 @@ impl faucet_core::Sink for DeltaSink {
             return Ok(0);
         }
         let mut state = self.state.lock().await;
-        let bs = self.config.batch_size;
-        let mut total = 0;
-        if bs == 0 || records.len() <= bs {
-            total += self.write_chunk(&mut state, records).await?;
-        } else {
-            for chunk in records.chunks(bs) {
-                total += self.write_chunk(&mut state, chunk).await?;
-            }
-        }
-        Ok(total)
+        self.write_page(&mut state, records, self.config.batch_size)
+            .await
     }
 
     /// delta-rs writes via `RecordBatchWriter`, so the sink consumes Arrow

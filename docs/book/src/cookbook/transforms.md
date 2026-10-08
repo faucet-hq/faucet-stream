@@ -8,6 +8,11 @@ order you want them to run, and the CLI wires them up for you.
 This page is a tour of the standard transforms exposed in YAML. All of
 them are listed in `faucet list` and dispatchable as `type:` values.
 
+A `config:` key the transform does not declare is refused at load time
+(`faucet validate` reports it, with a `did you mean` hint), so a typo such as
+`slat:` for `salt:` never silently runs with the option off. `faucet schema
+transform <name>` lists every key.
+
 ## At a glance
 
 | Kind | Purpose | Shape |
@@ -474,6 +479,11 @@ array is replaced **in place** with its compact JSON-string form — the
 standard step for landing nested data as a flat `STRING` column (e.g. when
 matching a warehouse table that stores nested structures as text). Scalar
 (already-flat) values and absent fields are left unchanged (idempotent).
+The string is canonical: object keys are sorted at every depth (arrays keep
+their order), so `{login: octo, id: 2}` always encodes as
+`{"id":2,"login":"octo"}` — the same bytes from every build and release, which
+keeps hashes, upsert change detection and test fixtures stable. The `hash`
+transform and `join` serialize nested values the same way.
 Needs the `transform-json-encode` feature.
 
 ## `unpivot` — wide/map → long (1→N)
@@ -558,8 +568,9 @@ the report's header row and the group columns from `ancestors.as`. It is the
 one reshape that otherwise forced these connectors onto the embedded-DuckDB SQL
 transform; `tree_flatten` keeps them inbuilt. Uneven branch depth leaves the
 missing ancestor levels null; a header/cell length mismatch zips to the shorter;
-a malformed/cyclic tree is truncated at `max_depth` (logged) rather than
-overflowing the stack. It also flattens any generic `children` tree (org charts,
+a tree deeper than `max_depth` (a malformed or cyclic one) fails the record
+rather than overflowing the stack or dropping the deeper rows, and a repeated
+header label (or one that collides with an ancestor/path column) fails it too. It also flattens any generic `children` tree (org charts,
 category trees, BOM explosions). Column-lineage is opaque (structure-changing).
 Needs the `transform-tree-flatten` feature.
 
@@ -603,8 +614,11 @@ both name each fail the page, with the group and row named.
 Expands one record into the **cartesian product of two or more of its sibling
 array fields**, emitting one flat row per combination — e.g. a HCM record's
 `jobs[] × compensation[] × employment[]`. Object elements spread their fields
-into the row (`prefix: true` name-prefixes them to avoid collisions); scalar
-elements land under the array's name. This is a different shape from `explode`
+into the row; a field that would overwrite an existing column (a parent field
+such as `id`, or a field of an earlier array) fails the record, so set
+`prefix: true` to name-prefix them instead. Scalar elements land under the
+array's name. A crossed field that is missing or `null` counts as empty; one
+that is present but not an array fails the record. This is a different shape from `explode`
 (one array → N rows) and `unpivot` (wide → long), and the last per-record
 reshape that otherwise forced a connector (e.g. `ukg_pro`) onto the DuckDB SQL
 transform. An empty crossed array yields zero rows (`skip`) or a null-filled row

@@ -277,9 +277,17 @@ pub async fn import_namespace(
     Ok(report)
 }
 
-/// Sentinel key used by state-store `check()` probes. Valid per
+/// Prefix of the sentinel key used by state-store `check()` probes. Valid per
 /// [`validate_state_key`] and deleted after the probe so it leaves no residue.
+/// Probes use [`doctor_sentinel_key`], which makes each one unique.
 pub const DOCTOR_SENTINEL_KEY: &str = "faucet_doctor_probe";
+
+/// A sentinel key unique to one `check()` probe, so concurrent probes against
+/// a shared store never delete each other's sentinel between its put and get
+/// (CORE-57).
+pub fn doctor_sentinel_key() -> String {
+    format!("{DOCTOR_SENTINEL_KEY}.{}", uuid::Uuid::new_v4().simple())
+}
 
 /// Reject keys that could escape the storage namespace or break filename
 /// rules on common filesystems. Allowed: ASCII letters, digits, `_`, `-`,
@@ -475,25 +483,85 @@ impl StateStore for MemoryStateStore {
 
 // ── FileStateStore ──────────────────────────────────────────────────────────
 
-/// Map a logical state key to a filesystem-safe filename stem. The key
-/// grammar allows `:` (used by the documented `pipeline:rest:issues`
-/// convention), but `:` is illegal in a filename on Windows/NTFS, so it is
-/// percent-encoded as `%3A`. This is collision-free because `%` can never
-/// appear in a valid key (see [`validate_state_key`]) (#78 LOW).
+/// Longest filename stem [`safe_filename`] emits before it hashes the key.
+/// The temp name adds `.{32-hex}.{seq}.json.tmp` (at most 63 bytes), so a
+/// stem of this length keeps every file the store writes under the 255-byte
+/// name limit of common filesystems (CORE-29).
+const MAX_STEM: usize = 160;
+
+/// Map a logical state key to a filesystem-safe filename stem.
+///
+/// - `:` and `/` are percent-encoded as `%3A` / `%2F` (`:` is illegal in an
+///   NTFS filename, `/` is a path separator).
+/// - Every uppercase ASCII letter is percent-encoded (`A` → `%41`), so the
+///   stem holds no uppercase letters outside escapes and two keys that differ
+///   only in case can never share a file on a case-insensitive filesystem
+///   (APFS, NTFS) (CORE-28).
+/// - A stem longer than [`MAX_STEM`] keeps a readable prefix and ends in
+///   `~<sha256 of the key>`; `~` never appears in a key or an escape, so the
+///   two shapes cannot collide. The full key is kept in a `<stem>.key`
+///   sidecar so [`StateStore::list`] can still report it.
+///
+/// Collision-free because `%` and `~` can never appear in a valid key (see
+/// [`validate_state_key`]).
 fn safe_filename(key: &str) -> String {
-    key.replace(':', "%3A").replace('/', "%2F")
+    let mut out = String::with_capacity(key.len() + 8);
+    for c in key.chars() {
+        match c {
+            ':' => out.push_str("%3A"),
+            '/' => out.push_str("%2F"),
+            'A'..='Z' => out.push_str(&format!("%{:02X}", c as u32)),
+            other => out.push(other),
+        }
+    }
+    if out.len() <= MAX_STEM {
+        return out;
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let mut cut = MAX_STEM - hex.len() - 1;
+    // Never split a `%XX` escape.
+    while cut > 0
+        && out.as_bytes()[..cut]
+            .iter()
+            .rev()
+            .take(2)
+            .any(|b| *b == b'%')
+    {
+        cut -= 1;
+    }
+    format!("{}~{hex}", &out[..cut])
 }
 
-/// Inverse of [`safe_filename`]; `None` when the stem is not a valid key.
+/// Inverse of [`safe_filename`] for un-hashed stems (both the current and the
+/// legacy shape decode); `None` when the stem is hashed or not a valid key.
 fn key_from_filename(stem: &str) -> Option<String> {
-    let key = stem.replace("%3A", ":").replace("%2F", "/");
+    if stem.contains('~') {
+        return None;
+    }
+    let bytes = stem.as_bytes();
+    let mut key = String::with_capacity(stem.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = stem.get(i + 1..i + 3)?;
+            let code = u8::from_str_radix(hex, 16).ok()?;
+            key.push(char::from(code));
+            i += 3;
+        } else {
+            key.push(char::from(bytes[i]));
+            i += 1;
+        }
+    }
     validate_state_key(&key).ok().map(|()| key)
 }
 
 /// File-backed `StateStore`. Each key maps to a JSON file at
 /// `{root}/{safe_filename(key)}.json`, written via atomic rename. The
-/// filename stem percent-encodes `:` as `%3A` so keys using the
-/// `pipeline:rest:issues` convention are valid on Windows.
+/// filename stem percent-encodes `:`, `/` and uppercase letters, so keys are
+/// valid on Windows and keys differing only in case never share a file on a
+/// case-insensitive filesystem; over-long keys are hashed.
 ///
 /// Each `put` writes a temp file, fsyncs it, renames it over the final path,
 /// and (on Unix) fsyncs the parent directory — so once `put` returns the
@@ -507,6 +575,7 @@ fn key_from_filename(stem: &str) -> Option<String> {
 pub struct FileStateStore {
     root: PathBuf,
     write_lock: Mutex<()>,
+    migrated: tokio::sync::OnceCell<()>,
     /// Optional at-rest encryption (#207). When set, `put` seals the JSON
     /// bytes before the atomic write and `get` unseals; plaintext files
     /// remain readable (and are sealed on their next write).
@@ -520,6 +589,7 @@ impl FileStateStore {
         Self {
             root: root.into(),
             write_lock: Mutex::new(()),
+            migrated: tokio::sync::OnceCell::new(),
             #[cfg(feature = "encryption")]
             encryption: None,
         }
@@ -573,18 +643,10 @@ impl FileStateStore {
         })
     }
 
-    /// Returns the root directory this store writes into.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-}
-
-#[async_trait]
-impl StateStore for FileStateStore {
-    async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
-        validate_state_key(key)?;
-        let path = self.entry_path(key);
-        match tokio::fs::read(&path).await {
+    async fn read_entry(&self, key: &str, path: &Path) -> Result<Option<Value>, FaucetError> {
+        #[cfg(not(feature = "encryption"))]
+        let _ = key;
+        match tokio::fs::read(path).await {
             Ok(bytes) => {
                 #[cfg(feature = "encryption")]
                 let bytes: Vec<u8> = if crate::encryption::is_encrypted(&bytes) {
@@ -639,6 +701,95 @@ impl StateStore for FileStateStore {
         }
     }
 
+    /// Rename every file written under an older naming scheme (uppercase
+    /// letters unescaped, long keys unhashed) to its current name, once per
+    /// store. Done eagerly rather than as a read fallback because on a
+    /// case-insensitive filesystem the current name of `users:x` would open the
+    /// legacy file of `Users:x`.
+    async fn migrate_legacy_names(&self) -> Result<(), FaucetError> {
+        self.migrated
+            .get_or_try_init(|| async {
+                let mut dir = match tokio::fs::read_dir(&self.root).await {
+                    Ok(d) => d,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => {
+                        return Err(FaucetError::State(format!(
+                            "failed to list state dir {}: {e}",
+                            self.root.display()
+                        )));
+                    }
+                };
+                let mut renames = Vec::new();
+                while let Some(entry) = dir.next_entry().await.map_err(|e| {
+                    FaucetError::State(format!(
+                        "failed to list state dir {}: {e}",
+                        self.root.display()
+                    ))
+                })? {
+                    let name = entry.file_name();
+                    let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                        continue;
+                    };
+                    if let Some(key) = key_from_filename(stem)
+                        && safe_filename(&key) != stem
+                    {
+                        renames.push((key, entry.path()));
+                    }
+                }
+                for (key, from) in renames {
+                    if let Some(sidecar) = self.key_sidecar(&key) {
+                        tokio::fs::write(&sidecar, key.as_bytes())
+                            .await
+                            .map_err(|e| {
+                                FaucetError::State(format!(
+                                    "failed to write state key file {}: {e}",
+                                    sidecar.display()
+                                ))
+                            })?;
+                    }
+                    let to = self.entry_path(&key);
+                    if tokio::fs::try_exists(&to).await.unwrap_or(false) {
+                        let _ = tokio::fs::remove_file(&from).await;
+                        continue;
+                    }
+                    match tokio::fs::rename(&from, &to).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(FaucetError::State(format!(
+                                "failed to rename legacy state file {} to {}: {e}",
+                                from.display(),
+                                to.display()
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| ())
+    }
+
+    fn key_sidecar(&self, key: &str) -> Option<PathBuf> {
+        let stem = safe_filename(key);
+        stem.contains('~')
+            .then(|| self.root.join(format!("{stem}.key")))
+    }
+
+    /// Returns the root directory this store writes into.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+#[async_trait]
+impl StateStore for FileStateStore {
+    async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
+        validate_state_key(key)?;
+        self.migrate_legacy_names().await?;
+        self.read_entry(key, &self.entry_path(key)).await
+    }
+
     async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
         validate_state_key(key)?;
         let _guard = self.write_lock.lock().await;
@@ -651,15 +802,28 @@ impl StateStore for FileStateStore {
             Some(enc) => enc.encrypt_bound(&bytes, key.as_bytes()),
             None => bytes,
         };
+        self.migrate_legacy_names().await?;
         let final_path = self.entry_path(key);
         let tmp_path = self.temp_path(key);
+
+        if let Some(sidecar) = self.key_sidecar(key) {
+            tokio::fs::write(&sidecar, key.as_bytes())
+                .await
+                .map_err(|e| {
+                    FaucetError::State(format!(
+                        "failed to write state key file {}: {e}",
+                        sidecar.display()
+                    ))
+                })?;
+        }
 
         // Write the temp file and fsync it BEFORE the rename. `fs::write`
         // alone leaves the bytes in the page cache: a crash after `put`
         // returns could surface a zero-length or stale file, breaking the
         // durability guarantee this store documents (#78/#8). `sync_all`
-        // flushes the file's data and metadata to disk.
-        {
+        // flushes the file's data and metadata to disk. Any failure removes
+        // the temp file so retries do not accumulate orphans (CORE-96).
+        let written: Result<(), FaucetError> = async {
             let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
                 FaucetError::State(format!(
                     "failed to create temp state file {}: {e}",
@@ -678,16 +842,21 @@ impl StateStore for FileStateStore {
                     tmp_path.display()
                 ))
             })?;
+            drop(file);
+            tokio::fs::rename(&tmp_path, &final_path)
+                .await
+                .map_err(|e| {
+                    FaucetError::State(format!(
+                        "failed to commit state file {}: {e}",
+                        final_path.display()
+                    ))
+                })
         }
-
-        tokio::fs::rename(&tmp_path, &final_path)
-            .await
-            .map_err(|e| {
-                FaucetError::State(format!(
-                    "failed to commit state file {}: {e}",
-                    final_path.display()
-                ))
-            })?;
+        .await;
+        if let Err(e) = written {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e);
+        }
 
         // fsync the parent directory so the rename itself is durable — an
         // atomic rename can still be lost on crash if the directory entry was
@@ -720,15 +889,22 @@ impl StateStore for FileStateStore {
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
         validate_state_key(key)?;
-        let path = self.entry_path(key);
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(FaucetError::State(format!(
-                "failed to delete state file {}: {e}",
-                path.display()
-            ))),
+        self.migrate_legacy_names().await?;
+        let mut paths = vec![self.entry_path(key)];
+        paths.extend(self.key_sidecar(key));
+        for path in paths {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(FaucetError::State(format!(
+                        "failed to delete state file {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
         }
+        Ok(())
     }
 
     fn supports_compare_and_put(&self) -> bool {
@@ -760,6 +936,7 @@ impl StateStore for FileStateStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        self.migrate_legacy_names().await?;
         let mut dir = match tokio::fs::read_dir(&self.root).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -783,13 +960,22 @@ impl StateStore for FileStateStore {
             let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
                 continue;
             };
-            if let Some(key) = key_from_filename(stem)
+            let key = if stem.contains('~') {
+                tokio::fs::read_to_string(self.root.join(format!("{stem}.key")))
+                    .await
+                    .ok()
+                    .filter(|k| validate_state_key(k).is_ok())
+            } else {
+                key_from_filename(stem)
+            };
+            if let Some(key) = key
                 && key.starts_with(prefix)
             {
                 keys.push(key);
             }
         }
         keys.sort();
+        keys.dedup();
         Ok(keys)
     }
 
@@ -820,10 +1006,11 @@ impl FileStateStore {
     /// probe, factored out so the happy path stays linear.
     async fn sentinel_roundtrip(&self) -> Result<(), FaucetError> {
         let probe = serde_json::json!({ "faucet_doctor": true });
-        self.put(DOCTOR_SENTINEL_KEY, &probe).await?;
-        let got = self.get(DOCTOR_SENTINEL_KEY).await?;
+        let key = doctor_sentinel_key();
+        self.put(&key, &probe).await?;
+        let got = self.get(&key).await?;
         // Best-effort cleanup regardless of the read result.
-        let _ = self.delete(DOCTOR_SENTINEL_KEY).await;
+        let _ = self.delete(&key).await;
         match got {
             Some(v) if v == probe => Ok(()),
             _ => Err(FaucetError::State(
@@ -1110,6 +1297,107 @@ mod tests {
             }
         }
         assert!(!has_colon, "no state filename may contain ':'");
+    }
+
+    #[test]
+    fn safe_filename_escapes_uppercase_and_round_trips() {
+        assert_eq!(safe_filename("Users::x"), "%55sers%3A%3Ax");
+        assert_ne!(
+            safe_filename("Users::x").to_lowercase(),
+            safe_filename("users::x").to_lowercase()
+        );
+        for k in ["Users::x", "a/B:c", "plain"] {
+            assert_eq!(key_from_filename(&safe_filename(k)).as_deref(), Some(k));
+        }
+        // Legacy (unescaped) stems still decode.
+        assert_eq!(key_from_filename("Users%3Ax").as_deref(), Some("Users:x"));
+        assert_eq!(key_from_filename("bad%Z"), None);
+        assert_eq!(key_from_filename("a~b"), None);
+    }
+
+    #[test]
+    fn long_keys_hash_into_a_bounded_stem() {
+        let key = format!("p::{}", "A:".repeat(120));
+        let stem = safe_filename(&key);
+        assert!(stem.len() <= MAX_STEM, "{}", stem.len());
+        assert!(stem.contains('~'));
+        let other = format!("p::{}B", "A:".repeat(119));
+        assert_ne!(safe_filename(&other), stem);
+    }
+
+    #[tokio::test]
+    async fn keys_differing_only_in_case_keep_separate_files() {
+        let dir = TempDir::new().unwrap();
+        let s = FileStateStore::new(dir.path());
+        s.put("Users::x", &json!(1)).await.unwrap();
+        s.put("users::x", &json!(2)).await.unwrap();
+        assert_eq!(s.get("Users::x").await.unwrap(), Some(json!(1)));
+        assert_eq!(s.get("users::x").await.unwrap(), Some(json!(2)));
+        assert_eq!(s.list("").await.unwrap(), vec!["Users::x", "users::x"]);
+    }
+
+    #[tokio::test]
+    async fn a_long_key_round_trips_lists_and_deletes() {
+        let dir = TempDir::new().unwrap();
+        let s = FileStateStore::new(dir.path());
+        let key = format!("pipe::row::{}", "parent:".repeat(34));
+        assert!(key.len() <= 256);
+        s.put(&key, &json!({"c": 1})).await.unwrap();
+        assert_eq!(s.get(&key).await.unwrap(), Some(json!({"c": 1})));
+        assert_eq!(s.list("pipe").await.unwrap(), vec![key.clone()]);
+        s.delete(&key).await.unwrap();
+        assert_eq!(s.get(&key).await.unwrap(), None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_named_files_are_read_and_migrated() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("Users%3Ax.json"), b"{\"c\":7}").unwrap();
+        let s = FileStateStore::new(dir.path());
+        // A lowercase key must not read the uppercase key's legacy file.
+        assert_eq!(s.get("users:x").await.unwrap(), None);
+        assert_eq!(s.get("Users:x").await.unwrap(), Some(json!({"c": 7})));
+        s.put("Users:x", &json!({"c": 8})).await.unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["%55sers%3Ax.json".to_string()]);
+        assert_eq!(s.get("Users:x").await.unwrap(), Some(json!({"c": 8})));
+        s.delete("Users:x").await.unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // A long legacy name is migrated to its hashed name.
+        let dir = TempDir::new().unwrap();
+        let key = format!("p::{}", "q".repeat(170));
+        std::fs::write(
+            dir.path().join(format!("p%3A%3A{}.json", "q".repeat(170))),
+            b"3",
+        )
+        .unwrap();
+        let s = FileStateStore::new(dir.path());
+        assert_eq!(s.list("p").await.unwrap(), vec![key.clone()]);
+        assert_eq!(s.get(&key).await.unwrap(), Some(json!(3)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_put_leaves_no_temp_file() {
+        let dir = TempDir::new().unwrap();
+        let s = FileStateStore::new(dir.path());
+        // A directory where the final file should be makes the rename fail.
+        std::fs::create_dir(dir.path().join("k.json")).unwrap();
+        std::fs::write(dir.path().join("k.json").join("x"), b"x").unwrap();
+        assert!(s.put("k", &json!(1)).await.is_err());
+        assert!(!has_tmp_residue(dir.path()));
+    }
+
+    #[test]
+    fn doctor_sentinel_keys_are_unique_and_valid() {
+        let a = doctor_sentinel_key();
+        assert_ne!(a, doctor_sentinel_key());
+        assert!(a.starts_with(DOCTOR_SENTINEL_KEY));
+        validate_state_key(&a).unwrap();
     }
 
     /// True if any `.json.tmp` residue remains in `dir`. Temp names are unique

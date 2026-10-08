@@ -195,17 +195,19 @@ impl Source for TransformingSource {
                     continue;
                 }
                 let effective = std::cmp::max(batch_size, page_len);
-                let total = out.len();
-                let mut start = 0usize;
-                while start < total {
-                    let end = std::cmp::min(start + effective, total);
-                    let is_last = end == total;
-                    let chunk: Vec<Value> = out[start..end].to_vec();
+                if out.len() <= effective {
+                    yield StreamPage { records: out, bookmark: page.bookmark };
+                    continue;
+                }
+                // Move the records into the chunks rather than cloning them.
+                let mut rest = out.into_iter();
+                while rest.len() > 0 {
+                    let chunk: Vec<Value> = rest.by_ref().take(effective).collect();
+                    let is_last = rest.len() == 0;
                     yield StreamPage {
                         records: chunk,
                         bookmark: if is_last { page.bookmark.clone() } else { None },
                     };
-                    start = end;
                 }
             }
         })

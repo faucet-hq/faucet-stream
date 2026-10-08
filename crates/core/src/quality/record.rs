@@ -87,7 +87,13 @@ pub fn evaluate_record_check(c: &CompiledRecordCheck, rec: &Value) -> Result<(),
                 let msg = validator
                     .iter_errors(rec)
                     .next()
-                    .map(|e| e.to_string())
+                    .map(|e| {
+                        format!(
+                            "record did not validate against schema at `{}` (rule `{}`)",
+                            e.instance_path(),
+                            e.schema_path()
+                        )
+                    })
                     .unwrap_or_else(|| "record did not validate against schema".into());
                 Err(msg)
             }
@@ -186,7 +192,7 @@ fn evaluate_compare(op: CompareOp, actual: &Value, expected: &Value) -> Result<(
             if ok {
                 Ok(())
             } else {
-                Err(format!("comparison {actual} {op} {expected} failed"))
+                Err(format!("comparison {op} {expected} failed"))
             }
         }
     }
@@ -505,5 +511,22 @@ mod tests {
         assert!(evaluate_record_check(&c, &json!({"id": 1})).is_ok());
         assert!(evaluate_record_check(&c, &json!({"id": "x"})).is_err());
         assert!(evaluate_record_check(&c, &json!({})).is_err());
+        let msg = evaluate_record_check(&c, &json!({"id": "secret-value"})).unwrap_err();
+        assert!(
+            !msg.contains("secret-value") && msg.contains("/id"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn compare_failure_message_omits_the_record_value() {
+        let gt = one(RecordCheck::Compare {
+            field: "id".into(),
+            op: CompareOp::Lt,
+            value: json!(10),
+            on_failure: OnFailure::Abort,
+        });
+        let msg = evaluate_record_check(&gt, &json!({"id": 4242})).unwrap_err();
+        assert!(!msg.contains("4242") && msg.contains("10"), "{msg}");
     }
 }

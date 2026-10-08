@@ -62,9 +62,11 @@ pub async fn write_columnar(
     };
     let key = format!("{prefix}faucet-{}.parquet", uuid::Uuid::now_v7());
     let bucket_path = format!("projects/_/buckets/{}", cfg.staging_bucket);
+    let crc = faucet_common_gcs::crc32c_of_bytes(&bytes);
     store
         .write_object(bucket_path, key.clone(), bytes::Bytes::from(bytes))
         .set_content_type("application/vnd.apache.parquet")
+        .with_known_crc32c(crc)
         .send_unbuffered()
         .await
         .map_err(|e| {

@@ -69,10 +69,7 @@ pub async fn send_webhook(
     for (k, v) in &headers {
         req = req.header(k, v);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let resp = req.send().await.map_err(request_failed)?;
     check_status(resp).await
 }
 
@@ -87,11 +84,14 @@ async fn post_json(
     for (k, v) in headers {
         req = req.header(k, v);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let resp = req.send().await.map_err(request_failed)?;
     check_status(resp).await
+}
+
+/// A transport error, without the request URL: a channel URL (a Slack
+/// incoming webhook) is itself a credential, and this text is logged.
+fn request_failed(e: reqwest::Error) -> String {
+    format!("request failed: {}", e.without_url())
 }
 
 /// A 2xx is success; anything else is an error carrying the status + a short
@@ -122,6 +122,25 @@ fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_transport_error_does_not_carry_the_webhook_url() {
+        let cfg = crate::notify::spec::SlackConfig {
+            webhook_url: "http://127.0.0.1:1/services/T000/B000/SECRETTOKEN".into(),
+            channel: None,
+            username: None,
+        };
+        let err = send_slack(
+            &Client::new(),
+            &cfg,
+            &crate::notify::NotifyEvent::run_failure("p", "", "s", "m"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.starts_with("request failed"), "{err}");
+        assert!(!err.contains("SECRETTOKEN"), "{err}");
+        assert!(!err.contains("127.0.0.1"), "{err}");
+    }
 
     #[test]
     fn hmac_matches_known_vector() {

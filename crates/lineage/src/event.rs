@@ -51,11 +51,42 @@ pub struct RunFacets {
     pub parent: Option<ParentRunFacet>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nominal_time: Option<NominalTimeRunFacet>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<ErrorMessageRunFacet>,
 }
 
 impl RunFacets {
     fn is_empty(&self) -> bool {
-        self.parent.is_none() && self.nominal_time.is_none()
+        self.parent.is_none() && self.nominal_time.is_none() && self.error_message.is_none()
+    }
+}
+
+/// Schema URL of the OpenLineage `ErrorMessageRunFacet`.
+pub const ERROR_MESSAGE_FACET_URL: &str = "https://openlineage.io/spec/facets/1-0-1/ErrorMessageRunFacet.json#/$defs/ErrorMessageRunFacet";
+
+/// Schema URL of the OpenLineage `OutputStatisticsOutputDatasetFacet`.
+pub const OUTPUT_STATISTICS_FACET_URL: &str = "https://openlineage.io/spec/facets/1-0-2/OutputStatisticsOutputDatasetFacet.json#/$defs/OutputStatisticsOutputDatasetFacet";
+
+/// Why a run failed (OpenLineage `errorMessage` run facet).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorMessageRunFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    pub message: String,
+    pub programming_language: String,
+}
+
+impl ErrorMessageRunFacet {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            producer: PRODUCER.into(),
+            schema_url: ERROR_MESSAGE_FACET_URL.into(),
+            message: message.into(),
+            programming_language: "rust".into(),
+        }
     }
 }
 
@@ -132,6 +163,11 @@ pub struct Dataset {
     pub name: String,
     #[serde(skip_serializing_if = "DatasetFacets::is_empty")]
     pub facets: DatasetFacets,
+    #[serde(
+        rename = "outputFacets",
+        skip_serializing_if = "OutputDatasetFacets::is_empty"
+    )]
+    pub output_facets: OutputDatasetFacets,
 }
 
 impl Dataset {
@@ -140,6 +176,42 @@ impl Dataset {
             namespace: namespace.into(),
             name: name.into(),
             facets: DatasetFacets::default(),
+            output_facets: OutputDatasetFacets::default(),
+        }
+    }
+}
+
+/// Facets that only an output dataset carries.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputDatasetFacets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_statistics: Option<OutputStatisticsFacet>,
+}
+
+impl OutputDatasetFacets {
+    fn is_empty(&self) -> bool {
+        self.output_statistics.is_none()
+    }
+}
+
+/// Records written to an output dataset (OpenLineage `outputStatistics`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputStatisticsFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    pub row_count: u64,
+}
+
+impl OutputStatisticsFacet {
+    pub fn new(row_count: u64) -> Self {
+        Self {
+            producer: PRODUCER.into(),
+            schema_url: OUTPUT_STATISTICS_FACET_URL.into(),
+            row_count,
         }
     }
 }

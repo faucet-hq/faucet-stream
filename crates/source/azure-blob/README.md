@@ -17,7 +17,7 @@ Connection fields come from `faucet-common-azure` and are set at the top level:
 |---|---|---|
 | `container` | string | **Required.** Blob container / ADLS filesystem. |
 | `account` | string | Storage-account name (optional with a connection string / emulator). |
-| `auth` | `{ type, config }` | `account_key` / `sas_token` / `connection_string` / `managed_identity` / `service_principal` / `default`. |
+| `auth` | `{ type, config }` | `account_key` / `sas_token` / `connection_string` / `managed_identity` / `service_principal` / `default`. With any explicit `auth`, `AZURE_*` credential variables in the environment are ignored (only `default` uses the environment's credential chain). A `connection_string` honours `EndpointSuffix`, `DefaultEndpointsProtocol` and `UseDevelopmentStorage=true`. |
 | `endpoint` | string | Custom blob endpoint (emulator / sovereign cloud). |
 | `allow_http` | bool | Permit plaintext HTTP (Azurite). |
 | `use_emulator` | bool | Target the Azurite emulator. |
@@ -33,7 +33,9 @@ Source-specific fields:
 | `prefix` | string | — | Object-name prefix filter. Ignored when `object_keys` is set. |
 | `object_keys` | list | — | Explicit object names; skips listing. |
 | `file_format` | enum | `json_lines` | `json_lines` / `json_array` / `raw_text` / `csv` / `xml` / `xlsx`. |
+| `include` | string | *(unset)* | Glob over the whole object key selecting what to read (e.g. `exports/*.parquet`). Without it, zero-byte folder markers and keys with a `_`- or `.`-prefixed segment below the prefix (`_SUCCESS`, `_temporary/…`, `.crc`) are skipped; with it, exactly the matching keys are read. |
 | `max_objects` | int | — | Hard cap on objects read. |
+| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may reach; a larger one fails the run instead of exhausting memory. |
 | `concurrency` | int | `10` | Max concurrent object reads, on the streaming path as well as the batch one. The streaming prefetch is ordered, so records stay in listing order; `0` is clamped to 1. For `json_lines` it overlaps only the request setup (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole bodies are resident. |
 | `batch_size` | int | `1000` | Records per `StreamPage`; `0` = one page per object. |
 | `verify_length` | bool | `true` | Verify each object's byte count against the `size` Azure reports; a short (truncated) or over-long transfer fails with `FaucetError::Source`. See [Read-integrity verification](#read-integrity-verification). |

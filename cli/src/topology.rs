@@ -114,6 +114,14 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
     }
     refuse_graph_blocks(cfg)?;
     refuse_destructive_sources(cfg)?;
+    refuse_unresolved_node_refs(cfg)?;
+    crate::expand::check_sla_and_profiling(
+        "topology",
+        cfg.sla.as_ref(),
+        cfg.profiling.as_ref(),
+        cfg.pipeline.state.as_ref(),
+    )?;
+    validate_governance(cfg)?;
     let spec = &cfg.pipeline;
     let mut known: Vec<String> = spec.nodes.keys().cloned().collect();
     known.sort_unstable();
@@ -124,6 +132,102 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
                     name: endpoint.clone(),
                     known: known.clone(),
                 });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `${vars.*}` / `${sources.*}` / `${sinks.*}` reference still present in a
+/// node config was never resolved (the config was built without
+/// `resolve_config_refs`), and the connector would receive it literally
+/// (#789 CLI-62).
+fn refuse_unresolved_node_refs(cfg: &PipelineConfig) -> CliResult<()> {
+    fn find(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => crate::interpolate::iter_directives(s).find_map(|(t, d)| {
+                matches!(
+                    d,
+                    crate::interpolate::Directive::Deferred { id, .. }
+                        if matches!(id, "vars" | "sources" | "sinks")
+                )
+                .then(|| t.to_string())
+            }),
+            Value::Array(a) => a.iter().find_map(find),
+            Value::Object(m) => m.values().find_map(find),
+            _ => None,
+        }
+    }
+    let mut ids: Vec<&String> = cfg.pipeline.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let token = match &cfg.pipeline.nodes[id] {
+            NodeSpec::Source { config, .. } | NodeSpec::Sink { config, .. } => {
+                config.as_ref().and_then(find)
+            }
+            NodeSpec::Transform { transforms } => transforms.iter().find_map(|t| find(&t.config)),
+            _ => None,
+        };
+        if let Some(token) = token {
+            return Err(CliError::Config(format!(
+                "topology node '{id}': `{token}` was never resolved — load the config through \
+                 `PipelineConfig::from_path*` / `from_text`, which resolve `vars:` and template \
+                 references"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Compile the governance blocks and apply the gates a matrix row gets at
+/// expand time, so a topology that cannot run fails `validate` (and fails
+/// before any lineage START is emitted) rather than mid-run: a quarantining
+/// quality / contract / drift policy needs a `dlq:`, and `on_drift: evolve`
+/// needs every sink node to support schema evolution (#789 CLI-83).
+fn validate_governance(cfg: &PipelineConfig) -> CliResult<()> {
+    build_governance(cfg)?;
+    let mut quarantines: Vec<&str> = Vec::new();
+    #[cfg(feature = "quality")]
+    if let Some(q) = cfg.pipeline.quality.as_ref()
+        && faucet_core::CompiledQuality::compile(q)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("quality");
+    }
+    #[cfg(feature = "contract")]
+    if let Some(c) = cfg.pipeline.contract.as_ref()
+        && faucet_core::CompiledContract::compile(c)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("contract");
+    }
+    let drift = cfg
+        .pipeline
+        .schema
+        .as_ref()
+        .map(faucet_core::SchemaDriftPolicy::compile);
+    if drift.as_ref().is_some_and(|d| d.requires_dlq()) {
+        quarantines.push("schema");
+    }
+    if !quarantines.is_empty() && cfg.pipeline.dlq.is_none() {
+        return Err(CliError::Config(format!(
+            "topology: the {} block quarantines records, which needs a `dlq:` block to route \
+             them to",
+            quarantines.join(" / ")
+        )));
+    }
+    if drift
+        .as_ref()
+        .is_some_and(|d| d.on_drift == faucet_core::OnDrift::Evolve)
+    {
+        for (id, kind, _) in sink_nodes(cfg)? {
+            if !crate::registry::sink_supports_schema_evolution(&kind) {
+                return Err(CliError::Config(format!(
+                    "sink node '{id}': schema.on_drift: evolve is not supported by sink \
+                     '{kind}' — use warn, ignore, quarantine or fail"
+                )));
             }
         }
     }
@@ -295,10 +399,10 @@ fn resolved_node_kind(cfg: &PipelineConfig, node: &NodeSpec) -> Option<String> {
 
 /// The four atomic-watermark requirements, per node, plus the single-source rule.
 ///
-/// Ordered so the message names the *limiting* side, and suggests the keyed-upsert
-/// alternative when the sinks could do it — the same shape as the matrix gate in
-/// `expand`, so an operator moving a pipeline between the two forms reads the same
-/// diagnosis.
+/// Ordered so the message names the *limiting* side. A node graph supports only
+/// the atomic-watermark mechanism; the keyed-upsert alternative matrix mode
+/// accepts is not offered here, so the messages point at what a graph can do
+/// instead (#789 CLI-84).
 fn validate_exactly_once(cfg: &PipelineConfig) -> CliResult<()> {
     let nodes = &cfg.pipeline.nodes;
     let sources: Vec<(&String, String)> = nodes
@@ -320,8 +424,9 @@ fn validate_exactly_once(cfg: &PipelineConfig) -> CliResult<()> {
             "`delivery: exactly_once` needs exactly one source node; this graph has {}. A \
              sink's commit watermark is only meaningful against a known source position, and \
              nothing records which source fed a given page. Split the graph into one pipeline \
-             per source, or use `write_mode: upsert` + `key` on the sinks for keyed-upsert \
-             effectively-once with any number of sources",
+             per source, or keep `delivery: at_least_once` and write with `write_mode: upsert` \
+             + `key`, whose replays overwrite the same rows (a node graph does not report \
+             that as exactly-once)",
             sources.len()
         )));
     }
@@ -340,7 +445,9 @@ fn validate_exactly_once(cfg: &PipelineConfig) -> CliResult<()> {
             return Err(CliError::Config(format!(
                 "node '{id}': `delivery: exactly_once` is not supported by sink '{kind}' \
                  (sinks that commit a watermark atomically: {}). Every sink node must qualify — \
-                 each one keeps its own watermark",
+                 each one keeps its own watermark. A keyed upsert sink is not accepted in a node \
+                 graph: keep `delivery: at_least_once` with `write_mode: upsert` + `key`, or run \
+                 it as a matrix pipeline, which reports that as effectively-once",
                 crate::registry::IDEMPOTENT_SINK_KINDS.join(", ")
             )));
         }
@@ -568,7 +675,8 @@ pub async fn build_topology_meta(
     opts: &TopologyRunOptions,
 ) -> CliResult<(Topology, NodeIdentities)> {
     let mut ids = NodeIdentities::new();
-    let topo = build_topology_inner(cfg, auth, opts, Some(&mut ids), None, None).await?;
+    let topo =
+        build_topology_inner(cfg, auth, opts, Some(&mut ids), None, None, Build::Live).await?;
     Ok((topo, ids))
 }
 
@@ -581,8 +689,16 @@ pub async fn build_topology_full(
 ) -> CliResult<(Topology, NodeIdentities, TopologyProfilers)> {
     let mut ids = NodeIdentities::new();
     let mut profilers = TopologyProfilers::new();
-    let topo =
-        build_topology_inner(cfg, auth, opts, Some(&mut ids), Some(&mut profilers), None).await?;
+    let topo = build_topology_inner(
+        cfg,
+        auth,
+        opts,
+        Some(&mut ids),
+        Some(&mut profilers),
+        None,
+        Build::Live,
+    )
+    .await?;
     Ok((topo, ids, profilers))
 }
 
@@ -616,6 +732,7 @@ pub async fn build_topology_run(
         Some(&mut identities),
         Some(&mut profilers),
         Some(&mut budgets),
+        Build::Live,
     )
     .await?;
     Ok(BuiltTopology {
@@ -642,7 +759,83 @@ pub async fn build_topology_with(
     auth: &AuthCatalog,
     opts: &TopologyRunOptions,
 ) -> CliResult<Topology> {
-    build_topology_inner(cfg, auth, opts, None, None, None).await
+    build_topology_inner(cfg, auth, opts, None, None, None, Build::Live).await
+}
+
+/// Validate a topology config **offline** (#844): the graph checks, governance,
+/// and each source/sink node's connector config — deserialization plus the
+/// connector's own `validate()`, exactly what matrix-mode `faucet validate`
+/// runs — without constructing a single connector.
+///
+/// Building a connector is not side-effect free (a Postgres sink connects, a
+/// SQLite sink creates its database file), so `validate` must never do it. The
+/// returned graph wires inert placeholders in place of the connectors: it is
+/// for reporting its shape, never for running.
+pub async fn validate_topology(cfg: &PipelineConfig) -> CliResult<Topology> {
+    let auth = AuthCatalog::default();
+    build_topology_inner(
+        cfg,
+        &auth,
+        &TopologyRunOptions::default(),
+        None,
+        None,
+        None,
+        Build::Offline,
+    )
+    .await
+}
+
+/// The offline twin of [`faucet_core::check_dlq_all_policy`]: refuse
+/// `on_batch_error: dlq_all` on a sink that may commit part of a failed batch,
+/// judged from its config rather than a built connector.
+fn check_dlq_all_offline(
+    id: &str,
+    kind: &str,
+    config: &Value,
+    dlq: &crate::config::DlqSpec,
+) -> CliResult<()> {
+    if dlq.on_batch_error != crate::config::OnBatchErrorSpec::DlqAll
+        || dlq.allow_duplicates_on_dlq_all
+    {
+        return Ok(());
+    }
+    let atomicity = crate::registry::sink_batch_atomicity(kind, config).unwrap_or_default();
+    if faucet_core::dlq_all_is_safe(
+        atomicity,
+        crate::commands::validate::config_writes_by_key(kind, config),
+    ) {
+        return Ok(());
+    }
+    Err(CliError::Config(format!(
+        "node '{id}': {}",
+        faucet_core::dlq_all_refusal(kind, atomicity)
+    )))
+}
+
+/// Whether [`build_topology_inner`] builds the real connectors or only checks
+/// their configs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Build {
+    Live,
+    Offline,
+}
+
+/// The placeholder source an offline-validated graph wires in place of a real
+/// connector. It is never run.
+struct OfflineSource;
+
+#[async_trait::async_trait]
+impl faucet_core::Source for OfflineSource {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, faucet_core::FaucetError> {
+        Ok(Vec::new())
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "offline"
+    }
 }
 
 async fn build_topology_inner(
@@ -652,6 +845,7 @@ async fn build_topology_inner(
     mut identities: Option<&mut NodeIdentities>,
     mut profilers: Option<&mut TopologyProfilers>,
     mut budgets: Option<&mut TopologyBudgets>,
+    build: Build,
 ) -> CliResult<Topology> {
     // Cheap graph checks first, so a wiring typo never costs a connector build.
     validate_topology_spec(cfg)?;
@@ -692,6 +886,13 @@ async fn build_topology_inner(
                 )?;
                 crate::executor::resolve_now_inplace(&mut c, clock)?;
                 crate::executor::reject_unresolved_backfill_tokens(&c, "source")?;
+                if build == Build::Offline {
+                    crate::registry::validate_source_config(&k, id, c)
+                        .map_err(|e| CliError::Config(format!("node '{id}' source: {e}")))?;
+                    builder =
+                        builder.node((*id).clone(), NodeKind::Source(Box::new(OfflineSource)));
+                    continue;
+                }
                 let source = build_source(&k, c.clone(), auth, None).await?;
                 record_identity(&mut identities, id, &k, c, source.dataset_uri());
                 NodeKind::Source(source)
@@ -716,7 +917,14 @@ async fn build_topology_inner(
                 // identity is still recorded from the *real* config, so a
                 // `--dry-run` report names the destination it would have
                 // written rather than the counting stand-in.
-                let sink: Box<dyn faucet_core::Sink> = if opts.dry_run {
+                let sink: Box<dyn faucet_core::Sink> = if build == Build::Offline {
+                    crate::registry::validate_sink_config(&k, id, c.clone())
+                        .map_err(|e| CliError::Config(format!("node '{id}' sink: {e}")))?;
+                    if let Some(dlq) = &spec.dlq {
+                        check_dlq_all_offline(id, &k, &c, dlq)?;
+                    }
+                    Box::new(crate::executor::CountingSink::new())
+                } else if opts.dry_run {
                     if let Ok(probe) = build_sink(&k, c.clone(), auth).await {
                         record_identity(&mut identities, id, &k, c.clone(), probe.dataset_uri());
                     }
@@ -813,7 +1021,7 @@ async fn build_topology_inner(
                         }
                         .map(|b| b.attributes.clone())
                         .unwrap_or_default();
-                        let policy_sink = faucet_core::PolicySink::new(
+                        let mut policy_sink = faucet_core::PolicySink::new(
                             sink,
                             std::sync::Arc::new(compiled),
                             faucet_core::SinkFacts {
@@ -826,6 +1034,10 @@ async fn build_topology_inner(
                                 row: (*id).clone(),
                             },
                         );
+                        if let Some(dlq) = &spec.dlq {
+                            policy_sink =
+                                policy_sink.with_dlq_destination(crate::policy::dlq_facts(dlq));
+                        }
                         Box::new(match cfg.pipeline.masking.as_ref() {
                             Some(masking) => policy_sink.with_masking(std::sync::Arc::new(
                                 faucet_core::CompiledMasking::compile_for_sink(
@@ -856,7 +1068,7 @@ async fn build_topology_inner(
                 capacity: *channel_capacity,
                 fanout: *fanout,
             },
-            NodeSpec::Merge => NodeKind::Merge,
+            NodeSpec::Merge {} => NodeKind::Merge,
             NodeSpec::Join(js) => NodeKind::Join(JoinNode {
                 config: JoinConfig {
                     mode: js.mode,
@@ -900,6 +1112,18 @@ async fn build_topology_inner(
 /// that node's identifiers (node id, template ref, connector kind) — any of which
 /// an `applies_to` rule may name. A sink for which no rule applies gets no entry,
 /// so the pass is skipped entirely for it.
+/// The governance a run applies: a preview (`--dry-run` / `--limit`) writes
+/// through counting or truncating sinks that keep no watermark, so it runs
+/// at-least-once whatever the config's `delivery:` (#789 CLI-82), as matrix
+/// mode does.
+fn run_governance(cfg: &PipelineConfig, preview: bool) -> CliResult<TopologyGovernance> {
+    let mut g = build_governance(cfg)?;
+    if preview {
+        g.delivery = faucet_core::DeliveryMode::AtLeastOnce;
+    }
+    Ok(g)
+}
+
 fn build_governance(cfg: &PipelineConfig) -> CliResult<TopologyGovernance> {
     #[allow(unused_mut)]
     let mut g = TopologyGovernance::new();
@@ -930,12 +1154,33 @@ fn build_governance(cfg: &PipelineConfig) -> CliResult<TopologyGovernance> {
 
     #[cfg(feature = "masking")]
     if let Some(spec) = &cfg.pipeline.masking {
-        for (node_id, node) in &cfg.pipeline.nodes {
+        for (node_id, ids) in sink_node_masking_ids(cfg) {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let compiled = faucet_core::CompiledMasking::compile_for_sink(spec, &ids)
+                .map_err(|e| CliError::Config(format!("masking: {e}")))?;
+            if !compiled.is_empty() {
+                g.masking_by_sink
+                    .insert(node_id, std::sync::Arc::new(compiled));
+            }
+        }
+    }
+    Ok(g)
+}
+
+/// Each sink node's id with the ids its masking rules are scoped by — the
+/// node id, its template name, and its resolved connector kind (the node's
+/// own `type:` override, else the template's). Shared by the runtime and
+/// `faucet masking`, so the report names what a run applies.
+#[cfg(feature = "masking")]
+pub(crate) fn sink_node_masking_ids(cfg: &PipelineConfig) -> Vec<(String, Vec<String>)> {
+    cfg.pipeline
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| {
             let NodeSpec::Sink { template, kind, .. } = node else {
-                continue;
+                return None;
             };
             let template_ref = template.as_deref().unwrap_or("default");
-            // The node's own kind override, else the template's declared kind.
             let resolved_kind = kind.clone().or_else(|| {
                 cfg.pipeline
                     .sinks
@@ -943,19 +1188,11 @@ fn build_governance(cfg: &PipelineConfig) -> CliResult<TopologyGovernance> {
                     .or(cfg.pipeline.sink.as_ref())
                     .map(|t| t.kind.clone())
             });
-            let mut ids: Vec<&str> = vec![node_id.as_str(), template_ref];
-            if let Some(k) = resolved_kind.as_deref() {
-                ids.push(k);
-            }
-            let compiled = faucet_core::CompiledMasking::compile_for_sink(spec, &ids)
-                .map_err(|e| CliError::Config(format!("masking: {e}")))?;
-            if !compiled.is_empty() {
-                g.masking_by_sink
-                    .insert(node_id.clone(), std::sync::Arc::new(compiled));
-            }
-        }
-    }
-    Ok(g)
+            let mut ids = vec![node_id.clone(), template_ref.to_string()];
+            ids.extend(resolved_kind);
+            Some((node_id.clone(), ids))
+        })
+        .collect()
 }
 
 /// Collect a bounded preview of each `source` node's records (source side
@@ -1108,9 +1345,15 @@ pub async fn run_topology(
         opts = opts.with_state_store(store);
     }
     if let Some(dlq) = &cfg.pipeline.dlq {
-        opts = opts.with_dlq(crate::executor::build_dlq_config(dlq).await?);
+        // A `--dry-run` writes nothing, dead letters included (#789 CLI-81).
+        opts = opts.with_dlq(if run.dry_run {
+            crate::executor::preview_dlq_config(dlq)
+        } else {
+            crate::executor::build_dlq_config(dlq).await?
+        });
     }
 
+    let governance = run_governance(cfg, run.is_preview())?;
     // Lineage START, one per sink node — a topology's analogue of an invocation.
     // Built before the run so a crash still leaves a START on record.
     #[cfg(feature = "lineage")]
@@ -1143,7 +1386,6 @@ pub async fn run_topology(
     }
 
     let state_store = opts.state_store.clone();
-    let governance = build_governance(cfg)?;
     // Run lease + run-outcome marker per sink node (#732 / #735), like a
     // matrix invocation's.
     let mut markers: Vec<(String, String, crate::pipeline_state::markers::RunMarkers)> = Vec::new();
@@ -1736,7 +1978,11 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
                 })
                 .collect();
 
-            if sources.is_empty() {
+            // A node failed by `profiling.on_drift: fail` is a failed run: its
+            // profile is still recorded below, its run is not (#789 CLI-85).
+            if node_failed_by_profile {
+                tracing::debug!(node = %row, "failed by profile drift; run not catalogued");
+            } else if sources.is_empty() {
                 tracing::debug!(node = %row, "no source reaches this sink; nothing to catalog");
             } else {
                 let update = CatalogUpdate {
@@ -1785,6 +2031,101 @@ mod tests {
 
     fn cfg(yaml: &str) -> PipelineConfig {
         serde_yaml::from_str(yaml).expect("valid config")
+    }
+
+    /// #789 CLI-61: a misspelt node key is an error, not a silent no-op.
+    #[test]
+    fn unknown_node_keys_are_refused() {
+        for node in [
+            "{ kind: sink, ref: out, confg: { table: eu } }",
+            "{ kind: transform, transfroms: [] }",
+            "{ kind: tee, channel_capacty: 4 }",
+            "{ kind: merge, extra: 1 }",
+        ] {
+            let yaml = format!("version: 1\npipeline:\n  nodes:\n    n: {node}\n");
+            let err = serde_yaml::from_str::<PipelineConfig>(&yaml).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{node}: {err}");
+        }
+        serde_yaml::from_str::<PipelineConfig>(
+            "version: 1\npipeline:\n  nodes:\n    n: { kind: sink, ref: out, config: { table: eu } }\n",
+        )
+        .expect("known keys still parse");
+    }
+
+    /// #789 CLI-62: `${vars.*}` in a node override resolves at load time.
+    #[test]
+    fn vars_resolve_inside_node_configs() {
+        let yaml = "version: 1\nvars: { table: orders_eu, mode: snake }\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n  nodes:\n    s: { kind: source }\n    t: { kind: transform, transforms: [ { type: keys_case, config: { mode: \"${vars.mode}\" } } ] }\n    w: { kind: sink, config: { path: \"${vars.table}.jsonl\" } }\n  edges:\n    - { from: s, to: t }\n    - { from: t, to: w }\n";
+        let c = PipelineConfig::from_text(yaml, std::path::Path::new("t.yaml")).unwrap();
+        let NodeSpec::Sink { config, .. } = &c.pipeline.nodes["w"] else {
+            panic!()
+        };
+        assert_eq!(config.as_ref().unwrap()["path"], "orders_eu.jsonl");
+        let NodeSpec::Transform { transforms } = &c.pipeline.nodes["t"] else {
+            panic!()
+        };
+        assert_eq!(transforms[0].config["mode"], "snake");
+        validate_topology_spec(&c).unwrap();
+
+        let raw = cfg(yaml);
+        let err = validate_topology_spec(&raw).unwrap_err().to_string();
+        assert!(
+            err.contains("`${vars.") && err.contains("never resolved"),
+            "{err}"
+        );
+    }
+
+    /// #789 CLI-82: a preview of an exactly-once graph runs at-least-once.
+    #[test]
+    fn previews_run_at_least_once() {
+        let c = cfg(
+            "version: 1\ndelivery: exactly_once\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n  nodes:\n    s: { kind: source }\n    w: { kind: sink }\n  edges:\n    - { from: s, to: w }\n",
+        );
+        assert_eq!(
+            run_governance(&c, false).unwrap().delivery,
+            faucet_core::DeliveryMode::ExactlyOnce
+        );
+        assert_eq!(
+            run_governance(&c, true).unwrap().delivery,
+            faucet_core::DeliveryMode::AtLeastOnce
+        );
+    }
+
+    /// #789 CLI-63: SLA and profiling need history in topology mode too.
+    #[test]
+    fn sla_and_profiling_gates_apply_to_a_graph() {
+        let graph = "pipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n  nodes:\n    s: { kind: source }\n    w: { kind: sink }\n  edges:\n    - { from: s, to: w }\n";
+        let err = validate_topology_spec(&cfg(&format!(
+            "version: 1\nsla: {{ max_staleness_secs: 60 }}\n{graph}"
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("topology: sla.max_staleness_secs"), "{err}");
+        let err = validate_topology_spec(&cfg(&format!("version: 1\nprofiling: {{}}\n{graph}")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("profiling: needs a `state:` block"), "{err}");
+        let with_state = graph.replace(
+            "pipeline:\n",
+            "pipeline:\n  state: { type: file, config: { path: ./st } }\n",
+        );
+        validate_topology_spec(&cfg(&format!(
+            "version: 1\nsla: {{ max_staleness_secs: 60 }}\nprofiling: {{}}\n{with_state}"
+        )))
+        .unwrap();
+    }
+
+    /// #789 CLI-84: the sink refusal points at what a graph can do.
+    #[test]
+    fn exactly_once_sink_refusal_names_the_graph_alternatives() {
+        let c = cfg(
+            "version: 1\ndelivery: exactly_once\npipeline:\n  state: { type: file, config: { path: ./st } }\n  sources: { a: { type: postgres-cdc, config: {} } }\n  sinks: { out: { type: elasticsearch, config: { write_mode: upsert, key: [id] } } }\n  nodes:\n    s: { kind: source, ref: a }\n    w: { kind: sink, ref: out }\n  edges:\n    - { from: s, to: w }\n",
+        );
+        let err = validate_topology_spec(&c).unwrap_err().to_string();
+        assert!(
+            err.contains("delivery: at_least_once") && err.contains("matrix pipeline"),
+            "{err}"
+        );
     }
 
     // ─── build_summary ──────────────────────────────────────────────────────
@@ -1894,6 +2235,33 @@ mod tests {
             "transport": { "type": "file", "config": { "path": "/tmp/ol.jsonl" } },
         }))
         .expect("valid lineage config")
+    }
+
+    /// `validate_topology_spec` compiles the governance blocks and applies
+    /// the DLQ / evolve gates a matrix row gets (#789 CLI-83).
+    #[test]
+    fn topology_validation_applies_governance_gates() {
+        let with = |extra: &str| cfg(&format!("{LINEAR}{extra}"));
+        assert!(validate_topology_spec(&cfg(LINEAR)).is_ok());
+        let err = validate_topology_spec(&with("  schema: { on_drift: evolve }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("evolve is not supported by sink 'jsonl'"),
+            "{err}"
+        );
+        let err = validate_topology_spec(&with("  schema: { on_drift: quarantine }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a `dlq:` block"), "{err}");
+        #[cfg(feature = "masking")]
+        assert!(
+            validate_topology_spec(&with(
+                "  masking: { rules: [ { match: { field_pattern: \"(\" }, action: { type: redact } } ] }\n"
+            ))
+            .is_err(),
+            "a bad masking regex fails validation, not the run"
+        );
     }
 
     const LINEAR: &str = r#"version: 1
@@ -2343,5 +2711,115 @@ pipeline:
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[0].0, "w");
         assert!(verdicts[0].1.contains("max_duration_secs"), "{verdicts:?}");
+    }
+
+    /// #844: offline validation checks every connector config without building
+    /// a connector, so nothing is opened or created.
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn offline_validation_builds_no_connector() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("never.jsonl");
+        let yaml = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {in_} }} }}\n  sink: {{ type: jsonl, config: {{ path: {out} }} }}\n  nodes:\n    s: {{ kind: source }}\n    t: {{ kind: transform, transforms: [] }}\n    w: {{ kind: sink }}\n  edges:\n    - {{ from: s, to: t }}\n    - {{ from: t, to: w }}\n",
+            in_ = dir.path().join("missing.csv").display(),
+            out = out.display(),
+        );
+        let topo = validate_topology(&cfg(&yaml)).await.expect("valid");
+        assert_eq!(topo.nodes().len(), 3);
+        assert_eq!(topo.edges().len(), 2);
+        assert!(!out.exists(), "validation must not create the sink's file");
+        let placeholder = topo
+            .nodes()
+            .iter()
+            .find_map(|n| match &n.kind {
+                NodeKind::Source(s) if n.id == "s" => Some(s),
+                _ => None,
+            })
+            .expect("source node");
+        assert_eq!(placeholder.connector_name(), "offline");
+        assert!(
+            placeholder
+                .fetch_with_context(&HashMap::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// #844: a bad connector config is still refused offline, naming the node.
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn offline_validation_refuses_bad_connector_configs() {
+        let graph = "  nodes:\n    s: { kind: source }\n    w: { kind: sink }\n  edges:\n    - { from: s, to: w }\n";
+        let bad_source = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv, nope: 1 }} }}\n  sink: {{ type: jsonl, config: {{ path: out.jsonl }} }}\n{graph}"
+        );
+        let err = validate_topology(&cfg(&bad_source)).await.unwrap_err();
+        assert!(err.to_string().contains("node 's' source"), "{err}");
+        let bad_sink = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: out.jsonl, nope: 1 }} }}\n{graph}"
+        );
+        let err = validate_topology(&cfg(&bad_sink)).await.unwrap_err();
+        assert!(err.to_string().contains("node 'w' sink"), "{err}");
+    }
+
+    /// #844: `on_batch_error: dlq_all` on a best-effort sink is refused offline,
+    /// as the live build refuses it, unless the DLQ opts in to duplicates.
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn offline_validation_refuses_unsafe_dlq_all() {
+        let doc = |extra: &str| {
+            format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: out.jsonl }} }}\n  dlq:\n    sink: {{ type: jsonl, config: {{ path: dlq.jsonl }} }}\n{extra}  nodes:\n    s: {{ kind: source }}\n    w: {{ kind: sink }}\n  edges:\n    - {{ from: s, to: w }}\n"
+            )
+        };
+        let err = validate_topology(&cfg(&doc("    on_batch_error: dlq_all\n")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("node 'w'") && err.to_string().contains("dlq_all"),
+            "{err}"
+        );
+        validate_topology(&cfg(&doc(
+            "    on_batch_error: dlq_all\n    allow_duplicates_on_dlq_all: true\n",
+        )))
+        .await
+        .expect("opted in");
+        validate_topology(&cfg(&doc(""))).await.expect("propagate");
+    }
+
+    /// #844: a keyed upsert sink is safe under `dlq_all` (a replayed row
+    /// overwrites itself), so offline validation accepts it.
+    #[cfg(all(feature = "source-csv", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn offline_validation_accepts_dlq_all_on_a_keyed_sink() {
+        let yaml = "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: sqlite, config: { database_url: 'sqlite:out.db', table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id] } }\n  dlq:\n    sink: { type: sqlite, config: { database_url: 'sqlite:dlq.db', table_name: d, column_mapping: auto_map } }\n    on_batch_error: dlq_all\n  nodes:\n    s: { kind: source }\n    w: { kind: sink }\n  edges:\n    - { from: s, to: w }\n";
+        validate_topology(&cfg(yaml))
+            .await
+            .expect("keyed sink is safe");
+    }
+
+    /// The identity-reporting builders still build the real connectors.
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn identity_builders_build_live_connectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        std::fs::write(&input, "id\n1\n").unwrap();
+        let yaml = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {} }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n  nodes:\n    s: {{ kind: source }}\n    w: {{ kind: sink }}\n  edges:\n    - {{ from: s, to: w }}\n",
+            input.display(),
+            dir.path().join("out.jsonl").display(),
+        );
+        let c = cfg(&yaml);
+        let auth = AuthCatalog::default();
+        let opts = TopologyRunOptions::default();
+        let (topo, ids) = build_topology_meta(&c, &auth, &opts).await.unwrap();
+        assert_eq!(topo.nodes().len(), 2);
+        assert_eq!(ids["s"].kind, "csv");
+        let (topo, ids, _) = build_topology_full(&c, &auth, &opts).await.unwrap();
+        assert_eq!(topo.nodes().len(), 2);
+        assert_eq!(ids["w"].kind, "jsonl");
     }
 }

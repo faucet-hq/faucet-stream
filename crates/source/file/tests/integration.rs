@@ -483,6 +483,33 @@ async fn a_zero_batch_size_emits_one_page_per_file() {
     assert_eq!(sizes, vec![2, 1, 3]);
 }
 
+#[tokio::test]
+async fn a_whole_file_past_max_object_bytes_fails_instead_of_exhausting_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows: Vec<Value> = (0..2_000)
+        .map(|i| json!({"padding": "x".repeat(50), "i": i}))
+        .collect();
+    let body = serde_json::to_vec(&rows).unwrap();
+    let path = write(dir.path(), "bomb.json.gz", &gzip(&body));
+    let mut cfg = FileSourceConfig::new(path.clone());
+    cfg.max_object_bytes = 10_000;
+    let err = read_all(&FileSource::new(cfg.clone()).unwrap())
+        .await
+        .unwrap_err();
+    assert!(err.contains("max_object_bytes"), "{err}");
+    assert!(err.contains("bomb.json.gz"), "{err}");
+    cfg.max_object_bytes = body.len() as u64;
+    assert_eq!(
+        read_all(&FileSource::new(cfg.clone()).unwrap())
+            .await
+            .unwrap()
+            .len(),
+        2_000
+    );
+    cfg.max_object_bytes = 0;
+    assert!(FileSource::new(cfg).is_err());
+}
+
 mod http {
     use super::*;
     use wiremock::matchers::{header, method, path};
@@ -550,6 +577,32 @@ mod http {
         let mut cfg = FileSourceConfig::new("http://127.0.0.1:1/x.csv");
         cfg.http_retries = 0;
         assert!(read_all(&FileSource::new(cfg).unwrap()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_server_times_out_and_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow.jsonl"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"s\":1}\n")
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut cfg = FileSourceConfig::new(format!("{}/slow.jsonl", server.uri()));
+        cfg.http_retries = 1;
+        cfg.http_read_timeout_secs = 1;
+        let started = std::time::Instant::now();
+        let err = read_all(&FileSource::new(cfg.clone()).unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.contains("2 attempt"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        cfg.http_read_timeout_secs = 0;
+        assert!(FileSource::new(cfg).is_err());
     }
 
     #[tokio::test]

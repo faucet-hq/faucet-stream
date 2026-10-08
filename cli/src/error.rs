@@ -130,7 +130,10 @@ pub enum CliError {
     TransformIndexGap { missing: u32 },
 
     /// A matrix row id collides with a load-time interpolation prefix.
-    #[error("matrix row id '{id}' is reserved (env, file, secret, matrix, pipeline)")]
+    #[error(
+        "matrix row id '{id}' is reserved ({})",
+        crate::expand::RESERVED_IDS.join(", ")
+    )]
     ReservedRowId { id: String },
 
     /// Two matrix rows declared the same id.
@@ -557,6 +560,11 @@ pub enum CliError {
     /// or unknown, 2 failed).
     #[error("pipeline status: {health}")]
     StatusUnhealthy { code: u8, health: String },
+
+    /// A one-shot run was stopped by a signal (or the TUI's `q`) before it
+    /// finished; it flushed what it had written. Exit code 130.
+    #[error("run cancelled before it finished")]
+    Cancelled,
 
     /// A `faucet serve` startup or runtime failure (bind, auth gate, etc.).
     #[error("serve error: {0}")]

@@ -75,6 +75,8 @@ impl Remote for S3Remote {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn every_writable_format_takes_every_option_on_s3() {
     let container = MinIO::default()
+        // tmpfs: MinIO refuses writes when the runner disk is nearly full.
+        .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
         .with_name("cgr.dev/chainguard/minio")
         .with_tag("latest")
         .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))

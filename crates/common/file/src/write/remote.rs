@@ -161,11 +161,69 @@ pub struct RemoteBackend {
     swap: String,
     template: NameTemplate,
     scratch: tempfile::TempDir,
+    /// Held locked for the backend's life, so a later run can tell this
+    /// scratch directory from one a crashed run left behind.
+    _owner: std::fs::File,
     uploads: usize,
     slots: Arc<tokio::sync::Semaphore>,
     in_flight: std::sync::Mutex<Vec<InFlight>>,
     seq: std::sync::atomic::AtomicU64,
     scrubbed: tokio::sync::Mutex<[bool; 2]>,
+}
+
+const SCRATCH_PREFIX: &str = "faucet-remote-";
+const OWNER_FILE: &str = ".owner";
+/// Age past which a scratch directory without an owner lock (left by a
+/// faucet that predates the lock) is treated as abandoned.
+const UNOWNED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Lock the owner file under a private name and only then rename it into
+/// place, so a concurrent sweep never sees an unlocked `.owner` in a live
+/// directory and removes it.
+fn lock_owner(dir: &Path) -> std::io::Result<std::fs::File> {
+    let pending = dir.join(".owner.pending");
+    let file = std::fs::File::create(&pending)?;
+    file.try_lock().map_err(std::io::Error::other)?;
+    std::fs::rename(&pending, dir.join(OWNER_FILE))?;
+    Ok(file)
+}
+
+/// Remove the scratch directories in `parent` whose run is gone: a crashed
+/// (SIGKILL, OOM) run of an encrypted sink leaves plaintext there. A live
+/// run holds its directory's owner lock; one whose lock can be taken is
+/// dead. Best effort — a directory that can not be inspected is left.
+fn sweep_orphaned_scratch(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SCRATCH_PREFIX)
+            || !entry.file_type().is_ok_and(|t| t.is_dir())
+        {
+            continue;
+        }
+        let dir = entry.path();
+        if scratch_is_orphaned(&dir) && std::fs::remove_dir_all(&dir).is_ok() {
+            tracing::info!(
+                path = %dir.display(),
+                "remote file sink: removed the scratch directory of a run that is gone"
+            );
+        }
+    }
+}
+
+fn scratch_is_orphaned(dir: &Path) -> bool {
+    match std::fs::File::open(dir.join(OWNER_FILE)) {
+        Ok(owner) => owner.try_lock().is_ok(),
+        Err(_) => std::fs::metadata(dir)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > UNOWNED_MAX_AGE),
+    }
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -189,8 +247,10 @@ impl RemoteBackend {
         scratch_dir: Option<&Path>,
     ) -> Result<Self, FaucetError> {
         let base = base.into();
+        let parent = scratch_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        sweep_orphaned_scratch(&parent);
         let mut builder = tempfile::Builder::new();
-        builder.prefix("faucet-remote-");
+        builder.prefix(SCRATCH_PREFIX);
         let scratch = match scratch_dir {
             Some(dir) => builder.tempdir_in(dir),
             None => builder.tempdir(),
@@ -202,7 +262,12 @@ impl RemoteBackend {
                 |d| d.display().to_string()
             )
         )))?;
+        let owner = lock_owner(scratch.path()).map_err(sink_io(format!(
+            "remote file sink: locking the scratch directory '{}'",
+            scratch.path().display()
+        )))?;
         Ok(Self {
+            _owner: owner,
             swap: format!("{base}{}/", template.swap_dir_name()),
             template: template.clone(),
             base,
@@ -764,6 +829,64 @@ pub(crate) mod tests {
 
     fn template(name: &str) -> NameTemplate {
         NameTemplate { name: name.into() }
+    }
+
+    #[test]
+    fn a_crashed_runs_scratch_is_swept_and_a_live_ones_kept() {
+        let parent = tempfile::tempdir().unwrap();
+        let mem = Arc::new(Mem::default());
+        let live =
+            RemoteBackend::new(mem.clone(), "a/", &template("x"), Some(parent.path())).unwrap();
+        let crashed = parent.path().join("faucet-remote-crashed");
+        std::fs::create_dir(&crashed).unwrap();
+        std::fs::write(crashed.join(OWNER_FILE), b"").unwrap();
+        std::fs::write(crashed.join("plain.jsonl"), b"{\"ssn\":1}").unwrap();
+        let young = parent.path().join("faucet-remote-young");
+        std::fs::create_dir(&young).unwrap();
+        let other = parent.path().join("not-ours");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(crashed.with_extension("file"), b"").unwrap();
+
+        let next = RemoteBackend::new(mem, "b/", &template("x"), Some(parent.path())).unwrap();
+        assert!(
+            !crashed.exists(),
+            "a dead run's plaintext scratch is removed"
+        );
+        assert!(live.scratch_dir().exists(), "a live run's scratch is kept");
+        assert!(young.exists() && other.exists());
+        assert!(!scratch_is_orphaned(next.scratch_dir()));
+        assert!(!scratch_is_orphaned(&young));
+        drop(live);
+    }
+
+    #[test]
+    fn concurrent_backends_never_sweep_each_others_scratch() {
+        let parent = Arc::new(tempfile::tempdir().unwrap());
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let parent = parent.clone();
+                std::thread::spawn(move || {
+                    let mem = Arc::new(Mem::default());
+                    for _ in 0..100 {
+                        let b = RemoteBackend::new(
+                            mem.clone(),
+                            "a/",
+                            &template("x"),
+                            Some(parent.path()),
+                        )
+                        .expect("a fresh scratch directory locks");
+                        assert!(
+                            b.scratch_dir().join(OWNER_FILE).exists(),
+                            "a live run's scratch survives a concurrent sweep"
+                        );
+                        assert!(!b.scratch_dir().join(".owner.pending").exists());
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
     }
 
     #[tokio::test]

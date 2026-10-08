@@ -155,9 +155,13 @@ async fn the_composer_refuses_a_child_stream_on_a_truncating_sink() {
         .await
         .expect_err("child overwrite via append must be refused")
         .to_string();
-        assert!(
-            err.contains("child stream 'bill_lines' (parent: bills)"),
-            "{sink}: {err}"
-        );
+        // The appending template is refused before any stream resolves: its
+        // `overwrite: append` alias would re-append everything (#789 CLI-125).
+        let expected = if sink == "appending" {
+            "re-append the whole table"
+        } else {
+            "child stream 'bill_lines' (parent: bills)"
+        };
+        assert!(err.contains(expected), "{sink}: {err}");
     }
 }

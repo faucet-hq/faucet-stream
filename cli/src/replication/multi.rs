@@ -325,6 +325,20 @@ async fn prepare_snapshot(shared: &Shared, table: &str) -> CliResult<Vec<ShardRu
             shards.len() as u64,
             Utc::now(),
         );
+        if multi_state::flag_stale_resnapshot(
+            &mut state,
+            table,
+            shared.snapshot_replaces(),
+            &shared.sink_kind,
+        ) {
+            tracing::warn!(
+                pipeline = %shared.opts.pipeline_name,
+                table = %table,
+                sink = %shared.sink_kind,
+                "mirror: re-snapshotting into a destination this sink cannot replace — rows \
+                 deleted at the source meanwhile may remain; see `faucet mirror status`"
+            );
+        }
     }
     shared.persist().await?;
     Ok(shards)
@@ -909,6 +923,18 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// How long a stream cycle gets to stop at a page boundary and flush before
+/// the driver gives up on it.
+const CYCLE_STOP_GRACE: Duration = Duration::from_secs(30);
+
+/// Stop a running stream cycle cooperatively before the driver propagates an
+/// error: cancel its token and wait (bounded) for the table pipelines to
+/// flush, instead of dropping them mid-write.
+async fn stop_cycle<T>(cancel: &CancellationToken, task: &mut AbortOnDrop<T>) {
+    cancel.cancel();
+    let _ = tokio::time::timeout(CYCLE_STOP_GRACE, &mut task.0).await;
+}
+
 async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> {
     let mut d = Driver {
         shared,
@@ -1007,13 +1033,21 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
                         }
                         _ = d.joined.notified() => cycle_cancel.cancel(),
                         Some(joined) = d.snapshots.join_next(), if !d.snapshots.is_empty() => {
-                            let (table, result) = joined
-                                .map_err(|e| CliError::Internal(format!("snapshot task: {e}")))?;
-                            d.on_snapshot(table, result).await?;
+                            let handled = match joined {
+                                Ok((table, result)) => d.on_snapshot(table, result).await,
+                                Err(e) => Err(CliError::Internal(format!("snapshot task: {e}"))),
+                            };
+                            if let Err(e) = handled {
+                                stop_cycle(&cycle_cancel, &mut cycle_task).await;
+                                return Err(e);
+                            }
                         }
                         _ = async { tokio::time::sleep_until(tick.unwrap_or_else(tokio::time::Instant::now)).await }, if tick.is_some() => {
                             if interval > 0 && Instant::now() >= next_discovery {
-                                d.rediscover().await?;
+                                if let Err(e) = d.rediscover().await {
+                                    stop_cycle(&cycle_cancel, &mut cycle_task).await;
+                                    return Err(e);
+                                }
                                 next_discovery = Instant::now() + Duration::from_secs(interval.max(1));
                             }
                             let due = {
@@ -1123,6 +1157,22 @@ pipeline:
         let clear = snapshot_as_overwrite(&snap, true);
         assert!(clear.id.ends_with("::clear"));
         assert!(clear.source_override.is_some());
+    }
+
+    /// A driver error stops the running cycle through its token, giving it
+    /// time to flush, before the task is dropped (#789 CLI-87).
+    #[tokio::test]
+    async fn a_driver_error_cancels_the_cycle_before_dropping_it() {
+        let cancel = CancellationToken::new();
+        let seen = cancel.clone();
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = flushed.clone();
+        let mut task = AbortOnDrop(tokio::spawn(async move {
+            seen.cancelled().await;
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        stop_cycle(&cancel, &mut task).await;
+        assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

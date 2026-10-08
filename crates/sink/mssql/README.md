@@ -395,6 +395,10 @@ the field (narrowing later is the `schema:` drift policy's job). In `json_column
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out.
 
+Concurrent first writes are safe (#828): when two writers create the same table
+(or the commit-token table) at once, the loser's "object already exists"
+(error 2714) is treated as success.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **atomic** for `write_mode: upsert|delete`, otherwise **best-effort** — keyed writes run in one transaction; appends commit per chunk and isolate failing rows. `on_batch_error: dlq_all`

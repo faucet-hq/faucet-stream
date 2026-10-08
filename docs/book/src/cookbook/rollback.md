@@ -38,7 +38,9 @@ The block needs a durable `state:` (`file` / `redis` / `postgres` — the
 marker lives there) and is refused at load time for a sink that cannot undo
 its writes or when `metadata_columns` is disabled. Only the last `retain` runs
 per row stay undoable; older journals and markers are dropped as new runs
-complete.
+**succeed** — a failing run never evicts an undoable one (and stays undoable
+itself, so its partial writes can be removed). A run of failures is capped at
+`2 × retain + 1` retained runs.
 
 ## What a rollback does, per write mode
 
@@ -53,6 +55,12 @@ to its pre-run value (or cleared) and, for an exactly-once row, the sink's
 **commit token** is rewound — so the next run re-reads exactly the window that
 was undone instead of skipping it. The run's journal rows and marker are then
 dropped.
+
+When the sink finds nothing of the run — the table does not exist, or no row
+carries the run id, typically because the sink config changed since (a renamed
+table, a different database URL) — nothing is rewound: the report says
+`applied: false` with a note, and the bookmark, watermark and marker stay as
+they were, so fixing the config and running the rollback again still works.
 
 Undo is per dataset and **all-or-nothing per dataset**: a matrix run that
 wrote several tables is undone one row at a time (`--row`), each in one

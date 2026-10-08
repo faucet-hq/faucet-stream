@@ -52,6 +52,10 @@ Keywords are case-insensitive. Column names may be dot paths into structs (`addr
 filter: "status = 'active' and (amount >= 10.5 or vip is not null) and region in ('eu', 'us')"
 ```
 
+## Record shape
+
+Rows come out with every column present (a null is `null`); a `decimal` column keeps every digit as a string, and a non-finite float is the string `"NaN"` / `"Infinity"` / `"-Infinity"`.
+
 ## Incremental reads
 
 The bookmark is the last processed snapshot id (`{"snapshot_id": 123}`), persisted under the state key `iceberg:<namespace>.<table>`:

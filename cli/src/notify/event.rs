@@ -168,8 +168,22 @@ impl NotifyEvent {
     pub fn opens_incident(&self) -> bool {
         matches!(
             self.kind,
-            EventKind::RunFailure | EventKind::CircuitOpen | EventKind::ContractAbort
+            EventKind::RunFailure
+                | EventKind::CircuitOpen
+                | EventKind::ContractAbort
+                | EventKind::BudgetExceeded
         )
+    }
+
+    /// PagerDuty `dedup_key` for a trigger: every failure-class event of a
+    /// (pipeline, row) shares one incident; any other kind gets its own, so a
+    /// warning never merges into (or masks) a failure incident.
+    pub fn pagerduty_key(&self) -> String {
+        if self.opens_incident() {
+            self.incident_key()
+        } else {
+            self.dedupe_key()
+        }
     }
 
     /// True when this event closes any open incident for its `incident_key`.

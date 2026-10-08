@@ -110,10 +110,19 @@ fn plan_impact_walks_the_catalog_and_names_contracts_owners_and_consumers() {
         .unwrap()
         .to_string();
 
-    // Annotate B's sink over the CLI (id prefix resolution included).
+    // Annotate B's sink over the CLI: a write refuses an id prefix (CLI-155).
     faucet()
         .args(["catalog", "annotate"])
         .arg(&b_id[..8])
+        .args(["--config"])
+        .arg(&a_path)
+        .args(["--owner", "team-b"])
+        .assert()
+        .failure()
+        .stderr(contains("is not a full dataset id"));
+    faucet()
+        .args(["catalog", "annotate"])
+        .arg(&b_id)
         .args(["--config"])
         .arg(&a_path)
         .args([

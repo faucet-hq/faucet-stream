@@ -6,9 +6,9 @@ description: >-
   scheduled (CronJob) `faucet run` pipelines.
 type: application
 # Chart version — bump on chart changes (SemVer).
-version: 0.1.0
+version: 0.1.1
 # The faucet-cli / image version this chart tracks. Overridable via image.tag.
-appVersion: "1.7.0"
+appVersion: "1.13.2"
 home: https://faucet-hq.github.io/faucet-stream/
 sources:
   - https://github.com/faucet-hq/faucet-stream

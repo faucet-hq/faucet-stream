@@ -190,19 +190,20 @@ pub fn build_transforms(env: &HashMap<String, String>) -> CliResult<Vec<Transfor
 pub fn build_named_sources(
     env: &HashMap<String, String>,
 ) -> CliResult<HashMap<String, ConnectorSpec>> {
-    build_named_catalog(env, "FAUCET_SOURCES_")
+    build_named_catalog(env, "FAUCET_SOURCES_", &crate::registry::source_kinds())
 }
 
 /// Same as [`build_named_sources`] but for sinks via `FAUCET_SINKS_<NAME>_*`.
 pub fn build_named_sinks(
     env: &HashMap<String, String>,
 ) -> CliResult<HashMap<String, ConnectorSpec>> {
-    build_named_catalog(env, "FAUCET_SINKS_")
+    build_named_catalog(env, "FAUCET_SINKS_", &crate::registry::sink_kinds())
 }
 
 fn build_named_catalog(
     env: &HashMap<String, String>,
     prefix: &str,
+    known_kinds: &[&str],
 ) -> CliResult<HashMap<String, ConnectorSpec>> {
     // First sweep: find each template's `<NAME>` by spotting
     // `<prefix><NAME>_TYPE`.
@@ -219,6 +220,16 @@ fn build_named_catalog(
         }
         kinds.insert(name_upper.to_ascii_lowercase(), value.clone());
     }
+    // A `*_TYPE` var nested under another template whose value is no
+    // connector kind is that template's field (`PG_SLOT_TYPE=temporary` is
+    // `pg`'s `slot_type`), not a template of its own (#789 CLI-138).
+    let candidates: Vec<String> = kinds.keys().cloned().collect();
+    kinds.retain(|name, kind| {
+        known_kinds.contains(&kind.as_str())
+            || !candidates
+                .iter()
+                .any(|other| other != name && name.starts_with(&format!("{other}_")))
+    });
     // All template scope prefixes, so each env var can be assigned to its
     // LONGEST matching prefix. Without this, a template like `users` would
     // absorb `users_api`'s vars, since `FAUCET_SOURCES_USERS_` is a prefix of
@@ -379,6 +390,13 @@ pub fn build_pipeline_config(env: &HashMap<String, String>) -> CliResult<Pipelin
     })
 }
 
+/// [`from_process_env`] followed by the load tail every file load runs:
+/// `${vars.*}` / template references and secrets-manager directives are
+/// resolved, so neither reaches a connector verbatim (#789 CLI-139).
+pub async fn load_from_process_env() -> CliResult<PipelineConfig> {
+    PipelineConfig::finish_built(from_process_env()?, std::path::Path::new("<environment>")).await
+}
+
 /// Snapshot the process environment and call [`build_pipeline_config`].
 /// Variables that are not UTF-8 are skipped (a `FAUCET_*` one is an error),
 /// and secret-looking `FAUCET_*` values are registered for log redaction.
@@ -442,6 +460,27 @@ mod tests {
     use serde_json::json;
 
     #[cfg(unix)]
+    #[test]
+    fn a_nested_type_field_is_not_a_phantom_template() {
+        let env: HashMap<String, String> = [
+            ("FAUCET_SOURCES_PG_TYPE", "sqlite"),
+            ("FAUCET_SOURCES_PG_SLOT_TYPE", "temporary"),
+            ("FAUCET_SOURCES_PG_PATH", "a.db"),
+            ("FAUCET_SOURCES_PG_API_TYPE", "sqlite"),
+            ("FAUCET_SOURCES_PG_API_PATH", "b.db"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let out = build_named_catalog(&env, "FAUCET_SOURCES_", &["sqlite"]).unwrap();
+        let mut names: Vec<&String> = out.keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["pg", "pg_api"]);
+        assert_eq!(out["pg"].config["slot_type"], "temporary");
+        assert_eq!(out["pg"].config["path"], "a.db");
+        assert_eq!(out["pg_api"].config["path"], "b.db");
+    }
+
     #[test]
     fn non_utf8_variables_are_skipped_unless_they_are_faucet_ones() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -855,6 +894,45 @@ mod tests {
             "https://users.example"
         );
         assert_eq!(cfg.pipeline.sinks["archive"].kind, "jsonl");
+    }
+
+    /// The env-built config goes through the file-load tail: `${vars.*}`
+    /// resolves, and a secrets directive is never handed to a connector
+    /// verbatim (#789 CLI-139).
+    #[tokio::test]
+    async fn the_env_built_config_gets_the_load_tail() {
+        let built = build_pipeline_config(&env(&[
+            ("FAUCET_SOURCE", "rest"),
+            ("FAUCET_SOURCE_REST_BASE_URL", "${vars.api_base}"),
+            ("FAUCET_SINK", "jsonl"),
+            ("FAUCET_SINK_JSONL_PATH", "./o.jsonl"),
+            ("FAUCET_VARS_API_BASE", "https://api.example.com"),
+        ]))
+        .unwrap();
+        let cfg = PipelineConfig::finish_built(built, std::path::Path::new("<env>"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cfg.pipeline.source.unwrap().config["base_url"],
+            json!("https://api.example.com")
+        );
+        let secret = build_pipeline_config(&env(&[
+            ("FAUCET_SOURCE", "rest"),
+            ("FAUCET_SOURCE_REST_BASE_URL", "https://x"),
+            (
+                "FAUCET_SOURCE_REST_HEADERS_JSON",
+                r#"{"x-key": "${vault:secret/data/api#key}"}"#,
+            ),
+            ("FAUCET_SINK", "jsonl"),
+            ("FAUCET_SINK_JSONL_PATH", "./o.jsonl"),
+        ]))
+        .unwrap();
+        assert!(
+            PipelineConfig::finish_built(secret, std::path::Path::new("<env>"))
+                .await
+                .is_err(),
+            "an unresolvable directive is refused, never sent as the credential"
+        );
     }
 
     #[test]

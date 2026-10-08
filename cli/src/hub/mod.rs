@@ -23,6 +23,7 @@ pub mod remote;
 pub mod rows;
 pub mod spec;
 pub mod trust;
+pub mod typed;
 
 use std::path::{Path, PathBuf};
 
@@ -1344,10 +1345,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            c.name, "octo/acme",
-            "the pipeline (and state-key prefix) is the full id"
+            c.name, "octo/acme.files",
+            "the pipeline (and state-key prefix) is the full source id × sink id"
         );
-        assert_eq!(c.document["name"], serde_json::json!("octo/acme"));
+        assert_eq!(c.document["name"], serde_json::json!("octo/acme.files"));
 
         // No official template of that name, but a community one exists.
         std::fs::write(
@@ -1713,9 +1714,9 @@ mod tests {
     async fn compose_locators_yields_a_loadable_pipeline() {
         let d = hub();
         let c = compose_locators("acme", "files", d.path()).await.unwrap();
-        assert_eq!(c.name, "acme");
+        assert_eq!(c.name, "acme.files");
         let cfg = load_composed(&c, &RunInputs::default()).unwrap();
-        assert_eq!(cfg.name.as_deref(), Some("acme"));
+        assert_eq!(cfg.name.as_deref(), Some("acme.files"));
         assert_eq!(cfg.matrix.len(), 1);
         assert_eq!(composed_path("a", "b"), PathBuf::from("<hub:a+b>.yaml"));
     }

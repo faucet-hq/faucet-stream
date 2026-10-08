@@ -111,12 +111,14 @@ pub fn prepare_boxed<'a>(
     Box::pin(prepare(store, sink, marker, retain))
 }
 
-/// Write the pre-run marker for `marker.run_id` and prune the retained set.
-/// Reads the bookmark before the run (and the exactly-once token, when the
-/// row is exactly-once) off the live store / sink. Pruned runs lose their
-/// journal rows (`Sink::forget_run`) and marker. Never fails the run: a
-/// marker that could not be written is logged and the run proceeds — it is
-/// then simply not undoable.
+/// Write the pre-run marker for `marker.run_id` and add it to the retained
+/// set. Reads the bookmark before the run (and the exactly-once token, when
+/// the row is exactly-once) off the live store / sink, and drops the journals
+/// of runs [`finish`] pruned. The retained set is trimmed to `retain` only
+/// after a successful run ([`finish`]), so a failing run never evicts an
+/// undoable one; until then it is capped at `2 * retain + 1`. Never fails the
+/// run: a marker that could not be written is logged and the run proceeds —
+/// it is then simply not undoable.
 pub async fn prepare(
     store: &dyn StateStore,
     sink: &dyn Sink,
@@ -137,21 +139,65 @@ pub async fn prepare(
         .await?;
     let ik = state::index_key(&marker.state_key);
     let mut index = RunIndex::decode(store.get(&ik).await?.as_ref());
-    for old in index.push(&marker.run_id, retain) {
+    let mut forget = std::mem::take(&mut index.forget);
+    let evicted = index.push(&marker.run_id, retain.max(1) * 2 + 1);
+    for old in &evicted {
+        drop_marker(store, &marker.state_key, old).await;
+    }
+    forget.extend(evicted);
+    for old in forget {
         if let Err(e) = sink.forget_run(&old).await {
             tracing::warn!(run_id = %old, error = %e, "could not drop the pruned run's journal");
-        }
-        if let Err(e) = store
-            .delete(&state::marker_key(&marker.state_key, &old))
-            .await
-        {
-            tracing::warn!(run_id = %old, error = %e, "could not drop the pruned run's marker");
+            index.forget.push(old);
         }
     }
+    put_index(store, &ik, &index).await
+}
+
+/// After a successful run: trim the retained set to `retain`, oldest first.
+/// The pruned runs' markers go now; their journals are dropped by the next
+/// run's [`prepare`] (which holds a sink). Logged, never fails the run.
+pub async fn finish(store: &dyn StateStore, state_key: &str, retain: usize) {
+    let ik = state::index_key(state_key);
+    let result = async {
+        let mut index = RunIndex::decode(store.get(&ik).await?.as_ref());
+        let pruned = index.prune(retain);
+        if pruned.is_empty() {
+            return Ok(());
+        }
+        for old in &pruned {
+            drop_marker(store, state_key, old).await;
+        }
+        index.forget.extend(pruned);
+        put_index(store, &ik, &index).await
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(state_key, error = %e, "could not prune the retained undoable runs");
+    }
+}
+
+/// [`finish`] behind a heap allocation (see [`prepare_boxed`]).
+#[inline(never)]
+pub fn finish_boxed<'a>(
+    store: &'a dyn StateStore,
+    state_key: &'a str,
+    retain: usize,
+) -> futures::future::BoxFuture<'a, ()> {
+    Box::pin(finish(store, state_key, retain))
+}
+
+async fn drop_marker(store: &dyn StateStore, state_key: &str, run_id: &str) {
+    if let Err(e) = store.delete(&state::marker_key(state_key, run_id)).await {
+        tracing::warn!(run_id = %run_id, error = %e, "could not drop the pruned run's marker");
+    }
+}
+
+async fn put_index(store: &dyn StateStore, ik: &str, index: &RunIndex) -> CliResult<()> {
     store
         .put(
-            &ik,
-            &serde_json::to_value(&index)
+            ik,
+            &serde_json::to_value(index)
                 .map_err(|e| CliError::Internal(format!("rollback index: {e}")))?,
         )
         .await?;
@@ -205,7 +251,7 @@ impl RollbackReport {
 
 /// Undo `inputs.run_id` on the row that wrote it.
 pub async fn rollback(cfg: &PipelineConfig, inputs: RollbackInputs) -> CliResult<RollbackReport> {
-    let nodes = expand(cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(cfg).await?)?;
     let (node, store, marker) = locate(
         &nodes,
         &inputs.pipeline_name,
@@ -265,8 +311,21 @@ pub async fn rollback_node(
         outcome.note = Some(later_runs_note(&later_runs));
         return Ok(base(outcome, true));
     }
-    let outcome = sink.rollback_run(&marker.run_id, &opts).await?;
+    let mut outcome = sink.rollback_run(&marker.run_id, &opts).await?;
     let blocked = outcome.conflicts > 0 && !inputs.force;
+    if outcome.applied && !inputs.dry_run && nothing_undone(&outcome) {
+        outcome.applied = false;
+        outcome.note = Some(format!(
+            "nothing of this run was found in {} ({}); the bookmark, watermark and undo \
+             marker are left as they are. Check that the sink config still names the table \
+             and database the run wrote to",
+            marker.sink_uri,
+            outcome
+                .note
+                .as_deref()
+                .unwrap_or("no rows, journal or previous table"),
+        ));
+    }
     let mut report = base(outcome, blocked);
     if !report.outcome.applied || inputs.dry_run {
         return Ok(report);
@@ -311,6 +370,13 @@ pub async fn rollback_node(
         "run rolled back"
     );
     Ok(report)
+}
+
+/// The sink found nothing of the run (`RollbackOutcome::nothing`: no rows,
+/// journal or previous table): rewinding state then would re-load rows that
+/// may still be there.
+fn nothing_undone(outcome: &RollbackOutcome) -> bool {
+    outcome.deleted == 0 && outcome.restored == 0 && outcome.note.is_some()
 }
 
 /// Why a rollback of a run that later runs followed was refused.
@@ -372,7 +438,7 @@ pub async fn list(
     pipeline_name: &str,
     row: Option<&str>,
 ) -> CliResult<Vec<RunMarker>> {
-    let nodes = expand(cfg)?;
+    let nodes = expand(&crate::partition::resolve_runtime(cfg).await?)?;
     let mut out = Vec::new();
     for node in nodes
         .iter()
@@ -491,6 +557,20 @@ mod tests {
     }
 
     #[test]
+    fn only_a_nothing_outcome_counts_as_nothing_undone() {
+        assert!(nothing_undone(&RollbackOutcome::nothing("no rows")));
+        assert!(!nothing_undone(&RollbackOutcome {
+            applied: true,
+            ..Default::default()
+        }));
+        assert!(!nothing_undone(&RollbackOutcome {
+            deleted: 2,
+            applied: true,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
     fn report_blocked_means_conflicts_without_apply() {
         let base = RollbackReport {
             run_id: "r".into(),
@@ -555,7 +635,7 @@ mod tests {
         )
         .unwrap()
         .remove(0);
-        for id in ["a", "b", "c"] {
+        let mk = |id: &str| {
             let mut m = marker_for(
                 "x",
                 "p",
@@ -567,10 +647,19 @@ mod tests {
             );
             m.run_id = id.into();
             m.delivery = DeliveryMode::ExactlyOnce;
-            prepare(&store, &sink, m, 2).await.unwrap();
+            m
+        };
+        for id in ["a", "b", "c"] {
+            prepare(&store, &sink, mk(id), 2).await.unwrap();
         }
-        // `a` was pruned: journal forgotten, marker gone; `b`/`c` retained.
-        assert_eq!(*sink.0.lock().unwrap(), vec!["a".to_string()]);
+        // Nothing is evicted before a run succeeds: a failing run keeps every
+        // undoable one.
+        assert!(sink.0.lock().unwrap().is_empty());
+        let idx = RunIndex::decode(store.get("p::row::__rollback__").await.unwrap().as_ref());
+        assert_eq!(idx.runs, vec!["a", "b", "c"]);
+        // `c` succeeded: `a` is pruned, its marker goes now and its journal
+        // with the next run's prepare.
+        finish(&store, "p::row", 2).await;
         assert!(
             store
                 .get("p::row::__rollback__::a")
@@ -578,13 +667,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let idx = RunIndex::decode(store.get("p::row::__rollback__").await.unwrap().as_ref());
+        assert_eq!(idx.forget, vec!["a"]);
+        prepare(&store, &sink, mk("d"), 2).await.unwrap();
+        assert_eq!(*sink.0.lock().unwrap(), vec!["a".to_string()]);
         let c: RunMarker =
             serde_json::from_value(store.get("p::row::__rollback__::c").await.unwrap().unwrap())
                 .unwrap();
         assert_eq!(c.bookmark_before, Some(json!({"updated_at": "2026-01-01"})));
         assert_eq!(c.token_before.as_deref(), Some("tok"));
         assert_eq!(c.mode, RollbackMode::Upsert);
+        finish(&store, "p::row", 2).await;
+        // The hard cap bounds a run of failures: 2 * retain + 1.
+        for id in ["e", "f", "g", "h", "i", "j"] {
+            prepare(&store, &sink, mk(id), 2).await.unwrap();
+        }
         let idx = RunIndex::decode(store.get("p::row::__rollback__").await.unwrap().as_ref());
-        assert_eq!(idx.runs, vec!["b", "c"]);
+        assert_eq!(idx.runs.len(), 5);
+        assert!(idx.forget.is_empty());
+        finish(&store, "p::row", 2).await;
+        let idx = RunIndex::decode(store.get("p::row::__rollback__").await.unwrap().as_ref());
+        assert_eq!(idx.runs, vec!["i", "j"]);
     }
 }

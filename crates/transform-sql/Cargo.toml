@@ -25,6 +25,8 @@ tracing.workspace = true
 # blocking client on a dedicated thread. `blocking` is enabled on top of the
 # workspace features so the sync compile path can drive it without a runtime.
 reqwest = { workspace = true, features = ["blocking"] }
+# `block_in_place` around the compile-time HTTP fetch, so it never pins a worker.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 criterion.workspace = true

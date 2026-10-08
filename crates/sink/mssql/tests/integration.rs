@@ -350,3 +350,35 @@ async fn upsert_keeps_columns_a_record_does_not_carry() {
         ]
     );
 }
+
+/// #828: concurrent first writes into one missing table — backfill windows or
+/// matrix rows — all succeed; the probe-then-create race is not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_first_writes_create_the_table_once() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+
+    const N: usize = 8;
+    let mut sinks = Vec::with_capacity(N);
+    for _ in 0..N {
+        let mut s = auto_cfg(&cfg, "dbo.race");
+        s.create_table = true;
+        sinks.push(std::sync::Arc::new(MssqlSink::new(s).await.expect("sink")));
+    }
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (i, sink) in sinks.into_iter().enumerate() {
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            sink.write_batch(&[json!({"id": i as i64, "name": "n"})])
+                .await
+        });
+    }
+    while let Some(r) = tasks.join_next().await {
+        assert_eq!(r.expect("task").expect("concurrent first write"), 1);
+    }
+    assert_eq!(count(&pool, "dbo.race").await, N as i32);
+}

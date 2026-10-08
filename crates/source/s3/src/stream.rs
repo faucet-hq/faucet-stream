@@ -71,6 +71,7 @@ pub struct S3Source {
     /// `list` (one per `ListObjectsV2` page), `get` (one per `GetObject`,
     /// including each ranged Parquet read).
     roundtrips: faucet_core::observability::RecorderSlot,
+    filter: faucet_common_file::ObjectFilter,
 }
 
 impl S3Source {
@@ -79,12 +80,15 @@ impl S3Source {
     /// Builds the S3 client eagerly so it is reused across calls.
     pub async fn new(config: S3SourceConfig) -> Result<Self, FaucetError> {
         config.parquet.validate()?;
+        let filter = faucet_common_file::ObjectFilter::new(config.include.as_deref())
+            .map_err(|e| faucet_common_file::config_context("S3 source", e))?;
         let client = Self::build_client(&config).await?;
         Ok(Self {
             config,
             client,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            filter,
         })
     }
 
@@ -151,6 +155,13 @@ impl S3Source {
                 if key.is_empty() || faucet_common_file::write::is_unfinished_output_key(key) {
                     continue;
                 }
+                let size = object.size().and_then(|n| u64::try_from(n).ok());
+                if !self
+                    .filter
+                    .keep(key, size, effective_prefix.unwrap_or_default())
+                {
+                    continue;
+                }
                 keys.push(key.to_string());
 
                 if let Some(max) = self.config.max_objects
@@ -207,14 +218,9 @@ impl S3Source {
         feature = "file-format-orc"
     ))]
     async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
+        let reader = self.open_object_reader(key).await?;
+        faucet_core::file_format::read_to_end_capped(reader, self.config.max_object_bytes, key)
             .await
-            .map_err(|e| FaucetError::Source(format!("S3 read error for key '{key}': {e}")))?;
-        Ok(buf)
     }
 
     /// Decode a single Parquet object into its Arrow schema and the list of
@@ -300,7 +306,7 @@ impl S3Source {
             .shared()
             .ok_or_else(|| FaucetError::Source(format!("S3 '{key}': format has no decoder")))?;
         let records =
-            faucet_core::file_format::decode(&bytes, format, &self.config.format_options())
+            faucet_core::file_format::decode_owned(bytes, format, &self.config.format_options())
                 .await
                 .map_err(|e| FaucetError::Source(format!("S3 '{key}': {e}")))?;
         Ok(Fetched::Records(records))
@@ -404,15 +410,9 @@ impl S3Source {
     /// at once (#78/#25). The whole object is still one unit for
     /// `JsonArray` / `RawText`, but peak memory is now ~1× the decoded size.
     async fn read_object_text(&self, key: &str) -> Result<String, FaucetError> {
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut text = String::new();
-        reader.read_to_string(&mut text).await.map_err(|e| {
-            FaucetError::Source(format!(
-                "S3 read/decode error for key '{key}' (not valid UTF-8?): {e}"
-            ))
-        })?;
-        Ok(text)
+        let reader = self.open_object_reader(key).await?;
+        faucet_core::file_format::read_to_string_capped(reader, self.config.max_object_bytes, key)
+            .await
     }
 
     /// Open an S3 object as an [`AsyncBufRead`](tokio::io::AsyncBufRead) over
@@ -684,12 +684,15 @@ impl faucet_core::Source for S3Source {
                 let payload = payload?;
                 #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                 let payload = match payload {
-                    Fetched::Container(bytes) => Fetched::Records(
-                        container
-                            .as_mut()
+                    Fetched::Container(bytes) => {
+                        let (d, rows) = container
+                            .take()
                             .expect("a container object implies a container format")
-                            .decode_all(key, faucet_core::FileInput::Bytes(bytes))?,
-                    ),
+                            .decode_all_offloaded(key.to_string(), faucet_core::FileInput::Bytes(bytes))
+                            .await?;
+                        container = Some(d);
+                        Fetched::Records(rows)
+                    }
                     other => other,
                 };
                 match payload {
@@ -992,14 +995,16 @@ impl faucet_core::Source for S3Source {
                     }
                     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                     Fetched::Container(bytes) => {
-                        let (_, batches) = container
-                            .as_mut()
+                        let (d, batches) = container
+                            .take()
                             .expect("a container object implies a container format")
-                            .decode_batches(
-                            key,
-                            faucet_core::FileInput::Bytes(bytes),
-                            self.config.batch_size,
-                        )?;
+                            .decode_batches_offloaded(
+                                key.to_string(),
+                                faucet_core::FileInput::Bytes(bytes),
+                                self.config.batch_size,
+                            )
+                            .await?;
+                        container = Some(d);
                         pending = batches;
                     }
                     _ => Err(FaucetError::Source(format!(
@@ -1262,6 +1267,7 @@ mod tests {
             client,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            filter: Default::default(),
         }
     }
 

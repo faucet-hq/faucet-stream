@@ -437,6 +437,27 @@ pub async fn decode(
     }
 }
 
+/// [`decode`] for an owned body, run on a blocking thread.
+///
+/// The XML / Excel / Avro / ORC / JSON-array / CSV decoders are synchronous and
+/// CPU-bound; inline on an async worker a large object stalls heartbeats,
+/// cancellation and every other task on that worker (CORE-34). The body is
+/// moved rather than copied (ORC reads it in place).
+pub async fn decode_owned(
+    bytes: Vec<u8>,
+    format: FileFormat,
+    opts: &FormatOptions,
+) -> Result<Vec<Value>, FaucetError> {
+    let opts = opts.clone();
+    tokio::task::spawn_blocking(move || match format {
+        #[cfg(feature = "file-format-orc")]
+        FileFormat::Orc => orc::decode_owned(bytes, &opts.orc),
+        other => futures::executor::block_on(decode(&bytes, other, &opts)),
+    })
+    .await
+    .map_err(|e| FaucetError::Source(format!("file_format: decode task failed: {e}")))?
+}
+
 /// Encode records into one object's bytes.
 pub fn encode(
     records: &[Value],
@@ -469,6 +490,53 @@ fn columnar_refusal(verb: &str) -> FaucetError {
         "file_format::{verb}: `parquet` is columnar and is handled by each connector's Arrow \
          path, not the generic record helper"
     ))
+}
+
+/// Default ceiling on one file's size once decompressed, for formats read
+/// whole into memory (2 GiB).
+pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Read `reader` to the end, failing once it yields more than `max` bytes — so
+/// a decompression bomb fails the file instead of exhausting memory. `what`
+/// names the file in the error.
+pub async fn read_to_end_capped<R>(reader: R, max: u64, what: &str) -> Result<Vec<u8>, FaucetError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    reader
+        .take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| FaucetError::Source(format!("read error for '{what}': {e}")))?;
+    check_object_size(buf.len() as u64, max, what)?;
+    Ok(buf)
+}
+
+/// [`read_to_end_capped`] for a UTF-8 text body.
+pub async fn read_to_string_capped<R>(
+    reader: R,
+    max: u64,
+    what: &str,
+) -> Result<String, FaucetError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let bytes = read_to_end_capped(reader, max, what).await?;
+    String::from_utf8(bytes)
+        .map_err(|e| FaucetError::Source(format!("'{what}' is not valid UTF-8: {e}")))
+}
+
+/// The error for a file past `max_object_bytes`.
+pub fn check_object_size(len: u64, max: u64, what: &str) -> Result<(), FaucetError> {
+    if len > max {
+        return Err(FaucetError::Source(format!(
+            "'{what}' is larger than `max_object_bytes` ({max} bytes) once decompressed; \
+             raise `max_object_bytes` to read it"
+        )));
+    }
+    Ok(())
 }
 
 /// The error a build without the feature reports.
@@ -619,7 +687,34 @@ pub fn cell_text(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        other => serde_json::to_string(other).unwrap_or_default(),
+        other => crate::util::canonical_json(other),
+    }
+}
+
+#[cfg(test)]
+mod capped_read_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_body_past_the_cap_fails_and_one_at_the_cap_reads() {
+        let body = [b'x'; 64];
+        let ok = read_to_end_capped(&body[..], 64, "f").await.unwrap();
+        assert_eq!(ok.len(), 64);
+        let err = read_to_end_capped(&body[..], 63, "big.json.gz")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("big.json.gz"), "{err}");
+        assert!(err.to_string().contains("max_object_bytes"), "{err}");
+        assert_eq!(
+            read_to_string_capped(&b"hi"[..], 8, "t").await.unwrap(),
+            "hi"
+        );
+        assert!(
+            read_to_string_capped(&[0xff, 0xfe][..], 8, "t")
+                .await
+                .is_err()
+        );
+        assert!(check_object_size(5, 4, "x").is_err());
     }
 }
 
@@ -627,6 +722,36 @@ pub fn cell_text(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn decode_owned_matches_decode_and_runs_off_the_runtime() {
+        let body = b"[{\"a\":1},{\"a\":2}]".to_vec();
+        let opts = FormatOptions::default();
+        assert_eq!(
+            decode_owned(body.clone(), FileFormat::JsonArray, &opts)
+                .await
+                .unwrap(),
+            decode(&body, FileFormat::JsonArray, &opts).await.unwrap()
+        );
+        assert!(
+            decode_owned(Vec::new(), FileFormat::Parquet, &opts)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "file-format-orc")]
+    #[tokio::test]
+    async fn decode_owned_reads_orc_in_place() {
+        const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/orc/people.orc");
+        let opts = FormatOptions::default();
+        assert_eq!(
+            decode_owned(FIXTURE.to_vec(), FileFormat::Orc, &opts)
+                .await
+                .unwrap(),
+            decode(FIXTURE, FileFormat::Orc, &opts).await.unwrap()
+        );
+    }
 
     /// Every variant's extension and wire name, so adding a format without
     /// giving it both is a test failure rather than a `.txt` file called

@@ -50,8 +50,8 @@ pub fn extract_records(body: &Value, path: Option<&str>) -> Result<Vec<Value>, F
 /// Check an HTTP response status and return a [`FaucetError::HttpStatus`] on
 /// non-success responses.
 ///
-/// Reads the response body for error context, truncating to `max_body_len`
-/// bytes (default: 2048) to avoid large error messages.
+/// Reads at most `max_body_len` bytes (default: 2048) of the response body for
+/// error context, so a huge error page is never buffered whole.
 pub async fn check_http_response(
     resp: reqwest::Response,
     max_body_len: usize,
@@ -62,13 +62,23 @@ pub async fn check_http_response(
 
     let status = resp.status().as_u16();
     let url = resp.url().to_string();
-    let body_text = resp.text().await.unwrap_or_default();
+    let mut resp = resp;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut more = false;
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        raw.extend_from_slice(&chunk);
+        if raw.len() > max_body_len {
+            more = true;
+            break;
+        }
+    }
+    let body_text = String::from_utf8_lossy(&raw);
 
-    let body = if body_text.len() > max_body_len {
-        let end = body_text.floor_char_boundary(max_body_len);
+    let body = if more || body_text.len() > max_body_len {
+        let end = body_text.floor_char_boundary(max_body_len.min(body_text.len()));
         format!("{}...(truncated)", &body_text[..end])
     } else {
-        body_text
+        body_text.into_owned()
     };
 
     Err(FaucetError::HttpStatus { status, url, body })
@@ -588,6 +598,106 @@ pub fn snake_case(key: &str) -> String {
         .join("_")
 }
 
+/// Compact JSON text for `v` with object keys sorted (byte order) at every
+/// depth; arrays keep their element order.
+///
+/// Use this wherever a JSON value becomes *record data* (an encoded column, a
+/// hash input, a CSV cell, a row identity). `serde_json`'s own `to_string`
+/// follows its map's iteration order, which flips between sorted and
+/// insertion order depending on whether Cargo feature unification enabled
+/// `serde_json/preserve_order` in the build — so the same record would
+/// serialize differently from one binary to the next (#817). Sorted order is
+/// what every build without `preserve_order` has always produced.
+pub fn canonical_json(v: &Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(v, &mut out);
+    out
+}
+
+fn write_canonical_json(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            out.push('{');
+            for (i, (k, val)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                write_canonical_json(val, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod canonical_json_tests {
+    use super::canonical_json;
+    use serde_json::{Map, Value, json};
+
+    /// Build an object whose *insertion* order is the reverse of sorted order,
+    /// so the test is meaningful whichever way `preserve_order` resolves.
+    fn reversed(pairs: Vec<(&str, Value)>) -> Value {
+        let mut m = Map::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v);
+        }
+        Value::Object(m)
+    }
+
+    #[test]
+    fn sorts_keys_at_every_depth_and_keeps_array_order() {
+        let owner = reversed(vec![("login", json!("octo-org")), ("id", json!(2))]);
+        assert_eq!(canonical_json(&owner), r#"{"id":2,"login":"octo-org"}"#);
+
+        let nested = reversed(vec![
+            ("z", json!([3, 1, 2])),
+            (
+                "m",
+                Value::Array(vec![reversed(vec![("y", json!(null)), ("x", json!(true))])]),
+            ),
+            ("a", reversed(vec![("b", json!(1.5)), ("a", json!("s"))])),
+        ]);
+        assert_eq!(
+            canonical_json(&nested),
+            r#"{"a":{"a":"s","b":1.5},"m":[{"x":true,"y":null}],"z":[3,1,2]}"#
+        );
+    }
+
+    #[test]
+    fn escapes_keys_and_strings_like_serde_json() {
+        let v = reversed(vec![
+            ("q\"k", json!("line\nbreak\u{7f}\u{8}")),
+            ("\u{e9}", json!(-1)),
+        ]);
+        let text = canonical_json(&v);
+        // Keys and strings are escaped exactly as serde_json escapes them.
+        let mut sorted = std::collections::BTreeMap::new();
+        for (k, val) in v.as_object().unwrap() {
+            sorted.insert(k.clone(), val.clone());
+        }
+        assert_eq!(text, serde_json::to_string(&sorted).unwrap());
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), v);
+        assert_eq!(canonical_json(&json!("x")), r#""x""#);
+        assert_eq!(canonical_json(&json!({})), "{}");
+        assert_eq!(canonical_json(&json!([])), "[]");
+    }
+}
+
 #[cfg(test)]
 mod snake_tests {
     use super::snake_case;
@@ -614,6 +724,54 @@ mod snake_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Serve one response: `head` then `body`, then hold the socket open.
+    fn serve_once(head: String, body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn check_http_response_reads_only_the_truncation_limit() {
+        let url = serve_once(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100000000\r\n\r\n".into(),
+            vec![b'x'; 8192],
+        );
+        let resp = reqwest::get(&url).await.unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            check_http_response(resp, 100),
+        )
+        .await
+        .expect("must not wait for the rest of a huge body")
+        .unwrap_err();
+        match err {
+            FaucetError::HttpStatus { status, body, .. } => {
+                assert_eq!(status, 500);
+                assert_eq!(body, format!("{}...(truncated)", "x".repeat(100)));
+            }
+            other => panic!("{other:?}"),
+        }
+        let url = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\n".into(),
+            b"gone".to_vec(),
+        );
+        let resp = reqwest::get(&url).await.unwrap();
+        match check_http_response(resp, 100).await.unwrap_err() {
+            FaucetError::HttpStatus { body, .. } => assert_eq!(body, "gone"),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn retry_after_reads_seconds_and_http_dates() {

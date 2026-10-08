@@ -35,7 +35,30 @@ pub(crate) struct S3RangeReader {
     bucket: String,
     key: String,
     len: u64,
+    pin: Pin,
     recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
+}
+
+/// What every range read is tied to, so all of them see the object as the
+/// `HeadObject` saw it: the version when the bucket is versioned, else the
+/// ETag as an `If-Match` precondition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Pin {
+    version_id: Option<String>,
+    etag: Option<String>,
+}
+
+impl Pin {
+    fn apply(
+        &self,
+        req: aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder,
+    ) -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder {
+        match (&self.version_id, &self.etag) {
+            (Some(v), _) => req.version_id(v),
+            (None, Some(e)) => req.if_match(e),
+            (None, None) => req,
+        }
+    }
 }
 
 impl S3RangeReader {
@@ -73,11 +96,16 @@ impl S3RangeReader {
                 "S3 object '{key}' reports a negative Content-Length ({len})"
             ))
         })?;
+        let pin = Pin {
+            version_id: head.version_id().map(str::to_string),
+            etag: head.e_tag().map(str::to_string),
+        };
         Ok(Self {
             client: client.clone(),
             bucket: bucket.to_string(),
             key: key.to_string(),
             len,
+            pin,
             recorder,
         })
     }
@@ -95,15 +123,19 @@ impl S3RangeReader {
         if let Some(r) = &self.recorder {
             r.record("get");
         }
-        let response = self
+        let request = self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(&self.key)
-            .range(&header)
-            .send()
-            .await
-            .map_err(|e| failed(&self.key, &header, "", e))?;
+            .range(&header);
+        let response = self.pin.apply(request).send().await.map_err(|e| {
+            if precondition_failed(&e) {
+                replaced(&self.key)
+            } else {
+                failed(&self.key, &header, "", e)
+            }
+        })?;
         let data = response
             .body
             .collect()
@@ -130,6 +162,18 @@ fn range_header(range: &Range<u64>) -> String {
 fn failed(key: &str, header: &str, when: &str, cause: impl std::fmt::Display) -> ParquetError {
     ParquetError::External(Box::new(std::io::Error::other(format!(
         "S3 ranged read for '{key}' ({header}) failed{when}: {cause}"
+    ))))
+}
+
+fn precondition_failed<E>(e: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    e.raw_response().is_some_and(|r| r.status().as_u16() == 412)
+}
+
+/// The object changed after the read began.
+fn replaced(key: &str) -> ParquetError {
+    ParquetError::External(Box::new(std::io::Error::other(format!(
+        "S3 object '{key}' was replaced while it was being read (its ETag no longer matches); \
+         rerun to read the new version"
     ))))
 }
 
@@ -194,6 +238,34 @@ mod tests {
             mid.contains("mid-stream"),
             "a failure part-way through must say so: {mid}"
         );
+    }
+
+    #[test]
+    fn every_range_read_is_pinned_to_the_object_the_head_saw() {
+        let client = Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .build(),
+        );
+        let get = || client.get_object().bucket("b").key("k");
+        let versioned = Pin {
+            version_id: Some("v1".into()),
+            etag: Some("\"e\"".into()),
+        };
+        let req = versioned.apply(get());
+        assert_eq!(req.get_version_id().as_deref(), Some("v1"));
+        assert_eq!(req.get_if_match(), &None);
+        let etag_only = Pin {
+            version_id: None,
+            etag: Some("\"e\"".into()),
+        };
+        assert_eq!(
+            etag_only.apply(get()).get_if_match().as_deref(),
+            Some("\"e\"")
+        );
+        let none = Pin::default().apply(get());
+        assert!(none.get_if_match().is_none() && none.get_version_id().is_none());
+        assert!(replaced("o.parquet").to_string().contains("replaced"));
     }
 
     #[test]

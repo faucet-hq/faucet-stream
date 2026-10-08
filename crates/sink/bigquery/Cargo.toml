@@ -60,6 +60,7 @@ schemars.workspace = true
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 tempfile = "3"
+base64.workspace = true
 serde = { workspace = true }
 
 [package.metadata.docs.rs]

@@ -125,15 +125,16 @@ The `action` block is tagged by `type`:
 ### Detectors
 
 All detectors are **conservative** — fully anchored full-string regexes — so
-false positives stay rare. This matters because masking silently rewrites
+false positives stay rare. They run on string values; a JSON number is only
+checked by `credit_card`, and booleans never match. This matters because masking silently rewrites
 data: a false positive is a data-quality bug, not just noise.
 
 | `value_detector` | Matches |
 |------------------|---------|
 | `email` | An RFC-5322-ish email address. |
-| `credit_card` | A 13–19 digit card number (spaces/dashes allowed) that passes the **Luhn** checksum. |
+| `credit_card` | A 13–19 digit card number (spaces/dashes allowed) that passes the **Luhn** checksum — as a string or a JSON integer. |
 | `ssn` | A US SSN `NNN-NN-NNNN`, excluding never-issued ranges (000/666/9xx area, 00 group, 0000 serial). |
-| `phone` | An E.164 / North-American phone number. |
+| `phone` | An E.164 number (`+` then 8–15 digits) or a North-American number written with separators (`415-555-2671`, `(415) 555-2671`). A bare run of digits never matches — ids and epoch timestamps look exactly like one. |
 | `ipv4` | An IPv4 dotted-quad address. |
 
 ## Determinism & joinability
@@ -194,8 +195,11 @@ pipeline:
 ## Inspecting a policy (`faucet masking`)
 
 `faucet masking [config]` validates the `masking:` block and prints, per
-destination sink, which rules apply — the fast way to confirm your
-`applies_to` scoping is right. It is offline-safe (no secrets are fetched):
+destination, which rules apply — the fast way to confirm your `applies_to`
+scoping is right. Destinations are what the run actually writes: each sink
+template with the rows that use it and the connector kind after a row's
+`type:` override (or, in topology mode, each sink node), scoped exactly as the
+run scopes them. It is offline-safe (no secrets are fetched):
 
 ```console
 $ faucet masking cli/examples/csv_to_jsonl_with_masking.yaml

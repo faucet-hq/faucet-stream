@@ -58,7 +58,8 @@ pub async fn run(args: UsageArgs) -> CliResult<()> {
         .usage_list(&filter)
         .await
         .map_err(|e| CliError::Internal(format!("usage read: {e}")))?;
-    let report = aggregate(&records, by, &report_currency(&records));
+    let mut report = aggregate(&records, by, &report_currency(&records));
+    report.truncated = crate::usage::listing_truncated(records.len(), args.limit);
     if args.common.json {
         println!(
             "{}",

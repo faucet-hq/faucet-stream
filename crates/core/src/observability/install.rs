@@ -88,9 +88,27 @@ pub enum InstallError {
 /// - If `tracing` is set, installs a `tracing-subscriber` registry with the
 ///   given env-filter directive as the default subscriber. Already-set-default
 ///   is logged via `tracing::warn!` and continues.
+/// - OTLP export (feature `otel`) needs a tokio runtime; called outside one it
+///   is skipped with a warning.
 #[cfg(feature = "observability-install")]
 pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport, InstallError> {
     let mut report = InstallReport::default();
+
+    // The OTLP exporters (and the fanout's `/metrics` task) need a tokio
+    // runtime; outside one, skip OTLP rather than panic.
+    #[cfg(feature = "otel")]
+    let without_otel;
+    #[cfg(feature = "otel")]
+    let cfg = if cfg.otel.is_some() && tokio::runtime::Handle::try_current().is_err() {
+        tracing::warn!("OTLP export needs a tokio runtime; install_observability skips it");
+        without_otel = ObservabilityConfig {
+            otel: None,
+            ..cfg.clone()
+        };
+        &without_otel
+    } else {
+        cfg
+    };
 
     // Provider holders moved into the guard after both arms run; only populated
     // (and only referenced) when the `otel` feature is enabled.
@@ -124,8 +142,9 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
                 match crate::observability::otel::build_meter_provider(otel) {
                     Ok((mp, recorder)) => {
                         if metrics::set_global_recorder(recorder).is_err() {
-                            tracing::warn!("metrics recorder already installed; continuing");
-                            report.prometheus_already_installed = true;
+                            tracing::warn!(
+                                "metrics recorder already installed; OTLP metrics are not exported"
+                            );
                         } else {
                             otel_meter = Some(mp);
                             report.otel_signals.push("metrics");
@@ -151,13 +170,20 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
     }
 
     // --- Traces ---
-    if let Some(t) = cfg.tracing.as_ref() {
+    #[cfg(feature = "otel")]
+    let otel_traces = cfg
+        .otel
+        .as_ref()
+        .is_some_and(|o| o.exports(crate::observability::otel::OtelSignal::Traces));
+    #[cfg(not(feature = "otel"))]
+    let otel_traces = false;
+    if cfg.tracing.is_some() || otel_traces {
         use tracing_subscriber::EnvFilter;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
-        let make_filter =
-            || EnvFilter::try_new(&t.level).unwrap_or_else(|_| EnvFilter::new("info"));
+        let level = cfg.tracing.as_ref().map_or("info", |t| t.level.as_str());
+        let make_filter = || EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
 
         // Reassigned only in the `otel` branch below; without that feature the
         // `mut` is genuinely unused.
@@ -165,31 +191,46 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
         let mut installed = false;
 
         #[cfg(feature = "otel")]
-        {
-            let otel_traces = cfg
-                .otel
-                .as_ref()
-                .map(|o| o.exports(crate::observability::otel::OtelSignal::Traces))
-                .unwrap_or(false);
-            if let (true, Some(otel)) = (otel_traces, cfg.otel.as_ref()) {
+        if let (true, Some(otel)) = (otel_traces, cfg.otel.as_ref()) {
+            if crate::observability::otel::tracer_installed() {
+                installed = true;
+            } else {
                 match crate::observability::otel::build_trace_provider(otel) {
                     Ok(tp) => {
                         use opentelemetry::trace::TracerProvider as _;
+                        use tracing_subscriber::Layer as _;
                         let tracer = tp.tracer("faucet");
                         crate::observability::otel::install_propagator();
-                        let reg = tracing_subscriber::registry()
-                            .with(make_filter())
-                            .with(tracing_subscriber::fmt::layer())
-                            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-                            .with(crate::observability::otel::OtelErrorCountLayer);
-                        if reg.try_init().is_err() {
-                            tracing::warn!("tracing subscriber already installed; continuing");
-                            report.tracing_already_installed = true;
-                            // try_init failed: no otel layer was installed, so DON'T store the
-                            // provider — let `tp` drop here to shut its exporter down.
-                        } else {
-                            report.otel_signals.push("traces");
-                            otel_tracer = Some(tp);
+                        let layer: crate::observability::otel::TraceLayer = Box::new(
+                            tracing_opentelemetry::layer()
+                                .with_tracer(tracer)
+                                .and_then(crate::observability::otel::OtelErrorCountLayer),
+                        );
+                        // A host that installed its own subscriber first (the CLI)
+                        // registered a slot for exactly this layer.
+                        match crate::observability::otel::fill_trace_slot(layer) {
+                            Ok(()) => {
+                                report.otel_signals.push("traces");
+                                otel_tracer = Some(tp);
+                            }
+                            Err(layer) => {
+                                let reg = tracing_subscriber::registry()
+                                    .with(layer)
+                                    .with(make_filter())
+                                    .with(tracing_subscriber::fmt::layer());
+                                if reg.try_init().is_err() {
+                                    tracing::warn!(
+                                        "tracing subscriber already installed and no trace \
+                                         layer slot registered; OTLP traces are not exported"
+                                    );
+                                    report.tracing_already_installed = true;
+                                    // No otel layer was installed, so DON'T store the
+                                    // provider — let `tp` drop to shut its exporter down.
+                                } else {
+                                    report.otel_signals.push("traces");
+                                    otel_tracer = Some(tp);
+                                }
+                            }
                         }
                         installed = true;
                     }
@@ -386,6 +427,44 @@ fn install_fanout(
     Ok(())
 }
 
+/// Install, as the global metrics recorder, a fanout to `prometheus` — a
+/// recorder the host built (e.g. `PrometheusBuilder::build_recorder`) and
+/// renders through its own handle — and an OTLP metrics exporter built from
+/// `otel`. For a host such as an HTTP server that serves `/metrics` itself and
+/// so cannot use [`install_observability`]'s listener.
+///
+/// Returns `Ok(true)` when OTLP metrics are exported, `Ok(false)` when the
+/// exporter could not be built (the Prometheus recorder is installed alone, so
+/// `/metrics` keeps working), and an error when a global recorder is already
+/// installed. The meter provider lives for the process and is flushed by
+/// [`shutdown_otel`](crate::observability::otel::shutdown_otel).
+#[cfg(all(feature = "observability-install", feature = "otel"))]
+pub fn install_prometheus_with_otel_metrics(
+    prometheus: metrics_exporter_prometheus::PrometheusRecorder,
+    otel: &crate::observability::otel::OtelConfig,
+) -> Result<bool, InstallError> {
+    use metrics_util::layers::FanoutBuilder;
+    let already =
+        || InstallError::PrometheusInstall("a metrics recorder is already installed".into());
+    match crate::observability::otel::build_meter_provider(otel) {
+        Ok((mp, otel_recorder)) => {
+            let fanout = FanoutBuilder::default()
+                .add_recorder(prometheus)
+                .add_recorder(otel_recorder)
+                .build();
+            metrics::set_global_recorder(fanout).map_err(|_| already())?;
+            crate::observability::otel::keep_meter_provider(mp);
+            crate::observability::otel::describe();
+            Ok(true)
+        }
+        Err(e) => {
+            tracing::warn!("OTLP metrics exporter init failed; Prometheus-only: {e}");
+            metrics::set_global_recorder(prometheus).map_err(|_| already())?;
+            Ok(false)
+        }
+    }
+}
+
 /// Non-`observability-install` stub. Returns an empty report, never panics.
 #[cfg(not(feature = "observability-install"))]
 pub fn install_observability(_cfg: &ObservabilityConfig) -> Result<InstallReport, InstallError> {
@@ -398,19 +477,48 @@ pub fn install_observability(_cfg: &ObservabilityConfig) -> Result<InstallReport
     Ok(InstallReport::default())
 }
 
+/// The version [`register_build_info`] reports, when an application set one.
+static BUILD_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Set the version the `faucet_build_info{version}` gauge reports — call it
+/// with the **binary's** own `env!("CARGO_PKG_VERSION")` before installing
+/// observability. Without it the label is `faucet-core`'s version, which
+/// differs from the binary's whenever only the binary was released (#832).
+///
+/// First call wins (a process has one build); returns `false` when a version
+/// was already set. Re-registers the gauge so a recorder installed before
+/// this call reports the new version too.
+pub fn set_build_version(version: &'static str) -> bool {
+    let first = BUILD_VERSION.set(version).is_ok();
+    if first {
+        register_build_info();
+    }
+    first
+}
+
+/// The version `faucet_build_info` reports: the one passed to
+/// [`set_build_version`], else `faucet-core`'s `CARGO_PKG_VERSION`.
+pub fn build_version() -> &'static str {
+    BUILD_VERSION
+        .get()
+        .copied()
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// Register the `faucet_build_info{version}` gauge (set to 1) under the
 /// currently-installed `metrics` recorder. Safe to call from any code path
 /// that wants to ensure the gauge is set; `install_observability` invokes
 /// this automatically. Gauges are naturally idempotent under the `metrics`
 /// model — repeat calls just re-set the same value.
 ///
-/// The version label is `CARGO_PKG_VERSION` of `faucet-core` — matches the
-/// crate that owns the observability layer. Dashboards `group_left` the gauge
-/// onto every other metric to annotate panels with the running version.
+/// The version label is [`build_version`]: the application's version when it
+/// called [`set_build_version`] (the `faucet` CLI does), else `faucet-core`'s.
+/// Dashboards `group_left` the gauge onto every other metric to annotate
+/// panels with the running version.
 pub fn register_build_info() {
     metrics::gauge!(
         "faucet_build_info",
-        "version" => env!("CARGO_PKG_VERSION"),
+        "version" => build_version(),
     )
     .set(1.0);
 }
@@ -421,6 +529,18 @@ mod tests {
     use std::sync::Mutex;
 
     static LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otlp_outside_a_runtime_is_skipped_not_a_panic() {
+        let cfg = ObservabilityConfig {
+            otel: Some(crate::observability::otel::OtelConfig::default()),
+            ..Default::default()
+        };
+        let report = install_observability(&cfg).expect("no runtime is not an error");
+        assert!(report.otel_signals.is_empty());
+        assert!(!report.prometheus_already_installed);
+    }
 
     #[test]
     fn metrics_mode_selection() {

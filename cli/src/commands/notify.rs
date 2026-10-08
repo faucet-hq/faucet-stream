@@ -6,7 +6,7 @@
 use crate::cli::{NotifyArgs, NotifyCommand, NotifyTestArgs};
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
-use crate::notify::{Notifier, NotifyEvent};
+use crate::notify::{DeliveryOutcome, Notifier, NotifyEvent};
 
 /// Execute the `notify` subcommand.
 pub async fn run(args: NotifyArgs) -> CliResult<()> {
@@ -26,7 +26,7 @@ async fn test(args: NotifyTestArgs) -> CliResult<()> {
         None => crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?,
     };
     // Real load (resolves secrets) so channel credentials are live for delivery.
-    let cfg = PipelineConfig::from_path_async(&path, None).await?;
+    let cfg = PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
     if cfg.notifications.is_empty() {
         return Err(CliError::Config(
             "no `notifications:` block in this config — add one, or run \
@@ -48,19 +48,56 @@ async fn test(args: NotifyTestArgs) -> CliResult<()> {
         args.event,
         cfg.notifications.len()
     );
-    notifier.emit(event).await;
-    println!("Done — check your channels. Any delivery failure was logged above.");
+    let mut outcomes = notifier.emit_report(event.clone()).await;
+    if event.opens_incident() && !args.keep_open {
+        // Close the incident the test opened, so it neither stays open on
+        // call nor swallows a real failure.
+        outcomes.extend(notifier.resolve(&event).await);
+    }
+    for o in &outcomes {
+        match &o.error {
+            None => println!("  {} ({}): {} ok", o.rule, o.channel, o.action),
+            Some(e) => println!("  {} ({}): {} FAILED — {e}", o.rule, o.channel, o.action),
+        }
+    }
+    test_verdict(&args.event, &outcomes)
+}
+
+/// Fail when no rule took the event or any delivery failed.
+fn test_verdict(kind: &str, outcomes: &[DeliveryOutcome]) -> CliResult<()> {
+    if !outcomes.iter().any(|o| o.action == "trigger") {
+        return Err(CliError::Config(format!(
+            "no notification rule delivered a `{kind}` event — check the rules' `on:`, \
+             `min_severity` and `dlq_threshold`"
+        )));
+    }
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| o.error.is_some())
+        .map(|o| o.rule.as_str())
+        .collect();
+    if !failed.is_empty() {
+        return Err(CliError::Config(format!(
+            "notification delivery failed for rule(s): {}",
+            failed.join(", ")
+        )));
+    }
+    println!("Done — every matching rule delivered.");
     Ok(())
 }
 
 /// Build a synthetic event for the requested kind. DLQ uses a large count so it
 /// clears any configured `dlq_threshold`.
 ///
-/// Every kind except `scheduler_stuck` carries a synthetic [`RunContext`], so a
+/// Every kind except `scheduler_stuck` carries a synthetic [`RunContext`](crate::notify::RunContext), so a
 /// receiver being tested sees the same populated `run_id` / `invocation_id` /
 /// timing fields a real run would send (#480). `scheduler_stuck` deliberately
 /// does not — it has no owning invocation in production either, so leaving it
 /// null is the faithful shape.
+/// The row every synthetic event carries, so its incident / dedup key
+/// (`{pipeline}:faucet-notify-test`) never matches a real run's.
+pub const TEST_ROW: &str = "faucet-notify-test";
+
 fn synth_event(kind: &str, pipeline: &str) -> CliResult<NotifyEvent> {
     let run = || {
         crate::notify::RunContext::start(
@@ -72,23 +109,28 @@ fn synth_event(kind: &str, pipeline: &str) -> CliResult<NotifyEvent> {
     Ok(match kind {
         "run_failure" => NotifyEvent::run_failure(
             pipeline,
-            "",
+            TEST_ROW,
             "test",
             "synthetic test failure from `faucet notify test`",
         )
         .with_run(run()),
-        "run_success" => NotifyEvent::run_success(pipeline, "", 0).with_run(run()),
-        "sla_breach" => NotifyEvent::sla_breach(pipeline, "", "staleness", "synthetic SLA breach")
-            .with_run(run()),
-        "circuit_open" => NotifyEvent::circuit_open(pipeline, "", 5, 30).with_run(run()),
-        "contract_abort" => {
-            NotifyEvent::contract_abort(pipeline, "", "synthetic contract breach").with_run(run())
+        "run_success" => NotifyEvent::run_success(pipeline, TEST_ROW, 0).with_run(run()),
+        "sla_breach" => {
+            NotifyEvent::sla_breach(pipeline, TEST_ROW, "staleness", "synthetic SLA breach")
+                .with_run(run())
         }
-        "dlq_threshold" => NotifyEvent::dlq_threshold(pipeline, "", 1_000_000).with_run(run()),
+        "circuit_open" => NotifyEvent::circuit_open(pipeline, TEST_ROW, 5, 30).with_run(run()),
+        "contract_abort" => {
+            NotifyEvent::contract_abort(pipeline, TEST_ROW, "synthetic contract breach")
+                .with_run(run())
+        }
+        "dlq_threshold" => {
+            NotifyEvent::dlq_threshold(pipeline, TEST_ROW, 1_000_000).with_run(run())
+        }
         "scheduler_stuck" => NotifyEvent::scheduler_stuck(pipeline, "synthetic scheduler-stuck"),
         "profile_drift" => NotifyEvent::profile_drift(
             pipeline,
-            "",
+            TEST_ROW,
             "amount",
             "null_rate",
             "synthetic profile drift: null_rate 0.4 vs baseline mean 0",
@@ -102,7 +144,7 @@ fn synth_event(kind: &str, pipeline: &str) -> CliResult<NotifyEvent> {
             "synthetic change request",
         ),
         "budget_exceeded" => {
-            NotifyEvent::budget_exceeded(pipeline, "", "max_records", 1_000_000, 1_000_500)
+            NotifyEvent::budget_exceeded(pipeline, TEST_ROW, "max_records", 1_000_000, 1_000_500)
                 .with_run(run())
         }
         "connection_needs_reauth" => NotifyEvent::connection_needs_reauth(
@@ -158,6 +200,58 @@ mod tests {
                 .and_then(|v| v.as_u64()),
             Some(1_000_000)
         );
+    }
+
+    #[test]
+    fn synthetic_events_never_share_a_real_runs_incident_key() {
+        let e = synth_event("run_failure", "orders").unwrap();
+        assert_eq!(e.incident_key(), "orders:faucet-notify-test");
+        assert_ne!(
+            e.incident_key(),
+            NotifyEvent::run_failure("orders", "", "s", "m").incident_key()
+        );
+    }
+
+    #[test]
+    fn the_verdict_fails_on_no_match_or_a_failed_delivery() {
+        let o = |action: &'static str, error: Option<&str>| DeliveryOutcome {
+            rule: "r".into(),
+            channel: "slack",
+            action,
+            error: error.map(str::to_string),
+        };
+        assert!(test_verdict("run_failure", &[o("trigger", None)]).is_ok());
+        let none = test_verdict("run_failure", &[]).unwrap_err().to_string();
+        assert!(none.contains("no notification rule"), "{none}");
+        assert!(test_verdict("run_failure", &[o("coalesced", None)]).is_err());
+        let failed = test_verdict("x", &[o("trigger", None), o("resolve", Some("boom"))])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            failed.contains("delivery failed for rule(s): r"),
+            "{failed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_command_exits_non_zero_when_delivery_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("faucet.yaml");
+        std::fs::write(
+            &cfg,
+            "version: 1\nname: n\nnotifications:\n  - name: s\n    channel:\n      type: slack\n      config:\n        webhook_url: http://127.0.0.1:1/hook\npipeline:\n  source:\n    type: csv\n    config:\n      path: in.csv\n  sink:\n    type: jsonl\n    config:\n      path: out.jsonl\n",
+        )
+        .unwrap();
+        let args = |event: &str| NotifyTestArgs {
+            config: Some(cfg.clone()),
+            event: event.into(),
+            keep_open: false,
+            profile: None,
+            env_file: None,
+            no_env_file: true,
+        };
+        let err = test(args("run_failure")).await.unwrap_err().to_string();
+        assert!(err.contains("delivery failed"), "{err}");
     }
 
     #[test]

@@ -65,6 +65,13 @@ Each row deep-merges a per-dataset **config patch** over the connection config;
 introspected column schemas and row estimates appear as comments (`?` marks a
 nullable column).
 
+The row id is also the row's state key, so it depends only on the dataset's
+name: the name with every other character run collapsed to `_`
+(`public.orders` → `public_orders`). When that is ambiguous — two datasets
+sanitize to the same id (unless one is literally named that), the result is a
+reserved id like `window`, or the name has no ASCII letters or digits — the id
+gets a stable `-<hash>` of the full name (`a.b` beside `a_b` → `a_b-1c2d3e4f`).
+
 When the sink writes one fixed file — a `file` / `jsonl` / `csv` / single-file
 `parquet` path, or an `s3` / `gcs` / `azure-blob` sink with a fixed `path`
 (`sftp`: `file_name`) — every row would overwrite the others, and `faucet run`
@@ -124,7 +131,8 @@ bulk-query API that needs an explicit column list (no `SELECT *`) is exactly
 `describe` + `${field_names}` in the emitted query. Setting `fan_out: true`
 (same key on `odata:`) applies the recipe **at run time** — `faucet run` /
 `serve` turn the discovered datasets into one matrix row each before
-expansion. Pass `--sink <template>` to `faucet discover` so each dataset
+expansion, and `faucet schedule` does so on every tick. Such a config may not
+also carry a `matrix:`, and only one source may set `fan_out: true`. Pass `--sink <template>` to `faucet discover` so each dataset
 routes to its own table. Any other source kind fails with a typed error
 naming the supported set. Library users can call `Source::discover()`
 directly — it returns the same `DatasetDescriptor` list.

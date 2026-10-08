@@ -340,10 +340,32 @@ fn strip_marker(mut rec: Value, marker: Option<&DeleteMarker>) -> Value {
     rec
 }
 
-/// Stable canonical string for a key tuple, for dedup.
+/// Stable canonical string for a key tuple, for dedup. Scalars compare by
+/// their text, as a database compares a key column, so `7`, `7.0` and `"7"`
+/// are one key (the rule `rollback::canonical_key` applies, plus integral
+/// floats).
 fn canonical(k: &KeyTuple) -> String {
-    let arr: Vec<&Value> = k.0.iter().map(|(_, v)| v).collect();
-    serde_json::to_string(&arr).expect("a Vec<&serde_json::Value> always serializes")
+    let arr: Vec<String> = k.0.iter().map(|(_, v)| key_scalar_text(v)).collect();
+    serde_json::to_string(&arr).expect("a Vec<String> always serializes")
+}
+
+fn key_scalar_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => match n.as_f64() {
+            Some(f)
+                if n.as_i64().is_none()
+                    && n.as_u64().is_none()
+                    && f.fract() == 0.0
+                    && f.abs() < 9_007_199_254_740_992.0 =>
+            {
+                (f as i64).to_string()
+            }
+            _ => n.to_string(),
+        },
+        Value::Bool(b) => b.to_string(),
+        other => crate::util::canonical_json(other),
+    }
 }
 
 /// Render a key tuple into a single document id (Elasticsearch `_id`).
@@ -364,11 +386,11 @@ pub fn key_to_doc_id(k: &KeyTuple, separator: &str) -> String {
     if k.0.len() == 1 {
         return match &k.0[0].1 {
             Value::String(s) => s.clone(),
-            other => other.to_string(),
+            other => crate::util::canonical_json(other),
         };
     }
-    let values: Vec<&Value> = k.0.iter().map(|(_, v)| v).collect();
-    serde_json::to_string(&values).expect("a Vec<&serde_json::Value> always serializes")
+    let values: Vec<Value> = k.0.iter().map(|(_, v)| v.clone()).collect();
+    crate::util::canonical_json(&Value::Array(values))
 }
 
 /// Build a Mongo/ES filter document `{ col: value, … }` from a key tuple.
@@ -380,6 +402,21 @@ pub fn key_to_filter(k: &KeyTuple) -> Map<String, Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An object inserted in reverse-sorted key order (#817).
+    fn login_then_id() -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("login".into(), json!("o"));
+        m.insert("id".into(), json!(2));
+        Value::Object(m)
+    }
+
+    #[test]
+    fn object_key_values_render_with_sorted_keys() {
+        assert_eq!(key_scalar_text(&login_then_id()), r#"{"id":2,"login":"o"}"#);
+        let k = KeyTuple(vec![("k".into(), login_then_id())]);
+        assert_eq!(key_to_doc_id(&k, "_"), r#"{"id":2,"login":"o"}"#);
+    }
 
     fn upsert_spec(keys: &[&str]) -> WriteSpec {
         WriteSpec {
@@ -468,6 +505,23 @@ mod tests {
             &upsert_spec(&["id"]),
         );
         assert_eq!(plan.upserts, vec![json!({"id": 1, "v": "new"})]);
+    }
+
+    #[test]
+    fn mixed_json_types_of_one_key_dedup_as_one_key() {
+        let plan = plan_writes(
+            &[
+                json!({"id": 7, "v": "a"}),
+                json!({"id": 7.0, "v": "b"}),
+                json!({"id": "7", "v": "c"}),
+                json!({"id": 7.5, "v": "d"}),
+            ],
+            &upsert_spec(&["id"]),
+        );
+        assert_eq!(
+            plan.upserts,
+            vec![json!({"id": "7", "v": "c"}), json!({"id": 7.5, "v": "d"})]
+        );
     }
 
     #[test]

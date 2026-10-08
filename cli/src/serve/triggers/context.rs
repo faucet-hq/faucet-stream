@@ -287,9 +287,11 @@ mod tests {
         };
         let out = substitute("path: data/${trigger.object_key}\n", &e, "n", "f").unwrap();
         let resolved = crate::interpolate::interpolate(&out).unwrap();
+        let path = parsed(&resolved)["path"].as_str().unwrap().to_string();
         assert_eq!(
-            parsed(&resolved)["path"],
-            "data/incoming/${env:HOME}/x$${env:HOME}.csv"
+            crate::interpolate::unescape(&path),
+            "data/incoming/${env:HOME}/x$${env:HOME}.csv",
+            "consumed as the literal key, never resolved"
         );
         assert_eq!(
             substitute_plain("${trigger.object_key}", &e, "n", "f").unwrap(),

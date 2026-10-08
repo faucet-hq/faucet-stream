@@ -45,6 +45,9 @@ pub struct StateMigrationReport {
     pub pipeline: String,
     pub check: bool,
     pub keys: Vec<StateKeyMigration>,
+    /// Runs found holding a lease that `--force` overrode.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl StateMigrationReport {
@@ -55,27 +58,71 @@ impl StateMigrationReport {
 }
 
 /// Plan (and unless `check`, apply) the migration of every row's bookmark keys.
+/// Refuses while a run holds a selected row's lease.
 pub async fn migrate_state(
     target: &crate::pipeline_state::PipelineTarget,
     stores: &crate::pipeline_state::ops::Stores,
     row: Option<&str>,
     check: bool,
 ) -> CliResult<StateMigrationReport> {
+    migrate_state_with(target, stores, row, check, false).await
+}
+
+/// [`migrate_state`], with `force` overriding a live run's lease. Each key is
+/// re-read immediately before it is rewritten, so a bookmark a run persisted
+/// after the listing is migrated rather than overwritten with the older value.
+pub async fn migrate_state_with(
+    target: &crate::pipeline_state::PipelineTarget,
+    stores: &crate::pipeline_state::ops::Stores,
+    row: Option<&str>,
+    check: bool,
+    force: bool,
+) -> CliResult<StateMigrationReport> {
     use crate::pipeline_state::keys::KeyKind;
     use faucet_core::state_version::{StoredState, resolve_with};
     let rows = target.select(row)?;
     let entries = crate::pipeline_state::ops::collect_keys(target, stores).await?;
     let mut keys = Vec::new();
+    let mut warnings = Vec::new();
     for r in rows {
         let codec = crate::pipeline_state::ops::row_codec(r);
         let kind = r.source.as_ref().map(|(k, _)| k.clone());
-        for e in entries.iter().filter(|e| {
-            e.key.kind == KeyKind::Bookmark && e.key.row.as_deref() == Some(r.id.as_str())
-        }) {
-            let stored = StoredState::parse(&e.value);
+        let selected: Vec<&crate::pipeline_state::ops::KeyEntry> = entries
+            .iter()
+            .filter(|e| {
+                e.key.kind == KeyKind::Bookmark && e.key.row.as_deref() == Some(r.id.as_str())
+            })
+            .collect();
+        if !check && let Some(store) = stores.for_row(&r.id) {
+            let mut bases = vec![target.base_key(&r.id)];
+            bases.extend(selected.iter().filter_map(|e| e.key.base(&target.pipeline)));
+            bases.dedup();
+            warnings.extend(
+                crate::pipeline_state::ops::refuse_if_running(
+                    store.as_ref(),
+                    target,
+                    &bases,
+                    crate::pipeline_state::ops::LeaseScope::Bases,
+                    force,
+                    chrono::Utc::now(),
+                )
+                .await?,
+            );
+        }
+        for e in selected {
+            let current = if check {
+                Some(e.value.clone())
+            } else {
+                match stores.for_key(&e.key) {
+                    Some(store) => store.get(&e.key.key).await?,
+                    None => Some(e.value.clone()),
+                }
+            };
+            let Some(value) = current else { continue };
+            let stored = StoredState::parse(&value);
             let resolved = resolve_with(
                 &e.key.key,
-                &e.value,
+                &value,
                 &codec.owner,
                 codec.schema,
                 |from, data| match &kind {
@@ -110,6 +157,7 @@ pub async fn migrate_state(
         pipeline: target.pipeline.clone(),
         check,
         keys,
+        warnings,
     })
 }
 
@@ -152,13 +200,23 @@ pub fn render_state_report(r: &StateMigrationReport) -> String {
 async fn run_state(args: &MigrateArgs) -> CliResult<()> {
     let load = crate::cli::StateLoadArgs {
         json: args.json,
-        env_file: None,
-        no_env_file: false,
-        profile: None,
+        env_file: args.env_file.clone(),
+        no_env_file: args.no_env_file,
+        profile: args.profile.clone(),
     };
     let (_, target, _) = crate::commands::state::load(args.config.as_deref(), &load).await?;
     let stores = crate::pipeline_state::ops::Stores::build(&target, None).await?;
-    let report = migrate_state(&target, &stores, args.row.as_deref(), args.check).await?;
+    let report = migrate_state_with(
+        &target,
+        &stores,
+        args.row.as_deref(),
+        args.check,
+        args.force,
+    )
+    .await?;
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
     if args.json {
         println!(
             "{}",
@@ -575,6 +633,10 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             state: false,
             row: None,
             json: false,
+            force: false,
+            env_file: None,
+            no_env_file: false,
+            profile: None,
         })
         .await
         .unwrap();
@@ -590,6 +652,10 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             state: false,
             row: None,
             json: false,
+            force: false,
+            env_file: None,
+            no_env_file: false,
+            profile: None,
         })
         .await
         .unwrap();
@@ -606,6 +672,10 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             state: false,
             row: None,
             json: false,
+            force: false,
+            env_file: None,
+            no_env_file: false,
+            profile: None,
         })
         .await;
         assert!(err.is_err(), "--check must fail on a legacy config");
@@ -619,6 +689,10 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             state: false,
             row: None,
             json: false,
+            force: false,
+            env_file: None,
+            no_env_file: false,
+            profile: None,
         })
         .await
         .expect("--check passes on a current config");
@@ -635,6 +709,10 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             state: false,
             row: None,
             json: false,
+            force: false,
+            env_file: None,
+            no_env_file: false,
+            profile: None,
         })
         .await
         .unwrap();

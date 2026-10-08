@@ -208,7 +208,7 @@ pub use layer::OtelErrorCountLayer;
 #[cfg(feature = "otel")]
 mod sdk {
     use super::{OtelConfig, OtelProtocol};
-    use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+    use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
     use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
@@ -227,6 +227,22 @@ mod sdk {
         cfg.headers.clone()
     }
 
+    /// The configured headers as gRPC metadata, for the tonic exporters.
+    pub(super) fn header_metadata(
+        cfg: &OtelConfig,
+    ) -> Result<opentelemetry_otlp::tonic_types::metadata::MetadataMap, OtelError> {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut headers = HeaderMap::new();
+        for (k, v) in &cfg.headers {
+            let name = HeaderName::from_bytes(k.to_ascii_lowercase().as_bytes())
+                .map_err(|e| format!("otel.headers: invalid header name '{k}': {e}"))?;
+            let value = HeaderValue::from_str(v)
+                .map_err(|e| format!("otel.headers: invalid value for header '{k}': {e}"))?;
+            headers.insert(name, value);
+        }
+        Ok(opentelemetry_otlp::tonic_types::metadata::MetadataMap::from_headers(headers))
+    }
+
     /// Build a batch-exporting tracer provider. NOTE: with grpc-tonic this MUST
     /// be called inside a tokio runtime (the CLI is `#[tokio::main]`).
     pub fn build_trace_provider(cfg: &OtelConfig) -> Result<SdkTracerProvider, OtelError> {
@@ -236,6 +252,7 @@ mod sdk {
             OtelProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(&endpoint)
+                .with_metadata(header_metadata(cfg)?)
                 .with_timeout(timeout)
                 .build()?,
             OtelProtocol::Http => opentelemetry_otlp::SpanExporter::builder()
@@ -264,6 +281,7 @@ mod sdk {
             OtelProtocol::Grpc => opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()
                 .with_endpoint(&endpoint)
+                .with_metadata(header_metadata(cfg)?)
                 .with_timeout(timeout)
                 .build()?,
             OtelProtocol::Http => opentelemetry_otlp::MetricExporter::builder()
@@ -296,8 +314,23 @@ mod sdk {
         GUARD.set(guard).is_ok()
     }
 
+    static EXTRA_METER: OnceLock<SdkMeterProvider> = OnceLock::new();
+
+    /// Keep a meter provider a host installed outside
+    /// [`install_observability`](crate::install_observability) alive for the
+    /// process, so [`shutdown_otel`] flushes it. A second one is shut down.
+    pub(crate) fn keep_meter_provider(mp: SdkMeterProvider) {
+        if let Err(mp) = EXTRA_METER.set(mp) {
+            let _ = mp.shutdown();
+        }
+    }
+
     /// Flush + shut down installed providers. Idempotent.
     pub fn shutdown_otel() {
+        if let Some(m) = EXTRA_METER.get() {
+            let _ = m.force_flush();
+            let _ = m.shutdown();
+        }
         if let Some(g) = GUARD.get() {
             if let Some(t) = g.tracer.as_ref() {
                 let _ = t.force_flush();
@@ -310,6 +343,39 @@ mod sdk {
         }
     }
 
+    /// The OTLP trace layer [`install_observability`](crate::install_observability)
+    /// builds, typed for the bottom of a [`tracing_subscriber::Registry`] stack.
+    pub type TraceLayer =
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
+    type TraceSlot = Box<dyn Fn(TraceLayer) -> Result<(), TraceLayer> + Send + Sync>;
+    static TRACE_SLOT: OnceLock<TraceSlot> = OnceLock::new();
+
+    /// Register where the OTLP trace layer goes when the host installed its own
+    /// global subscriber first (the CLI does, before any config is loaded): a
+    /// `tracing_subscriber::reload` slot at the bottom of that subscriber. The
+    /// closure returns the layer back when it cannot take it. Returns `false`
+    /// when a slot was already registered.
+    pub fn register_trace_layer_slot(
+        slot: impl Fn(TraceLayer) -> Result<(), TraceLayer> + Send + Sync + 'static,
+    ) -> bool {
+        TRACE_SLOT.set(Box::new(slot)).is_ok()
+    }
+
+    /// Hand `layer` to the registered slot; gives it back when there is none
+    /// or the slot refused it.
+    pub(crate) fn fill_trace_slot(layer: TraceLayer) -> Result<(), TraceLayer> {
+        match TRACE_SLOT.get() {
+            Some(slot) => slot(layer),
+            None => Err(layer),
+        }
+    }
+
+    /// Whether a trace provider is already installed for this process.
+    pub(crate) fn tracer_installed() -> bool {
+        GUARD.get().is_some_and(|g| g.tracer.is_some())
+    }
+
     /// Install the W3C trace-context propagator globally (#230 groundwork).
     pub fn install_propagator() {
         use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -319,9 +385,11 @@ mod sdk {
 
 #[cfg(feature = "otel")]
 pub use sdk::{
-    OtelError, OtelGuard, build_meter_provider, build_trace_provider, install_propagator,
-    set_guard, shutdown_otel,
+    OtelError, OtelGuard, TraceLayer, build_meter_provider, build_trace_provider,
+    install_propagator, register_trace_layer_slot, set_guard, shutdown_otel,
 };
+#[cfg(feature = "otel")]
+pub(crate) use sdk::{fill_trace_slot, keep_meter_provider, tracer_installed};
 
 /// No-op `shutdown_otel` when the `otel` feature is disabled, so CLI call sites
 /// compile in every build.
@@ -331,6 +399,23 @@ pub fn shutdown_otel() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn grpc_exports_carry_the_configured_headers() {
+        let mut cfg: OtelConfig = serde_json::from_value(serde_json::json!({
+            "headers": {"Authorization": "Bearer t0k", "x-tenant": "acme"}
+        }))
+        .unwrap();
+        let md = sdk::header_metadata(&cfg).unwrap();
+        assert_eq!(md.get("authorization").unwrap(), "Bearer t0k");
+        assert_eq!(md.get("x-tenant").unwrap(), "acme");
+        cfg.headers.insert("bad header".into(), "v".into());
+        assert!(sdk::header_metadata(&cfg).is_err());
+        cfg.headers.clear();
+        cfg.headers.insert("ok".into(), "line\nbreak".into());
+        assert!(sdk::header_metadata(&cfg).is_err());
+    }
 
     #[cfg(feature = "otel")]
     #[test]

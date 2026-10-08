@@ -69,7 +69,7 @@ pub async fn run(args: ExplainArgs) -> CliResult<()> {
     // never touches the network. `${env:…}` is resolved at load time, so the
     // narration only ever surfaces the safe allowlist below, never raw config.
     let cfg = PipelineConfig::from_path_tolerating_secrets(&path, args.profile.as_deref())?;
-    let nodes = expand(&cfg)?;
+    let nodes = expand(&crate::partition::offline(&cfg))?;
     let report = build_report(&cfg, &nodes);
 
     if args.json {
@@ -127,7 +127,10 @@ pub(crate) fn build_report(cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> Expl
         pipeline: cfg.name.clone().unwrap_or_else(|| "(unnamed)".to_string()),
         rows_total: nodes.len(),
         roots,
-        children: nodes.len() - roots,
+        children: nodes
+            .iter()
+            .filter(|n| matches!(n.role, NodeRole::Child { .. }))
+            .count(),
         incremental_rows,
         replication: cfg
             .replication
@@ -316,6 +319,31 @@ mod tests {
         let cfg = parse_with_extension(yaml, "yaml").unwrap();
         let nodes = expand(&cfg).unwrap();
         build_report(&cfg, &nodes)
+    }
+
+    /// Discovery and product rows are not counted as children (#789 CLI-162).
+    #[test]
+    fn discovery_rows_are_not_children() {
+        let e = explain_yaml(
+            r#"version: 1
+name: d
+pipeline:
+  sources:
+    api: { type: rest, config: { base_url: "https://x", path: "/" } }
+  sink: { type: jsonl, config: { path: "./${subs.id}.jsonl" } }
+matrix:
+  - id: subs
+    discover:
+      source: { ref: api, config: { path: "/subs" } }
+      select: "$.id"
+      as: id
+  - id: report
+    for_each: [subs]
+    source: { ref: api, config: { path: "/report" } }
+"#,
+        );
+        assert_eq!(e.children, 0, "{e:?}");
+        assert_eq!(e.rows_total, 2);
     }
 
     #[test]

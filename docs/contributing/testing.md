@@ -35,6 +35,13 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
   `cargo publish` need the other crate on crates.io first. CI enforces this
   with `scripts/connector-deps.py`.
 
+Every CI job builds against the committed `Cargo.lock`, which `cargo install
+faucet-cli` and docs.rs ignore. `.github/workflows/fresh-resolve.yml` runs daily
+(and on demand): it deletes the lockfile, resolves from scratch, runs
+`cargo check --workspace --all-features`, and on failure opens or updates a
+"Fresh dependency resolve is broken" issue, so a broken upstream release is
+caught before users hit it.
+
 There is a third kind that is neither: the **engine guarantee suites** in
 `crates/conformance/tests/reliability_*.rs`. A guarantee like "the bookmark is
 persisted only after the sink confirms" is a property of the *order* in which

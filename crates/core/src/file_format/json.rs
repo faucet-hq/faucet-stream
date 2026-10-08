@@ -24,6 +24,8 @@ pub fn decode_lines(bytes: &[u8]) -> Result<Vec<Value>, FaucetError> {
         }
         let v = serde_json::from_str(line)
             .map_err(|e| FaucetError::Source(format!("json_lines: line {}: {e}", i + 1)))?;
+        check_numbers_exact(line.as_bytes())
+            .map_err(|e| FaucetError::Source(format!("json_lines: line {}: {e}", i + 1)))?;
         out.push(v);
     }
     Ok(out)
@@ -33,10 +35,94 @@ pub fn decode_lines(bytes: &[u8]) -> Result<Vec<Value>, FaucetError> {
 pub fn decode_array(bytes: &[u8]) -> Result<Vec<Value>, FaucetError> {
     let v: Value = serde_json::from_slice(bytes)
         .map_err(|e| FaucetError::Source(format!("json_array: {e}")))?;
+    check_numbers_exact(bytes).map_err(|e| FaucetError::Source(format!("json_array: {e}")))?;
     Ok(match v {
         Value::Array(a) => a,
         other => vec![other],
     })
+}
+
+/// Refuse a number literal the parsed value cannot hold exactly (CORE-69).
+///
+/// Without serde_json's `arbitrary_precision`, an integer beyond `u64` or a
+/// decimal with more than ~17 significant digits is stored as the nearest
+/// `f64`, silently changing an id or an amount. Each literal is compared, as a
+/// decimal value, with what parsing it yields; a literal of at most 15
+/// significant digits always survives and is skipped cheaply. Runs only on
+/// input that already parsed, so it never has to report a syntax error.
+fn check_numbers_exact(bytes: &[u8]) -> Result<(), String> {
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                b'\\' => i += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if b == b'-' || b.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len()
+                && matches!(bytes[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+            {
+                i += 1;
+            }
+            let token = std::str::from_utf8(&bytes[start..i]).unwrap_or_default();
+            if token.bytes().filter(u8::is_ascii_digit).count() > 15 {
+                check_literal(token)?;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn check_literal(token: &str) -> Result<(), String> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Number>(token) else {
+        return Ok(());
+    };
+    let back = parsed.to_string();
+    if canonical_decimal(token) == canonical_decimal(&back) {
+        Ok(())
+    } else {
+        Err(format!(
+            "number {token} cannot be represented exactly (it would be read as {back}); \
+             quote it as a string in the source data to keep every digit"
+        ))
+    }
+}
+
+/// `(negative, significant digits, decimal-point position)` with leading and
+/// trailing zeros stripped, so `1.50`, `15e-1` and `0.15e1` compare equal.
+fn canonical_decimal(s: &str) -> Option<(bool, String, i64)> {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (mantissa, exp) = match body.find(['e', 'E']) {
+        Some(k) => (&body[..k], body[k + 1..].parse::<i64>().ok()?),
+        None => (body, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits: String = format!("{int}{frac}");
+    let mut point = (int.len() as i64).checked_add(exp)?;
+    let trimmed = digits.trim_start_matches('0');
+    point -= (digits.len() - trimmed.len()) as i64;
+    let trimmed = trimmed.trim_end_matches('0');
+    if trimmed.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    Some((neg, trimmed.to_string(), point))
 }
 
 /// The whole body as one record.
@@ -88,6 +174,34 @@ fn as_utf8<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str, FaucetError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn numbers_that_would_round_are_refused() {
+        // Exact: big u64, i64::MIN, short decimals, strings that look like numbers.
+        let ok = br#"[{"a": 18446744073709551615, "b": -9223372036854775808, "c": 0.1,
+            "d": 1.50, "e": "123456789012345678901234567890", "f": 1.0000000000000000e-5,
+            "g": 0.0000000000000000}]"#;
+        assert_eq!(decode_array(ok).unwrap().len(), 1);
+        let err = decode_array(br#"[{"id": 18446744073709551616}]"#).unwrap_err();
+        assert!(err.to_string().contains("18446744073709551616"), "{err}");
+        let err = decode_lines(b"{\"x\":\"\\\"\"}\n{\"amt\": 0.12345678901234567890}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("line 2") && err.contains("0.12345678901234567890"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn canonical_decimal_normalizes_spellings() {
+        assert_eq!(canonical_decimal("1.50"), canonical_decimal("15e-1"));
+        assert_eq!(canonical_decimal("0.15e1"), canonical_decimal("1.5"));
+        assert_eq!(canonical_decimal("-0.0"), canonical_decimal("0"));
+        assert_ne!(canonical_decimal("-1"), canonical_decimal("1"));
+        assert_eq!(canonical_decimal("1e99999999999999999999"), None);
+        assert!(check_literal("1e99999").is_ok());
+    }
 
     #[test]
     fn json_lines_round_trips_and_tolerates_blank_lines() {

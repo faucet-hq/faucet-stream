@@ -262,7 +262,7 @@ fn out_of_fuel_message(remaining: Option<u64>, limit: u64) -> Option<String> {
         Some(0) => Some(format!(
             "wasm transform: module signalled an error with no fuel left (budget {limit} units) — \
              its error message could not be read back, because doing so calls into the module. \
-             Raise `fuel_per_record` or simplify the module"
+             Raise `fuel_limit` or simplify the module"
         )),
         _ => None,
     }
@@ -277,6 +277,10 @@ mod fuel_message_tests {
         let msg = out_of_fuel_message(Some(0), 10_000).expect("a message");
         assert!(msg.contains("fuel"), "{msg}");
         assert!(msg.contains("10000"), "names the budget: {msg}");
+        assert!(
+            msg.contains("`fuel_limit`"),
+            "names the real config key: {msg}"
+        );
 
         // Fuel left, or unmetered → let the normal error-export read proceed.
         assert!(out_of_fuel_message(Some(1), 10_000).is_none());

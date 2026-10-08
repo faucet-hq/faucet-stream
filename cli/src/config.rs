@@ -350,7 +350,7 @@ pub struct PipelineSpec {
 /// list. `tee` carries `channel_capacity` + optional `fanout`. `merge` has no
 /// extra fields. `join` carries the hash-join configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum NodeSpec {
     /// A data source (0 in, 1 out).
     Source {
@@ -392,7 +392,8 @@ pub enum NodeSpec {
         fanout: Option<usize>,
     },
     /// Fan-in: forward pages from all inputs in arrival order (N in, 1 out).
-    Merge,
+    /// A struct variant so an unknown key on it is refused like on the others.
+    Merge {},
     /// Hash-join two upstreams by key (2 in, 1 out).
     Join(JoinSpec),
 }
@@ -586,10 +587,9 @@ pub struct PartialConnector {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransformSpec {
-    /// Built-in transform identifier. One of: `flatten`, `rename_keys`,
-    /// `snake_case`, `select`, `drop`, `set`, `rename_field`, `cast`, `redact`,
-    /// `value_case`. See the docs-site cookbook page on transforms for
-    /// per-transform config schemas.
+    /// Transform identifier, e.g. `flatten`, `select`, `rename_field`, `cast`,
+    /// `filter`, `explode`, `sql`. `faucet list` prints every transform this
+    /// build supports and `faucet schema transform <name>` its config schema.
     #[serde(rename = "type")]
     pub kind: String,
 
@@ -1522,6 +1522,7 @@ impl PipelineConfig {
         if let Some(raw) = &raw {
             crate::vocabulary::warn_deprecated(raw);
         }
+        // Typed parse first: its errors carry the document's line numbers.
         let cfg: PipelineConfig = match ext.as_deref() {
             Some("yaml" | "yml") => {
                 serde_yaml::from_str(text).map_err(|e| CliError::ParseConfig {
@@ -1539,6 +1540,16 @@ impl PipelineConfig {
                 });
             }
         };
+        let cfg = match raw {
+            Some(mut doc) if text.contains("$${") => {
+                crate::interpolate::unescape_document(&mut doc);
+                serde_json::from_value(doc).map_err(|e| CliError::ParseConfig {
+                    path: path.to_path_buf(),
+                    message: friendly_parse_error(&e.to_string()),
+                })?
+            }
+            _ => cfg,
+        };
         Self::finish(cfg, path)
     }
 
@@ -1549,15 +1560,24 @@ impl PipelineConfig {
     /// **Note:** load-time `${env:VAR}` / `${file:PATH}` / `${secret:VAR}` directives
     /// are **not** resolved here — the caller must pre-resolve them (e.g. by running
     /// `interpolate` on the source text) before building the `Value`.
-    pub fn from_value(value: serde_json::Value) -> CliResult<Self> {
+    pub fn from_value(mut value: serde_json::Value) -> CliResult<Self> {
         let synthetic = Path::new("<submitted>");
         crate::vocabulary::warn_deprecated(&value);
+        crate::interpolate::unescape_document(&mut value);
         let cfg: PipelineConfig =
             serde_json::from_value(value).map_err(|e| CliError::ParseConfig {
                 path: synthetic.to_path_buf(),
                 message: friendly_parse_error(&e.to_string()),
             })?;
         Self::finish(cfg, synthetic)
+    }
+
+    /// The load tail for a config built in memory (`--from-env`): the same
+    /// post-parse pass a file load runs, then the secrets-manager directives.
+    pub(crate) async fn finish_built(cfg: PipelineConfig, origin: &Path) -> CliResult<Self> {
+        let mut cfg = Self::finish(cfg, origin)?;
+        crate::secrets::resolve_secrets(&mut cfg).await?;
+        Ok(cfg)
     }
 
     /// Shared post-parse tail: version gate + structural `${...}` ref resolution.

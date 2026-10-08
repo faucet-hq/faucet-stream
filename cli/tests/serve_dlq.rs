@@ -60,6 +60,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf) -> faucet_cli::cli::Se
         triggers: None,
         templates_sync: None,
         policy: None,
+        otel_config: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
@@ -191,7 +192,12 @@ async fn dlq_endpoints_inspect_replay_discard_with_rbac() {
     assert_eq!(discard.status(), 200, "admin must be allowed dlq discard");
     let dout: Value = discard.json().await.unwrap();
     assert_eq!(dout["discarded"], 2);
-    // The source file now holds no envelopes.
-    let remaining = std::fs::read_to_string(&dlq).unwrap();
-    assert!(remaining.trim().is_empty());
+    // The source file is left as written (a live pipeline may append to it,
+    // #789 CLI-48); its discard sidecar hides every envelope from readers.
+    let scan = faucet_cli::dlq_replay::reader::scan_files(
+        std::slice::from_ref(&dlq),
+        &faucet_cli::dlq_replay::reader::DlqDecryptor::default(),
+    )
+    .unwrap();
+    assert!(scan.envelopes.is_empty());
 }

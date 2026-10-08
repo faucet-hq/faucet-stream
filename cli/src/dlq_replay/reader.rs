@@ -47,6 +47,10 @@ enum LineDecode {
     /// Sealed and successfully decrypted — classify the plaintext.
     #[cfg(feature = "encryption")]
     Decrypted(String),
+    /// The header or trailer line of a file sealed with whole-file
+    /// integrity — not a record.
+    #[cfg(feature = "encryption")]
+    Marker,
     /// Sealed but no key / wrong key / tampered — counted, never fatal.
     Undecryptable,
 }
@@ -144,11 +148,12 @@ impl DlqDecryptor {
             if !faucet_core::encryption::is_encrypted(&sealed) {
                 return LineDecode::Plain;
             }
-            return match enc.decrypt(&sealed) {
-                Ok(plain) => match String::from_utf8(plain) {
+            return match enc.open_line(&sealed) {
+                Ok(faucet_core::SealedLine::Data(plain)) => match String::from_utf8(plain) {
                     Ok(text) => LineDecode::Decrypted(text),
                     Err(_) => LineDecode::Undecryptable,
                 },
+                Ok(_) => LineDecode::Marker,
                 Err(_) => LineDecode::Undecryptable,
             };
         }
@@ -228,6 +233,8 @@ pub fn classify_line_with(line: &str, dec: &DlqDecryptor) -> LineOutcome {
         LineDecode::Plain => classify_text(line),
         #[cfg(feature = "encryption")]
         LineDecode::Decrypted(plain) => classify_text(&plain),
+        #[cfg(feature = "encryption")]
+        LineDecode::Marker => LineOutcome::Blank,
         LineDecode::Undecryptable => LineOutcome::Undecryptable,
     }
 }
@@ -252,14 +259,56 @@ pub struct ScanResult {
 /// into (`dlq.jsonl` → `dlq.jsonl.archived`).
 pub const ARCHIVE_SUFFIX: &str = ".archived";
 
+/// Suffix of the sidecar listing the envelopes `faucet dlq discard` removed
+/// from a DLQ file (`dlq.jsonl` → `dlq.jsonl.discarded`). The live file is
+/// never rewritten — a pipeline may be appending to it — so readers skip
+/// the lines it names instead.
+pub const DISCARD_SUFFIX: &str = ".discarded";
+
 /// Whether `path` is a discard archive — the current `<file>.archived` or the
-/// `<stem>.archived.jsonl` written by older versions. Directory and glob
-/// locations skip them, so a replay never re-reads discarded envelopes; an
-/// archive named explicitly as the location is still read.
+/// `<stem>.archived.jsonl` written by older versions — or a discard sidecar.
+/// Directory and glob locations skip them, so a replay never re-reads
+/// discarded envelopes; an archive named explicitly as the location is still
+/// read.
 pub fn is_archive(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(ARCHIVE_SUFFIX) || n.ends_with(".archived.jsonl"))
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n.ends_with(ARCHIVE_SUFFIX) || n.ends_with(".archived.jsonl") || n.ends_with(DISCARD_SUFFIX)
+    })
+}
+
+/// The discard sidecar of a DLQ file.
+pub fn discard_sidecar(file: &Path) -> PathBuf {
+    let name = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dlq.jsonl");
+    file.with_file_name(format!("{name}{DISCARD_SUFFIX}"))
+}
+
+/// A line's identity in a discard sidecar: its length and a 64-bit FNV-1a
+/// hash of its text.
+pub fn line_id(line: &str) -> String {
+    let h = line.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{}:{h:016x}", line.len())
+}
+
+/// The ids of the lines discarded from `file` (empty when none were).
+pub fn discarded_lines(file: &Path) -> Result<std::collections::HashSet<String>, FaucetError> {
+    match std::fs::read_to_string(discard_sidecar(file)) {
+        Ok(text) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(FaucetError::Source(format!(
+            "reading DLQ discard list for '{}': {e}",
+            file.display()
+        ))),
+    }
 }
 
 /// Expand a DLQ location into the concrete local files to read.
@@ -318,7 +367,11 @@ pub fn scan_files(files: &[PathBuf], dec: &DlqDecryptor) -> Result<ScanResult, F
             FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
         })?;
         out.files_read += 1;
+        let discarded = discarded_lines(file)?;
         for line in text.lines() {
+            if !discarded.is_empty() && discarded.contains(&line_id(line)) {
+                continue;
+            }
             match classify_line_with(line, dec) {
                 LineOutcome::Blank => {}
                 LineOutcome::Malformed => out.malformed += 1,
@@ -649,6 +702,35 @@ mod tests {
                 classify_line_with("RkNU-not-really-sealed!!!", &dec),
                 LineOutcome::Malformed
             );
+        }
+
+        #[test]
+        fn bound_lines_classify_and_header_and_trailer_lines_are_blank() {
+            use faucet_core::encryption::{
+                SEALED_LINE_CONTEXT, SEALED_LINES_HEADER_CONTEXT, SEALED_LINES_TRAILER_CONTEXT,
+            };
+            let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+                key: "k".into(),
+                previous_keys: vec![],
+                algorithm: Default::default(),
+            })
+            .unwrap();
+            let b64 = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+            let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+            let record = envelope_line("quality", serde_json::json!({"id": 1}));
+            assert!(matches!(
+                classify_line_with(
+                    &b64(enc.encrypt_bound(record.as_bytes(), SEALED_LINE_CONTEXT)),
+                    &dec
+                ),
+                LineOutcome::Envelope(_)
+            ));
+            for ctx in [SEALED_LINES_HEADER_CONTEXT, SEALED_LINES_TRAILER_CONTEXT] {
+                assert_eq!(
+                    classify_line_with(&b64(enc.encrypt_bound(b"{}", ctx)), &dec),
+                    LineOutcome::Blank
+                );
+            }
         }
 
         #[test]

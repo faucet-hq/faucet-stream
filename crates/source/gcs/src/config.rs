@@ -95,6 +95,13 @@ pub struct GcsSourceConfig {
     pub bucket: String,
     /// Object name prefix filter. Ignored when `object_keys` is set.
     pub prefix: Option<String>,
+    /// Glob over the whole object key selecting which listed objects to read
+    /// (e.g. `exports/*.parquet`). Without it, folder markers and objects
+    /// with a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,
+    /// `_temporary/`, `.crc`) are skipped; with it, exactly the matching keys
+    /// are read.
+    #[serde(default)]
+    pub include: Option<String>,
     /// Explicit object names. When set, listing is skipped and `prefix`
     /// is ignored.
     pub object_keys: Option<Vec<String>>,
@@ -133,6 +140,12 @@ pub struct GcsSourceConfig {
     /// debug log notes it); the length check still applies.
     #[serde(default)]
     pub verify_checksum: bool,
+    /// Largest object, once decompressed, that a format read whole (JSON
+    /// array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may
+    /// reach; a larger one fails with an error instead of exhausting memory.
+    /// Default 2 GiB.
+    #[serde(default = "default_max_object_bytes")]
+    pub max_object_bytes: u64,
     /// Optional storage-host override (e.g. `http://localhost:4443` for
     /// fake-gcs-server). Production users should leave this unset.
     pub storage_host: Option<String>,
@@ -173,6 +186,10 @@ fn default_true() -> bool {
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
 }
+fn default_max_object_bytes() -> u64 {
+    faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
+}
+
 fn default_concurrency() -> usize {
     10
 }
@@ -183,6 +200,7 @@ impl GcsSourceConfig {
         Self {
             bucket: bucket.into(),
             prefix: None,
+            include: None,
             object_keys: None,
             auth: GcsCredentials::default(),
             file_format: GcsFileFormat::default(),
@@ -191,6 +209,7 @@ impl GcsSourceConfig {
             batch_size: default_batch_size(),
             verify_length: true,
             verify_checksum: false,
+            max_object_bytes: default_max_object_bytes(),
             storage_host: None,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),

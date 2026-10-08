@@ -41,14 +41,23 @@ pub fn config_schema() -> Value {
 
     // Accumulate namespaced connector-config `$defs` here, then merge once.
     let mut extra_defs: Map<String, Value> = Map::new();
+    let spec_props = connector_spec_properties(root_obj);
     let source_union = connector_union(
         "source",
         &source_kinds(),
         source_schema,
         true,
+        &spec_props,
         &mut extra_defs,
     );
-    let sink_union = connector_union("sink", &sink_kinds(), sink_schema, false, &mut extra_defs);
+    let sink_union = connector_union(
+        "sink",
+        &sink_kinds(),
+        sink_schema,
+        false,
+        &spec_props,
+        &mut extra_defs,
+    );
 
     let defs_key = if root_obj.contains_key("definitions") && !root_obj.contains_key("$defs") {
         "definitions"
@@ -117,6 +126,21 @@ fn retarget_property(
     props.insert(key.to_string(), new);
 }
 
+/// The connector-level keys `ConnectorSpec` accepts besides `type` / `config`
+/// (`transforms`, `status`, `tags`, `complete_for`, `attributes`, …), taken
+/// from its derived schema so a new key reaches every connector variant.
+fn connector_spec_properties(root: &Map<String, Value>) -> Map<String, Value> {
+    let mut props = ["$defs", "definitions"]
+        .iter()
+        .find_map(|k| root.get(*k)?.get("ConnectorSpec")?.get("properties"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    props.remove("type");
+    props.remove("config");
+    props
+}
+
 /// Build a `oneOf` connector schema discriminated by `type`, embedding each
 /// kind's (relaxed) config schema. `source_side` connectors additionally allow
 /// `transforms` / `inherit_transforms` at the connector level.
@@ -125,6 +149,7 @@ fn connector_union(
     kinds: &[&str],
     schema_fn: fn(&str) -> crate::error::CliResult<Value>,
     source_side: bool,
+    spec_props: &Map<String, Value>,
     extra_defs: &mut Map<String, Value>,
 ) -> Value {
     let mut variants = Vec::new();
@@ -144,16 +169,12 @@ fn connector_union(
         let mut props = Map::new();
         props.insert("type".into(), json!({ "const": kind }));
         props.insert("config".into(), config);
-        if source_side {
-            props.insert("transforms".into(), json!({ "type": ["array", "null"] }));
-            props.insert("inherit_transforms".into(), json!({ "type": "boolean" }));
+        for (key, schema) in spec_props {
+            if !source_side && matches!(key.as_str(), "transforms" | "inherit_transforms") {
+                continue;
+            }
+            props.insert(key.clone(), schema.clone());
         }
-        // Destination attributes a data-flow policy reasons about (#702);
-        // accepted on either side by `ConnectorSpec`, meaningful on sinks.
-        props.insert(
-            "attributes".into(),
-            json!({ "type": "object", "additionalProperties": { "type": "string" } }),
-        );
         variants.push(json!({
             "type": "object",
             "title": kind,
@@ -330,6 +351,44 @@ mod tests {
             .iter()
             .any(|v| v["properties"]["type"]["const"] == json!("jsonl"));
         assert!(has_jsonl, "sink union should have a jsonl branch");
+    }
+
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[test]
+    fn connector_variants_accept_every_connector_spec_key() {
+        let s = config_schema();
+        let defs = s.get("$defs").or_else(|| s.get("definitions")).unwrap();
+        let branch = |union: &str, kind: &str| {
+            defs[union]["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["properties"]["type"]["const"] == json!(kind))
+                .unwrap()["properties"]
+                .clone()
+        };
+        let src = branch("SourceConnector", "csv");
+        for key in ["complete_for", "status", "tags", "attributes", "transforms"] {
+            assert!(src.get(key).is_some(), "source variant lacks `{key}`");
+        }
+        let sink = branch("SinkConnector", "jsonl");
+        for key in ["status", "tags", "attributes"] {
+            assert!(sink.get(key).is_some(), "sink variant lacks `{key}`");
+        }
+        assert!(sink.get("transforms").is_none());
+
+        let doc = json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "csv", "config": { "path": "a.csv" },
+                            "tags": ["x"], "status": "available",
+                            "complete_for": { "scope": { "id": 1 }, "on_missing": "delete" } },
+                "sink": { "type": "jsonl", "config": { "path": "o.jsonl" }, "tags": ["y"] }
+            }
+        });
+        let validator = jsonschema::validator_for(&s).unwrap();
+        let errors: Vec<String> = validator.iter_errors(&doc).map(|e| e.to_string()).collect();
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

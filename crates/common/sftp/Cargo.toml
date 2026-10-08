@@ -16,7 +16,7 @@ schemars.workspace = true
 serde.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "io-util", "net"] }
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "time"] }
 russh.workspace = true
 russh-sftp.workspace = true
 

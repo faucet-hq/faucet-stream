@@ -3,7 +3,10 @@
 //! Shared GCS credential and client construction for faucet source and
 //! sink connectors.
 
+mod checksum;
 mod json_control;
+
+pub use checksum::{crc32c_of_bytes, open_with_crc32c};
 
 use faucet_core::FaucetError;
 use google_cloud_storage::client::{Storage, StorageControl};
@@ -90,6 +93,7 @@ pub async fn build_storage(
     creds: &GcsCredentials,
     storage_host: Option<&str>,
 ) -> Result<Storage, FaucetError> {
+    refuse_credentials_over_plaintext(creds, storage_host)?;
     let credentials = build_credentials(creds).await?;
     let mut builder = Storage::builder().with_credentials(credentials);
     if let Some(host) = storage_host {
@@ -111,6 +115,7 @@ pub async fn build_storage_control(
     creds: &GcsCredentials,
     storage_host: Option<&str>,
 ) -> Result<StorageControl, FaucetError> {
+    refuse_credentials_over_plaintext(creds, storage_host)?;
     if let Some(host) = storage_host.filter(|h| json_control::is_plaintext_endpoint(h)) {
         return Ok(StorageControl::from_stub(
             json_control::JsonApiControl::new(host),
@@ -127,10 +132,44 @@ pub async fn build_storage_control(
         .map_err(|e| FaucetError::Auth(format!("GCS control client build failed: {e}")))
 }
 
+/// A plaintext (`http://`) storage host is an emulator: refuse to send it a
+/// real credential, whose bearer token would cross the network in clear.
+pub fn refuse_credentials_over_plaintext(
+    creds: &GcsCredentials,
+    storage_host: Option<&str>,
+) -> Result<(), FaucetError> {
+    match storage_host {
+        Some(host)
+            if json_control::is_plaintext_endpoint(host)
+                && !matches!(creds, GcsCredentials::Anonymous) =>
+        {
+            Err(FaucetError::Config(format!(
+                "GCS: storage_host '{host}' is plaintext http, which would send the \
+                 credential's bearer token in clear — use `auth: {{ type: anonymous }}` for an \
+                 emulator, or an https:// host"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn real_credentials_are_refused_over_a_plaintext_host() {
+        let adc = GcsCredentials::ApplicationDefault;
+        let host = Some("http://127.0.0.1:4443");
+        assert!(refuse_credentials_over_plaintext(&adc, host).is_err());
+        assert!(refuse_credentials_over_plaintext(&GcsCredentials::Anonymous, host).is_ok());
+        assert!(refuse_credentials_over_plaintext(&adc, Some("https://gcs.example")).is_ok());
+        assert!(refuse_credentials_over_plaintext(&adc, None).is_ok());
+        let err = build_storage(&adc, host).await.err().unwrap();
+        assert!(err.to_string().contains("plaintext"), "{err}");
+        assert!(build_storage_control(&adc, host).await.is_err());
+    }
 
     #[test]
     fn credentials_serde_application_default() {

@@ -62,6 +62,8 @@ pub mod retry;
 pub mod rollback;
 pub mod schema;
 pub mod shard;
+#[cfg(test)]
+mod sink_forwarding;
 pub mod stage;
 pub mod staging;
 pub mod state;
@@ -124,7 +126,7 @@ pub use drift::{
     SchemaDriftSpec, SchemaEvolution, SqlBaseType, adds_null, base_widened, json_schema_base_type,
 };
 #[cfg(feature = "encryption")]
-pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
+pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec, SealedLine};
 pub use error::FaucetError;
 pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{
@@ -160,8 +162,8 @@ pub use observability::otel::{OtelConfig, OtelProtocol, OtelSignal, shutdown_ote
 pub use observability::{
     DurationGuard, InstallError, InstallReport, InstrumentedSink, InstrumentedSource,
     InstrumentedStateStore, Labels, ObservabilityConfig, PrometheusConfig, RunStreamOptions,
-    TracingConfig, install_observability, instrumented_apply_stages, register_build_info,
-    update_bookmark_lag,
+    TracingConfig, build_version, install_observability, instrumented_apply_stages,
+    register_build_info, set_build_version, update_bookmark_lag,
 };
 pub use pipeline::{
     DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, Pipeline, PipelineResult, StreamPage, run_stream,

@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct UsageSpec {
     /// A YAML/JSON file holding a [`PricingSpec`], merged under the inline
-    /// `pricing:` (inline wins). Relative to the working directory.
+    /// `pricing:` (inline wins). Relative to the config file's directory (the
+    /// working directory for a config with no file, such as a submitted one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_file: Option<String>,
     /// Inline pricing overrides. Any field left unset keeps the shipped

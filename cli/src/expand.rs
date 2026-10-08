@@ -379,6 +379,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         if RESERVED_IDS.contains(&id.as_str()) {
             return Err(CliError::ReservedRowId { id });
         }
+        if !is_row_id(&id) {
+            return Err(CliError::Config(format!(
+                "matrix row id '{id}' may only contain letters, digits, `_` and `-` — it is \
+                 part of the row's state key and interpolation tokens"
+            )));
+        }
         if !seen.insert(id.clone()) {
             return Err(CliError::DuplicateRowId { id });
         }
@@ -394,6 +400,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         .chain(capture_names.iter())
         .map(String::as_str)
         .collect();
+    // Graph edges (`parent:`, `depends_on:`, `for_each:`) name rows only, never
+    // a capture name (#789 CLI-141).
+    let row_id_set: HashSet<&str> = ids.iter().map(String::as_str).collect();
 
     // 1b) Discovery-driven matrix (#501): identify `discover:` rows and validate
     // the `discover:` / `for_each:` shapes before the graph checks below, so
@@ -471,7 +480,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                         "matrix row '{id}': `for_each` cannot reference itself"
                     )));
                 }
-                if !id_set.contains(dim.as_str()) {
+                if !row_id_set.contains(dim.as_str()) {
                     return Err(CliError::Config(format!(
                         "matrix row '{id}': `for_each` references unknown row '{dim}'"
                     )));
@@ -495,11 +504,18 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
     for (i, row) in rows.iter().enumerate() {
         let id = ids[i].as_str();
         if let Some(parent) = row.parent.as_deref() {
-            if !id_set.contains(parent) {
+            if !row_id_set.contains(parent) {
                 return Err(CliError::UnknownParent {
                     id: id.to_owned(),
                     parent: parent.to_owned(),
                 });
+            }
+            if discovery_ids.contains(parent) {
+                return Err(CliError::Config(format!(
+                    "matrix row '{id}': `parent: {parent}` names a `fan_out:` row, which publishes \
+                     values rather than records — use `for_each: [{parent}]` to run once per \
+                     discovered value"
+                )));
             }
             if parent == id {
                 return Err(CliError::ParentCycle {
@@ -525,7 +541,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let id = ids[i].as_str();
         let mut deps: Vec<String> = Vec::with_capacity(row.depends_on.len());
         for dep in &row.depends_on {
-            if !id_set.contains(dep.as_str()) {
+            if !row_id_set.contains(dep.as_str()) {
                 return Err(CliError::UnknownDependency {
                     id: id.to_owned(),
                     depends_on: dep.clone(),
@@ -825,6 +841,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let mut deferred = Vec::new();
         collect_deferred(&merged_source.config, &mut deferred);
         collect_deferred(&merged_sink.config, &mut deferred);
+        check_deferred_scope(row_id, &role, &deferred, &row_id_set)?;
 
         // Resolved readiness status (#371): `merged_source.status` already
         // carries the template→row `source.status` scalar merge; default to
@@ -982,57 +999,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             )));
         }
 
-        // SLA gate (load-time, #202): validate the spec once per row and
-        // require a `state:` block when staleness / volume-anomaly checks need
-        // persisted history. `min_rows_per_run` alone is stateless and passes
-        // without one.
-        if let Some(sla) = row.sla.as_ref().or(cfg.sla.as_ref()) {
-            sla.validate()
-                .map_err(|e| CliError::Config(format!("sla: {e}")))?;
-            if sla.needs_state() {
-                match state.as_ref() {
-                    None => {
-                        return Err(CliError::Config(format!(
-                            "row '{row_id}': sla.max_staleness_secs / sla.volume_anomaly \
-                             need persisted run history — add a `state:` block \
-                             (min_rows_per_run alone works without one)"
-                        )));
-                    }
-                    Some(s) if s.kind == "memory" => {
-                        tracing::warn!(
-                            row = %row_id,
-                            "sla: the `memory` state store resets on process exit — \
-                             staleness/volume baselines only persist within a single \
-                             `faucet schedule`/`serve` process; use `file`, `redis`, \
-                             or `postgres` for one-shot runs"
-                        );
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-
-        // Profiling gate (#708): validate the spec once per row and require a
-        // `state:` block — the rolling baseline lives there. A memory store
-        // only baselines within one process.
-        if let Some(pf) = row.profiling.as_ref().or(cfg.profiling.as_ref()) {
-            pf.validate()
-                .map_err(|e| CliError::Config(format!("profiling: {e}")))?;
-            match state.as_ref() {
-                None => {
-                    return Err(CliError::Config(format!(
-                        "row '{row_id}': profiling: needs a `state:` block — the rolling                          baseline of column profiles is kept there"
-                    )));
-                }
-                Some(s) if s.kind == "memory" => {
-                    tracing::warn!(
-                        row = %row_id,
-                        "profiling: the `memory` state store resets on process exit — the                          profile baseline only persists within a single `faucet                          schedule`/`serve` process; use `file`, `redis`, or `postgres`                          for one-shot runs"
-                    );
-                }
-                Some(_) => {}
-            }
-        }
+        check_sla_and_profiling(
+            &format!("row '{row_id}'"),
+            row.sla.as_ref().or(cfg.sla.as_ref()),
+            row.profiling.as_ref().or(cfg.profiling.as_ref()),
+            state.as_ref(),
+        )?;
 
         // postgres-cdc gate (#789 SQL-131): the replication slot only advances
         // from a persisted bookmark, so without state every run replays from
@@ -1178,6 +1150,22 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                      acknowledges each page once it is written into the staging copy, and a \
                      failed or cancelled run discards staging, losing those messages for \
                      good. Use write_mode: append or upsert",
+                    ids[i], merged_source.kind
+                )));
+            }
+            if state.is_some()
+                && merged_sink.config.get("scope").is_none_or(Value::is_null)
+                && crate::registry::source_resumes_from_bookmark(
+                    &merged_source.kind,
+                    &merged_source.config,
+                )
+            {
+                return Err(CliError::Config(format!(
+                    "row '{}': write_mode: overwrite replaces the whole destination, but source \
+                     '{}' resumes from its stored bookmark when `state:` is set, so every run \
+                     after the first would replace the table with only the rows changed since \
+                     the last one. Read the full source (drop the incremental setting or the \
+                     `state:` block) or use write_mode: upsert",
                     ids[i], merged_source.kind
                 )));
             }
@@ -1431,6 +1419,15 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                         quarantines.join("`/`")
                     )));
                 }
+                check_cleanup_completeness(
+                    &ids[i],
+                    &role,
+                    claim,
+                    state.is_some(),
+                    row.partition.is_some()
+                        || (matches!(role, NodeRole::Root) && cfg.partition.is_some()),
+                    &merged_source,
+                )?;
                 Some(claim.scope.clone())
             }
         };
@@ -1587,7 +1584,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
+    for warning in out.iter().filter_map(rewritten_file_warning) {
+        tracing::warn!("{warning}");
+    }
     check_truncating_fan_out(&out)?;
+    if cfg.reconcile.is_some() {
+        check_reconcile_scope(&out)?;
+    }
     if cfg.verify.as_ref().is_some_and(|v| v.after_run) {
         for node in out.iter().filter(|n| matches!(n.role, NodeRole::Root)) {
             crate::destination::check_verify_scope(node, &out)?;
@@ -1649,6 +1652,62 @@ fn apply_cdc_image_policy(
     Ok(())
 }
 
+/// The single top-level `reconcile:` count describes one dataset, and each
+/// root invocation is compared with it on its own (#789 CLI-56): a config with
+/// several root invocations — two rows, or one partitioned row — would fail
+/// every one of them against the whole dataset's count.
+fn check_reconcile_scope(nodes: &[ExpandedNode]) -> CliResult<()> {
+    let roots: Vec<&str> = nodes
+        .iter()
+        .filter(|n| matches!(n.role, NodeRole::Root))
+        .map(|n| n.id.as_str())
+        .collect();
+    if let Some(chunk) = roots.iter().find(|id| id.contains("::partition::")) {
+        let row = chunk.split("::partition::").next().unwrap_or(chunk);
+        return Err(CliError::Config(format!(
+            "row '{row}' is partitioned, but `reconcile:` compares one authoritative count with \
+             each invocation's own row count, so every chunk would fail — remove `partition:` \
+             or `reconcile:`"
+        )));
+    }
+    if roots.len() > 1 {
+        return Err(CliError::Config(format!(
+            "`reconcile:` compares one authoritative count with each root invocation's own row \
+             count, but this config has {} root rows ({}) — reconcile a config with a single \
+             root row",
+            roots.len(),
+            roots.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The fan-out ids whose `${id.…}` tokens differ between a node's invocations:
+/// its parent, or its `for_each` and collected discovery rows.
+fn invocation_ids(n: &ExpandedNode) -> Vec<&str> {
+    match &n.role {
+        NodeRole::Child { parent_id, .. } => vec![parent_id.as_str()],
+        NodeRole::Product { dims, collected } => dims
+            .iter()
+            .chain(collected.iter())
+            .map(String::as_str)
+            .collect(),
+        NodeRole::Root | NodeRole::Discovery { .. } => Vec::new(),
+    }
+}
+
+/// Whether `path` carries a token that changes per invocation of `n` (#789
+/// CLI-144): `${now.*}`, `${backfill.*}`, `${partition.*}` and other rows'
+/// tokens are the same for every invocation of one parent.
+fn varies_per_invocation(path: &str, n: &ExpandedNode) -> bool {
+    let ids = invocation_ids(n);
+    path.match_indices("${").any(|(i, _)| {
+        let rest = &path[i + 2..];
+        ids.iter()
+            .any(|id| rest.starts_with(&format!("{id}.")) || rest.starts_with(&format!("{id}}}")))
+    })
+}
+
 fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
     for n in nodes {
         let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
@@ -1658,10 +1717,7 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
         let Some(path) = crate::registry::sink_truncating_path(&n.sink.kind, &n.sink.config) else {
             continue;
         };
-        let per_invocation = path
-            .match_indices("${")
-            .any(|(i, _)| !path[i + 2..].starts_with("now."));
-        if !per_invocation {
+        if !varies_per_invocation(path, n) {
             let fix = match n.sink.kind.as_str() {
                 "parquet" => "write to a directory destination or set a rollover cap",
                 _ => "set `append: true`",
@@ -1677,6 +1733,84 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
     Ok(())
 }
 
+/// A local file sink writing one unnumbered file in a format that can only be
+/// rewritten whole to continue it, under a source that bookmarks — so the
+/// pipeline flushes — every page: each flush rewrites the file, so the run's
+/// time and I/O grow with the square of its size (#789 FILE-19). JSON Lines
+/// and raw text extend in place unless the whole file is sealed (encrypted
+/// and compressed). The sink warns again, per file, when it happens.
+fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
+    if matches!(n.role, NodeRole::Discovery { .. })
+        || !source_flushes_every_page(&n.source.kind, &n.source.config)
+    {
+        return None;
+    }
+    let cfg = &n.sink.config;
+    let text = |k: &str| cfg.get(k).and_then(Value::as_str);
+    let path: String = match n.sink.kind.as_str() {
+        "file" | "csv" => text("path")?.to_string(),
+        "parquet" => crate::registry::sink_shared_destination("parquet", cfg)?
+            .strip_prefix("file:")?
+            .to_string(),
+        _ => return None,
+    };
+    let capped = [
+        "max_records_per_file",
+        "max_bytes_per_file",
+        "max_rows_per_file",
+    ]
+    .iter()
+    .any(|k| cfg.get(*k).is_some_and(|v| !v.is_null()));
+    if capped || path.contains("{part}") || path.ends_with('/') {
+        return None;
+    }
+    let format = match n.sink.kind.as_str() {
+        "csv" => faucet_core::FileFormat::Csv,
+        "parquet" => faucet_core::FileFormat::Parquet,
+        _ => match text("format").filter(|f| *f != "auto") {
+            Some("json_lines") => faucet_core::FileFormat::JsonLines,
+            Some("raw_text") => faucet_core::FileFormat::RawText,
+            Some(_) => faucet_core::FileFormat::Csv,
+            None => faucet_core::FileFormat::from_path(&path)?,
+        },
+    };
+    let line = matches!(
+        format,
+        faucet_core::FileFormat::JsonLines | faucet_core::FileFormat::RawText
+    );
+    let compressed = match text("compression").unwrap_or("auto") {
+        "auto" => [".gz", ".gzip", ".zst", ".zstd"]
+            .iter()
+            .any(|ext| path.to_ascii_lowercase().ends_with(ext)),
+        other => other != "none",
+    };
+    let sealed_whole = cfg.get("encryption").is_some_and(|v| !v.is_null()) && compressed;
+    if line && !sealed_whole {
+        return None;
+    }
+    Some(format!(
+        "row '{}': the {} source bookmarks every page, so the {} sink flushes '{path}' once per \
+         page and must rewrite it whole each time (its format can not be appended to) — the \
+         run's time and I/O grow with the square of the file's size; add `{{part}}` to the path \
+         or set max_records_per_file / max_bytes_per_file",
+        n.id, n.source.kind, n.sink.kind
+    ))
+}
+
+/// Whether a source bookmarks every page it emits, which makes the pipeline
+/// flush the sink once per page.
+fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
+    let mode = || cfg.get("mode").and_then(Value::as_str);
+    match kind {
+        "postgres-cdc" | "mysql-cdc" | "mongodb-cdc" | "mssql-cdc" | "oracle-cdc" | "kafka"
+        | "kinesis" | "rabbitmq" | "nats" | "pubsub" | "sqs" => true,
+        "dynamodb" => mode() == Some("streams"),
+        "iceberg" => mode() == Some("incremental"),
+        "file" => cfg.get("incremental").is_some_and(|v| !v.is_null()),
+        _ => false,
+    }
+}
+
 /// File-writing sinks must not share a destination (#743, #789 FILE-05): two
 /// writers on one fixed set of names overwrite each other's files and prune
 /// the parts the other wrote. Rows must differ, and a row that runs once per
@@ -1685,19 +1819,22 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
 /// object-store and SFTP sinks given a fixed `path` / `file_name`
 /// ([`crate::registry::sink_shared_destination`]).
 fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
-    fn per_invocation(path: &str) -> bool {
-        path.match_indices("${")
-            .any(|(i, _)| !path[i + 2..].starts_with("now."))
-    }
     let mut seen: HashMap<String, &str> = HashMap::new();
-    for n in nodes {
+    // Discovery rows carry their source as a placeholder sink and write nothing
+    // (#789 CLI-143).
+    let writers = || {
+        nodes
+            .iter()
+            .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
+    };
+    for n in writers() {
         let Some(dest) = crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config)
         else {
             continue;
         };
         let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
         let legacy = matches!(n.sink.kind.as_str(), "jsonl" | "csv" | "parquet");
-        if fans_out && !legacy && !per_invocation(&dest) {
+        if fans_out && !legacy && !varies_per_invocation(&dest, n) {
             return Err(CliError::Config(format!(
                 "row '{}': its {} sink destination '{dest}' is the same for every invocation of \
                  a fan-out row, so concurrent writers would overwrite each other — put a \
@@ -1714,8 +1851,7 @@ fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
             )));
         }
     }
-    let data_paths: HashMap<&str, &str> = nodes
-        .iter()
+    let data_paths: HashMap<&str, &str> = writers()
         .filter(|n| matches!(n.sink.kind.as_str(), "file" | "jsonl" | "csv"))
         .filter_map(|n| Some((n.sink.config.get("path")?.as_str()?, n.id.as_str())))
         .collect();
@@ -2026,6 +2162,163 @@ fn validate_tag(tag: &str, row_id: &str) -> CliResult<()> {
             "row '{row_id}': invalid tag '{tag}' — tags must match ^[a-z0-9][a-z0-9_-]*$ \
              (lowercase letters, digits, `_`, `-`; first char alphanumeric)"
         )));
+    }
+    Ok(())
+}
+
+/// `complete_for … on_missing: delete` deletes every in-scope destination row
+/// an invocation did not write, so each invocation's fetch must be the whole
+/// scope (#789 CLI-23, CLI-25):
+/// - a partitioned row's chunks each write a slice and would delete the
+///   others' rows;
+/// - a source that resumes from a bookmark reads only what changed;
+/// - a row that runs once per parent record or tuple must narrow its scope
+///   with that invocation's own token, or each invocation deletes its
+///   siblings' rows.
+fn check_cleanup_completeness(
+    row_id: &str,
+    role: &NodeRole,
+    claim: &crate::config::CompletenessClaim,
+    has_state: bool,
+    partitioned: bool,
+    source: &ConnectorSpec,
+) -> CliResult<()> {
+    if partitioned {
+        return Err(CliError::Config(format!(
+            "row '{row_id}': `complete_for.on_missing: delete` cannot be combined with \
+             `partition:` — each chunk reads only its slice, so its cleanup would delete the \
+             rows the other chunks wrote"
+        )));
+    }
+    if has_state && crate::registry::source_resumes_from_bookmark(&source.kind, &source.config) {
+        return Err(CliError::Config(format!(
+            "row '{row_id}': `complete_for.on_missing: delete` needs a complete fetch every run, \
+             but source '{}' resumes from its stored bookmark when `state:` is set, so a run \
+             reads only what changed and its cleanup would delete every unchanged row in scope",
+            source.kind
+        )));
+    }
+    let ids: Vec<&str> = match role {
+        NodeRole::Child { parent_id, .. } => vec![parent_id.as_str()],
+        NodeRole::Product { dims, collected } => {
+            dims.iter().chain(collected).map(String::as_str).collect()
+        }
+        NodeRole::Root | NodeRole::Discovery { .. } => return Ok(()),
+    };
+    let mut narrowed = false;
+    for v in claim.scope.values() {
+        let _ = walk_strings(v, &mut |s| {
+            narrowed |= iter_directives(s)
+                .any(|(_, d)| matches!(d, Directive::Deferred { id, .. } if ids.contains(&id)));
+            Ok(())
+        });
+    }
+    if !narrowed {
+        return Err(CliError::Config(format!(
+            "row '{row_id}' runs once per {} but its `complete_for.scope` carries no \
+             per-invocation token, so every invocation would delete the rows its siblings \
+             wrote — scope it with e.g. `${{{}.id}}`",
+            if matches!(role, NodeRole::Child { .. }) {
+                "parent record"
+            } else {
+                "discovered tuple"
+            },
+            ids.first().copied().unwrap_or("parent")
+        )));
+    }
+    Ok(())
+}
+
+/// SLA (#202) and profiling (#708) gates, shared by matrix rows and topology
+/// sink nodes (#789 CLI-63): validate each spec and require a `state:` block
+/// when the check needs persisted history (staleness / volume baselines, the
+/// profile baseline). A `memory` store only keeps history within one process.
+pub(crate) fn check_sla_and_profiling(
+    owner: &str,
+    sla: Option<&crate::sla::SlaSpec>,
+    profiling: Option<&faucet_core::ProfilingSpec>,
+    state: Option<&StateStoreSpec>,
+) -> CliResult<()> {
+    let memory_warning = |what: &str| {
+        tracing::warn!(
+            owner,
+            "{what}: the `memory` state store resets on process exit — the baseline only \
+             persists within a single `faucet schedule`/`serve` process; use `file`, `redis`, \
+             or `postgres` for one-shot runs"
+        );
+    };
+    if let Some(sla) = sla {
+        sla.validate()
+            .map_err(|e| CliError::Config(format!("sla: {e}")))?;
+        if sla.needs_state() {
+            match state {
+                None => {
+                    return Err(CliError::Config(format!(
+                        "{owner}: sla.max_staleness_secs / sla.volume_anomaly need persisted \
+                         run history — add a `state:` block (min_rows_per_run alone works \
+                         without one)"
+                    )));
+                }
+                Some(s) if s.kind == "memory" => memory_warning("sla"),
+                Some(_) => {}
+            }
+        }
+    }
+    if let Some(pf) = profiling {
+        pf.validate()
+            .map_err(|e| CliError::Config(format!("profiling: {e}")))?;
+        match state {
+            None => {
+                return Err(CliError::Config(format!(
+                    "{owner}: profiling: needs a `state:` block — the rolling baseline of \
+                     column profiles is kept there"
+                )));
+            }
+            Some(s) if s.kind == "memory" => memory_warning("profiling"),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// A row id: letters, digits, `_` and `-` (#789 CLI-79). `::` would read as a
+/// child key in state tooling and `.` splits interpolation paths.
+fn is_row_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A deferred `${row.path}` token resolves only against the record or tuple
+/// the invocation runs for: the row's parent, or its `for_each` and collected
+/// discovery rows (#789 CLI-60). Any other row's token would reach the
+/// connector verbatim.
+fn check_deferred_scope(
+    row_id: &str,
+    role: &NodeRole,
+    deferred: &[DeferredRef],
+    row_ids: &HashSet<&str>,
+) -> CliResult<()> {
+    for r in deferred {
+        let id = r.referenced_id.as_str();
+        if id == row_id || !row_ids.contains(id) {
+            continue;
+        }
+        let resolvable = match role {
+            NodeRole::Child { parent_id, .. } => parent_id == id,
+            NodeRole::Product { dims, collected } => dims.iter().chain(collected).any(|d| d == id),
+            NodeRole::Root | NodeRole::Discovery { .. } => false,
+        };
+        if !resolvable {
+            return Err(CliError::Config(format!(
+                "row '{row_id}' references `{}`, but '{id}' is not its parent or one of its \
+                 `for_each` dimensions, so the token would reach the connector unresolved — \
+                 add `parent: {id}` (once per {id} record) or `for_each: [{id}]` (a `fan_out:` \
+                 row)",
+                r.token
+            )));
+        }
     }
     Ok(())
 }
@@ -3934,6 +4227,98 @@ pipeline:
         );
     }
 
+    /// #789 FILE-19: a per-page-bookmarking source writing one unnumbered
+    /// file in a format that is rewritten whole on every flush is warned
+    /// about at load time; line formats, numbered templates, rollover caps
+    /// and sources that bookmark once are not.
+    #[test]
+    fn rewritten_file_sinks_are_warned_about_at_load() {
+        let warn = |source: &str, sink: &str| {
+            let yaml = format!("version: 1\npipeline:\n  source: {source}\n  sink: {sink}\n");
+            let nodes = expand(&parse_with_extension(&yaml, "yaml").unwrap()).unwrap();
+            rewritten_file_warning(&nodes[0])
+        };
+        let kafka = r#"{ type: kafka, config: { brokers: "b:9092", topics: [t], group_id: g, max_messages: 10 } }"#;
+        let csv_out = r#"{ type: file, config: { path: /tmp/f19/out.csv } }"#;
+        let w = warn(kafka, csv_out).expect("csv under kafka is rewritten per page");
+        assert!(
+            w.contains("{part}") && w.contains("max_records_per_file"),
+            "{w}"
+        );
+        assert!(w.contains("kafka"), "{w}");
+
+        for quiet in [
+            r#"{ type: file, config: { path: /tmp/f19/out.jsonl } }"#,
+            r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz } }"#,
+            r#"{ type: file, config: { path: "/tmp/f19/out-{part}.csv" } }"#,
+            r#"{ type: file, config: { path: /tmp/f19/out.csv, max_records_per_file: 1000 } }"#,
+            r#"{ type: file, config: { path: /tmp/f19/dir/, format: csv } }"#,
+            r#"{ type: stdout, config: {} }"#,
+        ] {
+            assert_eq!(warn(kafka, quiet), None, "{quiet}");
+        }
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.txt, format: json_array } }"#
+            )
+            .is_some()
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: csv, config: { path: /tmp/f19/legacy.csv } }"#
+            )
+            .is_some()
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz, encryption: { key: k } } }"#
+            )
+            .is_some(),
+            "a compressed line file sealed whole is rewritten"
+        );
+        assert_eq!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.jsonl, encryption: { key: k } } }"#
+            ),
+            None,
+            "per-line sealing stays appendable"
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: parquet, config: { destination: { type: local_path, path: /tmp/f19/out.parquet } } }"#
+            )
+            .is_some()
+        );
+        let incremental =
+            r#"{ type: file, config: { path: /tmp/f19/in/, incremental: { by: mtime } } }"#;
+        assert!(warn(incremental, csv_out).is_some());
+        assert_eq!(
+            warn(
+                r#"{ type: file, config: { path: /tmp/f19/in.csv } }"#,
+                csv_out
+            ),
+            None,
+            "a source that bookmarks once flushes once"
+        );
+        assert!(source_flushes_every_page(
+            "dynamodb",
+            &serde_json::json!({"mode": "streams"})
+        ));
+        assert!(!source_flushes_every_page(
+            "dynamodb",
+            &serde_json::json!({"mode": "scan"})
+        ));
+        assert!(source_flushes_every_page(
+            "iceberg",
+            &serde_json::json!({"mode": "incremental"})
+        ));
+    }
+
     #[test]
     fn exactly_once_kafka_source_accepted_with_atomic_sink() {
         // kafka → sqlite + durable state: the kafka source's offset bookmarks
@@ -4475,6 +4860,111 @@ pipeline:
         ] {
             assert!(expand(&cfg(&yaml(ok.0, ok.1))).is_ok(), "{ok:?}");
         }
+        // A token that is the same for every invocation of one parent does not
+        // make the path per-invocation (#789 CLI-144).
+        for constant in ["${backfill.start}", "${partition.id}"] {
+            let sink = format!("{{ path: \"out/{constant}.jsonl\" }}");
+            let err = expand(&cfg(&yaml("jsonl", &sink)));
+            assert!(
+                err.as_ref()
+                    .is_err_and(|e| e.to_string().contains("runs once per parent record")),
+                "{constant}: {err:?}"
+            );
+        }
+    }
+
+    const TWO_ROWS: &str = "version: 1\nname: t\npipeline:\n  source: { type: csv, config: { path: p.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl, append: true } }\nmatrix:\n";
+
+    /// #789 CLI-79: hand-written row ids are limited to `[A-Za-z0-9_-]`.
+    #[test]
+    fn row_ids_outside_the_charset_are_refused() {
+        for bad in ["a::b", "a b", "a.b", "a/b", "é"] {
+            let yaml = format!("{TWO_ROWS}  - id: \"{bad}\"\n");
+            let err = expand(&cfg(&yaml)).unwrap_err().to_string();
+            assert!(err.contains("may only contain letters"), "{bad}: {err}");
+        }
+        assert!(expand(&cfg(&format!("{TWO_ROWS}  - id: Orders_v2-eu\n"))).is_ok());
+        let err = expand(&cfg(&format!("{TWO_ROWS}  - id: now\n")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("partition") && err.contains("faucet"), "{err}");
+    }
+
+    /// #789 CLI-59: a `parent:` naming a `fan_out:` row would run nothing.
+    #[test]
+    fn parent_naming_a_fan_out_row_is_refused() {
+        let yaml = format!(
+            "{TWO_ROWS}  - id: regions\n    fan_out: {{ source: {{ type: csv, config: {{ path: r.csv }} }}, select: region, as: name }}\n  - id: c\n    parent: regions\n    sink: {{ config: {{ path: \"o-${{regions.name}}.jsonl\" }} }}\n"
+        );
+        let err = expand(&cfg(&yaml)).unwrap_err().to_string();
+        assert!(err.contains("for_each: [regions]"), "{err}");
+    }
+
+    /// #789 CLI-60: a deferred token must name the row's parent or dimension.
+    #[test]
+    fn a_token_for_a_row_that_is_not_the_parent_is_refused() {
+        let yaml = format!(
+            "{TWO_ROWS}  - id: orders\n  - id: lines\n    depends_on: [orders]\n    source: {{ config: {{ path: \"l-${{orders.id}}.csv\" }} }}\n"
+        );
+        let err = expand(&cfg(&yaml)).unwrap_err().to_string();
+        assert!(
+            err.contains("row 'lines' references `${orders.id}`") && err.contains("parent: orders"),
+            "{err}"
+        );
+        let ok = format!(
+            "{TWO_ROWS}  - id: orders\n  - id: lines\n    parent: orders\n    source: {{ config: {{ path: \"l-${{orders.id}}.csv\" }} }}\n"
+        );
+        assert!(expand(&cfg(&ok)).is_ok());
+        let grandparent = format!(
+            "{TWO_ROWS}  - id: a\n  - id: b\n    parent: a\n  - id: c\n    parent: b\n    source: {{ config: {{ path: \"c-${{a.id}}.csv\" }} }}\n"
+        );
+        assert!(
+            expand(&cfg(&grandparent)).is_err(),
+            "only the parent record is in scope"
+        );
+    }
+
+    /// #789 CLI-141: graph edges never resolve to a flow-auth capture name.
+    #[test]
+    fn depends_on_a_capture_name_is_an_unknown_dependency_not_a_panic() {
+        let yaml = "version: 1\nname: t\nauth:\n  login:\n    type: flow\n    config:\n      steps:\n        - capture: { session: \"$.token\" }\npipeline:\n  source: { type: csv, config: { path: p.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\nmatrix:\n  - id: a\n    depends_on: [session]\n";
+        let err = expand(&cfg(yaml)).unwrap_err();
+        assert!(matches!(err, CliError::UnknownDependency { .. }), "{err:?}");
+        let parent = yaml.replace("depends_on: [session]", "parent: session");
+        let err = expand(&cfg(&parent)).unwrap_err();
+        assert!(matches!(err, CliError::UnknownParent { .. }), "{err:?}");
+    }
+
+    /// #789 CLI-143: two `fan_out:` rows reading one file are not two writers.
+    #[test]
+    fn discovery_rows_over_one_file_are_not_checked_as_sinks() {
+        let c = cfg(
+            "version: 1\nname: t\npipeline:\n  source: { type: file, config: { path: in.csv } }\n  sink: { type: file, config: { path: out.jsonl } }\nmatrix:\n  - id: regions\n    fan_out: { source: { type: file, config: { path: dims.csv } }, select: region, as: name }\n  - id: kinds\n    fan_out: { source: { type: file, config: { path: dims.csv } }, select: kind, as: name }\n",
+        );
+        let nodes = expand(&c).expect("two discovery rows over one source file are fine");
+        assert_eq!(nodes.len(), 2);
+    }
+
+    /// #789 CLI-56: one authoritative count cannot reconcile several root
+    /// invocations.
+    #[test]
+    fn reconcile_is_refused_with_several_root_invocations() {
+        let base = "version: 1\nname: t\nreconcile:\n  count: { type: csv, config: { path: n.csv } }\npipeline:\n  source: { type: csv, config: { path: p.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n";
+        assert!(expand(&cfg(base)).is_ok());
+        let two = format!(
+            "{base}matrix:\n  - id: a\n  - id: b\n    sink: {{ config: {{ path: o2.jsonl }} }}\n"
+        );
+        let err = expand(&cfg(&two)).unwrap_err().to_string();
+        assert!(err.contains("2 root rows (a, b)"), "{err}");
+        let parted = format!(
+            "{base}matrix:\n  - id: a\n    source: {{ config: {{ path: \"p-${{partition.id}}.csv\" }} }}\n    sink: {{ config: {{ path: \"o-${{partition.id}}.jsonl\" }} }}\n    partition: {{ kind: integer, from: 0, to: 19, chunk_size: 10, bounds: inclusive }}\n"
+        );
+        let err = expand(&cfg(&parted)).unwrap_err().to_string();
+        assert!(err.contains("row 'a' is partitioned"), "{err}");
+        let child = format!(
+            "{base}matrix:\n  - id: a\n  - id: c\n    parent: a\n    sink: {{ config: {{ path: \"o-${{a.id}}.jsonl\" }} }}\n"
+        );
+        assert!(expand(&cfg(&child)).is_ok(), "children are not reconciled");
     }
 }
 

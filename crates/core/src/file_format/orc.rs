@@ -37,16 +37,21 @@ pub enum OrcInput {
 
 /// Decode a whole ORC object into records.
 pub fn decode(bytes: &[u8], opts: &OrcOptions) -> Result<Vec<Value>, FaucetError> {
+    decode_input(OrcInput::Bytes(bytes::Bytes::copy_from_slice(bytes)), opts)
+}
+
+/// [`decode`] taking ownership of the body, so it is read in place rather
+/// than copied (CORE-73).
+pub fn decode_owned(bytes: Vec<u8>, opts: &OrcOptions) -> Result<Vec<Value>, FaucetError> {
+    decode_input(OrcInput::Bytes(bytes::Bytes::from(bytes)), opts)
+}
+
+fn decode_input(input: OrcInput, opts: &OrcOptions) -> Result<Vec<Value>, FaucetError> {
     let mut out = Vec::new();
-    read_batches(
-        OrcInput::Bytes(bytes::Bytes::copy_from_slice(bytes)),
-        opts,
-        0,
-        &mut |b| {
-            out.extend(crate::columnar::record_batch_to_values(&b)?);
-            Ok(())
-        },
-    )?;
+    read_batches(input, opts, 0, &mut |b| {
+        out.extend(crate::columnar::record_batch_to_values(&b)?);
+        Ok(())
+    })?;
     Ok(out)
 }
 

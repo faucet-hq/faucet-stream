@@ -5,8 +5,9 @@ events out to Slack, PagerDuty, or a generic signed webhook — so a failure,
 SLA breach, or tripped circuit breaker reaches your team without you having to
 stand up Prometheus + Alertmanager first.
 
-It is fully opt-in and requires the `notify` build feature
-(`cargo install faucet-cli --features notify`, or `--features full`). With no
+It is fully opt-in and requires the `notify` build feature — included in the
+prebuilt binaries; from crates.io, `cargo install faucet-cli --features notify`
+(or `--features full`). With no
 block, nothing changes.
 
 > **Delivery never fails a run.** Each event is delivered with a short bounded
@@ -19,7 +20,7 @@ block, nothing changes.
 
 | Event | Fires when | Severity |
 |-------|-----------|----------|
-| `run_failure` | a run (or its final flush) failed | error |
+| `run_failure` | a run (or its final flush) failed — a rule on `run_failure` also hears `circuit_open`, `contract_abort` and `budget_exceeded`, which are run failures too | error |
 | `run_success` | a run completed successfully | info |
 | `sla_breach` | a post-run SLA check was violated (staleness / min_rows / volume) | warning |
 | `circuit_open` | the resilience circuit breaker tripped | critical |
@@ -97,9 +98,18 @@ channel:
 
 ### PagerDuty
 
-Uses the Events API v2. A failure-class event **opens** an incident; the next
-`run_success` on the same pipeline/row automatically sends a matching
-**resolve** (correlated by dedup key), so incidents self-close.
+Uses the Events API v2. A failure-class event (`run_failure`,
+`circuit_open`, `contract_abort`, `budget_exceeded`) **opens** one incident per
+pipeline/row (dedup key `<pipeline>:<row>`); any other kind (`sla_breach`,
+`dlq_threshold`, `profile_drift`, …) opens its own incident, keyed by kind
+(`<kind>:<pipeline>:<row>`), so a warning never merges into a failure. The next
+`run_success` on the same pipeline/row sends a matching **resolve** for each of
+them, so incidents self-close. The resolve does not depend on the process that
+saw the failure: a success resolves the key of every kind the rule's `on:`
+admits (all kinds when `on:` is empty; PagerDuty ignores a resolve with nothing
+open), so incidents opened by an earlier `faucet run` or another serve run
+close too. `dedupe_window_secs` coalesces within one process only — PagerDuty
+itself folds repeats on the dedup key into the open incident.
 
 ```yaml
 channel:
@@ -194,7 +204,16 @@ faucet notify test pipeline.yaml --event run_failure
 ```
 
 `--event` accepts any event kind (`run_failure`, `run_success`, `sla_breach`,
-`circuit_open`, `contract_abort`, `dlq_threshold`, `scheduler_stuck`).
+`circuit_open`, `contract_abort`, `dlq_threshold`, `scheduler_stuck`,
+`profile_drift`, `change_requested`, `budget_exceeded`,
+`connection_needs_reauth`); `--profile` selects a `profiles:` overlay.
+
+The synthetic event uses the row `faucet-notify-test`, so its PagerDuty dedup
+key (`<pipeline>:faucet-notify-test`) never matches a real run's, and a
+failure-class test incident is resolved right after it is triggered (pass
+`--keep-open` to leave it open). The command prints what each rule did and
+exits non-zero when no rule took the event or any delivery failed, so it can
+gate a deploy.
 
 ## Metrics
 

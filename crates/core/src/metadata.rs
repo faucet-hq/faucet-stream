@@ -142,6 +142,11 @@ pub struct MetadataSink {
     meta: CompiledMetadata,
     ctx: MetadataContext,
     seq: AtomicU64,
+    /// Source fields a metadata column replaced (each warned about once).
+    collided: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The destination was checked for the metadata columns (and they were
+    /// added where missing).
+    columns_ready: tokio::sync::OnceCell<()>,
 }
 
 impl std::fmt::Debug for MetadataSink {
@@ -161,6 +166,8 @@ impl MetadataSink {
             meta,
             ctx,
             seq: AtomicU64::new(0),
+            collided: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            columns_ready: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -192,18 +199,98 @@ impl MetadataSink {
                 MetadataColumn::Source => Value::String(self.ctx.source.clone()),
                 MetadataColumn::Sequence => Value::from(self.seq.fetch_add(1, Ordering::Relaxed)),
             };
-            map.insert(name, value);
+            if map.insert(name.clone(), value).is_some() {
+                self.note_collision(name);
+            }
         }
+    }
+
+    /// Make sure a column-mapped destination has every metadata column before
+    /// the first write. The drift pass compares pages *before* this decorator
+    /// stamps them, so it never adds these columns, and an auto-mapping sink
+    /// writes only the columns that exist — the metadata would be dropped
+    /// silently. Missing columns are added through `evolve_schema`; a sink
+    /// that cannot evolve fails instead. A schemaless destination, or one not
+    /// created yet (it is created from stamped records), needs nothing.
+    async fn ensure_columns(&self) -> Result<(), FaucetError> {
+        self.columns_ready
+            .get_or_try_init(|| async {
+                let Some(schema) = self.inner.current_schema().await? else {
+                    return Ok(());
+                };
+                let props = schema.get("properties").and_then(Value::as_object);
+                let additions: Vec<crate::drift::ColumnChange> = self
+                    .meta
+                    .columns
+                    .iter()
+                    .map(|&c| (self.meta.column_name(c), c))
+                    .filter(|(name, _)| props.is_none_or(|p| !p.contains_key(name)))
+                    .map(|(name, c)| crate::drift::ColumnChange {
+                        name,
+                        from: None,
+                        to: serde_json::json!({ "type": [
+                            if c == MetadataColumn::Sequence { "integer" } else { "string" },
+                            "null"
+                        ] }),
+                    })
+                    .collect();
+                if additions.is_empty() {
+                    return Ok(());
+                }
+                let names: Vec<String> = additions.iter().map(|a| a.name.clone()).collect();
+                if !self.inner.supports_schema_evolution() {
+                    return Err(FaucetError::Config(format!(
+                        "metadata_columns: the destination has no column {} and sink '{}' \
+                         cannot add columns; add them to the table or disable metadata_columns",
+                        names.join(", "),
+                        self.inner.connector_name()
+                    )));
+                }
+                tracing::info!(columns = ?names, "adding missing metadata columns to the destination");
+                self.inner
+                    .evolve_schema(&crate::drift::SchemaEvolution {
+                        additions,
+                        ..Default::default()
+                    })
+                    .await
+            })
+            .await
+            .map(|_| ())
+    }
+
+    /// A source record already held a field named like a metadata column; the
+    /// metadata value replaced it. Warned once per column, never silent.
+    fn note_collision(&self, name: String) {
+        let Ok(mut seen) = self.collided.lock() else {
+            return;
+        };
+        if seen.insert(name.clone()) {
+            tracing::warn!(
+                column = %name,
+                "a source field has the same name as a metadata column; the metadata \
+                 value replaces it (choose another `metadata_columns.prefix` to keep it)"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn collisions(&self) -> Vec<String> {
+        self.collided.lock().unwrap().iter().cloned().collect()
     }
 }
 
 #[async_trait::async_trait]
 impl Sink for MetadataSink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.ensure_columns().await?;
         self.inner.write_batch(&self.stamp(records)).await
     }
 
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+        self.ensure_columns().await?;
         self.inner.write_batch_partial(&self.stamp(records)).await
     }
 
@@ -213,6 +300,7 @@ impl Sink for MetadataSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
+        self.ensure_columns().await?;
         self.inner
             .write_batch_idempotent(&self.stamp(records), scope, token)
             .await
@@ -285,6 +373,8 @@ impl Sink for MetadataSink {
         self.inner.is_overwrite()
     }
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+        // Before the staging clone is taken from the target.
+        self.ensure_columns().await?;
         self.inner.begin_overwrite().await
     }
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
@@ -296,11 +386,175 @@ impl Sink for MetadataSink {
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
     }
+    fn write_batch_is_replay_safe(&self) -> bool {
+        self.inner.write_batch_is_replay_safe()
+    }
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
+    fn supports_staged_load(&self) -> bool {
+        self.inner.supports_staged_load()
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    fn supports_rollback(&self) -> bool {
+        self.inner.supports_rollback()
+    }
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &crate::rollback::RollbackOptions,
+    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
+        self.inner.rollback_run(run_id, opts).await
+    }
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.inner.forget_run(run_id).await
+    }
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.inner.rewind_commit_token(scope, token).await
+    }
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.inner.readback_source()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Mapped {
+        evolutions: std::sync::Mutex<Vec<Vec<String>>>,
+        evolves: bool,
+    }
+    #[async_trait::async_trait]
+    impl Sink for Mapped {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+            Ok(Some(json!({"type": "object", "properties": {
+                "id": {"type": "integer"}, "_faucet_source": {"type": "string"}
+            }})))
+        }
+        fn supports_schema_evolution(&self) -> bool {
+            self.evolves
+        }
+        async fn evolve_schema(
+            &self,
+            evolution: &crate::drift::SchemaEvolution,
+        ) -> Result<(), FaucetError> {
+            self.evolutions.lock().unwrap().push(
+                evolution
+                    .additions
+                    .iter()
+                    .map(|a| format!("{}:{}", a.name, a.to["type"][0]))
+                    .collect(),
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_metadata_columns_are_added_once_before_the_first_write() {
+        let meta = CompiledMetadata::compile(&spec(&[
+            MetadataColumn::RunId,
+            MetadataColumn::Source,
+            MetadataColumn::Sequence,
+        ]))
+        .unwrap()
+        .unwrap();
+        let inner = std::sync::Arc::new(Mapped {
+            evolutions: std::sync::Mutex::new(Vec::new()),
+            evolves: true,
+        });
+        struct Shared(std::sync::Arc<Mapped>);
+        #[async_trait::async_trait]
+        impl Sink for Shared {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                self.0.write_batch(r).await
+            }
+            async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+                self.0.current_schema().await
+            }
+            fn supports_schema_evolution(&self) -> bool {
+                self.0.supports_schema_evolution()
+            }
+            async fn evolve_schema(
+                &self,
+                e: &crate::drift::SchemaEvolution,
+            ) -> Result<(), FaucetError> {
+                self.0.evolve_schema(e).await
+            }
+        }
+        let sink = MetadataSink::new(Box::new(Shared(inner.clone())), meta, ctx());
+        sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+        sink.write_batch(&[json!({"id": 2})]).await.unwrap();
+        assert_eq!(
+            *inner.evolutions.lock().unwrap(),
+            vec![vec![
+                "_faucet_run_id:\"string\"".to_string(),
+                "_faucet_sequence:\"integer\"".to_string()
+            ]]
+        );
+
+        let meta = CompiledMetadata::compile(&spec(&[MetadataColumn::RunId]))
+            .unwrap()
+            .unwrap();
+        let rigid = MetadataSink::new(
+            Box::new(Mapped {
+                evolutions: std::sync::Mutex::new(Vec::new()),
+                evolves: false,
+            }),
+            meta,
+            ctx(),
+        );
+        let err = rigid.write_batch(&[json!({"id": 1})]).await.unwrap_err();
+        assert!(err.to_string().contains("_faucet_run_id"), "{err}");
+    }
+
+    #[test]
+    fn a_colliding_source_field_is_reported() {
+        let meta = CompiledMetadata::compile(&spec(&[MetadataColumn::RunId]))
+            .unwrap()
+            .unwrap();
+        let sink = MetadataSink::new(Box::new(CapturingSink::default()), meta, ctx());
+        let out = sink.stamp(&[
+            json!({"_faucet_run_id": "upstream", "a": 1}),
+            json!({"a": 2}),
+        ]);
+        assert_eq!(out[0]["_faucet_run_id"], json!("run-42"));
+        assert_eq!(sink.collisions(), vec!["_faucet_run_id".to_string()]);
+        sink.stamp(&[json!({"_faucet_run_id": "again"})]);
+        assert_eq!(sink.collisions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_sink_forwards_every_hook_but_the_unstamped_paths() {
+        let probe = crate::sink_forwarding::HookSink::default();
+        let meta = CompiledMetadata::compile(&spec(&[MetadataColumn::RunId]))
+            .unwrap()
+            .unwrap();
+        let sink = MetadataSink::new(Box::new(probe.clone()), meta, ctx());
+        crate::sink_forwarding::assert_forwards_every_hook(
+            &sink,
+            &probe,
+            &[
+                "supports_columnar",
+                "write_batch_columnar",
+                "native_load_capabilities",
+                "load_native",
+            ],
+        )
+        .await;
+    }
     use serde_json::json;
     use std::sync::Mutex;
 

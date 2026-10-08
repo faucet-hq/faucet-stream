@@ -104,6 +104,10 @@ pub struct TableState {
     /// Catalog row estimate at discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_rows: Option<u64>,
+    /// Set when the table was snapshotted again into a destination the sink
+    /// cannot replace: rows deleted at the source in between may remain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resync_required: Option<String>,
 }
 
 impl TableState {
@@ -121,6 +125,7 @@ impl TableState {
             write_mode: String::new(),
             id: String::new(),
             estimated_rows: None,
+            resync_required: None,
         }
     }
 
@@ -327,6 +332,31 @@ pub fn mark_snapshot_started(
     }
 }
 
+/// Flag `name` when this snapshot is a redo into a destination the sink
+/// cannot replace atomically (`replaces` false): its earlier content stays,
+/// so rows deleted at the source since are never removed. A replacing
+/// snapshot clears the flag. Returns whether the table is flagged.
+pub fn flag_stale_resnapshot(
+    state: &mut MirrorState,
+    name: &str,
+    replaces: bool,
+    sink_kind: &str,
+) -> bool {
+    let Some(t) = state.tables.get_mut(name) else {
+        return false;
+    };
+    if replaces {
+        t.resync_required = None;
+    } else if t.snapshot.attempts > 1 {
+        t.resync_required = Some(format!(
+            "re-snapshotted into a {sink_kind} destination that is not replaced: rows deleted at \
+             the source since its earlier snapshot may remain — empty the destination and \
+             re-snapshot the table to resync"
+        ));
+    }
+    t.resync_required.is_some()
+}
+
 /// One snapshot range of `name` finished with `rows` rows.
 pub fn mark_shard_done(state: &mut MirrorState, name: &str, rows: u64, now: DateTime<Utc>) {
     if let Some(t) = state.tables.get_mut(name) {
@@ -339,7 +369,11 @@ pub fn mark_shard_done(state: &mut MirrorState, name: &str, rows: u64, now: Date
 /// `name`'s snapshot completed: it joins the stream.
 pub fn mark_snapshot_done(state: &mut MirrorState, name: &str, now: DateTime<Utc>) {
     if let Some(t) = state.tables.get_mut(name) {
-        t.set_phase(TablePhase::Active, now);
+        // A table dropped (or refused) by a discovery while it snapshotted
+        // stays that way.
+        if !matches!(t.phase, TablePhase::Dropped | TablePhase::Refused) {
+            t.set_phase(TablePhase::Active, now);
+        }
         t.snapshot.finished_at = Some(now);
         t.last_applied_at = Some(now);
         state.updated_at = now;
@@ -426,6 +460,24 @@ mod tests {
             state.incumbents().into_iter().collect::<Vec<_>>(),
             ["a", "b", "c", "d"]
         );
+    }
+
+    /// A table a discovery dropped mid-snapshot is not reactivated when the
+    /// snapshot finishes (#789 CLI-88).
+    #[test]
+    fn a_table_dropped_during_its_snapshot_stays_dropped() {
+        let now = Utc::now();
+        let mut state = MirrorState::new(now);
+        state
+            .tables
+            .insert("t".into(), TableState::new(TablePhase::Pending, now));
+        mark_snapshot_started(&mut state, "t", json!(1), 1, now);
+        state.tables.get_mut("t").unwrap().phase = TablePhase::Dropped;
+        mark_snapshot_done(&mut state, "t", now);
+        assert_eq!(state.tables["t"].phase, TablePhase::Dropped);
+        mark_snapshot_started(&mut state, "t", json!(2), 1, now);
+        mark_snapshot_done(&mut state, "t", now);
+        assert_eq!(state.tables["t"].phase, TablePhase::Active);
     }
 
     #[test]

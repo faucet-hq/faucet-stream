@@ -623,7 +623,8 @@ async fn validate_config(ctx: &McpContext, args: &Value) -> Result<String, Strin
     let cfg = parse_config(text)?;
 
     if crate::topology::is_topology(&cfg) {
-        let topo = crate::topology::build_topology(&cfg, &ctx.auth)
+        // Offline: building the connectors would connect and create files (#844).
+        let topo = crate::topology::validate_topology(&cfg)
             .await
             .map_err(|e| e.to_string())?;
         return Ok(pretty(&json!({

@@ -63,6 +63,8 @@ pub struct GithubHub {
     r#ref: String,
     path: String,
     token: Option<String>,
+    /// The commit [`Self::head_sha`] resolved; listings read it once set.
+    at: std::sync::OnceLock<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -144,6 +146,7 @@ impl GithubHub {
             r#ref: r#ref.clone(),
             path: path.trim_matches('/').to_string(),
             token,
+            at: std::sync::OnceLock::new(),
         })
     }
 
@@ -215,6 +218,9 @@ impl GithubHub {
                 format!("unexpected commit id '{sha}'"),
             ));
         }
+        // Every later listing and download reads this commit, so a push
+        // during the download cannot mix two revisions into one snapshot.
+        let _ = self.at.set(sha.clone());
         Ok(sha)
     }
 
@@ -228,7 +234,9 @@ impl GithubHub {
         }
         format!(
             "{}/repos/{}/contents/{p}?ref={}",
-            self.api_base, self.repo, self.r#ref
+            self.api_base,
+            self.repo,
+            self.at.get().unwrap_or(&self.r#ref)
         )
     }
 
@@ -624,7 +632,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/repos/acme/hub/contents/source-templates"))
-            .and(query_param("ref", "main"))
+            .and(query_param("ref", sha))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
                 entry("acme.yaml", "file", "source-templates", &base),
                 entry(".keep", "file", "source-templates", &base),

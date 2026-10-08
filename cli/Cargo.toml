@@ -644,7 +644,9 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 dotenvy = "0.15"
 schemars.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `preserve_order`: `faucet fmt` (and every rendered config) keeps insertion
+# order whatever else the build enables, so slim and full binaries agree.
+serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = "0.9"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time"] }

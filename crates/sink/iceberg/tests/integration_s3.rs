@@ -50,6 +50,8 @@ const BUCKET: &str = "faucet-iceberg-tests";
 /// Start a MinIO container; return the handle + `http://127.0.0.1:port` endpoint.
 async fn start_minio() -> (ContainerAsync<MinIO>, String) {
     let container = MinIO::default()
+        // tmpfs: MinIO refuses writes when the runner disk is nearly full.
+        .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
         .with_name(MINIO_IMAGE_NAME)
         .with_tag(MINIO_IMAGE_TAG)
         .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))

@@ -19,7 +19,7 @@ Built on the `parquet` + `arrow` crates wired through `object_store`, so local a
 ## Feature highlights
 
 - **Local or S3** — write to a local file/directory or to S3 (and S3-compatible services like MinIO / LocalStack via `endpoint_url`).
-- **Schema inference per file** — the Arrow schema is learned from each file's opening batch; every field is forced nullable, so missing keys round-trip as `NULL`. On rollover the schema is re-inferred, so a column added mid-run (e.g. CDC after `ALTER TABLE ADD COLUMN`) is picked up by the next file rather than dropped for the whole run.
+- **Schema inference per file** — the Arrow schema is learned from each file's opening batch; every field is forced nullable, so missing keys round-trip as `NULL`, and a field null in every sampled record becomes a nullable string column instead of failing the first non-null value. On rollover the schema is re-inferred, so a column added mid-run (e.g. CDC after `ALTER TABLE ADD COLUMN`) is picked up by the next file rather than dropped for the whole run.
 - **Columnar compression** — `snappy` (default), `gzip`, `zstd`, `lz4`, or `uncompressed` — applied internally by the Parquet writer.
 - **Row & byte rollover** — split large outputs across multiple `<uuid>.parquet` files by row count (`max_rows_per_file`) or byte budget (`max_bytes_per_file`).
 - **Streaming writer** — one reused `object_store` client, bounded buffering, configurable `row_group_size` for read-back performance.

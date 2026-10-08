@@ -29,10 +29,14 @@ inert by default so the simplest pipelines are unchanged.
   `with_retry!`, gated on an attached `ResiliencePolicy`. With no policy the macro is
   a bare `.await` — the write path is byte-for-byte identical to un-retried code.
 
-**The duplication-safety rule** (`with_retry_write!`): a non-idempotent
-`write_batch` is retried **only** when `sink.supports_idempotent_writes()`.
-Otherwise it falls through to a bare `.await` with no retry. `write_batch_idempotent`
-is always safe to retry (a token-stamped replay is a no-op).
+**The duplication-safety rule** (`with_retry_write!`): a plain `write_batch` /
+`write_batch_partial` is retried **only** when `sink.write_batch_is_replay_safe()`
+(default: `dedups_by_key()`, a keyed `write_mode: upsert|delete` config).
+Otherwise it falls through to a bare `.await` with no retry. The gate is not
+`supports_idempotent_writes()`, which covers only the token path; most sinks
+advertising it still do a plain multi-row `INSERT` in `write_batch`.
+`write_batch_idempotent` is retried through `eo_write_once`, which re-reads the
+committed token before each attempt so a page that already committed is skipped.
 
 Backoff is `base * 2^attempt` capped at `MAX_BACKOFF`, with decorrelated `[0.5,1.5)`
 jitter seeded per call so concurrent retries don't realign. Only transient

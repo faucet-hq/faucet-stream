@@ -233,13 +233,32 @@ keyed-upsert alternative when the sink supports it:
 version: 1
 name: cdc-mirror
 delivery: exactly_once
-state: { type: file, config: { path: ./state } }
 pipeline:
+  state: { type: file, config: { path: ./state } }
   sources:
-    changes: { type: postgres-cdc, config: { ... } }
+    changes:
+      type: postgres-cdc
+      config:
+        connection_url: postgres://replicator@db/app
+        slot_name: faucet_mirror
+        publication_name: faucet_pub
   sinks:
-    warm: { type: postgres, config: { ..., write_mode: upsert, key: [id] } }
-    cold: { type: sqlite,   config: { ..., write_mode: upsert, key: [id] } }
+    warm:
+      type: sqlite
+      config:
+        database_url: "sqlite://./warm.db?mode=rwc"
+        table_name: orders
+        column_mapping: auto_map
+        write_mode: upsert
+        key: [id]
+    cold:
+      type: sqlite
+      config:
+        database_url: "sqlite://./cold.db?mode=rwc"
+        table_name: orders
+        column_mapping: auto_map
+        write_mode: upsert
+        key: [id]
   nodes:
     src:  { kind: source, ref: changes }
     fan:  { kind: tee, fanout: 2 }
@@ -262,11 +281,14 @@ transform, a `wasm` transform) does not stall the rest of the graph.
 
 ## Observability
 
-Topology runs emit the standard sink/transform/state metrics plus
+Topology runs emit the standard source/sink/transform/state metrics — with the
+node id as `row` — including round-trip counts and one
+`faucet_pipeline_runs_total` / `faucet_pipeline_run_duration_seconds` per sink
+node (`source` is the feeding source's kind, or `multiple`), plus
 `faucet_tee_records_total`, `faucet_merge_records_total`, and the
 `faucet_join_*` family (`build_records`, `probe_records`, `matches`, `misses`,
-`duplicates`, `build_nulls`, `project_misses`, `build_duration_seconds`),
-labelled `pipeline` + `node`.
+`duplicates` (duplicated build keys), `build_nulls`, `project_misses`,
+`build_duration_seconds`), labelled `pipeline` + `node`.
 
 Every top-level governance and reporting block applies, each scoped to the node
 where it makes sense:

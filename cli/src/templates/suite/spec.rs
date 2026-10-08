@@ -47,6 +47,12 @@ pub struct SuiteFile {
     pub overlay_select: Option<String>,
     /// The cases.
     pub suite: Suite,
+    /// The suite file's directory, which relative fixture paths resolve
+    /// against (set by [`SuiteFile::from_path`]; the working directory when
+    /// the suite was parsed from text).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub base_dir: Option<std::path::PathBuf>,
 }
 
 /// The three ways cases come into existence, applied in this order:
@@ -174,6 +180,10 @@ pub struct Behavioral {
     /// Records per page fed to the pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<usize>,
+    /// Which row (stream) of the materialized config the case runs. Required
+    /// when it expands to more than one root row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<String>,
     /// Inline records, or a path to a `.jsonl` / `.json` / `.yaml` fixture —
     /// the same shapes `faucet test` accepts.
     pub input: Value,
@@ -204,7 +214,9 @@ impl SuiteFile {
         let text = std::fs::read_to_string(path).map_err(|e| {
             CliError::Config(format!("template test suite {}: {e}", path.display()))
         })?;
-        Self::parse(&text)
+        let mut file = Self::parse(&text)?;
+        file.base_dir = path.parent().map(std::path::Path::to_path_buf);
+        Ok(file)
     }
 
     fn validate(&self) -> CliResult<()> {

@@ -29,21 +29,27 @@ pub fn instrumented_apply_masking(
 
     let outcome = apply_masking(records, masking);
 
+    // One registry lookup per distinct (rule, action, detector) per page
+    // rather than one per masked field (CORE-64).
+    let mut tally: std::collections::BTreeMap<(&str, &'static str, &'static str), u64> =
+        std::collections::BTreeMap::new();
     for hit in &outcome.hits {
+        *tally
+            .entry((hit.rule.as_str(), hit.action, hit.detector.unwrap_or("")))
+            .or_default() += 1;
+    }
+    for ((rule, action, detector), n) in tally {
         counter!(
             "faucet_masking_fields_total",
             vec![
                 Label::new("pipeline", SharedString::from(labels.pipeline.to_string())),
                 Label::new("row", SharedString::from(labels.row.to_string())),
-                Label::new("rule", SharedString::from(hit.rule.clone())),
-                Label::new("action", SharedString::const_str(hit.action)),
-                Label::new(
-                    "detector",
-                    SharedString::const_str(hit.detector.unwrap_or("")),
-                ),
+                Label::new("rule", SharedString::from(rule.to_string())),
+                Label::new("action", SharedString::const_str(action)),
+                Label::new("detector", SharedString::const_str(detector)),
             ]
         )
-        .increment(1);
+        .increment(n);
     }
 
     outcome
@@ -111,5 +117,38 @@ mod tests {
             found,
             "expected faucet_masking_fields_total{{rule=emails,action=redact,detector=email}}"
         );
+    }
+
+    #[test]
+    fn a_page_of_hits_is_counted_once_per_series() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshotter();
+        let out = instrumented_apply_masking(
+            vec![
+                json!({"a": "x@y.io", "nested": {"b": ["p@q.io", "r@s.io"]}}),
+                json!({"a": "t@u.io"}),
+            ],
+            &compiled(json!({
+                "rules": [{ "name": "tally", "match": { "value_detector": "email" },
+                            "action": { "type": "hash" } }]
+            })),
+            &Labels::for_named("test_masking_tally"),
+        );
+        assert_eq!(out.hits.len(), 4, "nested values masked without paths");
+        assert!(out.records[0]["nested"]["b"][1].as_str().unwrap() != "r@s.io");
+        let series: Vec<u64> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| {
+                k.key().name() == "faucet_masking_fields_total"
+                    && k.key().labels().any(|l| l.value() == "test_masking_tally")
+            })
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(series, vec![4]);
     }
 }

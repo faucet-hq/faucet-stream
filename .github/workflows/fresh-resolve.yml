@@ -1,0 +1,79 @@
+# Daily fresh dependency resolve (#794). Every other job builds against the
+# committed Cargo.lock, but `cargo install faucet-cli` and docs.rs resolve the
+# newest semver-compatible releases. This job throws the lockfile away,
+# resolves from scratch and builds every feature, so a broken upstream release
+# shows up here (and in a tracking issue) before a user hits it.
+name: Fresh resolve
+
+on:
+  schedule:
+    - cron: "29 5 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-C debuginfo=0"
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fresh-resolve-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fresh-resolve:
+    name: Fresh resolve (all features)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.96.0"
+      - name: Install librdkafka prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      - name: Resolve dependencies from scratch
+        id: resolve
+        continue-on-error: true
+        run: |
+          rm -f Cargo.lock
+          cargo generate-lockfile
+      - name: cargo check --workspace --all-features
+        id: check
+        if: steps.resolve.outcome == 'success'
+        continue-on-error: true
+        run: cargo check --workspace --all-features
+      - name: Upload the resolved lockfile
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fresh-Cargo.lock
+          path: Cargo.lock
+          if-no-files-found: ignore
+      - name: Open or update the tracking issue
+        if: steps.resolve.outcome == 'failure' || steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Fresh dependency resolve is broken"
+          body="The daily fresh-resolve build failed: ${RUN_URL}
+
+          A clean resolve (what \`cargo install faucet-cli\` and docs.rs see) no longer builds with \`--all-features\`. The resolved lockfile is attached to the run. Find the release that broke it (diff against the committed \`Cargo.lock\`), then fix the code, pin around it, or ask upstream to yank."
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label bug --label tier-1 --body "$body"
+          fi
+      - name: Fail when the fresh resolve is broken
+        if: steps.resolve.outcome == 'failure' || steps.check.outcome == 'failure'
+        run: exit 1

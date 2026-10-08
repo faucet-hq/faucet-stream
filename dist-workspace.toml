@@ -20,8 +20,10 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 # Whether dist should create a Github Release or use an existing draft
 create-release = false
-# Features to pass to cargo build
-features = ["serve", "serve-ui", "schedule", "lineage", "templates"]
+# Features to pass to cargo build (on top of the CLI default set). Keep in sync
+# with docs/book/src/getting-started/installation.md — cli/tests/shipped_features.rs
+# checks both.
+features = ["serve", "serve-ui", "schedule", "lineage", "templates", "mcp", "notify", "secrets", "catalog", "serve-history-sqlite", "serve-history-postgres"]
 # Skip checking whether the specified configuration files are up to date
 allow-dirty = ["ci"]
 # Whether to install an updater program

@@ -69,11 +69,17 @@ pub fn plan_columns(page: &[Value]) -> Option<Vec<PlannedColumn>> {
         .into_iter()
         .map(|name| {
             let fragment = &props[&name];
+            // A column whose every observed value was null carries no type
+            // information; TEXT is the one choice that can hold whatever
+            // shows up next without a lossy cast.
+            let mut base_type = json_schema_base_type(fragment).unwrap_or(SqlBaseType::Text);
+            // An integer above i64::MAX fits no BIGINT/INTEGER column (SQLite
+            // would silently store it as a rounded REAL); TEXT keeps its digits.
+            if base_type == SqlBaseType::Integer && holds_wide_integer(page, &name) {
+                base_type = SqlBaseType::Text;
+            }
             PlannedColumn {
-                // A column whose every observed value was null carries no type
-                // information; TEXT is the one choice that can hold whatever
-                // shows up next without a lossy cast.
-                base_type: json_schema_base_type(fragment).unwrap_or(SqlBaseType::Text),
+                base_type,
                 nullable: true,
                 name,
             }
@@ -81,6 +87,15 @@ pub fn plan_columns(page: &[Value]) -> Option<Vec<PlannedColumn>> {
         .collect();
 
     (!columns.is_empty()).then_some(columns)
+}
+
+/// Whether any record holds an integer above `i64::MAX` under `column`.
+fn holds_wide_integer(page: &[Value], column: &str) -> bool {
+    page.iter().any(|r| {
+        r.get(column)
+            .and_then(Value::as_number)
+            .is_some_and(|n| n.is_u64() && n.as_i64().is_none())
+    })
 }
 
 /// Render a `CREATE TABLE` column list, given a dialect's type mapper and
@@ -211,6 +226,18 @@ mod tests {
             cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["id", "note"]
         );
+    }
+
+    #[test]
+    fn an_integer_column_above_i64_plans_as_text() {
+        let cols = plan_columns(&[
+            json!({"big": 1, "small": 1}),
+            json!({"big": 18446744073709551615u64, "small": 2}),
+        ])
+        .unwrap();
+        let ty = |n: &str| cols.iter().find(|c| c.name == n).unwrap().base_type;
+        assert_eq!(ty("big"), SqlBaseType::Text);
+        assert_eq!(ty("small"), SqlBaseType::Integer);
     }
 
     #[test]

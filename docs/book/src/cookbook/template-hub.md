@@ -70,7 +70,7 @@ streams:
 
 | Field | Purpose |
 |---|---|
-| `name` | Short name (`^[a-z0-9][a-z0-9_-]*$`, equal to the file stem). With `owner`, the hub id is `owner/name`; the id is the composed pipeline's `name:` — so per-stream state keys are `{id}::{stream}` and bookmarks survive swapping the sink. |
+| `name` | Short name (`^[a-z0-9][a-z0-9_-]*$`, equal to the file stem). With `owner`, the hub id is `owner/name`; the composed pipeline's `name:` is `{id}.{sink id}` — so per-stream state keys are `{id}.{sink id}::{stream}` and each pairing keeps its own bookmarks (a deployment overlay's `state_scope: source` shares them across sinks). |
 | `owner` | Publisher namespace — the GitHub user or org login the file lives under (`source-templates/<owner>/`). `faucet-hq` for the hub's official templates. |
 | `params`, `auth` | Same grammar as a pipeline's `params:` / `auth:` blocks. Merged with the sink template's at compose time; a name declared by both with different specs is an error. |
 | `source` | The connector every stream reads through. Shared transforms go in the top-level `transforms`, not here. |
@@ -132,7 +132,11 @@ The composer records the substitution (`overwrite→append` in `faucet hub
 check`) and validates it against the connector registry: the target mode must
 be one the connector supports, an alias for a natively supported mode is
 refused as redundant, and keyed modes (`upsert`, `delete`) cannot be aliased —
-only a sink that dedups by key can honour them.
+only a sink that dedups by key can honour them. `overwrite: append` is refused
+for a built-in sink that, as configured, keeps what earlier runs wrote (an
+appending file, a queue, an object store with unique names, a warehouse): every
+overwrite stream would re-append the whole table on each run. A plugin sink is
+taken at its template's word.
 
 ### Child streams and truncating sinks
 
@@ -165,8 +169,10 @@ is refused. Set `if_exists: append`, or put a per-parent token in the path.
 ## Composition and the compatibility matrix
 
 `faucet run --source X --sink Y` (and `faucet validate --source X --sink Y`,
-`faucet hub compose`) build an ordinary config document:
+`faucet hub compose`) build an ordinary config document (shape only — the
+`<…>` parts stand for what each template contributes):
 
+<!-- faucet:no-validate -->
 ```yaml
 version: 1
 name: acme/billing                           # the source's hub id
@@ -242,8 +248,14 @@ message saying so, so the shape of a run is always fixed by its two templates.
 `state` and `dlq` land under `pipeline.`, the rest at the top level, and an
 overlay's value replaces whatever the composition carried. Its `params:` merge
 with the templates' (a name declared on both sides must be declared
-identically). The run keeps the source's `name`, so its state keys are the
-same with or without an overlay, and across sink swaps.
+identically). The run keeps the pairing's `name` (`{source}.{sink}`), so its
+state keys are the same with or without an overlay. A new destination starts
+from an empty bookmark; to have a sink swap resume where the previous sink
+stopped, set `state_scope: source` on the overlay — the run is then named after
+the source alone, so never run two pairings of it at once. A `streams.<name>`
+entry must name a stream of the source template; on a run that selects only
+some streams (a row selection, or the streams a sink can run), entries for the
+streams left out are skipped.
 
 `faucet validate` and `faucet hub check --overlay` print what the overlay set
 (`pipeline.state, notifications, matrix.invoices.sla`, …). Two warnings are
@@ -268,10 +280,10 @@ secrets.
 
 ```bash
 faucet hub list      [--hub DIR] [--json]
-faucet hub check     --source X --sink Y [--overlay O] [--json]  # per-stream write modes; exit≠0 if incompatible
+faucet hub check     --source X --sink Y [--overlay O] [--json]  # per-stream write modes + typed config validation; exit≠0 if incompatible or invalid
 faucet hub compose   --source X --sink Y [--overlay O] [--out FILE|--json]
 faucet hub matrix    [--format table|markdown|json] [--out FILE]
-faucet hub lint      [--hub DIR] [FILE…]                   # publishability lint
+faucet hub lint      [--hub DIR] [FILE…]                   # publishability lint + typed config validation
 faucet run           --source X --sink Y [--overlay O] [--param k=v] …  # compose + run
 faucet validate      --source X --sink Y [--overlay O] [--show-composed]  # compose + validate offline
 faucet schema source-template | sink-template | deployment
@@ -377,7 +389,7 @@ Hand it credentials through its declared params (`--param`, `--param-env`),
 or review it and pass `--trust <owner>` (or `--trust <owner/name>`).
 
 The full id names the composed pipeline, so state keys are
-`acme/erp::invoices` and two publishers' templates never collide in a
+`acme/erp.faucet-hq/bigquery::invoices` and two publishers' templates never collide in a
 shared state store or registry (`/` is a legal state-key character; the file
 store encodes it). In `per_stream` addressing `${source}` stays the short
 name — a table cannot contain `/` — and `${owner}` is available for paths
@@ -446,7 +458,7 @@ records facts that help you choose, in `index.json` under each entry's `trust`:
 
 | Signal | What it is |
 |---|---|
-| `stars` | upvotes (↑) on the template's discussion in the catalog (**Discussions → Templates**). GitHub allows one upvote per account. |
+| `stars` | distinct GitHub accounts that reacted 👍, ❤️ or 🚀 on the template's discussion in the catalog (**Discussions → Templates**). Each account counts once however many of the three it uses; upvotes (↑) are not counted. |
 | `updated` / `stable_since` | when the newest version landed, and when the stable one did |
 | `open_issues` | open catalog issues labelled `template:<id>` |
 | `compatible_sinks` | how many sink templates the source composes with in full |
@@ -467,7 +479,8 @@ faucet run --source erp --sink faucet-hq/bigquery
 
 Variants are ranked official first, then by stars, then by recency. The
 [hub page](https://faucet-hq.github.io/hub) shows the same signals on every
-card and sorts by them. To star a template, upvote its discussion; to report a
+card and sorts by them. To star a template, react 👍, ❤️ or 🚀 on its discussion
+(the hub page's comment widget does this for you); to report a
 problem, open an issue with its `template:<id>` label.
 
 ### Mirror the hub into your server
@@ -551,11 +564,24 @@ repository's catalog test runs it plus a full composition of every pairing:
 
 - credentials are `${param.NAME}` (`secret: true`) or `${env:…}` /
   `${secret:…}` — never a literal value; a param whose name looks like a
-  credential must be marked `secret`, and a secret param has no default;
+  credential must be marked `secret`, and a secret param has no default. The
+  check covers every block of the template (named `sources:`, per-stream
+  overrides, headers), any key spelling (`api_token`, `apiToken`,
+  `X-Api-Key`, `Authorization`), numbers as well as strings, a value written
+  as `Bearer …` / `Basic …` / `Token …`, and a password embedded in a URL
+  (`postgres://user:pw@host`);
 - no private infrastructure or placeholder text (`.internal`, managed-DB
   hostnames, `REPLACE_ME`);
 - a `description`; `name` equal to the file stem; unique stream names; every
-  `${param.*}` reference declared.
+  `${param.*}` reference declared;
+- the configs it produces pass the typed validation `faucet validate` runs:
+  a source template is composed with a probe sink, a sink template with a probe
+  source, every placeholder-bound connector config is deserialized into its
+  typed struct and every transform chain compiled. A failure names the param
+  responsible when one is — e.g. a `type: int` param used as a whole
+  `query_params` value, which the REST source requires to be a string. A
+  connector this binary was built without is skipped. `faucet hub check` runs
+  the same validation on the composed pairing and names both template files.
 
 See also: [Parameters & pipeline templates](./templates.md) (the registry a
 composed pipeline can be registered into), [Write modes / upsert](./upsert.md),

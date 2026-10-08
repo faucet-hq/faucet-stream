@@ -263,6 +263,7 @@ FAUCET_SERVE_AUTH_TOKEN=s3cret faucet serve --listen 0.0.0.0:8080      # bearer 
 faucet serve --no-auth                                                 # explicit no-auth opt-in (required if no token)
 faucet serve --history sqlite:/var/lib/faucet/runs.db                  # durable run history
 faucet serve --default-config defaults.yaml                            # merge workspace defaults under every run
+faucet serve --otel-config otel.yaml                                   # OTLP traces + metrics (an `observability.otel` block; `otel` feature)
 ```
 
 Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** without `--no-auth`, startup fails (an unauthenticated server is never accidental). The default bind is loopback.
@@ -974,7 +975,7 @@ metrics (`faucet_pipeline_adaptive_batch_*`).
 #### State keys
 
 - Root invocations: `{name}::{row_id}`.
-- Child invocations: `{name}::{row_id}::{parent_record_key}` where `parent_record_key` is the value at `parent_key` (default `id`) in the parent record.
+- Child invocations: `{name}::{row_id}::{parent_record_key}` where `parent_record_key` is the value at `parent_key` (default `id`) in the parent record. A value with characters outside `[A-Za-z0-9_.:/-]`, a `::`, or more than 64 characters is written as a readable prefix plus a stable hash, so an email or a non-ASCII key still gets its own resumable state; a parent key that collides with a sibling's fails only that child invocation.
 
 A state-key collision among siblings sharing a parent is detected upfront and errors with both offenders named.
 

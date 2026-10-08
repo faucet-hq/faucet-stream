@@ -58,6 +58,7 @@ fn args(port: u16) -> ServeArgs {
         triggers: None,
         templates_sync: None,
         policy: None,
+        otel_config: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
@@ -173,7 +174,7 @@ streams:
   - name: deals
     source: {{ config: {{ path: "${{param.data_dir}}/deals.csv" }} }}
     primary_keys: [id]
-    write: [overwrite]
+    write: [overwrite, append]
   - name: deal_lines
     parent: deals
     source: {{ config: {{ path: "{d}/lines-${{deals.id}}.csv" }} }}
@@ -200,8 +201,6 @@ sink:
   config: {{ append: true }}
 per_stream:
   path: "${{param.out_dir}}/${{stream}}.jsonl"
-write_mode_aliases:
-  overwrite: append
 "#,
         o = out.display()
     )
@@ -318,10 +317,9 @@ async fn rows_api_describes_every_group_and_resolves_selections() {
         accounts["guarantees"]["delivery_guarantee"],
         "at-least-once"
     );
-    assert_eq!(
-        row(&r, "deals")["write"]["alias_applied"],
-        "overwrite→append"
-    );
+    // An appending sink cannot alias overwrite to append (it would re-append
+    // the whole table each run), so `deals` falls back to its listed append.
+    assert_eq!(row(&r, "deals")["write"]["resolved"], "append");
     let audit = row(&r, "audit");
     assert_eq!(audit["write"]["supported"], false);
     assert!(
@@ -469,6 +467,38 @@ async fn a_selection_runs_the_subset_from_every_http_path() {
     );
     assert!(exists(&out, "deals") && exists(&out, "deal_lines"));
     assert!(!exists(&out, "accounts"));
+
+    // An overlay tuning a stream the selection drops still applies to the
+    // rest (#789 CLI-67); a stream the template does not have is refused.
+    let overlay = |stream: &str| {
+        json!({
+            "kind": "deployment",
+            "name": "ops",
+            "streams": {
+                stream: { "delivery": "at_least_once" },
+                "deals": { "delivery": "at_least_once" }
+            }
+        })
+    };
+    let (code, v) = api
+        .post(
+            "/v1/templates/crm/runs",
+            json!({ "sink": "files", "overlay": overlay("accounts"),
+                    "selection": { "select": ["deal_lines"], "include_parents": "eligible" } }),
+        )
+        .await;
+    assert_eq!(code, 202, "{v}");
+    let run = api.wait_terminal(v["run_id"].as_str().unwrap()).await;
+    assert_eq!(run["status"], "completed", "{run}");
+    let (code, v) = api
+        .post(
+            "/v1/templates/crm/runs",
+            json!({ "sink": "files", "overlay": overlay("nope"),
+                    "selection": { "select": ["deal_lines"], "include_parents": "eligible" } }),
+        )
+        .await;
+    assert_eq!(code, 422, "{v}");
+    assert!(v.to_string().contains("names no stream"), "{v}");
 
     // Unknown stream → 400 naming the valid ones.
     let (code, v) = api

@@ -9,7 +9,11 @@ use crate::config::WasmTransformConfig;
 use crate::instance::WasmInstance;
 use crate::metrics;
 use faucet_core::FaucetError;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
@@ -34,7 +38,7 @@ pub(crate) const MAX_TABLE_ELEMENTS: usize = 100_000;
 /// A compiled WASM transform: owns the wasmtime engine, the compiled module,
 /// and the import linker. Cheap to build an instance from, per page.
 pub(crate) struct WasmEngine {
-    engine: Engine,
+    pub(crate) engine: Engine,
     module: Module,
     linker: Linker<HostState>,
     pub(crate) function: String,
@@ -59,22 +63,7 @@ impl WasmEngine {
             ))
         })?;
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-
-        let mut config = Config::new();
-        config.consume_fuel(true);
-        config.wasm_multi_memory(false);
-        let engine = Engine::new(&config)
-            .map_err(|e| FaucetError::Config(format!("wasm transform: engine init failed: {e}")))?;
-
-        let compile_start = Instant::now();
-        let module = Module::new(&engine, &bytes).map_err(|e| {
-            FaucetError::Config(format!(
-                "wasm transform: failed to compile '{}': {e}",
-                path.display()
-            ))
-        })?;
-        metrics::compile_duration(&module_label, compile_start.elapsed().as_secs_f64());
-
+        let (engine, module) = off_worker(|| cached_module(&path, &bytes, &module_label))?;
         let linker = build_linker(&engine)?;
 
         let memory_bytes = (cfg.memory_limit_mb as usize) * 1024 * 1024;
@@ -116,12 +105,21 @@ impl WasmEngine {
         match std::fs::read(&self.path) {
             Ok(bytes) => {
                 let start = Instant::now();
-                match Module::new(&self.engine, &bytes) {
+                match off_worker(|| Module::new(&self.engine, &bytes)) {
                     Ok(module) => {
                         metrics::compile_duration(
                             &self.module_label,
                             start.elapsed().as_secs_f64(),
                         );
+                        if let Err(e) = self.instance_for(&module) {
+                            tracing::warn!(
+                                target: "faucet::transform::wasm",
+                                module = %self.module_label,
+                                error = %e,
+                                "wasm module changed but fails the ABI check; keeping previous module"
+                            );
+                            return;
+                        }
                         self.module = module;
                         self.mtime = cur;
                         tracing::info!(
@@ -155,6 +153,10 @@ impl WasmEngine {
 
     /// Create a fresh store + instance for one page.
     pub(crate) fn new_page_instance(&self) -> Result<WasmInstance, FaucetError> {
+        self.instance_for(&self.module)
+    }
+
+    fn instance_for(&self, module: &Module) -> Result<WasmInstance, FaucetError> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.memory_bytes)
             .memories(1)
@@ -179,16 +181,71 @@ impl WasmEngine {
         store.set_fuel(self.fuel_limit).map_err(|e| {
             FaucetError::Config(format!("wasm transform: could not enable fuel: {e}"))
         })?;
-        let instance = self
-            .linker
-            .instantiate(&mut store, &self.module)
-            .map_err(|e| {
-                FaucetError::Transform(format!(
-                    "wasm transform: instantiation failed for '{}': {e}",
-                    self.module_label
-                ))
-            })?;
+        let instance = self.linker.instantiate(&mut store, module).map_err(|e| {
+            FaucetError::Transform(format!(
+                "wasm transform: instantiation failed for '{}': {e}",
+                self.module_label
+            ))
+        })?;
         WasmInstance::new(store, instance, &self.function, self.fuel_limit)
+    }
+}
+
+/// Compiled modules by content, shared across invocations: a fan-out of N
+/// parents running one module compiles it once.
+type ModuleCache = Mutex<HashMap<(u64, usize), (Engine, Module)>>;
+
+/// Entries kept before the cache is cleared.
+const MODULE_CACHE_CAP: usize = 64;
+
+static MODULE_CACHE: OnceLock<ModuleCache> = OnceLock::new();
+
+/// Modules compiled by this process (cache misses).
+pub(crate) static MODULES_COMPILED: AtomicU64 = AtomicU64::new(0);
+
+fn cached_module(
+    path: &std::path::Path,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(Engine, Module), FaucetError> {
+    let mut hasher = std::hash::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let key = (hasher.finish(), bytes.len());
+    let cache = MODULE_CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(hit.clone());
+    }
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    config.wasm_multi_memory(false);
+    let engine = Engine::new(&config)
+        .map_err(|e| FaucetError::Config(format!("wasm transform: engine init failed: {e}")))?;
+    let compile_start = Instant::now();
+    let module = Module::new(&engine, bytes).map_err(|e| {
+        FaucetError::Config(format!(
+            "wasm transform: failed to compile '{}': {e}",
+            path.display()
+        ))
+    })?;
+    MODULES_COMPILED.fetch_add(1, Ordering::Relaxed);
+    metrics::compile_duration(label, compile_start.elapsed().as_secs_f64());
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= MODULE_CACHE_CAP {
+        map.clear();
+    }
+    map.insert(key, (engine.clone(), module.clone()));
+    Ok((engine, module))
+}
+
+/// Run blocking work without pinning a tokio worker: on a multi-thread
+/// runtime the worker hands its other tasks off first (`block_in_place`).
+pub(crate) fn off_worker<T>(f: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_thread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
     }
 }
 

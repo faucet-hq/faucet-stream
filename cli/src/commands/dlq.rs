@@ -211,7 +211,8 @@ fn parse_before(s: &str, now: DateTime<Utc>) -> CliResult<i64> {
 /// Parse a relative age like `7d` into an epoch-millis cutoff (`now - age`).
 /// Returns `None` if `s` is not `<positive-int><d|h|m|s>`.
 fn parse_relative_age(s: &str, now: DateTime<Utc>) -> Option<i64> {
-    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
+    let last = s.chars().last()?;
+    let (num, unit) = s.split_at(s.len() - last.len_utf8());
     let n: i64 = num.parse().ok()?;
     if n <= 0 {
         return None;
@@ -223,12 +224,21 @@ fn parse_relative_age(s: &str, now: DateTime<Utc>) -> Option<i64> {
         "s" => n,
         _ => return None,
     };
-    Some((now - chrono::Duration::seconds(secs)).timestamp_millis())
+    now.checked_sub_signed(chrono::Duration::try_seconds(secs)?)
+        .map(|t| t.timestamp_millis())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_range_or_multibyte_ages_are_rejected_not_panicking() {
+        assert_eq!(parse_relative_age("99999999999999999s", now()), None);
+        assert_eq!(parse_relative_age("9999999999999d", now()), None);
+        assert_eq!(parse_relative_age("7é", now()), None);
+        assert!(parse_before("99999999999999999s", now()).is_err());
+    }
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-06T00:00:00Z")

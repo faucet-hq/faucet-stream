@@ -402,7 +402,7 @@ format and option the file sink does, with the same field names:
 | `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`** — the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each object's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
-| `scratch_dir` | a local directory | Where objects are built before upload (default: the system temporary directory; a private subdirectory is created in it). Every object is built whole before it is uploaded, so this needs room for up to `concurrency` + 1 objects. Scratch files are not encrypted while the run is in progress. |
+| `scratch_dir` | a local directory | Where objects are built before upload (default: the system temporary directory; a private subdirectory is created in it). Every object is built whole before it is uploaded, so this needs room for up to `concurrency` + 1 objects. Scratch files are not encrypted while the run is in progress; a run that crashed leaves its scratch directory behind, and the next run of any remote file sink using the same `scratch_dir` removes it. |
 
 `if_exists: append` / `error` and `write_mode: overwrite` need `path`: without it every run
 writes new, uniquely named objects (`<run id>-<part><file_extension>`), so
@@ -412,7 +412,8 @@ there is nothing to replace or append to.
 with one upload (resumable past the client's threshold, finalised only when every byte arrived) when it closes — at `max_records_per_file` /
 `max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
 partial object, and a bookmark never advances past records that are not
-there.
+there. Every upload declares the object's CRC32C up front, so the server
+refuses an object whose stored bytes differ from the scratch file.
 
 Object names are `prefix + path`.
 

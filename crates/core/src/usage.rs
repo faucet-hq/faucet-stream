@@ -118,6 +118,18 @@ pub struct CostSignal {
     pub connector: String,
 }
 
+fn fold_signal(signals: &mut Vec<CostSignal>, signal: CostSignal) {
+    match signals.iter_mut().find(|s| {
+        s.kind == signal.kind
+            && s.unit == signal.unit
+            && s.side == signal.side
+            && s.connector == signal.connector
+    }) {
+        Some(s) => s.quantity += signal.quantity,
+        None => signals.push(signal),
+    }
+}
+
 /// The counters a run accumulated, frozen for reporting and storage.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageSnapshot {
@@ -167,7 +179,8 @@ impl UsageSnapshot {
         }
     }
 
-    /// Fold another snapshot into this one (sums; signals concatenated).
+    /// Fold another snapshot into this one (sums; signals summed per kind,
+    /// unit, side and connector).
     pub fn merge(&mut self, other: &UsageSnapshot) {
         self.records_read += other.records_read;
         self.records_written += other.records_written;
@@ -179,7 +192,9 @@ impl UsageSnapshot {
         for (k, v) in &other.sink_roundtrips {
             *self.sink_roundtrips.entry(k.clone()).or_default() += v;
         }
-        self.signals.extend(other.signals.iter().cloned());
+        for sig in &other.signals {
+            fold_signal(&mut self.signals, sig.clone());
+        }
         self.throttled += other.throttled;
         self.throttle_wait_secs += other.throttle_wait_secs;
         for (k, v) in &other.source_retries {
@@ -225,12 +240,13 @@ impl UsageMeter {
         *map.entry((side, op)).or_default() += 1;
     }
 
-    /// Record a backend-reported usage figure.
+    /// Record a backend-reported usage figure, summed into the entry with the
+    /// same kind, unit, side and connector.
     pub fn add_signal(&self, signal: CostSignal) {
-        self.signals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(signal);
+        fold_signal(
+            &mut self.signals.lock().unwrap_or_else(|e| e.into_inner()),
+            signal,
+        );
     }
 
     /// Count one rate-limit response the source received.
@@ -372,7 +388,8 @@ mod tests {
         total.merge(&s);
         assert_eq!(total.records_written, 4);
         assert_eq!(total.source_roundtrips["page"], 4);
-        assert_eq!(total.signals.len(), 2);
+        assert_eq!(total.signals.len(), 1);
+        assert_eq!(total.signals[0].quantity, 2048.0);
         let round: UsageSnapshot =
             serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
         assert_eq!(round, s);
@@ -409,5 +426,29 @@ mod tests {
         let round: UsageSnapshot =
             serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
         assert_eq!(round, s);
+    }
+
+    #[test]
+    fn signals_are_summed_per_kind_unit_side_and_connector() {
+        let sig = |kind: &str, q: f64| CostSignal {
+            kind: kind.into(),
+            unit: "bytes".into(),
+            quantity: q,
+            side: UsageSide::Sink,
+            connector: "bigquery".into(),
+        };
+        let m = UsageMeter::new();
+        for _ in 0..1000 {
+            m.add_signal(sig("bytes_streamed", 2.0));
+        }
+        m.add_signal(sig("bytes_billed", 5.0));
+        let mut snap = m.snapshot();
+        assert_eq!(snap.signals.len(), 2);
+        assert_eq!(snap.signals[0].quantity, 2000.0);
+        let other = snap.clone();
+        snap.merge(&other);
+        assert_eq!(snap.signals.len(), 2);
+        assert_eq!(snap.signals[0].quantity, 4000.0);
+        assert_eq!(snap.signals[1].quantity, 10.0);
     }
 }

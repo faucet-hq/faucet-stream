@@ -117,9 +117,24 @@ pub fn read_records<R: std::io::Read>(
     chunk: usize,
     f: &mut dyn FnMut(Vec<Value>) -> Result<(), FaucetError>,
 ) -> Result<Schema, FaucetError> {
+    read_records_checked(reader, reader_schema, None, chunk, f)
+}
+
+/// Checks a file's writer schema before any of its rows are decoded.
+pub(crate) type WriterCheck<'a> = dyn Fn(&Schema) -> Result<(), FaucetError> + 'a;
+
+/// [`read_records`] with a writer-schema check run before the first row.
+pub(crate) fn read_records_checked<R: std::io::Read>(
+    reader: R,
+    reader_schema: Option<&Schema>,
+    check: Option<&WriterCheck<'_>>,
+    chunk: usize,
+    f: &mut dyn FnMut(Vec<Value>) -> Result<(), FaucetError>,
+) -> Result<Schema, FaucetError> {
     read_with(
         reader,
         reader_schema,
+        check,
         chunk,
         Mode::Record,
         &mut |chunk, _| f(chunk),
@@ -140,6 +155,7 @@ pub(crate) type ChunkSink<'a> = dyn FnMut(Vec<Value>, &Schema) -> Result<(), Fau
 pub(crate) fn read_with<R: std::io::Read>(
     reader: R,
     reader_schema: Option<&Schema>,
+    check: Option<&WriterCheck<'_>>,
     chunk: usize,
     mode: Mode,
     f: &mut ChunkSink<'_>,
@@ -150,6 +166,9 @@ pub(crate) fn read_with<R: std::io::Read>(
         None => builder.build(),
     }
     .map_err(|e| FaucetError::Source(format!("avro header: {e}")))?;
+    if let Some(check) = check {
+        check(r.writer_schema())?;
+    }
     let schema = reader_schema
         .cloned()
         .unwrap_or_else(|| r.writer_schema().clone());
@@ -540,13 +559,29 @@ pub(crate) fn decimal_from_str(
         return Err(format!("{text:?} is not a decimal"));
     }
     let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
-    let point = int.len() as i64 + exp;
-    let wanted = point + scale as i64;
-    if wanted < 0 {
-        if digits.iter().any(|d| *d != 0) {
-            return Err(format!("{text:?} has more than {scale} fractional digits"));
+    let out_of_range = || format!("{text:?} is out of range for precision {precision}");
+    let wanted = (int.len() as i64)
+        .checked_add(exp)
+        .and_then(|p| p.checked_add(scale as i64))
+        .ok_or_else(out_of_range)?;
+    // Check the significant digits the scaled value would need before padding,
+    // so an exponent such as `1e18` cannot drive an enormous allocation.
+    match digits.iter().position(|d| *d != 0) {
+        None => digits.clear(),
+        Some(first)
+            if wanted > first as i64 && (wanted - first as i64) as u128 > precision as u128 =>
+        {
+            return Err(format!(
+                "{text:?} needs {} digits, more than the precision {precision}",
+                wanted - first as i64
+            ));
         }
-        digits.clear();
+        Some(_) => {}
+    }
+    if digits.is_empty() {
+        // Zero at any exponent: nothing to scale.
+    } else if wanted < 0 {
+        return Err(format!("{text:?} has more than {scale} fractional digits"));
     } else {
         let wanted = wanted as usize;
         if digits.len() > wanted {
@@ -1185,6 +1220,18 @@ pub fn read_batches<R: std::io::Read>(
     batch_size: usize,
     f: &mut dyn FnMut(arrow::array::RecordBatch) -> Result<(), FaucetError>,
 ) -> Result<(Schema, arrow::datatypes::SchemaRef), FaucetError> {
+    read_batches_checked(reader, reader_schema, None, batch_size, f)
+}
+
+/// [`read_batches`] with a writer-schema check run before the first row.
+#[cfg(feature = "arrow")]
+pub(crate) fn read_batches_checked<R: std::io::Read>(
+    reader: R,
+    reader_schema: Option<&Schema>,
+    check: Option<&WriterCheck<'_>>,
+    batch_size: usize,
+    f: &mut dyn FnMut(arrow::array::RecordBatch) -> Result<(), FaucetError>,
+) -> Result<(Schema, arrow::datatypes::SchemaRef), FaucetError> {
     let chunk = if batch_size == 0 {
         usize::MAX
     } else {
@@ -1194,6 +1241,7 @@ pub fn read_batches<R: std::io::Read>(
     let schema = read_with(
         reader,
         reader_schema,
+        check,
         chunk,
         Mode::Arrow,
         &mut |rows, schema| {
@@ -1477,6 +1525,16 @@ mod tests {
             "1.23"
         );
         assert!(decimal_from_str("1.234", 2, 5).is_err());
+        // A huge exponent is refused before any padding (CORE-35).
+        for huge in ["1e18", "1e9223372036854775807", "-5e400000000000"] {
+            let err = decimal_from_str(huge, 2, 10).unwrap_err();
+            assert!(err.contains("precision"), "{huge}: {err}");
+        }
+        assert_eq!(
+            decimal_to_string(&decimal_from_str("0e400000000000", 2, 5).expect("zero"), 2),
+            "0.00"
+        );
+        assert!(decimal_from_str("1e-9223372036854775807", 2, 5).is_err());
         assert!(decimal_from_str("123456", 0, 5).is_err());
         assert!(decimal_from_str("abc", 0, 5).is_err());
         assert!(decimal_from_str("1e-9", 2, 5).is_err());

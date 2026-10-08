@@ -55,6 +55,8 @@ async fn conformance_connector_name_nonempty() {
 /// `http://host:port` endpoint URL.
 async fn start_minio() -> (ContainerAsync<MinIO>, String) {
     let container: ContainerAsync<MinIO> = MinIO::default()
+        // tmpfs: MinIO refuses writes when the runner disk is nearly full.
+        .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
         .with_name(MINIO_IMAGE_NAME)
         .with_tag(MINIO_IMAGE_TAG)
         .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))

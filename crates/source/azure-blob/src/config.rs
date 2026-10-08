@@ -91,6 +91,13 @@ pub struct AzureBlobSourceConfig {
     pub connection: AzureConnection,
     /// Object name prefix filter. Ignored when `object_keys` is set.
     pub prefix: Option<String>,
+    /// Glob over the whole object key selecting which listed objects to read
+    /// (e.g. `exports/*.parquet`). Without it, folder markers and objects
+    /// with a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,
+    /// `_temporary/`, `.crc`) are skipped; with it, exactly the matching keys
+    /// are read.
+    #[serde(default)]
+    pub include: Option<String>,
     /// Explicit object names. When set, listing is skipped and `prefix`
     /// is ignored.
     pub object_keys: Option<Vec<String>>,
@@ -124,6 +131,12 @@ pub struct AzureBlobSourceConfig {
     /// rather than silently ignored — see `validate()`.
     #[serde(default)]
     pub verify_checksum: bool,
+    /// Largest object, once decompressed, that a format read whole (JSON
+    /// array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may
+    /// reach; a larger one fails with an error instead of exhausting memory.
+    /// Default 2 GiB.
+    #[serde(default = "default_max_object_bytes")]
+    pub max_object_bytes: u64,
     /// Compression codec applied to each downloaded object. Defaults to
     /// [`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the
     /// codec is resolved per-object-key, so a single source can read a mix of
@@ -160,6 +173,10 @@ fn default_true() -> bool {
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
 }
+fn default_max_object_bytes() -> u64 {
+    faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
+}
+
 fn default_concurrency() -> usize {
     10
 }
@@ -170,6 +187,7 @@ impl AzureBlobSourceConfig {
         Self {
             connection: AzureConnection::new(container),
             prefix: None,
+            include: None,
             object_keys: None,
             file_format: AzureFileFormat::default(),
             max_objects: None,
@@ -177,6 +195,7 @@ impl AzureBlobSourceConfig {
             batch_size: default_batch_size(),
             verify_length: true,
             verify_checksum: false,
+            max_object_bytes: default_max_object_bytes(),
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),
             csv: faucet_core::CsvOptions::default(),

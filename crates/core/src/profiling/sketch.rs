@@ -118,8 +118,8 @@ impl TopK {
         let (victim, min) = self
             .counters
             .iter()
+            .min_by(|a, b| a.1.0.cmp(&b.1.0).then_with(|| a.0.cmp(b.0)))
             .map(|(k, (c, _))| (k.clone(), *c))
-            .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
             .expect("capacity >= 1");
         self.counters.remove(&victim);
         self.counters.insert(value.to_string(), (min + 1, min));

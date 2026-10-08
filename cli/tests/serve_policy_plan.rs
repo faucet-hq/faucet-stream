@@ -85,6 +85,7 @@ fn serve_args(
         triggers: None,
         templates_sync: None,
         policy,
+        otel_config: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
