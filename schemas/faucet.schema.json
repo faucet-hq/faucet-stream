@@ -4949,7 +4949,7 @@
       ]
     },
     "source_rest__BindFormat": {
-      "description": "How the bookmark value is formatted before it is substituted into the\n[`ReplicationBind::template`].\n\nFor every non-[`Raw`](BindFormat::Raw) format the bookmark is first parsed\ninto an instant: a string is read as RFC 3339, a bare `YYYY-MM-DD` date\n(midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON\nnumber is read as **epoch seconds**. It is then re-emitted in the target\nrepresentation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both\nwork.",
+      "description": "How the bookmark value is formatted before it is substituted into the\n[`ReplicationBind::template`].\n\nFor every non-[`Raw`](BindFormat::Raw) format the bookmark is first parsed\ninto an instant: a string is read as RFC 3339, a bare `YYYY-MM-DD` date\n(midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON\nnumber is read as **epoch seconds**. It is then re-emitted in the target\nrepresentation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both\nwork. A JSON number under `epoch_s` / `epoch_ms` is taken to be in that\nunit already and emitted as its integer value.",
       "oneOf": [
         {
           "description": "Emit the scalar verbatim (string as-is, number as its decimal form).\nThe default; no timestamp parsing.",
@@ -29251,7 +29251,7 @@
       "additionalProperties": true
     },
     "source_graphql__BindFormat": {
-      "description": "How the bookmark value is formatted before it is substituted into the\n[`ReplicationBind::template`].\n\nFor every non-[`Raw`](BindFormat::Raw) format the bookmark is first parsed\ninto an instant: a string is read as RFC 3339, a bare `YYYY-MM-DD` date\n(midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON\nnumber is read as **epoch seconds**. It is then re-emitted in the target\nrepresentation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both\nwork.",
+      "description": "How the bookmark value is formatted before it is substituted into the\n[`ReplicationBind::template`].\n\nFor every non-[`Raw`](BindFormat::Raw) format the bookmark is first parsed\ninto an instant: a string is read as RFC 3339, a bare `YYYY-MM-DD` date\n(midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON\nnumber is read as **epoch seconds**. It is then re-emitted in the target\nrepresentation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both\nwork. A JSON number under `epoch_s` / `epoch_ms` is taken to be in that\nunit already and emitted as its integer value.",
       "oneOf": [
         {
           "description": "Emit the scalar verbatim (string as-is, number as its decimal form).\nThe default; no timestamp parsing.",

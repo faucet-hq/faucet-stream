@@ -289,7 +289,7 @@ transaction, so it cannot be replayed idempotently).
 | Metric | Meaning |
 |---|---|
 | `faucet_cleanup_deleted_total{pipeline,row,connector}` | Rows deleted. Emitted even at zero — zero is the steady state a healthy mirror shows. |
-| `faucet_cleanup_runs_total{pipeline,row,outcome}` | `applied` / `skipped_cancelled` / `refused_overflow`. A non-zero `refused_overflow` means stale rows were left behind — worth alerting on. |
+| `faucet_cleanup_runs_total{pipeline,row,outcome}` | `applied` / `skipped_cancelled` / `refused_overflow` / `failed` (the sink's delete errored). A non-zero `refused_overflow` or `failed` means stale rows were left behind — worth alerting on. |
 
 ## Overwrite (full refresh)
 

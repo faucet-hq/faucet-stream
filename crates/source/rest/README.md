@@ -229,7 +229,7 @@ net). Requires `replication_method: incremental` + `replication_key`.
 | `path` | string / null | `null` | `into: body` only: an RFC 6901 JSON Pointer into the configured `body` (`/filterGroups/0/filters/0/value`) instead of a top-level `name`. Set exactly one of `name` / `path`. The pointer must resolve to an existing scalar (or `null`), or to a new key of an existing object — array elements and intermediate objects are never created, and an unresolvable pointer fails the request naming it. Requires a JSON object `body`; two binds may not write the same pointer. |
 | `value_type` | `string \| number` | `string` | JSON type a body bind writes — `number` for an `epoch_ms` / `epoch_s` value an API wants unquoted. |
 | `template` | string | `${bookmark}` | Rendered with `${bookmark}` → the formatted value, e.g. `"gte\|${bookmark}"`, `"[${bookmark} TO *]"`. |
-| `format` | `raw \| iso8601 \| epoch_s \| epoch_ms \| date` | `raw` | Value formatting (string↔epoch conversion via a parsed instant). |
+| `format` | `raw \| iso8601 \| epoch_s \| epoch_ms \| date` | `raw` | Value formatting (string↔epoch conversion via a parsed instant; a numeric bookmark under `epoch_s` / `epoch_ms` is taken to be in that unit already). |
 | `advance_from` | string / null | `null` | JSONPath into the **response** to advance the bookmark from, instead of `max(record[replication_key])`. |
 
 ```yaml

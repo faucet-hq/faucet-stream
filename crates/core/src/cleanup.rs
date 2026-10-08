@@ -277,6 +277,12 @@ impl<'a, S: Sink + ?Sized> CleanupTracker<'a, S> {
         self.inner.cleanup_scope(&policy.scope, &seen).await
     }
 
+    /// Whether more keys were written than the policy's ceiling, so the
+    /// cleanup was (or will be) refused rather than run.
+    pub fn overflowed(&self) -> bool {
+        self.seen.lock().map(|g| g.overflowed()).unwrap_or(true)
+    }
+
     /// Number of keys tracked so far (for logging).
     pub fn tracked(&self) -> usize {
         self.seen.lock().map(|g| g.len()).unwrap_or(0)
@@ -602,5 +608,37 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn overflowed_tells_a_refusal_from_a_backend_failure() {
+        struct Fails;
+        #[async_trait::async_trait]
+        impl Sink for Fails {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            fn supports_cleanup(&self) -> bool {
+                true
+            }
+            async fn cleanup_scope(
+                &self,
+                _: &BTreeMap<String, Value>,
+                _: &SeenKeys,
+            ) -> Result<u64, FaucetError> {
+                Err(FaucetError::Sink("db down".into()))
+            }
+        }
+        let policy = CleanupPolicy::new(scope(), vec!["id".into()], 1).unwrap();
+        let t = CleanupTracker::new(&Fails, &policy);
+        t.write_batch(&[json!({"id": 1})]).await.unwrap();
+        assert!(t.finish(&policy).await.is_err());
+        assert!(!t.overflowed());
+        let t = CleanupTracker::new(&Fails, &policy);
+        t.write_batch(&[json!({"id": 1}), json!({"id": 2})])
+            .await
+            .unwrap();
+        assert!(t.finish(&policy).await.is_err());
+        assert!(t.overflowed());
     }
 }

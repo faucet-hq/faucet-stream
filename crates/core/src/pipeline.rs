@@ -905,11 +905,12 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                                         );
                                     }
                                     Err(e) => {
-                                        crate::observability::cleanup_run(
-                                            &name,
-                                            &row,
-                                            "refused_overflow",
-                                        );
+                                        let outcome = if tracker.overflowed() {
+                                            "refused_overflow"
+                                        } else {
+                                            "failed"
+                                        };
+                                        crate::observability::cleanup_run(&name, &row, outcome);
                                         return Err(e);
                                     }
                                 }
