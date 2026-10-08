@@ -47,6 +47,10 @@ pub async fn build_storage_control(
 - `build_storage_control` returns the **control-plane** `StorageControl` client used by source object listings (`list_objects`).
 - `storage_host` is an integration-test escape hatch — pass `None` in production. Tests target `fake-gcs-server` with `Some("http://127.0.0.1:4443")`, which sets the client endpoint. For a plaintext (`http://`) host, `build_storage_control` returns a client whose `list_objects` and `get_object` go over the GCS JSON API: the SDK's control client speaks gRPC, which needs HTTP/2, and emulators serve HTTP/2 only behind TLS. Every other host uses the SDK's gRPC client unchanged. A plaintext host is refused with any credential other than `anonymous`, so a bearer token never crosses the network in clear.
 
+### Upload checksums
+
+`crc32c_of_bytes(&[u8]) -> u32` and `open_with_crc32c(&Path) -> io::Result<(tokio::fs::File, u32)>` (reads the file in chunks, then rewinds it) give an upload's CRC32C so it can be declared up front with `write_object(..).with_known_crc32c(crc)`. `google-cloud-storage` 1.19+ otherwise sends a single-shot upload's checksum as a third multipart part, which a server that reads only metadata + media (`fake-gcs-server`) stores as object content; declared up front, it travels in the metadata part, where every server checks it against the bytes it stored.
+
 ## Who depends on this
 
 You usually **don't** depend on this crate directly. End users configure GCS through `faucet-source-gcs` / `faucet-sink-gcs` (both re-export `GcsCredentials`), or through the `faucet` CLI via the `source-gcs` / `sink-gcs` features. Depend on `faucet-common-gcs` only if you are a **third-party connector author** building your own GCS source/sink for the faucet ecosystem and want to stay interchangeable with the first-party connectors' credential shape and client construction.

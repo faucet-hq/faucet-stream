@@ -3,7 +3,10 @@
 //! Shared GCS credential and client construction for faucet source and
 //! sink connectors.
 
+mod checksum;
 mod json_control;
+
+pub use checksum::{crc32c_of_bytes, open_with_crc32c};
 
 use faucet_core::FaucetError;
 use google_cloud_storage::client::{Storage, StorageControl};

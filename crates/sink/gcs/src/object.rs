@@ -131,13 +131,14 @@ impl ObjectClient for GcsObjects {
     }
 
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
-        let file = tokio::fs::File::open(from)
+        let (file, crc) = faucet_common_gcs::open_with_crc32c(from)
             .await
             .map_err(|e| err("open local file", key, e))?;
         self.roundtrips.record("put");
         self.storage
             .write_object(self.bucket_path(), key.to_string(), file)
             .set_content_type(content_type(key))
+            .with_known_crc32c(crc)
             .send_unbuffered()
             .await
             .map_err(|e| self.gcs_err("put object", key, e))?;
@@ -269,6 +270,44 @@ mod tests {
             "{e:?}"
         );
         assert!(faucet_core::FaucetError::is_retriable(&e));
+    }
+
+    /// #803: the upload's CRC32C travels in the object metadata, and the
+    /// request carries exactly the metadata and media parts — no trailing
+    /// checksum part a two-part server would store as content.
+    #[tokio::test]
+    async fn uploads_send_the_crc32c_in_the_metadata_part() {
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let body = b"{\"a\":1}\n";
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(faucet_common_gcs::crc32c_of_bytes(body).to_be_bytes());
+        Mock::given(method("POST"))
+            .and(path("/upload/storage/v1/b/b/o"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "bucket": "b", "name": "k.jsonl", "crc32c": encoded,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k.jsonl");
+        std::fs::write(&file, body).unwrap();
+        o.upload(&file, "k.jsonl").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = String::from_utf8_lossy(&requests[0].body).into_owned();
+        let content_type = requests[0].headers["content-type"].to_str().unwrap();
+        let boundary = content_type.split("boundary=").nth(1).unwrap();
+        let parts = sent.matches(&format!("--{boundary}\r\n")).count();
+        assert_eq!(parts, 2, "metadata + media only: {sent}");
+        assert!(
+            sent.contains(&format!("\"crc32c\":\"{encoded}\"")),
+            "the checksum is declared up front: {sent}"
+        );
     }
 
     #[test]
