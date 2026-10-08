@@ -100,11 +100,13 @@ pub struct MatchSpec {
 pub enum Detector {
     /// RFC-5322-ish email address.
     Email,
-    /// 13–19 digit card number (spaces/dashes allowed) passing the Luhn check.
+    /// 13–19 digit card number (spaces/dashes allowed, or a JSON integer)
+    /// passing the Luhn check.
     CreditCard,
     /// US Social Security Number `NNN-NN-NNNN`.
     Ssn,
-    /// E.164 / North-American phone number.
+    /// E.164 (`+` then 8–15 digits) or a North-American number written with
+    /// separators; a bare run of digits never matches.
     Phone,
     /// IPv4 dotted-quad address.
     Ipv4,

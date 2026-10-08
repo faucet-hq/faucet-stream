@@ -206,16 +206,14 @@ fn walk(
             let mut labels = policy.labels_for_name(path);
             labels.extend(inherited.iter().cloned());
             let mut via = "name";
-            if let Value::String(s) = scalar {
-                let by_value = policy.labels_for_value(s);
-                if !by_value.is_empty() {
-                    via = if labels.is_empty() {
-                        "value"
-                    } else {
-                        "name+value"
-                    };
-                    labels.extend(by_value);
-                }
+            let by_value = policy.labels_for_scalar(scalar);
+            if !by_value.is_empty() {
+                via = if labels.is_empty() {
+                    "value"
+                } else {
+                    "name+value"
+                };
+                labels.extend(by_value);
             }
             if !labels.is_empty() {
                 let entry = out
@@ -641,6 +639,31 @@ mod tests {
         let (s, cap) = sink(policy("fail"), "eu");
         assert_eq!(
             s.write_batch(&[json!({"email": "a@b.io"})]).await.unwrap(),
+            1
+        );
+        assert_eq!(cap.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_card_number_stored_as_a_json_integer_is_classified() {
+        let spec: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pan", "value_detector": "credit_card"}],
+            "rules": [{"name": "no-pan", "when": {"label": "pan"}, "deny": true, "on_runtime": "fail"}]
+        }))
+        .unwrap();
+        let (s, cap) = sink(Arc::new(CompiledPolicy::compile(&spec).unwrap()), "us");
+        let err = s
+            .write_batch(&[json!({"cc": 4111111111111111u64})])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::PolicyViolation { column, .. } if column == "cc"),
+            "{err}"
+        );
+        assert_eq!(
+            s.write_batch(&[json!({"n": 42, "ok": true})])
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(cap.0.lock().unwrap().len(), 1);

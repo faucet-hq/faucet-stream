@@ -1571,7 +1571,7 @@
           "const": "email"
         },
         {
-          "description": "13–19 digit card number (spaces/dashes allowed) passing the Luhn check.",
+          "description": "13–19 digit card number (spaces/dashes allowed, or a JSON integer)\npassing the Luhn check.",
           "type": "string",
           "const": "credit_card"
         },
@@ -1581,7 +1581,7 @@
           "const": "ssn"
         },
         {
-          "description": "E.164 / North-American phone number.",
+          "description": "E.164 (`+` then 8–15 digits) or a North-American number written with\nseparators; a bare run of digits never matches.",
           "type": "string",
           "const": "phone"
         },

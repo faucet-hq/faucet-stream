@@ -8,7 +8,6 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// Return `true` if `value` looks like an instance of `detector`'s PII class.
-/// Only ever called on string values.
 pub fn detects(detector: Detector, value: &str) -> bool {
     match detector {
         Detector::Email => email_re().is_match(value),
@@ -16,6 +15,20 @@ pub fn detects(detector: Detector, value: &str) -> bool {
         Detector::Phone => is_phone(value),
         Detector::Ipv4 => is_ipv4(value),
         Detector::CreditCard => is_credit_card(value),
+    }
+}
+
+/// [`detects`] over a JSON scalar. Strings go through every detector; a JSON
+/// number only through the card detector (an integer can hold a card number,
+/// while ids, epoch timestamps and amounts are numbers that look like phone
+/// numbers); booleans and containers never match.
+pub fn detects_value(detector: Detector, value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => detects(detector, s),
+        serde_json::Value::Number(n) if detector == Detector::CreditCard => {
+            n.as_u64().is_some_and(|u| is_credit_card(&u.to_string()))
+        }
+        _ => false,
     }
 }
 
@@ -41,20 +54,27 @@ fn is_ssn(value: &str) -> bool {
     area != "000" && area != "666" && !area.starts_with('9') && group != "00" && serial != "0000"
 }
 
-/// E.164 / North-American phone number. Code-based (no regex): allow only
-/// digits and the usual separators, `+` only at the front, and require 10–15
-/// digits total so short numeric ids don't match.
+/// A phone number with real phone structure: E.164 (`+` then 8–15 digits,
+/// separators allowed), or a North-American number written with separators
+/// (`415-555-2671`, `(415) 555-2671`, `1 415 555 2671`). A bare run of digits
+/// is not a phone number — ids and epoch timestamps look exactly like one.
 fn is_phone(value: &str) -> bool {
-    let mut digits = 0usize;
-    for (i, ch) in value.chars().enumerate() {
-        match ch {
-            '0'..='9' => digits += 1,
-            '+' if i == 0 => {}
-            ' ' | '.' | '-' | '(' | ')' => {}
-            _ => return false,
+    if let Some(rest) = value.strip_prefix('+') {
+        let mut digits = 0usize;
+        for ch in rest.chars() {
+            match ch {
+                '0'..='9' => digits += 1,
+                ' ' | '.' | '-' | '(' | ')' => {}
+                _ => return false,
+            }
         }
+        return rest.starts_with(|c: char| ('1'..='9').contains(&c)) && (8..=15).contains(&digits);
     }
-    (10..=15).contains(&digits)
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^(?:1[ .-]?)?(?:\(\d{3}\) ?|\d{3}[ .-])\d{3}[ .-]\d{4}$").unwrap()
+    })
+    .is_match(value)
 }
 
 fn is_ipv4(value: &str) -> bool {
@@ -165,10 +185,36 @@ mod tests {
     #[test]
     fn phone_detector() {
         assert!(detects(Detector::Phone, "+14155552671"));
+        assert!(detects(Detector::Phone, "+44 20 7946 0958"));
         assert!(detects(Detector::Phone, "415-555-2671"));
         assert!(detects(Detector::Phone, "(415) 555-2671"));
+        assert!(detects(Detector::Phone, "415.555.2671"));
+        assert!(detects(Detector::Phone, "1-415-555-2671"));
         assert!(!detects(Detector::Phone, "12345")); // too short
         assert!(!detects(Detector::Phone, "not a phone"));
+        assert!(!detects(Detector::Phone, "1717200000000")); // epoch ms
+        assert!(!detects(Detector::Phone, "4155552671")); // bare digits
+        assert!(!detects(Detector::Phone, "+0123456789"));
+        assert!(!detects(Detector::Phone, "+1234"));
+        assert!(!detects(Detector::Phone, "+1415x5552671"));
+    }
+
+    #[test]
+    fn numbers_only_go_through_the_card_detector() {
+        use serde_json::json;
+        assert!(detects_value(
+            Detector::CreditCard,
+            &json!(4111111111111111u64)
+        ));
+        assert!(!detects_value(
+            Detector::CreditCard,
+            &json!(4111111111111112u64)
+        ));
+        assert!(!detects_value(Detector::Phone, &json!(4155552671u64)));
+        assert!(!detects_value(Detector::Phone, &json!(1717200000000u64)));
+        assert!(!detects_value(Detector::CreditCard, &json!(true)));
+        assert!(detects_value(Detector::Phone, &json!("415-555-2671")));
+        assert!(!detects_value(Detector::Email, &json!(null)));
     }
 
     #[test]
