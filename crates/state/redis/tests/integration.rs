@@ -315,3 +315,75 @@ async fn compare_and_put_mismatch_leaves_the_value() {
     assert_eq!(store.get("k").await.unwrap(), Some(b));
     assert!(store.compare_and_put("bad key!", None, &a).await.is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_errors_and_corrupt_values_surface_as_state_errors() {
+    let (_container, url) = start_redis().await;
+    let store = RedisStateStore::connect(&url, "ns").await.expect("connect");
+    let client = redis::Client::open(url.as_str()).expect("client");
+    let mut raw = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("conn");
+    let _: i64 = redis::cmd("LPUSH")
+        .arg("ns:listkey")
+        .arg("x")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("ns:corrupt")
+        .arg("not json")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+
+    let err = store.get("listkey").await.unwrap_err().to_string();
+    assert!(err.contains("Redis GET for key 'listkey' failed"), "{err}");
+    let err = store
+        .compare_and_put("listkey", None, &json!(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Redis GET for key 'listkey' failed"), "{err}");
+    let err = store
+        .compare_and_put("corrupt", None, &json!(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is not valid JSON"), "{err}");
+
+    // A server that refuses writes (out of memory) fails every write path.
+    let _: () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory-policy")
+        .arg("noeviction")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory")
+        .arg("1")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let err = store.put("k", &json!(1)).await.unwrap_err().to_string();
+    assert!(err.contains("Redis SET for key 'k' failed"), "{err}");
+    let err = store
+        .put_batch(&[("k".to_string(), json!(1))])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Redis MSET failed"), "{err}");
+    let err = store
+        .compare_and_put("fresh", None, &json!(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Redis compare-and-set for key 'fresh' failed"),
+        "{err}"
+    );
+    assert_eq!(store.get("fresh").await.unwrap(), None);
+}

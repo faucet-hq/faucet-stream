@@ -436,6 +436,48 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn both_connection_kinds_carry_pipelines_and_report_their_database() {
+        use redis::aio::ConnectionLike as _;
+        use testcontainers::runners::AsyncRunner as _;
+        let container = testcontainers_modules::redis::Redis::default()
+            .start()
+            .await
+            .expect("redis container start");
+        let port = container.get_host_port_ipv4(6379).await.expect("port");
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}/0")).unwrap();
+        let mut shared = None;
+        for _ in 0..50 {
+            if let Ok(c) = client.get_multiplexed_async_connection().await {
+                shared = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let managed = redis::aio::ConnectionManager::new(client.clone())
+            .await
+            .unwrap();
+        for mut conn in [
+            Conn::Shared(shared.expect("connection")),
+            Conn::Managed(managed),
+        ] {
+            assert_eq!(conn.get_db(), 0);
+            let (a, b): (String, i64) = redis::pipe()
+                .cmd("SET")
+                .arg("p")
+                .arg("1")
+                .ignore()
+                .cmd("GET")
+                .arg("p")
+                .cmd("INCR")
+                .arg("p")
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(a.parse::<i64>().unwrap() + 1, b);
+        }
+    }
+
     #[test]
     fn build_redis_key_namespaces_consistently() {
         assert_eq!(
