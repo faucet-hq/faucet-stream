@@ -553,6 +553,12 @@ automatically, so generated cases test the axes you listed and nothing else.
   it silently *widens* the tested space rather than narrowing it.
 - An empty suite is rejected. A suite with no cases reports green, which is worse
   than no suite.
+- A sweep whose full product passes 32,768 combinations is refused before it is
+  built (narrow it or use `pairwise: true`, which is generated without the
+  product).
+- A behavioural case on a config with several rows (a multi-stream source
+  template, a `matrix:`) must name one with `row:`; fixture paths resolve
+  against the suite file's directory.
 - Duplicate case names are rejected (they make `--filter` ambiguous).
 
 `--filter '<pattern>'` runs a subset (`*` wildcards; a bare name is an exact
