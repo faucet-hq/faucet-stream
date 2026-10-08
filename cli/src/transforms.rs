@@ -820,8 +820,9 @@ pub fn compile_transforms(specs: &[TransformSpec]) -> CliResult<Vec<TransformSta
 fn compile_one(spec: &TransformSpec) -> CliResult<TransformStage> {
     match registry().into_iter().find(|t| t.kind == spec.kind) {
         Some(def) => {
+            let config = crate::interpolate::unescaped(spec.config.clone());
             if let Some((unknown, hint)) =
-                crate::registry::unknown_config_keys(&spec.config, &(def.schema_fn)())
+                crate::registry::unknown_config_keys(&config, &(def.schema_fn)())
             {
                 return Err(CliError::InvalidTransform {
                     name: spec.kind.clone(),
@@ -832,7 +833,7 @@ fn compile_one(spec: &TransformSpec) -> CliResult<TransformStage> {
                     ),
                 });
             }
-            (def.compile_fn)(&spec.kind, spec.config.clone())
+            (def.compile_fn)(&spec.kind, config)
         }
         None => Err(unknown_transform(&spec.kind)),
     }

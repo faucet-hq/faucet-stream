@@ -1522,6 +1522,7 @@ impl PipelineConfig {
         if let Some(raw) = &raw {
             crate::vocabulary::warn_deprecated(raw);
         }
+        // Typed parse first: its errors carry the document's line numbers.
         let cfg: PipelineConfig = match ext.as_deref() {
             Some("yaml" | "yml") => {
                 serde_yaml::from_str(text).map_err(|e| CliError::ParseConfig {
@@ -1539,6 +1540,16 @@ impl PipelineConfig {
                 });
             }
         };
+        let cfg = match raw {
+            Some(mut doc) if text.contains("$${") => {
+                crate::interpolate::unescape_document(&mut doc);
+                serde_json::from_value(doc).map_err(|e| CliError::ParseConfig {
+                    path: path.to_path_buf(),
+                    message: friendly_parse_error(&e.to_string()),
+                })?
+            }
+            _ => cfg,
+        };
         Self::finish(cfg, path)
     }
 
@@ -1549,9 +1560,10 @@ impl PipelineConfig {
     /// **Note:** load-time `${env:VAR}` / `${file:PATH}` / `${secret:VAR}` directives
     /// are **not** resolved here — the caller must pre-resolve them (e.g. by running
     /// `interpolate` on the source text) before building the `Value`.
-    pub fn from_value(value: serde_json::Value) -> CliResult<Self> {
+    pub fn from_value(mut value: serde_json::Value) -> CliResult<Self> {
         let synthetic = Path::new("<submitted>");
         crate::vocabulary::warn_deprecated(&value);
+        crate::interpolate::unescape_document(&mut value);
         let cfg: PipelineConfig =
             serde_json::from_value(value).map_err(|e| CliError::ParseConfig {
                 path: synthetic.to_path_buf(),

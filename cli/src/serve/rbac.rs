@@ -363,6 +363,7 @@ impl RbacConfig {
         protect_references(&doc);
         crate::interpolate::interpolate_value(&mut doc).map_err(|e| at(&e))?;
         resolve_secret_refs(&mut doc).map_err(|e| at(&e))?;
+        crate::interpolate::unescape_value(&mut doc);
         let file: AuthConfigFile = serde_json::from_value(doc).map_err(|e| {
             CliError::Serve(format!("parsing --auth-config {}: {e}", path.display()))
         })?;

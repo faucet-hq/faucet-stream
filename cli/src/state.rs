@@ -58,6 +58,11 @@ const DEFAULT_PG_POOL_SIZE: u32 = 5;
 
 /// Construct a state store from the parsed `state:` block.
 pub async fn build_state_store(spec: &StateStoreSpec) -> CliResult<Arc<dyn StateStore>> {
+    let unescaped = StateStoreSpec {
+        kind: spec.kind.clone(),
+        config: crate::interpolate::unescaped(spec.config.clone()),
+    };
+    let spec = &unescaped;
     match spec.kind.as_str() {
         "memory" => Ok(Arc::new(MemoryStateStore::new())),
         "file" => {

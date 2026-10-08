@@ -1180,7 +1180,14 @@ mod tests {
             "pipeline": { "note": "$${param.a}" }
         });
         bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
-        assert_eq!(doc["pipeline"]["note"], "${param.a}");
+        // The escape is kept until the value is consumed, so binding it again
+        // (or any later pass) still leaves it literal (#789 CLI-100).
+        assert_eq!(doc["pipeline"]["note"], "$${param.a}");
+        bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
+        assert_eq!(
+            crate::interpolate::unescape(doc["pipeline"]["note"].as_str().unwrap()),
+            "${param.a}"
+        );
     }
 
     #[test]

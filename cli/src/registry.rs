@@ -285,6 +285,7 @@ pub async fn build_source(
     auth: &AuthCatalog,
     retry_policy: Option<&faucet_core::RetryPolicy>,
 ) -> CliResult<Box<dyn Source>> {
+    let config = crate::interpolate::unescaped(config);
     // Third-party connectors registered via `PluginRegistry` win first. Names
     // can never collide with a built-in (registration rejects that), so this is
     // safe to check ahead of the built-in `match`. Custom factories receive the
@@ -642,6 +643,7 @@ pub async fn build_source(
 /// carries `auth: { ref: <name> }`, the named provider is resolved from `auth`
 /// (the catalog) and injected into the connector.
 pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliResult<Box<dyn Sink>> {
+    let config = crate::interpolate::unescaped(config);
     if let Some(entry) = global().sinks.get(kind) {
         reject_unknown_config_keys("sink", kind, kind, &config, &(entry.schema)())?;
         return (entry.factory)(config);
@@ -1443,7 +1445,8 @@ pub(crate) fn unknown_config_keys(config: &Value, schema: &Value) -> Option<(Str
         })
         .collect();
     let hint = if suggestions.is_empty() {
-        String::new()
+        let declared: Vec<String> = known.iter().map(|k| format!("`{k}`")).collect();
+        format!(" (declared: {})", declared.join(", "))
     } else {
         format!(" ({})", suggestions.join("; "))
     };
@@ -1659,6 +1662,7 @@ where
 /// passing silently, so a slim build never reports a config valid that it
 /// simply could not read.
 pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResult<()> {
+    let config = crate::interpolate::unescaped(config);
     // A plugin-registered connector is validated by building it — the factory
     // is the only thing that knows its config shape.
     if let Some(entry) = global().sources.get(kind) {
@@ -2070,6 +2074,7 @@ pub fn sink_batch_atomicity(kind: &str, config: &Value) -> Option<faucet_core::B
 /// passing silently, so a slim build never reports a config valid that it
 /// simply could not read.
 pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<()> {
+    let config = crate::interpolate::unescaped(config);
     // A plugin-registered connector is validated by building it — the factory
     // is the only thing that knows its config shape.
     if let Some(entry) = global().sinks.get(kind) {

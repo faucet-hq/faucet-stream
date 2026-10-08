@@ -19,7 +19,10 @@
 //! | `${secret:VAR}`    | alias for `${env:VAR}` (reserved for a future secrets backend) |
 //!
 //! Anything else (including `${users.id}`, `${posts.author.name}`) is
-//! deferred to record-time. A literal `${` is written `$${`.
+//! deferred to record-time. A literal `${` is written `$${`. The escape is
+//! kept through every interpolation pass and turned into `${` only where the
+//! string is consumed ([`unescape_value`]), so no later pass can resolve it
+//! (#789 CLI-100).
 
 use crate::error::{CliError, CliResult};
 use chrono::{DateTime, FixedOffset};
@@ -218,10 +221,11 @@ where
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        // Escape: `$${` → literal `${`.
+        // Escape: `$${` stays as written — it becomes a literal `${` only
+        // when the value is consumed, so no later pass can resolve it.
         if bytes[i] == b'$' && i + 2 < bytes.len() && bytes[i + 1] == b'$' && bytes[i + 2] == b'{' {
-            out.push('$');
-            i += 2;
+            out.push_str("$${");
+            i += 3;
             continue;
         }
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
@@ -245,6 +249,105 @@ where
         i += ch.len_utf8();
     }
     Ok(out)
+}
+
+/// Turn every `$${` escape in `s` into the literal `${` it stands for.
+pub fn unescape(s: &str) -> String {
+    s.replace("$${", "${")
+}
+
+/// [`unescape`] every string (and object key) in `v`. Applied where a value
+/// leaves the interpolation passes for good: a connector / transform / state
+/// config as it is built, and every other field before the typed parse.
+pub fn unescape_value(v: &mut Value) {
+    match v {
+        Value::String(s) if s.contains("$${") => *s = unescape(s),
+        Value::Array(a) => a.iter_mut().for_each(unescape_value),
+        Value::Object(m) => {
+            let entries: Vec<(String, Value)> = std::mem::take(m).into_iter().collect();
+            for (k, mut val) in entries {
+                unescape_value(&mut val);
+                m.insert(unescape(&k), val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`unescape_value`] on an owned value.
+pub fn unescaped(mut v: Value) -> Value {
+    unescape_value(&mut v);
+    v
+}
+
+/// Byte offset of the first `prefix` (which starts with `${`) in `s` that is
+/// not the tail of a `$${` escape.
+pub fn find_unescaped(s: &str, prefix: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(prefix) {
+        let at = from + rel;
+        if at > 0 && s.as_bytes()[at - 1] == b'$' {
+            from = at + 1;
+            continue;
+        }
+        return Some(at);
+    }
+    None
+}
+
+/// Whether `s` holds an unescaped `prefix` token.
+pub fn contains_unescaped(s: &str, prefix: &str) -> bool {
+    find_unescaped(s, prefix).is_some()
+}
+
+/// Unescape a raw config document everywhere except the connector, transform,
+/// state and DLQ configs — those are interpolated again at run time and are
+/// unescaped when built instead.
+pub(crate) fn unescape_document(doc: &mut Value) {
+    fn deferred(path: &[&str]) -> bool {
+        matches!(
+            path,
+            ["pipeline", "source" | "sink", "config"]
+                | ["pipeline", "sources" | "sinks", _, "config"]
+                | ["pipeline", "source", "transforms", _, "config"]
+                | ["pipeline", "sources", _, "transforms", _, "config"]
+                | ["pipeline", "transforms", _, "config"]
+                | ["pipeline", "state", "config"]
+                | ["pipeline", "dlq", "sink", "config"]
+                | ["matrix", _, "source" | "sink", "config"]
+                | ["matrix", _, "source", "transforms", _, "config"]
+                | ["matrix", _, "transforms", _, "config"]
+                | ["matrix", _, "state", "config"]
+                | ["mirror" | "replication", "snapshot", "source", "config"]
+        )
+    }
+    fn walk(v: &mut Value, path: &mut Vec<String>) {
+        let view: Vec<&str> = path.iter().map(String::as_str).collect();
+        if deferred(&view) {
+            return;
+        }
+        match v {
+            Value::String(s) if s.contains("$${") => *s = unescape(s),
+            Value::Array(a) => {
+                for item in a.iter_mut() {
+                    path.push("*".into());
+                    walk(item, path);
+                    path.pop();
+                }
+            }
+            Value::Object(m) => {
+                let entries: Vec<(String, Value)> = std::mem::take(m).into_iter().collect();
+                for (k, mut val) in entries {
+                    path.push(k.clone());
+                    walk(&mut val, path);
+                    path.pop();
+                    m.insert(k, val);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(doc, &mut Vec::new());
 }
 
 /// Classification of a `${...}` directive body. This is the **single** rule
@@ -1006,7 +1109,49 @@ mod tests {
     #[test]
     fn dollar_dollar_brace_is_escaped() {
         let out = interpolate("path=$${env:VAR}").unwrap();
-        assert_eq!(out, "path=${env:VAR}");
+        assert_eq!(out, "path=$${env:VAR}");
+        assert_eq!(unescape(&out), "path=${env:VAR}");
+    }
+
+    #[test]
+    fn the_escape_survives_every_pass_until_it_is_consumed() {
+        let once = interpolate("a=$${now.date} b=$${param.x}").unwrap();
+        let twice = interpolate(&once).unwrap();
+        assert_eq!(twice, "a=$${now.date} b=$${param.x}");
+        assert_eq!(
+            resolve_now(&twice, chrono::Utc::now().into()).unwrap(),
+            twice
+        );
+        assert_eq!(unescape(&twice), "a=${now.date} b=${param.x}");
+        assert_eq!(find_unescaped("x $${p.a} ${p.b}", "${p."), Some(10));
+        assert!(!contains_unescaped("$${p.a}", "${p."));
+        assert_eq!(find_unescaped("${p.a}", "${p."), Some(0));
+    }
+
+    #[test]
+    fn documents_unescape_everywhere_but_the_deferred_configs() {
+        let mut doc = serde_json::json!({
+            "name": "$${x}",
+            "pipeline": {
+                "source": { "type": "csv", "config": { "q": "$${a}" } },
+                "sinks": { "s": { "type": "jsonl", "config": { "p": "$${b}" } } },
+                "transforms": [{ "type": "set", "config": { "v": "$${c}" } }],
+                "state": { "type": "file", "config": { "path": "$${d}" } }
+            },
+            "matrix": [{ "id": "r", "source": { "config": { "q": "$${e}" } } }],
+            "notifications": [{ "text": "$${f}" }]
+        });
+        unescape_document(&mut doc);
+        assert_eq!(doc["name"], "${x}");
+        assert_eq!(doc["notifications"][0]["text"], "${f}");
+        assert_eq!(doc["pipeline"]["source"]["config"]["q"], "$${a}");
+        assert_eq!(doc["pipeline"]["sinks"]["s"]["config"]["p"], "$${b}");
+        assert_eq!(doc["pipeline"]["transforms"][0]["config"]["v"], "$${c}");
+        assert_eq!(doc["pipeline"]["state"]["config"]["path"], "$${d}");
+        assert_eq!(doc["matrix"][0]["source"]["config"]["q"], "$${e}");
+        let mut v = doc["pipeline"]["source"]["config"].clone();
+        unescape_value(&mut v);
+        assert_eq!(v["q"], "${a}");
     }
 
     #[test]

@@ -181,6 +181,7 @@ impl ConnectProviders {
             .map_err(|e| format!("parsing --connect-providers {}: {e}", path.display()))?;
         crate::interpolate::interpolate_value(&mut doc)
             .map_err(|e| format!("--connect-providers {}: {e}", path.display()))?;
+        crate::interpolate::unescape_value(&mut doc);
         let file: ConnectProvidersFile = serde_json::from_value(doc)
             .map_err(|e| format!("parsing --connect-providers {}: {e}", path.display()))?;
         Self::from_file(file).map_err(|e| format!("--connect-providers {}: {e}", path.display()))

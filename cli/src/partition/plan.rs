@@ -175,7 +175,7 @@ pub fn substitute(value: &mut Value, chunk: &PartitionChunk) -> CliResult<()> {
 fn substitute_in_str(input: &str, chunk: &PartitionChunk) -> CliResult<String> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
-    while let Some(pos) = rest.find(PREFIX) {
+    while let Some(pos) = crate::interpolate::find_unescaped(rest, PREFIX) {
         out.push_str(&rest[..pos]);
         let after = &rest[pos + PREFIX.len()..];
         let close = after.find('}').ok_or_else(|| {
@@ -200,7 +200,7 @@ fn substitute_in_str(input: &str, chunk: &PartitionChunk) -> CliResult<String> {
 /// A `partition:` block on a row whose source ignores the tokens would run the
 /// same query N times, so this gates the config at load time.
 pub fn references_partition(serialized: &str) -> bool {
-    serialized.contains(PREFIX)
+    crate::interpolate::contains_unescaped(serialized, PREFIX)
 }
 
 /// The `end` predicate for an open-ended final chunk is the caller's problem —

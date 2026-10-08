@@ -3580,11 +3580,13 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
 pub(crate) fn reject_unresolved_backfill_tokens(value: &Value, owner: &str) -> CliResult<()> {
     fn walk(value: &Value, owner: &str) -> CliResult<()> {
         match value {
-            Value::String(s) if s.contains("${backfill.") => Err(CliError::Config(format!(
-                "the {owner} config references a `${{backfill.*}}` token, which only \
+            Value::String(s) if crate::interpolate::contains_unescaped(s, "${backfill.") => {
+                Err(CliError::Config(format!(
+                    "the {owner} config references a `${{backfill.*}}` token, which only \
                  `faucet backfill` resolves — run this config via `faucet backfill \
                  --from … --to …`, or remove the token"
-            ))),
+                )))
+            }
             Value::Array(a) => a.iter().try_for_each(|v| walk(v, owner)),
             Value::Object(m) => m.values().try_for_each(|v| walk(v, owner)),
             _ => Ok(()),

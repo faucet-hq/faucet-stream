@@ -166,6 +166,10 @@ Three stages resolve placeholders:
 
 Reference cycles surface as a clear `InterpolationCycle` error.
 
+Write `$${` for a literal `${`. The escape holds through every stage — a
+`$${param.x}`, `$${now.date}` or `$${vault:…}` is never resolved — and becomes
+`${` only in the value the connector or transform finally receives.
+
 ### `${now.*}` — run-clock interpolation
 
 `${now.*}` tokens inject the current wall time into **source and sink config

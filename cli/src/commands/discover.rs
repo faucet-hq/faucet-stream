@@ -657,7 +657,10 @@ mod tests {
         let cfg = crate::config::parse_with_extension(&doc, "yaml").unwrap();
         let nodes = crate::expand::expand(&cfg).unwrap();
         assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].source.config["prefix"], "${file:/etc/passwd}");
+        // Still escaped in the expanded config; built as the literal text.
+        let prefix = nodes[0].source.config["prefix"].as_str().unwrap();
+        assert_eq!(prefix, "$${file:/etc/passwd}");
+        assert_eq!(crate::interpolate::unescape(prefix), "${file:/etc/passwd}");
     }
 
     fn ds(name: &str, kind: &str, patch: Value) -> DatasetDescriptor {
