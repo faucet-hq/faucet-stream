@@ -870,6 +870,19 @@ mod tests {
     use crate::config::{SoapConfig, SoapVersion};
     use faucet_core::Source;
 
+    #[test]
+    fn body_templates_keep_unknown_and_unclosed_braces_and_render_non_strings() {
+        let ctx: HashMap<String, Value> = [("n".to_string(), serde_json::json!(42))]
+            .into_iter()
+            .collect();
+        let none = BTreeMap::new();
+        assert_eq!(
+            render_xml_body("<a>{n}</a><b>{missing}</b>", &ctx, &none, None),
+            "<a>42</a><b>{missing}</b>"
+        );
+        assert_eq!(render_xml_body("<a>{n</a>", &ctx, &none, None), "<a>{n</a>");
+    }
+
     fn soap_response(records: &str) -> String {
         format!(
             "<Envelope xmlns=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body>\

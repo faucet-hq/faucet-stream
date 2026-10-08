@@ -243,6 +243,27 @@ mod tests {
     }
 
     #[test]
+    fn a_sequence_start_position_names_exactly_one_shard() {
+        for start in [
+            StartPosition::AtSequenceNumber {
+                sequence: "4959".into(),
+            },
+            StartPosition::AfterSequenceNumber {
+                sequence: "4959".into(),
+            },
+        ] {
+            let mut c = valid();
+            c.start_position = start;
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("applies to one shard"), "{err}");
+            c.shard_ids = vec!["a".into(), "b".into()];
+            assert!(c.validate().is_err());
+            c.shard_ids = vec!["shardId-000000000000".into()];
+            c.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn validation_bounds() {
         valid().validate().unwrap();
 

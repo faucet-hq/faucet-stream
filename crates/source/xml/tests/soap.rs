@@ -402,3 +402,38 @@ async fn a_non_fault_http_500_is_still_retried() {
     let records = XmlStream::new(config).fetch_all().await.unwrap();
     assert_eq!(records[0]["Name"], "Ann");
 }
+
+#[tokio::test]
+async fn a_long_non_fault_http_500_body_is_truncated_in_the_error() {
+    let server = MockServer::start().await;
+    let page = format!("<html>{}</html>", "x".repeat(5000));
+    Mock::given(method("POST"))
+        .and(path("/ws"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(page))
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/ws")
+        .method(Method::POST)
+        .records_element_path("GetUsersResponse.Users.User")
+        .with_soap(SoapConfig {
+            body_inner: Some("<GetUsers/>".into()),
+            ..Default::default()
+        });
+    let policy = faucet_core::RetryPolicy {
+        max_attempts: 1,
+        ..faucet_core::RetryPolicy::default()
+    };
+    let err = XmlStream::new(config)
+        .with_retry_policy(policy)
+        .fetch_all()
+        .await
+        .unwrap_err();
+    match err {
+        FaucetError::HttpStatus { status, body, .. } => {
+            assert_eq!(status, 500);
+            assert!(body.ends_with("...(truncated)"), "{body}");
+            assert!(body.len() < 2100, "{}", body.len());
+        }
+        other => panic!("expected an HTTP status error, got {other}"),
+    }
+}

@@ -82,12 +82,17 @@ mod tests {
         assert!(err.contains("invalid character reference"), "{err}");
     }
 
+    fn empty(event: Event<'_>) -> quick_xml::events::BytesStart<'_> {
+        match event {
+            Event::Empty(e) => e,
+            _ => panic!("expected empty element"),
+        }
+    }
+
     #[test]
     fn attributes_are_unescaped_and_duplicates_rejected() {
         let mut reader = Reader::from_str(r#"<a n="A &amp; B &quot;q&quot;" m="&#65;"/>"#);
-        let Event::Empty(e) = reader.read_event().unwrap() else {
-            panic!("expected empty element")
-        };
+        let e = empty(reader.read_event().unwrap());
         assert_eq!(
             attributes(&e).unwrap(),
             vec![
@@ -96,14 +101,10 @@ mod tests {
             ]
         );
         let mut reader = Reader::from_str(r#"<a n="1" n="2"/>"#);
-        let Event::Empty(e) = reader.read_event().unwrap() else {
-            panic!("expected empty element")
-        };
+        let e = empty(reader.read_event().unwrap());
         assert!(attributes(&e).unwrap_err().contains("malformed attribute"));
         let mut reader = Reader::from_str(r#"<a n="&bogus;"/>"#);
-        let Event::Empty(e) = reader.read_event().unwrap() else {
-            panic!("expected empty element")
-        };
+        let e = empty(reader.read_event().unwrap());
         assert!(attributes(&e).unwrap_err().contains("attribute `n`"));
     }
 }
