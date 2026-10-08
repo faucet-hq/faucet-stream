@@ -1047,15 +1047,27 @@ fn finish(mut st: RowStatus, failing: bool, inputs: &StatusInputs<'_>) -> RowSta
     }
     for c in &st.children {
         if c.worst > health {
-            st.reasons.push(format!(
-                "child row '{}': {} of its invocations failed",
-                c.row, c.failed
-            ));
+            if let Some(reason) = child_reason(c.worst, &c.row, c.failed) {
+                st.reasons.push(reason);
+            }
             health = c.worst;
         }
     }
     st.health = health;
     st
+}
+
+/// Why a child row worsens its parent's health — phrased from the child's
+/// own health, and only when it is a problem (a warming or running child is
+/// not one).
+fn child_reason(worst: Health, row: &str, failed: usize) -> Option<String> {
+    match worst {
+        Health::Failed => Some(format!(
+            "child row '{row}': {failed} of its invocations failed"
+        )),
+        Health::Degraded => Some(format!("child row '{row}' is degraded")),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

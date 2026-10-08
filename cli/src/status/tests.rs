@@ -565,3 +565,20 @@ async fn render_covers_unreadable_dlqs_repeat_failures_and_probed_lag() {
     assert!(text.contains("lag: 1m 30s (queried now"), "{text}");
     assert!(text.contains('?'), "{text}");
 }
+
+/// A warming or running child worsens its parent without claiming failed
+/// invocations; a failed or degraded one is named (#789 CLI-168).
+#[test]
+fn child_reasons_follow_the_childs_own_health() {
+    use super::{Health, child_reason};
+    assert_eq!(child_reason(Health::Warming, "kid", 0), None);
+    assert_eq!(child_reason(Health::Running, "kid", 0), None);
+    assert_eq!(
+        child_reason(Health::Failed, "kid", 2).as_deref(),
+        Some("child row 'kid': 2 of its invocations failed")
+    );
+    assert_eq!(
+        child_reason(Health::Degraded, "kid", 0).as_deref(),
+        Some("child row 'kid' is degraded")
+    );
+}
