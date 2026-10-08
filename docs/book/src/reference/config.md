@@ -329,8 +329,9 @@ identically. A type mismatch, a missing `required` param, an undeclared
 `--param`, or an undeclared `${param.x}` reference is an error naming the param.
 
 **Validation.** `faucet validate` with no `--param` binds required params to
-type-shaped placeholders, so a parameterized config validates in CI without
-inventing values; passing any `--param` switches to strict binding. `faucet
+type-shaped placeholders (the first entry of a `values:` set, and a
+`${map:}` switching on a placeholder takes its first case), so a parameterized
+config validates in CI without inventing values; passing any `--param` switches to strict binding. `faucet
 schema params` prints the JSON Schema for one entry.
 
 Persisting a parameterized config for register-once / trigger-by-id use is the
