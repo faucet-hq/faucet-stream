@@ -4062,6 +4062,7 @@ components:
             tables: { type: integer }
             by_phase: { type: object, additionalProperties: { type: integer } }
             lagging: { type: integer }
+            resync_required: { type: integer, description: "Tables whose destination may hold rows the source deleted" }
         tables:
           type: array
           items:
@@ -4090,6 +4091,7 @@ components:
               last_error: { type: string, nullable: true }
               key: { type: array, items: { type: string } }
               write_mode: { type: string, nullable: true }
+              resync_required: { type: string, description: "Set when the table was re-snapshotted into a destination its sink cannot replace, so rows the source deleted may remain" }
     StatusReport:
       type: object
       description: "`faucet status` / `GET /v1/status` (#732)"

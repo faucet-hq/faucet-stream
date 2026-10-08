@@ -325,6 +325,20 @@ async fn prepare_snapshot(shared: &Shared, table: &str) -> CliResult<Vec<ShardRu
             shards.len() as u64,
             Utc::now(),
         );
+        if multi_state::flag_stale_resnapshot(
+            &mut state,
+            table,
+            shared.snapshot_replaces(),
+            &shared.sink_kind,
+        ) {
+            tracing::warn!(
+                pipeline = %shared.opts.pipeline_name,
+                table = %table,
+                sink = %shared.sink_kind,
+                "mirror: re-snapshotting into a destination this sink cannot replace — rows \
+                 deleted at the source meanwhile may remain; see `faucet mirror status`"
+            );
+        }
     }
     shared.persist().await?;
     Ok(shards)

@@ -311,6 +311,10 @@ keeps that position until the table joins, and replays everything after it over
 the snapshot (keyed upsert makes the overlap idempotent). On sinks that support
 [overwrite](./upsert.md#overwrite-full-refresh) a re-snapshot replaces the
 destination atomically, so a redo never leaves rows the source no longer has.
+On other sinks a re-snapshot (a redo, a paused table retried, a dropped table
+returning) writes over the existing destination, so rows the source deleted in
+between can remain: the table is flagged `resync required` in status (and
+logged) until you empty the destination and snapshot it again.
 
 | Event | What happens |
 |---|---|
@@ -326,7 +330,8 @@ destination atomically, so a redo never leaves rows the source no longer has.
 [`GET /v1/mirror/{name}`](../reference/http-api.md#mirror-status)) reads the
 mirror's state store and shows, per table: phase (`pending` / `snapshotting` /
 `active` / `paused` / `dropped` / `refused`), snapshot progress, change records
-routed, committed position, lag and last error:
+routed, committed position, lag, last error and a `resync required` note when
+a re-snapshot could not replace the destination:
 
 ```text
 mirror shop_mirror (41 tables: 38 active, 1 paused, 1 refused, 1 snapshotting)

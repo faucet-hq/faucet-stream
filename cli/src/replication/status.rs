@@ -35,6 +35,10 @@ pub struct TableStatus {
     pub last_error: Option<String>,
     pub key: Vec<String>,
     pub write_mode: Option<String>,
+    /// Why the destination may hold rows the source deleted (a re-snapshot
+    /// into a sink that cannot replace it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resync_required: Option<String>,
 }
 
 /// Snapshot progress of one table.
@@ -57,6 +61,8 @@ pub struct StatusSummary {
     pub tables: usize,
     pub by_phase: BTreeMap<String, usize>,
     pub lagging: usize,
+    /// Tables whose destination may hold rows the source deleted.
+    pub resync_required: usize,
 }
 
 /// The whole status view.
@@ -108,6 +114,9 @@ pub fn multi_status(
             if lagging {
                 summary.lagging += 1;
             }
+            if t.resync_required.is_some() {
+                summary.resync_required += 1;
+            }
             TableStatus {
                 table: table.clone(),
                 phase: t.phase.as_str().to_string(),
@@ -130,6 +139,7 @@ pub fn multi_status(
                 last_error: t.last_error.clone(),
                 key: t.key.clone(),
                 write_mode: (!t.write_mode.is_empty()).then(|| t.write_mode.clone()),
+                resync_required: t.resync_required.clone(),
             }
         })
         .collect();
@@ -182,6 +192,7 @@ pub fn single_status(
             last_error: None,
             key: Vec::new(),
             write_mode: None,
+            resync_required: None,
         }],
     }
 }
@@ -267,6 +278,13 @@ pub fn render_human(status: &MirrorStatus) -> String {
             String::new()
         }
     ));
+    for t in status.tables.iter().filter(|t| t.resync_required.is_some()) {
+        out.push_str(&format!(
+            "  ! {}: {}\n",
+            t.table,
+            t.resync_required.as_deref().unwrap_or_default()
+        ));
+    }
     let width = status
         .tables
         .iter()
@@ -285,6 +303,11 @@ pub fn render_human(status: &MirrorStatus) -> String {
             None => "-".into(),
         };
         let mut note = t.last_error.clone().unwrap_or_default();
+        if t.resync_required.is_some() {
+            note = format!("resync required; {note}")
+                .trim_end_matches("; ")
+                .to_string();
+        }
         if t.lagging {
             note = format!("lagging; {note}")
                 .trim_end_matches("; ")
@@ -406,6 +429,26 @@ mod tests {
         assert!(text.contains("no primary key"), "{text}");
         let json = serde_json::to_value(&st).unwrap();
         assert_eq!(json["tables"][0]["phase"], "active");
+        assert_eq!(st.summary.resync_required, 0);
+    }
+
+    /// A table snapshotted again into a sink that cannot replace its
+    /// destination is flagged until a replacing snapshot clears it (#789 CLI-27).
+    #[test]
+    fn a_non_replacing_resnapshot_is_flagged_in_status() {
+        let mut s = state();
+        assert!(!multi_state::flag_stale_resnapshot(&mut s, "public.a", false, "spanner"));
+        multi_state::mark_snapshot_started(&mut s, "public.a", json!(2), 1, t0());
+        assert!(multi_state::flag_stale_resnapshot(&mut s, "public.a", false, "spanner"));
+        assert!(!multi_state::flag_stale_resnapshot(&mut s, "public.zzz", false, "spanner"));
+        let st = multi_status("shop", &s, &BTreeMap::new(), 0, t0());
+        assert_eq!(st.summary.resync_required, 1);
+        let text = render_human(&st);
+        assert!(text.contains("resync required"), "{text}");
+        assert!(text.contains("! public.a: re-snapshotted into a spanner"), "{text}");
+        assert!(serde_json::to_value(&st).unwrap()["tables"][0]["resync_required"].is_string());
+        assert!(!multi_state::flag_stale_resnapshot(&mut s, "public.a", true, "postgres"));
+        assert!(s.tables["public.a"].resync_required.is_none());
     }
 
     #[test]
