@@ -6473,7 +6473,6 @@ name = "faucet-source-iceberg"
 version = "1.0.1"
 dependencies = [
  "arrow 58.3.0",
- "arrow-json 58.3.0",
  "async-stream",
  "async-trait",
  "chrono",

@@ -23,6 +23,10 @@ Fabric) write.
   because reading those files whole would return deleted rows. Purge them
   (`REORG TABLE … APPLY (PURGE)`) or disable the table property first.
 
+## Record shape
+
+Every column is present in every row (a null is `null`); a decimal keeps every digit as a string.
+
 ## Configuration
 
 | Field | Type | Default | Notes |

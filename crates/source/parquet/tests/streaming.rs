@@ -532,3 +532,32 @@ async fn sharded_stream_rejects_cross_shard_schema_mismatch() {
         );
     }
 }
+
+#[tokio::test]
+async fn files_differing_only_in_schema_metadata_read_as_one_dataset() {
+    // #789 FILE-28: pyarrow stamps per-file key-value metadata (pandas index
+    // bounds); identical columns must not count as a mismatch.
+    let dir = TempDir::new().unwrap();
+    for (i, name) in ["a_part.parquet", "b_part.parquet"].iter().enumerate() {
+        let (batch, _) = small_batch(10);
+        let meta = std::collections::HashMap::from([(
+            "pandas".to_string(),
+            format!("{{\"stop\": {}}}", 10 * (i + 1)),
+        )]);
+        let schema = Arc::new(batch.schema().as_ref().clone().with_metadata(meta));
+        let batch = RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap();
+        write_single_row_group(&dir.path().join(name), &batch);
+    }
+    let pattern = format!("{}/*_part.parquet", dir.path().display());
+    let source = ParquetSource::new(ParquetSourceConfig::glob(pattern).with_batch_size(5))
+        .await
+        .unwrap();
+    let ctx = std::collections::HashMap::new();
+    assert_eq!(source.fetch_with_context(&ctx).await.unwrap().len(), 20);
+    let mut pages = source.stream_pages(&ctx, 5);
+    let mut rows = 0;
+    while let Some(page) = pages.next().await {
+        rows += page.unwrap().records.len();
+    }
+    assert_eq!(rows, 20);
+}

@@ -1,12 +1,11 @@
 //! Arrow `RecordBatch` → `serde_json::Value` conversion.
 //!
-//! `arrow_json::ArrayWriter` already knows how to encode every Arrow logical
-//! type (structs, lists, maps, decimals, dates, timestamps) as JSON. We let it
-//! do the heavy lifting: write each batch as a JSON array into an in-memory
-//! buffer and parse the result back into `Vec<Value>`.
+//! Delegates to [`faucet_core::columnar::record_batch_to_values`]: null
+//! columns stay present as `null`, decimals keep every digit as a string, and
+//! NaN / ±Infinity come out as the strings `"NaN"` / `"Infinity"` /
+//! `"-Infinity"` rather than `null`.
 
 use arrow::array::RecordBatch;
-use arrow_json::ArrayWriter;
 use faucet_core::FaucetError;
 use serde_json::Value;
 
@@ -21,27 +20,8 @@ pub fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<Value>, FaucetErr
         return Ok(Vec::new());
     }
 
-    let mut buf: Vec<u8> = Vec::with_capacity(batch.num_rows() * 64);
-    {
-        let mut writer = ArrayWriter::new(&mut buf);
-        writer
-            .write(batch)
-            .map_err(|e| FaucetError::Source(format!("arrow_json encode error: {e}")))?;
-        writer
-            .finish()
-            .map_err(|e| FaucetError::Source(format!("arrow_json finish error: {e}")))?;
-    }
-
-    let parsed: Value = serde_json::from_slice(&buf)
-        .map_err(|e| FaucetError::Source(format!("arrow_json output parse error: {e}")))?;
-
-    match parsed {
-        Value::Array(rows) => Ok(rows),
-        other => Err(FaucetError::Source(format!(
-            "arrow_json produced non-array output: {}",
-            other
-        ))),
-    }
+    faucet_core::columnar::record_batch_to_values(batch)
+        .map_err(|e| FaucetError::Source(format!("parquet: encoding rows as JSON failed: {e}")))
 }
 
 #[cfg(test)]
@@ -81,7 +61,41 @@ mod tests {
         assert_eq!(rows[0]["id"], 1);
         assert_eq!(rows[0]["name"], "Alice");
         assert_eq!(rows[1]["id"], 2);
-        // Null fields are omitted by arrow_json's default writer.
-        assert!(rows[1].get("name").is_none() || rows[1]["name"].is_null());
+        assert_eq!(
+            rows[1].get("name"),
+            Some(&Value::Null),
+            "a null stays present"
+        );
+    }
+
+    #[test]
+    fn decimals_keep_every_digit_and_non_finite_floats_survive() {
+        use arrow::array::{Decimal128Array, Float64Array};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Decimal128(38, 10), true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let d = Decimal128Array::from(vec![
+            Some(12_345_678_901_234_567_890_123_456_789_012_345_678i128),
+            None,
+        ])
+        .with_precision_and_scale(38, 10)
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(d),
+                Arc::new(Float64Array::from(vec![
+                    Some(f64::NAN),
+                    Some(f64::NEG_INFINITY),
+                ])),
+            ],
+        )
+        .unwrap();
+        let rows = record_batch_to_json(&batch).unwrap();
+        assert_eq!(rows[0]["d"], "1234567890123456789012345678.9012345678");
+        assert_eq!(rows[1]["d"], Value::Null);
+        assert_eq!(rows[0]["f"], "NaN");
+        assert_eq!(rows[1]["f"], "-Infinity");
     }
 }

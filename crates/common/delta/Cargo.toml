@@ -19,7 +19,7 @@ azure = ["deltalake/azure"]
 gcs = ["deltalake/gcs"]
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["arrow"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 schemars.workspace = true
