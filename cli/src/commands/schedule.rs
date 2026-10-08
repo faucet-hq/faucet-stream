@@ -75,6 +75,8 @@ impl Reload {
 struct Rows {
     nodes: Vec<ExpandedNode>,
     topology: Option<std::sync::Arc<PipelineConfig>>,
+    /// A `fan_out:` config, whose rows are discovered afresh every tick.
+    fanout: Option<std::sync::Arc<PipelineConfig>>,
 }
 
 impl Rows {
@@ -85,6 +87,14 @@ impl Rows {
             return Ok(Self {
                 nodes: Vec::new(),
                 topology: Some(std::sync::Arc::new(cfg.clone())),
+                fanout: None,
+            });
+        }
+        if crate::dynamic_fanout::has_fanout_source(cfg)? {
+            return Ok(Self {
+                nodes: Vec::new(),
+                topology: None,
+                fanout: Some(std::sync::Arc::new(cfg.clone())),
             });
         }
         Ok(expand(cfg)?.into())
@@ -101,6 +111,7 @@ impl From<Vec<ExpandedNode>> for Rows {
         Self {
             nodes,
             topology: None,
+            fanout: None,
         }
     }
 }
@@ -121,7 +132,14 @@ async fn run_rows(rows: Rows, opts: ExecuteOptions) -> CliResult<RunSummary> {
             };
             crate::topology::run_topology(&cfg, &opts.auth, run).await
         }
-        None => run_expanded(rows.nodes, opts).await,
+        None => match rows.fanout {
+            Some(cfg) => {
+                let mut cfg = (*cfg).clone();
+                crate::dynamic_fanout::resolve_dynamic_fanout(&mut cfg, &opts.auth).await?;
+                run_expanded(expand(&cfg)?, opts).await
+            }
+            None => run_expanded(rows.nodes, opts).await,
+        },
     }
 }
 
@@ -1152,6 +1170,66 @@ mod tests {
         // the timeout message shape when it errors.
         if let Err(CliError::Internal(msg)) = &joined {
             assert!(msg.contains("run_timeout_secs"), "{msg}");
+        }
+    }
+
+    /// A `fan_out:` config is planned as such and discovers its rows on
+    /// every tick, like `faucet run` (#789 CLI-30).
+    #[cfg(feature = "source-rest")]
+    #[tokio::test]
+    async fn a_fan_out_config_discovers_on_every_tick() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/objects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "items": [] })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut src = serde_json::to_value(faucet_source_rest::RestStreamConfig::new(
+            &server.uri(),
+            "/",
+        ))
+        .unwrap();
+        src["discovery"] = serde_json::json!({
+            "list": { "get": "/objects", "items": "$.items[*]", "name": "$.name" },
+            "emit": { "config": { "path": "/${name_lower}" } },
+            "fan_out": true
+        });
+        let cfg: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "name": "fo",
+            "pipeline": { "source": { "type": "rest", "config": src }, "sink": { "type": "jsonl", "config": { "path": "/dev/null" } } }
+        }))
+        .unwrap();
+        let rows = Rows::plan(&cfg).unwrap();
+        assert!(rows.fanout.is_some() && rows.nodes.is_empty());
+        let auth = AuthCatalog::new();
+        for _ in 0..2 {
+            let opts = make_opts(
+                "fo",
+                &None,
+                &auth,
+                Utc::now().fixed_offset(),
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &crate::usage::UsageOptions::default(),
+                &None,
+                #[cfg(feature = "lineage")]
+                &None,
+                #[cfg(feature = "lineage")]
+                &None,
+                #[cfg(feature = "notify")]
+                &None,
+                #[cfg(feature = "catalog")]
+                &None,
+            );
+            let err = run_rows(rows.clone(), opts).await.unwrap_err().to_string();
+            assert!(err.contains("returned no datasets"), "{err}");
         }
     }
 
