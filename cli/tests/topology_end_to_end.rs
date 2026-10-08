@@ -543,10 +543,11 @@ pipeline:
         "{err}"
     );
     assert_eq!(summary.invocations[0].row_id, "w");
+    // The failing run stays out of the baseline (#789 CLI-173).
     let history =
         faucet_cli::profiling::ProfileHistory::from_value(store.get(&key).await.unwrap().unwrap());
-    assert_eq!(history.runs.len(), 3);
-    assert!(!history.latest().unwrap().drift.is_empty());
+    assert_eq!(history.runs.len(), 2);
+    assert!(history.latest().unwrap().drift.is_empty());
 
     // A preview never touches the baseline.
     let auth = build_auth_catalog(None).unwrap();
@@ -562,7 +563,7 @@ pipeline:
     .unwrap();
     let history =
         faucet_cli::profiling::ProfileHistory::from_value(store.get(&key).await.unwrap().unwrap());
-    assert_eq!(history.runs.len(), 3);
+    assert_eq!(history.runs.len(), 2);
 }
 
 #[tokio::test]
