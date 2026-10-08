@@ -8,7 +8,7 @@ type: application
 # Chart version — bump on chart changes (SemVer).
 version: 0.1.1
 # The faucet-cli / image version this chart tracks. Overridable via image.tag.
-appVersion: "1.13.2"
+appVersion: "1.13.3"
 home: https://faucet-hq.github.io/faucet-stream/
 sources:
   - https://github.com/faucet-hq/faucet-stream
