@@ -1974,7 +1974,10 @@ mod tests {
         let err = validate_topology_spec(&with("  schema: { on_drift: evolve }\n"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("evolve is not supported by sink 'jsonl'"), "{err}");
+        assert!(
+            err.contains("evolve is not supported by sink 'jsonl'"),
+            "{err}"
+        );
         let err = validate_topology_spec(&with("  schema: { on_drift: quarantine }\n"))
             .unwrap_err()
             .to_string();
