@@ -40,6 +40,8 @@ Implement `Source` or `Sink`. Both are object-safe (`Box<dyn Source>` works) and
 all newer methods have defaults, so a minimal connector is small.
 
 ```rust,ignore
+use std::collections::HashMap;
+
 use faucet_core::{async_trait, Source, Sink, FaucetError, Value};
 
 struct MySource { /* reusable client/pool created in new() */ }
@@ -47,7 +49,11 @@ struct MySource { /* reusable client/pool created in new() */ }
 #[async_trait]
 impl Source for MySource {
     // Primary entry point. (`fetch_all()` is a provided convenience.)
-    async fn fetch_with_context(&self) -> Result<Vec<Value>, FaucetError> {
+    // `context` carries parent-record values for `${parent.path}` placeholders.
+    async fn fetch_with_context(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
         todo!("fetch records from your system")
     }
 }

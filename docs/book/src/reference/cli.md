@@ -195,6 +195,10 @@ Each row's `decision` is `"run"`/`"skip"` when a selector or the readiness ladde
 is active, otherwise `null`. A topology-mode config emits `"mode": "topology"`
 with `nodes`/`edges` counts and any inert-block `warnings`.
 
+In both modes validation is offline: each source/sink config is checked the way
+the connector would read it, but no connector is built — nothing connects to a
+database and no file (a SQLite database, say) is created.
+
 ### Composition flags
 
 When a config uses [composition](config.md#config-composition) (`extends:` /
@@ -965,7 +969,8 @@ dataset.
 
 ## `usage`
 
-*(requires the `catalog` build feature)*
+*(requires the `catalog` build feature — included in `full`, not in the
+default build or the prebuilt binaries)*
 
 ```bash
 faucet usage [--config PATH] [--since WHEN] [--until WHEN] [--pipeline NAME] \

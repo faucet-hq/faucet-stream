@@ -230,6 +230,75 @@ pipeline:
         .stdout(contains("2 node(s), 1 edge(s) — valid"));
 }
 
+/// #844: `validate --no-secrets` on a topology is offline — it checks each
+/// node's connector config without building the connector, so an unreachable
+/// Postgres host is never resolved and a SQLite database file is never created.
+#[cfg(all(feature = "sink-postgres", feature = "sink-sqlite"))]
+#[test]
+fn validate_builds_no_sink_connector() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let db = dir.path().join("fresh.db");
+    let cfg = dir.path().join("faucet.yaml");
+    write(
+        &cfg,
+        &format!(
+            r#"version: 1
+name: offline_validate
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    pg:
+      type: postgres
+      config:
+        connection_url: postgres://u:p@faucet-844.invalid:5432/db
+        table_name: orders
+        column_mapping: auto_map
+    lite:
+      type: sqlite
+      config:
+        database_url: "sqlite:{db}?mode=rwc"
+        table_name: orders
+        column_mapping: auto_map
+  nodes:
+    s: {{ kind: source, ref: o }}
+    t: {{ kind: tee }}
+    a: {{ kind: sink, ref: pg }}
+    b: {{ kind: sink, ref: lite }}
+  edges:
+    - {{ from: s, to: t }}
+    - {{ from: t, to: a }}
+    - {{ from: t, to: b }}
+"#,
+            csv = csv.display(),
+            db = db.display(),
+        ),
+    );
+
+    let started = std::time::Instant::now();
+    Command::cargo_bin("faucet")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["validate", "--no-secrets", "--no-env-file"])
+        .arg(&cfg)
+        .assert()
+        .success()
+        .stdout(contains("4 node(s), 3 edge(s) — valid"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "validation took {:?} — it must not wait on the network",
+        started.elapsed()
+    );
+    assert!(!db.exists(), "validate created the SQLite database file");
+    let leftovers: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "orders.csv" && n != "faucet.yaml")
+        .collect();
+    assert!(leftovers.is_empty(), "validate wrote files: {leftovers:?}");
+}
+
 #[test]
 fn preview_prints_source_records() {
     let dir = TempDir::new().unwrap();

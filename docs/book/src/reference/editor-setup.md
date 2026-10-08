@@ -22,6 +22,7 @@ committed to the repository at
 Install the [Red Hat YAML extension](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml),
 then either add a modeline to the top of each config:
 
+<!-- faucet:no-validate -->
 ```yaml
 # yaml-language-server: $schema=./faucet.schema.json
 version: 1

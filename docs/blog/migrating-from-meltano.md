@@ -114,7 +114,7 @@ pipeline:
     config:
       connection_url: ${env:PG_URL}
       table_name: payments_charges
-      column_mapping: { type: jsonb, column: data }
+      column_mapping: { jsonb: { column: data } }
 
   state:
     type: file
@@ -137,7 +137,7 @@ This is a real, runnable config —
    `rest` / `graphql` source pointed at the same API. Databases, warehouses,
    files, and streaming systems map to dedicated connectors.
 2. **Translate one pipeline** using the table above. Keep the raw-JSONB landing
-   pattern (`column_mapping: { type: jsonb }`) if you transform downstream in
+   pattern (`column_mapping: { jsonb: { column: data } }`) if you transform downstream in
    dbt — it mirrors how most Singer targets land data.
 3. **Port your STATE.** faucet keeps its own bookmark in the `state:` store; you
    don't hand-migrate Singer STATE. On first run, set the initial position via

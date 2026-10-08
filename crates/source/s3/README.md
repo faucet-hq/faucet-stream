@@ -64,8 +64,8 @@ pipeline:
       connection_url: postgres://user:pass@localhost/warehouse
       table_name: events_raw
       column_mapping:
-        type: jsonb
-        column: payload
+        jsonb:
+          column: payload
 ```
 
 ```bash

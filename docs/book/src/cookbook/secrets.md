@@ -95,7 +95,7 @@ pipeline:
       project_id: my-gcp-project
       dataset_id: analytics
       table_id: events
-      credentials:
+      auth:
         type: application_default
 ```
 
@@ -128,7 +128,7 @@ pipeline:
     config:
       bucket: my-export-bucket
       prefix: exports/
-      credentials:
+      auth:
         type: application_default
 ```
 
@@ -168,7 +168,7 @@ pipeline:
       auth:
         type: oauth
         config:
-          access_token: "${azure-kv:my-vault/snowflake-token}"
+          token: "${azure-kv:my-vault/snowflake-token}"
 ```
 
 ## The `#field` JSON extractor

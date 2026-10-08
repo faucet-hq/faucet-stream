@@ -33,14 +33,19 @@ in the codebase. See [ADR 0002](../adr/0002-checkpoint-ordering.md),
 
 **Guarantee.** A retry re-attempts the *same* operation against the *same*
 position; it never moves the bookmark forward. And a plain, non-idempotent
-`write_batch` is retried **only** when the sink commits writes idempotently
-(`Sink::supports_idempotent_writes()`); otherwise a lost-response retry could
-duplicate every row.
+`write_batch` is retried **only** when replaying it converges
+(`Sink::write_batch_is_replay_safe()`, which defaults to `dedups_by_key()` —
+a sink configured with `write_mode: upsert|delete` and a `key`); otherwise a
+lost-response retry could duplicate every row.
 
-**Where.** The `with_retry_write!` macro in `run_stream` gates retrying
-non-idempotent writes on `sink.supports_idempotent_writes()`; the idempotent
-path (`write_batch_idempotent`) is always safe to retry because replaying a
-token-stamped write is a no-op.
+**Where.** The `with_retry_write!` macro in `run_stream` gates retrying plain
+writes on `sink.write_batch_is_replay_safe()`. It deliberately does **not**
+gate on `supports_idempotent_writes()`: that only promises the rows and a
+commit token commit together on the `write_batch_idempotent` path, and most
+sinks that advertise it still do a plain multi-row `INSERT` in `write_batch`.
+The idempotent path (`write_batch_idempotent`) is retried through
+`eo_write_once`, which re-reads the committed token before every attempt, so a
+page that committed before its response was lost is not written again.
 
 **If violated.** Duplicated rows on a lost sink response — the repo's
 #1-worst-bug class. See [retries](./retries.md), [ADR 0007](../adr/0007-retries.md).

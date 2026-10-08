@@ -675,7 +675,8 @@ pub async fn build_topology_meta(
     opts: &TopologyRunOptions,
 ) -> CliResult<(Topology, NodeIdentities)> {
     let mut ids = NodeIdentities::new();
-    let topo = build_topology_inner(cfg, auth, opts, Some(&mut ids), None, None).await?;
+    let topo =
+        build_topology_inner(cfg, auth, opts, Some(&mut ids), None, None, Build::Live).await?;
     Ok((topo, ids))
 }
 
@@ -688,8 +689,16 @@ pub async fn build_topology_full(
 ) -> CliResult<(Topology, NodeIdentities, TopologyProfilers)> {
     let mut ids = NodeIdentities::new();
     let mut profilers = TopologyProfilers::new();
-    let topo =
-        build_topology_inner(cfg, auth, opts, Some(&mut ids), Some(&mut profilers), None).await?;
+    let topo = build_topology_inner(
+        cfg,
+        auth,
+        opts,
+        Some(&mut ids),
+        Some(&mut profilers),
+        None,
+        Build::Live,
+    )
+    .await?;
     Ok((topo, ids, profilers))
 }
 
@@ -723,6 +732,7 @@ pub async fn build_topology_run(
         Some(&mut identities),
         Some(&mut profilers),
         Some(&mut budgets),
+        Build::Live,
     )
     .await?;
     Ok(BuiltTopology {
@@ -749,7 +759,83 @@ pub async fn build_topology_with(
     auth: &AuthCatalog,
     opts: &TopologyRunOptions,
 ) -> CliResult<Topology> {
-    build_topology_inner(cfg, auth, opts, None, None, None).await
+    build_topology_inner(cfg, auth, opts, None, None, None, Build::Live).await
+}
+
+/// Validate a topology config **offline** (#844): the graph checks, governance,
+/// and each source/sink node's connector config — deserialization plus the
+/// connector's own `validate()`, exactly what matrix-mode `faucet validate`
+/// runs — without constructing a single connector.
+///
+/// Building a connector is not side-effect free (a Postgres sink connects, a
+/// SQLite sink creates its database file), so `validate` must never do it. The
+/// returned graph wires inert placeholders in place of the connectors: it is
+/// for reporting its shape, never for running.
+pub async fn validate_topology(cfg: &PipelineConfig) -> CliResult<Topology> {
+    let auth = AuthCatalog::default();
+    build_topology_inner(
+        cfg,
+        &auth,
+        &TopologyRunOptions::default(),
+        None,
+        None,
+        None,
+        Build::Offline,
+    )
+    .await
+}
+
+/// The offline twin of [`faucet_core::check_dlq_all_policy`]: refuse
+/// `on_batch_error: dlq_all` on a sink that may commit part of a failed batch,
+/// judged from its config rather than a built connector.
+fn check_dlq_all_offline(
+    id: &str,
+    kind: &str,
+    config: &Value,
+    dlq: &crate::config::DlqSpec,
+) -> CliResult<()> {
+    if dlq.on_batch_error != crate::config::OnBatchErrorSpec::DlqAll
+        || dlq.allow_duplicates_on_dlq_all
+    {
+        return Ok(());
+    }
+    let atomicity = crate::registry::sink_batch_atomicity(kind, config).unwrap_or_default();
+    if faucet_core::dlq_all_is_safe(
+        atomicity,
+        crate::commands::validate::config_writes_by_key(kind, config),
+    ) {
+        return Ok(());
+    }
+    Err(CliError::Config(format!(
+        "node '{id}': {}",
+        faucet_core::dlq_all_refusal(kind, atomicity)
+    )))
+}
+
+/// Whether [`build_topology_inner`] builds the real connectors or only checks
+/// their configs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Build {
+    Live,
+    Offline,
+}
+
+/// The placeholder source an offline-validated graph wires in place of a real
+/// connector. It is never run.
+struct OfflineSource;
+
+#[async_trait::async_trait]
+impl faucet_core::Source for OfflineSource {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, faucet_core::FaucetError> {
+        Ok(Vec::new())
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "offline"
+    }
 }
 
 async fn build_topology_inner(
@@ -759,6 +845,7 @@ async fn build_topology_inner(
     mut identities: Option<&mut NodeIdentities>,
     mut profilers: Option<&mut TopologyProfilers>,
     mut budgets: Option<&mut TopologyBudgets>,
+    build: Build,
 ) -> CliResult<Topology> {
     // Cheap graph checks first, so a wiring typo never costs a connector build.
     validate_topology_spec(cfg)?;
@@ -799,6 +886,13 @@ async fn build_topology_inner(
                 )?;
                 crate::executor::resolve_now_inplace(&mut c, clock)?;
                 crate::executor::reject_unresolved_backfill_tokens(&c, "source")?;
+                if build == Build::Offline {
+                    crate::registry::validate_source_config(&k, id, c)
+                        .map_err(|e| CliError::Config(format!("node '{id}' source: {e}")))?;
+                    builder =
+                        builder.node((*id).clone(), NodeKind::Source(Box::new(OfflineSource)));
+                    continue;
+                }
                 let source = build_source(&k, c.clone(), auth, None).await?;
                 record_identity(&mut identities, id, &k, c, source.dataset_uri());
                 NodeKind::Source(source)
@@ -823,7 +917,14 @@ async fn build_topology_inner(
                 // identity is still recorded from the *real* config, so a
                 // `--dry-run` report names the destination it would have
                 // written rather than the counting stand-in.
-                let sink: Box<dyn faucet_core::Sink> = if opts.dry_run {
+                let sink: Box<dyn faucet_core::Sink> = if build == Build::Offline {
+                    crate::registry::validate_sink_config(&k, id, c.clone())
+                        .map_err(|e| CliError::Config(format!("node '{id}' sink: {e}")))?;
+                    if let Some(dlq) = &spec.dlq {
+                        check_dlq_all_offline(id, &k, &c, dlq)?;
+                    }
+                    Box::new(crate::executor::CountingSink::new())
+                } else if opts.dry_run {
                     if let Ok(probe) = build_sink(&k, c.clone(), auth).await {
                         record_identity(&mut identities, id, &k, c.clone(), probe.dataset_uri());
                     }
@@ -2610,5 +2711,115 @@ pipeline:
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[0].0, "w");
         assert!(verdicts[0].1.contains("max_duration_secs"), "{verdicts:?}");
+    }
+
+    /// #844: offline validation checks every connector config without building
+    /// a connector, so nothing is opened or created.
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn offline_validation_builds_no_connector() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("never.jsonl");
+        let yaml = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {in_} }} }}\n  sink: {{ type: jsonl, config: {{ path: {out} }} }}\n  nodes:\n    s: {{ kind: source }}\n    t: {{ kind: transform, transforms: [] }}\n    w: {{ kind: sink }}\n  edges:\n    - {{ from: s, to: t }}\n    - {{ from: t, to: w }}\n",
+            in_ = dir.path().join("missing.csv").display(),
+            out = out.display(),
+        );
+        let topo = validate_topology(&cfg(&yaml)).await.expect("valid");
+        assert_eq!(topo.nodes().len(), 3);
+        assert_eq!(topo.edges().len(), 2);
+        assert!(!out.exists(), "validation must not create the sink's file");
+        let placeholder = topo
+            .nodes()
+            .iter()
+            .find_map(|n| match &n.kind {
+                NodeKind::Source(s) if n.id == "s" => Some(s),
+                _ => None,
+            })
+            .expect("source node");
+        assert_eq!(placeholder.connector_name(), "offline");
+        assert!(
+            placeholder
+                .fetch_with_context(&HashMap::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// #844: a bad connector config is still refused offline, naming the node.
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn offline_validation_refuses_bad_connector_configs() {
+        let graph = "  nodes:\n    s: { kind: source }\n    w: { kind: sink }\n  edges:\n    - { from: s, to: w }\n";
+        let bad_source = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv, nope: 1 }} }}\n  sink: {{ type: jsonl, config: {{ path: out.jsonl }} }}\n{graph}"
+        );
+        let err = validate_topology(&cfg(&bad_source)).await.unwrap_err();
+        assert!(err.to_string().contains("node 's' source"), "{err}");
+        let bad_sink = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: out.jsonl, nope: 1 }} }}\n{graph}"
+        );
+        let err = validate_topology(&cfg(&bad_sink)).await.unwrap_err();
+        assert!(err.to_string().contains("node 'w' sink"), "{err}");
+    }
+
+    /// #844: `on_batch_error: dlq_all` on a best-effort sink is refused offline,
+    /// as the live build refuses it, unless the DLQ opts in to duplicates.
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn offline_validation_refuses_unsafe_dlq_all() {
+        let doc = |extra: &str| {
+            format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: out.jsonl }} }}\n  dlq:\n    sink: {{ type: jsonl, config: {{ path: dlq.jsonl }} }}\n{extra}  nodes:\n    s: {{ kind: source }}\n    w: {{ kind: sink }}\n  edges:\n    - {{ from: s, to: w }}\n"
+            )
+        };
+        let err = validate_topology(&cfg(&doc("    on_batch_error: dlq_all\n")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("node 'w'") && err.to_string().contains("dlq_all"),
+            "{err}"
+        );
+        validate_topology(&cfg(&doc(
+            "    on_batch_error: dlq_all\n    allow_duplicates_on_dlq_all: true\n",
+        )))
+        .await
+        .expect("opted in");
+        validate_topology(&cfg(&doc(""))).await.expect("propagate");
+    }
+
+    /// #844: a keyed upsert sink is safe under `dlq_all` (a replayed row
+    /// overwrites itself), so offline validation accepts it.
+    #[cfg(all(feature = "source-csv", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn offline_validation_accepts_dlq_all_on_a_keyed_sink() {
+        let yaml = "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: sqlite, config: { database_url: 'sqlite:out.db', table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id] } }\n  dlq:\n    sink: { type: sqlite, config: { database_url: 'sqlite:dlq.db', table_name: d, column_mapping: auto_map } }\n    on_batch_error: dlq_all\n  nodes:\n    s: { kind: source }\n    w: { kind: sink }\n  edges:\n    - { from: s, to: w }\n";
+        validate_topology(&cfg(yaml))
+            .await
+            .expect("keyed sink is safe");
+    }
+
+    /// The identity-reporting builders still build the real connectors.
+    #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn identity_builders_build_live_connectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        std::fs::write(&input, "id\n1\n").unwrap();
+        let yaml = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {} }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n  nodes:\n    s: {{ kind: source }}\n    w: {{ kind: sink }}\n  edges:\n    - {{ from: s, to: w }}\n",
+            input.display(),
+            dir.path().join("out.jsonl").display(),
+        );
+        let c = cfg(&yaml);
+        let auth = AuthCatalog::default();
+        let opts = TopologyRunOptions::default();
+        let (topo, ids) = build_topology_meta(&c, &auth, &opts).await.unwrap();
+        assert_eq!(topo.nodes().len(), 2);
+        assert_eq!(ids["s"].kind, "csv");
+        let (topo, ids, _) = build_topology_full(&c, &auth, &opts).await.unwrap();
+        assert_eq!(topo.nodes().len(), 2);
+        assert_eq!(ids["w"].kind, "jsonl");
     }
 }

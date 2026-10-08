@@ -40,8 +40,10 @@ triggers:
 ### Pipeline template (`pipelines/s3_load.yaml`)
 
 The trigger injects `${trigger.object_key}` and `${trigger.bucket}` into the
-config at fire time. Use them as you would any `${…}` token:
+config at fire time. Use them as you would any `${…}` token (the file only
+validates through its trigger, which binds them):
 
+<!-- faucet:no-validate -->
 ```yaml
 version: 1
 name: s3-load
@@ -58,7 +60,7 @@ pipeline:
     config:
       connection_url: "${env:PG_URL}"
       table_name: events_raw
-      column_mapping: { type: jsonb, column: payload }
+      column_mapping: { jsonb: { column: payload } }
 ```
 
 ### Start the server

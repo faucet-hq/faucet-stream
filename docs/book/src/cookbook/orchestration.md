@@ -141,7 +141,7 @@ Enable the exporter in `faucet_pipeline.yaml`:
 ```yaml
 observability:
   prometheus:
-    listen_addr: 0.0.0.0:9464
+    listen: 0.0.0.0:9464
 ```
 
 ## See also

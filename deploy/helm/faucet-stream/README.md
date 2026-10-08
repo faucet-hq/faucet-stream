@@ -206,6 +206,10 @@ Override via `podSecurityContext` / `securityContext`.
 
 ## Values reference
 
+The chart's `appVersion` is the faucet-cli version of the release it ships
+with (the release PR updates it and CI fails when it drifts), so leaving
+`image.tag` empty runs that release's image.
+
 See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 
 | Key | Default | Purpose |

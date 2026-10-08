@@ -44,11 +44,16 @@ pipeline:
   source:
     type: rest
     config:
-      url: "https://api.example.com/tenants/${param.tenant_id}/events?since=${param.since}"
+      base_url: https://api.example.com
+      path: "/tenants/${param.tenant_id}/events"
+      query_params: { since: "${param.since}" }
       auth: { type: bearer, config: { token: "${param.api_token}" } }
       pagination:
-        type: page_number
-        config: { page_param: page, size_param: per_page, size: "${param.page_size}" }
+        type: PageNumber
+        param_name: page
+        start_page: 1
+        page_size: "${param.page_size}"
+        page_size_param: per_page
   sink:
     type: file
     config:

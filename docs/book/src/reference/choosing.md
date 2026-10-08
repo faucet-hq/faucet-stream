@@ -124,7 +124,7 @@ read-write transaction.
 
 The Postgres/MySQL/SQLite/SQL Server sinks can write either:
 
-- **a single JSON/JSONB column** (`column_mapping: { type: jsonb, column: data }`)
+- **a single JSON/JSONB column** (`column_mapping: { jsonb: { column: data } }`)
   — schemaless, no DDL coupling, easiest to start with; or
 - **auto-mapped columns** — one column per top-level field, for queryable
   relational tables.

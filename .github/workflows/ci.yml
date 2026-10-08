@@ -126,6 +126,10 @@ jobs:
         run: python3 scripts/connector-deps.py
       - name: Check no published crate packages a private key (#789 SUPPLY-20)
         run: python3 scripts/packaged-keys.py
+      - name: Check the Helm chart appVersion equals the faucet-cli version (#830)
+        run: |
+          python3 scripts/test_helm_app_version.py
+          python3 scripts/helm-app-version.py
 
   clippy:
     name: Clippy

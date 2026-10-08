@@ -186,8 +186,10 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
     // matrix. `build_topology` runs the core structural validator (arity,
     // fan-out, join edges, cycle, reachability).
     if crate::topology::is_topology(&cfg) {
-        let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
-        let topo = crate::topology::build_topology(&cfg, &auth).await?;
+        // Config-level checks only: building the connectors would connect to
+        // databases and create files (#844).
+        crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
+        let topo = crate::topology::validate_topology(&cfg).await?;
         let inert: Vec<(&str, &str)> = crate::topology::inert_blocks(&cfg);
         #[cfg(feature = "policy")]
         let policy = match cfg.policy.as_ref() {
@@ -689,11 +691,16 @@ pub(crate) fn check_dlq_all_safety(nodes: &[crate::expand::ExpandedNode]) -> Cli
 /// Whether the sink config asks for a keyed write (`write_mode: upsert|delete`
 /// with a `key`) the sink kind supports — a replayed row then overwrites itself.
 fn sink_writes_by_key(sink: &crate::config::ConnectorSpec) -> bool {
-    let Ok(spec) = serde_json::from_value::<faucet_core::WriteSpec>(sink.config.clone()) else {
+    config_writes_by_key(&sink.kind, &sink.config)
+}
+
+/// [`sink_writes_by_key`] over a resolved `(kind, config)` pair.
+pub(crate) fn config_writes_by_key(kind: &str, config: &serde_json::Value) -> bool {
+    let Ok(spec) = serde_json::from_value::<faucet_core::WriteSpec>(config.clone()) else {
         return false;
     };
     spec.dedups_by_key()
-        && crate::registry::sink_supported_write_modes(&sink.kind).contains(&spec.write_mode)
+        && crate::registry::sink_supported_write_modes(kind).contains(&spec.write_mode)
 }
 
 /// Compile every row's transform chain.

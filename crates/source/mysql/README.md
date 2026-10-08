@@ -97,8 +97,7 @@ pipeline:
     config:
       connection_url: postgres://user:pass@localhost/modern
       table_name: customers_imported
-      column_mapping:
-        type: auto_map
+      column_mapping: auto_map
       batch_size: 1000
       max_connections: 10
 ```

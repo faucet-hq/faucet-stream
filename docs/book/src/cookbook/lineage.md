@@ -49,8 +49,18 @@ lineage:
       url: http://marquez:5000/api/v1/lineage
 
 pipeline:
-  source: { type: postgres, config: { … } }
-  sink:   { type: bigquery, config: { … } }
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://localhost/app
+      query: SELECT * FROM orders
+  sink:
+    type: bigquery
+    config:
+      project_id: my-project
+      dataset_id: analytics
+      table_id: orders
+      auth: { type: application_default }
 ```
 
 ### Full field reference
