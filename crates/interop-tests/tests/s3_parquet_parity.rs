@@ -24,6 +24,8 @@ const BUCKET: &str = "faucet-parquet-parity";
 
 async fn start() -> (ContainerAsync<MinIO>, String, Client) {
     let container = MinIO::default()
+        // tmpfs: MinIO refuses writes when the runner disk is nearly full.
+        .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
         .with_name("cgr.dev/chainguard/minio")
         .with_tag("latest")
         .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
