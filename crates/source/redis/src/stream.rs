@@ -70,7 +70,7 @@ pub struct RedisSource {
     /// [`ConnectionManager`] reconnects after the server connection drops (a
     /// failover), where a bare multiplexed connection failed every later
     /// command until it was rebuilt (#789 MSG-78). Cheap to clone.
-    conn: tokio::sync::OnceCell<ConnectionManager>,
+    conn: std::panic::AssertUnwindSafe<tokio::sync::OnceCell<ConnectionManager>>,
 }
 
 impl RedisSource {
@@ -81,7 +81,7 @@ impl RedisSource {
         faucet_core::validate_batch_size(config.batch_size)?;
         Ok(Self {
             config,
-            conn: tokio::sync::OnceCell::new(),
+            conn: std::panic::AssertUnwindSafe(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -631,6 +631,12 @@ fn stream_ignores_consumer_group(group: Option<&str>, consumer: Option<&str>) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keeps_its_auto_traits() {
+        fn assert<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert::<super::RedisSource>();
+    }
+
     use super::*;
     use crate::config::RedisSourceConfig;
 

@@ -20,7 +20,7 @@ pub const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// stall a run.
 pub struct RedisStateStore {
     namespace: String,
-    conn: Conn,
+    conn: std::panic::AssertUnwindSafe<Conn>,
 }
 
 /// The store's connection: a self-healing manager, or a caller-supplied
@@ -116,7 +116,7 @@ impl RedisStateStore {
         .map_err(|e| FaucetError::State(format!("Redis connection failed: {e}")))?;
         Ok(Self {
             namespace,
-            conn: Conn::Managed(conn),
+            conn: std::panic::AssertUnwindSafe(Conn::Managed(conn)),
         })
     }
 
@@ -130,7 +130,7 @@ impl RedisStateStore {
         validate_namespace(&namespace)?;
         Ok(Self {
             namespace,
-            conn: Conn::Shared(conn),
+            conn: std::panic::AssertUnwindSafe(Conn::Shared(conn)),
         })
     }
 
@@ -200,7 +200,7 @@ impl StateStore for RedisStateStore {
     async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
         validate_state_key(key)?;
         let rkey = self.redis_key(key);
-        let raw: Option<String> = with_retry(&self.conn, |mut c| {
+        let raw: Option<String> = with_retry(&self.conn.0, |mut c| {
             let rkey = rkey.clone();
             async move { c.get(rkey).await }
         })
@@ -225,7 +225,7 @@ impl StateStore for RedisStateStore {
             FaucetError::State(format!("failed to serialize state for key '{key}': {e}"))
         })?;
         let rkey = self.redis_key(key);
-        let _: () = with_retry(&self.conn, |mut c| {
+        let _: () = with_retry(&self.conn.0, |mut c| {
             let (rkey, serialized) = (rkey.clone(), serialized.clone());
             async move { c.set(rkey, serialized).await }
         })
@@ -238,7 +238,7 @@ impl StateStore for RedisStateStore {
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
         validate_state_key(key)?;
         let rkey = self.redis_key(key);
-        let _: i64 = with_retry(&self.conn, |mut c| {
+        let _: i64 = with_retry(&self.conn.0, |mut c| {
             let rkey = rkey.clone();
             async move { c.del(rkey).await }
         })
@@ -258,7 +258,7 @@ impl StateStore for RedisStateStore {
         let mut keys = Vec::new();
         let mut cursor: u64 = 0;
         loop {
-            let (next, batch): (u64, Vec<String>) = with_retry(&self.conn, |mut c| {
+            let (next, batch): (u64, Vec<String>) = with_retry(&self.conn.0, |mut c| {
                 let pattern = pattern.clone();
                 async move {
                     redis::cmd("SCAN")
@@ -308,9 +308,9 @@ impl StateStore for RedisStateStore {
         })?;
         let redis_key = self.redis_key(key);
         let script = redis::Script::new(COMPARE_AND_SET_LUA);
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.0.clone();
         for _ in 0..CAS_ATTEMPTS {
-            let raw: Option<String> = with_retry(&self.conn, |mut c| {
+            let raw: Option<String> = with_retry(&self.conn.0, |mut c| {
                 let rkey = redis_key.clone();
                 async move { c.get(rkey).await }
             })
@@ -366,7 +366,7 @@ impl StateStore for RedisStateStore {
             })?;
             pairs.push((self.redis_key(key), serialized));
         }
-        let _: () = with_retry(&self.conn, |mut c| {
+        let _: () = with_retry(&self.conn.0, |mut c| {
             let pairs = pairs.clone();
             async move { c.mset(&pairs).await }
         })
@@ -428,6 +428,12 @@ impl RedisStateStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keeps_its_auto_traits() {
+        fn assert<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert::<super::RedisStateStore>();
+    }
+
     use super::*;
 
     #[test]

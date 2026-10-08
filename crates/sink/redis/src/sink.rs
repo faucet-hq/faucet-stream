@@ -14,7 +14,7 @@ pub struct RedisSink {
     config: RedisSinkConfig,
     /// Reconnects after the server connection drops (a failover), where a
     /// bare multiplexed connection failed every later command (#789 MSG-78).
-    conn: ConnectionManager,
+    conn: std::panic::AssertUnwindSafe<ConnectionManager>,
 }
 
 /// The exactly-once write: every data command and the watermark in one Lua
@@ -63,7 +63,10 @@ impl RedisSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("Redis connection failed: {e}")))?;
 
-        Ok(Self { config, conn })
+        Ok(Self {
+            config,
+            conn: std::panic::AssertUnwindSafe(conn),
+        })
     }
 
     fn command(&self, record: &Value) -> Result<Vec<String>, FaucetError> {
@@ -72,7 +75,7 @@ impl RedisSink {
 
     /// Pipeline `commands` in `batch_size` chunks.
     async fn run_commands(&self, commands: &[Vec<String>]) -> Result<(), FaucetError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.0.clone();
         let chunk = if self.config.batch_size == 0 {
             commands.len().max(1)
         } else {
@@ -132,7 +135,7 @@ impl faucet_core::Sink for RedisSink {
         use faucet_core::check::{CheckReport, Probe};
 
         // The connection manager is cheaply cloneable; clone to satisfy &self.
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.0.clone();
         let started = std::time::Instant::now();
         let hint = "check the Redis url / that the server is reachable and accepting connections";
 
@@ -206,7 +209,7 @@ impl faucet_core::Sink for RedisSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.0.clone();
         let commands = records
             .iter()
             .map(|r| self.command(r))
@@ -239,7 +242,7 @@ impl faucet_core::Sink for RedisSink {
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.0.clone();
         // The token is opaque to the sink (it may carry an embedded resume
         // bookmark after a '#'); never parse it here — just hand it back.
         redis::cmd("GET")
@@ -379,6 +382,12 @@ fn flatten_record_to_fields(record: &Value) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keeps_its_auto_traits() {
+        fn assert<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert::<super::RedisSink>();
+    }
+
     use super::*;
     use crate::config::RedisSinkConfig;
     use serde_json::json;
