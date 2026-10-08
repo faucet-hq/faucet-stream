@@ -257,3 +257,71 @@ async fn body_cursor_pages_stream_before_the_next_request() {
     assert_eq!(second.records[0]["id"], "2");
     assert!(pages.next().await.is_none());
 }
+
+/// A gzipped, base64-wrapped CSV report decodes through every step.
+#[tokio::test]
+async fn decode_pipeline_gunzips_a_compressed_report() {
+    use std::io::Write as _;
+    let server = MockServer::start().await;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(b"id,name\n1,alice\n").unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(gz.finish().unwrap());
+    let body = format!("<r><bytes>{b64}</bytes></r>");
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<runReport/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "bytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            DecodeStep::Simple(SimpleStep::Gunzip),
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Csv,
+                    records_path: None,
+                    delimiter: None,
+                    has_headers: true,
+                    sheet: None,
+                    header_row: 0,
+                },
+            },
+        ]);
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["name"], "alice");
+}
+
+/// A SOAP fault answered to a decode-pipeline request is a fault, not a
+/// decode failure: zero records under `fault_as_error: false`.
+#[tokio::test]
+async fn a_soap_fault_is_detected_before_the_decode_pipeline() {
+    let server = MockServer::start().await;
+    let fault = "<Envelope xmlns=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body>\
+         <Fault><faultstring>busy</faultstring></Fault></Body></Envelope>";
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fault))
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .with_soap(faucet_source_xml::SoapConfig {
+            body_inner: Some("<runReport/>".into()),
+            fault_as_error: false,
+            ..Default::default()
+        })
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "runReportResponse.reportBytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+        ]);
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert!(records.is_empty());
+}
