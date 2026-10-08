@@ -930,12 +930,33 @@ fn build_governance(cfg: &PipelineConfig) -> CliResult<TopologyGovernance> {
 
     #[cfg(feature = "masking")]
     if let Some(spec) = &cfg.pipeline.masking {
-        for (node_id, node) in &cfg.pipeline.nodes {
+        for (node_id, ids) in sink_node_masking_ids(cfg) {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let compiled = faucet_core::CompiledMasking::compile_for_sink(spec, &ids)
+                .map_err(|e| CliError::Config(format!("masking: {e}")))?;
+            if !compiled.is_empty() {
+                g.masking_by_sink
+                    .insert(node_id, std::sync::Arc::new(compiled));
+            }
+        }
+    }
+    Ok(g)
+}
+
+/// Each sink node's id with the ids its masking rules are scoped by — the
+/// node id, its template name, and its resolved connector kind (the node's
+/// own `type:` override, else the template's). Shared by the runtime and
+/// `faucet masking`, so the report names what a run applies.
+#[cfg(feature = "masking")]
+pub(crate) fn sink_node_masking_ids(cfg: &PipelineConfig) -> Vec<(String, Vec<String>)> {
+    cfg.pipeline
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| {
             let NodeSpec::Sink { template, kind, .. } = node else {
-                continue;
+                return None;
             };
             let template_ref = template.as_deref().unwrap_or("default");
-            // The node's own kind override, else the template's declared kind.
             let resolved_kind = kind.clone().or_else(|| {
                 cfg.pipeline
                     .sinks
@@ -943,19 +964,11 @@ fn build_governance(cfg: &PipelineConfig) -> CliResult<TopologyGovernance> {
                     .or(cfg.pipeline.sink.as_ref())
                     .map(|t| t.kind.clone())
             });
-            let mut ids: Vec<&str> = vec![node_id.as_str(), template_ref];
-            if let Some(k) = resolved_kind.as_deref() {
-                ids.push(k);
-            }
-            let compiled = faucet_core::CompiledMasking::compile_for_sink(spec, &ids)
-                .map_err(|e| CliError::Config(format!("masking: {e}")))?;
-            if !compiled.is_empty() {
-                g.masking_by_sink
-                    .insert(node_id.clone(), std::sync::Arc::new(compiled));
-            }
-        }
-    }
-    Ok(g)
+            let mut ids = vec![node_id.clone(), template_ref.to_string()];
+            ids.extend(resolved_kind);
+            Some((node_id.clone(), ids))
+        })
+        .collect()
 }
 
 /// Collect a bounded preview of each `source` node's records (source side
