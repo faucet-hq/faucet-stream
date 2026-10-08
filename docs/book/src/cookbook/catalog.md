@@ -31,7 +31,7 @@ run — a broken store logs a warning and the pipeline continues.
 
 > Requires a build with the `catalog` Cargo feature (included in
 > `--features full`), plus `serve-history-sqlite` / `serve-history-postgres`
-> for persistent stores.
+> for persistent stores. The prebuilt binaries include all three.
 
 ## Recording from `faucet run` / `schedule` / `replicate`
 

@@ -5,8 +5,9 @@ events out to Slack, PagerDuty, or a generic signed webhook — so a failure,
 SLA breach, or tripped circuit breaker reaches your team without you having to
 stand up Prometheus + Alertmanager first.
 
-It is fully opt-in and requires the `notify` build feature
-(`cargo install faucet-cli --features notify`, or `--features full`). With no
+It is fully opt-in and requires the `notify` build feature — included in the
+prebuilt binaries; from crates.io, `cargo install faucet-cli --features notify`
+(or `--features full`). With no
 block, nothing changes.
 
 > **Delivery never fails a run.** Each event is delivered with a short bounded

@@ -50,11 +50,15 @@ cosign verify ghcr.io/faucet-hq/faucet-stream:full \
 
 The prebuilt binary includes the CLI **default** feature set (every first-party
 connector, transforms, quality checks, contracts, masking, compression) plus
-`serve` (with the embedded web console), `schedule`, `lineage`, and `templates`
-(the pipeline template registry — note that a registry surviving a restart also
-needs a `serve-history-*` backend). Not included — build from source for these:
-`transform-sql` (embedded DuckDB), `otel`, `triggers`, `catalog`, the
-`serve-history-*` backends, and the Oracle connectors (`source-oracle`,
+`serve` with the embedded web console (`serve-ui`), `schedule`, `lineage`, `templates`
+(the pipeline template registry), `mcp` (the `faucet mcp` server for AI
+agents), `notify` (Slack / PagerDuty / webhook notifications), `secrets`
+(`${vault:…}`, `${aws-sm:…}`, `${gcp-sm:…}`, `${azure-kv:…}`), `catalog` (the
+Data Movement Catalog), and the `serve-history-sqlite` /
+`serve-history-postgres` backends (so run history, the template registry and
+the catalog survive a restart). Not included — build from source for these:
+`transform-sql` (embedded DuckDB), `transform-wasm`, `otel`, `triggers`,
+`tenants`, `encryption`, and the Oracle connectors (`source-oracle`,
 `source-oracle-cdc`, `sink-oracle`), which need Oracle Instant Client at runtime
 (see [Oracle Instant Client](#oracle-instant-client)).
 
