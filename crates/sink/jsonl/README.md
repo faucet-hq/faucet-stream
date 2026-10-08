@@ -25,7 +25,7 @@ It's the workhorse local-file destination: zero credentials, zero connection set
 - **Optional encryption at rest** — behind the `encryption` feature, every record line is sealed with AES-256-GCM and written base64-encoded (#207). Append-safe; the natural fit for a file-backed DLQ. See [Encryption at rest](#encryption-at-rest).
 - **Pretty-print mode** — `pretty: true` indents each record for human reading (no longer strict JSONL — records span multiple lines).
 - **Flush-safe for CDC** — `flush()` finalises the writer and the next write reopens in append mode regardless of `append`, so a CDC source's per-transaction flush appends rather than truncates — no data loss mid-stream.
-- **`faucet doctor` preflight** — `check()` verifies the parent directory is writable (via a throwaway temp file) without ever touching your real output file.
+- **`faucet doctor` preflight** — `check()` verifies the nearest existing ancestor of the output path is a writable directory (missing directories are created by the sink) (via a throwaway temp file) without ever touching your real output file.
 
 ## Installation
 
@@ -236,7 +236,7 @@ println!("Exported {} records", result.records_written);
 3. The first open obeys `append`; **re-opens after a `flush()` always append**, so a flush-then-write sequence never truncates earlier data — important for CDC's per-transaction flush.
 4. Each record is serialized to a single JSON line (or pretty-printed) followed by a newline; a `Mutex` guards the writer for thread-safe writes.
 5. With the `compression` feature, the buffered file is wrapped in a gzip/zstd encoder chosen by `compression.resolve(path)`; a one-shot warning fires if an explicit codec disagrees with the file suffix.
-6. `flush()` finalises and shuts down the writer (flushing the buffer and writing any compression trailer). The default `Sink` impl does **not** flush on `Drop` — call `flush()` explicitly before the program exits or the tail of the buffer is lost.
+6. `flush()` finalises and shuts down the writer (flushing the buffer and writing any compression trailer) and `fsync`s the file, so the bookmark the pipeline records next never outlives the rows. A write that fails part-way closes the file; the next open in append mode (plain, uncompressed output) cuts a torn last line first, so a rerun never continues a half-written record. The default `Sink` impl does **not** flush on `Drop` — call `flush()` explicitly before the program exits or the tail of the buffer is lost.
 
 ## Lineage dataset URI
 

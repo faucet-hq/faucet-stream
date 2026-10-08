@@ -154,6 +154,12 @@ impl faucet_core::Sink for CsvSink {
             return Ok(0);
         }
 
+        if records.iter().any(|r| !r.is_object()) {
+            return Err(FaucetError::Sink(
+                "CSV sink expects JSON objects, got non-object record".into(),
+            ));
+        }
+
         let config = self.config.clone();
         let records: Vec<Value> = records.to_vec();
 
@@ -205,8 +211,18 @@ impl faucet_core::Sink for CsvSink {
         .await
         .map_err(|e| FaucetError::Sink(format!("CSV write task failed: {e}")))?;
 
+        let (state, result) = result;
+        // The writer goes back even when the batch failed, so earlier rows (and
+        // a compressed stream's open frame) are still finished by `flush()`.
+        if let Some(state) = state {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|e| FaucetError::Sink(format!("CSV sink lock poisoned: {e}")))?;
+            *guard = Some(state);
+        }
         let WriteOutcome {
-            state: new_state,
+            columns,
             count,
             warned_unknown,
         } = result?;
@@ -223,7 +239,7 @@ impl faucet_core::Sink for CsvSink {
                 .lock()
                 .map_err(|e| FaucetError::Sink(format!("CSV sink lock poisoned: {e}")))?;
             if guard.is_none() {
-                *guard = Some(new_state.columns.clone());
+                *guard = Some(columns);
             }
         }
 
@@ -231,15 +247,6 @@ impl faucet_core::Sink for CsvSink {
         if warned_unknown {
             self.warned_unknown
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Put the state back.
-        {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|e| FaucetError::Sink(format!("CSV sink lock poisoned: {e}")))?;
-            *guard = Some(new_state);
         }
 
         Ok(count)
@@ -267,18 +274,14 @@ impl faucet_core::Sink for CsvSink {
                     .into_inner()
                     .map_err(|e| FaucetError::Sink(format!("CSV flush failed: {e}")))?;
                 #[cfg(feature = "compression")]
-                {
-                    // Writes the gzip/zstd trailer and surfaces any I/O error.
-                    inner.finish().map_err(|e| {
-                        FaucetError::Sink(format!("CSV compression finalise failed: {e}"))
-                    })?;
-                }
+                let file = inner.finish().map_err(|e| {
+                    FaucetError::Sink(format!("CSV compression finalise failed: {e}"))
+                })?;
                 #[cfg(not(feature = "compression"))]
-                {
-                    let mut f = inner;
-                    std::io::Write::flush(&mut f)
-                        .map_err(|e| FaucetError::Sink(format!("CSV flush failed: {e}")))?;
-                }
+                let file = inner;
+                // Durable before the pipeline records the bookmark.
+                file.sync_all()
+                    .map_err(|e| FaucetError::Sink(format!("CSV fsync failed: {e}")))?;
                 Ok(())
             })
             .await
@@ -332,7 +335,7 @@ impl faucet_core::Sink for CsvSink {
 /// of records written, and whether this batch emitted the one-shot
 /// "dropping unknown field" warning (so the caller can latch its atomic flag).
 struct WriteOutcome {
-    state: WriterState,
+    columns: Vec<String>,
     count: usize,
     warned_unknown: bool,
 }
@@ -395,7 +398,25 @@ fn read_existing_header(config: &CsvSinkConfig) -> Result<Option<Vec<String>>, F
     Ok(found.then(|| record.iter().map(str::to_string).collect()))
 }
 
-/// Synchronous CSV writing logic, run inside `spawn_blocking`.
+/// Make a newly created file's directory entry durable.
+fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Synchronous CSV writing logic, run inside `spawn_blocking`. The writer
+/// state comes back whatever happened, so a failed batch never drops it.
 fn write_csv_blocking(
     config: CsvSinkConfig,
     existing_state: Option<WriterState>,
@@ -403,10 +424,28 @@ fn write_csv_blocking(
     opened_before: bool,
     already_warned: bool,
     frozen_columns: Option<Vec<String>>,
-) -> Result<WriteOutcome, FaucetError> {
+) -> (Option<WriterState>, Result<WriteOutcome, FaucetError>) {
     let mut state = match existing_state {
         Some(s) => s,
-        None => {
+        None => match open_writer(&config, records, opened_before, frozen_columns) {
+            Ok(s) => s,
+            Err(e) => return (None, Err(e)),
+        },
+    };
+    let result = write_rows(&config, &mut state, records, already_warned);
+    (Some(state), result)
+}
+
+/// Open (or reopen) the output and write the header when one is due.
+fn open_writer(
+    config: &CsvSinkConfig,
+    records: &[Value],
+    opened_before: bool,
+    frozen_columns: Option<Vec<String>>,
+) -> Result<WriterState, FaucetError> {
+    let config = config.clone();
+    {
+        {
             // Column order. On a re-open after `flush()` reuse the header frozen
             // at the first open (#321 H2) so later rows never drift out of
             // alignment with the already-written header. Only on the very first
@@ -474,6 +513,10 @@ fn write_csv_blocking(
                 .map_err(|e| {
                     FaucetError::Sink(format!("failed to open CSV file '{}': {e}", config.path))
                 })?;
+            if !opened_before {
+                sync_parent_dir(std::path::Path::new(&config.path))
+                    .map_err(|e| FaucetError::Sink(format!("CSV directory fsync failed: {e}")))?;
+            }
 
             #[cfg(feature = "compression")]
             let inner: SinkWriter = {
@@ -496,10 +539,18 @@ fn write_csv_blocking(
                     .map_err(|e| FaucetError::Sink(format!("failed to write CSV headers: {e}")))?;
             }
 
-            WriterState { writer, columns }
+            Ok(WriterState { writer, columns })
         }
-    };
+    }
+}
 
+/// Write `records` through an open writer.
+fn write_rows(
+    config: &CsvSinkConfig,
+    state: &mut WriterState,
+    records: &[Value],
+    already_warned: bool,
+) -> Result<WriteOutcome, FaucetError> {
     // The header is now frozen (either just written, or carried over from a
     // prior batch). Detect any record key that is not a known column — it
     // cannot be added to the header and would be dropped from the output.
@@ -555,7 +606,7 @@ fn write_csv_blocking(
     tracing::debug!(records = count, path = %config.path, "CSV batch written");
 
     Ok(WriteOutcome {
-        state,
+        columns: state.columns.clone(),
         count,
         warned_unknown,
     })
@@ -567,6 +618,43 @@ mod tests {
     use faucet_core::Sink;
     use serde_json::json;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn a_non_object_record_is_refused_in_every_batch() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let sink = CsvSink::new(CsvSinkConfig::new(&path));
+        sink.write_batch(&[json!({"a": 1})]).await.unwrap();
+        let err = sink.write_batch(&[json!(7)]).await.unwrap_err();
+        assert!(err.to_string().contains("non-object"), "{err}");
+        sink.write_batch(&[json!({"a": 2})]).await.unwrap();
+        sink.flush().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n1\n2\n");
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn a_failed_batch_keeps_the_compressed_stream_finishable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv.zst");
+        let mut config = CsvSinkConfig::new(path.to_str().unwrap());
+        config.on_unknown_field = crate::config::OnUnknownField::Error;
+        let sink = CsvSink::new(config);
+        sink.write_batch(&[json!({"a": 1})]).await.unwrap();
+        assert!(sink.write_batch(&[json!({"a": 2, "b": 3})]).await.is_err());
+        sink.write_batch(&[json!({"a": 4})]).await.unwrap();
+        sink.flush().await.unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut faucet_core::compression::wrap_sync_reader(
+                std::fs::File::open(&path).unwrap(),
+                faucet_core::compression::Compression::Zstd,
+            ),
+            &mut text,
+        )
+        .unwrap();
+        assert_eq!(text, "a\n1\n4\n");
+    }
 
     #[test]
     fn dataset_uri_returns_file_scheme() {
@@ -840,11 +928,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_fails_when_parent_dir_missing() {
+    async fn check_passes_when_a_missing_parent_can_be_created() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nope").join("out.csv");
+        let path = dir.path().join("nope").join("deeper").join("out.csv");
         let path_str = path.to_str().unwrap().to_string();
         let sink = CsvSink::new(CsvSinkConfig::new(&path_str));
+        let report = sink
+            .check(&faucet_core::check::CheckContext::default())
+            .await
+            .unwrap();
+        assert_eq!(report.failed_count(), 0, "the sink creates the directory");
+        assert!(!dir.path().join("nope").exists(), "check() creates nothing");
+
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let under_file = file.join("out.csv");
+        let sink = CsvSink::new(CsvSinkConfig::new(under_file.to_str().unwrap()));
         let report = sink
             .check(&faucet_core::check::CheckContext::default())
             .await
