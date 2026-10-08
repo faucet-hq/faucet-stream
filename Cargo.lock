@@ -5785,6 +5785,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -6151,6 +6152,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
