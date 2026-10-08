@@ -1247,8 +1247,9 @@ Runs a pipeline on a recurring cron schedule in a **long-running foreground proc
 must contain a top-level `schedule:` block (without one, faucet errors and suggests `faucet run`).
 Requires the `schedule` Cargo feature (included in `full`).
 
-- Stop with Ctrl-C or SIGTERM; the in-flight run drains for up to `shutdown_grace_secs` (default 30)
-  before the process exits.
+- Stop with Ctrl-C or SIGTERM; an in-flight run is cancelled at its next page boundary and flushes
+  for up to `shutdown_grace_secs` (default 30), then the process exits 130 (0 when no run was in
+  flight).
 - `--once` ignores cron timing and runs the pipeline exactly once immediately — handy for testing
   a scheduled config or for one-shot container invocations.
 - Missed ticks are skipped, not backfilled. A run that starts late emits

@@ -3558,7 +3558,7 @@
           "default": false
         },
         "run_timeout_secs": {
-          "description": "Optional per-run kill switch (seconds). A run exceeding this is aborted\nand counts as a failed run.",
+          "description": "Optional per-run time limit (seconds). A run exceeding this is\ncancelled at its next page boundary and counts as a failed run.",
           "type": [
             "integer",
             "null"
@@ -3568,7 +3568,7 @@
           "default": null
         },
         "shutdown_grace_secs": {
-          "description": "On SIGTERM/SIGINT, await the in-flight run this many seconds before\naborting it. Default 30 (matches Kubernetes' default termination grace).",
+          "description": "Seconds a cancelled run (SIGTERM/SIGINT or `run_timeout_secs`) gets to\nstop at a page boundary and flush before it is aborted. Default 30\n(matches Kubernetes' default termination grace).",
           "type": "integer",
           "format": "uint64",
           "minimum": 0,

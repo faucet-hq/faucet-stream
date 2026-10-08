@@ -1513,7 +1513,7 @@ schedule:
 | `max_consecutive_failures` | integer \| null | `null` | Exit non-zero after this many consecutive failed runs without a success in between. A successful run resets the counter. `null` means never exit on failures alone. |
 | `on_failure` | `continue` \| `stop` | `continue` | `stop` exits non-zero immediately after the first failed run. `continue` keeps scheduling; use `max_consecutive_failures` to bound sustained outages. |
 | `start_immediately` | bool | `false` | When `true`, the first run fires right on startup before the cron clock reaches its first tick. |
-| `run_timeout_secs` | integer \| null | `null` | Per-run time limit in seconds. A run that exceeds this is killed and counts as a failure. `null` means no timeout. |
+| `run_timeout_secs` | integer \| null | `null` | Per-run time limit in seconds. A run that exceeds this is cancelled at its next page boundary (flushing its sinks, within `shutdown_grace_secs`) and counts as a failure. `null` means no timeout. |
 | `shutdown_grace_secs` | integer | `30` | On SIGTERM/SIGINT, wait this many seconds for the in-flight run to finish before forcibly aborting it. |
 
 **Validation:** `faucet validate pipeline.yaml` checks the `schedule:` block at parse time — bad cron

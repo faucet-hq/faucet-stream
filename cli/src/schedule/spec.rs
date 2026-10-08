@@ -39,13 +39,14 @@ pub struct ScheduleSpec {
     #[serde(default)]
     pub start_immediately: bool,
 
-    /// Optional per-run kill switch (seconds). A run exceeding this is aborted
-    /// and counts as a failed run.
+    /// Optional per-run time limit (seconds). A run exceeding this is
+    /// cancelled at its next page boundary and counts as a failed run.
     #[serde(default)]
     pub run_timeout_secs: Option<u64>,
 
-    /// On SIGTERM/SIGINT, await the in-flight run this many seconds before
-    /// aborting it. Default 30 (matches Kubernetes' default termination grace).
+    /// Seconds a cancelled run (SIGTERM/SIGINT or `run_timeout_secs`) gets to
+    /// stop at a page boundary and flush before it is aborted. Default 30
+    /// (matches Kubernetes' default termination grace).
     #[serde(default = "default_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
 }
