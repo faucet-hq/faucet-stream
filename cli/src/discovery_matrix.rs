@@ -81,7 +81,8 @@ pub fn inject_collected(ctx: &mut HashMap<String, Value>, collected: &[Collected
 /// dedup the results in first-seen order. `null` / missing projections are
 /// skipped. `$` (or `""`) selects the whole record. Pure.
 pub fn project_dedup(records: &[Value], select: &str) -> Vec<Value> {
-    let mut seen: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::new();
     for rec in records {
         let Some(v) = project_value(rec, select) else {
             continue;
@@ -89,11 +90,32 @@ pub fn project_dedup(records: &[Value], select: &str) -> Vec<Value> {
         if v.is_null() {
             continue;
         }
-        if !seen.contains(&v) {
-            seen.push(v);
+        if seen.insert(dedup_key(&v)) {
+            out.push(v);
         }
     }
-    seen
+    out
+}
+
+/// Text identity of a value for dedup, with object keys sorted so two
+/// objects that compare equal always produce the same key.
+fn dedup_key(v: &Value) -> String {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let body: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", Value::String(k.clone()), dedup_key(&m[k])))
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        Value::Array(a) => {
+            let body: Vec<String> = a.iter().map(dedup_key).collect();
+            format!("[{}]", body.join(","))
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Resolve a dot-path projection against one record. Supports a leading `$.` or
@@ -409,6 +431,20 @@ mod tests {
                 .map(|c| format!("p::row::{}", tuple_state_key_suffix(&dims, c)))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn project_dedup_keeps_first_occurrence_order_across_many_values() {
+        let mut recs: Vec<Value> = (0..5000).map(|i| json!({ "v": i % 2500 })).collect();
+        recs.push(json!({ "v": { "b": 1, "a": 2 } }));
+        recs.push(json!({ "v": { "a": 2, "b": 1 } }));
+        recs.push(json!({ "v": "1" }));
+        let out = project_dedup(&recs, "v");
+        assert_eq!(out.len(), 2502);
+        assert_eq!(out[0], json!(0));
+        assert_eq!(out[2499], json!(2499));
+        assert_eq!(out[2500], json!({ "a": 2, "b": 1 }));
+        assert_eq!(out[2501], json!("1"));
     }
 
     #[test]
