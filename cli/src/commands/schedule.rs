@@ -861,11 +861,8 @@ async fn run_loop(
                             .as_ref()
                             .and_then(|r| r.circuit_breaker)
                             .map(|cb| cb.cooldown);
-                        next_due = if compiled.start_immediately {
-                            Utc::now()
-                        } else {
-                            compiled.next_after(Utc::now()).unwrap_or(next_due)
-                        };
+                        next_due =
+                            reload_next_due(&compiled, running.is_some(), Utc::now(), next_due);
                         m::reload(&pipeline_name, "ok");
                         tracing::info!(
                             pipeline = %pipeline_name, cron = %cron, timezone = %timezone,
@@ -884,6 +881,22 @@ async fn run_loop(
 
             _ = tokio::time::sleep(chunk) => { /* re-loop: re-read wall clock */ }
         }
+    }
+}
+
+/// The next tick after a hot reload: `start_immediately` fires at once only
+/// when no run is in flight — an immediate tick during a run would overlap it
+/// (and under `overlap_policy: forbid` stop the scheduler).
+fn reload_next_due(
+    compiled: &CompiledSchedule,
+    running: bool,
+    now: chrono::DateTime<Utc>,
+    previous: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    if compiled.start_immediately && !running {
+        now
+    } else {
+        compiled.next_after(now).unwrap_or(previous)
     }
 }
 
@@ -1381,6 +1394,16 @@ mod tests {
             Err(CliError::Cancelled)
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A reload with `start_immediately` while a run is in flight waits for
+    /// the next cron tick instead of overlapping it (#789 CLI-86).
+    #[test]
+    fn a_reload_during_a_run_does_not_tick_immediately() {
+        let c = compiled("cron: \"0 0 * * *\"\nstart_immediately: true\noverlap_policy: forbid");
+        let now = Utc::now();
+        assert_eq!(reload_next_due(&c, false, now, now), now);
+        assert!(reload_next_due(&c, true, now, now) > now);
     }
 
     #[tokio::test]
