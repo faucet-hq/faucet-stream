@@ -207,8 +207,17 @@ jobs:
             /usr/local/share/powershell \
             /usr/local/lib/node_modules \
             /usr/local/share/chromium \
-            /opt/microsoft
+            /opt/microsoft \
+            /usr/lib/jvm \
+            /usr/local/julia* \
+            /usr/share/miniconda \
+            /usr/local/share/vcpkg \
+            /usr/share/az_* \
+            /usr/lib/google-cloud-sdk \
+            /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
           sudo apt-get clean
+          docker image prune -af >/dev/null || true
           df -h /
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
@@ -246,6 +255,13 @@ jobs:
           echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           echo "Oracle Instant Client installed at $dir"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Clear Docker before the container-backed tests
+        # Testcontainer images and volumes left by earlier steps count against
+        # the runner disk the tests (MinIO's free-space check among them) need.
+        run: |
+          docker ps -aq | xargs -r docker rm -f >/dev/null
+          docker system prune -af --volumes >/dev/null
+          df -h /
       - name: Run workspace tests
         # Integration tests boot Docker containers via testcontainers, whose
         # in-process (bollard) image pull intermittently fails. Only that is
@@ -829,7 +845,8 @@ jobs:
             /opt/hostedtoolcache/go \
             /opt/hostedtoolcache/PyPy \
             /opt/hostedtoolcache/Ruby \
-            /opt/hostedtoolcache/node
+            /opt/hostedtoolcache/node \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
           sudo apt-get clean
           docker image prune -af >/dev/null || true
           df -h /
@@ -873,6 +890,14 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Clear Docker before the container-backed tests
+        # Testcontainer images and volumes left by earlier steps count against
+        # the runner disk the tests (MinIO's free-space check among them) need.
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        run: |
+          docker ps -aq | xargs -r docker rm -f >/dev/null
+          docker system prune -af --volumes >/dev/null
+          df -h /
       # Cover unit + integration tests, and keep the integration-only share
       # separately (#695). One build, two phases:
       #   1. integration — compiles every library once, plus each crate's
