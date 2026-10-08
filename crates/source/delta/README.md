@@ -14,9 +14,12 @@ Fabric) write.
   stays at one `batch_size`, no whole-table buffering, no datafusion.
 - **Time travel** — read a pinned `version` or as-of `timestamp`.
 - **Projection pushdown** — `columns` limits the columns read.
-- **Partition-aware** — partition-column values (stored in the Hive-style path,
-  not the data files) are reconstructed and merged into every row, typed
-  against the table schema.
+- **Partition-aware** — partition-column values are read from each add
+  action's `partitionValues` in the log (authoritative, whatever the file path
+  looks like) and merged into every row, typed against the table schema.
+- **Column mapping is refused** — a table with `delta.columnMapping.mode` set
+  stores physical column names in its data files, which this source does not
+  translate, so it fails the read instead of emitting `col-<uuid>` keys.
 - **Deletion vectors are refused** — a table whose active files carry deletion
   vectors (Delta 3.x `DELETE` / `UPDATE` / `MERGE` with
   `delta.enableDeletionVectors`) fails the read naming the first such file,
@@ -36,8 +39,8 @@ Every column is present in every row (a null is `null`); a decimal keeps every d
 | `storage_options` | map | `{}` | Passed verbatim to delta-rs; explicit keys win over `credentials` |
 | `version` | int? | — | Time travel: read as of this version (mutually exclusive with `timestamp`) |
 | `timestamp` | string? | — | Time travel: read as of this RFC 3339 timestamp |
-| `columns` | string[] | `[]` (all) | Projection pushdown |
-| `batch_size` | int | `1000` | Page-size hint; `0` = one page per file |
+| `columns` | string[] | `[]` (all) | Projection pushdown over top-level columns (a struct / list / map column is one name). A name the table does not have is a config error; a column a given file lacks reads as `null`. |
+| `batch_size` | int | `1000` | Rows per page; `0` = one page per data file, whatever its row groups |
 
 Cloud backends require the matching crate feature: `s3`, `azure`, `gcs`.
 
