@@ -1641,8 +1641,9 @@ where
     // very duplication this wrapper exists to prevent.
     //
     // The idempotent exactly-once path (`write_batch_idempotent`) keeps using
-    // `with_retry!` — replaying a token-stamped write is a no-op, so it is
-    // always safe to retry.
+    // `with_retry!`, through `eo_write_once`: every retry first re-reads the
+    // committed token, so a page that committed before its response was lost
+    // is not written again.
     macro_rules! with_retry_write {
         ($op_label:literal, $op:expr) => {
             if retry_policy.is_some() && sink.write_batch_is_replay_safe() {
@@ -2209,9 +2210,13 @@ where
                                 counter!("faucet_pipeline_pages_skipped_total", skip_labels)
                                     .increment(1);
                             } else {
+                                // A retry after an ambiguous failure first asks the
+                                // sink whether the page already committed: replaying
+                                // it would insert its rows again.
+                                let attempt = std::sync::atomic::AtomicU32::new(0);
                                 records_written += outcomes.observe(with_retry!(
                                     "sink_write",
-                                    sink.write_batch_idempotent(&page.records, &scope, &token)
+                                    eo_write_once(sink, &page.records, &scope, &token, next_seq, &attempt)
                                 ))?;
                             }
                             with_retry!("flush", sink.flush())?;
@@ -2399,6 +2404,26 @@ where
         bookmark: last_bookmark,
         dlq: dlq.is_some().then_some(dlq_stats),
     })
+}
+
+/// One attempt of an exactly-once page write. Every attempt after the first
+/// re-reads the sink's committed token and treats the page as written when the
+/// token already covers `seq`.
+async fn eo_write_once<Si: Sink + ?Sized>(
+    sink: &Si,
+    records: &[Value],
+    scope: &str,
+    token: &str,
+    seq: u64,
+    attempt: &std::sync::atomic::AtomicU32,
+) -> Result<usize, FaucetError> {
+    if attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0
+        && let Some(committed) = sink.last_committed_token(scope).await?
+        && crate::idempotency::parse_token(&committed).is_some_and(|c| c >= seq)
+    {
+        return Ok(records.len());
+    }
+    sink.write_batch_idempotent(records, scope, token).await
 }
 
 /// Emit the adaptive controller's current state + any adjustment as metrics.
@@ -6051,6 +6076,86 @@ mod tests {
         assert_eq!(written.load(Ordering::SeqCst), 1);
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert_eq!(res.records_written, 1);
+    }
+
+    #[tokio::test]
+    async fn an_exactly_once_retry_after_an_ambiguous_commit_does_not_rewrite() {
+        use crate::resilience::{BackoffKind, ResiliencePolicy, RetryPolicy};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        // Commits the page and its token, then reports a transient failure —
+        // the response of a committed transaction lost on the way back.
+        struct CommitsThenFails {
+            inner: IdempotentMockSink,
+            calls: AtomicU32,
+        }
+        #[async_trait]
+        impl Sink for CommitsThenFails {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                self.inner.write_batch(records).await
+            }
+            fn supports_idempotent_writes(&self) -> bool {
+                true
+            }
+            async fn write_batch_idempotent(
+                &self,
+                records: &[Value],
+                scope: &str,
+                token: &str,
+            ) -> Result<usize, FaucetError> {
+                self.inner
+                    .write_batch_idempotent(records, scope, token)
+                    .await?;
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(FaucetError::HttpStatus {
+                        status: 503,
+                        url: "u".into(),
+                        body: "".into(),
+                    });
+                }
+                Ok(records.len())
+            }
+            async fn last_committed_token(
+                &self,
+                scope: &str,
+            ) -> Result<Option<String>, FaucetError> {
+                self.inner.last_committed_token(scope).await
+            }
+        }
+        let sink = CommitsThenFails {
+            inner: IdempotentMockSink::new(),
+            calls: AtomicU32::new(0),
+        };
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let pages = futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"id": 1}), json!({"id": 2})],
+            bookmark: Some(json!("b1")),
+        })]);
+        let policy = ResiliencePolicy {
+            retry: RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffKind::None,
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+                jitter: false,
+                ..RetryPolicy::default()
+            },
+            ..ResiliencePolicy::default()
+        };
+        let res = run_stream(
+            pages,
+            &sink,
+            eo_opts(store, "eo-k", 0).with_resilience(policy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sink.inner.rows().len(), 2, "the page is written once");
+        assert_eq!(
+            sink.calls.load(Ordering::SeqCst),
+            1,
+            "the retry did not write"
+        );
+        assert_eq!(res.records_written, 2);
     }
 
     #[tokio::test]
