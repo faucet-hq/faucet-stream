@@ -78,14 +78,14 @@ pub fn check_composition(c: &Composition) -> CliResult<()> {
 /// what breaks the config.
 fn as_string_param(params: &ParamsSpec, name: &str) -> ParamsSpec {
     let mut out = params.clone();
-    if let Some(p) = out.get_mut(name) {
+    out.entry(name.to_string()).and_modify(|p| {
         p.kind = ParamType::String;
         p.values.clear();
         p.default = p.default.take().map(|d| match d {
             Value::String(s) => Value::String(s),
             other => Value::String(other.to_string()),
         });
-    }
+    });
     out
 }
 
@@ -177,11 +177,7 @@ streams: [{ name: items }]
         let f = source_findings(&source(INT_QUERY_PARAM));
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].contains("does not validate"), "{}", f[0]);
-        assert!(
-            f[0].contains("param `page_size` (type: int)"),
-            "the param is named: {}",
-            f[0]
-        );
+        assert!(f[0].contains("param `page_size` (type: int)"), "{}", f[0]);
     }
 
     #[cfg(feature = "source-rest")]
