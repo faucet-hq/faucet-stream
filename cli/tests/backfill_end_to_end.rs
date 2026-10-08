@@ -6,7 +6,7 @@
 
 #![cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
 
-use faucet_cli::backfill::state::{BackfillState, marker_key};
+use faucet_cli::backfill::state::{BackfillState, marker_key, unit_state_key};
 use faucet_cli::backfill::{BackfillOptions, BackfillRange, run_backfill};
 use faucet_cli::config::PipelineConfig;
 use serde_json::json;
@@ -296,4 +296,45 @@ pipeline:
     assert_ne!(unit(&first), unit(&second));
     assert_eq!(store.get(&unit(&first)).await.unwrap(), Some(json!(1)));
     assert_eq!(store.get(&unit(&second)).await.unwrap(), Some(json!(500)));
+}
+
+/// #789: a unit refused by another run's live lease fails the whole backfill
+/// rather than being recorded as one failed unit among successes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_unit_lease_fails_the_whole_backfill() {
+    use faucet_cli::pipeline_state::{keys::lease_key, lease::RunLease};
+    use faucet_core::StateStore;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (src, dst) = seed(dir.path()).await;
+    let state_dir = dir.path().join("state");
+    let cfg = config(&src, &dst, &state_dir);
+    let mut o = opts(time_range("2026-06-01", "2026-06-04", 1));
+    o.dry_run = true;
+    let plan = run_backfill(&cfg, o).await.expect("dry run");
+    let hash = faucet_cli::backfill::plan::range_hash(&plan.descriptor);
+    let store = faucet_core::FileStateStore::new(&state_dir);
+    let now = chrono::Utc::now();
+    let held = RunLease {
+        run_id: "elsewhere".into(),
+        pid: 1,
+        host: Some("another-host.invalid".into()),
+        pid_ns: None,
+        acquired_at: now,
+        expires_at: now + chrono::Duration::seconds(60),
+    };
+    store
+        .put(
+            &lease_key(&unit_state_key("bf", &hash, "20260602T000000Z")),
+            &serde_json::to_value(&held).unwrap(),
+        )
+        .await
+        .unwrap();
+    let err = run_backfill(&cfg, opts(time_range("2026-06-01", "2026-06-04", 1)))
+        .await
+        .expect_err("a held lease fails the backfill");
+    assert!(
+        matches!(err, faucet_cli::error::CliError::LeaseHeld(_)),
+        "{err}"
+    );
+    assert!(err.to_string().contains("elsewhere"), "{err}");
 }

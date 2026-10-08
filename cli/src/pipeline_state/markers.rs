@@ -39,7 +39,7 @@ impl RunMarkers {
             let lease = match (&store, take_lease) {
                 (Some(s), true) => lease::try_acquire(Arc::clone(s), base, run_id, force)
                     .await
-                    .map_err(|held| crate::error::CliError::Config(held.message(base)))?,
+                    .map_err(|held| crate::error::CliError::LeaseHeld(held.message(base)))?,
                 _ => None,
             };
             Ok(Self { store, lease })

@@ -353,6 +353,9 @@ async fn snapshot_table(
             make_opts(&shared.opts, Some(cancel.clone())),
         )
         .await?;
+        if let Some(held) = summary.lease_refusal() {
+            return Err(held);
+        }
         if let Some(e) = summary_error(&summary) {
             return Err(CliError::Internal(format!(
                 "clearing '{table}' before its sharded snapshot failed: {e}"
@@ -378,6 +381,9 @@ async fn snapshot_table(
             if let Some(joined) = runs.join_next().await {
                 let summary =
                     joined.map_err(|e| CliError::Internal(format!("snapshot task: {e}")))??;
+                if let Some(held) = summary.lease_refusal() {
+                    return Err(held);
+                }
                 if let Some(e) = summary_error(&summary) {
                     return Err(CliError::Internal(format!(
                         "snapshot of '{table}' failed: {e}"
@@ -396,6 +402,9 @@ async fn snapshot_table(
     let mut failure: Option<String> = None;
     while let Some(joined) = runs.join_next().await {
         let outcome = joined.map_err(|e| CliError::Internal(format!("snapshot task: {e}")))?;
+        if let Some(held) = outcome.as_ref().ok().and_then(RunSummary::lease_refusal) {
+            return Err(held);
+        }
         match outcome {
             Ok(summary) => match summary_error(&summary) {
                 Some(e) => failure = failure.or(Some(e)),
@@ -524,6 +533,9 @@ struct CycleResult {
     tables: BTreeMap<String, Result<(), String>>,
     new_tables: BTreeSet<String>,
     source_error: Option<String>,
+    /// A table's run was refused by another run's live lease: the mirror
+    /// fails as a whole rather than recording a table failure.
+    lease_held: Option<String>,
 }
 
 /// Stream every active table for one cycle (one shared stream per group).
@@ -562,6 +574,7 @@ async fn run_cycle(
             Ok(group) => {
                 out.tables.extend(group.tables);
                 out.new_tables.extend(group.new_tables);
+                out.lease_held = out.lease_held.or(group.lease_held);
                 if group.source_error.is_some() {
                     out.source_error = group.source_error;
                 }
@@ -588,7 +601,7 @@ async fn run_group(
         }
     };
     let mut feeds = Vec::new();
-    let mut runs: JoinSet<(String, Result<(), String>)> = JoinSet::new();
+    let mut runs: JoinSet<(String, Result<(), String>, Option<String>)> = JoinSet::new();
     let mut streamed = Vec::new();
     for table in &group {
         let node = shared.plan(table).and_then(|plan| shared.table_node(&plan));
@@ -608,19 +621,24 @@ async fn run_group(
         let opts = make_opts(&shared.opts, None);
         let name = table.clone();
         runs.spawn(async move {
-            let result = match run_expanded(vec![node], opts).await {
-                Ok(summary) => summary_error(&summary).map_or(Ok(()), Err),
-                Err(e) => Err(e.to_string()),
+            let (result, held) = match run_expanded(vec![node], opts).await {
+                Ok(summary) => (
+                    summary_error(&summary).map_or(Ok(()), Err),
+                    summary.lease_refusal().map(|e| e.to_string()),
+                ),
+                Err(e @ CliError::LeaseHeld(_)) => (Err(e.to_string()), Some(e.to_string())),
+                Err(e) => (Err(e.to_string()), None),
             };
-            (name, result)
+            (name, result, held)
         });
     }
     let router = shared.router(&streamed, known);
     let demux = feed::run_demux(source, feeds, router, floors, cancel, shared.live.clone()).await;
     while let Some(joined) = runs.join_next().await {
         match joined {
-            Ok((table, result)) => {
+            Ok((table, result, held)) => {
                 out.tables.insert(table, result);
+                out.lease_held = out.lease_held.or(held);
             }
             Err(e) => out.source_error = Some(format!("table task: {e}")),
         }
@@ -749,6 +767,7 @@ impl Driver {
                 self.joined.notify_one();
             }
             Ok(false) => {}
+            Err(e @ CliError::LeaseHeld(_)) => return Err(e),
             Err(e) => {
                 let msg = e.to_string();
                 tracing::error!(pipeline = %self.shared.opts.pipeline_name, table = %table, error = %msg, "mirror: table snapshot failed");
@@ -834,6 +853,9 @@ impl Driver {
     }
 
     async fn apply_cycle(&mut self, result: &CycleResult) -> CliResult<usize> {
+        if let Some(held) = &result.lease_held {
+            return Err(CliError::LeaseHeld(held.clone()));
+        }
         let now = Utc::now();
         let mut ok = 0;
         let mut failures = Vec::new();

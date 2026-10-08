@@ -545,6 +545,7 @@ mod tests {
                     run_id: "run-9".into(),
                     pid: 42,
                     host: None,
+                    pid_ns: None,
                     acquired_at: now,
                     expires_at: now,
                 }),

@@ -524,7 +524,7 @@ pub async fn run_backfill(
 
     // ── Execute ──────────────────────────────────────────────────────────────
     let cancel = match &opts.cancel {
-        Some(token) => token.clone(),
+        Some(token) => token.child_token(),
         None => {
             let token = CancellationToken::new();
             crate::replication::orchestrator::spawn_cancel_on_signal(token.clone());
@@ -582,6 +582,7 @@ pub async fn run_backfill(
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let mut lease_held: Option<CliError> = None;
     while let Some(joined) = join.join_next().await {
         let (unit, result) =
             joined.map_err(|e| CliError::Internal(format!("backfill unit task panicked: {e}")))?;
@@ -594,7 +595,12 @@ pub async fn run_backfill(
             Err(e) => {
                 failed += 1;
                 super::metrics::record_unit(&opts.pipeline_name, "err");
-                ("failed".to_string(), Some(e.to_string()))
+                let msg = e.to_string();
+                if matches!(e, CliError::LeaseHeld(_)) && lease_held.is_none() {
+                    cancel.cancel();
+                    lease_held = Some(e);
+                }
+                ("failed".to_string(), Some(msg))
             }
         };
         // Durable per-unit progress: read-modify-write under the lock so a
@@ -625,6 +631,9 @@ pub async fn run_backfill(
         });
     }
 
+    if let Some(held) = lease_held {
+        return Err(held);
+    }
     reports.sort_by(|a, b| a.unit.cmp(&b.unit));
     Ok(BackfillOutcome {
         descriptor,
@@ -712,6 +721,9 @@ async fn run_one_unit(
     }
 
     let summary = run_expanded(vec![node], make_opts(opts, unit.start, cancel.clone())).await?;
+    if let Some(held) = summary.lease_refusal() {
+        return Err(held);
+    }
     if summary.had_failures() {
         let detail = summary
             .invocations

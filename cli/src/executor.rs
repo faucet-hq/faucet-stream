@@ -264,6 +264,9 @@ pub enum InvocationErrorKind {
     /// page or cancelled the run. Serve marks the change request / run as
     /// over budget rather than as a generic failure.
     BudgetExceeded,
+    /// [`CliError::LeaseHeld`] — another run holds the row's live run lease.
+    /// Orchestrators fail the whole run on it rather than retrying the unit.
+    LeaseHeld,
     /// Any other failure. No consumer needs to distinguish these yet, and it
     /// stays separate from `None` (= this outcome was never classified, e.g. a
     /// synthetic placeholder outcome) so the two are never confused.
@@ -349,6 +352,7 @@ pub fn classify_error(err: &CliError) -> InvocationErrorKind {
         | CliError::PolicyViolations { .. } => InvocationErrorKind::Policy,
         CliError::Faucet(FaucetError::BudgetExceeded { .. })
         | CliError::BudgetSinkNotAllowed { .. } => InvocationErrorKind::BudgetExceeded,
+        CliError::LeaseHeld(_) => InvocationErrorKind::LeaseHeld,
         _ => InvocationErrorKind::Other,
     }
 }
@@ -416,6 +420,14 @@ impl RunSummary {
     }
     pub fn had_failures(&self) -> bool {
         self.failure_count() > 0
+    }
+    /// The first invocation refused because another run holds its row's
+    /// lease, as the error an orchestrator fails the whole run with.
+    pub fn lease_refusal(&self) -> Option<CliError> {
+        self.invocations.iter().find_map(|i| {
+            (i.error_kind == Some(InvocationErrorKind::LeaseHeld))
+                .then(|| CliError::LeaseHeld(i.error.clone().unwrap_or_default()))
+        })
     }
 }
 

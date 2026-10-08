@@ -237,6 +237,9 @@ pub async fn run_replication(
             make_opts(&opts, Some(cancel.clone())),
         )
         .await?;
+        if let Some(held) = summary.lease_refusal() {
+            return Err(held);
+        }
         if summary.had_failures() {
             return Err(phase_failure(&summary, "snapshot"));
         }
@@ -288,12 +291,18 @@ pub async fn run_replication(
                 make_opts(&opts, Some(cancel.clone())),
             )
             .await?;
+            if let Some(held) = summary.lease_refusal() {
+                return Err(held);
+            }
             if summary.had_failures() {
                 return Err(phase_failure(&summary, "CDC"));
             }
             Ok(())
         }
         .await;
+        if let Err(held @ CliError::LeaseHeld(_)) = cycle {
+            return Err(held);
+        }
 
         match cdc_loop_action(cycle.is_ok(), compiled.continuous, cancel.is_cancelled()) {
             CdcLoopAction::Break => break,

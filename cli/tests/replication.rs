@@ -100,6 +100,10 @@ replication:
 }
 
 async fn run_once(url: &str, state_dir: &str) {
+    try_run(url, state_dir).await.expect("replication run");
+}
+
+async fn try_run(url: &str, state_dir: &str) -> faucet_cli::error::CliResult<()> {
     let yaml = config_yaml(url, state_dir);
     let cfg = PipelineConfig::from_text(&yaml, std::path::Path::new("repl.yaml")).unwrap();
     let spec = cfg.replication.clone().unwrap();
@@ -126,7 +130,6 @@ async fn run_once(url: &str, state_dir: &str) {
         },
     )
     .await
-    .expect("replication run");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -213,4 +216,47 @@ async fn resume_skips_snapshot_and_continues_cdc() {
     .await;
     mirror.sort();
     assert_eq!(mirror, vec![(1, 150), (2, 200)]);
+}
+
+/// #789: a CDC phase refused by another run's live lease fails the mirror
+/// with the lease error instead of a generic phase failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_lease_fails_the_mirror() {
+    use faucet_cli::pipeline_state::{keys::lease_key, lease::RunLease};
+    use faucet_core::StateStore;
+    let (_pg, url) = start_postgres().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().to_str().unwrap();
+    sql(
+        &url,
+        "CREATE TABLE public.orders (id int4 PRIMARY KEY, amount int8); \
+         CREATE TABLE public.orders_mirror (id int4 PRIMARY KEY, amount int8); \
+         CREATE PUBLICATION orders_pub FOR TABLE public.orders; \
+         INSERT INTO public.orders VALUES (1, 100);",
+    )
+    .await;
+    run_once(&url, state_dir).await;
+    let now = chrono::Utc::now();
+    let held = RunLease {
+        run_id: "elsewhere".into(),
+        pid: 1,
+        host: Some("another-host.invalid".into()),
+        pid_ns: None,
+        acquired_at: now,
+        expires_at: now + chrono::Duration::seconds(60),
+    };
+    faucet_core::FileStateStore::new(state_dir)
+        .put(
+            &lease_key("orders_mirror::cdc"),
+            &serde_json::to_value(&held).unwrap(),
+        )
+        .await
+        .unwrap();
+    let err = try_run(&url, state_dir)
+        .await
+        .expect_err("a held lease fails the mirror");
+    assert!(
+        matches!(err, faucet_cli::error::CliError::LeaseHeld(_)),
+        "{err}"
+    );
 }

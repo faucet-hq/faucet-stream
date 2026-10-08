@@ -4127,6 +4127,7 @@ components:
             run_id: { type: string }
             pid: { type: integer }
             host: { type: string }
+            pid_ns: { type: string, description: The holder's PID namespace (Linux) }
             acquired_at: { type: string, format: date-time }
             expires_at: { type: string, format: date-time }
         bookmark: { description: The resume position (an exactly-once envelope's inner bookmark) }
