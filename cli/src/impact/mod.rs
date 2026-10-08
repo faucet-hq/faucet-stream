@@ -691,70 +691,62 @@ fn walk_downstream(
     // (dataset id, affected columns at that dataset, opaque so far)
     let mut frontier: Vec<(String, Vec<AffectedColumn>, bool)> =
         vec![(own_edge.dst_id.clone(), root_columns, unknown_delta)];
-    let mut seen: HashSet<String> = HashSet::from([own_edge.dst_id.clone()]);
+    // A dataset is resolved only once every inbound edge of its hop has been
+    // weighed: one reached first by an edge reading unchanged columns is
+    // still affected through another edge carrying a changed one.
+    let mut resolved: HashSet<String> = HashSet::from([own_edge.dst_id.clone()]);
     for hop in 1..=depth {
-        let mut next = Vec::new();
+        let mut reached: std::collections::BTreeMap<
+            String,
+            (Vec<AffectedColumn>, bool, &CatalogLineageEdge),
+        > = Default::default();
         for (id, cols, opaque_so_far) in &frontier {
-            for e in edges.iter().filter(|e| &e.src_id == id) {
-                if !seen.insert(e.dst_id.clone()) {
-                    continue;
-                }
-                let (affected_cols, opaque) = match edge_fields(e) {
-                    Some(fields) if !opaque_so_far => {
-                        let mut acc: Vec<AffectedColumn> = Vec::new();
-                        for (out_col, ins) in &fields {
-                            let reads: Vec<&AffectedColumn> =
-                                cols.iter().filter(|c| ins.contains(&c.column)).collect();
-                            // A column added upstream is not read by anything
-                            // recorded yet, so only non-additive changes flow.
-                            let breaking: Vec<&AffectedColumn> = reads
-                                .iter()
-                                .copied()
-                                .filter(|c| c.change != ColumnChange::Added)
-                                .collect();
-                            if let Some(worst) = breaking.first() {
-                                acc.push(AffectedColumn {
-                                    column: out_col.clone(),
-                                    change: worst.change.clone(),
-                                    reads: breaking.iter().map(|c| c.column.clone()).collect(),
-                                });
-                            }
-                        }
-                        (acc, false)
-                    }
-                    _ => (Vec::new(), true),
-                };
-                let ds = datasets.get(&e.dst_id);
-                let severity = if opaque {
-                    Severity::Unknown
-                } else {
-                    affected_cols
-                        .iter()
-                        .map(|c| c.change.severity())
-                        .max()
-                        .unwrap_or(Severity::None)
-                };
-                if severity == Severity::None {
-                    // Nothing it reads changes; nothing past it can either.
-                    continue;
-                }
-                out.push(AffectedDataset {
-                    id: e.dst_id.clone(),
-                    uri: e.dst_uri.clone(),
-                    pipeline: e.pipeline.clone(),
-                    row: e.row.clone(),
-                    depth: hop,
-                    severity,
-                    opaque,
-                    columns: affected_cols.clone(),
-                    contract: None,
-                    owners: ds.map(|d| d.owners.clone()).unwrap_or_default(),
-                    consumers: ds
-                        .map(|d| affected_consumers(&d.consumers, &affected_cols, opaque))
-                        .unwrap_or_default(),
-                });
-                next.push((e.dst_id.clone(), affected_cols, opaque));
+            for e in edges
+                .iter()
+                .filter(|e| &e.src_id == id && !resolved.contains(&e.dst_id))
+            {
+                let (affected_cols, opaque) = edge_effect(e, cols, *opaque_so_far);
+                let entry = reached
+                    .entry(e.dst_id.clone())
+                    .or_insert_with(|| (Vec::new(), false, e));
+                entry.1 |= opaque;
+                merge_columns(&mut entry.0, affected_cols);
             }
+        }
+        let mut next = Vec::new();
+        for (dst, (affected_cols, opaque, e)) in reached {
+            let severity = if opaque {
+                Severity::Unknown
+            } else {
+                affected_cols
+                    .iter()
+                    .map(|c| c.change.severity())
+                    .max()
+                    .unwrap_or(Severity::None)
+            };
+            if severity == Severity::None {
+                // Nothing it reads changes at this hop; a longer path may
+                // still reach it.
+                continue;
+            }
+            resolved.insert(dst.clone());
+            let ds = datasets.get(&dst);
+            out.push(AffectedDataset {
+                id: dst.clone(),
+                uri: e.dst_uri.clone(),
+                pipeline: e.pipeline.clone(),
+                row: e.row.clone(),
+                depth: hop,
+                severity,
+                opaque,
+                columns: affected_cols.clone(),
+                contract: None,
+                owners: ds.map(|d| d.owners.clone()).unwrap_or_default(),
+                consumers: ds
+                    .map(|d| affected_consumers(&d.consumers, &affected_cols, opaque))
+                    .unwrap_or_default(),
+            });
+            next.push((dst, affected_cols, opaque));
         }
         if next.is_empty() {
             break;
@@ -762,6 +754,58 @@ fn walk_downstream(
         frontier = next;
     }
     out
+}
+
+/// What one lineage edge carries downstream: the destination columns that
+/// read a changed (non-additive) upstream column, or opaque when the edge has
+/// no column lineage.
+fn edge_effect(
+    e: &CatalogLineageEdge,
+    cols: &[AffectedColumn],
+    opaque_so_far: bool,
+) -> (Vec<AffectedColumn>, bool) {
+    match edge_fields(e) {
+        Some(fields) if !opaque_so_far => {
+            let mut acc: Vec<AffectedColumn> = Vec::new();
+            for (out_col, ins) in &fields {
+                // A column added upstream is not read by anything recorded
+                // yet, so only non-additive changes flow.
+                let breaking: Vec<&AffectedColumn> = cols
+                    .iter()
+                    .filter(|c| ins.contains(&c.column) && c.change != ColumnChange::Added)
+                    .collect();
+                if let Some(worst) = breaking.first() {
+                    acc.push(AffectedColumn {
+                        column: out_col.clone(),
+                        change: worst.change.clone(),
+                        reads: breaking.iter().map(|c| c.column.clone()).collect(),
+                    });
+                }
+            }
+            (acc, false)
+        }
+        _ => (Vec::new(), true),
+    }
+}
+
+/// Fold `more` into `into`: one entry per column, the worse change, the
+/// union of what it reads.
+fn merge_columns(into: &mut Vec<AffectedColumn>, more: Vec<AffectedColumn>) {
+    for c in more {
+        match into.iter_mut().find(|x| x.column == c.column) {
+            Some(x) => {
+                if c.change.severity() > x.change.severity() {
+                    x.change = c.change.clone();
+                }
+                for r in c.reads {
+                    if !x.reads.contains(&r) {
+                        x.reads.push(r);
+                    }
+                }
+            }
+            None => into.push(c),
+        }
+    }
 }
 
 /// Human rendering for `faucet plan --impact`.
@@ -1015,6 +1059,49 @@ mod tests {
             .await
             .unwrap();
         store
+    }
+
+    /// A dataset first reached by an edge reading only unchanged columns is
+    /// still reported when another path carries the changed column to it,
+    /// and two edges of one hop merge their columns (#789 CLI-74).
+    #[test]
+    fn a_dataset_reached_first_by_an_unaffected_path_is_still_reported() {
+        let edge = |src: &str, dst: &str, fields: Value| CatalogLineageEdge {
+            src_id: src.into(),
+            dst_id: dst.into(),
+            src_uri: format!("file:///{src}"),
+            dst_uri: format!("file:///{dst}"),
+            pipeline: format!("{src}-{dst}"),
+            row: "row-0".into(),
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            last_run_id: "r".into(),
+            runs: 1,
+            last_records: 1,
+            column_lineage: Some(json!({ "fields": fields })),
+        };
+        let own = edge("s", "a", json!({ "id": ["id"], "email": ["email"] }));
+        let edges = vec![
+            own.clone(),
+            edge("a", "t", json!({ "id": ["id"] })),
+            edge("a", "m", json!({ "contact": ["email"] })),
+            edge("m", "t", json!({ "contact2": ["contact"] })),
+            edge("a", "u", json!({ "id": ["id"] })),
+            edge("a", "u", json!({ "mail": ["email"], "id": ["id"] })),
+        ];
+        let delta = SchemaDelta {
+            removed: vec!["email".into()],
+            ..Default::default()
+        };
+        let out = walk_downstream(&own, &edges, &HashMap::new(), &delta, false, 5);
+        let by = |id: &str| out.iter().find(|d| d.id == id);
+        assert_eq!(by("m").unwrap().depth, 1);
+        let t = by("t").expect("t breaks through m");
+        assert_eq!((t.depth, t.severity), (2, Severity::Breaking));
+        assert_eq!(t.columns[0].column, "contact2");
+        let u = by("u").expect("u reads email on one of its edges");
+        assert_eq!(u.columns.len(), 1);
+        assert_eq!(out.iter().filter(|d| d.id == "u").count(), 1);
     }
 
     #[tokio::test]
