@@ -22,6 +22,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread"] }
 google-cloud-storage.workspace = true
 google-cloud-gax.workspace = true
+crc32c.workspace = true
 futures.workspace = true
 bytes.workspace = true
 uuid.workspace = true
@@ -59,6 +60,7 @@ reqwest = { workspace = true }
 urlencoding.workspace = true
 futures.workspace = true
 tempfile.workspace = true
+base64.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

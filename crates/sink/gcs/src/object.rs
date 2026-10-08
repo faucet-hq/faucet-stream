@@ -32,6 +32,30 @@ fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
 /// a server that never reports `done` would otherwise loop forever.
 pub(crate) const MAX_REWRITE_CALLS: usize = 1000;
 
+/// Open a local file for upload, with its CRC32C (read in chunks; the file
+/// is rewound to its start).
+///
+/// An upload sends the checksum in the object metadata, where the server
+/// checks it against the bytes it stored. Left to itself, the client (>= 1.19)
+/// sends a single-shot upload's checksum as a third multipart part, which a
+/// server that reads only two parts (the GCS emulator) stores as object
+/// content, so the upload then fails its own checksum validation (#803).
+pub(crate) async fn open_with_crc32c(path: &Path) -> std::io::Result<(tokio::fs::File, u32)> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0_u8; 256 * 1024];
+    let mut crc = 0_u32;
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        crc = crc32c::crc32c_append(crc, &buf[..n]);
+    }
+    file.rewind().await?;
+    Ok((file, crc))
+}
+
 /// The HTTP status a client error stands for: its own, or the equivalent of
 /// a retryable gRPC code.
 fn status_of(e: &google_cloud_storage::Error) -> Option<u16> {
@@ -131,13 +155,14 @@ impl ObjectClient for GcsObjects {
     }
 
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
-        let file = tokio::fs::File::open(from)
+        let (file, crc) = open_with_crc32c(from)
             .await
             .map_err(|e| err("open local file", key, e))?;
         self.roundtrips.record("put");
         self.storage
             .write_object(self.bucket_path(), key.to_string(), file)
             .set_content_type(content_type(key))
+            .with_known_crc32c(crc)
             .send_unbuffered()
             .await
             .map_err(|e| self.gcs_err("put object", key, e))?;
@@ -269,6 +294,66 @@ mod tests {
             "{e:?}"
         );
         assert!(faucet_core::FaucetError::is_retriable(&e));
+    }
+
+    #[tokio::test]
+    async fn the_crc32c_covers_the_whole_body_across_chunks() {
+        use tokio::io::AsyncReadExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let crc = |name: &str, body: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            async move {
+                let (mut file, crc) = open_with_crc32c(&path).await.unwrap();
+                let mut read = Vec::new();
+                file.read_to_end(&mut read).await.unwrap();
+                assert_eq!(read.len(), std::fs::metadata(&path).unwrap().len() as usize);
+                crc
+            }
+        };
+        // The CRC-32C check value.
+        assert_eq!(crc("small", b"123456789").await, 0xE306_9283);
+        let body: Vec<u8> = (0..700_000_u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(crc("big", &body).await, crc32c::crc32c(&body));
+        assert_eq!(crc("empty", b"").await, 0);
+    }
+
+    /// #803: the upload's CRC32C travels in the object metadata, and the
+    /// request carries exactly the metadata and media parts — no trailing
+    /// checksum part a two-part server would store as content.
+    #[tokio::test]
+    async fn uploads_send_the_crc32c_in_the_metadata_part() {
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let body = b"{\"a\":1}\n";
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(crc32c::crc32c(body).to_be_bytes());
+        Mock::given(method("POST"))
+            .and(path("/upload/storage/v1/b/b/o"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "bucket": "b", "name": "k.jsonl", "crc32c": encoded,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k.jsonl");
+        std::fs::write(&file, body).unwrap();
+        o.upload(&file, "k.jsonl").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = String::from_utf8_lossy(&requests[0].body).into_owned();
+        let content_type = requests[0].headers["content-type"].to_str().unwrap();
+        let boundary = content_type.split("boundary=").nth(1).unwrap();
+        let parts = sent.matches(&format!("--{boundary}\r\n")).count();
+        assert_eq!(parts, 2, "metadata + media only: {sent}");
+        assert!(
+            sent.contains(&format!("\"crc32c\":\"{encoded}\"")),
+            "the checksum is declared up front: {sent}"
+        );
     }
 
     #[test]

@@ -5658,7 +5658,9 @@ version = "1.4.1"
 dependencies = [
  "arrow 58.3.0",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
+ "crc32c",
  "faucet-common-file",
  "faucet-common-gcs",
  "faucet-conformance",

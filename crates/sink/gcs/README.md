@@ -412,7 +412,8 @@ there is nothing to replace or append to.
 with one upload (resumable past the client's threshold, finalised only when every byte arrived) when it closes — at `max_records_per_file` /
 `max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
 partial object, and a bookmark never advances past records that are not
-there.
+there. Every upload declares the object's CRC32C up front, so the server
+refuses an object whose stored bytes differ from the scratch file.
 
 Object names are `prefix + path`.
 

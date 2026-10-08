@@ -297,6 +297,8 @@ md-5 = "0.10"
 dashmap = "6"
 uuid = { version = "1", features = ["v4", "v7"] }
 google-cloud-storage = "1.12"
+# CRC32C of an upload, sent up front so every server verifies it (#803).
+crc32c = "0.6"
 google-cloud-auth = "1.10"
 google-cloud-gax = "1.10"
 # Cloud Spanner stack: the mature community client (yoshidan/google-cloud-rust,
