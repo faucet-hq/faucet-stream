@@ -150,6 +150,10 @@ impl RunProfile {
     }
 }
 
+/// How often (in observed values) a column's distinct estimate is compared
+/// with `categorical_max_distinct`.
+const CARDINALITY_CHECK_EVERY: u64 = 256;
+
 /// Per-column accumulator.
 #[derive(Debug)]
 struct ColumnAcc {
@@ -158,19 +162,23 @@ struct ColumnAcc {
     types: TypeCounts,
     distinct: HyperLogLog,
     top: Option<TopK>,
+    /// `categorical_max_distinct`: once the distinct estimate passes it the
+    /// column reports no top values, so the sketch stops being fed.
+    cardinality_cap: u64,
     numeric: Welford,
     reservoir: Reservoir,
     string_len: Welford,
 }
 
 impl ColumnAcc {
-    fn new(top_values: usize) -> Self {
+    fn new(top_values: usize, cardinality_cap: u64) -> Self {
         Self {
             present: 0,
             nulls: 0,
             types: TypeCounts::default(),
             distinct: HyperLogLog::new(),
             top: (top_values > 0).then(|| TopK::new(top_values)),
+            cardinality_cap,
             numeric: Welford::default(),
             reservoir: Reservoir::new(RESERVOIR_CAPACITY),
             string_len: Welford::default(),
@@ -213,6 +221,14 @@ impl ColumnAcc {
             .insert_hash(hash64(&(type_tag(v), text.as_ref())));
         if let Some(top) = &mut self.top {
             top.insert(&truncate_text(&text));
+            // The estimate only grows, so a column clearly past the cap (a
+            // margin over the sketch's error) ends the run past it too and
+            // will report no top values.
+            if self.present.is_multiple_of(CARDINALITY_CHECK_EVERY)
+                && self.distinct.estimate() > self.cardinality_cap.saturating_mul(9) / 8 + 16
+            {
+                self.top = None;
+            }
         }
     }
 
@@ -349,7 +365,8 @@ impl Profiler {
                     self.skipped.insert(name.clone());
                     continue;
                 }
-                let mut acc = ColumnAcc::new(self.spec.top_values);
+                let mut acc =
+                    ColumnAcc::new(self.spec.top_values, self.spec.categorical_max_distinct);
                 acc.observe(v);
                 self.columns.insert(name.clone(), acc);
             }
@@ -530,5 +547,19 @@ mod tests {
         assert!(rp.columns.is_empty());
         assert!(!rp.truncated());
         assert_eq!(TypeCounts::default().dominant(), None);
+    }
+
+    #[test]
+    fn a_high_cardinality_column_stops_feeding_its_top_values() {
+        let mut acc = ColumnAcc::new(10, 100);
+        for i in 0..1024 {
+            acc.observe(&serde_json::json!(format!("id-{i}")));
+        }
+        assert!(acc.top.is_none());
+        let mut low = ColumnAcc::new(10, 100);
+        for i in 0..1024 {
+            low.observe(&serde_json::json!(format!("v{}", i % 5)));
+        }
+        assert!(low.top.is_some());
     }
 }

@@ -88,9 +88,27 @@ pub enum InstallError {
 /// - If `tracing` is set, installs a `tracing-subscriber` registry with the
 ///   given env-filter directive as the default subscriber. Already-set-default
 ///   is logged via `tracing::warn!` and continues.
+/// - OTLP export (feature `otel`) needs a tokio runtime; called outside one it
+///   is skipped with a warning.
 #[cfg(feature = "observability-install")]
 pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport, InstallError> {
     let mut report = InstallReport::default();
+
+    // The OTLP exporters (and the fanout's `/metrics` task) need a tokio
+    // runtime; outside one, skip OTLP rather than panic.
+    #[cfg(feature = "otel")]
+    let without_otel;
+    #[cfg(feature = "otel")]
+    let cfg = if cfg.otel.is_some() && tokio::runtime::Handle::try_current().is_err() {
+        tracing::warn!("OTLP export needs a tokio runtime; install_observability skips it");
+        without_otel = ObservabilityConfig {
+            otel: None,
+            ..cfg.clone()
+        };
+        &without_otel
+    } else {
+        cfg
+    };
 
     // Provider holders moved into the guard after both arms run; only populated
     // (and only referenced) when the `otel` feature is enabled.
@@ -124,8 +142,9 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
                 match crate::observability::otel::build_meter_provider(otel) {
                     Ok((mp, recorder)) => {
                         if metrics::set_global_recorder(recorder).is_err() {
-                            tracing::warn!("metrics recorder already installed; continuing");
-                            report.prometheus_already_installed = true;
+                            tracing::warn!(
+                                "metrics recorder already installed; OTLP metrics are not exported"
+                            );
                         } else {
                             otel_meter = Some(mp);
                             report.otel_signals.push("metrics");
@@ -443,6 +462,18 @@ mod tests {
     use std::sync::Mutex;
 
     static LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otlp_outside_a_runtime_is_skipped_not_a_panic() {
+        let cfg = ObservabilityConfig {
+            otel: Some(crate::observability::otel::OtelConfig::default()),
+            ..Default::default()
+        };
+        let report = install_observability(&cfg).expect("no runtime is not an error");
+        assert!(report.otel_signals.is_empty());
+        assert!(!report.prometheus_already_installed);
+    }
 
     #[test]
     fn metrics_mode_selection() {

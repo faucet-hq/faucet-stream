@@ -1465,6 +1465,15 @@ where
                             .into(),
                     ));
                 }
+                if sink.is_overwrite() {
+                    // The watermark path persists state per page; an overwrite
+                    // must hold every bookmark until its swap commits.
+                    return Err(FaucetError::Config(
+                        "delivery: exactly_once (atomic watermark) is not compatible with \
+                         write_mode: overwrite"
+                            .into(),
+                    ));
+                }
                 Some(crate::idempotency::EffectivelyOnceMechanism::AtomicWatermark)
             } else if sink.dedups_by_key() {
                 Some(crate::idempotency::EffectivelyOnceMechanism::KeyedUpsert)
@@ -3396,6 +3405,39 @@ mod tests {
             .with_state(store, key)
             .with_delivery(crate::idempotency::DeliveryMode::ExactlyOnce)
             .with_start_seq(start_seq)
+    }
+
+    #[tokio::test]
+    async fn exactly_once_refuses_an_overwrite_sink() {
+        struct OverwriteIdem(IdempotentMockSink);
+        #[async_trait]
+        impl Sink for OverwriteIdem {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                self.0.write_batch(records).await
+            }
+            fn supports_idempotent_writes(&self) -> bool {
+                true
+            }
+            fn is_overwrite(&self) -> bool {
+                true
+            }
+        }
+        let sink = OverwriteIdem(IdempotentMockSink::new());
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let pages = vec![Ok(StreamPage {
+            records: vec![json!({"id": 1})],
+            bookmark: Some(json!("b1")),
+        })];
+        let err = run_stream(
+            futures::stream::iter(pages),
+            &sink,
+            eo_opts(store.clone(), "k", 0),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("write_mode: overwrite"), "{err}");
+        assert!(sink.0.rows().is_empty());
+        assert!(store.get("k").await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -142,6 +142,8 @@ pub struct MetadataSink {
     meta: CompiledMetadata,
     ctx: MetadataContext,
     seq: AtomicU64,
+    /// Source fields a metadata column replaced (each warned about once).
+    collided: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for MetadataSink {
@@ -161,6 +163,7 @@ impl MetadataSink {
             meta,
             ctx,
             seq: AtomicU64::new(0),
+            collided: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -192,8 +195,30 @@ impl MetadataSink {
                 MetadataColumn::Source => Value::String(self.ctx.source.clone()),
                 MetadataColumn::Sequence => Value::from(self.seq.fetch_add(1, Ordering::Relaxed)),
             };
-            map.insert(name, value);
+            if map.insert(name.clone(), value).is_some() {
+                self.note_collision(name);
+            }
         }
+    }
+
+    /// A source record already held a field named like a metadata column; the
+    /// metadata value replaced it. Warned once per column, never silent.
+    fn note_collision(&self, name: String) {
+        let Ok(mut seen) = self.collided.lock() else {
+            return;
+        };
+        if seen.insert(name.clone()) {
+            tracing::warn!(
+                column = %name,
+                "a source field has the same name as a metadata column; the metadata \
+                 value replaces it (choose another `metadata_columns.prefix` to keep it)"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn collisions(&self) -> Vec<String> {
+        self.collided.lock().unwrap().iter().cloned().collect()
     }
 }
 
@@ -342,6 +367,22 @@ impl Sink for MetadataSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_colliding_source_field_is_reported() {
+        let meta = CompiledMetadata::compile(&spec(&[MetadataColumn::RunId]))
+            .unwrap()
+            .unwrap();
+        let sink = MetadataSink::new(Box::new(CapturingSink::default()), meta, ctx());
+        let out = sink.stamp(&[
+            json!({"_faucet_run_id": "upstream", "a": 1}),
+            json!({"a": 2}),
+        ]);
+        assert_eq!(out[0]["_faucet_run_id"], json!("run-42"));
+        assert_eq!(sink.collisions(), vec!["_faucet_run_id".to_string()]);
+        sink.stamp(&[json!({"_faucet_run_id": "again"})]);
+        assert_eq!(sink.collisions().len(), 1);
+    }
 
     #[tokio::test]
     async fn metadata_sink_forwards_every_hook_but_the_unstamped_paths() {
