@@ -25,6 +25,7 @@ pub fn install(
     format: crate::cli::LogFormat,
     otel: Option<&faucet_core::OtelConfig>,
 ) -> (Option<PrometheusHandle>, LogHub) {
+    crate::set_build_version();
     let handle = install_recorder(otel);
     // Register faucet_build_info into whatever recorder is now global.
     faucet_core::register_build_info();

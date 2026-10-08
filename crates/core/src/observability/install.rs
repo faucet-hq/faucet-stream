@@ -477,19 +477,48 @@ pub fn install_observability(_cfg: &ObservabilityConfig) -> Result<InstallReport
     Ok(InstallReport::default())
 }
 
+/// The version [`register_build_info`] reports, when an application set one.
+static BUILD_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Set the version the `faucet_build_info{version}` gauge reports — call it
+/// with the **binary's** own `env!("CARGO_PKG_VERSION")` before installing
+/// observability. Without it the label is `faucet-core`'s version, which
+/// differs from the binary's whenever only the binary was released (#832).
+///
+/// First call wins (a process has one build); returns `false` when a version
+/// was already set. Re-registers the gauge so a recorder installed before
+/// this call reports the new version too.
+pub fn set_build_version(version: &'static str) -> bool {
+    let first = BUILD_VERSION.set(version).is_ok();
+    if first {
+        register_build_info();
+    }
+    first
+}
+
+/// The version `faucet_build_info` reports: the one passed to
+/// [`set_build_version`], else `faucet-core`'s `CARGO_PKG_VERSION`.
+pub fn build_version() -> &'static str {
+    BUILD_VERSION
+        .get()
+        .copied()
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// Register the `faucet_build_info{version}` gauge (set to 1) under the
 /// currently-installed `metrics` recorder. Safe to call from any code path
 /// that wants to ensure the gauge is set; `install_observability` invokes
 /// this automatically. Gauges are naturally idempotent under the `metrics`
 /// model — repeat calls just re-set the same value.
 ///
-/// The version label is `CARGO_PKG_VERSION` of `faucet-core` — matches the
-/// crate that owns the observability layer. Dashboards `group_left` the gauge
-/// onto every other metric to annotate panels with the running version.
+/// The version label is [`build_version`]: the application's version when it
+/// called [`set_build_version`] (the `faucet` CLI does), else `faucet-core`'s.
+/// Dashboards `group_left` the gauge onto every other metric to annotate
+/// panels with the running version.
 pub fn register_build_info() {
     metrics::gauge!(
         "faucet_build_info",
-        "version" => env!("CARGO_PKG_VERSION"),
+        "version" => build_version(),
     )
     .set(1.0);
 }

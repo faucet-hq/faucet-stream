@@ -98,6 +98,7 @@ fn warn_recorder_occupied() {
 /// render the recorder's output; the rest of the observability config (OTLP
 /// traces) installs as usual with the prometheus block taken out.
 pub fn setup_observability(cfg: &crate::config::PipelineConfig) -> CliResult<PrometheusHandle> {
+    crate::set_build_version();
     let mut obs_cfg = crate::obs::build_observability_config(cfg);
     let prom = obs_cfg.prometheus.take();
     let handle = install_metrics_recorder(prom.as_ref())?;

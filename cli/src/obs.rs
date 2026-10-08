@@ -81,6 +81,7 @@ pub fn build_observability_config(cfg: &PipelineConfig) -> ObservabilityConfig {
 /// Install Prometheus + tracing from the config's `observability:` block. Logs
 /// (does not fail) when a recorder/subscriber is already installed.
 pub fn install(cfg: &PipelineConfig) -> CliResult<()> {
+    crate::set_build_version();
     let obs_cfg = build_observability_config(cfg);
     let report = install_observability(&obs_cfg)?;
     if let Some(addr) = report.prometheus_listen.as_deref() {

@@ -72,7 +72,10 @@ cardinality and never a Prometheus label.
   not create are never deleted). Distinct from `faucet_cleanup_*`, which counts
   destination *rows* removed by [scoped cleanup](../cookbook/upsert.md).
 - **Build:** `faucet_build_info{version}` is set to `1` — `group_left` it onto
-  other metrics to annotate dashboards with the running version.
+  other metrics to annotate dashboards with the running version. `version` is
+  the binary's own version (what `faucet --version` prints); a library
+  application sets its own with `faucet_core::set_build_version`, else the
+  label is `faucet-core`'s version.
 
 ## Reliability properties
 
