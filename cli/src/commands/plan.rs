@@ -470,6 +470,11 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
         ));
     }
     let auth = auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
+    let cfg = {
+        let mut c = cfg;
+        crate::partition::resolve_runtime_with(&mut c, &auth).await?;
+        c
+    };
     let nodes = expand::expand(&cfg)?;
     let node = select_root(&nodes, args.row.as_deref())?;
 
@@ -668,7 +673,7 @@ async fn run_diff(args: PlanArgs) -> CliResult<()> {
                 .into(),
         )
     })?;
-    let nodes = expand::expand(&cfg)?;
+    let nodes = expand::expand(&crate::partition::resolve_runtime(&cfg).await?)?;
     let pipeline = snapshot::resolve_name(&cfg, Some(&path));
     let current = snapshot::build_snapshot(
         pipeline.clone(),

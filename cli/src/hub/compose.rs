@@ -54,8 +54,9 @@ impl StreamPlan {
 /// One composed pipeline plus the per-stream decisions behind it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Composition {
-    /// Pipeline `name:` — the source template's name, so state keys are
-    /// `{source}::{stream}` regardless of sink.
+    /// Pipeline `name:` — `{source}.{sink}`, so each pairing keeps its own
+    /// bookmarks (`{source}.{sink}::{stream}`); a deployment overlay with
+    /// `state_scope: source` makes it the source id, shared across sinks.
     pub name: String,
     pub source: String,
     pub sink: String,
@@ -362,6 +363,15 @@ pub fn compose(source: &SourceTemplate, sink: &SinkTemplate) -> CliResult<Compos
     )
 }
 
+/// A first-party sink faucet knows the write behaviour of; a plugin sink is
+/// taken at its template's word.
+fn builtin_sink(kind: &str) -> bool {
+    crate::registry_index::RegistryIndex::embedded()
+        .find(kind, Some("sink"))
+        .iter()
+        .any(|e| e.verified)
+}
+
 /// [`compose`] with an explicit capability list (the registry's, or a test's).
 pub fn compose_with(
     source: &SourceTemplate,
@@ -394,6 +404,19 @@ pub fn compose_with(
         }
     }
     let truncates = sink.truncates_per_invocation();
+    if !truncates
+        && aliases
+            .iter()
+            .any(|(from, to)| *from == WriteMode::Overwrite && *to == WriteMode::Append)
+        && builtin_sink(&sink.sink.kind)
+    {
+        return Err(CliError::Config(format!(
+            "sink-template '{}': `write_mode_aliases.overwrite: append` is only a full refresh on \
+             a sink that replaces its output each run; sink '{}' as configured here keeps what \
+             earlier runs wrote, so every overwrite stream would re-append the whole table",
+            sink.name, sink.sink.kind
+        )));
+    }
     let mut plans = Vec::with_capacity(source.streams.len());
     let mut failures = Vec::new();
     for s in &source.streams {
@@ -515,7 +538,8 @@ pub fn compose_with(
 
     let mut doc = Map::new();
     doc.insert("version".into(), json!(1));
-    doc.insert("name".into(), Value::String(source.id()));
+    let name = pairing_name(&source.id(), &sink.id());
+    doc.insert("name".into(), Value::String(name.clone()));
     if !params.is_empty() {
         doc.insert(
             "params".into(),
@@ -549,7 +573,7 @@ pub fn compose_with(
     }
 
     Ok(Composition {
-        name: source.id(),
+        name,
         source: source.id(),
         sink: sink.id(),
         sink_kind: sink.sink.kind.clone(),
@@ -604,7 +628,21 @@ impl Composition {
     /// whatever the composition carried, and its per-stream overrides land on
     /// the matching matrix rows. Connector selection and stream shape are out
     /// of its reach by construction ([`DeploymentTemplate::from_value`]).
-    pub fn apply_overlay(mut self, overlay: &DeploymentTemplate) -> CliResult<Self> {
+    pub fn apply_overlay(self, overlay: &DeploymentTemplate) -> CliResult<Self> {
+        let known: Vec<String> = self.streams.iter().map(|p| p.stream.clone()).collect();
+        self.apply_overlay_within(overlay, &known)
+    }
+
+    /// [`Self::apply_overlay`] on a composition of a **narrowed** source
+    /// template (a row selection, or only the streams a sink can run):
+    /// `streams.<name>` is checked against `all_streams` — the template's full
+    /// list — and an override for a stream the narrowing dropped is skipped
+    /// rather than refused.
+    pub fn apply_overlay_within(
+        mut self,
+        overlay: &DeploymentTemplate,
+        all_streams: &[String],
+    ) -> CliResult<Self> {
         overlay.validate()?;
         let doc = self
             .document
@@ -649,24 +687,26 @@ impl Composition {
             }
         }
 
-        let known: Vec<String> = self.streams.iter().map(|p| p.stream.clone()).collect();
         let rows = doc
             .get_mut("matrix")
             .and_then(Value::as_array_mut)
             .ok_or_else(|| CliError::Internal("hub compose: document has no matrix".into()))?;
         for (stream, o) in &overlay.streams {
-            let row = rows
+            if !all_streams.contains(stream) {
+                return Err(CliError::Config(format!(
+                    "deployment '{}': `streams.{stream}` names no stream of '{}' (streams: {})",
+                    overlay.id(),
+                    self.source,
+                    all_streams.join(", ")
+                )));
+            }
+            let Some(row) = rows
                 .iter_mut()
                 .find(|r| r.get("id").and_then(Value::as_str) == Some(stream.as_str()))
                 .and_then(Value::as_object_mut)
-                .ok_or_else(|| {
-                    CliError::Config(format!(
-                        "deployment '{}': `streams.{stream}` names no stream of '{}' (streams: {})",
-                        overlay.id(),
-                        self.source,
-                        known.join(", ")
-                    ))
-                })?;
+            else {
+                continue;
+            };
             let dlq = o.dlq.as_ref().map(|v| v.clone().unwrap_or(Value::Null));
             for (key, value) in [
                 ("sla", o.sla.clone()),
@@ -691,10 +731,28 @@ impl Composition {
                 ));
             }
         }
+        if overlay.state_scope == crate::hub::spec::StateScope::Source {
+            self.name = self.source.clone();
+            doc_name(&mut self.document, &self.name);
+            contributes.push("name".to_string());
+        }
         self.overlay = Some(overlay.id());
         self.overlay_contributes = contributes;
         Ok(self)
     }
+}
+
+fn doc_name(document: &mut Value, name: &str) {
+    if let Some(doc) = document.as_object_mut() {
+        doc.insert("name".into(), Value::String(name.to_string()));
+    }
+}
+
+/// The composed pipeline's name, and so its state namespace: one per
+/// source × sink pairing, so two destinations fed by one source template never
+/// resume from each other's bookmarks.
+pub fn pairing_name(source: &str, sink: &str) -> String {
+    format!("{source}.{sink}")
 }
 
 fn internal(e: serde_json::Error) -> CliError {
@@ -792,8 +850,8 @@ per_stream:
         let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         let c = compose_with(&src(), &sink, ALL).unwrap();
         assert_eq!(
-            c.name, "spend",
-            "pipeline name is the source's, so state keys survive a sink swap"
+            c.name, "spend.bigquery",
+            "one state namespace per pairing, so two sinks never share bookmarks (#789 CLI-32)"
         );
         assert_eq!(c.sink_kind, "bigquery");
         assert_eq!(c.streams[0].chosen, WriteMode::Overwrite);
@@ -910,21 +968,14 @@ per_stream:
             .to_string();
         assert!(err.contains("cannot write append"), "{err}");
 
-        // An appending file sink keeps every parent's rows; a root stream may
-        // still use the alias.
+        // An appending file sink keeps every run's rows, so `overwrite:
+        // append` would re-append the whole table each run (#789 CLI-125).
         let mut appending = jsonl.clone();
         appending.sink.config = json!({ "append": true });
-        let c = compose_with(&s, &appending, &[WriteMode::Append]).unwrap();
-        assert_eq!(c.streams[2].chosen, WriteMode::Append);
-        let err = {
-            let mut s = src();
-            s.streams
-                .push(child(WriteChoice::One(WriteMode::Overwrite)));
-            compose_with(&s, &appending, &[WriteMode::Append])
-                .unwrap_err()
-                .to_string()
-        };
-        assert!(err.contains("overwrite via append"), "{err}");
+        let err = compose_with(&s, &appending, &[WriteMode::Append])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("re-append the whole table"), "{err}");
 
         // A native overwrite is grouped by the executor (#552): allowed, and
         // a refused alias falls through to the next listed mode.
@@ -935,6 +986,7 @@ per_stream:
         let c = compose_with(&s, &bq, ALL).unwrap();
         assert_eq!(c.streams[2].chosen, WriteMode::Overwrite);
         let mut aliased = bq.clone();
+        aliased.sink.kind = "acme-warehouse".into();
         aliased
             .write_mode_aliases
             .insert("overwrite".into(), WriteMode::Append);
@@ -993,6 +1045,15 @@ per_stream:
                 .to_string()
                 .contains("redundant")
         );
+        // A built-in sink that keeps earlier runs' output (#789 CLI-125).
+        let err = compose_with(&src(), &bq2, &[WriteMode::Append])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("re-append the whole table"), "{err}");
+        // A plugin sink is taken at its template's word.
+        let mut plugin = bq2.clone();
+        plugin.sink.kind = "acme-files".into();
+        assert!(compose_with(&src(), &plugin, &[WriteMode::Append]).is_ok());
         let mut bad: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
         bad.write_mode_aliases
             .insert("overwrite".into(), WriteMode::Delete);
@@ -1164,6 +1225,29 @@ per_stream:
         compose_with(&src(), &k, ALL).unwrap()
     }
 
+    /// Two sinks fed by one source template keep separate bookmarks unless a
+    /// deployment opts into `state_scope: source` (#789 CLI-32).
+    #[test]
+    fn each_pairing_owns_its_state_namespace_unless_the_overlay_shares_it() {
+        let a = jsonl_pair();
+        assert_eq!(a.document["name"], json!(a.name));
+        assert_eq!(a.name, pairing_name(&a.source, &a.sink));
+        assert_ne!(a.name, a.source);
+        let shared = a
+            .clone()
+            .apply_overlay(&overlay("kind: deployment\nname: x\nstate_scope: source\n"))
+            .unwrap();
+        assert_eq!(shared.name, shared.source);
+        assert_eq!(shared.document["name"], json!(shared.source));
+        assert!(shared.overlay_contributes.contains(&"name".to_string()));
+        let kept = a
+            .apply_overlay(&overlay(
+                "kind: deployment\nname: x\nstate_scope: pairing\n",
+            ))
+            .unwrap();
+        assert_ne!(kept.name, kept.source);
+    }
+
     #[test]
     fn an_overlay_places_operational_blocks_and_per_stream_overrides() {
         let o = overlay(
@@ -1226,6 +1310,36 @@ streams:
             d["pipeline"]["sinks"],
             jsonl_pair().document["pipeline"]["sinks"]
         );
+    }
+
+    /// A row selection narrows the template before composition; an overlay
+    /// tuning a stream the selection dropped still applies to the rest
+    /// (#789 CLI-67).
+    #[test]
+    fn an_overlay_skips_a_stream_the_narrowing_dropped() {
+        let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let full = src();
+        let all: Vec<String> = full.streams.iter().map(|s| s.name.clone()).collect();
+        let mut narrowed = full.clone();
+        narrowed.streams.retain(|s| s.name != "bills");
+        let kept = narrowed.streams[0].name.clone();
+        let o = overlay(&format!(
+            "kind: deployment\nname: x\nstreams:\n  bills: {{ delivery: at_least_once }}\n  {kept}: {{ delivery: at_least_once }}\n"
+        ));
+        let c = compose_with(&narrowed, &k, ALL)
+            .unwrap()
+            .apply_overlay_within(&o, &all)
+            .unwrap();
+        let rows = c.document["matrix"].as_array().unwrap();
+        assert!(rows.iter().all(|r| r["id"] != "bills"));
+        let row = rows.iter().find(|r| r["id"] == kept.as_str()).unwrap();
+        assert_eq!(row["delivery"], "at_least_once");
+        let err = compose_with(&narrowed, &k, ALL)
+            .unwrap()
+            .apply_overlay(&o)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names no stream"), "{err}");
     }
 
     #[test]

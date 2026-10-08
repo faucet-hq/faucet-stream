@@ -708,6 +708,28 @@ pub struct DeploymentTemplate {
     /// Per-stream overrides, keyed by the source template's stream name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub streams: BTreeMap<String, StreamOverlay>,
+    /// Whose bookmarks a composed run keeps: `pairing` (default — one set per
+    /// source × sink) or `source` (shared by every sink the source template is
+    /// paired with, so a sink swap resumes; never run two pairings at once).
+    #[serde(default, skip_serializing_if = "StateScope::is_default")]
+    pub state_scope: StateScope,
+}
+
+/// The state namespace of a composed run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateScope {
+    /// `{source}.{sink}::{stream}`.
+    #[default]
+    Pairing,
+    /// `{source}::{stream}`, whatever the sink.
+    Source,
+}
+
+impl StateScope {
+    fn is_default(&self) -> bool {
+        *self == Self::Pairing
+    }
 }
 
 impl DeploymentTemplate {
@@ -730,6 +752,7 @@ impl DeploymentTemplate {
                 "params",
                 "streams",
                 "notify",
+                "state_scope",
             ];
             let refused: Vec<&str> = obj
                 .keys()

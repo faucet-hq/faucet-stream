@@ -214,18 +214,56 @@ fn sanitize_row_id(name: &str) -> String {
     }
 }
 
-/// Assign unique row ids to the datasets (a `-2`, `-3`, … suffix on collision).
+/// Assign each dataset a row id — which is also its state key, so it must not
+/// depend on listing order or on which other datasets happen to exist.
+///
+/// A dataset keeps its plain sanitized name when that is unambiguous; it gets a
+/// `-<hash>` suffix of its full name (plus its config patch, for exact
+/// duplicates) when the sanitized name is reserved, empty, or shared with
+/// another dataset whose name is not literally that id.
 pub(crate) fn unique_row_ids(datasets: &[DatasetDescriptor]) -> Vec<String> {
-    let mut seen = std::collections::HashMap::<String, usize>::new();
+    use std::collections::{HashMap, HashSet};
+    let bases: Vec<String> = datasets.iter().map(|d| sanitize_row_id(&d.name)).collect();
+    let mut base_count: HashMap<&str, usize> = HashMap::new();
+    let mut name_count: HashMap<&str, usize> = HashMap::new();
+    for (d, b) in datasets.iter().zip(&bases) {
+        *base_count.entry(b.as_str()).or_default() += 1;
+        *name_count.entry(d.name.as_str()).or_default() += 1;
+    }
+    let mut seen: HashSet<String> = HashSet::new();
     datasets
         .iter()
-        .map(|d| {
-            let base = sanitize_row_id(&d.name);
-            let n = seen.entry(base.clone()).or_insert(0);
-            *n += 1;
-            if *n == 1 { base } else { format!("{base}-{n}") }
+        .zip(&bases)
+        .map(|(d, base)| {
+            let reserved = crate::expand::RESERVED_IDS.contains(&base.as_str())
+                || d.name.chars().all(|c| !c.is_ascii_alphanumeric());
+            let exact = d.name == *base && name_count[d.name.as_str()] == 1;
+            let plain = !reserved && (base_count[base.as_str()] == 1 || exact);
+            let mut id = if plain {
+                base.clone()
+            } else {
+                let mut material = d.name.clone();
+                if name_count[d.name.as_str()] > 1 {
+                    material.push('\0');
+                    material.push_str(&d.config_patch.to_string());
+                }
+                format!("{base}-{:08x}", fnv1a(&material) as u32)
+            };
+            let stem = id.clone();
+            let mut n = 1;
+            while !seen.insert(id.clone()) {
+                n += 1;
+                id = format!("{stem}-{n}");
+            }
+            id
         })
         .collect()
+}
+
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// One-line column summary for a dataset's schema comment, e.g.
@@ -707,12 +745,46 @@ mod tests {
         assert_eq!(sanitize_row_id("public.orders"), "public_orders");
         assert_eq!(sanitize_row_id("raw/orders/"), "raw_orders");
         assert_eq!(sanitize_row_id("...."), "dataset");
-        let ids = unique_row_ids(&[
-            ds("a.b", "table", json!({})),
-            ds("a/b", "table", json!({})),
-            ds("a.b", "table", json!({})),
+        assert_eq!(
+            unique_row_ids(&[ds("public.orders", "table", json!({}))]),
+            vec!["public_orders"]
+        );
+    }
+
+    /// Ids are order-independent, never reserved, and a dataset whose name is
+    /// literally its id keeps it when a punctuation twin appears (#789 CLI-30).
+    #[test]
+    fn row_ids_are_stable_across_order_and_never_reserved() {
+        let set = [
+            ds("a.b", "table", json!({"q": 1})),
+            ds("a/b", "table", json!({"q": 2})),
+            ds("a_b", "table", json!({"q": 3})),
+            ds("window", "table", json!({})),
+            ds("日本", "table", json!({})),
+            ds("x-2", "table", json!({})),
+        ];
+        let ids = unique_row_ids(&set);
+        let mut reversed: Vec<_> = set.to_vec();
+        reversed.reverse();
+        let mut back = unique_row_ids(&reversed);
+        back.reverse();
+        assert_eq!(ids, back, "order must not change any id");
+        assert_eq!(ids[2], "a_b");
+        assert!(
+            ids[0].starts_with("a_b-") && ids[1].starts_with("a_b-"),
+            "{ids:?}"
+        );
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids[3].starts_with("window-"), "{ids:?}");
+        assert!(ids[4].starts_with("dataset-"), "{ids:?}");
+        assert_eq!(ids[5], "x-2");
+        let dups = unique_row_ids(&[
+            ds("t", "table", json!({"p": 1})),
+            ds("t", "table", json!({"p": 2})),
         ]);
-        assert_eq!(ids, vec!["a_b", "a_b-2", "a_b-3"]);
+        assert_ne!(dups[0], dups[1]);
+        let same = unique_row_ids(&[ds("t", "table", json!({})), ds("t", "table", json!({}))]);
+        assert_ne!(same[0], same[1]);
     }
 
     // ── schema summary ────────────────────────────────────────────────────────

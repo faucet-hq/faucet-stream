@@ -77,7 +77,8 @@ pub async fn list_usage(
         .usage_list(&filter)
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
-    let report = aggregate(&records, by, &report_currency(&records));
+    let mut report = aggregate(&records, by, &report_currency(&records));
+    report.truncated = crate::usage::listing_truncated(records.len(), filter.limit);
     Ok(Json(UsageResponse {
         report,
         records: q.include_records.then_some(records),

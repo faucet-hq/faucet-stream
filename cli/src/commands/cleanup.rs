@@ -42,13 +42,14 @@ pub async fn run(args: CleanupArgs) -> CliResult<()> {
         )));
     }
 
-    let (store, retention_days) = connect(&args).await?;
+    let (store, retention_days, pipeline) = connect(&args).await?;
     // `in_flight` stays empty here — this process runs no pipelines, and a
     // `--store` pointed at a live server's ledger cannot see that server's runs
     // at all. The mtime grace is what protects those files: it asks the
     // filesystem whether the path was touched recently rather than asking about
     // runs it cannot enumerate.
     let opts = SweepOptions::new(retention_days)
+        .pipeline(pipeline)
         .dry_run(args.dry_run)
         .in_flight_grace(std::time::Duration::from_secs(args.in_flight_grace_secs));
     let report = sweep::run(store.as_ref(), &scope, &opts)
@@ -92,12 +93,13 @@ fn resolve_scope(args: &CleanupArgs) -> CliResult<SweepScope> {
 }
 
 /// Load the config named by the flags and connect its ledger store, returning it
-/// alongside the retention window to apply.
+/// alongside the retention window to apply and the pipeline the sweep is scoped
+/// to (the config's own, unless `--pipeline` names one).
 ///
 /// The ledger lives in the `catalog:` store — the same one `faucet run` /
 /// `schedule` / `replicate` record into, and the one `faucet serve --history`
 /// browses. `--store` overrides it for the case where the config is not to hand.
-async fn connect(args: &CleanupArgs) -> CliResult<(Arc<dyn RunHistory>, u32)> {
+async fn connect(args: &CleanupArgs) -> CliResult<(Arc<dyn RunHistory>, u32, Option<String>)> {
     // An explicit --store needs no config at all.
     if let Some(url) = &args.store {
         let spec = crate::catalog::CatalogSpec {
@@ -109,6 +111,7 @@ async fn connect(args: &CleanupArgs) -> CliResult<(Arc<dyn RunHistory>, u32)> {
         return Ok((
             handle.store,
             args.retention_days.unwrap_or(DEFAULT_RETENTION_DAYS),
+            args.pipeline.clone(),
         ));
     }
 
@@ -140,7 +143,15 @@ async fn connect(args: &CleanupArgs) -> CliResult<(Arc<dyn RunHistory>, u32)> {
                 .and_then(|spec| spec.retention_days)
         })
         .unwrap_or(DEFAULT_RETENTION_DAYS);
-    Ok((handle.store, retention_days))
+    let pipeline = args.pipeline.clone().unwrap_or_else(|| {
+        cfg.name.clone().unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("pipeline")
+                .to_owned()
+        })
+    });
+    Ok((handle.store, retention_days, Some(pipeline)))
 }
 
 /// Human-readable report. Deliberately explicit about what was *not* deleted:
@@ -238,9 +249,33 @@ mod tests {
             in_flight_grace_secs: 60,
             all: false,
             retention_days: None,
+            pipeline: None,
             dry_run: false,
             yes: false,
         }
+    }
+
+    #[tokio::test]
+    async fn a_config_scopes_the_sweep_to_its_own_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("orders.yaml");
+        std::fs::write(
+            &cfg,
+            "version: 1\ncatalog:\n  url: memory\npipeline:\n  source:\n    type: csv\n    config:\n      path: in.csv\n  sink:\n    type: jsonl\n    config:\n      path: out.jsonl\n",
+        )
+        .unwrap();
+        let mut a = args();
+        a.config = Some(cfg.clone());
+        a.no_env_file = true;
+        let (_, _, pipeline) = connect(&a).await.unwrap();
+        assert_eq!(pipeline.as_deref(), Some("orders"));
+        a.pipeline = Some("other".into());
+        let (_, _, pipeline) = connect(&a).await.unwrap();
+        assert_eq!(pipeline.as_deref(), Some("other"));
+        let mut a = args();
+        a.store = Some("memory".into());
+        let (_, _, pipeline) = connect(&a).await.unwrap();
+        assert_eq!(pipeline, None);
     }
 
     #[test]

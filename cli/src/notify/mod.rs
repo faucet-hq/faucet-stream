@@ -30,7 +30,7 @@ pub mod metrics;
 pub mod render;
 pub mod spec;
 
-pub use dispatch::Notifier;
+pub use dispatch::{DeliveryOutcome, Notifier};
 pub use event::{NotifyEvent, RunContext};
 pub use spec::{
     ChannelSpec, EventKind, NotificationSpec, PagerdutyConfig, RESERVED_BODY_KEYS, Severity,

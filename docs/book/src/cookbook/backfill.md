@@ -125,6 +125,10 @@ faucet backfill pipeline.yaml --from 2026-06-01 --to 2026-07-01 --into staging
 `--into <name>` swaps the destination for the named template under
 `pipeline.sinks`.
 
+A row's [scoped cleanup](upsert.md) (`complete_for: {on_missing: delete}`) is
+skipped for backfill units, with a warning: a unit fetches one window, so a
+sweep would delete every in-scope row outside it.
+
 ## Bookmark-range mode
 
 For sources whose replication key is not time-shaped, replay between two

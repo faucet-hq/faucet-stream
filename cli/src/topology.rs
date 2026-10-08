@@ -121,6 +121,7 @@ pub fn validate_topology_spec(cfg: &PipelineConfig) -> CliResult<()> {
         cfg.profiling.as_ref(),
         cfg.pipeline.state.as_ref(),
     )?;
+    validate_governance(cfg)?;
     let spec = &cfg.pipeline;
     let mut known: Vec<String> = spec.nodes.keys().cloned().collect();
     known.sort_unstable();
@@ -173,6 +174,61 @@ fn refuse_unresolved_node_refs(cfg: &PipelineConfig) -> CliResult<()> {
                  `PipelineConfig::from_path*` / `from_text`, which resolve `vars:` and template \
                  references"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Compile the governance blocks and apply the gates a matrix row gets at
+/// expand time, so a topology that cannot run fails `validate` (and fails
+/// before any lineage START is emitted) rather than mid-run: a quarantining
+/// quality / contract / drift policy needs a `dlq:`, and `on_drift: evolve`
+/// needs every sink node to support schema evolution (#789 CLI-83).
+fn validate_governance(cfg: &PipelineConfig) -> CliResult<()> {
+    build_governance(cfg)?;
+    let mut quarantines: Vec<&str> = Vec::new();
+    #[cfg(feature = "quality")]
+    if let Some(q) = cfg.pipeline.quality.as_ref()
+        && faucet_core::CompiledQuality::compile(q)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("quality");
+    }
+    #[cfg(feature = "contract")]
+    if let Some(c) = cfg.pipeline.contract.as_ref()
+        && faucet_core::CompiledContract::compile(c)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("contract");
+    }
+    let drift = cfg
+        .pipeline
+        .schema
+        .as_ref()
+        .map(faucet_core::SchemaDriftPolicy::compile);
+    if drift.as_ref().is_some_and(|d| d.requires_dlq()) {
+        quarantines.push("schema");
+    }
+    if !quarantines.is_empty() && cfg.pipeline.dlq.is_none() {
+        return Err(CliError::Config(format!(
+            "topology: the {} block quarantines records, which needs a `dlq:` block to route \
+             them to",
+            quarantines.join(" / ")
+        )));
+    }
+    if drift
+        .as_ref()
+        .is_some_and(|d| d.on_drift == faucet_core::OnDrift::Evolve)
+    {
+        for (id, kind, _) in sink_nodes(cfg)? {
+            if !crate::registry::sink_supports_schema_evolution(&kind) {
+                return Err(CliError::Config(format!(
+                    "sink node '{id}': schema.on_drift: evolve is not supported by sink \
+                     '{kind}' — use warn, ignore, quarantine or fail"
+                )));
+            }
         }
     }
     Ok(())
@@ -997,12 +1053,33 @@ fn build_governance(cfg: &PipelineConfig) -> CliResult<TopologyGovernance> {
 
     #[cfg(feature = "masking")]
     if let Some(spec) = &cfg.pipeline.masking {
-        for (node_id, node) in &cfg.pipeline.nodes {
+        for (node_id, ids) in sink_node_masking_ids(cfg) {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let compiled = faucet_core::CompiledMasking::compile_for_sink(spec, &ids)
+                .map_err(|e| CliError::Config(format!("masking: {e}")))?;
+            if !compiled.is_empty() {
+                g.masking_by_sink
+                    .insert(node_id, std::sync::Arc::new(compiled));
+            }
+        }
+    }
+    Ok(g)
+}
+
+/// Each sink node's id with the ids its masking rules are scoped by — the
+/// node id, its template name, and its resolved connector kind (the node's
+/// own `type:` override, else the template's). Shared by the runtime and
+/// `faucet masking`, so the report names what a run applies.
+#[cfg(feature = "masking")]
+pub(crate) fn sink_node_masking_ids(cfg: &PipelineConfig) -> Vec<(String, Vec<String>)> {
+    cfg.pipeline
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| {
             let NodeSpec::Sink { template, kind, .. } = node else {
-                continue;
+                return None;
             };
             let template_ref = template.as_deref().unwrap_or("default");
-            // The node's own kind override, else the template's declared kind.
             let resolved_kind = kind.clone().or_else(|| {
                 cfg.pipeline
                     .sinks
@@ -1010,19 +1087,11 @@ fn build_governance(cfg: &PipelineConfig) -> CliResult<TopologyGovernance> {
                     .or(cfg.pipeline.sink.as_ref())
                     .map(|t| t.kind.clone())
             });
-            let mut ids: Vec<&str> = vec![node_id.as_str(), template_ref];
-            if let Some(k) = resolved_kind.as_deref() {
-                ids.push(k);
-            }
-            let compiled = faucet_core::CompiledMasking::compile_for_sink(spec, &ids)
-                .map_err(|e| CliError::Config(format!("masking: {e}")))?;
-            if !compiled.is_empty() {
-                g.masking_by_sink
-                    .insert(node_id.clone(), std::sync::Arc::new(compiled));
-            }
-        }
-    }
-    Ok(g)
+            let mut ids = vec![node_id.clone(), template_ref.to_string()];
+            ids.extend(resolved_kind);
+            Some((node_id.clone(), ids))
+        })
+        .collect()
 }
 
 /// Collect a bounded preview of each `source` node's records (source side
@@ -1183,6 +1252,7 @@ pub async fn run_topology(
         });
     }
 
+    let governance = run_governance(cfg, run.is_preview())?;
     // Lineage START, one per sink node — a topology's analogue of an invocation.
     // Built before the run so a crash still leaves a START on record.
     #[cfg(feature = "lineage")]
@@ -1215,7 +1285,6 @@ pub async fn run_topology(
     }
 
     let state_store = opts.state_store.clone();
-    let governance = run_governance(cfg, run.is_preview())?;
     // Run lease + run-outcome marker per sink node (#732 / #735), like a
     // matrix invocation's.
     let mut markers: Vec<(String, String, crate::pipeline_state::markers::RunMarkers)> = Vec::new();
@@ -2065,6 +2134,33 @@ mod tests {
             "transport": { "type": "file", "config": { "path": "/tmp/ol.jsonl" } },
         }))
         .expect("valid lineage config")
+    }
+
+    /// `validate_topology_spec` compiles the governance blocks and applies
+    /// the DLQ / evolve gates a matrix row gets (#789 CLI-83).
+    #[test]
+    fn topology_validation_applies_governance_gates() {
+        let with = |extra: &str| cfg(&format!("{LINEAR}{extra}"));
+        assert!(validate_topology_spec(&cfg(LINEAR)).is_ok());
+        let err = validate_topology_spec(&with("  schema: { on_drift: evolve }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("evolve is not supported by sink 'jsonl'"),
+            "{err}"
+        );
+        let err = validate_topology_spec(&with("  schema: { on_drift: quarantine }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a `dlq:` block"), "{err}");
+        #[cfg(feature = "masking")]
+        assert!(
+            validate_topology_spec(&with(
+                "  masking: { rules: [ { match: { field_pattern: \"(\" }, action: { type: redact } } ] }\n"
+            ))
+            .is_err(),
+            "a bad masking regex fails validation, not the run"
+        );
     }
 
     const LINEAR: &str = r#"version: 1

@@ -22,6 +22,8 @@ use tracing::Instrument;
 struct RunningRun {
     handle: JoinHandle<CliResult<RunSummary>>,
     started: Instant,
+    /// Cancels the run cooperatively: rows stop at a page boundary and flush.
+    cancel: faucet_core::CancellationToken,
 }
 
 /// The data the loop needs after a run finishes.
@@ -75,6 +77,9 @@ impl Reload {
 struct Rows {
     nodes: Vec<ExpandedNode>,
     topology: Option<std::sync::Arc<PipelineConfig>>,
+    /// A `fan_out:` or probed-partition config, whose rows are planned afresh
+    /// every tick (discovery and bound probes run each time).
+    fanout: Option<std::sync::Arc<PipelineConfig>>,
 }
 
 impl Rows {
@@ -85,6 +90,15 @@ impl Rows {
             return Ok(Self {
                 nodes: Vec::new(),
                 topology: Some(std::sync::Arc::new(cfg.clone())),
+                fanout: None,
+            });
+        }
+        if crate::dynamic_fanout::has_fanout_source(cfg)? || crate::partition::has_probes(cfg) {
+            expand(&crate::partition::offline(cfg))?;
+            return Ok(Self {
+                nodes: Vec::new(),
+                topology: None,
+                fanout: Some(std::sync::Arc::new(cfg.clone())),
             });
         }
         Ok(expand(cfg)?.into())
@@ -101,6 +115,7 @@ impl From<Vec<ExpandedNode>> for Rows {
         Self {
             nodes,
             topology: None,
+            fanout: None,
         }
     }
 }
@@ -121,7 +136,14 @@ async fn run_rows(rows: Rows, opts: ExecuteOptions) -> CliResult<RunSummary> {
             };
             crate::topology::run_topology(&cfg, &opts.auth, run).await
         }
-        None => run_expanded(rows.nodes, opts).await,
+        None => match rows.fanout {
+            Some(cfg) => {
+                let mut cfg = (*cfg).clone();
+                crate::partition::resolve_runtime_with(&mut cfg, &opts.auth).await?;
+                run_expanded(expand(&cfg)?, opts).await
+            }
+            None => run_expanded(rows.nodes, opts).await,
+        },
     }
 }
 
@@ -361,28 +383,49 @@ fn run_span(run_ordinal: u64, scheduled_for: DateTime<Utc>, tick: DateTime<Utc>)
 }
 
 /// Spawn one pipeline run, wrapping it in the optional run timeout and the
-/// per-run span.
+/// per-run span. A run past its timeout is cancelled cooperatively and given
+/// `flush_grace` to flush before it is dropped.
 fn spawn_run(
     nodes: Rows,
-    opts: ExecuteOptions,
+    mut opts: ExecuteOptions,
     timeout: Option<Duration>,
+    flush_grace: Duration,
     span: tracing::Span,
-) -> JoinHandle<CliResult<RunSummary>> {
-    tokio::spawn(
+) -> RunningRun {
+    let cancel = faucet_core::CancellationToken::new();
+    opts.cancel = Some(cancel.clone());
+    let token = cancel.clone();
+    let handle = tokio::spawn(
         async move {
-            match timeout {
-                Some(d) => match tokio::time::timeout(d, run_rows(nodes, opts)).await {
-                    Ok(r) => r,
-                    Err(_) => Err(CliError::Internal(format!(
-                        "scheduled run exceeded run_timeout_secs ({}s) and was aborted",
-                        d.as_secs()
-                    ))),
-                },
-                None => run_rows(nodes, opts).await,
+            let fut = run_rows(nodes, opts);
+            tokio::pin!(fut);
+            let Some(d) = timeout else {
+                return fut.await;
+            };
+            match tokio::time::timeout(d, &mut fut).await {
+                Ok(r) => r,
+                Err(_) => {
+                    token.cancel();
+                    let flushed = tokio::time::timeout(flush_grace, &mut fut).await.is_ok();
+                    Err(CliError::Internal(format!(
+                        "scheduled run exceeded run_timeout_secs ({}s) and was cancelled{}",
+                        d.as_secs(),
+                        if flushed {
+                            " (its rows stopped at a page boundary and flushed)"
+                        } else {
+                            "; it did not stop within the shutdown grace and was dropped"
+                        }
+                    )))
+                }
             }
         }
         .instrument(span),
-    )
+    );
+    RunningRun {
+        handle,
+        started: Instant::now(),
+        cancel,
+    }
 }
 
 /// Classify a joined run task into a scheduler outcome + a log detail. When the
@@ -481,16 +524,16 @@ async fn run_once(
         catalog,
     );
     let span = run_span(1, now, now);
-    let fut = run_rows(nodes.clone(), opts).instrument(span);
-    let summary = match compiled.run_timeout {
-        Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
-            CliError::Internal(format!(
-                "--once run exceeded run_timeout_secs ({}s)",
-                d.as_secs()
-            ))
-        })??,
-        None => fut.await?,
-    };
+    let summary = spawn_run(
+        nodes.clone(),
+        opts,
+        compiled.run_timeout,
+        compiled.shutdown_grace,
+        span,
+    )
+    .handle
+    .await
+    .map_err(|e| CliError::Internal(format!("--once run task: {e}")))??;
     if summary.had_failures() {
         return Err(CliError::PipelineHadFailures {
             count: summary.failure_count(),
@@ -619,15 +662,18 @@ async fn run_loop(
                         &catalog,
                     );
                     let span = run_span(run_ordinal, next_due, now);
-                    let handle = spawn_run(nodes.clone(), opts, compiled.run_timeout, span);
+                    let run = spawn_run(
+                        nodes.clone(),
+                        opts,
+                        compiled.run_timeout,
+                        compiled.shutdown_grace,
+                        span,
+                    );
                     m::in_flight(&pipeline_name, 1);
                     m::last_run_started(&pipeline_name, now);
                     m::lateness(&pipeline_name, now - next_due);
                     tracing::info!(pipeline = %pipeline_name, run_ordinal, scheduled_for = %next_due, "run started");
-                    running = Some(RunningRun {
-                        handle,
-                        started: Instant::now(),
-                    });
+                    running = Some(run);
                 }
                 TickAction::Skip => {
                     m::overlap(&pipeline_name, "skip");
@@ -676,11 +722,12 @@ async fn run_loop(
 
             _ = shutdown.recv() => {
                 tracing::info!(pipeline = %pipeline_name, "shutdown signal received; draining in-flight run");
-                graceful_shutdown(running.take(), compiled.shutdown_grace, &pipeline_name).await;
+                let stopped =
+                    graceful_shutdown(running.take(), compiled.shutdown_grace, &pipeline_name).await;
                 // Flush any buffered OTLP telemetry after the final run drains
                 // (no-op without the `otel` feature).
                 faucet_core::shutdown_otel();
-                return Ok(());
+                return stopped;
             }
 
             finished = wait_for_run(&mut running, breaker_cooldown) => {
@@ -774,12 +821,18 @@ async fn run_loop(
                                 &catalog,
                             );
                             let span = run_span(run_ordinal, sched_for, done_at);
-                            let handle = spawn_run(nodes.clone(), opts, compiled.run_timeout, span);
+                            let run = spawn_run(
+                                nodes.clone(),
+                                opts,
+                                compiled.run_timeout,
+                                compiled.shutdown_grace,
+                                span,
+                            );
                             m::in_flight(&pipeline_name, 1);
                             m::last_run_started(&pipeline_name, done_at);
                             m::lateness(&pipeline_name, done_at - sched_for);
                             tracing::info!(pipeline = %pipeline_name, run_ordinal, scheduled_for = %sched_for, "queued run started");
-                            running = Some(RunningRun { handle, started: Instant::now() });
+                            running = Some(run);
                         }
                     }
                 }
@@ -808,11 +861,8 @@ async fn run_loop(
                             .as_ref()
                             .and_then(|r| r.circuit_breaker)
                             .map(|cb| cb.cooldown);
-                        next_due = if compiled.start_immediately {
-                            Utc::now()
-                        } else {
-                            compiled.next_after(Utc::now()).unwrap_or(next_due)
-                        };
+                        next_due =
+                            reload_next_due(&compiled, running.is_some(), Utc::now(), next_due);
                         m::reload(&pipeline_name, "ok");
                         tracing::info!(
                             pipeline = %pipeline_name, cron = %cron, timezone = %timezone,
@@ -834,6 +884,22 @@ async fn run_loop(
     }
 }
 
+/// The next tick after a hot reload: `start_immediately` fires at once only
+/// when no run is in flight — an immediate tick during a run would overlap it
+/// (and under `overlap_policy: forbid` stop the scheduler).
+fn reload_next_due(
+    compiled: &CompiledSchedule,
+    running: bool,
+    now: chrono::DateTime<Utc>,
+    previous: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    if compiled.start_immediately && !running {
+        now
+    } else {
+        compiled.next_after(now).unwrap_or(previous)
+    }
+}
+
 /// Await the in-flight run (or never resolve when idle). Returns the classified
 /// outcome; the caller fills in `duration` from the `RunningRun`.
 async fn wait_for_run(
@@ -847,23 +913,36 @@ async fn wait_for_run(
 }
 
 /// On shutdown, await the in-flight run up to `grace`, then abort it.
-async fn graceful_shutdown(running: Option<RunningRun>, grace: Duration, pipeline_name: &str) {
-    if let Some(mut rr) = running {
-        match tokio::time::timeout(grace, &mut rr.handle).await {
-            Ok(_) => {
-                tracing::info!(pipeline = %pipeline_name, "in-flight run finished during shutdown grace")
-            }
-            Err(_) => {
-                rr.handle.abort();
-                tracing::warn!(
-                    pipeline = %pipeline_name,
-                    grace_secs = grace.as_secs(),
-                    "in-flight run exceeded shutdown grace; aborted (partial sink state possible; bookmark preserved for the next run)"
-                );
-            }
-        }
+async fn graceful_shutdown(
+    running: Option<RunningRun>,
+    grace: Duration,
+    pipeline_name: &str,
+) -> CliResult<()> {
+    let Some(mut rr) = running else {
+        return Ok(());
+    };
+    if rr.handle.is_finished() {
         m::in_flight(pipeline_name, 0);
+        return Ok(());
     }
+    rr.cancel.cancel();
+    let outcome = match tokio::time::timeout(grace, &mut rr.handle).await {
+        Ok(_) => {
+            tracing::info!(pipeline = %pipeline_name, "in-flight run stopped at a page boundary and flushed during the shutdown grace");
+            Err(CliError::Cancelled)
+        }
+        Err(_) => {
+            rr.handle.abort();
+            tracing::warn!(
+                pipeline = %pipeline_name,
+                grace_secs = grace.as_secs(),
+                "in-flight run did not stop within the shutdown grace; aborted (partial sink state possible; bookmark preserved for the next run)"
+            );
+            Err(CliError::Cancelled)
+        }
+    };
+    m::in_flight(pipeline_name, 0);
+    outcome
 }
 
 #[cfg(test)]
@@ -1095,6 +1174,7 @@ mod tests {
         let mut running = Some(RunningRun {
             handle,
             started: Instant::now(),
+            cancel: Default::default(),
         });
         let finished = wait_for_run(&mut running, None).await;
         assert_eq!(finished.outcome, RunOutcome::Success);
@@ -1140,18 +1220,81 @@ mod tests {
         );
         // A zero-ish timeout (1ns) virtually guarantees the timeout branch fires
         // even though the pipeline is fast — the timeout races the spawn.
-        let handle = spawn_run(
+        let run = spawn_run(
             nodes.into(),
             opts,
             Some(Duration::from_nanos(1)),
+            Duration::from_secs(5),
             run_span(1, Utc::now(), Utc::now()),
         );
-        let joined = handle.await.unwrap();
+        let joined = run.handle.await.unwrap();
         // Either the run finished before the 1ns deadline (Ok) — unlikely — or
         // it tripped the timeout into an Internal error. Accept both but assert
         // the timeout message shape when it errors.
         if let Err(CliError::Internal(msg)) = &joined {
             assert!(msg.contains("run_timeout_secs"), "{msg}");
+        }
+    }
+
+    /// A `fan_out:` config is planned as such and discovers its rows on
+    /// every tick, like `faucet run` (#789 CLI-30).
+    #[cfg(feature = "source-rest")]
+    #[tokio::test]
+    async fn a_fan_out_config_discovers_on_every_tick() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/objects"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "items": [] })),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut src = serde_json::to_value(faucet_source_rest::RestStreamConfig::new(
+            &server.uri(),
+            "/",
+        ))
+        .unwrap();
+        src["discovery"] = serde_json::json!({
+            "list": { "get": "/objects", "items": "$.items[*]", "name": "$.name" },
+            "emit": { "config": { "path": "/${name_lower}" } },
+            "fan_out": true
+        });
+        let cfg: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "name": "fo",
+            "pipeline": { "source": { "type": "rest", "config": src }, "sink": { "type": "jsonl", "config": { "path": "/dev/null" } } }
+        }))
+        .unwrap();
+        let rows = Rows::plan(&cfg).unwrap();
+        assert!(rows.fanout.is_some() && rows.nodes.is_empty());
+        let auth = AuthCatalog::new();
+        for _ in 0..2 {
+            let opts = make_opts(
+                "fo",
+                &None,
+                &auth,
+                Utc::now().fixed_offset(),
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &crate::usage::UsageOptions::default(),
+                &None,
+                #[cfg(feature = "lineage")]
+                &None,
+                #[cfg(feature = "lineage")]
+                &None,
+                #[cfg(feature = "notify")]
+                &None,
+                #[cfg(feature = "catalog")]
+                &None,
+            );
+            let err = run_rows(rows.clone(), opts).await.unwrap_err().to_string();
+            assert!(err.contains("returned no datasets"), "{err}");
         }
     }
 
@@ -1193,12 +1336,21 @@ mod tests {
         // A run that finishes immediately is awaited within the grace window.
         let c = compiled("cron: \"* * * * *\"\nshutdown_grace_secs: 5");
         let handle = tokio::spawn(async { Ok(summary(0, 1)) });
+        tokio::task::yield_now().await;
+        while !handle.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let running = Some(RunningRun {
             handle,
             started: Instant::now(),
+            cancel: Default::default(),
         });
         // Should return promptly without aborting (the run already completed).
-        graceful_shutdown(running, c.shutdown_grace, "p").await;
+        assert!(
+            graceful_shutdown(running, c.shutdown_grace, "p")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1211,14 +1363,56 @@ mod tests {
         let running = Some(RunningRun {
             handle,
             started: Instant::now(),
+            cancel: Default::default(),
         });
-        // 50ms grace → the abort branch fires; the call must still return.
-        graceful_shutdown(running, Duration::from_millis(50), "p").await;
+        // 50ms grace → the abort branch fires; the call must still return,
+        // and a stopped run is never reported as success.
+        assert!(matches!(
+            graceful_shutdown(running, Duration::from_millis(50), "p").await,
+            Err(CliError::Cancelled)
+        ));
+    }
+
+    /// Shutdown cancels the run's token first, so a run that honours it stops
+    /// within the grace instead of being dropped (#789 CLI-51).
+    #[tokio::test]
+    async fn graceful_shutdown_cancels_cooperatively_first() {
+        let cancel = faucet_core::CancellationToken::new();
+        let seen = cancel.clone();
+        let handle = tokio::spawn(async move {
+            seen.cancelled().await;
+            Ok(summary(0, 1))
+        });
+        let running = Some(RunningRun {
+            handle,
+            started: Instant::now(),
+            cancel,
+        });
+        let started = Instant::now();
+        assert!(matches!(
+            graceful_shutdown(running, Duration::from_secs(30), "p").await,
+            Err(CliError::Cancelled)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A reload with `start_immediately` while a run is in flight waits for
+    /// the next cron tick instead of overlapping it (#789 CLI-86).
+    #[test]
+    fn a_reload_during_a_run_does_not_tick_immediately() {
+        let c = compiled("cron: \"0 0 * * *\"\nstart_immediately: true\noverlap_policy: forbid");
+        let now = Utc::now();
+        assert_eq!(reload_next_due(&c, false, now, now), now);
+        assert!(reload_next_due(&c, true, now, now) > now);
     }
 
     #[tokio::test]
     async fn graceful_shutdown_noop_when_idle() {
         // No in-flight run → returns immediately.
-        graceful_shutdown(None, Duration::from_secs(1), "p").await;
+        assert!(
+            graceful_shutdown(None, Duration::from_secs(1), "p")
+                .await
+                .is_ok()
+        );
     }
 }

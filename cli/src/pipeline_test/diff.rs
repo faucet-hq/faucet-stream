@@ -112,18 +112,27 @@ fn match_records(
         ));
     }
     if unordered {
-        let mut claimed = vec![false; actual.len()];
+        // Maximum bipartite matching, so a loose expectation never takes the
+        // only record a stricter one could match.
+        let edges: Vec<Vec<usize>> = expected
+            .iter()
+            .map(|exp| {
+                actual
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, act)| value_matches(exp, act, mode))
+                    .map(|(j, _)| j)
+                    .collect()
+            })
+            .collect();
+        let mut owner: Vec<Option<usize>> = vec![None; actual.len()];
         for (i, exp) in expected.iter().enumerate() {
-            let hit = actual
-                .iter()
-                .enumerate()
-                .find(|(j, act)| !claimed[*j] && value_matches(exp, act, mode));
-            match hit {
-                Some((j, _)) => claimed[j] = true,
-                None => failures.push(format!(
+            let mut seen = vec![false; actual.len()];
+            if !augment(i, &edges, &mut owner, &mut seen) {
+                failures.push(format!(
                     "{label}[{i}]: no unmatched actual record equals {}",
                     compact(exp)
-                )),
+                ));
             }
         }
     } else {
@@ -149,6 +158,22 @@ fn match_records(
 
 /// Collect up to [`MAX_DIFF_PATHS`] `path: expected X, got Y` lines for two
 /// mismatching values.
+/// Kuhn's augmenting path: give expectation `i` an actual record, moving an
+/// earlier expectation to another of its matches when needed.
+fn augment(i: usize, edges: &[Vec<usize>], owner: &mut [Option<usize>], seen: &mut [bool]) -> bool {
+    for &j in &edges[i] {
+        if seen[j] {
+            continue;
+        }
+        seen[j] = true;
+        if owner[j].is_none_or(|k| augment(k, edges, owner, seen)) {
+            owner[j] = Some(i);
+            return true;
+        }
+    }
+    false
+}
+
 fn diff_paths(
     expected: &Value,
     actual: &Value,
@@ -222,6 +247,19 @@ fn compact(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loose expectation cannot steal the only record a stricter one
+    /// matches (#789 CLI-170).
+    #[test]
+    fn unordered_subset_pairs_by_maximum_matching() {
+        let expected = [json!({"a": 1}), json!({"a": 1, "b": 2})];
+        let actual = [json!({"a": 1, "b": 2}), json!({"a": 1, "b": 3})];
+        let failures = match_records("records", &expected, &actual, MatchMode::Subset, true);
+        assert!(failures.is_empty(), "{failures:?}");
+        let wrong = [json!({"a": 1, "b": 3}), json!({"a": 1, "b": 4})];
+        let failures = match_records("records", &expected, &wrong, MatchMode::Subset, true);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+    }
     use serde_json::json;
 
     fn run(written: Vec<Value>, dlq: Vec<Value>, error: Option<&str>) -> CaseRun {

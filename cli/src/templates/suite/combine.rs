@@ -100,11 +100,25 @@ pub fn generate(suite: &Suite, params: &ParamsSpec) -> CliResult<Vec<GeneratedCa
 /// nothing to do with the axes under test.
 fn from_combine(cb: &Combine, params: &ParamsSpec) -> CliResult<Vec<GeneratedCase>> {
     let axes: Vec<(&String, &Vec<Value>)> = cb.params.iter().collect();
-    let full = cartesian(&axes);
     let selected = if cb.pairwise {
-        all_pairs(&axes, full)
+        all_pairs(&axes)
     } else {
-        full
+        // Sized before it is built: a product past the ceiling would exhaust
+        // memory long before the case cap could refuse it.
+        let size = axes
+            .iter()
+            .try_fold(1usize, |acc, (_, v)| acc.checked_mul(v.len().max(1)));
+        match size {
+            Some(n) if n <= MAX_PRODUCT => cartesian(&axes),
+            _ => {
+                return Err(CliError::Config(format!(
+                    "template test suite: `combine.params` spans {} combinations, past the \
+                     {MAX_CASES}-case ceiling even before `exclude:`. Narrow the value lists or set \
+                     `pairwise: true` (all-pairs keeps the two-param interactions that hold most bugs).",
+                    size.map_or_else(|| "more than usize::MAX".to_string(), |n| n.to_string())
+                )));
+            }
+        }
     };
 
     let kept: Vec<BTreeMap<String, Value>> = selected
@@ -149,6 +163,11 @@ fn from_combine(cb: &Combine, params: &ParamsSpec) -> CliResult<Vec<GeneratedCas
         .collect())
 }
 
+/// The largest product built before `exclude:` filters it — room for
+/// exclusions to bring a sweep under [`MAX_CASES`], without letting a typo'd
+/// axis allocate millions of combinations.
+const MAX_PRODUCT: usize = MAX_CASES * 64;
+
 /// Full cartesian product, in a deterministic order.
 fn cartesian(axes: &[(&String, &Vec<Value>)]) -> Vec<BTreeMap<String, Value>> {
     let mut out: Vec<BTreeMap<String, Value>> = vec![BTreeMap::new()];
@@ -166,48 +185,72 @@ fn cartesian(axes: &[(&String, &Vec<Value>)]) -> Vec<BTreeMap<String, Value>> {
     out
 }
 
-/// Greedy all-pairs reduction: keep the fewest combinations that still cover
-/// every (param-a=value, param-b=value) pair.
+/// Greedy, constructive all-pairs: the fewest combinations (approximately)
+/// that still cover every (param-a=value, param-b=value) pair.
 ///
-/// Greedy rather than optimal because the optimal set is NP-hard to find and
-/// the difference is a handful of cases — while the *coverage* property, which
-/// is what the suite promises, is exact either way (asserted in the tests).
-fn all_pairs(
-    axes: &[(&String, &Vec<Value>)],
-    full: Vec<BTreeMap<String, Value>>,
-) -> Vec<BTreeMap<String, Value>> {
+/// Built one combination at a time from a still-uncovered pair, filling each
+/// other axis with the value that covers the most needed pairs — never from
+/// the full product, which for ten params of six values is 60 million maps.
+/// Greedy rather than optimal (optimal is NP-hard; the difference is a handful
+/// of cases), while the *coverage* property is exact (asserted in the tests).
+fn all_pairs(axes: &[(&String, &Vec<Value>)]) -> Vec<BTreeMap<String, Value>> {
     if axes.len() < 2 {
-        return full;
+        return cartesian(axes);
     }
-    // Every pair that must be covered.
-    let mut needed: BTreeSet<(String, String, String, String)> = BTreeSet::new();
+    type Pair = (String, String, String, String);
+    let pair = |a: &str, av: &Value, b: &str, bv: &Value| -> Pair {
+        if a < b {
+            (a.to_string(), key_of(av), b.to_string(), key_of(bv))
+        } else {
+            (b.to_string(), key_of(bv), a.to_string(), key_of(av))
+        }
+    };
+    let mut needed: BTreeSet<Pair> = BTreeSet::new();
     for i in 0..axes.len() {
         for j in (i + 1)..axes.len() {
             for a in axes[i].1 {
                 for b in axes[j].1 {
-                    needed.insert((axes[i].0.clone(), key_of(a), axes[j].0.clone(), key_of(b)));
+                    needed.insert(pair(axes[i].0, a, axes[j].0, b));
                 }
             }
         }
     }
+    let value = |name: &str, key: &str| -> Option<Value> {
+        axes.iter()
+            .find(|(n, _)| n.as_str() == name)
+            .and_then(|(_, vs)| vs.iter().find(|v| key_of(v) == key).cloned())
+    };
 
     let mut chosen: Vec<BTreeMap<String, Value>> = Vec::new();
-    while !needed.is_empty() {
-        // Pick the candidate covering the most still-needed pairs. Ties break
-        // on the first candidate, which keeps the output deterministic.
-        let best = full
-            .iter()
-            .max_by_key(|combo| pairs_of(combo).intersection(&needed).count())
-            .cloned();
-        let Some(best) = best else { break };
-        let covered = pairs_of(&best);
-        if covered.intersection(&needed).count() == 0 {
-            break;
+    while let Some((an, av, bn, bv)) = needed.iter().next().cloned() {
+        let mut combo: BTreeMap<String, Value> = BTreeMap::new();
+        combo.insert(an.clone(), value(&an, &av).unwrap_or(Value::Null));
+        combo.insert(bn.clone(), value(&bn, &bv).unwrap_or(Value::Null));
+        for (name, values) in axes {
+            if combo.contains_key(*name) || values.is_empty() {
+                continue;
+            }
+            let gain = |v: &Value| {
+                combo
+                    .iter()
+                    .filter(|(n, x)| needed.contains(&pair(n, x, name, v)))
+                    .count()
+            };
+            let mut best = &values[0];
+            let mut best_gain = gain(best);
+            for v in values.iter().skip(1) {
+                let g = gain(v);
+                if g > best_gain {
+                    best = v;
+                    best_gain = g;
+                }
+            }
+            combo.insert((*name).clone(), best.clone());
         }
-        for p in covered {
+        for p in pairs_of(&combo) {
             needed.remove(&p);
         }
-        chosen.push(best);
+        chosen.push(combo);
     }
     chosen
 }
@@ -446,6 +489,29 @@ mod tests {
         cb.exclude = vec![[("snik".to_string(), json!("jsonl"))].into_iter().collect()];
         let err = generate(&suite_of(cb), &ParamsSpec::new()).expect_err("typo");
         assert!(err.to_string().contains("never match"), "{err}");
+    }
+
+    /// Ten params of six values: the product is 60 million maps. All-pairs
+    /// is built without it, and the plain product is refused before it is
+    /// allocated (#789 CLI-105).
+    #[test]
+    fn a_huge_space_is_paired_or_refused_without_building_the_product() {
+        let axes: Vec<(String, Vec<Value>)> = (0..10)
+            .map(|i| (format!("p{i}"), (0..6).map(|v| json!(v)).collect()))
+            .collect();
+        let refs: Vec<(&str, Vec<Value>)> =
+            axes.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
+        let paired = generate(&suite_of(combine(&refs, true)), &ParamsSpec::new()).unwrap();
+        assert!(paired.len() <= MAX_CASES, "{}", paired.len());
+        let mut covered = BTreeSet::new();
+        for c in &paired {
+            covered.extend(pairs_of(&c.params));
+        }
+        assert_eq!(covered.len(), 45 * 36, "every pair of every two params");
+        let err = generate(&suite_of(combine(&refs, false)), &ParamsSpec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("60466176 combinations"), "{err}");
     }
 
     #[test]

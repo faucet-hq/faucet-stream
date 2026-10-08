@@ -153,7 +153,12 @@ a zero — `MAX(id)` over an empty table returns `NULL`, and treating that as 0
 would plan one degenerate chunk and read nothing.
 
 `faucet validate` is offline, so it reports that a row discovers its bound at run
-time rather than pretending to have planned the chunks.
+time rather than pretending to have planned the chunks (the rest of the config is
+checked against a one-chunk placeholder; `explain`, `policy`, `test` and template
+registration plan the same way). Every command that runs or inspects the real
+rows — `run`, `schedule` (each tick), `serve`, `preview`, `doctor`, `plan`,
+`backfill`, `verify`, `rollback`, `dlq replay`, `profiling` — runs the probe
+first, so they all plan the chunks `faucet run` would.
 
 ## What partitioning does not change
 

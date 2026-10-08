@@ -561,6 +561,11 @@ pub enum CliError {
     #[error("pipeline status: {health}")]
     StatusUnhealthy { code: u8, health: String },
 
+    /// A one-shot run was stopped by a signal (or the TUI's `q`) before it
+    /// finished; it flushed what it had written. Exit code 130.
+    #[error("run cancelled before it finished")]
+    Cancelled,
+
     /// A `faucet serve` startup or runtime failure (bind, auth gate, etc.).
     #[error("serve error: {0}")]
     Serve(String),

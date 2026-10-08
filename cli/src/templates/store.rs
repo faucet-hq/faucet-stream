@@ -277,7 +277,7 @@ pub async fn preview_register(
         .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
         .map(|r| r.version);
     let rows = match &prelude.pipeline {
-        Some(cfg) => crate::expand::expand(cfg)?
+        Some(cfg) => crate::expand::expand(&crate::partition::offline(cfg))?
             .iter()
             .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
             .map(crate::commands::plan::build_plan_report)
@@ -302,26 +302,42 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
         ..
     } = register_prelude(store, &req).await?;
 
-    // A description describes the *template*, not the build, so carry the previous
-    // version's forward when the caller omits one. Without this, a deploy that
-    // re-registers without `--description` blanks the listing for everybody.
-    let description = match &req.description {
-        Some(d) => Some(d.clone()),
-        None => store
+    // `--launch` goes through the same guard `launch` enforces: a retired
+    // template's `stable` must not advance behind its back.
+    if req.launch
+        && store
+            .template_deprecation(id.as_str())
+            .await
+            .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
+            .is_some()
+    {
+        return Err(CliError::Config(format!(
+            "template '{id}' is deprecated, so a new version cannot be launched — un-deprecate \
+             it first with `faucet template deprecate {id} --undo`, or register without \
+             `--launch`"
+        )));
+    }
+
+    // A hub template carries its own `description:` — the document is the
+    // source of truth, so an edit to it shows on re-register (and sync). For a
+    // pipeline, a description describes the *template*, not the build, so carry
+    // the previous version's forward when the caller omits one; without this, a
+    // deploy that re-registers without `--description` blanks the listing.
+    let own = match kind {
+        TemplateKind::SourceTemplate | TemplateKind::SinkTemplate | TemplateKind::Deployment => doc
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        TemplateKind::Pipeline => None,
+    };
+    let description = match (own, &req.description) {
+        (Some(d), _) => Some(d),
+        (None, Some(d)) => Some(d.clone()),
+        (None, None) => store
             .template_get(id.as_str(), None)
             .await
             .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
-            .and_then(|prev| prev.description)
-            .or_else(|| match kind {
-                // Hub templates carry their own description.
-                TemplateKind::SourceTemplate
-                | TemplateKind::SinkTemplate
-                | TemplateKind::Deployment => doc
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                TemplateKind::Pipeline => None,
-            }),
+            .and_then(|prev| prev.description),
     };
 
     let draft = TemplateDraft {
@@ -388,7 +404,7 @@ pub(crate) fn validate_pipeline_body(doc: &Value) -> CliResult<crate::config::Pi
         // Compile each row's transform chain too — `expand` only checks an entry's
         // shape, so without this a template with a misspelled transform field
         // registers cleanly and fails at trigger time instead.
-        for node in crate::expand::expand(&cfg)? {
+        for node in crate::expand::expand(&crate::partition::offline(&cfg))? {
             // Deserialize each connector's `config` into its typed struct
             // (#609). `expand` leaves it an opaque `Value`, so without this a
             // structurally wrong config — the wrong nesting under a flattened
@@ -803,12 +819,13 @@ pub async fn materialize(
         }
         TemplateKind::Deployment => return Err(not_runnable_deployment(id)),
     }
-    let doc = parse_body(&record.body, record.format)?;
+    let mut doc = parse_body(&record.body, record.format)?;
+    let name = default_name(&mut doc, &record.id);
     let (body, bound) = bind_document_for_run(doc, supplied, env_overrides, mode)?;
     Ok(MaterializedConfig {
         template_id: record.id.clone(),
         version: record.version,
-        name: record.name.clone(),
+        name: Some(name),
         body,
         params_redacted: bound.redacted(),
         used_secret_params: bound.has_supplied_secrets(),
@@ -1055,6 +1072,7 @@ async fn materialize_pair_selected(
                 "stored sink-template '{sink_id}' v{sink_version}: {e}"
             ))
         })?;
+    let all_streams: Vec<String> = source.streams.iter().map(|s| s.name.clone()).collect();
     let (source, effective) = match selection {
         Some(sel) => {
             let (narrowed, effective) = crate::hub::rows::narrow_source_template(&source, sel)?;
@@ -1066,7 +1084,7 @@ async fn materialize_pair_selected(
     let (mut overlay_id, mut overlay_version) = (None, None);
     if let Some(choice) = overlay {
         let (t, oid, over) = resolve_overlay(store, choice).await?;
-        composition = composition.apply_overlay(&t)?;
+        composition = composition.apply_overlay_within(&t, &all_streams)?;
         overlay_id = Some(oid);
         overlay_version = over;
     }
@@ -1105,6 +1123,20 @@ async fn fetch_version(store: &TemplateStore, id: &str, version: u32) -> CliResu
 /// The shared tail of materialization: (Local only) resolve load-time
 /// directives with the env overlay, bind `${param.*}` strictly, drop the
 /// `params:` block, and re-serialize as JSON.
+/// A pipeline template without `name:` runs as its template id: the name is
+/// the state-key namespace, and the run paths' own fallbacks (`pipeline` for
+/// the CLI, `serve` for a server) would make every unnamed template share
+/// bookmarks, and one template key differently on each path.
+fn default_name(doc: &mut Value, id: &str) -> String {
+    if let Some(name) = doc.get("name").and_then(Value::as_str) {
+        return name.to_string();
+    }
+    if let Some(map) = doc.as_object_mut() {
+        map.insert("name".into(), Value::String(id.to_string()));
+    }
+    id.to_string()
+}
+
 fn bind_document_for_run(
     mut doc: Value,
     supplied: &SuppliedParams,
@@ -1582,6 +1614,21 @@ pipeline:
             .unwrap_err()
             .to_string();
         assert!(err.contains("deprecated"), "{err}");
+        // So is `register --launch`, which would otherwise move `stable`.
+        let err = register(&s, req_launched(PARAMETERIZED))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("register without"), "{err}");
+        assert_eq!(
+            template_state(&s, "tenant-sync").await.unwrap().stable,
+            Some(1)
+        );
+        assert_eq!(
+            template_state(&s, "tenant-sync").await.unwrap().versions,
+            vec![1],
+            "a refused launch registers nothing"
+        );
 
         // `--undo` restores the prior status, derived rather than remembered.
         let status = set_deprecated(&s, "tenant-sync", None, None, false)
@@ -1689,6 +1736,28 @@ pipeline:
         assert_eq!(out.params_redacted["tenant_id"], json!("acme"));
         assert_eq!(out.params_redacted["page"], json!(100));
         assert!(!out.used_secret_params);
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_template_runs_under_its_id() {
+        let s = store();
+        let body = "version: 1\npipeline:\n  source: { type: csv, config: { path: a.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n";
+        let mut r = req_launched(body);
+        r.id = Some("orders-sync".into());
+        register(&s, r).await.unwrap();
+        let out = materialize(
+            &s,
+            "orders-sync",
+            1,
+            &SuppliedParams::new(),
+            &BTreeMap::new(),
+            Materialize::Local,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.name.as_deref(), Some("orders-sync"));
+        let doc: Value = serde_json::from_str(&out.body).unwrap();
+        assert_eq!(doc["name"], "orders-sync");
     }
 
     #[tokio::test]
@@ -2149,16 +2218,20 @@ write_mode_aliases:
                 .map(|v| v.is_string()),
             Some(true)
         );
-        // The template's own description is used when the request carries none.
+        // A hub template's own description wins, so an edited one shows on
+        // re-register.
         let mut no_desc = req(&source_template(dir.path()));
         no_desc.description = None;
         let again = register(&s, no_desc).await.unwrap();
         assert_eq!(again.version, 2);
         assert_eq!(
             again.description.as_deref(),
-            Some("test"),
-            "previous description carries forward"
+            Some("Acme — orders and customers exports"),
         );
+        let edited = source_template(dir.path())
+            .replace("Acme — orders and customers exports", "Acme — orders only");
+        let third = register(&s, req(&edited)).await.unwrap();
+        assert_eq!(third.description.as_deref(), Some("Acme — orders only"));
 
         let mut fresh = req_launched(&sink_template(dir.path()));
         fresh.description = None;
@@ -2347,7 +2420,7 @@ write_mode_aliases:
         assert_eq!(m.template_id, "acme-exports");
         assert_eq!(m.sink_id.as_deref(), Some("local-jsonl"));
         assert_eq!(m.sink_version, Some(1));
-        assert_eq!(m.name.as_deref(), Some("acme-exports"));
+        assert_eq!(m.name.as_deref(), Some("acme-exports.local-jsonl"));
         let names: Vec<&str> = m.streams.iter().map(|p| p.stream.as_str()).collect();
         assert_eq!(names, ["orders", "customers"]);
         let body: Value = serde_json::from_str(&m.body).unwrap();

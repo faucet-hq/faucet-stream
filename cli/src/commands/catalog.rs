@@ -11,9 +11,7 @@ use crate::cli::{
 };
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
-use crate::serve::history::catalog::{
-    CatalogDataset, CatalogDatasetDetail, CatalogLineageEdge, CatalogListFilter,
-};
+use crate::serve::history::catalog::{CatalogDatasetDetail, CatalogLineageEdge, CatalogListFilter};
 
 /// Pretty-print any serializable value (JSON output mode).
 fn to_pretty<T: serde::Serialize>(value: &T) -> CliResult<String> {
@@ -99,6 +97,7 @@ async fn datasets(args: CatalogDatasetsArgs) -> CliResult<()> {
 async fn resolve_dataset(
     handle: &CatalogHandle,
     id: &str,
+    allow_prefix: bool,
 ) -> CliResult<Option<CatalogDatasetDetail>> {
     if let Some(detail) = handle
         .store
@@ -108,32 +107,42 @@ async fn resolve_dataset(
     {
         return Ok(Some(detail));
     }
-    // Prefix match over the (bounded) dataset list.
-    let page = handle
-        .store
-        .catalog_list_datasets(&CatalogListFilter {
-            limit: 1000,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| CliError::Internal(format!("catalog read: {e}")))?;
-    let matches: Vec<&CatalogDataset> = page
-        .datasets
-        .iter()
-        .filter(|d| d.id.starts_with(id))
-        .collect();
-    match matches.as_slice() {
-        [one] => {
-            let full = one.id.clone();
-            handle
-                .store
-                .catalog_get_dataset(&full)
-                .await
-                .map_err(|e| CliError::Internal(format!("catalog read: {e}")))
+    // Prefix match over every page of the dataset list.
+    let mut matches: Vec<String> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = handle
+            .store
+            .catalog_list_datasets(&CatalogListFilter {
+                limit: 1000,
+                cursor: cursor.take(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| CliError::Internal(format!("catalog read: {e}")))?;
+        matches.extend(
+            page.datasets
+                .iter()
+                .filter(|d| d.id.starts_with(id))
+                .map(|d| d.id.clone()),
+        );
+        match page.next_cursor {
+            Some(next) if matches.len() < 2 => cursor = Some(next),
+            _ => break,
         }
+    }
+    match matches.as_slice() {
         [] => Ok(None),
+        [one] if allow_prefix => handle
+            .store
+            .catalog_get_dataset(one)
+            .await
+            .map_err(|e| CliError::Internal(format!("catalog read: {e}"))),
+        [one] => Err(CliError::Config(format!(
+            "'{id}' is not a full dataset id — a write needs the exact id ({one}?)"
+        ))),
         many => Err(CliError::Config(format!(
-            "dataset id prefix '{id}' is ambiguous ({} matches) — use the full id",
+            "dataset id prefix '{id}' is ambiguous ({}+ matches) — use the full id",
             many.len()
         ))),
     }
@@ -141,12 +150,14 @@ async fn resolve_dataset(
 
 async fn show(args: CatalogShowArgs) -> CliResult<()> {
     let handle = connect(&args.common).await?;
-    let detail = resolve_dataset(&handle, &args.id).await?.ok_or_else(|| {
-        CliError::Config(format!(
-            "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
-            args.id
-        ))
-    })?;
+    let detail = resolve_dataset(&handle, &args.id, true)
+        .await?
+        .ok_or_else(|| {
+            CliError::Config(format!(
+                "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
+                args.id
+            ))
+        })?;
     if args.common.json {
         println!("{}", to_pretty(&detail)?);
         return Ok(());
@@ -329,12 +340,14 @@ pub(crate) fn parse_consumer_flag(raw: &str) -> CliResult<(String, Option<String
 async fn annotate(args: CatalogAnnotateArgs) -> CliResult<()> {
     use crate::serve::history::catalog::{CatalogAnnotation, CatalogConsumer};
     let handle = connect(&args.common).await?;
-    let detail = resolve_dataset(&handle, &args.id).await?.ok_or_else(|| {
-        CliError::Config(format!(
-            "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
-            args.id
-        ))
-    })?;
+    let detail = resolve_dataset(&handle, &args.id, false)
+        .await?
+        .ok_or_else(|| {
+            CliError::Config(format!(
+                "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
+                args.id
+            ))
+        })?;
     let id = detail.dataset.id.clone();
     let now = chrono::Utc::now();
     let mut consumers = Vec::new();
@@ -369,7 +382,7 @@ async fn annotate(args: CatalogAnnotateArgs) -> CliResult<()> {
         .catalog_annotate(&id, &annotation)
         .await
         .map_err(|e| CliError::Internal(format!("catalog write: {e}")))?;
-    let updated = resolve_dataset(&handle, &id)
+    let updated = resolve_dataset(&handle, &id, false)
         .await?
         .ok_or_else(|| CliError::Internal("dataset vanished while annotating".to_string()))?;
     if args.common.json {
@@ -440,6 +453,102 @@ fn render_edges(edges: &[CatalogLineageEdge]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prefix resolution pages through every dataset, so a prefix unique on
+    /// the first page but shared beyond it is ambiguous; a write never
+    /// resolves a prefix (#789 CLI-155).
+    #[tokio::test]
+    async fn prefix_resolution_sees_every_page_and_writes_need_full_ids() {
+        use crate::serve::history::RunHistory;
+        let store =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        let obs = |uri: String, role| DatasetObservation {
+            uri,
+            kind: "jsonl".into(),
+            role,
+            schema: None,
+            records: 1,
+        };
+        for i in 0..520 {
+            store
+                .catalog_record(&CatalogUpdate {
+                    run_id: format!("r{i}"),
+                    pipeline: "p".into(),
+                    row: format!("r{i}"),
+                    recorded_at: chrono::Utc::now(),
+                    sources: vec![obs(format!("file:///in{i}"), DatasetRole::Source)],
+                    sink: obs(format!("file:///out{i}"), DatasetRole::Sink),
+                    column_lineage: None,
+                })
+                .await
+                .unwrap();
+        }
+        let handle = CatalogHandle {
+            store: std::sync::Arc::new(store),
+            run_id: None,
+            sample_records: 0,
+            annotations: Vec::new(),
+            tenant: None,
+        };
+        let first = handle
+            .store
+            .catalog_list_datasets(&CatalogListFilter {
+                limit: 1000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let rest = handle
+            .store
+            .catalog_list_datasets(&CatalogListFilter {
+                limit: 1000,
+                cursor: first.next_cursor.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!rest.datasets.is_empty());
+        let prefix = (1..16)
+            .flat_map(|n| rest.datasets.iter().map(move |d| d.id[..n].to_string()))
+            .find(|p| {
+                first
+                    .datasets
+                    .iter()
+                    .filter(|d| d.id.starts_with(p.as_str()))
+                    .count()
+                    == 1
+            })
+            .expect("a prefix shared across the pages");
+        let err = resolve_dataset(&handle, &prefix, true).await.unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        let full = &first.datasets[0].id;
+        let unique = (4..full.len())
+            .map(|n| &full[..n])
+            .find(|p| {
+                first
+                    .datasets
+                    .iter()
+                    .chain(&rest.datasets)
+                    .filter(|d| d.id.starts_with(p))
+                    .count()
+                    == 1
+            })
+            .unwrap();
+        assert!(
+            resolve_dataset(&handle, unique, true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let err = resolve_dataset(&handle, unique, false).await.unwrap_err();
+        assert!(err.to_string().contains("not a full dataset id"), "{err}");
+        assert!(
+            resolve_dataset(&handle, full, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
     use crate::serve::history::catalog::{
         CatalogUpdate, DatasetObservation, DatasetRole, apply_edge,
     };

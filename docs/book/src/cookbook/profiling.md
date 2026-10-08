@@ -73,8 +73,11 @@ A column absent from the baseline (new this run) is learned, not flagged —
 | `notify` | as `warn`, plus one `profile_drift` [notification](./notifications.md) per finding |
 | `fail` | as `notify`, and the run is reported **failed** — the data is already written (profiling runs after the write), so the failure marks the run for attention rather than undoing it |
 
-Whatever the policy, the run's profile joins the baseline, so a repeated
-drift fades once the new shape is the norm (after `min_history` runs). For a
+Under `warn` and `notify` the run's profile joins the baseline, so a repeated
+drift fades once the new shape is the norm (after `min_history` runs). Under
+`fail` a drifting run's profile is kept **out** of the baseline — otherwise
+retrying the same anomaly would widen the baseline until it passed — so the
+drift keeps failing until you accept it. For a
 *planned* change, re-baseline explicitly:
 
 ```bash

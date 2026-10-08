@@ -380,7 +380,7 @@ pub async fn show(
 
 /// Which live leases a state change must respect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeaseScope {
+pub(crate) enum LeaseScope {
     /// The changed bases, the child rows under them, and every invocation of
     /// the pipeline that is no matrix row's (mirror tables, backfill units).
     Bases,
@@ -439,7 +439,7 @@ fn lease_blocks(target: &PipelineTarget, bases: &[String], held: &str, scope: Le
 }
 
 /// Refuse when a live lease covers any of `bases` (unless `force`).
-async fn refuse_if_running(
+pub(crate) async fn refuse_if_running(
     store: &dyn StateStore,
     target: &PipelineTarget,
     bases: &[String],

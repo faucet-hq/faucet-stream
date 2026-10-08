@@ -53,6 +53,11 @@ pub struct RunMarker {
 pub struct RunIndex {
     #[serde(default)]
     pub runs: Vec<String>,
+    /// Runs pruned after a successful run whose journal rows the sink has not
+    /// dropped yet (pruning happens where no sink is at hand; the next run's
+    /// `prepare` drops them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forget: Vec<String>,
 }
 
 impl RunIndex {
@@ -67,6 +72,12 @@ impl RunIndex {
     pub fn push(&mut self, run_id: &str, retain: usize) -> Vec<String> {
         self.runs.retain(|r| r != run_id);
         self.runs.push(run_id.to_string());
+        self.prune(retain)
+    }
+
+    /// Drop the oldest entries beyond `retain` (at least one is kept).
+    /// Returns the dropped ids.
+    pub fn prune(&mut self, retain: usize) -> Vec<String> {
         let keep = retain.max(1);
         if self.runs.len() <= keep {
             return Vec::new();
@@ -104,6 +115,7 @@ mod tests {
     fn later_lists_the_newer_runs() {
         let idx = RunIndex {
             runs: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
         };
         assert_eq!(idx.later("a"), vec!["b".to_string(), "c".to_string()]);
         assert!(idx.later("c").is_empty());

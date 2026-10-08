@@ -227,6 +227,7 @@ fn the_state_report_renders_every_action() {
         pipeline: "p".into(),
         check: false,
         keys: keys.clone(),
+        warnings: vec![],
     };
     let text = render_state_report(&applied);
     assert!(text.contains("state migration"));
@@ -240,6 +241,7 @@ fn the_state_report_renders_every_action() {
         pipeline: "p".into(),
         check: true,
         keys,
+        warnings: vec![],
     };
     let text = render_state_report(&check);
     assert!(text.contains("state check"));
@@ -250,6 +252,7 @@ fn the_state_report_renders_every_action() {
         pipeline: "p".into(),
         check: false,
         keys: vec![],
+        warnings: vec![],
     };
     assert!(render_state_report(&empty).contains("no stored bookmarks"));
 }

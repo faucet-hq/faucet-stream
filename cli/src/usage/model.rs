@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 /// Object-store connector kinds whose round trips are priced per request.
 const OBJECT_STORE_KINDS: &[&str] = &["s3", "gcs", "azure-blob", "azure_blob"];
 /// Local connector kinds: bytes moved between two of these cross no cloud.
-const LOCAL_KINDS: &[&str] = &["csv", "jsonl", "parquet", "stdout", "sqlite", "duckdb"];
+const LOCAL_KINDS: &[&str] = &[
+    "csv", "file", "jsonl", "parquet", "stdout", "sqlite", "duckdb",
+];
 
 const GB: f64 = 1_000_000_000.0;
 const GIB: f64 = 1_073_741_824.0;
@@ -301,6 +303,29 @@ pub struct UsageReport {
     pub records: u64,
     pub rows: Vec<UsageRow>,
     pub total: UsageRow,
+    /// The record listing hit its limit, so older invocations in the window
+    /// are not counted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// Set when the records were priced in more than one currency: each row
+    /// key names its currency, `total` carries no cost, and these are the
+    /// per-currency totals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub currency_totals: Vec<CurrencyTotal>,
+}
+
+/// The cost of the records priced in one currency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CurrencyTotal {
+    pub currency: String,
+    pub cost: f64,
+    pub hosted_equivalent: f64,
+}
+
+/// `true` when a listing capped at `limit` returned `len` records, i.e. there
+/// may be more.
+pub fn listing_truncated(len: usize, limit: usize) -> bool {
+    limit > 0 && len >= limit
 }
 
 /// Group `records` by `by`, ordered by estimated cost (then records written)
@@ -308,6 +333,19 @@ pub struct UsageReport {
 pub fn aggregate(records: &[UsageRecord], by: GroupBy, currency: &str) -> UsageReport {
     let mut groups: BTreeMap<String, UsageRow> = BTreeMap::new();
     let mut total = empty_row("total");
+    let mut by_currency: BTreeMap<String, CurrencyTotal> = BTreeMap::new();
+    for r in records {
+        let c = by_currency
+            .entry(r.cost.currency.clone())
+            .or_insert_with(|| CurrencyTotal {
+                currency: r.cost.currency.clone(),
+                cost: 0.0,
+                hosted_equivalent: 0.0,
+            });
+        c.cost += r.cost.total;
+        c.hosted_equivalent += r.cost.hosted_equivalent;
+    }
+    let mixed = by_currency.len() > 1;
     for r in records {
         let key = match by {
             GroupBy::Pipeline => r.pipeline.clone(),
@@ -319,6 +357,11 @@ pub fn aggregate(records: &[UsageRecord], by: GroupBy, currency: &str) -> UsageR
             GroupBy::Sink => r.sink_kind.clone(),
             GroupBy::Day => r.recorded_at.format("%Y-%m-%d").to_string(),
             GroupBy::Tenant => r.tenant.clone().unwrap_or_else(|| NO_TENANT.to_string()),
+        };
+        let key = if mixed {
+            format!("{key} [{}]", r.cost.currency)
+        } else {
+            key
         };
         let row = groups.entry(key.clone()).or_insert_with(|| empty_row(&key));
         fold(row, r);
@@ -332,14 +375,23 @@ pub fn aggregate(records: &[UsageRecord], by: GroupBy, currency: &str) -> UsageR
             .then_with(|| b.records_written.cmp(&a.records_written))
             .then_with(|| a.key.cmp(&b.key))
     });
+    let (currency, currency_totals) = if mixed {
+        total.cost = 0.0;
+        total.hosted_equivalent = 0.0;
+        ("mixed".to_string(), by_currency.into_values().collect())
+    } else {
+        (currency.to_string(), Vec::new())
+    };
     UsageReport {
         by,
         since: None,
         until: None,
-        currency: currency.to_string(),
+        currency,
         records: records.len() as u64,
         rows,
         total,
+        truncated: false,
+        currency_totals,
     }
 }
 
@@ -484,6 +536,59 @@ mod tests {
         let e = estimate(&snap(10, 10), "postgres", "snowflake", &p);
         assert_eq!(e.not_reported, vec!["postgres", "snowflake"]);
         assert_eq!(e.total, 0.0);
+    }
+
+    #[test]
+    fn local_file_moves_are_not_cloud() {
+        let p2 = PricingSpec {
+            egress_per_gb: 0.1,
+            ..Default::default()
+        };
+        let e = estimate(&snap(10, 3 * GB as u64), "file", "file", &p2);
+        assert!(e.lines.is_empty(), "{e:?}");
+        assert!(e.not_reported.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn mixed_currencies_are_never_summed() {
+        let c = |cur: &str, t: f64| CostEstimate {
+            currency: cur.into(),
+            total: t,
+            lines: vec![],
+            not_reported: vec![],
+            hosted_equivalent: 1.0,
+        };
+        let recs = vec![
+            record("a", "r1", "2026-09-01", c("USD", 1.0), false),
+            record("a", "r2", "2026-09-01", c("EUR", 2.0), false),
+            record("a", "r3", "2026-09-01", c("EUR", 3.0), false),
+        ];
+        let rep = aggregate(&recs, GroupBy::Pipeline, "USD");
+        assert_eq!(rep.currency, "mixed");
+        let keys: Vec<_> = rep.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["a [EUR]", "a [USD]"]);
+        assert_eq!(rep.total.cost, 0.0);
+        assert_eq!(
+            rep.currency_totals,
+            vec![
+                CurrencyTotal {
+                    currency: "EUR".into(),
+                    cost: 5.0,
+                    hosted_equivalent: 2.0
+                },
+                CurrencyTotal {
+                    currency: "USD".into(),
+                    cost: 1.0,
+                    hosted_equivalent: 1.0
+                },
+            ]
+        );
+        let single = aggregate(&recs[1..], GroupBy::Pipeline, "EUR");
+        assert!(single.currency_totals.is_empty());
+        assert_eq!(single.total.cost, 5.0);
+        assert!(listing_truncated(5000, 5000));
+        assert!(!listing_truncated(4999, 5000));
+        assert!(!listing_truncated(0, 0));
     }
 
     #[test]

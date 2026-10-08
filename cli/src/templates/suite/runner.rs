@@ -97,7 +97,9 @@ pub async fn run(
         if !name_matches(&b.name, filter) {
             continue;
         }
-        outcome.cases.push(run_behavioral_case(b, &target).await);
+        outcome
+            .cases
+            .push(run_behavioral_case(b, &target, file.base_dir.as_deref()).await);
     }
     Ok(outcome)
 }
@@ -322,7 +324,7 @@ async fn materialize_and_check(supplied: &SuppliedParams, target: &Target<'_>) -
     // Topology mode has no matrix to expand — its graph checks are the
     // equivalent gate, and skipping them would let a broken graph pass.
     if cfg.pipeline.nodes.is_empty() {
-        let nodes = crate::expand::expand(&cfg)?;
+        let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
         for n in &nodes {
             if !n.transforms.is_empty() {
                 crate::transforms::compile_transforms(&n.transforms).map_err(|e| {
@@ -337,9 +339,13 @@ async fn materialize_and_check(supplied: &SuppliedParams, target: &Target<'_>) -
 }
 
 /// Run one behavioural case through the fixture harness.
-async fn run_behavioral_case(b: &Behavioral, target: &Target<'_>) -> CaseOutcome {
+async fn run_behavioral_case(
+    b: &Behavioral,
+    target: &Target<'_>,
+    base_dir: Option<&std::path::Path>,
+) -> CaseOutcome {
     let supplied: SuppliedParams = b.params.clone().into_iter().collect();
-    let failure = match behavioral_inner(b, &supplied, target).await {
+    let failure = match behavioral_inner(b, &supplied, target, base_dir).await {
         Ok(None) => None,
         Ok(Some(msg)) => Some(msg),
         Err(e) => Some(e.to_string()),
@@ -357,22 +363,18 @@ async fn behavioral_inner(
     b: &Behavioral,
     supplied: &SuppliedParams,
     target: &Target<'_>,
+    base_dir: Option<&std::path::Path>,
 ) -> CliResult<Option<String>> {
     // Materialize first so the case tests the *combination*, not an unbound
     // template — which is the whole point of attaching fixtures to a param
     // set rather than to the template as a whole.
     let body = materialize_body(supplied, target).await?;
     let cfg = crate::config::PipelineConfig::from_text(&body, std::path::Path::new("suite.json"))?;
-    let nodes = crate::expand::expand(&cfg)?;
-    let node = nodes.first().ok_or_else(|| {
-        CliError::Config(format!(
-            "behavioral case '{}': the materialized config expands to no rows",
-            b.name
-        ))
-    })?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
+    let node = pick_row(&nodes, b)?;
 
     let input = crate::pipeline_test::fixtures::load_input(
-        std::path::Path::new("."),
+        base_dir.unwrap_or(std::path::Path::new(".")),
         &parse_input(&b.input)?,
     )?;
     let expect: crate::pipeline_test::spec::Expectation = serde_json::from_value(b.expect.clone())
@@ -396,6 +398,43 @@ async fn behavioral_inner(
     let run = crate::pipeline_test::runner::run_case(&resolved).await?;
     let failures = crate::pipeline_test::diff::evaluate(&expect, &run);
     Ok(failures.first().cloned())
+}
+
+/// The row a behavioural case runs: the one it names, or the only root row.
+fn pick_row<'a>(
+    nodes: &'a [crate::expand::ExpandedNode],
+    b: &Behavioral,
+) -> CliResult<&'a crate::expand::ExpandedNode> {
+    if let Some(row) = &b.row {
+        return nodes.iter().find(|n| &n.id == row).ok_or_else(|| {
+            let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+            CliError::Config(format!(
+                "behavioral case '{}': no row '{row}' (rows: {})",
+                b.name,
+                ids.join(", ")
+            ))
+        });
+    }
+    let roots: Vec<&crate::expand::ExpandedNode> = nodes
+        .iter()
+        .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
+        .collect();
+    match roots.as_slice() {
+        [one] => Ok(one),
+        [] => Err(CliError::Config(format!(
+            "behavioral case '{}': the materialized config expands to no rows",
+            b.name
+        ))),
+        many => Err(CliError::Config(format!(
+            "behavioral case '{}': the config has {} rows ({}) — name one with `row:`",
+            b.name,
+            many.len(),
+            many.iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 /// Materialize the template body for one param combination.
@@ -713,6 +752,69 @@ suite:
         assert!(out.cases[0].passed, "{:?}", out.cases[0].failure);
         assert_eq!(out.cases[0].origin, "behavioral");
         assert!(!out.cases[1].passed, "a wrong expectation must fail");
+    }
+
+    /// A config with several rows needs `row:`; the named row's transforms
+    /// are what runs (#789 CLI-69), and a fixture path resolves against the
+    /// suite file's directory (#789 CLI-120).
+    #[tokio::test]
+    async fn a_behavioural_case_runs_the_row_it_names_with_suite_relative_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.jsonl"), "{\"id\": \"1\", \"x\": 1}\n").unwrap();
+        let body = r#"
+version: 1
+name: multi
+pipeline:
+  source: { type: csv, config: { path: in.csv } }
+  sink: { type: jsonl, config: { path: out.jsonl } }
+matrix:
+  - id: first
+    sink: { config: { path: first.jsonl } }
+    transforms: [{ type: drop, config: { fields: [x] } }]
+  - id: second
+    sink: { config: { path: second.jsonl } }
+"#
+        .to_string();
+        let target = || Target::Document {
+            body: body.clone(),
+            sink_body: None,
+            overlay: None,
+        };
+        let suite_path = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite_path,
+            r#"
+version: 1
+template: t
+suite:
+  behavioral:
+    - name: unnamed
+      input: in.jsonl
+      expect: { records_written: 1 }
+    - name: keeps-x
+      row: second
+      input: in.jsonl
+      expect: { records: [{ "id": "1", "x": 1 }] }
+    - name: drops-x
+      row: first
+      input: in.jsonl
+      expect: { records: [{ "id": "1" }] }
+    - name: no-such-row
+      row: third
+      input: in.jsonl
+      expect: { records_written: 1 }
+"#,
+        )
+        .unwrap();
+        let file = SuiteFile::from_path(&suite_path).unwrap();
+        let out = run(&file, target(), None).await.expect("runs");
+        let by = |n: &str| out.cases.iter().find(|c| c.name == n).unwrap();
+        let unnamed = by("unnamed").failure.clone().unwrap_or_default();
+        assert!(unnamed.contains("name one with `row:`"), "{unnamed}");
+        assert!(by("keeps-x").passed, "{:?}", by("keeps-x").failure);
+        assert!(by("drops-x").passed, "{:?}", by("drops-x").failure);
+        let missing = by("no-such-row").failure.clone().unwrap_or_default();
+        assert!(missing.contains("no row 'third'"), "{missing}");
     }
 
     #[tokio::test]

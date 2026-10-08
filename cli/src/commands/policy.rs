@@ -26,7 +26,7 @@ pub async fn run(args: PolicyArgs) -> CliResult<()> {
                 .to_string(),
         )
     })?;
-    let nodes = crate::expand::expand(&cfg)?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
     let nodes: Vec<_> = match &args.row {
         Some(r) => {
             let selected: Vec<_> = nodes.into_iter().filter(|n| &n.id == r).collect();

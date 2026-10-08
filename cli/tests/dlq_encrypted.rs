@@ -207,10 +207,14 @@ async fn discard_filters_sealed_envelopes_and_preserves_lines_verbatim() {
         dlq_replay::discard(dlq.to_str().unwrap(), Some("quality"), None, false, &dec).unwrap();
     assert_eq!(outcome.discarded, 1);
 
-    // The surviving line is byte-identical (still sealed) and the archive
+    // The live file is never rewritten (#789 CLI-48): it is byte-identical
+    // (still sealed), the reader sees only the kept line, and the archive
     // holds the removed sealed line — nothing was re-encrypted or exposed.
     let after = std::fs::read_to_string(&dlq).unwrap();
-    assert_eq!(after.trim(), kept_line);
+    assert_eq!(after, before);
+    let scan = dlq_replay::reader::scan_files(std::slice::from_ref(&dlq), &dec).unwrap();
+    assert_eq!(scan.envelopes.len(), 1);
+    assert!(before.lines().nth(1) == Some(kept_line.as_str()));
     let archive = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
     assert!(archive.contains(before.lines().next().unwrap()));
     assert!(!archive.contains("\"id\":1"), "archive stays sealed");

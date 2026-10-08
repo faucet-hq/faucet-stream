@@ -21,9 +21,10 @@ use serde_json::{Value, json};
 /// If a source template declares a discovery block with `fan_out: true`, discover
 /// its datasets and replace `cfg.matrix` with one row per dataset. No-op otherwise.
 pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog) -> CliResult<()> {
-    let Some((src_ref, spec)) = find_fanout_source(cfg) else {
+    let Some((src_ref, spec)) = find_fanout_source(cfg)? else {
         return Ok(());
     };
+    refuse_matrix(cfg, &src_ref)?;
     let source = crate::registry::build_source(&spec.kind, spec.config.clone(), auth, None)
         .await
         .map_err(|e| {
@@ -36,7 +37,7 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
             spec.kind
         )));
     }
-    let descriptors = source
+    let mut descriptors = source
         .discover()
         .await
         .map_err(|e| CliError::Config(format!("dynamic fan-out: discovery failed: {e}")))?;
@@ -46,6 +47,7 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
                 .into(),
         ));
     }
+    descriptors.sort_by(|a, b| a.name.cmp(&b.name));
     let sink_ref = fanout_block(&spec)
         .and_then(|b| b.get("emit"))
         .and_then(|e| e.get("sink_ref"))
@@ -58,6 +60,27 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
         "dynamic fan-out: generated matrix from live discovery"
     );
     Ok(())
+}
+
+/// Whether the config generates its matrix by run-time discovery (refusing
+/// an ambiguous or matrix-carrying one).
+pub fn has_fanout_source(cfg: &PipelineConfig) -> CliResult<bool> {
+    let found = find_fanout_source(cfg)?;
+    if let Some((src_ref, _)) = &found {
+        refuse_matrix(cfg, src_ref)?;
+    }
+    Ok(found.is_some())
+}
+
+fn refuse_matrix(cfg: &PipelineConfig, src_ref: &str) -> CliResult<()> {
+    if cfg.matrix.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Config(format!(
+        "dynamic fan-out: source '{src_ref}' sets `fan_out: true` but the config also has a \
+         `matrix:` ({} rows) the discovered rows would replace — remove one of them",
+        cfg.matrix.len()
+    )))
 }
 
 /// The block driving fan-out: **any** top-level connector-config block carrying
@@ -81,19 +104,31 @@ fn fanout_block(spec: &ConnectorSpec) -> Option<&Value> {
 /// Find a source template (named `sources.*`, or the singular `source`
 /// registered as `default`) whose config opts into fan-out — any block with
 /// `fan_out: true`.
-fn find_fanout_source(cfg: &PipelineConfig) -> Option<(String, ConnectorSpec)> {
-    // Prefer a named template; fall back to the singular default source.
-    for (name, spec) in &cfg.pipeline.sources {
-        if fanout_block(spec).is_some() {
-            return Some((name.clone(), spec.clone()));
-        }
-    }
+fn find_fanout_source(cfg: &PipelineConfig) -> CliResult<Option<(String, ConnectorSpec)>> {
+    let mut found: Vec<(String, ConnectorSpec)> = cfg
+        .pipeline
+        .sources
+        .iter()
+        .filter(|(_, spec)| fanout_block(spec).is_some())
+        .map(|(name, spec)| (name.clone(), spec.clone()))
+        .collect();
     if let Some(spec) = &cfg.pipeline.source
         && fanout_block(spec).is_some()
     {
-        return Some(("default".to_string(), spec.clone()));
+        found.push(("default".to_string(), spec.clone()));
     }
-    None
+    match found.len() {
+        0 | 1 => Ok(found.pop()),
+        _ => {
+            let mut names: Vec<String> = found.into_iter().map(|(n, _)| n).collect();
+            names.sort();
+            Err(CliError::Config(format!(
+                "dynamic fan-out: several sources set `fan_out: true` ({}) — only one source can \
+                 drive the generated matrix",
+                names.join(", ")
+            )))
+        }
+    }
 }
 
 /// Turn discovery descriptors into matrix rows — the structured, in-memory twin
@@ -289,6 +324,43 @@ mod tests {
         resolve_dynamic_fanout(&mut cfg, &catalog()).await.unwrap();
         assert_eq!(cfg.matrix.len(), 2);
         assert!(cfg.matrix[0].source.as_ref().unwrap().r#ref.is_none());
+    }
+
+    /// Rows come out in name order whatever the listing order, a fan-out
+    /// config with a `matrix:` or two opting-in sources is refused (#789 CLI-30).
+    #[tokio::test]
+    async fn rows_are_name_ordered_and_ambiguous_configs_are_refused() {
+        let server = MockServer::start().await;
+        Mock::given(m("GET"))
+            .and(wpath("/objects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{ "name": "Lead" }, { "name": "Account" }]
+            })))
+            .mount(&server)
+            .await;
+        let mut cfg = cfg_with_source(recipe(&server.uri(), "/objects"), false);
+        assert!(has_fanout_source(&cfg).unwrap());
+        resolve_dynamic_fanout(&mut cfg, &catalog()).await.unwrap();
+        let ids: Vec<_> = cfg.matrix.iter().map(|r| r.id.clone().unwrap()).collect();
+        assert_eq!(ids, ["Account", "Lead"]);
+
+        let err = resolve_dynamic_fanout(&mut cfg, &catalog())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("also has a `matrix:`"), "{err}");
+        assert!(has_fanout_source(&cfg).is_err());
+
+        let mut two = cfg_with_source(recipe(&server.uri(), "/objects"), true);
+        two.pipeline.source = two.pipeline.sources.get("api").cloned();
+        let err = has_fanout_source(&two).unwrap_err().to_string();
+        assert!(
+            err.contains("several sources set `fan_out: true` (api, default)"),
+            "{err}"
+        );
+
+        let plain = cfg_with_source(json!({}), false);
+        assert!(!has_fanout_source(&plain).unwrap());
     }
 
     #[tokio::test]

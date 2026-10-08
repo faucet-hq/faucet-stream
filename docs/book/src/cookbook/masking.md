@@ -195,8 +195,11 @@ pipeline:
 ## Inspecting a policy (`faucet masking`)
 
 `faucet masking [config]` validates the `masking:` block and prints, per
-destination sink, which rules apply — the fast way to confirm your
-`applies_to` scoping is right. It is offline-safe (no secrets are fetched):
+destination, which rules apply — the fast way to confirm your `applies_to`
+scoping is right. Destinations are what the run actually writes: each sink
+template with the rows that use it and the connector kind after a row's
+`type:` override (or, in topology mode, each sink node), scoped exactly as the
+run scopes them. It is offline-safe (no secrets are fetched):
 
 ```console
 $ faucet masking cli/examples/csv_to_jsonl_with_masking.yaml

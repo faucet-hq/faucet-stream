@@ -130,7 +130,9 @@ mismatch is a result, not an error: the 200 body carries the differences.
 ## Limits
 
 - Range mode needs a **single integer key**; composite or text keys compare the
-  whole dataset (bounded by `max_rows_scanned`).
+  whole dataset (bounded by `max_rows_scanned`). The key's type is read from the
+  destination's schema, and a key whose ranges cannot be planned falls back to
+  the whole-dataset comparison too.
 - A source changing during the scan can be reported as differing; re-run, or
   verify against a snapshot query where the backend offers one.
 - Server-side digests compare only within one backend family; a Postgres →

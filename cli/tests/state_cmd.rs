@@ -752,3 +752,56 @@ async fn export_is_verbatim_and_owner_only() {
         assert_eq!(mode, 0o600);
     }
 }
+
+/// `migrate --state` refuses a pipeline a run holds until `--force`, and
+/// `--profile` migrates the deployed state store, not the base one
+/// (#789 CLI-34, CLI-161).
+#[tokio::test]
+async fn migrate_state_honours_the_run_lease_and_the_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let prod = dir.path().join("prod-state");
+    let profiles = format!(
+        "profiles:\n  prod:\n    pipeline:\n      state: {{ type: file, config: {{ path: {} }} }}\n",
+        s(&prod)
+    );
+    let cfg = write_config(dir.path(), &file_state(dir.path()), &profiles);
+    let cfgs = s(&cfg);
+    let store: Arc<dyn StateStore> = Arc::new(FileStateStore::new(dir.path().join("state")));
+    store.put("orders::a", &json!({"id": 2})).await.unwrap();
+    let lease = faucet_cli::pipeline_state::lease::acquire(Arc::clone(&store), "orders::a", "busy")
+        .await
+        .unwrap();
+    let err = run(&["migrate", "--state", &cfgs, "--no-env-file"])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CliError::StateBusy(_)), "{err}");
+    assert_eq!(
+        store.get("orders::a").await.unwrap(),
+        Some(json!({"id": 2}))
+    );
+    run(&["migrate", "--state", &cfgs, "--check"])
+        .await
+        .unwrap_err();
+    run(&["migrate", "--state", &cfgs, "--force", "--no-env-file"])
+        .await
+        .unwrap();
+    assert_ne!(
+        store.get("orders::a").await.unwrap(),
+        Some(json!({"id": 2}))
+    );
+    drop(lease);
+
+    let prod_store = FileStateStore::new(&prod);
+    prod_store
+        .put("orders::b", &json!({"id": 7}))
+        .await
+        .unwrap();
+    run(&["migrate", "--state", &cfgs, "--profile", "prod"])
+        .await
+        .unwrap();
+    assert_ne!(
+        prod_store.get("orders::b").await.unwrap(),
+        Some(json!({"id": 7})),
+        "the profile's store is the one migrated"
+    );
+}

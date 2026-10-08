@@ -79,18 +79,25 @@ fn collect_now_token_contexts(v: &Value, out: &mut Vec<TokenCtx>) {
             let mut search_from = 0;
             while let Some(rel) = s[search_from..].find("${now.") {
                 let start = search_from + rel;
-                let tail = &s[start..];
-                match tail.find('}') {
-                    Some(end_rel) => {
-                        let end = start + end_rel; // index of '}'
-                        let token = s[start..=end].to_string();
-                        let left = s[..start].chars().next_back();
-                        let right = s[end + 1..].chars().next();
-                        out.push(TokenCtx { token, left, right });
-                        search_from = end + 1;
+                // Adjacent tokens (`${now.year}${now.month}`) fold as one run:
+                // between them there is no literal character to anchor on.
+                let mut end = None;
+                let mut cursor = start;
+                while s[cursor..].starts_with("${now.") {
+                    match s[cursor..].find('}') {
+                        Some(end_rel) => {
+                            end = Some(cursor + end_rel);
+                            cursor += end_rel + 1;
+                        }
+                        None => break,
                     }
-                    None => break,
                 }
+                let Some(end) = end else { break };
+                let token = s[start..=end].to_string();
+                let left = s[..start].chars().next_back();
+                let right = s[end + 1..].chars().next();
+                out.push(TokenCtx { token, left, right });
+                search_from = end + 1;
             }
         }
         Value::Array(items) => items
@@ -126,6 +133,23 @@ mod tests {
 
     fn clock() -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339("2026-07-06T10:30:00Z").unwrap()
+    }
+
+    /// Adjacent tokens fold as one unit, so a compact dated path converges
+    /// on one dataset (#789 CLI-132).
+    #[test]
+    fn adjacent_tokens_fold_as_one_run() {
+        let raw = json!({"path": "./out/dt=${now.year}${now.month}${now.day}/x.jsonl"});
+        let uri = canonicalize_uri("file://./out/dt=20260706/x.jsonl", &raw, clock());
+        assert_eq!(
+            uri,
+            "file://./out/dt=${now.year}${now.month}${now.day}/x.jsonl"
+        );
+        let raw = json!({"path": "./out/${now.year}${now.month}"});
+        assert_eq!(
+            canonicalize_uri("file://./out/202607", &raw, clock()),
+            "file://./out/${now.year}${now.month}"
+        );
     }
 
     #[test]

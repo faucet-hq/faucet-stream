@@ -207,6 +207,10 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
             }
             // `status` printed its screen; 1 = degraded / unknown, 2 = failed.
             Err(CliError::StatusUnhealthy { code, .. }) => ExitCode::from(code),
+            Err(CliError::Cancelled) => {
+                eprintln!("faucet: cancelled — rows stopped at a page boundary and flushed");
+                ExitCode::from(130)
+            }
             Err(err) => {
                 commands::report(&err);
                 ExitCode::from(1)
@@ -432,7 +436,7 @@ pub async fn run_from_yaml_str_selected(
         )
         .await;
     }
-    let nodes = expand::expand(&cfg)?;
+    let nodes = expand::expand(&crate::partition::resolve_runtime(&cfg).await?)?;
     let nodes = match selection {
         Some(sel) => sel.apply(&cfg, nodes)?,
         None => nodes,

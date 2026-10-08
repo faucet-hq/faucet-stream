@@ -13,7 +13,7 @@
 //!
 //! **Scope:** `fmt` formats the *literal* file — it does not resolve
 //! `${env:…}` / `${file:…}` interpolation, apply `!include` / `extends`
-//! composition, or drop schema defaults. Use `faucet validate --show-composed`
+//! composition, or drop schema defaults; `!include` tags are kept as written. Use `faucet validate --show-composed`
 //! to see the composed result.
 //!
 //! **Comments are not preserved** — the config is parsed and re-serialized, the
@@ -41,8 +41,7 @@ pub async fn run(args: FmtArgs) -> CliResult<()> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| CliError::Config(format!("cannot read '{}': {e}", path.display())))?;
         let format = ConfigFormat::from_path(path)?;
-        let value = format.parse(&text, path)?;
-        let formatted = format.render(&canonicalize(value), path)?;
+        let formatted = format.format(&text, path)?;
 
         if args.check {
             if formatted != text {
@@ -61,8 +60,7 @@ pub async fn run(args: FmtArgs) -> CliResult<()> {
         if formatted == text {
             println!("{}: already formatted", path.display());
         } else {
-            std::fs::write(path, &formatted)
-                .map_err(|e| CliError::Config(format!("cannot write '{}': {e}", path.display())))?;
+            write_atomically(path, &formatted)?;
             println!("{}: formatted", path.display());
         }
     }
@@ -92,6 +90,22 @@ impl ConfigFormat {
                 "unsupported config extension for '{}' (expected .yaml/.yml/.json)",
                 path.display()
             ))),
+        }
+    }
+
+    /// Parse, canonicalize and re-render. YAML goes through `serde_yaml`'s
+    /// own value so tags (`!include path`) survive.
+    fn format(self, text: &str, path: &Path) -> CliResult<String> {
+        match self {
+            ConfigFormat::Yaml => {
+                let value: serde_yaml::Value = serde_yaml::from_str(text).map_err(|e| {
+                    CliError::Config(format!("cannot parse '{}': {e}", path.display()))
+                })?;
+                serde_yaml::to_string(&canonicalize_yaml(value)).map_err(|e| {
+                    CliError::Config(format!("cannot serialize '{}': {e}", path.display()))
+                })
+            }
+            ConfigFormat::Json => self.render(&canonicalize(self.parse(text, path)?), path),
         }
     }
 
@@ -188,7 +202,7 @@ fn key_rank(key: &str) -> usize {
 /// Rewrite `value` into canonical form: every object's keys are reordered by
 /// (canonical rank, then name), recursively. Pure and idempotent — running it on
 /// its own output is a no-op. Relies on `serde_json`'s `preserve_order` feature
-/// (enabled workspace-wide) so the rebuilt insertion order survives serialization.
+/// (enabled by this crate) so the rebuilt insertion order survives serialization.
 pub fn canonicalize(value: Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -200,6 +214,47 @@ pub fn canonicalize(value: Value) -> Value {
         Value::Array(items) => Value::Array(items.into_iter().map(canonicalize).collect()),
         scalar => scalar,
     }
+}
+
+/// [`canonicalize`] over a YAML document, keeping tags (`!include`) intact.
+fn canonicalize_yaml(value: serde_yaml::Value) -> serde_yaml::Value {
+    use serde_yaml::Value as Y;
+    match value {
+        Y::Mapping(map) => {
+            let mut entries: Vec<(Y, Y)> = map
+                .into_iter()
+                .map(|(k, v)| (k, canonicalize_yaml(v)))
+                .collect();
+            let name = |k: &Y| k.as_str().map(str::to_string).unwrap_or_default();
+            entries.sort_by(|(a, _), (b, _)| {
+                let (a, b) = (name(a), name(b));
+                key_rank(&a).cmp(&key_rank(&b)).then_with(|| a.cmp(&b))
+            });
+            Y::Mapping(entries.into_iter().collect())
+        }
+        Y::Sequence(items) => Y::Sequence(items.into_iter().map(canonicalize_yaml).collect()),
+        Y::Tagged(mut tagged) => {
+            tagged.value = canonicalize_yaml(tagged.value);
+            Y::Tagged(tagged)
+        }
+        scalar => scalar,
+    }
+}
+
+/// Replace `path` with `contents` atomically: a sibling temp file renamed
+/// over it, so an interrupted `fmt` never leaves a truncated config.
+fn write_atomically(path: &Path, contents: &str) -> CliResult<()> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let tmp = path.with_file_name(format!(".{name}.{}.fmt-tmp", std::process::id()));
+    std::fs::write(&tmp, contents)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            CliError::Config(format!("cannot write '{}': {e}", path.display()))
+        })
 }
 
 /// A minimal LCS-based unified-ish line diff, used only to show what `--check`
@@ -328,6 +383,40 @@ mod tests {
             .unwrap();
         assert_eq!(once, twice, "fmt must be idempotent at the byte level");
         assert!(once.starts_with("version: 1"), "{once}");
+    }
+
+    /// YAML keeps `!include` tags and orders keys the same in every build;
+    /// the write is atomic (#789 CLI-160).
+    #[test]
+    fn yaml_keeps_include_tags_and_orders_keys_in_any_build() {
+        let p = Path::new("f.yaml");
+        let text = "pipeline:\n  sink: !include sink.yaml\n  source: {type: csv}\nversion: 1\n";
+        let once = ConfigFormat::Yaml.format(text, p).unwrap();
+        assert!(once.contains("!include sink.yaml"), "{once}");
+        assert!(once.starts_with("version: 1"), "{once}");
+        assert!(
+            once.find("source").unwrap() < once.find("sink").unwrap(),
+            "{once}"
+        );
+        assert_eq!(ConfigFormat::Yaml.format(&once, p).unwrap(), once);
+        let json = ConfigFormat::Json
+            .format("{\"pipeline\": {}, \"version\": 1}", Path::new("f.json"))
+            .unwrap();
+        assert!(
+            json.find("version").unwrap() < json.find("pipeline").unwrap(),
+            "{json}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(&path, "old").unwrap();
+        write_atomically(&path, "new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temp left"
+        );
     }
 
     #[test]

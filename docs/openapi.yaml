@@ -3243,6 +3243,20 @@ components:
           type: array
           items: { $ref: "#/components/schemas/UsageRow" }
         total: { $ref: "#/components/schemas/UsageRow" }
+        truncated: { type: boolean, description: "The record listing hit `limit`; older invocations in the window are not counted." }
+        currency_totals:
+          type: array
+          description: >
+            Present when the records were priced in more than one currency: each
+            row key ends in `[CUR]`, `currency` is `mixed`, `total` carries no cost,
+            and these are the per-currency totals.
+          items:
+            type: object
+            required: [currency, cost, hosted_equivalent]
+            properties:
+              currency: { type: string }
+              cost: { type: number }
+              hosted_equivalent: { type: number }
     LocalOutput:
       type: object
       description: >
@@ -4052,6 +4066,7 @@ components:
             tables: { type: integer }
             by_phase: { type: object, additionalProperties: { type: integer } }
             lagging: { type: integer }
+            resync_required: { type: integer, description: "Tables whose destination may hold rows the source deleted" }
         tables:
           type: array
           items:
@@ -4080,6 +4095,7 @@ components:
               last_error: { type: string, nullable: true }
               key: { type: array, items: { type: string } }
               write_mode: { type: string, nullable: true }
+              resync_required: { type: string, description: "Set when the table was re-snapshotted into a destination its sink cannot replace, so rows the source deleted may remain" }
     StatusReport:
       type: object
       description: "`faucet status` / `GET /v1/status` (#732)"

@@ -70,7 +70,7 @@ streams:
 
 | Field | Purpose |
 |---|---|
-| `name` | Short name (`^[a-z0-9][a-z0-9_-]*$`, equal to the file stem). With `owner`, the hub id is `owner/name`; the id is the composed pipeline's `name:` — so per-stream state keys are `{id}::{stream}` and bookmarks survive swapping the sink. |
+| `name` | Short name (`^[a-z0-9][a-z0-9_-]*$`, equal to the file stem). With `owner`, the hub id is `owner/name`; the composed pipeline's `name:` is `{id}.{sink id}` — so per-stream state keys are `{id}.{sink id}::{stream}` and each pairing keeps its own bookmarks (a deployment overlay's `state_scope: source` shares them across sinks). |
 | `owner` | Publisher namespace — the GitHub user or org login the file lives under (`source-templates/<owner>/`). `faucet-hq` for the hub's official templates. |
 | `params`, `auth` | Same grammar as a pipeline's `params:` / `auth:` blocks. Merged with the sink template's at compose time; a name declared by both with different specs is an error. |
 | `source` | The connector every stream reads through. Shared transforms go in the top-level `transforms`, not here. |
@@ -132,7 +132,11 @@ The composer records the substitution (`overwrite→append` in `faucet hub
 check`) and validates it against the connector registry: the target mode must
 be one the connector supports, an alias for a natively supported mode is
 refused as redundant, and keyed modes (`upsert`, `delete`) cannot be aliased —
-only a sink that dedups by key can honour them.
+only a sink that dedups by key can honour them. `overwrite: append` is refused
+for a built-in sink that, as configured, keeps what earlier runs wrote (an
+appending file, a queue, an object store with unique names, a warehouse): every
+overwrite stream would re-append the whole table on each run. A plugin sink is
+taken at its template's word.
 
 ### Child streams and truncating sinks
 
@@ -242,8 +246,14 @@ message saying so, so the shape of a run is always fixed by its two templates.
 `state` and `dlq` land under `pipeline.`, the rest at the top level, and an
 overlay's value replaces whatever the composition carried. Its `params:` merge
 with the templates' (a name declared on both sides must be declared
-identically). The run keeps the source's `name`, so its state keys are the
-same with or without an overlay, and across sink swaps.
+identically). The run keeps the pairing's `name` (`{source}.{sink}`), so its
+state keys are the same with or without an overlay. A new destination starts
+from an empty bookmark; to have a sink swap resume where the previous sink
+stopped, set `state_scope: source` on the overlay — the run is then named after
+the source alone, so never run two pairings of it at once. A `streams.<name>`
+entry must name a stream of the source template; on a run that selects only
+some streams (a row selection, or the streams a sink can run), entries for the
+streams left out are skipped.
 
 `faucet validate` and `faucet hub check --overlay` print what the overlay set
 (`pipeline.state, notifications, matrix.invoices.sla`, …). Two warnings are
@@ -377,7 +387,7 @@ Hand it credentials through its declared params (`--param`, `--param-env`),
 or review it and pass `--trust <owner>` (or `--trust <owner/name>`).
 
 The full id names the composed pipeline, so state keys are
-`acme/erp::invoices` and two publishers' templates never collide in a
+`acme/erp.faucet-hq/bigquery::invoices` and two publishers' templates never collide in a
 shared state store or registry (`/` is a legal state-key character; the file
 store encodes it). In `per_stream` addressing `${source}` stays the short
 name — a table cannot contain `/` — and `${owner}` is available for paths
@@ -551,7 +561,12 @@ repository's catalog test runs it plus a full composition of every pairing:
 
 - credentials are `${param.NAME}` (`secret: true`) or `${env:…}` /
   `${secret:…}` — never a literal value; a param whose name looks like a
-  credential must be marked `secret`, and a secret param has no default;
+  credential must be marked `secret`, and a secret param has no default. The
+  check covers every block of the template (named `sources:`, per-stream
+  overrides, headers), any key spelling (`api_token`, `apiToken`,
+  `X-Api-Key`, `Authorization`), numbers as well as strings, a value written
+  as `Bearer …` / `Basic …` / `Token …`, and a password embedded in a URL
+  (`postgres://user:pw@host`);
 - no private infrastructure or placeholder text (`.internal`, managed-DB
   hostnames, `REPLACE_ME`);
 - a `description`; `name` equal to the file stem; unique stream names; every

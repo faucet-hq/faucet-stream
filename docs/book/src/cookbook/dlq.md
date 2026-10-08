@@ -225,15 +225,21 @@ envelopes; `--row` picks a specific root when the config has several.
 ## Discarding
 
 Once envelopes are handled (replayed, or known-bad), `faucet dlq discard` clears
-them so the DLQ doesn't grow unbounded:
+them from the backlog:
 
 ```console
 $ faucet dlq discard ./dlq/contract_breaches.jsonl --reason contract --before 7d
 DLQ discard: archived 42 envelope(s) across 1 file(s) → ./dlq/contract_breaches.jsonl.archived
 ```
 
-By default discarded envelopes are moved to a `<file>.archived` sibling;
-`--delete` removes them outright. Archives are not `.jsonl` files, and a
+The DLQ file itself is never rewritten — a running pipeline may be appending to
+it, and a rewrite would lose what it appends meanwhile. Instead each discarded
+envelope is recorded in a `<file>.discarded` sidecar, and `inspect`, `replay`,
+`discard` and `faucet status` skip the lines it lists. By default discarded
+envelopes are also copied to a `<file>.archived` sibling; `--delete` only
+records them. The file keeps its size, so write the DLQ to a dated path
+(`./dlq/${now.date}.jsonl`) and remove old days to reclaim space. Archives and
+sidecars are not `.jsonl` files, and a
 directory or glob location skips them (including the `<stem>.archived.jsonl`
 archives older versions wrote), so a later `inspect` or `replay` of the
 directory never brings discarded envelopes back. Name an archive file

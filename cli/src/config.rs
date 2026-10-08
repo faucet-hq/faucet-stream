@@ -1572,6 +1572,14 @@ impl PipelineConfig {
         Self::finish(cfg, synthetic)
     }
 
+    /// The load tail for a config built in memory (`--from-env`): the same
+    /// post-parse pass a file load runs, then the secrets-manager directives.
+    pub(crate) async fn finish_built(cfg: PipelineConfig, origin: &Path) -> CliResult<Self> {
+        let mut cfg = Self::finish(cfg, origin)?;
+        crate::secrets::resolve_secrets(&mut cfg).await?;
+        Ok(cfg)
+    }
+
     /// Shared post-parse tail: version gate + structural `${...}` ref resolution.
     fn finish(mut cfg: PipelineConfig, path: &Path) -> CliResult<Self> {
         if cfg.version != 1 {
