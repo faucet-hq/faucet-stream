@@ -74,3 +74,29 @@ pub use sweep::{SweepOptions, select};
 /// Seven days matches `--retain-terminal-runs-secs`, so a run record and the
 /// files it produced age out on the same clock by default.
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
+
+/// This machine's host name, stamped on every ledger row so a sweeper never
+/// deletes a path another host wrote (#789 CLI-45). `None` when the platform
+/// cannot say.
+pub fn local_host() -> Option<String> {
+    static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOST.get_or_init(read_host).clone()
+}
+
+#[cfg(unix)]
+fn read_host() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `buf.len()` bytes into a buffer we own.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(not(unix))]
+fn read_host() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().filter(|h| !h.is_empty())
+}

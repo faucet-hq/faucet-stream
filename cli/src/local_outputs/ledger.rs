@@ -82,6 +82,10 @@ pub struct LocalOutputRecord {
     /// Size of the file the last time it was deleted, for the sweep report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_bytes: Option<u64>,
+    /// The host that last wrote the file. A sweeper on another host leaves it
+    /// alone: the same path there is a different file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 impl LocalOutputRecord {
@@ -103,6 +107,7 @@ impl LocalOutputRecord {
             last_written_at: obs.observed_at,
             deleted_at: None,
             deleted_bytes: None,
+            host: super::local_host(),
         }
     }
 
@@ -116,6 +121,16 @@ impl LocalOutputRecord {
     /// **un-expires** the row: the file exists again, so the console must stop
     /// showing it as expired.
     pub fn observe(&mut self, obs: &LocalOutputObservation) {
+        // The GC deleted the file this row described, so whatever is at the
+        // path now is a new file: classify it afresh, or a user file put there
+        // after the GC would inherit "faucet-created" and be collectable
+        // (#789 CLI-171).
+        if self.deleted_at.is_some() {
+            self.pre_existing = obs.pre_existing;
+            self.replaced = obs.pre_existing && obs.replaced;
+            self.first_written_at = obs.observed_at;
+        }
+        self.host = super::local_host();
         self.dataset_uri = obs.dataset_uri.clone();
         self.dataset_id = obs.dataset_id.clone();
         self.kind = obs.kind.clone();
@@ -335,6 +350,11 @@ pub enum SkipReason {
     InFlight,
     /// `remove_file` failed (permissions, a read-only mount).
     DeleteFailed,
+    /// The recorded path is relative, so it would resolve against the
+    /// sweeper's working directory rather than the writer's.
+    RelativePath,
+    /// Another host wrote the file; only a sweeper on that host may delete it.
+    OtherHost,
 }
 
 impl SkipReason {
@@ -345,6 +365,8 @@ impl SkipReason {
             Self::NotOnDisk => "not_on_disk",
             Self::InFlight => "in_flight",
             Self::DeleteFailed => "delete_failed",
+            Self::RelativePath => "relative_path",
+            Self::OtherHost => "other_host",
         }
     }
 
@@ -470,6 +492,19 @@ mod tests {
         rec.observe(&second);
         assert!(!rec.pre_existing);
         assert_eq!(rec.state(), LocalOutputState::Present);
+    }
+
+    #[test]
+    fn observe_after_a_gc_reclassifies_the_new_file() {
+        let mut r = LocalOutputRecord::new(&obs("/tmp/a.jsonl", "2026-08-01T00:00:00Z"));
+        r.deleted_at = Some(ts("2026-08-10T00:00:00Z"));
+        let mut user = obs("/tmp/a.jsonl", "2026-08-12T00:00:00Z");
+        user.pre_existing = true;
+        r.observe(&user);
+        assert!(r.pre_existing, "a user file at a GC'd path is not faucet's");
+        assert_eq!(r.first_written_at, ts("2026-08-12T00:00:00Z"));
+        assert_eq!(r.deleted_at, None);
+        assert_eq!(r.state(), LocalOutputState::External);
     }
 
     #[test]
