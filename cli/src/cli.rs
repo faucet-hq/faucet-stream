@@ -1371,6 +1371,11 @@ pub struct VerifyArgs {
     /// Report at most this many differences (the count keeps going).
     #[arg(long)]
     pub max_differences: Option<usize>,
+    /// The `${now.*}` clock the compared run used (RFC3339 like
+    /// `2026-01-31T00:00:00Z`, or a date `2026-01-31`), so a dated
+    /// destination from an earlier run can be verified. Default: now (UTC).
+    #[arg(long)]
+    pub clock: Option<String>,
     /// Emit the machine-readable report instead of the human summary.
     #[arg(long)]
     pub json: bool,

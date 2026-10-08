@@ -884,6 +884,7 @@ async fn verify_and_rollback_commands_over_a_config_file() {
         allow_delete: repair,
         dry_run: false,
         max_differences: Some(10),
+        clock: None,
         json,
         env_file: None,
         no_env_file: true,
@@ -1210,4 +1211,39 @@ async fn verify_falls_back_to_a_full_comparison_for_a_text_key() {
     .expect("a text key verifies");
     assert_eq!(out.strategy, "full");
     assert_eq!(out.report.tally(), (0, 0, 1, 0), "{out:?}");
+}
+
+/// `--clock` verifies a dated destination an earlier run wrote (#789 CLI-97).
+#[tokio::test]
+async fn verify_takes_the_run_clock_for_a_dated_destination() {
+    let d = fresh().await;
+    let yaml = config_yaml(&d.src, &d.dst, &d.state, "upsert", "")
+        .replace("table_name: dst", "table_name: dst_${now.year}\n      create_table: true");
+    let path = d._dir.path().join("dated.yaml");
+    std::fs::write(&path, &yaml).unwrap();
+    let cfg = load(&yaml);
+    let mut opts = opts("mirror", &cfg);
+    opts.clock = chrono::DateTime::parse_from_rfc3339("2020-06-01T00:00:00Z").unwrap();
+    let summary = run_expanded(expand(&cfg).unwrap(), opts).await.unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    let args = |clock: Option<&str>| faucet_cli::cli::VerifyArgs {
+        config: Some(path.clone()),
+        row: None,
+        repair: false,
+        allow_delete: false,
+        dry_run: false,
+        max_differences: None,
+        clock: clock.map(str::to_string),
+        json: false,
+        env_file: None,
+        no_env_file: true,
+        profile: None,
+    };
+    faucet_cli::commands::verify::run(args(Some("2020-06-01")))
+        .await
+        .expect("the 2020 table matches its source");
+    assert!(
+        faucet_cli::commands::verify::run(args(None)).await.is_err(),
+        "today's table was never written"
+    );
 }

@@ -724,10 +724,13 @@ faucet verify pipeline.yaml --row orders --max-differences 50
 | `--allow-delete` | With `--repair`, also delete rows only the destination has. |
 | `--dry-run` | With `--repair`, plan without writing. |
 | `--max-differences <n>` | Report at most this many differences (the count keeps going). |
+| `--clock <when>` | The `${now.*}` clock the compared run used (RFC 3339 or a date), so a dated destination from an earlier run can be verified. Default: now. |
 | `--json` | Emit the machine-readable report. |
 | `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
 
-Rows are matched on the sink's `key` or `verify.key`; a keyless table is
+A scan that stops early (`max_rows_scanned`, or the report truncated at
+`max_differences`) is not a pass: the command exits non-zero even when no
+difference was found yet. Rows are matched on the sink's `key` or `verify.key`; a keyless table is
 refused. The `verify:` block (see [config](./config.md#verify)) also runs the
 comparison after every successful run. Cookbook: [Content
 verification](../cookbook/verify.md).
