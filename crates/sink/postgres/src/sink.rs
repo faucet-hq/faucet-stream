@@ -130,6 +130,77 @@ pub(crate) fn qualified_table_ref(schema: Option<&str>, table: &str) -> String {
     }
 }
 
+/// First key of the two-key advisory lock that serializes faucet's bootstrap
+/// DDL ("FAUC"), so it never collides with a single-key lock an application
+/// takes on the same database.
+const BOOTSTRAP_LOCK_CLASS: i32 = 0x4641_5543;
+
+/// How many times a bootstrap is attempted when a concurrent creator outside
+/// faucet wins the race on the catalog.
+const BOOTSTRAP_ATTEMPTS: usize = 3;
+
+/// The advisory-lock key for bootstrap DDL in `schema` (`None` = the
+/// connection's default schema). Every faucet writer creating objects in one
+/// schema serializes on it, because concurrent `CREATE SCHEMA IF NOT EXISTS` /
+/// `CREATE TABLE IF NOT EXISTS` are not safe against each other: the loser
+/// fails on the catalog's unique index (#828).
+pub(crate) fn bootstrap_lock_key(schema: Option<&str>) -> String {
+    format!("faucet-ddl:{}", schema.unwrap_or(""))
+}
+
+/// Whether a SQLSTATE is the catalog-race outcome of two concurrent
+/// `IF NOT EXISTS` creates: `23505` on `pg_namespace` / `pg_type` /
+/// `pg_class`, or `42P06` / `42P07` / `42710` (duplicate schema / table /
+/// object) when the other side committed in between.
+pub(crate) fn is_concurrent_ddl_code(code: &str) -> bool {
+    matches!(code, "23505" | "42P06" | "42P07" | "42710")
+}
+
+fn is_concurrent_ddl(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db) => db.code().is_some_and(|c| is_concurrent_ddl_code(&c)),
+        _ => false,
+    }
+}
+
+/// Run idempotent bootstrap DDL (`IF NOT EXISTS` creates) on `conn`,
+/// serialized against every other faucet writer in the same schema by a
+/// transaction-scoped advisory lock (#828). When `conn` is already inside a
+/// transaction the work runs in a savepoint and the lock is held to the
+/// caller's commit. A catalog race lost to a creator outside faucet is retried:
+/// the object exists by then, so the `IF NOT EXISTS` statement is a no-op.
+pub(crate) async fn run_bootstrap_ddl(
+    conn: &mut sqlx::PgConnection,
+    lock_key: &str,
+    statements: &[String],
+) -> Result<(), sqlx::Error> {
+    use sqlx::Connection;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut tx = conn.begin().await?;
+        let result: Result<(), sqlx::Error> = async {
+            sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+                .bind(BOOTSTRAP_LOCK_CLASS)
+                .bind(lock_key)
+                .execute(&mut *tx)
+                .await?;
+            for sql in statements {
+                sqlx::query(sql).execute(&mut *tx).await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => return tx.commit().await,
+            Err(e) if attempt < BOOTSTRAP_ATTEMPTS && is_concurrent_ddl(&e) => {
+                tx.rollback().await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Run a write under `secs` (0 = unbounded): a server that stops answering
 /// fails the write instead of hanging the run forever (#789 SQL-109).
 pub(crate) async fn bounded<T>(
@@ -522,24 +593,35 @@ impl PostgresSink {
             (None, None) => return Ok(()),
         };
 
+        let mut statements = Vec::with_capacity(2);
         if let Some(schema) = self.config.schema.as_deref() {
-            sqlx::query(&format!(
+            statements.push(format!(
                 "CREATE SCHEMA IF NOT EXISTS {}",
                 quote_ident(schema)
-            ))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("postgres CREATE SCHEMA failed: {e}")))?;
+            ));
         }
         // An overwrite writes to staging. On a first run (no target) nothing
         // else creates staging, so it is created here from the page (#676).
         let create_ref =
             qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
-        let sql = build_create_table_sql(&create_ref, &columns, json_column, key);
-        sqlx::query(&sql)
-            .execute(&self.pool)
+        statements.push(build_create_table_sql(
+            &create_ref,
+            &columns,
+            json_column,
+            key,
+        ));
+        let mut conn = self
+            .pool
+            .acquire()
             .await
-            .map_err(|e| FaucetError::Sink(format!("postgres CREATE TABLE failed: {e}")))?;
+            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
+        run_bootstrap_ddl(
+            &mut conn,
+            &bootstrap_lock_key(self.config.schema.as_deref()),
+            &statements,
+        )
+        .await
+        .map_err(|e| FaucetError::Sink(format!("postgres CREATE SCHEMA/TABLE failed: {e}")))?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -1234,9 +1316,26 @@ impl PostgresSink {
             s = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
             k = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
         );
-        sqlx::query(&sql).execute(&self.pool).await.map_err(|e| {
-            FaucetError::Sink(format!("PostgreSQL commit-table create failed: {e}"))
-        })?;
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
+        // Called per page: probe first so the bootstrap lock is only taken
+        // while the table is missing.
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE))
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("PostgreSQL commit-table probe failed: {e}")))?;
+        if exists.is_some() {
+            return Ok(());
+        }
+        run_bootstrap_ddl(&mut conn, &bootstrap_lock_key(None), &[sql])
+            .await
+            .map_err(|e| {
+                FaucetError::Sink(format!("PostgreSQL commit-table create failed: {e}"))
+            })?;
         Ok(())
     }
 }
@@ -1893,7 +1992,9 @@ mod tests {
         on_conflict_clause, pg_bind_text, pg_udt_to_json_schema, qualified_table_ref,
         split_unmatched, widened_keyword,
     };
-    use super::{FaucetError, bounded};
+    use super::{
+        FaucetError, bootstrap_lock_key, bounded, is_concurrent_ddl, is_concurrent_ddl_code,
+    };
 
     #[tokio::test]
     async fn bounded_writes_time_out_and_pass_results_through() {
@@ -2117,6 +2218,24 @@ mod tests {
     // dataset_uri test is skipped: PostgresSink::new() requires a live pool
     // (connects to PostgreSQL in new()), and no offline constructor exists.
     // The URI format is covered by unit tests in faucet-core's redact tests.
+
+    #[test]
+    fn bootstrap_lock_key_is_per_schema() {
+        assert_eq!(bootstrap_lock_key(None), "faucet-ddl:");
+        assert_eq!(bootstrap_lock_key(Some("raw")), "faucet-ddl:raw");
+        assert_ne!(bootstrap_lock_key(Some("a")), bootstrap_lock_key(Some("b")));
+    }
+
+    #[test]
+    fn concurrent_ddl_codes_are_the_catalog_race_outcomes() {
+        for code in ["23505", "42P06", "42P07", "42710"] {
+            assert!(is_concurrent_ddl_code(code), "{code}");
+        }
+        for code in ["42601", "42501", "23502", "40001"] {
+            assert!(!is_concurrent_ddl_code(code), "{code}");
+        }
+        assert!(!is_concurrent_ddl(&sqlx::Error::PoolTimedOut));
+    }
 
     #[test]
     fn qualified_table_ref_unqualified_is_bare_quoted_table() {

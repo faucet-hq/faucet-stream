@@ -9,7 +9,9 @@
 //! changed by a later run and blocks the rollback unless `force` is set.
 
 use crate::config::PostgresColumnMapping;
-use crate::sink::{PostgresSink, pg_bind_text, qualified_table_ref};
+use crate::sink::{
+    PostgresSink, bootstrap_lock_key, pg_bind_text, qualified_table_ref, run_bootstrap_ddl,
+};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, key_json, plan_keys,
@@ -68,15 +70,29 @@ impl PostgresSink {
         )
     }
 
+    /// Create the journal when it is missing. The existence probe comes first
+    /// so the bootstrap lock — held to the caller's commit when `conn` is in a
+    /// transaction — is only ever taken by the first journaled write (#828).
     async fn ensure_journal(&self, conn: &mut sqlx::PgConnection) -> Result<(), FaucetError> {
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(self.journal_ref())
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| sink_err("probe journal", e))?;
+        if exists.is_some() {
+            return Ok(());
+        }
         let sql = journal_sql().create().replace(
             &quote_ident(faucet_core::rollback::RUN_JOURNAL_TABLE),
             &self.journal_ref(),
         );
-        sqlx::query(&sql)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| sink_err("create journal", e))?;
+        run_bootstrap_ddl(
+            &mut *conn,
+            &bootstrap_lock_key(self.config.schema.as_deref()),
+            &[sql],
+        )
+        .await
+        .map_err(|e| sink_err("create journal", e))?;
         Ok(())
     }
 
