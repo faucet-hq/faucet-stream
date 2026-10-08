@@ -539,3 +539,27 @@ async fn s3_destination_builds_without_credentials_for_endpoint_url() {
         result.err()
     );
 }
+
+/// #789 FILE-47: a field that is null in every sampled record is written as a
+/// nullable string column (no format can store a Null-typed one).
+#[tokio::test]
+async fn a_field_null_in_every_record_is_a_nullable_string_column() {
+    let tmp = TempDir::new().unwrap();
+    let sink = ParquetSink::new(cfg_dir(tmp.path())).await.unwrap();
+    sink.write_batch(&[
+        json!({"id": 1, "note": null}),
+        json!({"id": 2, "note": null}),
+    ])
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+
+    let batches = read_all_local(tmp.path()).await;
+    assert_eq!(rows_in(&batches), 2);
+    let schema = batches[0].schema();
+    let note = schema.field_with_name("note").unwrap();
+    assert_eq!(note.data_type(), &DataType::Utf8);
+    assert!(note.is_nullable());
+    let col = batches[0].column(schema.index_of("note").unwrap());
+    assert_eq!(col.null_count(), col.len());
+}
