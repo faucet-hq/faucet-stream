@@ -325,3 +325,75 @@ async fn a_soap_fault_is_detected_before_the_decode_pipeline() {
     let records = XmlStream::new(config).fetch_all().await.unwrap();
     assert!(records.is_empty());
 }
+
+/// #789 API-40: Excel date, datetime and duration cells — including one used
+/// as a header — arrive as ISO text through the HTTP decode path, not as their
+/// serial numbers.
+#[cfg(feature = "excel")]
+#[tokio::test]
+async fn decode_pipeline_renders_excel_dates_as_iso_text() {
+    use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+
+    let day = Format::new().set_num_format("yyyy-mm-dd");
+    let stamp = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
+    let span = Format::new().set_num_format("[h]:mm:ss");
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.write_string(0, 0, "day").unwrap();
+    ws.write_string(0, 1, "at").unwrap();
+    ws.write_string(0, 2, "took").unwrap();
+    ws.write_datetime_with_format(0, 3, ExcelDateTime::from_ymd(2024, 1, 31).unwrap(), &day)
+        .unwrap();
+    ws.write_datetime_with_format(1, 0, ExcelDateTime::from_ymd(2023, 3, 15).unwrap(), &day)
+        .unwrap();
+    ws.write_datetime_with_format(
+        1,
+        1,
+        ExcelDateTime::parse_from_str("2023-03-15 12:30:00").unwrap(),
+        &stamp,
+    )
+    .unwrap();
+    ws.write_number_with_format(1, 2, 1.5, &span).unwrap();
+    ws.write_number(1, 3, 7).unwrap();
+    let xlsx = wb.save_to_buffer().unwrap();
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(xlsx);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/report"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("<report><bytes>{b64}</bytes></report>")),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = XmlStreamConfig::new(server.uri(), "/report").decode(vec![
+        DecodeStep::Extract {
+            extract: "report.bytes".into(),
+        },
+        DecodeStep::Simple(SimpleStep::Base64),
+        DecodeStep::Parse {
+            parse: ParseSpec {
+                format: ParseFormat::Xlsx,
+                records_path: None,
+                delimiter: None,
+                has_headers: true,
+                sheet: None,
+                header_row: 0,
+            },
+        },
+    ]);
+    config.batch_size = 0;
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+
+    assert_eq!(records.len(), 1, "{records:?}");
+    let row = &records[0];
+    assert_eq!(row["day"], "2023-03-15");
+    assert_eq!(row["at"], "2023-03-15T12:30:00");
+    assert_eq!(row["took"], "PT129600S", "1.5 days as an ISO 8601 duration");
+    assert_eq!(
+        row["2024-01-31"], 7.0,
+        "a date header is named by its ISO date"
+    );
+}

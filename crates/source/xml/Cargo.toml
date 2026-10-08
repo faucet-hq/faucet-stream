@@ -49,6 +49,7 @@ schemars.workspace = true
 futures.workspace = true
 tempfile = "3"
 wiremock = "0.6"
+rust_xlsxwriter.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
