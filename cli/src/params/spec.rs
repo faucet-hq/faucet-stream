@@ -298,8 +298,10 @@ pub fn coerce(name: &str, kind: ParamType, value: &Value) -> CliResult<Value> {
             Value::String(s) => s
                 .trim()
                 .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
                 .map(Value::from)
-                .map_err(|_| bad("a number")),
+                .ok_or_else(|| bad("a finite number")),
             _ => Err(bad("a number")),
         },
         ParamType::Bool => match value {
@@ -457,6 +459,18 @@ mod tests {
         assert_eq!(
             coerce("s", ParamType::String, &json!(7)).unwrap(),
             json!("7")
+        );
+    }
+
+    #[test]
+    fn coerce_rejects_non_finite_floats() {
+        for raw in ["NaN", "nan", "inf", "-inf", "infinity"] {
+            let err = coerce("t", ParamType::Float, &json!(raw)).unwrap_err();
+            assert!(err.to_string().contains("finite number"), "{raw}: {err}");
+        }
+        assert_eq!(
+            coerce("t", ParamType::Float, &json!("1.5")).unwrap(),
+            json!(1.5)
         );
     }
 
