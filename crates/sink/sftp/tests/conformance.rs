@@ -44,6 +44,8 @@ fn conformance_connector_name_nonempty() {
             password: "x".to_string(),
         },
         known_hosts: HostKeyPolicy::Insecure,
+        connect_timeout_secs: 30,
+        keepalive_interval_secs: 15,
     };
     let sink = SftpSink::new(SftpSinkConfig::new(conn, "/data")).expect("sink builds lazily");
     faucet_conformance::assert_batch_atomicity_declared(&sink);
@@ -80,6 +82,8 @@ fn connection(port: u16) -> SftpConnectionConfig {
             password: PASS.to_string(),
         },
         known_hosts: HostKeyPolicy::Insecure,
+        connect_timeout_secs: 30,
+        keepalive_interval_secs: 15,
     }
 }
 

@@ -38,7 +38,9 @@ Connection, authentication, and host-key verification come from
 | `port` | integer | `22` | Server port. |
 | `username` | string | — | SSH username. |
 | `type` / `config` | auth | — | `password` or `private_key` (see `faucet-common-sftp`). |
-| `known_hosts` | policy | `{ mode: accept_new }` | Host-key verification policy. |
+| `known_hosts` | policy | `{ mode: accept_new }` | Host-key verification policy. Wildcard host patterns and `@revoked` keys are honoured; a host trusted only through `@cert-authority` is refused (host certificates are not supported). |
+| `connect_timeout_secs` | integer | `30` | Seconds the TCP connect, SSH handshake and authentication together may take; a server that accepts and stalls fails the run. |
+| `keepalive_interval_secs` | integer | `15` | Seconds between SSH keepalives on a quiet connection; dropped after three unanswered. `0` disables them. |
 | `path` | string | — | Remote directory prefix under which objects are written. |
 | `format` | enum | `json_lines` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` — see [File formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Extension for written objects. |

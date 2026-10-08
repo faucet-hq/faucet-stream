@@ -147,8 +147,23 @@ impl SftpSource {
 
         let mut files = Vec::new();
         for entry in entries {
-            if !entry.file_type().is_file() {
+            let kind = entry.file_type();
+            if kind.is_dir() {
                 continue;
+            }
+            // A symlink, or an entry whose READDIR omitted its permissions,
+            // is stat'ed (following links) to learn what it really is.
+            if !kind.is_file() {
+                let target = sftp.metadata(entry.path()).await.map_err(|e| {
+                    FaucetError::Source(format!("SFTP stat '{}' failed: {e}", entry.path()))
+                })?;
+                if !target.file_type().is_file() {
+                    tracing::debug!(
+                        path = %entry.path(),
+                        "SFTP source: skipping an entry that is not a regular file"
+                    );
+                    continue;
+                }
             }
             let name = entry.file_name();
             if faucet_common_file::write::is_scratch_name(&name) {
