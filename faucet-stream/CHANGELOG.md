@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.9.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.9.2...faucet-stream-v1.9.3) - 2026-10-08
+
+### Bug Fixes
+
+- MEDIUM/LOW connector findings from the #789 audit (SQL/CDC, messaging, API) ([#839](https://github.com/faucet-hq/faucet-stream/pull/839))
+
+### Documentation
+
+- Link the faucet-stream LinkedIn company page ([#842](https://github.com/faucet-hq/faucet-stream/pull/842))
+
 ## [1.9.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.9.1...faucet-stream-v1.9.2) - 2026-10-06
 
 ### Bug Fixes

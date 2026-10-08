@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-parquet-v1.4.0...faucet-sink-parquet-v1.4.1) - 2026-10-08
+
+### Bug Fixes
+
+- #789 engine findings (core, files, transforms, CLI) + open bug issues ([#840](https://github.com/faucet-hq/faucet-stream/pull/840))
+- Close the API source, file and messaging findings of the production-readiness audit (#789 group D)
+
 ## [1.4.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-parquet-v1.3.0...faucet-sink-parquet-v1.4.0) - 2026-09-30
 
 ### Bug Fixes

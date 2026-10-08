@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.13.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.13.2...faucet-cli-v1.13.3) - 2026-10-08
+
+### Bug Fixes
+
+- #789 engine findings (core, files, transforms, CLI) + open bug issues ([#840](https://github.com/faucet-hq/faucet-stream/pull/840))
+- MEDIUM/LOW connector findings from the #789 audit (SQL/CDC, messaging, API) ([#839](https://github.com/faucet-hq/faucet-stream/pull/839))
+- MEDIUM/LOW security findings from the #789 audit (serve, supply chain, auth, secrets) ([#827](https://github.com/faucet-hq/faucet-stream/pull/827))
+- Close the API source, file and messaging findings of the production-readiness audit (#789 group D)
+- Close the core engine and CLI runtime findings of the production-readiness audit (#789 group B)
+- Close the security and trust-boundary findings of the production-readiness audit (#789 group A)
+
+### Testing
+
+- *(cli)* The pipeline_test_cmd matrix fixture appends to its shared jsonl sink ([#816](https://github.com/faucet-hq/faucet-stream/pull/816))
+
 ## [1.13.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.13.1...faucet-cli-v1.13.2) - 2026-10-06
 
 ### Bug Fixes

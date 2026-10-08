@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.1.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-gcs-v1.1.1...faucet-common-gcs-v1.1.2) - 2026-10-08
+
+### Bug Fixes
+
+- #789 engine findings (core, files, transforms, CLI) + open bug issues ([#840](https://github.com/faucet-hq/faucet-stream/pull/840))
+- MEDIUM/LOW security findings from the #789 audit (serve, supply chain, auth, secrets) ([#827](https://github.com/faucet-hq/faucet-stream/pull/827))
+
 ## [1.1.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-gcs-v1.1.0...faucet-common-gcs-v1.1.1) - 2026-09-30
 
 ### Bug Fixes
