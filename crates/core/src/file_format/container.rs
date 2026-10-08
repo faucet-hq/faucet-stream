@@ -7,15 +7,17 @@
 //!
 //! - **Avro** — the configured reader schema, or else the first file's writer
 //!   schema, is the reader schema for every file. A later file written with an
-//!   evolved schema is resolved against it (added fields take their defaults,
-//!   removed ones are dropped); a file that cannot be resolved fails with an
-//!   error naming both files.
+//!   evolved schema is resolved against it (fields it lacks take their
+//!   defaults); a file that cannot be resolved fails with an error naming both
+//!   files. Without a configured schema, a later file that adds top-level
+//!   fields fails too, naming them, rather than having them dropped for the
+//!   whole run.
 //! - **ORC** — the first file's (projected) Arrow schema is the reference; a
 //!   file whose schema differs fails with an error naming both files.
 //!
-//! Decoding is synchronous. Call it from a blocking context for large files;
-//! both [`FileInput`] variants stream rather than materialize the decoded
-//! rows.
+//! Decoding is synchronous. From async code use the `*_offloaded` methods,
+//! which run it on a blocking thread; both [`FileInput`] variants stream
+//! rather than materialize the decoded rows.
 
 #![cfg_attr(
     not(any(feature = "file-format-avro", feature = "file-format-orc")),
@@ -103,6 +105,39 @@ impl ContainerDecoder {
         Ok(out)
     }
 
+    /// [`decode_all`](Self::decode_all) on a blocking thread, so a large
+    /// object does not stall an async worker (CORE-34). Takes and returns the
+    /// decoder because the decode runs on another thread.
+    pub async fn decode_all_offloaded(
+        mut self,
+        name: String,
+        input: FileInput,
+    ) -> Result<(Self, Vec<Value>), FaucetError> {
+        tokio::task::spawn_blocking(move || {
+            let rows = self.decode_all(&name, input)?;
+            Ok((self, rows))
+        })
+        .await
+        .map_err(|e| FaucetError::Source(format!("container decode task failed: {e}")))?
+    }
+
+    /// [`decode_batches`](Self::decode_batches) on a blocking thread.
+    #[cfg(feature = "arrow")]
+    #[allow(clippy::type_complexity)]
+    pub async fn decode_batches_offloaded(
+        mut self,
+        name: String,
+        input: FileInput,
+        batch_size: usize,
+    ) -> Result<(Self, Vec<arrow::array::RecordBatch>), FaucetError> {
+        tokio::task::spawn_blocking(move || {
+            let (_, batches) = self.decode_batches(&name, input, batch_size)?;
+            Ok((self, batches))
+        })
+        .await
+        .map_err(|e| FaucetError::Source(format!("container decode task failed: {e}")))?
+    }
+
     /// Decode one whole file into Arrow batches of at most `batch_size` rows.
     #[cfg(feature = "arrow")]
     pub fn decode_batches(
@@ -133,8 +168,15 @@ impl ContainerDecoder {
             #[cfg(feature = "file-format-avro")]
             FileFormat::Avro => {
                 let reader_schema = self.avro_reader_schema();
+                let check = self.avro_writer_check();
                 let result = with_reader(input, |r| {
-                    super::avro::read_records(r, reader_schema.as_ref(), chunk, f)
+                    super::avro::read_records_checked(
+                        r,
+                        reader_schema.as_ref(),
+                        check.as_deref(),
+                        chunk,
+                        f,
+                    )
                 });
                 self.finish_avro(name, reader_schema, result)
             }
@@ -175,8 +217,15 @@ impl ContainerDecoder {
             #[cfg(feature = "file-format-avro")]
             FileFormat::Avro => {
                 let reader_schema = self.avro_reader_schema();
+                let check = self.avro_writer_check();
                 let result = with_reader(input, |r| {
-                    super::avro::read_batches(r, reader_schema.as_ref(), batch_size, f)
+                    super::avro::read_batches_checked(
+                        r,
+                        reader_schema.as_ref(),
+                        check.as_deref(),
+                        batch_size,
+                        f,
+                    )
                 });
                 let arrow = result.as_ref().ok().map(|(_, a)| a.clone());
                 self.finish_avro(name, reader_schema, result.map(|(s, _)| s))?;
@@ -194,6 +243,42 @@ impl ContainerDecoder {
             Some((_, Anchor::Avro(s))) => Some(s.clone()),
             _ => None,
         }
+    }
+
+    /// When the reader schema is the first file's writer schema (no
+    /// configured `avro.schema`), refuse a later file whose writer schema has
+    /// top-level fields the anchor lacks: Avro resolution would silently drop
+    /// them for the whole run (CORE-38).
+    #[cfg(feature = "file-format-avro")]
+    #[allow(clippy::type_complexity)]
+    fn avro_writer_check(&self) -> Option<Box<super::avro::WriterCheck<'static>>> {
+        if self.configured {
+            return None;
+        }
+        let Some((_, Anchor::Avro(anchor))) = &self.anchor else {
+            return None;
+        };
+        let known: std::collections::HashSet<String> =
+            record_field_names(anchor).into_iter().collect();
+        Some(Box::new(move |writer: &apache_avro::Schema| {
+            let extra: Vec<String> = record_field_names(writer)
+                .into_iter()
+                .filter(|n| !known.contains(n))
+                .collect();
+            if extra.is_empty() {
+                Ok(())
+            } else {
+                Err(FaucetError::Source(format!(
+                    "it has field(s) {} the reader schema lacks, which would be dropped — \
+                     set `avro.schema` to a reader schema that includes them",
+                    extra
+                        .iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        }))
     }
 
     #[cfg(feature = "file-format-avro")]
@@ -286,12 +371,23 @@ where
             })
             .buffered(concurrency.max(1));
         while let Some((name, body)) = fetched.next().await {
-            let (_, batches) = decoder.decode_batches(&name, FileInput::Bytes(body?), batch_size)?;
+            let (d, batches) = decoder
+                .decode_batches_offloaded(name, FileInput::Bytes(body?), batch_size)
+                .await?;
+            decoder = d;
             for batch in batches {
                 yield crate::columnar::ColumnarPage::new(batch, None);
             }
         }
     })
+}
+
+#[cfg(feature = "file-format-avro")]
+fn record_field_names(schema: &apache_avro::Schema) -> Vec<String> {
+    match schema {
+        apache_avro::Schema::Record(r) => r.fields.iter().map(|f| f.name.clone()).collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(feature = "file-format-avro")]
@@ -407,6 +503,30 @@ mod tests {
         assert!(pages[3].as_ref().is_err());
     }
 
+    #[cfg(all(feature = "file-format-avro", feature = "arrow"))]
+    #[tokio::test]
+    async fn offloaded_decodes_keep_the_anchor() {
+        let d = ContainerDecoder::new(FileFormat::Avro, &FormatOptions::default()).unwrap();
+        let (d, rows) = d
+            .decode_all_offloaded("a".into(), FileInput::Bytes(avro(&[json!({"id": 1})])))
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![json!({"id": 1})]);
+        let (d, batches) = d
+            .decode_batches_offloaded("b".into(), FileInput::Bytes(avro(&[json!({"id": 2})])), 0)
+            .await
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+        let err = d
+            .decode_all_offloaded(
+                "c".into(),
+                FileInput::Bytes(avro(&[json!({"id": 1, "z": 1})])),
+            )
+            .await
+            .expect_err("anchored on a");
+        assert!(err.to_string().contains("`z`"), "{err}");
+    }
+
     #[test]
     fn only_container_formats_are_accepted() {
         let err =
@@ -430,12 +550,27 @@ mod tests {
             },
         )
         .unwrap();
-        // Same field names, one dropped: resolvable, projected onto the first shape.
+        // A later file that adds a field would lose it: refused, naming it,
+        // before any of its rows are emitted (CORE-38).
         let wider = avro(&[json!({"id": 2, "x": "b", "extra": true})]);
-        d.records("b.avro", FileInput::Bytes(wider), 1, &mut |c| {
-            rows.extend(c);
-            Ok(())
-        })
+        let err = d
+            .records("b.avro", FileInput::Bytes(wider), 1, &mut |c| {
+                rows.extend(c);
+                Ok(())
+            })
+            .expect_err("added field");
+        let msg = err.to_string();
+        assert!(msg.contains("b.avro") && msg.contains("`extra`"), "{msg}");
+        // A file with a subset of the fields still resolves.
+        d.records(
+            "b2.avro",
+            FileInput::Bytes(avro(&[json!({"id": 2, "x": "b"})])),
+            1,
+            &mut |c| {
+                rows.extend(c);
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(
             rows,

@@ -88,9 +88,27 @@ pub enum InstallError {
 /// - If `tracing` is set, installs a `tracing-subscriber` registry with the
 ///   given env-filter directive as the default subscriber. Already-set-default
 ///   is logged via `tracing::warn!` and continues.
+/// - OTLP export (feature `otel`) needs a tokio runtime; called outside one it
+///   is skipped with a warning.
 #[cfg(feature = "observability-install")]
 pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport, InstallError> {
     let mut report = InstallReport::default();
+
+    // The OTLP exporters (and the fanout's `/metrics` task) need a tokio
+    // runtime; outside one, skip OTLP rather than panic.
+    #[cfg(feature = "otel")]
+    let without_otel;
+    #[cfg(feature = "otel")]
+    let cfg = if cfg.otel.is_some() && tokio::runtime::Handle::try_current().is_err() {
+        tracing::warn!("OTLP export needs a tokio runtime; install_observability skips it");
+        without_otel = ObservabilityConfig {
+            otel: None,
+            ..cfg.clone()
+        };
+        &without_otel
+    } else {
+        cfg
+    };
 
     // Provider holders moved into the guard after both arms run; only populated
     // (and only referenced) when the `otel` feature is enabled.
@@ -124,8 +142,9 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
                 match crate::observability::otel::build_meter_provider(otel) {
                     Ok((mp, recorder)) => {
                         if metrics::set_global_recorder(recorder).is_err() {
-                            tracing::warn!("metrics recorder already installed; continuing");
-                            report.prometheus_already_installed = true;
+                            tracing::warn!(
+                                "metrics recorder already installed; OTLP metrics are not exported"
+                            );
                         } else {
                             otel_meter = Some(mp);
                             report.otel_signals.push("metrics");
@@ -151,13 +170,20 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
     }
 
     // --- Traces ---
-    if let Some(t) = cfg.tracing.as_ref() {
+    #[cfg(feature = "otel")]
+    let otel_traces = cfg
+        .otel
+        .as_ref()
+        .is_some_and(|o| o.exports(crate::observability::otel::OtelSignal::Traces));
+    #[cfg(not(feature = "otel"))]
+    let otel_traces = false;
+    if cfg.tracing.is_some() || otel_traces {
         use tracing_subscriber::EnvFilter;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
-        let make_filter =
-            || EnvFilter::try_new(&t.level).unwrap_or_else(|_| EnvFilter::new("info"));
+        let level = cfg.tracing.as_ref().map_or("info", |t| t.level.as_str());
+        let make_filter = || EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
 
         // Reassigned only in the `otel` branch below; without that feature the
         // `mut` is genuinely unused.
@@ -165,31 +191,46 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
         let mut installed = false;
 
         #[cfg(feature = "otel")]
-        {
-            let otel_traces = cfg
-                .otel
-                .as_ref()
-                .map(|o| o.exports(crate::observability::otel::OtelSignal::Traces))
-                .unwrap_or(false);
-            if let (true, Some(otel)) = (otel_traces, cfg.otel.as_ref()) {
+        if let (true, Some(otel)) = (otel_traces, cfg.otel.as_ref()) {
+            if crate::observability::otel::tracer_installed() {
+                installed = true;
+            } else {
                 match crate::observability::otel::build_trace_provider(otel) {
                     Ok(tp) => {
                         use opentelemetry::trace::TracerProvider as _;
+                        use tracing_subscriber::Layer as _;
                         let tracer = tp.tracer("faucet");
                         crate::observability::otel::install_propagator();
-                        let reg = tracing_subscriber::registry()
-                            .with(make_filter())
-                            .with(tracing_subscriber::fmt::layer())
-                            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-                            .with(crate::observability::otel::OtelErrorCountLayer);
-                        if reg.try_init().is_err() {
-                            tracing::warn!("tracing subscriber already installed; continuing");
-                            report.tracing_already_installed = true;
-                            // try_init failed: no otel layer was installed, so DON'T store the
-                            // provider — let `tp` drop here to shut its exporter down.
-                        } else {
-                            report.otel_signals.push("traces");
-                            otel_tracer = Some(tp);
+                        let layer: crate::observability::otel::TraceLayer = Box::new(
+                            tracing_opentelemetry::layer()
+                                .with_tracer(tracer)
+                                .and_then(crate::observability::otel::OtelErrorCountLayer),
+                        );
+                        // A host that installed its own subscriber first (the CLI)
+                        // registered a slot for exactly this layer.
+                        match crate::observability::otel::fill_trace_slot(layer) {
+                            Ok(()) => {
+                                report.otel_signals.push("traces");
+                                otel_tracer = Some(tp);
+                            }
+                            Err(layer) => {
+                                let reg = tracing_subscriber::registry()
+                                    .with(layer)
+                                    .with(make_filter())
+                                    .with(tracing_subscriber::fmt::layer());
+                                if reg.try_init().is_err() {
+                                    tracing::warn!(
+                                        "tracing subscriber already installed and no trace \
+                                         layer slot registered; OTLP traces are not exported"
+                                    );
+                                    report.tracing_already_installed = true;
+                                    // No otel layer was installed, so DON'T store the
+                                    // provider — let `tp` drop to shut its exporter down.
+                                } else {
+                                    report.otel_signals.push("traces");
+                                    otel_tracer = Some(tp);
+                                }
+                            }
                         }
                         installed = true;
                     }
@@ -421,6 +462,18 @@ mod tests {
     use std::sync::Mutex;
 
     static LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otlp_outside_a_runtime_is_skipped_not_a_panic() {
+        let cfg = ObservabilityConfig {
+            otel: Some(crate::observability::otel::OtelConfig::default()),
+            ..Default::default()
+        };
+        let report = install_observability(&cfg).expect("no runtime is not an error");
+        assert!(report.otel_signals.is_empty());
+        assert!(!report.prometheus_already_installed);
+    }
 
     #[test]
     fn metrics_mode_selection() {

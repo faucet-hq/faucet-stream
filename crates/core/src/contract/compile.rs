@@ -43,11 +43,17 @@ fn config_err(msg: impl Into<String>) -> FaucetError {
 }
 
 /// Does `value` conform to the declared contract type? `integer` means a JSON
-/// number with no fractional part (fits `i64`/`u64` as parsed).
+/// number with no fractional part (`1` and `1.0` both conform).
 pub(crate) fn type_matches(value: &Value, ty: ContractFieldType) -> bool {
     match ty {
         ContractFieldType::String => value.is_string(),
-        ContractFieldType::Integer => value.is_i64() || value.is_u64(),
+        ContractFieldType::Integer => {
+            value.is_i64()
+                || value.is_u64()
+                || value
+                    .as_f64()
+                    .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
+        }
         ContractFieldType::Number => value.is_number(),
         ContractFieldType::Boolean => value.is_boolean(),
         ContractFieldType::Object => value.is_object(),

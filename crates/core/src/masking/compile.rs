@@ -19,6 +19,18 @@ fn config_err(msg: impl Into<String>) -> FaucetError {
 pub struct CompiledMasking {
     pub(crate) rules: Vec<CompiledRule>,
     pub(crate) hasher: Hasher,
+    /// Some rule matches by field name, so the walk must build dot-paths.
+    pub(crate) needs_paths: bool,
+}
+
+impl CompiledMasking {
+    /// Whether a name-based rule matches the top-level field `name`, so the
+    /// pass may rewrite (and re-type) every value of it.
+    pub(crate) fn rewrites_name(&self, name: &str) -> bool {
+        self.rules.iter().any(|r| {
+            r.fields.contains(name) || r.field_pattern.as_ref().is_some_and(|p| p.is_match(name))
+        })
+    }
 }
 
 /// One compiled rule: its matchers plus the action to apply.
@@ -65,9 +77,13 @@ impl CompiledMasking {
                 rules.push(compiled);
             }
         }
+        let needs_paths = rules
+            .iter()
+            .any(|r| r.field_pattern.is_some() || !r.fields.is_empty());
         Ok(Self {
             rules,
             hasher: Hasher::from_key(spec.key.as_deref()),
+            needs_paths,
         })
     }
 

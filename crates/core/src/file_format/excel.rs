@@ -34,6 +34,7 @@ pub fn decode(
         .map_err(|e| FaucetError::Source(format!("xlsx: opening workbook: {e}")))?;
     let names = wb.sheet_names().to_vec();
     let name = resolve_sheet(&names, sheet)?;
+    let name_of_sheet = name.clone();
     let range = wb
         .worksheet_range(&name)
         .map_err(|e| FaucetError::Source(format!("xlsx: reading sheet '{name}': {e}")))?;
@@ -53,19 +54,36 @@ pub fn decode(
             ))
         })?
         .iter()
-        .map(cell_to_string)
+        .enumerate()
+        .map(|(i, c)| {
+            let label = cell_to_string(c);
+            if label.is_empty() {
+                format!("column_{i}")
+            } else {
+                label
+            }
+        })
         .collect();
+    // Rows are keyed by header, so a repeated (or blank-defaulted) label would
+    // silently drop a column (CORE-37) — the CSV reader's rule.
+    let mut seen = std::collections::HashMap::with_capacity(headers.len());
+    for (i, name) in headers.iter().enumerate() {
+        if let Some(first) = seen.insert(name.as_str(), i) {
+            return Err(FaucetError::Source(format!(
+                "xlsx: sheet '{name_of_sheet}' repeats the header `{name}` at columns {first} \
+                 and {i}; rows are keyed by header, so one column would be lost — rename it"
+            )));
+        }
+    }
+    // A calamine range is rectangular, so every row is exactly as wide as the
+    // header and each cell has its own (now unique) key.
     let mut out = Vec::new();
     for row in range.rows().skip(header_row + 1) {
-        let mut obj = Map::new();
-        for (i, cell) in row.iter().enumerate() {
-            let key = headers
-                .get(i)
-                .cloned()
-                .filter(|k| !k.is_empty())
-                .unwrap_or_else(|| format!("column_{i}"));
-            obj.insert(key, cell_to_value(cell));
-        }
+        let obj: Map<String, Value> = headers
+            .iter()
+            .cloned()
+            .zip(row.iter().map(cell_to_value))
+            .collect();
         out.push(Value::Object(obj));
     }
     Ok(out)
@@ -249,6 +267,25 @@ mod tests {
             back,
             vec![json!({"a": 1, "b": null}), json!({"a": null, "b": 2})]
         );
+    }
+
+    #[test]
+    fn repeated_or_colliding_headers_are_refused() {
+        let bytes = encode(
+            &[json!({"a": "x", "b": "x"}), json!({"a": 1, "b": 2})],
+            None,
+        )
+        .expect("encode");
+        let err = decode(&bytes, None, 1).expect_err("dup").to_string();
+        assert!(err.contains("`x` at columns 0 and 1"), "{err}");
+        // A blank header defaults to `column_<i>`, which may collide with a real one.
+        let bytes = encode(
+            &[json!({"a": null, "b": "column_0"}), json!({"a": 1, "b": 2})],
+            None,
+        )
+        .expect("encode");
+        let err = decode(&bytes, None, 1).expect_err("blank").to_string();
+        assert!(err.contains("`column_0`"), "{err}");
     }
 
     #[test]

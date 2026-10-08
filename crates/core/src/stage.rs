@@ -579,16 +579,22 @@ impl CompiledExplode {
     fn apply(&self, rec: Value) -> Result<Vec<Value>, FaucetError> {
         // Resolve the value at `path`. If it's a non-empty array, fan out.
         // Otherwise, route through `on_missing`.
-        let target = self.path.resolve(&rec)?;
-        let Some(Value::Array(elements)) = target.cloned() else {
-            return self.handle_missing(rec);
-        };
-        if elements.is_empty() {
+        let non_empty = matches!(self.path.resolve(&rec)?, Some(Value::Array(a)) if !a.is_empty());
+        if !non_empty {
             return self.handle_missing(rec);
         }
         let (parent_segments, leaf) = self.path.parent_and_leaf();
         let parent_segments = parent_segments.to_vec();
         let leaf = leaf.to_owned();
+        // Move the array out first so each per-element clone copies the record
+        // without it: cloning the full record per element is O(N²) (CORE-30).
+        let mut rec = rec;
+        let elements = match CompiledPath::resolve_segments_mut(&mut rec, &parent_segments)?
+            .and_then(|m| m.get_mut(&leaf))
+        {
+            Some(Value::Array(a)) => std::mem::take(a),
+            _ => unreachable!("resolved as a non-empty array above"),
+        };
         let mut out: Vec<Value> = Vec::with_capacity(elements.len());
         for element in elements {
             let mut child = rec.clone();
@@ -1528,6 +1534,20 @@ mod tests {
                 json!({"id": 1, "tags": "etl"}),
             ]
         );
+    }
+
+    #[cfg(feature = "transform-explode")]
+    #[test]
+    fn explode_a_large_array_is_linear() {
+        // Quadratic cloning made this ~10^9 value copies (CORE-30).
+        let n = 40_000;
+        let items: Vec<Value> = (0..n).map(|i| json!(i)).collect();
+        let stages = compile(&[explode("$.user.items")]);
+        let start = std::time::Instant::now();
+        let out = apply_stages(json!({"id": 1, "user": {"items": items}}), &stages).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(out.len(), n);
+        assert_eq!(out[n - 1], json!({"id": 1, "user": {"items": n - 1}}));
     }
 
     #[cfg(feature = "transform-explode")]

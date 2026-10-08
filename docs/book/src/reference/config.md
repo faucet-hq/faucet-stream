@@ -1575,6 +1575,12 @@ metadata_columns:
 `extracted_at` is captured at sink-decorator time (≈ `loaded_at` in this model).
 Non-object records pass through unchanged.
 
+Before the first write, a column-mapped destination that already exists is
+checked for the metadata columns: missing ones are added (TEXT; `sequence` an
+integer) through the sink's schema evolution, and a sink that cannot add
+columns fails the run rather than dropping them. A source field with a
+metadata column's name is replaced, with a one-time warning.
+
 ## `catalog`
 
 Optional. When present, `faucet run` / `schedule` / `mirror` record every

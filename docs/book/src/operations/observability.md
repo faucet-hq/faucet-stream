@@ -156,11 +156,18 @@ to both exporters.
 **Protocol notes:**
 
 - `grpc` uses `tonic` (the default). The `faucet` CLI always runs inside a
-  tokio runtime, so gRPC works without any extra setup.
+  tokio runtime, so gRPC works without any extra setup. `headers` are sent as
+  gRPC metadata (names are lower-cased); an invalid header name or value
+  disables export with a warning.
 - `http` uses HTTP/Protobuf. When `endpoint` does not already end in a
   per-signal path (`/v1/traces`, `/v1/metrics`), faucet appends it
   automatically — point `endpoint` at the base URL of the collector (e.g.
   `http://localhost:4318`) and the right path is added per signal.
+
+Traces are exported whenever `export` lists `traces`, with or without an
+`observability.tracing` level, by `run`, `schedule`, `replicate`/`mirror` and
+the other commands that load a config. `faucet serve` has no process-level
+`observability:` block, so it does not export OTLP.
 
 **Reliability:** export is best-effort. An unreachable or slow collector
 **never** fails or delays a pipeline run. Export failures increment

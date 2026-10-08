@@ -50,8 +50,8 @@ pub fn extract_records(body: &Value, path: Option<&str>) -> Result<Vec<Value>, F
 /// Check an HTTP response status and return a [`FaucetError::HttpStatus`] on
 /// non-success responses.
 ///
-/// Reads the response body for error context, truncating to `max_body_len`
-/// bytes (default: 2048) to avoid large error messages.
+/// Reads at most `max_body_len` bytes (default: 2048) of the response body for
+/// error context, so a huge error page is never buffered whole.
 pub async fn check_http_response(
     resp: reqwest::Response,
     max_body_len: usize,
@@ -62,13 +62,23 @@ pub async fn check_http_response(
 
     let status = resp.status().as_u16();
     let url = resp.url().to_string();
-    let body_text = resp.text().await.unwrap_or_default();
+    let mut resp = resp;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut more = false;
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        raw.extend_from_slice(&chunk);
+        if raw.len() > max_body_len {
+            more = true;
+            break;
+        }
+    }
+    let body_text = String::from_utf8_lossy(&raw);
 
-    let body = if body_text.len() > max_body_len {
-        let end = body_text.floor_char_boundary(max_body_len);
+    let body = if more || body_text.len() > max_body_len {
+        let end = body_text.floor_char_boundary(max_body_len.min(body_text.len()));
         format!("{}...(truncated)", &body_text[..end])
     } else {
-        body_text
+        body_text.into_owned()
     };
 
     Err(FaucetError::HttpStatus { status, url, body })
@@ -614,6 +624,54 @@ mod snake_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Serve one response: `head` then `body`, then hold the socket open.
+    fn serve_once(head: String, body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn check_http_response_reads_only_the_truncation_limit() {
+        let url = serve_once(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100000000\r\n\r\n".into(),
+            vec![b'x'; 8192],
+        );
+        let resp = reqwest::get(&url).await.unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            check_http_response(resp, 100),
+        )
+        .await
+        .expect("must not wait for the rest of a huge body")
+        .unwrap_err();
+        match err {
+            FaucetError::HttpStatus { status, body, .. } => {
+                assert_eq!(status, 500);
+                assert_eq!(body, format!("{}...(truncated)", "x".repeat(100)));
+            }
+            other => panic!("{other:?}"),
+        }
+        let url = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\n".into(),
+            b"gone".to_vec(),
+        );
+        let resp = reqwest::get(&url).await.unwrap();
+        match check_http_response(resp, 100).await.unwrap_err() {
+            FaucetError::HttpStatus { body, .. } => assert_eq!(body, "gone"),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn retry_after_reads_seconds_and_http_dates() {

@@ -214,7 +214,7 @@ impl GcsSource {
                 FaucetError::Source(format!("GCS '{key}': format has no decoder"))
             })?;
         let records =
-            faucet_core::file_format::decode(&bytes, format, &self.config.format_options())
+            faucet_core::file_format::decode_owned(bytes, format, &self.config.format_options())
                 .await
                 .map_err(|e| FaucetError::Source(format!("GCS '{key}': {e}")))?;
         Ok(Fetched::Records(records))
@@ -718,12 +718,15 @@ impl faucet_core::Source for GcsSource {
                 let payload = payload?;
                 #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                 let payload = match payload {
-                    Fetched::Container(bytes) => Fetched::Records(
-                        container
-                            .as_mut()
+                    Fetched::Container(bytes) => {
+                        let (d, rows) = container
+                            .take()
                             .expect("a container object implies a container format")
-                            .decode_all(key, faucet_core::FileInput::Bytes(bytes))?,
-                    ),
+                            .decode_all_offloaded(key.to_string(), faucet_core::FileInput::Bytes(bytes))
+                            .await?;
+                        container = Some(d);
+                        Fetched::Records(rows)
+                    }
                     other => other,
                 };
                 match payload {
@@ -999,14 +1002,16 @@ impl faucet_core::Source for GcsSource {
                     }
                     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                     Fetched::Container(bytes) => {
-                        let (_, batches) = container
-                            .as_mut()
+                        let (d, batches) = container
+                            .take()
                             .expect("a container object implies a container format")
-                            .decode_batches(
-                                key,
+                            .decode_batches_offloaded(
+                                key.to_string(),
                                 faucet_core::FileInput::Bytes(bytes),
                                 self.config.batch_size,
-                            )?;
+                            )
+                            .await?;
+                        container = Some(d);
                         pending = batches;
                     }
                     _ => Err(FaucetError::Source(format!(

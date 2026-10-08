@@ -86,10 +86,11 @@ impl KeyRange {
     pub fn bisect(&self, obs: Option<(i64, i64)>) -> Option<(KeyRange, KeyRange)> {
         let lo = self.lo.or(obs.map(|(min, _)| min))?;
         let hi = self.hi.or(obs.map(|(_, max)| max.saturating_add(1)))?;
+        let (lo, hi) = (i128::from(lo), i128::from(hi));
         if hi - lo < 2 {
             return None;
         }
-        let mid = lo + (hi - lo) / 2;
+        let mid = (lo + (hi - lo) / 2) as i64;
         // Keep the outer edges as they were (possibly unbounded) so the two
         // halves still tile exactly the parent range.
         Some((
@@ -726,6 +727,9 @@ mod tests {
         assert_eq!((a.lo, a.hi), (None, Some(15)));
         assert_eq!((b.lo, b.hi), (Some(15), None));
         assert!(KeyRange::ALL.bisect(None).is_none());
+        let (a, b) = KeyRange::ALL.bisect(Some((i64::MIN, i64::MAX))).unwrap();
+        assert_eq!((a.lo, a.hi), (None, Some(-1)));
+        assert_eq!((b.lo, b.hi), (Some(-1), None));
         assert!(
             KeyRange {
                 lo: Some(3),

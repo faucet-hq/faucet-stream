@@ -80,8 +80,9 @@ pub struct MatchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_pattern: Option<String>,
 
-    /// Value-based PII detector run over each *string* field value.
-    /// Conservative (fully anchored) by default to avoid over-masking.
+    /// Value-based PII detector run over each *string* field value (and
+    /// integer values, for `credit_card`). Conservative (fully anchored) by
+    /// default to avoid over-masking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_detector: Option<Detector>,
 
@@ -100,11 +101,13 @@ pub struct MatchSpec {
 pub enum Detector {
     /// RFC-5322-ish email address.
     Email,
-    /// 13–19 digit card number (spaces/dashes allowed) passing the Luhn check.
+    /// 13–19 digit card number (spaces/dashes allowed, or a JSON integer)
+    /// passing the Luhn check.
     CreditCard,
     /// US Social Security Number `NNN-NN-NNNN`.
     Ssn,
-    /// E.164 / North-American phone number.
+    /// E.164 (`+` then 8–15 digits) or a North-American number written with
+    /// separators; a bare run of digits never matches.
     Phone,
     /// IPv4 dotted-quad address.
     Ipv4,

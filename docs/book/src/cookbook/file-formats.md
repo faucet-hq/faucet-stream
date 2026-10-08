@@ -66,7 +66,11 @@ A repeated header name fails the read — rows are keyed by header, so a
 duplicate would silently drop a column. With `flexible: false` a row with more
 or fewer fields than the header fails naming its line. The object-store and
 REST sources are lenient by default; the `file` source is strict, like the
-`csv` source.
+`csv` source. When lenient, the reader logs how many ragged rows it accepted,
+and a long row whose extra field would land on a header literally named
+`column_<i>` fails rather than overwriting that column. An Excel sheet whose
+header row repeats a label (or leaves a cell blank where `column_<i>` is also a
+real header) fails the same way a CSV does.
 
 ```yaml
 source:
@@ -151,6 +155,11 @@ The two in bold worth planning around: **XML trims padding**, so quote-and-pad
 alignment does not survive a round trip; and **xlsx returns a big integer as a
 string**, which is visible and correctable, unlike a rounded number.
 
+Reading `json_lines` / `json_array`, a number literal that the parsed record
+cannot hold exactly — an integer beyond 2^64, or a decimal with more
+significant digits than a double keeps — fails the read naming the literal,
+rather than being rounded. Write such values as JSON strings.
+
 ## Streaming and memory
 
 Only `json_lines` can be built a record at a time. Every other format has a
@@ -217,9 +226,13 @@ source:
 
 **Many files, one shape.** Every file under the prefix is resolved against one
 reader schema: `avro.schema` when set, otherwise **the first file's writer
-schema**. Avro's schema resolution then applies. A later file that added a
-field has it dropped. A field the reader declares with a default is filled for
-files that lack it. Numeric promotions such as `int → long` apply. A file that
+schema**. Avro's schema resolution then applies. Without `avro.schema`, a
+later file that adds a top-level field fails the run naming the field, rather
+than having it silently dropped for the whole run — set `avro.schema` to a
+reader schema that includes it (with a default for the older files). With a
+configured reader schema, writer fields it does not declare are dropped, as
+you asked. A field the reader declares with a default is filled for files that
+lack it. Numeric promotions such as `int → long` apply. A file that
 cannot be resolved fails the run with an error naming both files:
 
 ```text

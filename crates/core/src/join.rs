@@ -83,7 +83,7 @@ pub enum OnCollision {
     Overwrite,
     /// Leave the probe record's field untouched; skip the projection.
     Skip,
-    /// Fail the record with a typed error.
+    /// Fail the join node — and with it the run — with a typed error.
     Error,
 }
 
@@ -231,7 +231,7 @@ impl HashJoin {
                 }
             };
             let bucket = self.index.entry(ckey).or_default();
-            if !bucket.is_empty() {
+            if bucket.len() == 1 {
                 self.stats.duplicates += 1;
             }
             bucket.push(rec);
@@ -256,29 +256,37 @@ impl HashJoin {
             let key = get_path(&left, &self.config.probe_key).filter(|v| !v.is_null());
             let ckey = key.and_then(|k| canonical_key(k, self.config.key_normalize));
 
-            let matches: Option<&Vec<Value>> = ckey.as_ref().and_then(|k| self.index.get(k));
+            // Split the borrows so the matched build records are read in
+            // place while the stats are updated.
+            let Self {
+                config,
+                index,
+                stats,
+            } = self;
+            let matches: Option<&Vec<Value>> = ckey.as_ref().and_then(|k| index.get(k));
 
             match matches {
                 Some(bucket) if !bucket.is_empty() => {
-                    self.stats.matches += 1;
-                    let take = match self.config.on_duplicate {
+                    stats.matches += 1;
+                    let take = match config.on_duplicate {
                         OnDuplicate::First => &bucket[..1],
                         OnDuplicate::Cartesian => &bucket[..],
                     };
-                    // Clone the build records we need up front so we no longer
-                    // borrow `self.index` while mutating `self.stats`.
-                    let rights: Vec<Value> = take.to_vec();
-                    for right in &rights {
+                    let (last, rest) = take.split_last().expect("bucket is not empty");
+                    for right in rest {
                         let mut enriched = left.clone();
-                        self.apply_projection(&mut enriched, Some(right))?;
+                        apply_projection(config, stats, &mut enriched, Some(right))?;
                         out.push(enriched);
                     }
+                    let mut enriched = left;
+                    apply_projection(config, stats, &mut enriched, Some(last))?;
+                    out.push(enriched);
                 }
                 _ => {
-                    self.stats.misses += 1;
-                    if self.config.mode == JoinMode::Left {
+                    stats.misses += 1;
+                    if config.mode == JoinMode::Left {
                         let mut enriched = left;
-                        self.apply_projection(&mut enriched, None)?;
+                        apply_projection(config, stats, &mut enriched, None)?;
                         out.push(enriched);
                     }
                     // inner mode: drop.
@@ -287,30 +295,31 @@ impl HashJoin {
         }
         Ok(out)
     }
+}
 
-    /// Apply the configured projections onto `left`. `right = None` fills every
-    /// projected field with `on_missing` (the `left`-mode non-match path).
-    fn apply_projection(
-        &mut self,
-        left: &mut Value,
-        right: Option<&Value>,
-    ) -> Result<(), FaucetError> {
-        for proj in &self.config.projections {
-            let value = match right {
-                Some(r) => match get_path(r, &proj.from) {
-                    Some(v) => v.clone(),
-                    None => {
-                        // Field absent on the matched build record — skip it.
-                        self.stats.project_misses += 1;
-                        continue;
-                    }
-                },
-                None => self.config.on_missing.clone(),
-            };
-            set_field(left, &proj.as_, value, self.config.on_collision)?;
-        }
-        Ok(())
+/// Apply the configured projections onto `left`. `right = None` fills every
+/// projected field with `on_missing` (the `left`-mode non-match path).
+fn apply_projection(
+    config: &JoinConfig,
+    stats: &mut JoinStats,
+    left: &mut Value,
+    right: Option<&Value>,
+) -> Result<(), FaucetError> {
+    for proj in &config.projections {
+        let value = match right {
+            Some(r) => match get_path(r, &proj.from) {
+                Some(v) => v.clone(),
+                None => {
+                    // Field absent on the matched build record — skip it.
+                    stats.project_misses += 1;
+                    continue;
+                }
+            },
+            None => config.on_missing.clone(),
+        };
+        set_field(left, &proj.as_, value, config.on_collision)?;
     }
+    Ok(())
 }
 
 /// Resolve a dotted path against a JSON value, traversing objects only.
@@ -533,6 +542,21 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["customer_tier"], json!("gold"));
         assert_eq!(j.stats().duplicates, 1);
+    }
+
+    #[test]
+    fn duplicates_counts_keys_not_extra_records() {
+        let mut j = HashJoin::new(cfg());
+        j.add_build_page(vec![
+            json!({"id": 1, "tier": "a"}),
+            json!({"id": 1, "tier": "b"}),
+            json!({"id": 1, "tier": "c"}),
+            json!({"id": 2, "tier": "d"}),
+            json!({"id": 2, "tier": "e"}),
+            json!({"id": 3, "tier": "f"}),
+        ])
+        .unwrap();
+        assert_eq!(j.stats().duplicates, 2);
     }
 
     #[test]

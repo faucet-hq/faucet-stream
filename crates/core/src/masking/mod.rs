@@ -96,14 +96,21 @@ fn mask_node(node: &mut Value, path: &str, m: &CompiledMasking, hits: &mut Vec<M
     match node {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
-                let child = child_path(path, k);
-                mask_node(v, &child, m, hits);
+                // No name rule → the path is never read, so build none.
+                if m.needs_paths {
+                    mask_node(v, &child_path(path, k), m, hits);
+                } else {
+                    mask_node(v, UNTRACKED_PATH, m, hits);
+                }
             }
         }
         Value::Array(items) => {
             for (i, v) in items.iter_mut().enumerate() {
-                let child = child_path(path, &i.to_string());
-                mask_node(v, &child, m, hits);
+                if m.needs_paths {
+                    mask_node(v, &child_path(path, &i.to_string()), m, hits);
+                } else {
+                    mask_node(v, UNTRACKED_PATH, m, hits);
+                }
             }
         }
         _ => {}
@@ -145,8 +152,6 @@ fn first_match<'a>(
     path: &str,
     m: &'a CompiledMasking,
 ) -> Option<(&'a CompiledRule, Option<&'static str>)> {
-    // The scalar string form, computed once, for value-detector matching.
-    let scalar = scalar_to_string(node);
     for rule in &m.rules {
         // Name-based: field pattern over the dot-path, or explicit field list.
         // The empty root path never matches a name rule.
@@ -160,9 +165,10 @@ fn first_match<'a>(
                 return Some((rule, None));
             }
         }
-        // Value-based: run the detector over the scalar string form.
-        if let (Some(det), Some(s)) = (rule.value_detector, scalar.as_deref())
-            && detect::detects(det, s)
+        // Value-based: strings through every detector, numbers through the
+        // card detector only.
+        if let Some(det) = rule.value_detector
+            && detect::detects_value(det, node)
         {
             return Some((rule, Some(detector_label(det))));
         }
@@ -210,6 +216,9 @@ fn scalar_to_string(v: &Value) -> Option<String> {
         _ => None,
     }
 }
+
+/// The path of a non-root node when no rule matches by name.
+const UNTRACKED_PATH: &str = "*";
 
 fn child_path(prefix: &str, key: &str) -> String {
     if prefix.is_empty() {
@@ -292,6 +301,28 @@ mod tests {
             json!({"contact": "***", "note": "hi", "n": 5})
         );
         assert_eq!(out.hits[0].detector, Some("email"));
+    }
+
+    #[test]
+    fn numbers_are_not_phones_but_can_be_cards() {
+        let m = compile(json!({
+            "rules": [
+                { "match": { "value_detector": "phone" }, "action": { "type": "redact" } },
+                { "match": { "value_detector": "credit_card" }, "action": { "type": "redact" } }
+            ]
+        }));
+        let out = apply_masking(
+            vec![json!({
+                "ts": 1717200000000u64, "amount": 4155552671u64, "flag": true,
+                "tel": "415-555-2671", "cc": 4111111111111111u64
+            })],
+            &m,
+        );
+        assert_eq!(
+            out.records[0],
+            json!({"ts": 1717200000000u64, "amount": 4155552671u64, "flag": true,
+                   "tel": "***", "cc": "***"})
+        );
     }
 
     #[test]

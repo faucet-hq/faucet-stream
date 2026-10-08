@@ -214,7 +214,7 @@ mod containers {
             avro(&[json!({"id": 1}), json!({"id": 2})]),
         )
         .await;
-        put(port, "avro/b.avro", avro(&[json!({"id": 3, "more": "x"})])).await;
+        put(port, "avro/b.avro", avro(&[json!({"id": 3})])).await;
         put(port, "bad/a.avro", avro(&[json!({"id": 1})])).await;
         put(port, "bad/b.avro", avro(&[json!({"id": "text"})])).await;
         put(port, "orc/p.orc", ORC.to_vec()).await;

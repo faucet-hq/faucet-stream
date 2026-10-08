@@ -19,6 +19,39 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{Instrument, info_span};
 
+/// Count a native payload's bytes as they pass: a buffered payload at once, a
+/// streamed one chunk by chunk.
+fn metered_payload(
+    payload: crate::native::NativePayload,
+    labels: Vec<Label>,
+    metric: &'static str,
+    add: impl Fn(u64) + Send + Sync + 'static,
+) -> crate::native::NativePayload {
+    use crate::native::NativePayload;
+    use futures::StreamExt;
+    match payload {
+        NativePayload::Bytes(b) => {
+            counter!(metric, labels).increment(b.len() as u64);
+            add(b.len() as u64);
+            NativePayload::Bytes(b)
+        }
+        NativePayload::Stream(s) => NativePayload::Stream(Box::pin(s.inspect(move |chunk| {
+            if let Ok(c) = chunk {
+                counter!(metric, labels.clone()).increment(c.len() as u64);
+                add(c.len() as u64);
+            }
+        }))),
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
+}
+
 /// Guard an inner connector's `connector_name()` so an empty string maps to
 /// the `"unknown"` fallback. Used both for the `connector` metric label and the
 /// `connector_name()` passthrough so the two never disagree.
@@ -191,7 +224,19 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::columnar::ColumnarPage, FaucetError>> + Send + 'b>>
     {
-        self.inner.stream_batches(context, batch_size)
+        use futures::StreamExt;
+        let inner = self.inner.stream_batches(context, batch_size);
+        let Some(meter) = self.meter.clone() else {
+            return inner;
+        };
+        let labels = self.metric_labels();
+        Box::pin(inner.inspect(move |page| {
+            if let Ok(page) = page {
+                let bytes = page.batch.get_array_memory_size() as u64;
+                counter!("faucet_source_bytes_total", labels.clone()).increment(bytes);
+                meter.add_read(page.batch.num_rows() as u64, bytes);
+            }
+        }))
     }
 
     // Native byte-passthrough capability (#633) forwards to the inner source; the
@@ -207,7 +252,24 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'b>>
     {
-        self.inner.stream_native(context, format, batch_size)
+        use futures::StreamExt;
+        let inner = self.inner.stream_native(context, format, batch_size);
+        let Some(meter) = self.meter.clone() else {
+            return inner;
+        };
+        let labels = self.metric_labels();
+        Box::pin(inner.map(move |batch| {
+            batch.map(|mut b| {
+                let records = b.records.unwrap_or(0);
+                b.payload =
+                    metered_payload(b.payload, labels.clone(), "faucet_source_bytes_total", {
+                        let meter = Arc::clone(&meter);
+                        move |n| meter.add_read(0, n)
+                    });
+                meter.add_read(records, 0);
+                b
+            })
+        }))
     }
 
     fn stream_pages<'b>(
@@ -401,6 +463,9 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
 
 #[async_trait]
 impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     fn connector_name(&self) -> &'static str {
         // Return the guarded name so an inner connector that returns "" maps to
         // the "unknown" fallback — keeping this passthrough consistent with the
@@ -444,7 +509,15 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         &self,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
-        self.inner.write_batch_columnar(batch).await
+        let n = self.inner.write_batch_columnar(batch).await?;
+        if let Some(m) = &self.meter {
+            let rows = batch.num_rows().max(1);
+            let bytes = (batch.get_array_memory_size() as u64).saturating_mul(n.min(rows) as u64)
+                / rows as u64;
+            counter!("faucet_sink_bytes_total", self.metric_labels()).increment(bytes);
+            m.add_written(n as u64, bytes);
+        }
+        Ok(n)
     }
 
     // Native byte-passthrough load (#633): forward to the inner sink; the native
@@ -459,7 +532,25 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         scope: &str,
         ctx: crate::native::NativeLoadContext,
     ) -> Result<usize, FaucetError> {
-        self.inner.load_native(batch, scope, ctx).await
+        let Some(meter) = self.meter.clone() else {
+            return self.inner.load_native(batch, scope, ctx).await;
+        };
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut batch = batch;
+        batch.payload = metered_payload(
+            batch.payload,
+            self.metric_labels(),
+            "faucet_sink_bytes_total",
+            {
+                let bytes = Arc::clone(&bytes);
+                move |n| {
+                    bytes.fetch_add(n, Ordering::Relaxed);
+                }
+            },
+        );
+        let n = self.inner.load_native(batch, scope, ctx).await?;
+        meter.add_written(n as u64, bytes.load(Ordering::Relaxed));
+        Ok(n)
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -688,12 +779,52 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        let n = self
-            .inner
-            .write_batch_idempotent(records, scope, token)
-            .await?;
-        self.meter_written(records, n);
-        Ok(n)
+        let span = info_span!(
+            "faucet.sink.write_idempotent",
+            pipeline = %self.labels.pipeline,
+            row = %self.labels.row,
+            run_id = %self.labels.run_id,
+            connector = %self.connector,
+            records = records.len(),
+        );
+        let metric_labels = self.metric_labels();
+        gauge!("faucet_sink_in_flight", metric_labels.clone()).increment(1.0);
+        struct InFlightGuard(Vec<Label>);
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                gauge!("faucet_sink_in_flight", self.0.clone()).decrement(1.0);
+            }
+        }
+        let _in_flight = InFlightGuard(metric_labels.clone());
+        let _timer =
+            DurationGuard::new("faucet_sink_write_duration_seconds", metric_labels.clone());
+
+        let result = AssertUnwindSafe(self.inner.write_batch_idempotent(records, scope, token))
+            .catch_unwind()
+            .instrument(span)
+            .await;
+        match result {
+            Ok(Ok(n)) => {
+                counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
+                counter!("faucet_sink_records_total", metric_labels).increment(n as u64);
+                self.meter_written(records, n);
+                Ok(n)
+            }
+            Ok(Err(e)) => {
+                counter!(
+                    "faucet_sink_errors_total",
+                    self.error_labels(error_kind(&e))
+                )
+                .increment(1);
+                Err(e)
+            }
+            Err(panic) => {
+                counter!("faucet_sink_errors_total", self.error_labels("Panic")).increment(1);
+                Err(FaucetError::Custom(
+                    format!("panic in sink: {}", panic_message(&*panic)).into(),
+                ))
+            }
+        }
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
@@ -717,6 +848,57 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     }
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
+    }
+
+    fn write_batch_is_replay_safe(&self) -> bool {
+        self.inner.write_batch_is_replay_safe()
+    }
+
+    fn supports_staged_load(&self) -> bool {
+        self.inner.supports_staged_load()
+    }
+
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+
+    fn supports_rollback(&self) -> bool {
+        self.inner.supports_rollback()
+    }
+
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &crate::rollback::RollbackOptions,
+    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
+        self.inner.rollback_run(run_id, opts).await
+    }
+
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.inner.forget_run(run_id).await
+    }
+
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.inner.rewind_commit_token(scope, token).await
+    }
+
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.inner.readback_source()
+    }
+
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
+    }
+
+    async fn check(
+        &self,
+        ctx: &crate::check::CheckContext,
+    ) -> Result<crate::check::CheckReport, FaucetError> {
+        self.inner.check(ctx).await
     }
 }
 
@@ -1594,5 +1776,243 @@ mod sink_tests {
             "classification must survive verbatim"
         );
         assert_eq!(sink.dataset_uri(), "file:///tmp/out.jsonl");
+    }
+
+    fn counters_for(row: &str) -> HashMap<String, u64> {
+        let mut out = HashMap::new();
+        for (key, _u, _d, v) in snapshotter().snapshot().into_vec() {
+            let k = key.key();
+            if k.labels().any(|l| l.key() == "row" && l.value() == row)
+                && let DebugValue::Counter(c) = v
+            {
+                *out.entry(k.name().to_string()).or_default() += c;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn instrumented_sink_forwards_every_hook() {
+        let probe = crate::sink_forwarding::HookSink::default();
+        let wrapped = InstrumentedSink::new(&probe, labels());
+        crate::sink_forwarding::assert_forwards_every_hook(&wrapped, &probe, &[]).await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn idempotent_write_is_counted_metered_and_panic_guarded() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap = snapshotter();
+        let probe = crate::sink_forwarding::HookSink::default();
+        let meter = Arc::new(UsageMeter::new());
+        let wrapped = InstrumentedSink::new(&probe, Labels::new("p", "eo-row", "rid"))
+            .with_meter(Arc::clone(&meter));
+        let n = wrapped
+            .write_batch_idempotent(&[json!({"a": 1}), json!({"a": 2})], "s", "t")
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        let c = counters_for("eo-row");
+        assert_eq!(c["faucet_sink_writes_total"], 1);
+        assert_eq!(c["faucet_sink_records_total"], 2);
+        assert_eq!(meter.snapshot().records_written, 2);
+
+        struct EoPanics;
+        #[async_trait]
+        impl Sink for EoPanics {
+            async fn write_batch(&self, _: &[Value]) -> Result<usize, FaucetError> {
+                Ok(0)
+            }
+            async fn write_batch_idempotent(
+                &self,
+                _: &[Value],
+                _: &str,
+                _: &str,
+            ) -> Result<usize, FaucetError> {
+                panic!("eo kaboom")
+            }
+        }
+        let wrapped = InstrumentedSink::new(&EoPanics, Labels::new("p", "eo-panic", "rid"));
+        let err = wrapped
+            .write_batch_idempotent(&[json!({})], "s", "t")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("panic in sink: eo kaboom"),
+            "{err}"
+        );
+        assert_eq!(counters_for("eo-panic")["faucet_sink_errors_total"], 1);
+
+        struct EoFails;
+        #[async_trait]
+        impl Sink for EoFails {
+            async fn write_batch(&self, _: &[Value]) -> Result<usize, FaucetError> {
+                Ok(0)
+            }
+            async fn write_batch_idempotent(
+                &self,
+                _: &[Value],
+                _: &str,
+                _: &str,
+            ) -> Result<usize, FaucetError> {
+                Err(FaucetError::Sink("nope".into()))
+            }
+        }
+        let wrapped = InstrumentedSink::new(&EoFails, Labels::new("p", "eo-err", "rid"));
+        assert!(wrapped.write_batch_idempotent(&[], "s", "t").await.is_err());
+        assert_eq!(counters_for("eo-err")["faucet_sink_errors_total"], 1);
+    }
+
+    #[tokio::test]
+    async fn native_loads_are_metered_for_buffered_and_streamed_payloads() {
+        use crate::native::{NativeBatch, NativeFormat, NativeLoadContext, NativePayload};
+        let probe = crate::sink_forwarding::HookSink::default();
+        let meter = Arc::new(UsageMeter::new());
+        let wrapped = InstrumentedSink::new(&probe, labels()).with_meter(Arc::clone(&meter));
+        let ctx = || NativeLoadContext {
+            write_mode: crate::write_mode::WriteMode::Append,
+            first_batch: true,
+        };
+        let batch = |payload| NativeBatch {
+            format: NativeFormat::NdJson,
+            payload,
+            csv: Default::default(),
+            records: Some(2),
+            bookmark: None,
+        };
+        wrapped
+            .load_native(batch(NativePayload::Bytes(vec![0; 10])), "s", ctx())
+            .await
+            .unwrap();
+        let stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, FaucetError>> + Send>> =
+            Box::pin(futures::stream::iter(vec![Ok(vec![0; 3]), Ok(vec![0; 4])]));
+        struct Drains;
+        #[async_trait]
+        impl Sink for Drains {
+            async fn write_batch(&self, _: &[Value]) -> Result<usize, FaucetError> {
+                Ok(0)
+            }
+            async fn load_native(
+                &self,
+                batch: NativeBatch,
+                _: &str,
+                _: NativeLoadContext,
+            ) -> Result<usize, FaucetError> {
+                use futures::StreamExt;
+                if let NativePayload::Stream(mut s) = batch.payload {
+                    while s.next().await.is_some() {}
+                }
+                Ok(5)
+            }
+        }
+        let wrapped2 = InstrumentedSink::new(&Drains, labels()).with_meter(Arc::clone(&meter));
+        wrapped2
+            .load_native(batch(NativePayload::Stream(stream)), "s", ctx())
+            .await
+            .unwrap();
+        let snap = meter.snapshot();
+        assert_eq!(snap.records_written, 7 + 5);
+        assert_eq!(snap.bytes_written, 10 + 7);
+    }
+
+    #[tokio::test]
+    async fn native_source_batches_are_metered() {
+        use crate::native::{NativeBatch, NativeFormat, NativePayload};
+        struct Native;
+        #[async_trait]
+        impl Source for Native {
+            async fn fetch_with_context(
+                &self,
+                _: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(vec![])
+            }
+            fn stream_native<'b>(
+                &'b self,
+                _: &'b HashMap<String, Value>,
+                _: NativeFormat,
+                _: usize,
+            ) -> Pin<Box<dyn Stream<Item = Result<NativeBatch, FaucetError>> + Send + 'b>>
+            {
+                let b = NativeBatch {
+                    format: NativeFormat::NdJson,
+                    payload: NativePayload::Bytes(vec![1; 6]),
+                    csv: Default::default(),
+                    records: Some(3),
+                    bookmark: None,
+                };
+                Box::pin(futures::stream::iter(vec![Ok(b)]))
+            }
+        }
+        use futures::StreamExt;
+        let meter = Arc::new(UsageMeter::new());
+        let wrapped = InstrumentedSource::new(&Native, labels()).with_meter(Arc::clone(&meter));
+        let ctx = HashMap::new();
+        let got: Vec<_> = wrapped
+            .stream_native(&ctx, NativeFormat::NdJson, 10)
+            .collect()
+            .await;
+        assert_eq!(got.len(), 1);
+        let snap = meter.snapshot();
+        assert_eq!((snap.records_read, snap.bytes_read), (3, 6));
+        let unmetered = InstrumentedSource::new(&Native, labels());
+        assert_eq!(
+            unmetered
+                .stream_native(&ctx, NativeFormat::NdJson, 10)
+                .count()
+                .await,
+            1
+        );
+    }
+
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn columnar_batches_are_metered_on_both_sides() {
+        use crate::columnar::ColumnarPage;
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        fn batch() -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap()
+        }
+        struct Cols;
+        #[async_trait]
+        impl Source for Cols {
+            async fn fetch_with_context(
+                &self,
+                _: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(vec![])
+            }
+            fn stream_batches<'b>(
+                &'b self,
+                _: &'b HashMap<String, Value>,
+                _: usize,
+            ) -> Pin<Box<dyn Stream<Item = Result<ColumnarPage, FaucetError>> + Send + 'b>>
+            {
+                Box::pin(futures::stream::iter(vec![Ok(ColumnarPage {
+                    batch: batch(),
+                    bookmark: None,
+                })]))
+            }
+        }
+        use futures::StreamExt;
+        let meter = Arc::new(UsageMeter::new());
+        let src = InstrumentedSource::new(&Cols, labels()).with_meter(Arc::clone(&meter));
+        let ctx = HashMap::new();
+        assert_eq!(src.stream_batches(&ctx, 10).count().await, 1);
+        let unmetered = InstrumentedSource::new(&Cols, labels());
+        assert_eq!(unmetered.stream_batches(&ctx, 10).count().await, 1);
+
+        let probe = crate::sink_forwarding::HookSink::default();
+        let sink = InstrumentedSink::new(&probe, labels()).with_meter(Arc::clone(&meter));
+        assert_eq!(sink.write_batch_columnar(&batch()).await.unwrap(), 3);
+        let snap = meter.snapshot();
+        assert_eq!((snap.records_read, snap.records_written), (3, 3));
+        assert!(snap.bytes_read > 0);
+        assert_eq!(snap.bytes_read, snap.bytes_written);
     }
 }

@@ -10,7 +10,8 @@
 //!
 //! - **Records / bytes** are checked **before** a page is written. A page
 //!   that would cross the ceiling is refused whole with
-//!   [`FaucetError::BudgetExceeded`]: nothing of it lands and the pipeline
+//!   [`FaucetError::BudgetExceeded`] — checked through [`Sink::admit_page`]
+//!   before adaptive batching splits it — so nothing of it lands and the pipeline
 //!   never advances the bookmark past it, so a resumed run picks the page up
 //!   again. Refusing rather than truncating is what keeps the bookmark honest
 //!   (a partial write with a full-page bookmark would silently drop rows).
@@ -211,6 +212,9 @@ pub struct BudgetSink {
     spec: BudgetSpec,
     state: Arc<BudgetState>,
     cancel: CancellationToken,
+    /// Rows of a page already admitted whole by `admit_page` and not yet
+    /// written, so its sub-batches are not checked again one by one.
+    prepaid: AtomicU64,
 }
 
 impl BudgetSink {
@@ -231,6 +235,7 @@ impl BudgetSink {
                 spec,
                 state: Arc::clone(&state),
                 cancel,
+                prepaid: AtomicU64::new(0),
             },
             state,
             timer,
@@ -241,43 +246,55 @@ impl BudgetSink {
     /// written; on a crossing, record the verdict and refuse the page.
     fn admit(&self, records: &[Value]) -> Result<u64, FaucetError> {
         let n = records.len() as u64;
-        let bytes = if self.spec.max_bytes.is_some() {
-            estimate_page_bytes(records)
-        } else {
-            0
-        };
+        let bytes = self.page_bytes(records);
         if let Some(v) = self.state.verdict() {
             // Already over: refuse everything after the verdict, so a page
             // can't slip in between the cancel and the flush.
             return Err(v.error());
         }
+        let prepaid = self.prepaid.load(Ordering::Relaxed);
+        if prepaid >= n && n > 0 {
+            self.prepaid.store(prepaid - n, Ordering::Relaxed);
+            return Ok(bytes);
+        }
+        self.prepaid.store(0, Ordering::Relaxed);
+        self.check_ceilings(n, bytes)?;
+        Ok(bytes)
+    }
+
+    fn page_bytes(&self, records: &[Value]) -> u64 {
+        if self.spec.max_bytes.is_some() {
+            estimate_page_bytes(records)
+        } else {
+            0
+        }
+    }
+
+    fn check_ceilings(&self, n: u64, bytes: u64) -> Result<(), FaucetError> {
         if let Some(max) = self.spec.max_records {
             let would = self.state.records() + n;
             if would > max {
-                let v = BudgetVerdict {
-                    kind: BudgetKind::Records,
-                    limit: max,
-                    actual: would,
-                };
-                self.state.set_verdict(v.clone());
-                self.cancel.cancel();
-                return Err(v.error());
+                return Err(self.refuse(BudgetKind::Records, max, would));
             }
         }
         if let Some(max) = self.spec.max_bytes {
             let would = self.state.bytes() + bytes;
             if would > max {
-                let v = BudgetVerdict {
-                    kind: BudgetKind::Bytes,
-                    limit: max,
-                    actual: would,
-                };
-                self.state.set_verdict(v.clone());
-                self.cancel.cancel();
-                return Err(v.error());
+                return Err(self.refuse(BudgetKind::Bytes, max, would));
             }
         }
-        Ok(bytes)
+        Ok(())
+    }
+
+    fn refuse(&self, kind: BudgetKind, limit: u64, actual: u64) -> FaucetError {
+        let v = BudgetVerdict {
+            kind,
+            limit,
+            actual,
+        };
+        self.state.set_verdict(v.clone());
+        self.cancel.cancel();
+        v.error()
     }
 
     fn account(&self, accepted: u64, bytes: u64) {
@@ -321,6 +338,15 @@ impl Drop for BudgetTimer {
 
 #[async_trait]
 impl Sink for BudgetSink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        if let Some(v) = self.state.verdict() {
+            return Err(v.error());
+        }
+        self.check_ceilings(records.len() as u64, self.page_bytes(records))?;
+        self.inner.admit_page(records).await?;
+        self.prepaid.store(records.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let bytes = self.admit(records)?;
         let n = self.inner.write_batch(records).await?;
@@ -420,6 +446,12 @@ impl Sink for BudgetSink {
     }
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
     }
     fn supports_rollback(&self) -> bool {
         self.inner.supports_rollback()
@@ -776,5 +808,119 @@ mod tests {
         );
         assert!(t.0.is_none());
         assert!(st.verdict().is_none());
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedCount(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Sink for SharedCount {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.0.fetch_add(records.len(), Ordering::Relaxed);
+            Ok(records.len())
+        }
+        async fn write_batch_partial(
+            &self,
+            records: &[Value],
+        ) -> Result<Vec<RowOutcome>, FaucetError> {
+            self.0.fetch_add(records.len(), Ordering::Relaxed);
+            Ok(records.iter().map(|_| Ok(())).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_page_refuses_the_whole_page_and_prepays_an_admitted_one() {
+        let cancel = CancellationToken::new();
+        let inner = SharedCount::default();
+        let (sink, state, _t) = BudgetSink::wrap(
+            Box::new(inner.clone()),
+            BudgetSpec {
+                max_records: Some(5),
+                max_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+            cancel.clone(),
+        );
+        sink.admit_page(&page(4)).await.unwrap();
+        assert_eq!(sink.write_batch(&page(2)).await.unwrap(), 2);
+        assert_eq!(sink.write_batch(&page(2)).await.unwrap(), 2);
+        assert_eq!(state.records(), 4);
+        let err = sink.admit_page(&page(2)).await.unwrap_err();
+        assert!(
+            matches!(err, FaucetError::BudgetExceeded { actual: 6, .. }),
+            "{err}"
+        );
+        assert!(cancel.is_cancelled());
+        assert!(sink.admit_page(&page(1)).await.is_err(), "verdict sticks");
+        assert_eq!(inner.0.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn an_unprepaid_chunk_is_checked_on_its_own() {
+        let (sink, _state, _t) = BudgetSink::wrap(
+            Box::new(SharedCount::default()),
+            BudgetSpec {
+                max_records: Some(3),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        );
+        sink.admit_page(&page(2)).await.unwrap();
+        assert!(sink.write_batch(&page(4)).await.is_err());
+    }
+
+    async fn run_adaptive(
+        dlq: bool,
+    ) -> (Result<crate::pipeline::PipelineResult, FaucetError>, usize) {
+        use crate::RunStreamOptions;
+        use crate::pipeline::{StreamPage, run_stream};
+        let inner = SharedCount::default();
+        let (sink, _state, _t) = BudgetSink::wrap(
+            Box::new(inner.clone()),
+            BudgetSpec {
+                max_records: Some(3),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        );
+        let stream = futures::stream::iter(vec![Ok(StreamPage {
+            records: page(5),
+            bookmark: Some(json!(1)),
+        })]);
+        let cfg: crate::adaptive::AdaptiveBatchConfig =
+            serde_json::from_value(json!({"enabled": true, "min": 1, "max": 2})).unwrap();
+        let mut opts = RunStreamOptions::new().with_adaptive(cfg);
+        if dlq {
+            opts = opts.with_dlq(crate::dlq::DlqConfig::new(Arc::new(SharedCount::default())));
+        }
+        let r = run_stream(stream, &sink, opts).await;
+        (r, inner.0.load(Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn adaptive_reslicing_lands_nothing_of_a_refused_page() {
+        for dlq in [false, true] {
+            let (r, landed) = run_adaptive(dlq).await;
+            assert!(
+                matches!(r, Err(FaucetError::BudgetExceeded { .. })),
+                "dlq={dlq}: {r:?}"
+            );
+            assert_eq!(landed, 0, "dlq={dlq}");
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_sink_forwards_every_hook_but_native() {
+        let probe = crate::sink_forwarding::HookSink::default();
+        let (sink, _s, _t) = BudgetSink::wrap(
+            Box::new(probe.clone()),
+            BudgetSpec::default(),
+            CancellationToken::new(),
+        );
+        crate::sink_forwarding::assert_forwards_every_hook(
+            &sink,
+            &probe,
+            &["native_load_capabilities", "load_native"],
+        )
+        .await;
     }
 }

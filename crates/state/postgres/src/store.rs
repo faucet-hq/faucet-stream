@@ -1,7 +1,7 @@
 //! PostgreSQL-backed [`StateStore`].
 
 use async_trait::async_trait;
-use faucet_core::state::{DOCTOR_SENTINEL_KEY, StateStore, validate_state_key};
+use faucet_core::state::{StateStore, doctor_sentinel_key, validate_state_key};
 use faucet_core::util::quote_ident;
 use faucet_core::{FaucetError, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -365,10 +365,11 @@ impl PostgresStateStore {
     /// own `put`/`get`/`delete` against the configured table.
     async fn sentinel_roundtrip(&self) -> Result<(), FaucetError> {
         let probe = serde_json::json!({ "faucet_doctor": true });
-        self.put(DOCTOR_SENTINEL_KEY, &probe).await?;
-        let got = self.get(DOCTOR_SENTINEL_KEY).await?;
+        let key = doctor_sentinel_key();
+        self.put(&key, &probe).await?;
+        let got = self.get(&key).await?;
         // Best-effort cleanup regardless of the read result.
-        let _ = self.delete(DOCTOR_SENTINEL_KEY).await;
+        let _ = self.delete(&key).await;
         match got {
             Some(v) if v == probe => Ok(()),
             _ => Err(FaucetError::State(

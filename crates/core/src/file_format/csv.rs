@@ -58,6 +58,8 @@ pub struct CsvRowReader<R> {
     flexible: bool,
     null_values: Vec<String>,
     records: usize,
+    width: Option<usize>,
+    ragged: usize,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin + Send> CsvRowReader<R> {
@@ -87,6 +89,8 @@ impl<R: tokio::io::AsyncRead + Unpin + Send> CsvRowReader<R> {
             flexible,
             null_values: opts.null_values.clone(),
             records: 0,
+            width: None,
+            ragged: 0,
         })
     }
 
@@ -100,17 +104,37 @@ impl<R: tokio::io::AsyncRead + Unpin + Send> CsvRowReader<R> {
                 .await
                 .map_err(|e| self.parse_error(e))?;
             if !more {
+                if self.ragged > 0 {
+                    tracing::warn!(
+                        ragged_rows = self.ragged,
+                        "csv: accepted {} ragged row(s) because the dialect is flexible — short \
+                         rows lose trailing fields and long rows gain `column_<i>` keys; set \
+                         `csv.flexible: false` to refuse them",
+                        self.ragged
+                    );
+                    self.ragged = 0;
+                }
                 return Ok(None);
+            }
+            let width = self.record.len();
+            match self.width {
+                None => self.width = Some(width),
+                Some(w) if w != width => self.ragged += 1,
+                Some(_) => {}
             }
             if self.has_headers && self.headers.is_none() {
                 self.headers = Some(unique_headers(&self.record)?);
                 continue;
             }
-            return Ok(Some(Value::Object(record_to_object(
-                &self.record,
-                self.headers.as_deref(),
-                &self.null_values,
-            ))));
+            let at = self.records;
+            return record_to_object(&self.record, self.headers.as_deref(), &self.null_values)
+                .map(|o| Some(Value::Object(o)))
+                .map_err(|key| {
+                    FaucetError::Source(format!(
+                        "csv: record {at} is longer than the header and its extra field \
+                         `{key}` would overwrite the column of that name"
+                    ))
+                });
         }
     }
 
@@ -156,11 +180,14 @@ fn unique_headers(rec: &csv_async::StringRecord) -> Result<Vec<String>, FaucetEr
 
 /// How one CSV record becomes a JSON object — the single definition, so the
 /// `Value` path and any byte path can never drift apart.
+///
+/// `Err(key)` when a field past the header would overwrite a header column
+/// literally named `column_<i>` (CORE-60).
 fn record_to_object(
     rec: &csv_async::StringRecord,
     headers: Option<&[String]>,
     null_values: &[String],
-) -> Map<String, Value> {
+) -> Result<Map<String, Value>, String> {
     let mut obj = Map::new();
     for (i, field) in rec.iter().enumerate() {
         let key = headers
@@ -171,9 +198,11 @@ fn record_to_object(
         } else {
             Value::String(field.to_string())
         };
-        obj.insert(key, value);
+        if obj.insert(key.clone(), value).is_some() {
+            return Err(key);
+        }
     }
-    obj
+    Ok(obj)
 }
 
 /// Write records as CSV.
@@ -315,6 +344,29 @@ mod tests {
         assert_eq!(recs, vec![json!({"a": "x,y", "b": "2"})]);
         let out = encode_with(&recs, &o).expect("encode");
         assert_eq!(String::from_utf8(out).unwrap(), "a,b\n'x,y',2\n");
+    }
+
+    #[tokio::test]
+    async fn a_long_row_cannot_overwrite_a_column_named_like_its_fallback_key() {
+        let err = decode_with(b"a,column_2\n1,2\n3,4,5\n", &CsvOptions::default(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`column_2`") && err.contains("record 3"),
+            "{err}"
+        );
+        // Ragged rows that collide with nothing are still accepted (and counted).
+        let recs = decode_with(b"a,b\n1\n2,3,4\n", &CsvOptions::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            recs,
+            vec![
+                json!({"a": "1"}),
+                json!({"a": "2", "b": "3", "column_2": "4"})
+            ]
+        );
     }
 
     #[tokio::test]

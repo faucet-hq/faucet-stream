@@ -813,7 +813,7 @@ async fn build_topology_inner(
                         }
                         .map(|b| b.attributes.clone())
                         .unwrap_or_default();
-                        let policy_sink = faucet_core::PolicySink::new(
+                        let mut policy_sink = faucet_core::PolicySink::new(
                             sink,
                             std::sync::Arc::new(compiled),
                             faucet_core::SinkFacts {
@@ -826,6 +826,10 @@ async fn build_topology_inner(
                                 row: (*id).clone(),
                             },
                         );
+                        if let Some(dlq) = &spec.dlq {
+                            policy_sink =
+                                policy_sink.with_dlq_destination(crate::policy::dlq_facts(dlq));
+                        }
                         Box::new(match cfg.pipeline.masking.as_ref() {
                             Some(masking) => policy_sink.with_masking(std::sync::Arc::new(
                                 faucet_core::CompiledMasking::compile_for_sink(

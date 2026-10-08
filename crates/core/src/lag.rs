@@ -140,14 +140,20 @@ pub fn record_lag_gauges(labels: &[Label], lag: &SourceLag) {
 /// How often the pipeline asks a source for its lag while pages flow.
 pub const LAG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long one lag query may take before it is abandoned (logged once), so a
+/// hung query never stalls page delivery.
+pub const LAG_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Polls [`Source::lag`](crate::Source::lag) for one run: on the first page,
 /// then at most every [`LAG_POLL_INTERVAL`], and once more when the run ends.
-/// A failing query is logged once and never fails the run.
+/// A failing or slow (over [`LAG_POLL_TIMEOUT`]) query is logged once and
+/// never fails or stalls the run.
 pub(crate) struct LagPoller<'a> {
     source: &'a dyn crate::Source,
     labels: Vec<Label>,
     observer: Option<std::sync::Arc<LagObserver>>,
     interval: std::time::Duration,
+    timeout: std::time::Duration,
     last_poll: std::sync::Mutex<Option<std::time::Instant>>,
     warned: std::sync::atomic::AtomicBool,
 }
@@ -172,9 +178,16 @@ impl<'a> LagPoller<'a> {
             source,
             observer,
             interval: LAG_POLL_INTERVAL,
+            timeout: LAG_POLL_TIMEOUT,
             last_poll: std::sync::Mutex::new(None),
             warned: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     #[cfg(test)]
@@ -196,7 +209,14 @@ impl<'a> LagPoller<'a> {
             }
             *last = Some(now);
         }
-        match self.source.lag().await {
+        let result = match tokio::time::timeout(self.timeout, self.source.lag()).await {
+            Ok(r) => r,
+            Err(_) => Err(crate::FaucetError::Source(format!(
+                "lag query did not answer within {:?}",
+                self.timeout
+            ))),
+        };
+        match result {
             Ok(Some(lag)) if !lag.is_empty() => {
                 record_lag_gauges(&self.labels, &lag);
                 if let Some(o) = &self.observer {
@@ -325,5 +345,38 @@ mod tests {
             },
         );
         record_lag_gauges(&[], &SourceLag::default());
+    }
+
+    #[tokio::test]
+    async fn a_hung_lag_query_is_abandoned() {
+        struct Hangs;
+        #[async_trait::async_trait]
+        impl crate::Source for Hangs {
+            async fn fetch_with_context(
+                &self,
+                _: &std::collections::HashMap<String, serde_json::Value>,
+            ) -> Result<Vec<serde_json::Value>, crate::FaucetError> {
+                Ok(Vec::new())
+            }
+            async fn lag(&self) -> Result<Option<SourceLag>, crate::FaucetError> {
+                std::future::pending().await
+            }
+        }
+        let obs = std::sync::Arc::new(LagObserver::new());
+        let p = LagPoller::new(&Hangs, "p", "r", Some(std::sync::Arc::clone(&obs)))
+            .with_timeout(std::time::Duration::from_millis(20));
+        tokio::time::timeout(std::time::Duration::from_secs(5), p.poll(true))
+            .await
+            .expect("poll must return after its timeout");
+        assert!(p.warned.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(obs.last(), None);
+        use crate::Source;
+        assert!(
+            Hangs
+                .fetch_with_context(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

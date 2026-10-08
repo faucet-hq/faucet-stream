@@ -113,7 +113,8 @@ pub enum DlqReason {
 
 impl DlqReason {
     /// Returns the stable Prometheus label value for this reason.
-    /// Closed-set values: `"partial"`, `"dlq_all"`, or `"quality"`.
+    /// Closed-set values: `"partial"`, `"dlq_all"`, `"quality"`,
+    /// `"schema_drift"` or `"contract"` (see [`ALL`](Self::ALL)).
     pub fn as_str(self) -> &'static str {
         match self {
             DlqReason::Partial => "partial",
@@ -483,6 +484,16 @@ impl BatchOutcomeSink {
         });
         result
     }
+}
+
+/// The error for a sink whose `write_batch_partial` returned a different number
+/// of outcomes than rows — a broken trait contract that would otherwise leave
+/// rows neither written nor routed to the DLQ (CORE-58).
+pub(crate) fn outcome_count_mismatch(connector: &str, got: usize, want: usize) -> FaucetError {
+    FaucetError::Sink(format!(
+        "sink `{connector}` returned {got} per-row outcomes for {want} rows; \
+         `write_batch_partial` must return exactly one outcome per input row"
+    ))
 }
 
 #[cfg(test)]

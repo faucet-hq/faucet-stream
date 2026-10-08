@@ -437,6 +437,27 @@ pub async fn decode(
     }
 }
 
+/// [`decode`] for an owned body, run on a blocking thread.
+///
+/// The XML / Excel / Avro / ORC / JSON-array / CSV decoders are synchronous and
+/// CPU-bound; inline on an async worker a large object stalls heartbeats,
+/// cancellation and every other task on that worker (CORE-34). The body is
+/// moved rather than copied (ORC reads it in place).
+pub async fn decode_owned(
+    bytes: Vec<u8>,
+    format: FileFormat,
+    opts: &FormatOptions,
+) -> Result<Vec<Value>, FaucetError> {
+    let opts = opts.clone();
+    tokio::task::spawn_blocking(move || match format {
+        #[cfg(feature = "file-format-orc")]
+        FileFormat::Orc => orc::decode_owned(bytes, &opts.orc),
+        other => futures::executor::block_on(decode(&bytes, other, &opts)),
+    })
+    .await
+    .map_err(|e| FaucetError::Source(format!("file_format: decode task failed: {e}")))?
+}
+
 /// Encode records into one object's bytes.
 pub fn encode(
     records: &[Value],
@@ -627,6 +648,36 @@ pub fn cell_text(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn decode_owned_matches_decode_and_runs_off_the_runtime() {
+        let body = b"[{\"a\":1},{\"a\":2}]".to_vec();
+        let opts = FormatOptions::default();
+        assert_eq!(
+            decode_owned(body.clone(), FileFormat::JsonArray, &opts)
+                .await
+                .unwrap(),
+            decode(&body, FileFormat::JsonArray, &opts).await.unwrap()
+        );
+        assert!(
+            decode_owned(Vec::new(), FileFormat::Parquet, &opts)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "file-format-orc")]
+    #[tokio::test]
+    async fn decode_owned_reads_orc_in_place() {
+        const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/orc/people.orc");
+        let opts = FormatOptions::default();
+        assert_eq!(
+            decode_owned(FIXTURE.to_vec(), FileFormat::Orc, &opts)
+                .await
+                .unwrap(),
+            decode(FIXTURE, FileFormat::Orc, &opts).await.unwrap()
+        );
+    }
 
     /// Every variant's extension and wire name, so adding a format without
     /// giving it both is a test failure rather than a `.txt` file called

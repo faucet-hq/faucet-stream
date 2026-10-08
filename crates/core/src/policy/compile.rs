@@ -80,6 +80,19 @@ impl CompiledPolicy {
             .collect()
     }
 
+    /// [`labels_for_value`](Self::labels_for_value) over any JSON scalar: a
+    /// number is classified by the card detector too, as masking does.
+    pub fn labels_for_scalar(&self, value: &serde_json::Value) -> BTreeSet<String> {
+        self.classifications
+            .iter()
+            .filter(|c| {
+                c.value_detector
+                    .is_some_and(|d| detect::detects_value(d, value))
+            })
+            .map(|c| c.label.clone())
+            .collect()
+    }
+
     /// The value-detector classifications (the runtime backstop's work list).
     pub fn value_detectors(&self) -> impl Iterator<Item = (&str, Detector)> {
         self.classifications

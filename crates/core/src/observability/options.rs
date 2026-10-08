@@ -135,14 +135,14 @@ impl RunStreamOptions {
         self
     }
 
-    /// Set the resume sequence (exactly-once). Normally derived by
-    /// `Pipeline::run` from the unwrapped state value.
     /// Declare the source's replay capability (see the `replay` field).
     pub fn with_replay_guarantee(mut self, replay: crate::idempotency::ReplayGuarantee) -> Self {
         self.replay = Some(replay);
         self
     }
 
+    /// Set the resume sequence (exactly-once). Normally derived by
+    /// `Pipeline::run` from the unwrapped state value.
     pub fn with_start_seq(mut self, seq: u64) -> Self {
         self.start_seq = seq;
         self

@@ -125,8 +125,12 @@ impl CompiledCrossJoin {
     }
 
     /// Expand one record into the cartesian product of its named sibling arrays.
-    /// Non-object records pass through unchanged. Missing / non-array named
-    /// fields are treated as empty sets (subject to `on_empty`).
+    /// Non-object records pass through unchanged. Missing or `null` named fields
+    /// are treated as empty sets (subject to `on_empty`); a field that is present
+    /// but not an array is an error, so an upstream type change cannot silently
+    /// drop whole records (CORE-59). A produced column that would overwrite an
+    /// existing one (a parent field, or a field of an earlier array) is an error
+    /// too — set `prefix: true` to keep both (CORE-33).
     pub fn apply(&self, rec: Value) -> Result<Vec<Value>, FaucetError> {
         let Value::Object(obj) = rec else {
             return Ok(vec![rec]);
@@ -139,7 +143,18 @@ impl CompiledCrossJoin {
         for name in &self.spec.arrays {
             let elems = match obj.get(name) {
                 Some(Value::Array(a)) => a.clone(),
-                _ => Vec::new(),
+                None | Some(Value::Null) => Vec::new(),
+                Some(other) => {
+                    return Err(FaucetError::Transform(format!(
+                        "cross_join: field `{name}` is {} rather than an array",
+                        match other {
+                            Value::Object(_) => "an object",
+                            Value::String(_) => "a string",
+                            Value::Number(_) => "a number",
+                            _ => "a boolean",
+                        }
+                    )));
+                }
             };
             sets.push((name.as_str(), elems));
         }
@@ -198,7 +213,7 @@ impl CompiledCrossJoin {
             for base in &rows {
                 for elem in elems {
                     let mut row = base.clone();
-                    merge_element(&mut row, name, elem, self.spec.prefix);
+                    merge_element(&mut row, name, elem, self.spec.prefix)?;
                     next.push(row);
                 }
             }
@@ -211,8 +226,14 @@ impl CompiledCrossJoin {
 
 /// Merge one crossed array element into a product row. Object elements spread
 /// their fields (name-prefixed when `prefix`); scalar/null elements land under
-/// the array's own name.
-fn merge_element(row: &mut Map<String, Value>, array_name: &str, elem: &Value, prefix: bool) {
+/// the array's own name, replacing the raw array a kept parent carries. Any
+/// other overwrite of an existing column is refused.
+fn merge_element(
+    row: &mut Map<String, Value>,
+    array_name: &str,
+    elem: &Value,
+    prefix: bool,
+) -> Result<(), FaucetError> {
     match elem {
         Value::Object(fields) => {
             for (k, v) in fields {
@@ -221,6 +242,12 @@ fn merge_element(row: &mut Map<String, Value>, array_name: &str, elem: &Value, p
                 } else {
                     k.clone()
                 };
+                if row.contains_key(&key) {
+                    return Err(FaucetError::Transform(format!(
+                        "cross_join: field `{key}` of `{array_name}` would overwrite an \
+                         existing column — set `prefix: true` or rename it first"
+                    )));
+                }
                 row.insert(key, v.clone());
             }
         }
@@ -228,6 +255,7 @@ fn merge_element(row: &mut Map<String, Value>, array_name: &str, elem: &Value, p
             row.insert(array_name.to_string(), other.clone());
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -323,6 +351,42 @@ mod tests {
         assert_eq!(c.apply(json!(5)).unwrap(), vec![json!(5)]);
         // missing array under Skip → 0 rows
         assert!(c.apply(json!({"a": [{"x": 1}]})).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overwriting_a_column_is_refused_without_prefix() {
+        let c = spec(&["a", "b"]).compile().unwrap();
+        let err = c
+            .apply(json!({"id": 1, "a": [{"id": 9}], "b": [{"y": 2}]}))
+            .unwrap_err();
+        assert!(err.to_string().contains("field `id` of `a`"), "{err}");
+        let err = c
+            .apply(json!({"a": [{"x": 1}], "b": [{"x": 2}]}))
+            .unwrap_err();
+        assert!(err.to_string().contains("field `x` of `b`"), "{err}");
+        let mut p = spec(&["a", "b"]);
+        p.prefix = true;
+        let out = p
+            .compile()
+            .unwrap()
+            .apply(json!({"id": 1, "a": [{"id": 9}], "b": [{"id": 2}]}))
+            .unwrap();
+        assert_eq!(out[0]["id"], json!(1));
+        assert_eq!(out[0]["a_id"], json!(9));
+    }
+
+    #[test]
+    fn a_present_non_array_is_a_type_error() {
+        let c = spec(&["a", "b"]).compile().unwrap();
+        for bad in [json!({"x": 1}), json!("s"), json!(3), json!(true)] {
+            let err = c.apply(json!({"a": [{"x": 1}], "b": bad})).unwrap_err();
+            assert!(err.to_string().contains("rather than an array"), "{err}");
+        }
+        assert!(
+            c.apply(json!({"a": [{"x": 1}], "b": null}))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

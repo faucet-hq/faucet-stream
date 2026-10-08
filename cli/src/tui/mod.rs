@@ -111,10 +111,16 @@ pub fn install_tui_tracing(level: &str) -> LogBuffer {
     use tracing_subscriber::EnvFilter;
     let buffer = TUI_LOGS.get_or_init(LogBuffer::default).clone();
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .with_writer(buffer.clone())
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let _ = tracing_subscriber::registry()
+        .with(crate::trace_layer_slot())
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(buffer.clone()),
+        )
         .try_init();
     buffer
 }

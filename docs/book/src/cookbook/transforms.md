@@ -558,8 +558,9 @@ the report's header row and the group columns from `ancestors.as`. It is the
 one reshape that otherwise forced these connectors onto the embedded-DuckDB SQL
 transform; `tree_flatten` keeps them inbuilt. Uneven branch depth leaves the
 missing ancestor levels null; a header/cell length mismatch zips to the shorter;
-a malformed/cyclic tree is truncated at `max_depth` (logged) rather than
-overflowing the stack. It also flattens any generic `children` tree (org charts,
+a tree deeper than `max_depth` (a malformed or cyclic one) fails the record
+rather than overflowing the stack or dropping the deeper rows, and a repeated
+header label (or one that collides with an ancestor/path column) fails it too. It also flattens any generic `children` tree (org charts,
 category trees, BOM explosions). Column-lineage is opaque (structure-changing).
 Needs the `transform-tree-flatten` feature.
 
@@ -603,8 +604,11 @@ both name each fail the page, with the group and row named.
 Expands one record into the **cartesian product of two or more of its sibling
 array fields**, emitting one flat row per combination — e.g. a HCM record's
 `jobs[] × compensation[] × employment[]`. Object elements spread their fields
-into the row (`prefix: true` name-prefixes them to avoid collisions); scalar
-elements land under the array's name. This is a different shape from `explode`
+into the row; a field that would overwrite an existing column (a parent field
+such as `id`, or a field of an earlier array) fails the record, so set
+`prefix: true` to name-prefix them instead. Scalar elements land under the
+array's name. A crossed field that is missing or `null` counts as empty; one
+that is present but not an array fails the record. This is a different shape from `explode`
 (one array → N rows) and `unpivot` (wide → long), and the last per-record
 reshape that otherwise forced a connector (e.g. `ukg_pro`) onto the DuckDB SQL
 transform. An empty crossed array yields zero rows (`skip`) or a null-filled row

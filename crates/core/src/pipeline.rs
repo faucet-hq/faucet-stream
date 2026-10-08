@@ -905,11 +905,12 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                                         );
                                     }
                                     Err(e) => {
-                                        crate::observability::cleanup_run(
-                                            &name,
-                                            &row,
-                                            "refused_overflow",
-                                        );
+                                        let outcome = if tracker.overflowed() {
+                                            "refused_overflow"
+                                        } else {
+                                            "failed"
+                                        };
+                                        crate::observability::cleanup_run(&name, &row, outcome);
                                         return Err(e);
                                     }
                                 }
@@ -1048,6 +1049,10 @@ where
     let mut last_bookmark: Option<Value> = None;
     let mut gov_state = GovernanceState::default();
     let mut dlq_stats = crate::dlq::DlqStats::default();
+    // Top-level columns masking turned into strings; sticky for the run so
+    // every page reaches the sink with the same schema.
+    #[cfg_attr(not(feature = "masking"), allow(unused_mut))]
+    let mut widened: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     loop {
         // Cooperative cancellation: race the next batch against the token so a
@@ -1086,7 +1091,12 @@ where
             let records = crate::columnar::record_batch_to_values(&page.batch)?;
             let schema = page.batch.schema();
             let gov = apply_governance(records, &specs, &mut gov_state, sink).await?;
-            deferred = gov.deferred_abort;
+            if let Some(e) = gov.deferred_abort {
+                if let Some(dlq_cfg) = dlq.as_ref() {
+                    abort_with_envelopes(dlq_cfg, &gov.envelopes, &mut dlq_stats).await?;
+                }
+                return Err(e);
+            }
 
             if !gov.envelopes.is_empty() {
                 let dlq_cfg = dlq.as_ref().ok_or_else(|| {
@@ -1127,7 +1137,18 @@ where
             }
 
             // Re-encode against the *incoming* schema so a pass that only
-            // removes rows cannot silently re-type a column via inference.
+            // removes rows cannot silently re-type a column via inference —
+            // except the columns masking rewrote into strings, which are
+            // widened to Utf8.
+            #[cfg(feature = "masking")]
+            if let Some(m) = specs.masking {
+                widened.extend(crate::columnar::masked_string_columns(
+                    &schema,
+                    &gov.records,
+                    |name| m.rewrites_name(name),
+                ));
+            }
+            let schema = crate::columnar::widen_to_utf8(&schema, &widened);
             crate::columnar::values_to_record_batch(&gov.records, schema)?
         } else {
             page.batch
@@ -1444,6 +1465,15 @@ where
                             .into(),
                     ));
                 }
+                if sink.is_overwrite() {
+                    // The watermark path persists state per page; an overwrite
+                    // must hold every bookmark until its swap commits.
+                    return Err(FaucetError::Config(
+                        "delivery: exactly_once (atomic watermark) is not compatible with \
+                         write_mode: overwrite"
+                            .into(),
+                    ));
+                }
                 Some(crate::idempotency::EffectivelyOnceMechanism::AtomicWatermark)
             } else if sink.dedups_by_key() {
                 Some(crate::idempotency::EffectivelyOnceMechanism::KeyedUpsert)
@@ -1558,6 +1588,9 @@ where
                 cb.cooldown,
             )
         });
+    if breaker.is_some() {
+        crate::observability::resilience::circuit_closed(&pipeline_name, &row);
+    }
     // Poison-pill (per-row) policy, applied in the DLQ path only.
     let poison = resilience.as_ref().and_then(|r| r.poison);
 
@@ -1608,8 +1641,9 @@ where
     // very duplication this wrapper exists to prevent.
     //
     // The idempotent exactly-once path (`write_batch_idempotent`) keeps using
-    // `with_retry!` — replaying a token-stamped write is a no-op, so it is
-    // always safe to retry.
+    // `with_retry!`, through `eo_write_once`: every retry first re-reads the
+    // committed token, so a page that committed before its response was lost
+    // is not written again.
     macro_rules! with_retry_write {
         ($op_label:literal, $op:expr) => {
             if retry_policy.is_some() && sink.write_batch_is_replay_safe() {
@@ -1662,8 +1696,16 @@ where
                     let gov =
                         apply_governance(page.records, &specs, &mut gov_state, sink).await?;
                     let quality_envelopes = gov.envelopes;
-                    let mut drift_abort = gov.deferred_abort;
-                    let _ = &mut drift_abort;
+                    // A drift `fail` stops the run before anything from this
+                    // page is written or bookmarked: only the page's quarantine
+                    // envelopes are made durable first (CORE-20).
+                    if let Some(e) = gov.deferred_abort {
+                        if let Some(dlq_cfg) = dlq.as_ref() {
+                            abort_with_envelopes(dlq_cfg, &quality_envelopes, &mut dlq_stats)
+                                .await?;
+                        }
+                        return Err(e);
+                    }
 
                     let page = StreamPage {
                         records: gov.records,
@@ -1708,6 +1750,9 @@ where
                         // resliced page mixes the two failure modes.
                         let mut had_per_row_sink_failure = false;
                         let records_len = page.records.len();
+                        if adaptive_cfg.is_some() && records_len > 0 {
+                            sink.admit_page(&page.records).await?;
+                        }
                         let mut offset = 0usize;
                         while offset < records_len {
                             let size = match adaptive_cfg.as_ref() {
@@ -1744,7 +1789,25 @@ where
                                 Vec<crate::RowOutcome>,
                                 bool,
                             ) = match chunk_outcomes_result {
+                                Ok(o) if o.len() != chunk.len() => {
+                                    outcomes.record(BatchOutcome::Failed);
+                                    return Err(crate::dlq::outcome_count_mismatch(
+                                        sink_name,
+                                        o.len(),
+                                        chunk.len(),
+                                    ));
+                                }
                                 Ok(o) => (o, false),
+                                // A budget refusal or policy failure is not a sink
+                                // failure of the rows: the page must not land in the
+                                // DLQ with the bookmark moving past it (CORE-27).
+                                Err(
+                                    e @ (FaucetError::BudgetExceeded { .. }
+                                    | FaucetError::PolicyViolation { .. }),
+                                ) => {
+                                    outcomes.record(BatchOutcome::Failed);
+                                    return Err(e);
+                                }
                                 Err(e) => match dlq_cfg.on_batch_error {
                                     OnBatchError::Propagate => {
                                         outcomes.record(BatchOutcome::Failed);
@@ -1802,6 +1865,14 @@ where
                                     // `(max_row_attempts - 1) * max_attempts`,
                                     // amplifying duplicate writes (F47).
                                     let retried = match sink.write_batch_partial(&subset).await {
+                                        Ok(r) if r.len() != subset.len() => {
+                                            outcomes.record(BatchOutcome::Failed);
+                                            return Err(crate::dlq::outcome_count_mismatch(
+                                                sink_name,
+                                                r.len(),
+                                                subset.len(),
+                                            ));
+                                        }
                                         Ok(r) => r,
                                         Err(e) => {
                                             outcomes.record(BatchOutcome::Failed);
@@ -1812,8 +1883,8 @@ where
                                     // (the subset was built in `failing` order).
                                     // Consume by value — `FaucetError` is not Clone.
                                     let mut retried = retried.into_iter();
-                                    for &j in failing.iter() {
-                                        chunk_outcomes[j] = retried.next().unwrap_or(Ok(()));
+                                    for (&j, o) in failing.iter().zip(retried.by_ref()) {
+                                        chunk_outcomes[j] = o;
                                     }
                                     attempt += 1;
                                 }
@@ -1967,6 +2038,10 @@ where
                                 }
                             } else if page_success > 0 {
                                 b.record_success();
+                                crate::observability::resilience::circuit_closed(
+                                    &pipeline_name,
+                                    &row,
+                                );
                             }
                         }
                         if let Some(limit) = dlq_cfg.max_failures_per_page
@@ -2100,13 +2175,6 @@ where
                         if let Some(e) = circuit_error {
                             return Err(e);
                         }
-                        // Deferred schema-drift `fail` abort: this page's survivors
-                        // are committed and its quality/drift quarantine envelopes
-                        // are now in the DLQ, so the run stops without stranding
-                        // them (mirrors the budget/circuit deferral above).
-                        if let Some(e) = drift_abort {
-                            return Err(e);
-                        }
                         Ok::<(), FaucetError>(())
                         }
                         .instrument(span)
@@ -2142,9 +2210,13 @@ where
                                 counter!("faucet_pipeline_pages_skipped_total", skip_labels)
                                     .increment(1);
                             } else {
+                                // A retry after an ambiguous failure first asks the
+                                // sink whether the page already committed: replaying
+                                // it would insert its rows again.
+                                let attempt = std::sync::atomic::AtomicU32::new(0);
                                 records_written += outcomes.observe(with_retry!(
                                     "sink_write",
-                                    sink.write_batch_idempotent(&page.records, &scope, &token)
+                                    eo_write_once(sink, &page.records, &scope, &token, next_seq, &attempt)
                                 ))?;
                             }
                             with_retry!("flush", sink.flush())?;
@@ -2176,6 +2248,7 @@ where
                         );
                         if !page.records.is_empty() {
                             if let Some(cfg) = adaptive_cfg.as_ref() {
+                                sink.admit_page(&page.records).await?;
                                 let ctrl = controller.get_or_insert_with(|| {
                                     crate::adaptive::AimdController::new(cfg, page.records.len())
                                 });
@@ -2333,6 +2406,26 @@ where
     })
 }
 
+/// One attempt of an exactly-once page write. Every attempt after the first
+/// re-reads the sink's committed token and treats the page as written when the
+/// token already covers `seq`.
+async fn eo_write_once<Si: Sink + ?Sized>(
+    sink: &Si,
+    records: &[Value],
+    scope: &str,
+    token: &str,
+    seq: u64,
+    attempt: &std::sync::atomic::AtomicU32,
+) -> Result<usize, FaucetError> {
+    if attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0
+        && let Some(committed) = sink.last_committed_token(scope).await?
+        && crate::idempotency::parse_token(&committed).is_some_and(|c| c >= seq)
+    {
+        return Ok(records.len());
+    }
+    sink.write_batch_idempotent(records, scope, token).await
+}
+
 /// Emit the adaptive controller's current state + any adjustment as metrics.
 /// Labels are `pipeline,row` only (the controller is pipeline-scoped).
 fn emit_adaptive_metrics(
@@ -2411,7 +2504,8 @@ pub(crate) struct GovernanceSpecs<'a> {
     pub sink_name: &'a str,
     /// Whether a DLQ is configured. A drift/incompatible `fail` is **deferred**
     /// when it is, so this page's already-built quarantine envelopes still
-    /// reach the DLQ before the run stops (#146 M4).
+    /// reach the DLQ before the run stops (#146 M4); the page's survivors and
+    /// bookmark are never written (CORE-20).
     pub has_dlq: bool,
 }
 
@@ -2432,9 +2526,10 @@ pub(crate) struct GovernanceOutcome {
     /// DLQ envelopes from quality + contract + drift quarantine, merged in that
     /// order so the caller writes them as one batch.
     pub envelopes: Vec<Value>,
-    /// A drift `fail` / incompatible-`fail` abort to raise **after** the
-    /// envelopes are durable. `None` when there is nothing to defer; with no
-    /// DLQ configured the error is returned directly instead.
+    /// A drift `fail` / incompatible-`fail` abort to raise once the envelopes
+    /// are durable, without writing `records` or the page's bookmark. `None`
+    /// when there is nothing to defer; with no DLQ configured the error is
+    /// returned directly instead.
     pub deferred_abort: Option<FaucetError>,
 }
 
@@ -2653,12 +2748,37 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     })
 }
 
+/// Make a page's quarantine envelopes durable ahead of a drift `fail` abort, so
+/// the run stops without writing the page's survivors or its bookmark while the
+/// rows already routed to the DLQ are not lost.
+async fn abort_with_envelopes(
+    dlq_cfg: &crate::dlq::DlqConfig,
+    envelopes: &[Value],
+    dlq_stats: &mut DlqStats,
+) -> Result<(), FaucetError> {
+    if envelopes.is_empty() {
+        return Ok(());
+    }
+    dlq_cfg
+        .sink
+        .write_batch(envelopes)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("DLQ sink write failed: {e}")))?;
+    dlq_cfg
+        .sink
+        .flush()
+        .await
+        .map_err(|e| FaucetError::Sink(format!("DLQ sink flush failed: {e}")))?;
+    dlq_stats.records_dlq += envelopes.len();
+    dlq_stats.pages_with_failures += 1;
+    Ok(())
+}
+
 /// Apply the schema-drift policy to a page (#194). Returns the (possibly
-/// trimmed) records and an optional deferred abort error. The caller raises the
-/// error after this page is durable: with a DLQ it is threaded into the same
-/// post-commit raise site as the budget/circuit aborts (so the page's
-/// quality/drift quarantine envelopes reach the DLQ first); with no DLQ — where
-/// no envelopes can exist — it is raised immediately and the page is not written.
+/// trimmed) records and an optional deferred abort error. The page is never
+/// written when it is set: with a DLQ the caller first makes the page's
+/// quality/drift quarantine envelopes durable, then raises it; with no DLQ —
+/// where no envelopes can exist — it is raised immediately.
 /// Appends drift quarantine envelopes to `drift_envelopes`.
 #[allow(clippy::too_many_arguments)]
 async fn apply_drift_policy<Si: Sink + ?Sized>(
@@ -3310,6 +3430,39 @@ mod tests {
             .with_state(store, key)
             .with_delivery(crate::idempotency::DeliveryMode::ExactlyOnce)
             .with_start_seq(start_seq)
+    }
+
+    #[tokio::test]
+    async fn exactly_once_refuses_an_overwrite_sink() {
+        struct OverwriteIdem(IdempotentMockSink);
+        #[async_trait]
+        impl Sink for OverwriteIdem {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                self.0.write_batch(records).await
+            }
+            fn supports_idempotent_writes(&self) -> bool {
+                true
+            }
+            fn is_overwrite(&self) -> bool {
+                true
+            }
+        }
+        let sink = OverwriteIdem(IdempotentMockSink::new());
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let pages = vec![Ok(StreamPage {
+            records: vec![json!({"id": 1})],
+            bookmark: Some(json!("b1")),
+        })];
+        let err = run_stream(
+            futures::stream::iter(pages),
+            &sink,
+            eo_opts(store.clone(), "k", 0),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("write_mode: overwrite"), "{err}");
+        assert!(sink.0.rows().is_empty());
+        assert!(store.get("k").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -5926,6 +6079,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_exactly_once_retry_after_an_ambiguous_commit_does_not_rewrite() {
+        use crate::resilience::{BackoffKind, ResiliencePolicy, RetryPolicy};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        // Commits the page and its token, then reports a transient failure —
+        // the response of a committed transaction lost on the way back.
+        struct CommitsThenFails {
+            inner: IdempotentMockSink,
+            calls: AtomicU32,
+        }
+        #[async_trait]
+        impl Sink for CommitsThenFails {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                self.inner.write_batch(records).await
+            }
+            fn supports_idempotent_writes(&self) -> bool {
+                true
+            }
+            async fn write_batch_idempotent(
+                &self,
+                records: &[Value],
+                scope: &str,
+                token: &str,
+            ) -> Result<usize, FaucetError> {
+                self.inner
+                    .write_batch_idempotent(records, scope, token)
+                    .await?;
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(FaucetError::HttpStatus {
+                        status: 503,
+                        url: "u".into(),
+                        body: "".into(),
+                    });
+                }
+                Ok(records.len())
+            }
+            async fn last_committed_token(
+                &self,
+                scope: &str,
+            ) -> Result<Option<String>, FaucetError> {
+                self.inner.last_committed_token(scope).await
+            }
+        }
+        let sink = CommitsThenFails {
+            inner: IdempotentMockSink::new(),
+            calls: AtomicU32::new(0),
+        };
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let pages = futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"id": 1}), json!({"id": 2})],
+            bookmark: Some(json!("b1")),
+        })]);
+        let policy = ResiliencePolicy {
+            retry: RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffKind::None,
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+                jitter: false,
+                ..RetryPolicy::default()
+            },
+            ..ResiliencePolicy::default()
+        };
+        let res = run_stream(
+            pages,
+            &sink,
+            eo_opts(store, "eo-k", 0).with_resilience(policy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sink.inner.rows().len(), 2, "the page is written once");
+        assert_eq!(
+            sink.calls.load(Ordering::SeqCst),
+            1,
+            "the retry did not write"
+        );
+        assert_eq!(res.records_written, 2);
+    }
+
+    #[tokio::test]
     async fn resilience_does_not_retry_a_token_capable_sink_with_a_plain_insert() {
         // The regression this pins: gating the retry on
         // `supports_idempotent_writes()` retried these sinks' plain
@@ -7029,10 +7262,111 @@ mod tests {
         );
         assert_eq!(dlq[0]["payload"], json!({"id": 2, "email": "b@x"}));
         assert_eq!(dlq[0]["error"]["kind"], "QualityFailure");
-        // The surviving (drifting) row was committed to the main sink before the abort.
-        assert_eq!(
-            sink.written(),
-            vec![json!({"id": 1, "name": "ok", "email": "a@x"})]
+        // Nothing from the drifting page reaches the main sink (CORE-20).
+        assert!(sink.written().is_empty());
+    }
+
+    /// CORE-20: a drift `fail` with a DLQ writes neither the page's survivors
+    /// nor its bookmark.
+    #[tokio::test]
+    async fn drift_fail_with_dlq_persists_no_bookmark() {
+        use crate::dlq::DlqConfig;
+        let sink = SchemaSink::new(
+            json!({"type":"object","properties":{"id":{"type":"integer"}}}),
+            false,
+        );
+        let dlq_sink = std::sync::Arc::new(MockSink::new());
+        let store = std::sync::Arc::new(crate::state::MemoryStateStore::new());
+        let policy = crate::drift::SchemaDriftPolicy {
+            on_drift: crate::drift::OnDrift::Fail,
+            allow_widening: true,
+            on_incompatible: crate::drift::OnIncompatible::Fail,
+            relax_nullability_on_missing: false,
+        };
+        let pages = Box::pin(futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"id": 1, "email": "a@x"})],
+            bookmark: Some(json!({"cursor": 1})),
+        })]));
+        let opts = RunStreamOptions::new()
+            .with_schema_drift(policy)
+            .with_dlq(DlqConfig::new(dlq_sink.clone()))
+            .with_state(store.clone(), "k");
+        let err = run_stream(pages, &sink, opts).await.unwrap_err();
+        assert!(matches!(err, FaucetError::SchemaDrift { .. }), "{err:?}");
+        assert!(sink.written().is_empty());
+        assert!(dlq_sink.written().is_empty());
+        assert_eq!(store.get("k").await.unwrap(), None);
+    }
+
+    /// CORE-27: a budget refusal under `on_batch_error: dlq_all` stops the run;
+    /// the page is not DLQ'd as sink failures and the bookmark does not move.
+    #[tokio::test]
+    async fn budget_refusal_under_dlq_all_is_not_dlqd() {
+        use crate::dlq::{DlqConfig, OnBatchError};
+        struct RefusingSink;
+        #[async_trait]
+        impl Sink for RefusingSink {
+            async fn write_batch(&self, _r: &[Value]) -> Result<usize, FaucetError> {
+                unreachable!()
+            }
+            async fn write_batch_partial(
+                &self,
+                _r: &[Value],
+            ) -> Result<Vec<crate::RowOutcome>, FaucetError> {
+                Err(FaucetError::BudgetExceeded {
+                    budget: "max_records".into(),
+                    limit: 1,
+                    actual: 2,
+                })
+            }
+            fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+                crate::dlq::BatchAtomicity::Atomic
+            }
+        }
+        let dlq_sink = std::sync::Arc::new(MockSink::new());
+        let store = std::sync::Arc::new(crate::state::MemoryStateStore::new());
+        let mut dlq = DlqConfig::new(dlq_sink.clone());
+        dlq.on_batch_error = OnBatchError::DlqAll;
+        let pages = Box::pin(futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"id": 1}), json!({"id": 2})],
+            bookmark: Some(json!({"cursor": 2})),
+        })]));
+        let opts = RunStreamOptions::new()
+            .with_dlq(dlq)
+            .with_state(store.clone(), "k");
+        let err = run_stream(pages, &RefusingSink, opts).await.unwrap_err();
+        assert!(matches!(err, FaucetError::BudgetExceeded { .. }), "{err:?}");
+        assert!(dlq_sink.written().is_empty());
+        assert_eq!(store.get("k").await.unwrap(), None);
+    }
+
+    /// CORE-58: a sink returning fewer outcomes than rows fails the page.
+    #[tokio::test]
+    async fn short_outcome_vector_fails_the_page() {
+        use crate::dlq::DlqConfig;
+        struct ShortSink;
+        #[async_trait]
+        impl Sink for ShortSink {
+            async fn write_batch(&self, _r: &[Value]) -> Result<usize, FaucetError> {
+                unreachable!()
+            }
+            async fn write_batch_partial(
+                &self,
+                _r: &[Value],
+            ) -> Result<Vec<crate::RowOutcome>, FaucetError> {
+                Ok(vec![Ok(())])
+            }
+        }
+        let dlq_sink = std::sync::Arc::new(MockSink::new());
+        let pages = Box::pin(futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"id": 1}), json!({"id": 2})],
+            bookmark: None,
+        })]));
+        let opts = RunStreamOptions::new().with_dlq(DlqConfig::new(dlq_sink));
+        let err = run_stream(pages, &ShortSink, opts).await.unwrap_err();
+        assert!(
+            err.to_string().contains("1 per-row outcomes for 2 rows"),
+            "{err}"
         );
     }
 

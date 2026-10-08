@@ -191,7 +191,7 @@ async fn write_batch_idempotent_posts_transaction_with_params() {
         usage
             .signals
             .iter()
-            .any(|s| s.kind == "bytes_billed" && s.quantity == 10_485_760.0),
+            .any(|s| s.kind == "bytes_billed" && s.quantity == 2.0 * 10_485_760.0),
         "{:?}",
         usage.signals
     );

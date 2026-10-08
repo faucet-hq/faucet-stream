@@ -34,6 +34,7 @@ pub struct PolicySink {
     facts: SinkFacts,
     scope: PolicyScope,
     masking: Option<Arc<CompiledMasking>>,
+    dlq: Option<SinkFacts>,
 }
 
 impl PolicySink {
@@ -49,7 +50,16 @@ impl PolicySink {
             facts,
             scope,
             masking: None,
+            dlq: None,
         }
+    }
+
+    /// The DLQ a quarantined record is routed to, evaluated as a destination
+    /// of its own: a quarantine whose record the DLQ may not receive fails
+    /// the run instead.
+    pub fn with_dlq_destination(mut self, dlq: SinkFacts) -> Self {
+        self.dlq = Some(dlq);
+        self
     }
 
     /// The masking pass that ran upstream for this sink, so a column it
@@ -62,12 +72,17 @@ impl PolicySink {
 
     /// Classify one record's scalar leaves (by name and by value) and evaluate
     /// the rules; returns the violations with the harshest runtime action.
-    fn check_record(&self, record: &Value) -> Vec<Violation> {
-        let columns = classify_record_masked(&self.policy, record, self.masking.as_deref());
+    fn check_record(
+        &self,
+        record: &Value,
+        names: &mut NameLabels,
+    ) -> (Vec<ColumnFacts>, Vec<Violation>) {
+        let columns = classify_cached(&self.policy, record, self.masking.as_deref(), names);
         if columns.is_empty() {
-            return Vec::new();
+            return (columns, Vec::new());
         }
-        evaluate(&self.policy, &self.facts, &columns)
+        let violations = evaluate(&self.policy, &self.facts, &columns);
+        (columns, violations)
     }
 
     /// The runtime action for a set of violations: `fail` wins over
@@ -100,12 +115,23 @@ impl PolicySink {
     /// every violated rule quarantines, `Err` when any asks to fail the run.
     fn screen(&self, records: &[Value]) -> Result<Vec<(usize, Violation)>, FaucetError> {
         let mut offending = Vec::new();
+        let mut names = NameLabels::new();
         for (i, r) in records.iter().enumerate() {
-            let mut violations = self.check_record(r);
+            let (columns, mut violations) = self.check_record(r, &mut names);
             if violations.is_empty() {
                 continue;
             }
-            let action = self.action_for(&violations);
+            let mut action = self.action_for(&violations);
+            if action == RuntimeAction::Quarantine
+                && let Some(dlq) = &self.dlq
+            {
+                let at_dlq =
+                    super::evaluate::dlq_violations(&self.policy, dlq, &columns, &violations);
+                if !at_dlq.is_empty() {
+                    action = RuntimeAction::Fail;
+                    violations = at_dlq;
+                }
+            }
             for v in &violations {
                 self.record_metric(v, action);
                 tracing::warn!(
@@ -151,8 +177,21 @@ pub fn classify_record_masked(
     record: &Value,
     masking: Option<&CompiledMasking>,
 ) -> Vec<ColumnFacts> {
+    classify_cached(policy, record, masking, &mut NameLabels::new())
+}
+
+/// Labels each dot-path earns by name, memoized across the records of a page
+/// so the classification regexes run once per path, not once per record.
+type NameLabels = std::collections::HashMap<String, BTreeSet<String>>;
+
+fn classify_cached(
+    policy: &CompiledPolicy,
+    record: &Value,
+    masking: Option<&CompiledMasking>,
+    names: &mut NameLabels,
+) -> Vec<ColumnFacts> {
     let mut out: BTreeMap<String, (BTreeSet<String>, &'static str)> = BTreeMap::new();
-    walk(policy, "", record, &BTreeSet::new(), &mut out);
+    walk(policy, "", record, &BTreeSet::new(), &mut out, names);
     out.into_iter()
         .map(|(name, (labels, via))| ColumnFacts {
             masked: masking
@@ -172,30 +211,35 @@ fn walk(
     value: &Value,
     inherited: &BTreeSet<String>,
     out: &mut BTreeMap<String, (BTreeSet<String>, &'static str)>,
+    names: &mut NameLabels,
 ) {
-    let container_labels = |path: &str| {
-        let mut labels = inherited.clone();
-        if !path.is_empty() {
-            labels.extend(policy.labels_for_name(path));
+    let mut by_name = |path: &str| -> BTreeSet<String> {
+        if path.is_empty() {
+            return BTreeSet::new();
         }
-        labels
+        names
+            .entry(path.to_string())
+            .or_insert_with(|| policy.labels_for_name(path))
+            .clone()
     };
     match value {
         Value::Object(map) => {
-            let labels = container_labels(path);
+            let mut labels = inherited.clone();
+            labels.extend(by_name(path));
             for (k, v) in map {
                 let child = if path.is_empty() {
                     k.clone()
                 } else {
                     format!("{path}.{k}")
                 };
-                walk(policy, &child, v, &labels, out);
+                walk(policy, &child, v, &labels, out, names);
             }
         }
         Value::Array(items) => {
-            let labels = container_labels(path);
+            let mut labels = inherited.clone();
+            labels.extend(by_name(path));
             for (i, v) in items.iter().enumerate() {
-                walk(policy, &format!("{path}.{i}"), v, &labels, out);
+                walk(policy, &format!("{path}.{i}"), v, &labels, out, names);
             }
         }
         Value::Null => {}
@@ -203,19 +247,17 @@ fn walk(
             if path.is_empty() {
                 return;
             }
-            let mut labels = policy.labels_for_name(path);
+            let mut labels = by_name(path);
             labels.extend(inherited.iter().cloned());
             let mut via = "name";
-            if let Value::String(s) = scalar {
-                let by_value = policy.labels_for_value(s);
-                if !by_value.is_empty() {
-                    via = if labels.is_empty() {
-                        "value"
-                    } else {
-                        "name+value"
-                    };
-                    labels.extend(by_value);
-                }
+            let by_value = policy.labels_for_scalar(scalar);
+            if !by_value.is_empty() {
+                via = if labels.is_empty() {
+                    "value"
+                } else {
+                    "name+value"
+                };
+                labels.extend(by_value);
             }
             if !labels.is_empty() {
                 let entry = out
@@ -229,6 +271,9 @@ fn walk(
 
 #[async_trait]
 impl Sink for PolicySink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let offending = self.screen(records)?;
         if offending.is_empty() {
@@ -256,12 +301,19 @@ impl Sink for PolicySink {
             .filter(|(i, _)| !quarantined.contains_key(i))
             .map(|(_, r)| r.clone())
             .collect();
-        let mut inner_outcomes = if kept.is_empty() {
+        let inner_outcomes = if kept.is_empty() {
             Vec::new()
         } else {
             self.inner.write_batch_partial(&kept).await?
+        };
+        if inner_outcomes.len() != kept.len() {
+            return Err(crate::dlq::outcome_count_mismatch(
+                self.inner.connector_name(),
+                inner_outcomes.len(),
+                kept.len(),
+            ));
         }
-        .into_iter();
+        let mut inner_outcomes = inner_outcomes.into_iter();
         let outcomes = (0..records.len())
             .map(|i| match quarantined.get(&i) {
                 Some(v) => Err(FaucetError::PolicyViolation {
@@ -269,7 +321,7 @@ impl Sink for PolicySink {
                     column: v.column.clone(),
                     message: v.to_string(),
                 }),
-                None => inner_outcomes.next().unwrap_or(Ok(())),
+                None => inner_outcomes.next().expect("length checked above"),
             })
             .collect();
         Ok(outcomes)
@@ -366,6 +418,12 @@ impl Sink for PolicySink {
     }
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
     }
     fn supports_rollback(&self) -> bool {
         self.inner.supports_rollback()
@@ -482,6 +540,45 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn a_short_inner_outcome_vector_is_an_error() {
+        struct Short;
+        #[async_trait]
+        impl Sink for Short {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            async fn write_batch_partial(
+                &self,
+                _r: &[Value],
+            ) -> Result<Vec<RowOutcome>, FaucetError> {
+                Ok(Vec::new())
+            }
+        }
+        let facts = SinkFacts {
+            id: "default".into(),
+            kind: "jsonl".into(),
+            attributes: [("residency".to_string(), "us".to_string())].into(),
+        };
+        let s = PolicySink::new(
+            Box::new(Short),
+            policy("quarantine"),
+            facts,
+            PolicyScope {
+                pipeline: "p".into(),
+                row: "r".into(),
+            },
+        );
+        let err = s
+            .write_batch_partial(&[json!({"e": "a@b.io"}), json!({"id": 1})])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("0 per-row outcomes for 1 rows"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn classify_walks_nested_paths_by_name_and_value() {
         let p = policy("fail");
@@ -586,6 +683,61 @@ mod tests {
         let (s, cap) = sink(policy("fail"), "eu");
         assert_eq!(
             s.write_batch(&[json!({"email": "a@b.io"})]).await.unwrap(),
+            1
+        );
+        assert_eq!(cap.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quarantine_into_a_non_compliant_dlq_fails_instead() {
+        let dlq = |residency: &str| SinkFacts {
+            id: "dlq".into(),
+            kind: "jsonl".into(),
+            attributes: [("residency".to_string(), residency.to_string())].into(),
+        };
+        let (s, cap) = sink(policy("quarantine"), "us");
+        let s = s.with_dlq_destination(dlq("us"));
+        let err = s
+            .write_batch_partial(&[json!({"id": 1}), json!({"email": "a@b.io"})])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::PolicyViolation { column, .. } if column == "email"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("`dlq`"), "{err}");
+        assert!(cap.0.lock().unwrap().is_empty());
+
+        let (s, cap) = sink(policy("quarantine"), "us");
+        let s = s.with_dlq_destination(dlq("eu"));
+        let outcomes = s
+            .write_batch_partial(&[json!({"id": 1}), json!({"email": "a@b.io"})])
+            .await
+            .unwrap();
+        assert!(outcomes[0].is_ok() && outcomes[1].is_err());
+        assert_eq!(cap.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_card_number_stored_as_a_json_integer_is_classified() {
+        let spec: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pan", "value_detector": "credit_card"}],
+            "rules": [{"name": "no-pan", "when": {"label": "pan"}, "deny": true, "on_runtime": "fail"}]
+        }))
+        .unwrap();
+        let (s, cap) = sink(Arc::new(CompiledPolicy::compile(&spec).unwrap()), "us");
+        let err = s
+            .write_batch(&[json!({"cc": 4111111111111111u64})])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::PolicyViolation { column, .. } if column == "cc"),
+            "{err}"
+        );
+        assert_eq!(
+            s.write_batch(&[json!({"n": 42, "ok": true})])
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(cap.0.lock().unwrap().len(), 1);
@@ -761,5 +913,29 @@ mod tests {
             "{err}"
         );
         assert!(cap.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn policy_sink_forwards_every_hook_but_native() {
+        let probe = crate::sink_forwarding::HookSink::default();
+        let s = PolicySink::new(
+            Box::new(probe.clone()),
+            policy("fail"),
+            SinkFacts {
+                id: "default".into(),
+                kind: "jsonl".into(),
+                attributes: Default::default(),
+            },
+            PolicyScope {
+                pipeline: "p".into(),
+                row: "r".into(),
+            },
+        );
+        crate::sink_forwarding::assert_forwards_every_hook(
+            &s,
+            &probe,
+            &["native_load_capabilities", "load_native"],
+        )
+        .await;
     }
 }

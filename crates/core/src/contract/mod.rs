@@ -159,7 +159,7 @@ fn evaluate_record(
             return Some(violation(
                 "enum",
                 Some(&f.name),
-                format!("value {value} is not in the allowed set"),
+                "value is not in the allowed set".into(),
             ));
         }
         if let Some(re) = &f.pattern {
@@ -169,29 +169,29 @@ fn evaluate_record(
                 return Some(violation(
                     "pattern",
                     Some(&f.name),
-                    format!("value {value} does not match pattern '{re}'"),
+                    format!("value does not match pattern '{re}'"),
                 ));
             }
         }
         if (f.min.is_some() || f.max.is_some())
-            && let Some(n) = value.as_f64()
+            && let Value::Number(n) = value
         {
             if let Some(min) = f.min
-                && n < min
+                && cmp_number_to_bound(n, min) == Some(std::cmp::Ordering::Less)
             {
                 return Some(violation(
                     "range",
                     Some(&f.name),
-                    format!("value {n} is below the minimum {min}"),
+                    format!("value is below the minimum {min}"),
                 ));
             }
             if let Some(max) = f.max
-                && n > max
+                && cmp_number_to_bound(n, max) == Some(std::cmp::Ordering::Greater)
             {
                 return Some(violation(
                     "range",
                     Some(&f.name),
-                    format!("value {n} is above the maximum {max}"),
+                    format!("value is above the maximum {max}"),
                 ));
             }
         }
@@ -231,6 +231,37 @@ fn evaluate_record(
     }
 
     None
+}
+
+/// Order a JSON number against an `f64` bound without rounding an integer
+/// operand above 2^53 through `f64` (CORE-86).
+fn cmp_number_to_bound(n: &serde_json::Number, bound: f64) -> Option<std::cmp::Ordering> {
+    let int = n
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from));
+    match int {
+        Some(i) => cmp_int_to_f64(i, bound),
+        None => n.as_f64()?.partial_cmp(&bound),
+    }
+}
+
+fn cmp_int_to_f64(i: i128, bound: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if bound.is_nan() {
+        return None;
+    }
+    let floor = bound.floor();
+    if floor >= 1.0e20 {
+        return Some(Ordering::Less);
+    }
+    if floor <= -1.0e20 {
+        return Some(Ordering::Greater);
+    }
+    match i.cmp(&(floor as i128)) {
+        Ordering::Equal if bound > floor => Some(Ordering::Less),
+        other => Some(other),
+    }
 }
 
 fn json_type_name(v: &Value) -> &'static str {
@@ -285,6 +316,66 @@ mod tests {
                   "nullable": true, "pattern": "^.+@.+$", "min_length": 3 }
             ]
         }))
+    }
+
+    #[test]
+    fn breach_messages_never_carry_the_value() {
+        let c = compiled(json!({
+            "version": "1.0.0",
+            "on_breach": "fail",
+            "fields": [
+                { "name": "s", "type": "string", "required": false, "enum": ["a"] },
+                { "name": "p", "type": "string", "required": false, "pattern": "^x$" },
+                { "name": "n", "type": "integer", "required": false, "min": 0, "max": 5 }
+            ]
+        }));
+        for rec in [
+            json!({"s": "secret-enum"}),
+            json!({"p": "secret-pattern"}),
+            json!({"n": 987654321}),
+            json!({"n": -987654321}),
+        ] {
+            let err = apply_contract(vec![rec], &c).unwrap_err().to_string();
+            assert!(
+                !err.contains("secret") && !err.contains("987654321"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_accepts_whole_floats_and_bounds_compare_exactly() {
+        let c = compiled(json!({
+            "version": "1.0.0",
+            "on_breach": "fail",
+            "fields": [ { "name": "n", "type": "integer", "max": 9007199254740992.0 } ]
+        }));
+        assert!(apply_contract(vec![json!({"n": 1.0})], &c).is_ok());
+        assert!(apply_contract(vec![json!({"n": 1.5})], &c).is_err());
+        assert!(apply_contract(vec![json!({"n": 9007199254740992u64})], &c).is_ok());
+        // 2^53 + 1 rounds to 2^53 through f64 and used to pass.
+        assert!(apply_contract(vec![json!({"n": 9007199254740993u64})], &c).is_err());
+    }
+
+    #[test]
+    fn int_to_f64_bound_ordering_edges() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_int_to_f64(1, 1.5), Some(Ordering::Less));
+        assert_eq!(cmp_int_to_f64(2, 1.5), Some(Ordering::Greater));
+        assert_eq!(cmp_int_to_f64(1, 1.0), Some(Ordering::Equal));
+        assert_eq!(cmp_int_to_f64(1, f64::NAN), None);
+        assert_eq!(
+            cmp_int_to_f64(i128::from(u64::MAX), 1e30),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            cmp_int_to_f64(i128::from(i64::MIN), -1e30),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            cmp_number_to_bound(&serde_json::Number::from_f64(0.5).unwrap(), 1.0),
+            Some(Ordering::Less)
+        );
     }
 
     #[test]

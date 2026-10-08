@@ -355,7 +355,7 @@ async fn decode_whole(
             .map_err(|e| FaucetError::Source(format!("file source: '{path}' is not UTF-8: {e}")))?;
         return Ok(vec![json!({"path": path, "content": content})]);
     }
-    faucet_core::file_format::decode(&bytes, format, opts)
+    faucet_core::file_format::decode_owned(bytes, format, opts)
         .await
         .map_err(|e| FaucetError::Source(format!("file source: '{path}': {e}")))
 }
