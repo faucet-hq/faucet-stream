@@ -177,7 +177,7 @@ format and option the file sink does, with the same field names:
 | `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`**, like the S3 and GCS sinks — smaller objects to move; the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each file's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
-| `scratch_dir` | a local directory | Where files are built before upload (default: the system temporary directory; a private subdirectory is created in it). Every file is built whole before it is uploaded, so this needs room for up to `concurrency` + 1 files. Scratch files are not encrypted while the run is in progress. |
+| `scratch_dir` | a local directory | Where files are built before upload (default: the system temporary directory; a private subdirectory is created in it). Every file is built whole before it is uploaded, so this needs room for up to `concurrency` + 1 files. Scratch files are not encrypted while the run is in progress; a run that crashed leaves its scratch directory behind, and the next run of any remote file sink using the same `scratch_dir` removes it. |
 
 `if_exists: append` / `error` and `write_mode: overwrite` need `file_name`: without it every run
 writes new, uniquely named files (`<run id>-<part><file_extension>`), so

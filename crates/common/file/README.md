@@ -76,7 +76,10 @@ Scratch files are named `<file>.faucet-tmp` plus one of `SCRATCH_ROLES`
 (`-body`, `-old`, `-seal`, `-prev`); `is_scratch_name` and `is_swap_dir_name`
 let a reader skip them. Scratch files are not encrypted while a run is in
 progress: those holding plaintext of an encrypted output are created
-readable by their owner only.
+readable by their owner only. A remote backend's private scratch directory
+(`faucet-remote-*`) holds an `.owner` file locked for the run's life; a new
+backend removes every such directory whose lock it can take — the scratch of a
+run that crashed (SIGKILL, OOM) — so plaintext does not outlive the run.
 
 Features mirror the formats: `file-format-csv`, `-xml`, `-excel`, `-avro`,
 `-parquet` (`file-formats` is all of them), `arrow`, `encryption`.

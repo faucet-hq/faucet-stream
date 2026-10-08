@@ -454,7 +454,7 @@ format and option the file sink does, with the same field names:
 | `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`** — the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each object's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
-| `scratch_dir` | a local directory | Where objects are built before upload (default: the system temporary directory; a private subdirectory is created in it). JSON Lines and raw text go up as a multipart upload while they are written and need no scratch space; other formats need room for each object being built (up to `concurrency` of them). Scratch files are not encrypted while the run is in progress. |
+| `scratch_dir` | a local directory | Where objects are built before upload (default: the system temporary directory; a private subdirectory is created in it). JSON Lines and raw text go up as a multipart upload while they are written and need no scratch space; other formats need room for each object being built (up to `concurrency` of them). Scratch files are not encrypted while the run is in progress; a run that crashed leaves its scratch directory behind, and the next run of any remote file sink using the same `scratch_dir` removes it. |
 
 `if_exists: append` / `error` and `write_mode: overwrite` need `path`: without it every run
 writes new, uniquely named objects (`<run id>-<part><file_extension>`), so
