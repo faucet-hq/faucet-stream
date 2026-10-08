@@ -422,6 +422,20 @@ impl faucet_core::Source for WebhookSource {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn server_results_map_io_and_task_failures() {
+        assert!(super::server_result(Ok(Ok(()))).is_ok());
+        let io = super::server_result(Ok(Err(std::io::Error::other("boom"))))
+            .unwrap_err()
+            .to_string();
+        assert!(io.contains("webhook server error: boom"), "{io}");
+        let join = tokio::spawn(async { panic!("task died") })
+            .await
+            .unwrap_err();
+        let task = super::server_result(Err(join)).unwrap_err().to_string();
+        assert!(task.contains("webhook server task failed"), "{task}");
+    }
+
     use super::*;
     use serde_json::json;
 

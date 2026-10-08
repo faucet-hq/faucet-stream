@@ -2181,6 +2181,25 @@ impl faucet_core::Sink for MysqlSink {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn bounded_writes_time_out_and_pass_results_through() {
+        let ok = bounded(5, "write", async { Ok::<_, FaucetError>(7) }).await;
+        assert_eq!(ok.unwrap(), 7);
+        let unbounded = bounded(0, "write", async { Ok::<_, FaucetError>(8) }).await;
+        assert_eq!(unbounded.unwrap(), 8);
+        let err = bounded(
+            1,
+            "flush",
+            std::future::pending::<Result<(), FaucetError>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("mysql flush timed out after 1s"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn relax_column_sql_keeps_the_definition() {
         let def = MysqlColumnDef {

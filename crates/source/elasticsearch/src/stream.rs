@@ -609,6 +609,19 @@ fn apply_auth_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_values_are_path_encoded_and_non_strings_rendered() {
+        let ctx: std::collections::HashMap<String, Value> = [
+            ("a".to_string(), serde_json::json!("x/y")),
+            ("n".to_string(), serde_json::json!(7)),
+        ]
+        .into_iter()
+        .collect();
+        let enc = encoded_context(&ctx);
+        assert_eq!(enc["a"], serde_json::json!("x%2Fy"));
+        assert_eq!(enc["n"], serde_json::json!("7"));
+    }
     use faucet_core::Source;
 
     #[test]

@@ -300,6 +300,17 @@ mod config_tests {
     }
 
     #[test]
+    fn validate_rejects_a_zero_connect_timeout() {
+        let mut c = minimal();
+        c.connect_timeout = Duration::ZERO;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("connect_timeout must be greater than 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_empty_url() {
         let mut c = minimal();
         c.url = "  ".into();

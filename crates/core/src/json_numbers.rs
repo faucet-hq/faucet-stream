@@ -200,18 +200,18 @@ mod tests {
         assert_eq!(normalize("1.2e"), None);
         assert_eq!(normalize("."), None);
         assert_eq!(normalize("0.000"), Some((false, String::new(), 0)));
+        assert_eq!(normalize("-1.50"), Some((true, "15".to_string(), -1)));
     }
 
     #[test]
     fn documents_fail_or_keep_big_numbers_as_strings() {
         let doc = r#"{"a": 12345678901234567890.123, "s": "9.99999999999999999999 in a string", "b": [1, 2.5], "e": "\"q\\" }"#;
-        match parse_json_exact(doc, JsonBigNumbers::Fail) {
-            Err(JsonNumberError::Inexact(found)) => {
-                assert_eq!(found.len(), 1);
-                assert_eq!(found[0].preview(), "12345678901234567890.123");
-            }
-            other => panic!("expected Inexact, got {other:?}"),
-        }
+        let failed = parse_json_exact(doc, JsonBigNumbers::Fail);
+        assert!(matches!(
+            &failed,
+            Err(JsonNumberError::Inexact(found))
+                if found.len() == 1 && found[0].preview() == "12345678901234567890.123"
+        ));
         let (v, found) = parse_json_exact(doc, JsonBigNumbers::String).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(v["a"], json!("12345678901234567890.123"));

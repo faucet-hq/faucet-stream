@@ -1396,6 +1396,10 @@ mod tests {
             .unwrap();
         assert!(out[0].is_ok());
         assert_eq!(shared.count(), 2);
+        assert_eq!(sink.write_batch(&[json!({"ok": true})]).await.unwrap(), 1);
+        assert_eq!(shared.count(), 3);
+        sink.flush().await.unwrap();
+        assert_eq!(sink.config_schema(), json!({}));
     }
 
     #[tokio::test]

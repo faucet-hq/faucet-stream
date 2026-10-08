@@ -205,3 +205,33 @@ async fn discover_lists_data_streams_and_skips_unreadable_mappings() {
         "string"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_with_an_unreadable_mapping_is_skipped_not_fatal() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/_cat/indices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"index": "orders", "docs.count": "1"},
+            {"index": "logs", "docs.count": "2"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/orders/_mapping"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>proxy</html>"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/logs/_mapping"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "logs": {"mappings": {}}
+        })))
+        .mount(&server)
+        .await;
+    let source =
+        ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "orders")).unwrap();
+    let datasets = source.discover().await.unwrap();
+    let names: Vec<&str> = datasets.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["logs"]);
+}

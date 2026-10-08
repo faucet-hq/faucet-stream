@@ -5788,6 +5788,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -6154,6 +6155,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -7131,6 +7133,7 @@ dependencies = [
  "jsonpath-rust",
  "quick-xml 0.42.0",
  "reqwest 0.13.3",
+ "rust_xlsxwriter",
  "schemars 1.2.1",
  "serde",
  "serde_json",

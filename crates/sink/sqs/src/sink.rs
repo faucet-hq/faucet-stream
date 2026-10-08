@@ -274,6 +274,18 @@ impl SqsSink {
                             retry_indices.insert(idx);
                         }
                     }
+                    for e in &pending {
+                        if !outcomes.contains_key(&e.index) && !retry_indices.contains(&e.index) {
+                            outcomes.insert(
+                                e.index,
+                                Err(FaucetError::Sink(
+                                    "sqs: SendMessageBatch response neither confirmed nor \
+                                     rejected this message; treating it as not delivered"
+                                        .to_string(),
+                                )),
+                            );
+                        }
+                    }
                     if retry_indices.is_empty() {
                         return Ok(outcomes);
                     }

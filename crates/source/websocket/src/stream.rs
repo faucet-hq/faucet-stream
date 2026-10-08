@@ -555,6 +555,23 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[tokio::test]
+    async fn an_unparseable_url_is_a_config_error_naming_it() {
+        let cfg: crate::config::WebsocketSourceConfig = serde_json::from_value(serde_json::json!({
+            "url": "ws://bad host/feed",
+            "max_messages": 1
+        }))
+        .unwrap();
+        let src = WebsocketSource::new(cfg).unwrap();
+        let err = src
+            .connect_with("ws://bad host/feed", None)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, FaucetError::Config(_)), "{err}");
+        assert!(err.to_string().contains("websocket url"), "{err}");
+    }
+
     #[test]
     fn reconnect_delay_grows_and_stays_bounded() {
         let base = Duration::from_secs(1);

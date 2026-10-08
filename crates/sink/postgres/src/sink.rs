@@ -1893,6 +1893,28 @@ mod tests {
         on_conflict_clause, pg_bind_text, pg_udt_to_json_schema, qualified_table_ref,
         split_unmatched, widened_keyword,
     };
+    use super::{FaucetError, bounded};
+
+    #[tokio::test]
+    async fn bounded_writes_time_out_and_pass_results_through() {
+        let ok = bounded(5, "write", async { Ok::<_, FaucetError>(7) }).await;
+        assert_eq!(ok.unwrap(), 7);
+        let unbounded = bounded(0, "write", async { Ok::<_, FaucetError>(8) }).await;
+        assert_eq!(unbounded.unwrap(), 8);
+        let err = bounded(
+            1,
+            "flush",
+            std::future::pending::<Result<(), FaucetError>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("postgres flush timed out after 1s"),
+            "{err}"
+        );
+    }
+
     use serde_json::json;
 
     #[test]
@@ -1971,11 +1993,7 @@ mod tests {
             ]
         );
         let filtered = ident.copy_statements("t", "s", Some("w"), |_| true);
-        assert!(
-            filtered[0].ends_with("WHERE (\"id\" IS NOT NULL) AND (w)"),
-            "{}",
-            filtered[0]
-        );
+        assert!(filtered[0].ends_with("WHERE (\"id\" IS NOT NULL) AND (w)"));
         let only_id = ColumnRoles {
             insertable: vec!["id".into()],
             identity: vec![("id".into(), 'd')],

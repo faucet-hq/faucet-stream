@@ -23,6 +23,16 @@ fn backend_missing(why: &str) {
     eprintln!("skipping: {why}");
 }
 
+/// The Oracle Free container (a multi-GB database image) does not start on
+/// the PR runners, so a start failure is fatal only where the nightly
+/// heavy-integration job asks for it (`FAUCET_REQUIRE_ORACLE`).
+fn container_missing(why: &str) {
+    if std::env::var("FAUCET_REQUIRE_ORACLE").is_ok() {
+        panic!("{why} (FAUCET_REQUIRE_ORACLE is set)");
+    }
+    eprintln!("skipping: {why}");
+}
+
 pub fn client_available() -> bool {
     match oracle::Version::client() {
         Ok(_) => true,
@@ -49,7 +59,7 @@ pub async fn start_oracle() -> Option<(ContainerAsync<GenericImage>, OracleConne
     let container = match image.start().await {
         Ok(c) => c,
         Err(e) => {
-            backend_missing(&format!(
+            container_missing(&format!(
                 "Oracle integration test: container failed to start: {e}"
             ));
             return None;

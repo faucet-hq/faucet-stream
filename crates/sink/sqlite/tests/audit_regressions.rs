@@ -299,3 +299,33 @@ fn busy_timeout_defaults_to_a_minute_and_is_configurable() {
     .unwrap();
     assert_eq!(parsed.busy_timeout_secs, 120);
 }
+
+#[tokio::test]
+async fn json_column_partial_writes_and_large_unsigned_values() {
+    let (_d, url) = fresh_db(&[
+        "CREATE TABLE docs (data TEXT)",
+        "CREATE TABLE nums (n TEXT)",
+    ])
+    .await;
+    let json_sink = SqliteSink::new(SqliteSinkConfig::new(&url, "docs").column_mapping(
+        SqliteColumnMapping::Json {
+            column: "data".into(),
+        },
+    ))
+    .await
+    .unwrap();
+    let out = json_sink
+        .write_batch_partial(&[json!({"a": 1}), json!({"b": 2})])
+        .await
+        .unwrap();
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().all(Result::is_ok));
+    assert_eq!(query(&url, "SELECT data FROM docs").await.len(), 2);
+
+    let nums = SqliteSink::new(config(&url, "nums", WriteMode::Append, &[]))
+        .await
+        .unwrap();
+    nums.write_batch(&[json!({"n": u64::MAX})]).await.unwrap();
+    let rows = query(&url, "SELECT n FROM nums").await;
+    assert_eq!(rows[0].get::<String, _>(0), u64::MAX.to_string());
+}

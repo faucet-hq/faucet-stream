@@ -1029,6 +1029,14 @@ mod tests {
 
     // ── key validation ─────────────────────────────────────────────────────
 
+    #[tokio::test]
+    async fn a_lock_that_cannot_be_created_is_a_state_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing-dir").join("k.lock");
+        let err = acquire_lock_file(&path).await.err().unwrap().to_string();
+        assert!(err.contains("failed to create state lock"), "{err}");
+    }
+
     #[test]
     fn rejects_empty_key() {
         let err = validate_state_key("").unwrap_err();

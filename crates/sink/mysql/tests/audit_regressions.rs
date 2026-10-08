@@ -313,3 +313,65 @@ async fn mysql_audit_regressions() {
         "{err}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keyed_and_json_column_paths_of_every_write_entry_point() {
+    let (_c, url) = start_mysql().await;
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    exec(&pool, "CREATE TABLE kv (id INT PRIMARY KEY, v VARCHAR(20))").await;
+
+    let upsert = MysqlSink::new(config(&url, "kv", WriteMode::Upsert, &["id"]))
+        .await
+        .unwrap();
+    let err = upsert
+        .write_batch(&[json!({"v": "no key"})])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("mysql upsert: row 0"), "{err}");
+    let err = upsert
+        .write_batch_idempotent(
+            &[json!({"id": 1, "v": "a"}), json!({"v": "b"})],
+            "s",
+            &faucet_core::format_token(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("mysql upsert: row 1"), "{err}");
+    upsert
+        .write_batch_idempotent(
+            &[json!({"id": 1, "v": "a"}), json!({"id": 2, "v": "b"})],
+            "s",
+            &faucet_core::format_token(1),
+        )
+        .await
+        .unwrap();
+    let delete = MysqlSink::new(config(&url, "kv", WriteMode::Delete, &["id"]))
+        .await
+        .unwrap();
+    delete
+        .write_batch_idempotent(&[json!({"id": 1})], "s", &faucet_core::format_token(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        texts(&pool, "SELECT CAST(id AS CHAR) FROM kv ORDER BY id").await,
+        vec!["2"]
+    );
+
+    exec(&pool, "CREATE TABLE docs (data JSON)").await;
+    let json_sink = MysqlSink::new(MysqlSinkConfig::new(&url, "docs").column_mapping(
+        MysqlColumnMapping::Json {
+            column: "data".into(),
+        },
+    ))
+    .await
+    .unwrap();
+    let out = json_sink
+        .write_batch_partial(&[json!({"a": 1}), json!({"b": 2})])
+        .await
+        .unwrap();
+    assert!(out.len() == 2 && out.iter().all(Result::is_ok));
+    assert_eq!(
+        texts(&pool, "SELECT CAST(COUNT(*) AS CHAR) FROM docs").await,
+        vec!["2"]
+    );
+}
