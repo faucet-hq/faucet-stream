@@ -92,7 +92,7 @@ impl TargetProcess {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         tracing::debug!(target_command = %cfg.target_command, stream = %cfg.stream_name(), "spawning singer target");
-        let mut child = command.spawn().map_err(|e| {
+        let mut child = faucet_common_singer::spawn_command(&mut command).map_err(|e| {
             FaucetError::Sink(format!(
                 "failed to spawn singer target '{}': {e}",
                 redactor.redact(&cfg.target_command)
