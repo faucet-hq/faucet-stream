@@ -143,6 +143,8 @@ pub struct Normalizer {
     #[serde(default = "default_true")]
     pub timestamps: bool,
     /// Treat a string holding a number (`"42"`, `"1.5"`) as that number.
+    /// Key columns always do, so a key typed differently on each backend
+    /// still matches.
     #[serde(default)]
     pub numeric_strings: bool,
 }
@@ -182,18 +184,49 @@ impl Normalizer {
             Some(Value::Number(n)) => self.canonical_number(n.as_f64(), n.as_i64(), n.as_u64()),
             Some(Value::String(s)) => self.canonical_string(s),
             Some(Value::Array(a)) => {
-                let parts: Vec<String> = a.iter().map(|x| self.canonical(Some(x))).collect();
-                format!("[{}]", parts.join(","))
+                // Length-prefixed, so an element's text can never read as a
+                // separator (`["a","b"]` vs `["a,sb"]`).
+                let parts: Vec<String> = a
+                    .iter()
+                    .map(|x| length_prefixed(&self.canonical(Some(x))))
+                    .collect();
+                format!("[{}]", parts.concat())
             }
             Some(Value::Object(o)) => {
                 // Sorted keys: object key order is not content.
                 let sorted: BTreeMap<&String, &Value> = o.iter().collect();
                 let parts: Vec<String> = sorted
                     .into_iter()
-                    .map(|(k, x)| format!("{}:{}", k, self.canonical(Some(x))))
+                    .map(|(k, x)| {
+                        format!(
+                            "{}{}",
+                            length_prefixed(k),
+                            length_prefixed(&self.canonical(Some(x)))
+                        )
+                    })
                     .collect();
-                format!("{{{}}}", parts.join(","))
+                format!("{{{}}}", parts.concat())
             }
+        }
+    }
+
+    /// The normalizer key columns compare under: a key typed as a number on
+    /// one backend and as text on the other is still one key, or a keyed
+    /// repair would upsert a row and then delete it as extra (#789 CLI-91).
+    fn for_key(&self) -> Normalizer {
+        Normalizer {
+            numeric_strings: true,
+            ..self.clone()
+        }
+    }
+
+    /// Canonical text of column `name`, under the key normalizer when it is
+    /// a key column.
+    fn canonical_column(&self, name: &str, key: &[String], v: Option<&Value>) -> String {
+        if key.iter().any(|k| k == name) {
+            self.for_key().canonical(v)
+        } else {
+            self.canonical(v)
         }
     }
 
@@ -237,6 +270,10 @@ impl Normalizer {
         }
         format!("s{s}")
     }
+}
+
+fn length_prefixed(s: &str) -> String {
+    format!("{}:{s}", s.len())
 }
 
 /// UTC microseconds for a timestamp string in RFC 3339 form or the
@@ -310,7 +347,7 @@ pub fn row_hash(
     for name in names {
         text.push_str(name);
         text.push('=');
-        text.push_str(&norm.canonical(obj.and_then(|o| o.get(name))));
+        text.push_str(&norm.canonical_column(name, key, obj.and_then(|o| o.get(name))));
         text.push('\u{1f}');
     }
     let a = fnv1a_64(text.as_bytes(), FNV_BASIS_A);
@@ -330,6 +367,7 @@ pub fn is_excluded(name: &str, exclude: &[String]) -> bool {
 /// rows across the two sides.
 pub fn key_text(record: &Value, key: &[String], norm: &Normalizer) -> String {
     let obj = record.as_object();
+    let norm = norm.for_key();
     let mut out = String::new();
     for k in key {
         out.push_str(k);
@@ -501,6 +539,7 @@ impl Difference {
 fn changed_columns(
     a: &Value,
     b: &Value,
+    key: &[String],
     columns: Option<&[String]>,
     exclude: &[String],
     norm: &Normalizer,
@@ -524,7 +563,10 @@ fn changed_columns(
     let mut out: Vec<String> = names
         .into_iter()
         .filter(|n| !is_excluded(n, exclude))
-        .filter(|n| norm.canonical(a.get(n.as_str())) != norm.canonical(b.get(n.as_str())))
+        .filter(|n| {
+            norm.canonical_column(n, key, a.get(n.as_str()))
+                != norm.canonical_column(n, key, b.get(n.as_str()))
+        })
         .collect();
     out.sort();
     out
@@ -601,7 +643,7 @@ pub fn diff_rows(
                 },
             )),
             Some((_, d)) => {
-                let cols = changed_columns(s, d, columns, exclude, norm);
+                let cols = changed_columns(s, d, key, columns, exclude, norm);
                 if !cols.is_empty() {
                     out.push((
                         kt,
@@ -809,6 +851,42 @@ mod tests {
         assert_eq!(n.canonical(Some(&json!("hello"))), "shello");
         assert_eq!(n.canonical(Some(&json!("2026-x"))), "s2026-x");
         assert!(parse_timestamp_micros("not a date").is_none());
+    }
+
+    #[test]
+    fn array_and_object_text_cannot_be_forged_by_element_contents() {
+        let n = norm();
+        assert_ne!(
+            n.canonical(Some(&json!(["a", "b"]))),
+            n.canonical(Some(&json!(["a,sb"])))
+        );
+        assert_ne!(
+            n.canonical(Some(&json!({"a": "x", "b": "y"}))),
+            n.canonical(Some(&json!({"a": "x,b:sy"})))
+        );
+    }
+
+    #[test]
+    fn numeric_and_text_keys_match_and_repair_never_deletes_them() {
+        let n = norm();
+        let key = vec!["id".to_string()];
+        let src = vec![json!({"id": 7, "v": "a"}), json!({"id": 8, "v": "b"})];
+        let dst = vec![json!({"id": "7", "v": "a"}), json!({"id": "8", "v": "x"})];
+        let diffs = diff_rows(&src, &dst, &key, None, &[], &n);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert!(matches!(
+            &diffs[0].kind,
+            DifferenceKind::Changed { columns } if columns == &vec!["v".to_string()]
+        ));
+        assert_eq!(
+            row_hash(&src[0], &key, None, &[], &n),
+            row_hash(&dst[0], &key, None, &[], &n)
+        );
+        assert_ne!(
+            n.canonical(Some(&json!("7"))),
+            n.canonical(Some(&json!(7))),
+            "non-key columns keep numeric_strings off"
+        );
     }
 
     #[test]

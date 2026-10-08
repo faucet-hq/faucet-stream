@@ -3352,7 +3352,7 @@
           "default": true
         },
         "numeric_strings": {
-          "description": "Treat a string holding a number (`\"42\"`, `\"1.5\"`) as that number.",
+          "description": "Treat a string holding a number (`\"42\"`, `\"1.5\"`) as that number.\nKey columns always do, so a key typed differently on each backend\nstill matches.",
           "type": "boolean",
           "default": false
         }

@@ -87,7 +87,7 @@ verify:
   normalize:
     float_tolerance: 0.0
     timestamps: true
-    numeric_strings: false
+    numeric_strings: false  # key columns always compare `7` and "7" as equal
   after_run: true           # verify after every successful root run
   fail_on_difference: true  # …and fail the run on a mismatch
   repair: false             # …or re-sync the differences first
