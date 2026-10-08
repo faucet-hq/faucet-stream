@@ -896,12 +896,16 @@ impl Topology {
         // task (see the spawn below).
         type NodeFut = Pin<Box<dyn Future<Output = Result<NodeOutcome, FaucetError>> + Send>>;
         let mut by_id: HashMap<String, NodeFut> = HashMap::new();
+        let source_kinds: HashMap<String, &'static str> = sources
+            .iter()
+            .map(|(id, s)| (id.clone(), s.connector_name()))
+            .collect();
 
         for (id, source) in sources {
             let node_outs = outs.remove(&id).unwrap_or_default();
             let keep = node_outs.clone();
             let fut: NodeFut = Box::pin(run_source_node(
-                id.clone(),
+                Labels::new(opts.pipeline_name.clone(), id.clone(), opts.run_id.clone()),
                 source,
                 plan.start.clone(),
                 opts.batch_size,
@@ -1014,6 +1018,7 @@ impl Topology {
                             codec: codec.clone(),
                             resume,
                             position_source: only_source.clone(),
+                            source_label: source_label(facts.ancestors.get(&id), &source_kinds),
                             upstream: facts.ancestors.get(&id).cloned().unwrap_or_default(),
                             failed: Arc::clone(&failed),
                         };
@@ -1949,13 +1954,23 @@ fn cancelled(cancel: &Option<CancellationToken>) -> bool {
 }
 
 async fn run_source_node(
-    node_id: String,
+    labels: Labels,
     source: Arc<dyn Source>,
     start_bookmark: Option<Value>,
     batch_size: usize,
     mut outs: Vec<mpsc::Sender<StreamPage>>,
     cancel: CancellationToken,
 ) -> Result<NodeOutcome, FaucetError> {
+    let node_id = labels.row.to_string();
+    // The same instrumentation `Pipeline::run` layers on: per-node source
+    // metrics, with the node id as `row`, and a round-trip recorder.
+    source.set_roundtrip_recorder(Arc::new(crate::observability::RoundtripRecorder::new(
+        crate::observability::RoundtripSide::Source,
+        labels.pipeline.to_string(),
+        node_id.clone(),
+        source.connector_name(),
+    )));
+    let source = crate::observability::InstrumentedSource::new(source.as_ref(), labels);
     if let Some(bm) = start_bookmark {
         source.apply_start_bookmark(bm).await?;
     }
@@ -2192,10 +2207,47 @@ struct SinkNodeOpts {
     resume: Option<SinkResume>,
     /// The graph's only source, which orders positions for `resume.skip_through`.
     position_source: Option<Arc<dyn Source>>,
+    /// The `source` label of this node's run metrics: the connector kind of
+    /// the source feeding it, or `multiple`.
+    source_label: String,
     /// Every node upstream of this sink.
     upstream: HashSet<String>,
     /// Nodes that have failed so far.
     failed: FailedNodes,
+}
+
+/// `faucet_pipeline_runs_total` for one sink node's run.
+fn count_node_run(mut labels: Vec<Label>, err: Option<&FaucetError>) {
+    labels.push(Label::new(
+        "status",
+        SharedString::const_str(if err.is_some() { "err" } else { "ok" }),
+    ));
+    if let Some(e) = err {
+        labels.push(Label::new(
+            "kind",
+            SharedString::const_str(crate::observability::decorator::error_kind(e)),
+        ));
+    }
+    counter!("faucet_pipeline_runs_total", labels).increment(1);
+}
+
+/// The connector kind of the one source among `upstream`, or `multiple`.
+fn source_label(
+    upstream: Option<&HashSet<String>>,
+    kinds: &HashMap<String, &'static str>,
+) -> String {
+    let mut found: Vec<&str> = upstream
+        .into_iter()
+        .flatten()
+        .filter_map(|id| kinds.get(id).copied())
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    match found.as_slice() {
+        [one] => (*one).to_string(),
+        [] => "unknown".to_string(),
+        _ => "multiple".to_string(),
+    }
 }
 
 /// The first failed node among `upstream`, if any.
@@ -2323,7 +2375,36 @@ async fn run_sink_node(
     if overwriting {
         sink.begin_overwrite().await?;
     }
-    let result = match run_stream(pages, sink.as_ref(), run_opts).await {
+    // The same instrumentation `Pipeline::run` layers on: per-node sink
+    // metrics with the node id as `row`, a round-trip recorder, and the run
+    // counter.
+    let labels = Labels::new(
+        opts.pipeline_name.clone(),
+        node_id.clone(),
+        opts.run_id.clone(),
+    );
+    sink.set_roundtrip_recorder(Arc::new(crate::observability::RoundtripRecorder::new(
+        crate::observability::RoundtripSide::Sink,
+        opts.pipeline_name.clone(),
+        node_id.clone(),
+        sink.connector_name(),
+    )));
+    let run_labels = vec![
+        Label::new("pipeline", SharedString::from(opts.pipeline_name.clone())),
+        Label::new("row", SharedString::from(node_id.clone())),
+        Label::new("source", SharedString::from(opts.source_label.clone())),
+        Label::new("sink", SharedString::const_str(sink.connector_name())),
+    ];
+    let timer = crate::observability::DurationGuard::new(
+        "faucet_pipeline_run_duration_seconds",
+        run_labels.clone(),
+    );
+    let instrumented = crate::observability::InstrumentedSink::new(sink.as_ref(), labels);
+    let outcome = run_stream(pages, &instrumented, run_opts).await;
+    drop(instrumented);
+    drop(timer);
+    count_node_run(run_labels, outcome.as_ref().err());
+    let result = match outcome {
         Ok(r) => r,
         Err(e) => {
             if overwriting {
@@ -2912,6 +2993,81 @@ mod tests {
                 .iter()
                 .any(|r| r["order"] == json!("A") && r["tier"] == json!("gold"))
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn source_and_sink_nodes_are_instrumented() {
+        use metrics_util::debugging::DebugValue;
+        let _g = crate::observability::decorator::source_tests::LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let snap = crate::observability::decorator::source_tests::snapshotter();
+        let probe = crate::sink_forwarding::HookSink::default();
+        let topo = Topology::builder()
+            .source("src-node", VecSource::boxed(recs(3)))
+            .sink("sink-node", Box::new(probe.clone()))
+            .edge("src-node", "sink-node")
+            .build()
+            .unwrap();
+        topo.run(TopologyOptions::new("topo-metrics"))
+            .await
+            .unwrap();
+        assert!(probe.reached().contains(&"set_roundtrip_recorder"));
+        type Counter = (String, Vec<(String, String)>, u64);
+        let counters: Vec<Counter> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Counter(c) => Some((
+                    k.key().name().to_string(),
+                    k.key()
+                        .labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect::<Vec<_>>(),
+                    c,
+                )),
+                _ => None,
+            })
+            .filter(|(_, l, _)| l.contains(&("pipeline".into(), "topo-metrics".into())))
+            .collect();
+        let has = |name: &str, label: (&str, &str), n: u64| {
+            counters.iter().any(|(m, l, c)| {
+                m == name && l.contains(&(label.0.into(), label.1.into())) && *c == n
+            })
+        };
+        assert!(
+            has("faucet_source_records_total", ("row", "src-node"), 3),
+            "{counters:?}"
+        );
+        assert!(
+            has("faucet_sink_records_total", ("row", "sink-node"), 3),
+            "{counters:?}"
+        );
+        assert!(
+            has("faucet_pipeline_runs_total", ("source", "VecSource"), 1),
+            "{counters:?}"
+        );
+        assert!(
+            has("faucet_pipeline_runs_total", ("status", "ok"), 1),
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_fed_by_several_sources_is_labelled_multiple() {
+        let kinds: HashMap<String, &'static str> = [
+            ("a".to_string(), "rest"),
+            ("b".to_string(), "csv"),
+            ("c".to_string(), "rest"),
+        ]
+        .into();
+        let up = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        assert_eq!(source_label(Some(&up(&["a", "t"])), &kinds), "rest");
+        assert_eq!(source_label(Some(&up(&["a", "c"])), &kinds), "rest");
+        assert_eq!(source_label(Some(&up(&["a", "b"])), &kinds), "multiple");
+        assert_eq!(source_label(None, &kinds), "unknown");
     }
 
     #[tokio::test]
