@@ -139,6 +139,7 @@ pub async fn enable_logminer(
     let out = sysdba(container, ENABLE_ARCHIVELOG_SCRIPT).await;
     assert_archivelog_enabled(&out);
     wait_for_pdb(app).await;
+    wait_for_minable_transactions(app).await;
     exec(
         &sys_config(app),
         &[
@@ -202,6 +203,51 @@ pub async fn wait_for_pdb(app: &OracleConnectionConfig) {
     .expect("join");
 }
 
+/// Open transactions in the PDB that began before the oldest archived log: a
+/// capture anchored now would reach back to their start, into redo LogMiner
+/// cannot read.
+pub const UNMINABLE_TRANSACTIONS_SQL: &str = "SELECT TO_CHAR(COUNT(*)) FROM V$TRANSACTION \
+    WHERE START_SCN < (SELECT MIN(FIRST_CHANGE#) FROM V$ARCHIVED_LOG WHERE STATUS = 'A' \
+    AND RESETLOGS_CHANGE# = (SELECT RESETLOGS_CHANGE# FROM V$DATABASE))";
+
+/// Wait until no transaction left over from the restart (an instance-startup
+/// transaction can report a `START_SCN` of 0) is still open, so
+/// `capture_resume_position` anchors inside the archived redo.
+pub async fn wait_for_minable_transactions(app: &OracleConnectionConfig) {
+    let sys = sys_config(app);
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let open = query_strings(&sys, UNMINABLE_TRANSACTIONS_SQL).await;
+        if open == [Some("0".to_string())] {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "transactions from before ARCHIVELOG mode are still open: {open:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// A bookmark at the database's current SCN with nothing emitted there, so a
+/// capture mines only what happens from now on.
+pub async fn current_scn_anchor(cfg: &OracleConnectionConfig) -> serde_json::Value {
+    let scn: u64 = query_strings(cfg, "SELECT TO_CHAR(CURRENT_SCN) FROM V$DATABASE")
+        .await
+        .first()
+        .cloned()
+        .flatten()
+        .expect("current SCN")
+        .parse()
+        .expect("numeric SCN");
+    scn_anchor(scn)
+}
+
+/// The bookmark for "everything after `scn`".
+pub fn scn_anchor(scn: u64) -> serde_json::Value {
+    serde_json::json!({"commit_scn": scn, "restart_scn": scn + 1, "committed_xids": []})
+}
+
 /// Run a SQL*Plus script as SYSDBA in the CDB root; returns its output.
 pub async fn sysdba(container: &ContainerAsync<GenericImage>, script: &str) -> String {
     use testcontainers::core::ExecCommand;
@@ -223,4 +269,11 @@ fn archivelog_check_requires_every_old_log_archived() {
     ] {
         assert!(std::panic::catch_unwind(|| assert_archivelog_enabled(bad)).is_err());
     }
+}
+
+#[test]
+fn scn_anchor_resumes_after_the_scn() {
+    let a = scn_anchor(2_300_000);
+    assert_eq!(a["commit_scn"], 2_300_000);
+    assert_eq!(a["restart_scn"], 2_300_001);
 }

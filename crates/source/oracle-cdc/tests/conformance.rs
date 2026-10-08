@@ -46,7 +46,9 @@ async fn conformance_live_battery() {
     assert_connector_name_nonempty(&source);
     assert_preflight_check_wellformed(&source, &faucet_core::check::CheckContext::default()).await;
 
-    let anchor = source.capture_resume_position().await.unwrap().unwrap();
+    // Anchor at the current SCN: the battery checks streaming and resume, and
+    // must never reach back into redo from before the test began.
+    let anchor = common::current_scn_anchor(&conn).await;
     for i in 1..=TOTAL {
         common::exec(&conn, &[&format!("INSERT INTO EV VALUES ({i})")]).await;
     }
