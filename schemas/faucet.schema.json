@@ -16772,6 +16772,26 @@
                       "description": "Column projection, used when `format: parquet` (#777).",
                       "$ref": "#/$defs/source_sftp__ParquetReadOptions",
                       "default": {}
+                    },
+                    "connect_timeout_secs": {
+                      "default": 30,
+                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "keepalive_interval_secs": {
+                      "default": 15,
+                      "description": "Seconds between SSH keepalives on a quiet connection (default 15); the\nconnection is dropped after three go unanswered. `0` disables them.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   }
                 },
@@ -16936,6 +16956,24 @@
                       "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
                       "$ref": "#/$defs/source_s3__ParquetReadOptions",
                       "default": {}
+                    },
+                    "include": {
+                      "default": null,
+                      "description": "Glob over the whole object key selecting which listed objects to read\n(e.g. `exports/*.parquet`). Without it, folder markers and objects\nwith a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,\n`_temporary/`, `.crc`) are skipped; with it, exactly the matching keys\nare read.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "max_object_bytes": {
+                      "default": 2147483648,
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   },
                   "title": "S3SourceConfig",
@@ -18042,6 +18080,24 @@
                       "description": "Column projection, used when `file_format: parquet` (#777).",
                       "$ref": "#/$defs/source_azure-blob__ParquetReadOptions",
                       "default": {}
+                    },
+                    "include": {
+                      "default": null,
+                      "description": "Glob over the whole object key selecting which listed objects to read\n(e.g. `exports/*.parquet`). Without it, folder markers and objects\nwith a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,\n`_temporary/`, `.crc`) are skipped; with it, exactly the matching keys\nare read.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "max_object_bytes": {
+                      "default": 2147483648,
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   },
                   "title": "AzureBlobSourceConfig",
@@ -19286,7 +19342,7 @@
                       "default": []
                     },
                     "batch_size": {
-                      "description": "Page size hint for [`stream_pages`](faucet_core::Source::stream_pages).\nGoverns how many rows accumulate before a `StreamPage` is emitted; the\nunderlying parquet row-group size still bounds each read. `0` is the\n\"no batching\" sentinel — one page per file.",
+                      "description": "Page size hint for [`stream_pages`](faucet_core::Source::stream_pages).\nGoverns how many rows accumulate before a `StreamPage` is emitted. `0`\nis the \"no batching\" sentinel — one page per data file, however many\nrow groups it holds.",
                       "type": [
                         "integer",
                         "string"
@@ -19603,6 +19659,24 @@
                       "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
                       "$ref": "#/$defs/source_gcs__ParquetReadOptions",
                       "default": {}
+                    },
+                    "include": {
+                      "default": null,
+                      "description": "Glob over the whole object key selecting which listed objects to read\n(e.g. `exports/*.parquet`). Without it, folder markers and objects\nwith a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,\n`_temporary/`, `.crc`) are skipped; with it, exactly the matching keys\nare read.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "max_object_bytes": {
+                      "default": 2147483648,
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   },
                   "title": "GcsSourceConfig",
@@ -21015,6 +21089,24 @@
                       "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
                       "$ref": "#/$defs/source_s3__ParquetReadOptions",
                       "default": {}
+                    },
+                    "include": {
+                      "default": null,
+                      "description": "Glob over the whole object key selecting which listed objects to read\n(e.g. `exports/*.parquet`). Without it, folder markers and objects\nwith a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,\n`_temporary/`, `.crc`) are skipped; with it, exactly the matching keys\nare read.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "max_object_bytes": {
+                      "default": 2147483648,
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   },
                   "title": "S3SourceConfig",
@@ -21251,6 +21343,24 @@
                       "description": "Column projection, used when `file_format: parquet` (#777).",
                       "$ref": "#/$defs/source_azure-blob__ParquetReadOptions",
                       "default": {}
+                    },
+                    "include": {
+                      "default": null,
+                      "description": "Glob over the whole object key selecting which listed objects to read\n(e.g. `exports/*.parquet`). Without it, folder markers and objects\nwith a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,\n`_temporary/`, `.crc`) are skipped; with it, exactly the matching keys\nare read.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "max_object_bytes": {
+                      "default": 2147483648,
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   },
                   "title": "AzureBlobSourceConfig",
@@ -21424,6 +21534,24 @@
                       "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
                       "$ref": "#/$defs/source_gcs__ParquetReadOptions",
                       "default": {}
+                    },
+                    "include": {
+                      "default": null,
+                      "description": "Glob over the whole object key selecting which listed objects to read\n(e.g. `exports/*.parquet`). Without it, folder markers and objects\nwith a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,\n`_temporary/`, `.crc`) are skipped; with it, exactly the matching keys\nare read.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "max_object_bytes": {
+                      "default": 2147483648,
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   },
                   "title": "GcsSourceConfig",
@@ -23213,6 +23341,26 @@
                       "type": [
                         "string",
                         "null"
+                      ]
+                    },
+                    "connect_timeout_secs": {
+                      "default": 30,
+                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "keepalive_interval_secs": {
+                      "default": 15,
+                      "description": "Seconds between SSH keepalives on a quiet connection (default 15); the\nconnection is dropped after three go unanswered. `0` disables them.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
                       ]
                     }
                   },
