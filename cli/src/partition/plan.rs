@@ -59,7 +59,8 @@ pub fn plan(spec: &PartitionSpec) -> CliResult<Vec<PartitionChunk>> {
                 IntBound::Literal(v) => *v,
                 IntBound::Discovered(_) => {
                     return Err(CliError::Internal(
-                        "partition: an undiscovered bound reached the planner —                          `resolve_bounds` must run before `plan`"
+                        "partition: an undiscovered bound reached the planner — \
+                         `resolve_bounds` must run before `plan`"
                             .into(),
                     ));
                 }
@@ -127,7 +128,8 @@ pub fn plan(spec: &PartitionSpec) -> CliResult<Vec<PartitionChunk>> {
                 CountBound::Literal(v) => *v,
                 CountBound::Discovered(_) => {
                     return Err(CliError::Internal(
-                        "partition: an undiscovered total reached the planner —                          `resolve_bounds` must run before `plan`"
+                        "partition: an undiscovered total reached the planner — \
+                         `resolve_bounds` must run before `plan`"
                             .into(),
                     ));
                 }

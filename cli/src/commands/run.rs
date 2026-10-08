@@ -56,7 +56,8 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
     // guessing would be wrong either way (#610).
     if args.concurrency == Some(0) {
         return Err(CliError::Config(
-            "--concurrency must be greater than 0 (it is a connection/fetch count,              not a `0 = unlimited` sentinel)"
+            "--concurrency must be greater than 0 (it is a connection/fetch count, \
+             not a `0 = unlimited` sentinel)"
                 .into(),
         ));
     }

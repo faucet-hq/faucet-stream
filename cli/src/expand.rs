@@ -1662,12 +1662,16 @@ fn check_reconcile_scope(nodes: &[ExpandedNode]) -> CliResult<()> {
     if let Some(chunk) = roots.iter().find(|id| id.contains("::partition::")) {
         let row = chunk.split("::partition::").next().unwrap_or(chunk);
         return Err(CliError::Config(format!(
-            "row '{row}' is partitioned, but `reconcile:` compares one authoritative count with              each invocation's own row count, so every chunk would fail — remove `partition:`              or `reconcile:`"
+            "row '{row}' is partitioned, but `reconcile:` compares one authoritative count with \
+             each invocation's own row count, so every chunk would fail — remove `partition:` \
+             or `reconcile:`"
         )));
     }
     if roots.len() > 1 {
         return Err(CliError::Config(format!(
-            "`reconcile:` compares one authoritative count with each root invocation's own row              count, but this config has {} root rows ({}) — reconcile a config with a single              root row",
+            "`reconcile:` compares one authoritative count with each root invocation's own row \
+             count, but this config has {} root rows ({}) — reconcile a config with a single \
+             root row",
             roots.len(),
             roots.join(", ")
         )));
