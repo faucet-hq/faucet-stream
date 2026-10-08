@@ -193,7 +193,7 @@ impl faucet_core::Sink for RedisSink {
     }
 
     /// Write `records` AND durably record `token` for `scope` in one atomic
-    /// Lua script ([`IDEMPOTENT_SCRIPT`]).
+    /// Lua script.
     ///
     /// Every record's command for the configured [`RedisSinkType`] plus a
     /// final `SET _faucet_commit_token:{scope} {token}`, after a type check
