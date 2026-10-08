@@ -35,8 +35,9 @@ pub struct Notifier {
     timeout: Duration,
     /// (rule.name + dedupe_key) → last leading-edge send instant.
     dedupe: Mutex<HashMap<String, Instant>>,
-    /// (rule.name + incident_key) currently-open PagerDuty incidents.
-    incidents: Mutex<HashSet<String>>,
+    /// (rule.name + incident_key) → the PagerDuty `dedup_key`s triggered for
+    /// that (pipeline, row) and not yet resolved.
+    incidents: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl Notifier {
@@ -59,7 +60,7 @@ impl Notifier {
             client,
             timeout: DEFAULT_TIMEOUT,
             dedupe: Mutex::new(HashMap::new()),
-            incidents: Mutex::new(HashSet::new()),
+            incidents: Mutex::new(HashMap::new()),
         })))
     }
 
@@ -96,18 +97,21 @@ impl Notifier {
     async fn deliver(&self, rule: &NotificationSpec, event: &NotifyEvent) {
         let channel = rule.channel.kind();
         let start = Instant::now();
+        let pd_key = event.pagerduty_key();
         let res = self
-            .send_with_retry(rule, event, PdAction::Trigger, &event.incident_key())
+            .send_with_retry(rule, event, PdAction::Trigger, &pd_key)
             .await;
         metrics::record_duration(channel, start.elapsed().as_secs_f64());
         match res {
             Ok(()) => {
                 metrics::record_sent(channel, event.kind.as_str(), true);
-                if matches!(rule.channel, ChannelSpec::Pagerduty(_)) && event.opens_incident() {
+                if matches!(rule.channel, ChannelSpec::Pagerduty(_)) {
                     self.incidents
                         .lock()
                         .unwrap()
-                        .insert(incident_id(&rule.name, event));
+                        .entry(incident_id(&rule.name, event))
+                        .or_default()
+                        .insert(pd_key);
                 }
             }
             Err(e) => {
@@ -127,27 +131,36 @@ impl Notifier {
     /// Send a `resolve` for every PagerDuty rule with an open incident on this
     /// event's key.
     async fn resolve_incidents(&self, event: &NotifyEvent) {
-        let open: Vec<usize> = {
+        let open: Vec<(usize, String)> = {
             let inc = self.incidents.lock().unwrap();
-            self.rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| matches!(r.channel, ChannelSpec::Pagerduty(_)))
-                .filter(|(_, r)| inc.contains(&incident_id(&r.name, event)))
-                .map(|(i, _)| i)
-                .collect()
+            let mut open = Vec::new();
+            for (i, r) in self.rules.iter().enumerate() {
+                if !matches!(r.channel, ChannelSpec::Pagerduty(_)) {
+                    continue;
+                }
+                if let Some(keys) = inc.get(&incident_id(&r.name, event)) {
+                    let mut keys: Vec<&String> = keys.iter().collect();
+                    keys.sort();
+                    open.extend(keys.into_iter().map(|k| (i, k.clone())));
+                }
+            }
+            open
         };
-        for idx in open {
+        for (idx, key) in open {
             let rule = &self.rules[idx];
             let res = self
-                .send_with_retry(rule, event, PdAction::Resolve, &event.incident_key())
+                .send_with_retry(rule, event, PdAction::Resolve, &key)
                 .await;
             match res {
                 Ok(()) => {
-                    self.incidents
-                        .lock()
-                        .unwrap()
-                        .remove(&incident_id(&rule.name, event));
+                    let id = incident_id(&rule.name, event);
+                    let mut inc = self.incidents.lock().unwrap();
+                    if let Some(keys) = inc.get_mut(&id) {
+                        keys.remove(&key);
+                        if keys.is_empty() {
+                            inc.remove(&id);
+                        }
+                    }
                     metrics::record_sent(rule.channel.kind(), "resolve", true);
                 }
                 Err(e) => {
@@ -232,7 +245,12 @@ impl Notifier {
     /// Test-only view of open incidents.
     #[cfg(test)]
     fn open_incident_count(&self) -> usize {
-        self.incidents.lock().unwrap().len()
+        self.incidents
+            .lock()
+            .unwrap()
+            .values()
+            .map(HashSet::len)
+            .sum()
     }
 }
 
@@ -242,7 +260,10 @@ fn incident_id(rule_name: &str, event: &NotifyEvent) -> String {
 
 /// Pure rule/event match: kind selector + severity floor + DLQ threshold.
 fn rule_matches(rule: &NotificationSpec, event: &NotifyEvent) -> bool {
-    if !rule.on.is_empty() && !rule.on.contains(&event.kind) {
+    // Every failure-class event is a run failure, so `on: [run_failure]`
+    // hears a budget / circuit / contract failure too (#789 CLI-123).
+    let failure = event.opens_incident() && rule.on.contains(&EventKind::RunFailure);
+    if !rule.on.is_empty() && !rule.on.contains(&event.kind) && !failure {
         return false;
     }
     if event.severity < rule.min_severity {
@@ -407,11 +428,81 @@ mod tests {
         let mut r = rule("pd", vec![EventKind::RunFailure], pd);
         r.min_severity = Severity::Info;
         let n = Notifier::from_specs(&[r]).unwrap().unwrap();
-        n.incidents.lock().unwrap().insert("pd::p:r1".to_string());
+        n.incidents
+            .lock()
+            .unwrap()
+            .entry("pd::p:r1".to_string())
+            .or_default()
+            .insert("p:r1".to_string());
         assert_eq!(n.open_incident_count(), 1);
         n.emit(NotifyEvent::run_success("p", "r1", 1)).await;
         // resolve delivery failed (bad endpoint) → incident intentionally kept.
         assert_eq!(n.open_incident_count(), 1);
+    }
+
+    #[test]
+    fn run_failure_rules_hear_every_failure_class_event() {
+        let r = rule("r", vec![EventKind::RunFailure], slack());
+        assert!(rule_matches(
+            &r,
+            &NotifyEvent::budget_exceeded("p", "r", "records", 1, 2)
+        ));
+        assert!(!rule_matches(
+            &r,
+            &NotifyEvent::sla_breach("p", "r", "staleness", "m")
+        ));
+    }
+
+    #[tokio::test]
+    async fn success_resolves_every_triggered_pagerduty_key() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let pd = ChannelSpec::Pagerduty(PagerdutyConfig {
+            routing_key: "rk".into(),
+            source: None,
+            endpoint: Some(format!("{}/enqueue", server.uri())),
+        });
+        let n = Notifier::from_specs(&[rule("pd", vec![], pd)])
+            .unwrap()
+            .unwrap();
+        n.emit(NotifyEvent::budget_exceeded("p", "r1", "records", 1, 2))
+            .await;
+        n.emit(NotifyEvent::sla_breach("p", "r1", "staleness", "m"))
+            .await;
+        assert_eq!(n.open_incident_count(), 2);
+        n.emit(NotifyEvent::run_success("p", "r1", 1)).await;
+        assert_eq!(n.open_incident_count(), 0);
+
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        let pairs: Vec<(String, String)> = bodies
+            .iter()
+            .map(|b| {
+                (
+                    b["event_action"].as_str().unwrap().to_string(),
+                    b["dedup_key"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("trigger".to_string(), "p:r1".to_string()),
+                ("trigger".to_string(), "sla_breach:p:r1".to_string()),
+                ("resolve".to_string(), "p:r1".to_string()),
+                ("resolve".to_string(), "sla_breach:p:r1".to_string()),
+            ]
+        );
     }
 
     #[test]
