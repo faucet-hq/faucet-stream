@@ -369,7 +369,11 @@ pub fn mark_shard_done(state: &mut MirrorState, name: &str, rows: u64, now: Date
 /// `name`'s snapshot completed: it joins the stream.
 pub fn mark_snapshot_done(state: &mut MirrorState, name: &str, now: DateTime<Utc>) {
     if let Some(t) = state.tables.get_mut(name) {
-        t.set_phase(TablePhase::Active, now);
+        // A table dropped (or refused) by a discovery while it snapshotted
+        // stays that way.
+        if !matches!(t.phase, TablePhase::Dropped | TablePhase::Refused) {
+            t.set_phase(TablePhase::Active, now);
+        }
         t.snapshot.finished_at = Some(now);
         t.last_applied_at = Some(now);
         state.updated_at = now;
@@ -456,6 +460,24 @@ mod tests {
             state.incumbents().into_iter().collect::<Vec<_>>(),
             ["a", "b", "c", "d"]
         );
+    }
+
+    /// A table a discovery dropped mid-snapshot is not reactivated when the
+    /// snapshot finishes (#789 CLI-88).
+    #[test]
+    fn a_table_dropped_during_its_snapshot_stays_dropped() {
+        let now = Utc::now();
+        let mut state = MirrorState::new(now);
+        state
+            .tables
+            .insert("t".into(), TableState::new(TablePhase::Pending, now));
+        mark_snapshot_started(&mut state, "t", json!(1), 1, now);
+        state.tables.get_mut("t").unwrap().phase = TablePhase::Dropped;
+        mark_snapshot_done(&mut state, "t", now);
+        assert_eq!(state.tables["t"].phase, TablePhase::Dropped);
+        mark_snapshot_started(&mut state, "t", json!(2), 1, now);
+        mark_snapshot_done(&mut state, "t", now);
+        assert_eq!(state.tables["t"].phase, TablePhase::Active);
     }
 
     #[test]
