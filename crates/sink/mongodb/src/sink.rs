@@ -1263,6 +1263,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn collection_uris_drop_credentials_paths_and_options() {
+        assert_eq!(
+            collection_uri("mongodb://u:p@h1:27017,h2/admin?replicaSet=rs", "db", "c"),
+            "mongodb://h1:27017,h2/db/c"
+        );
+        assert_eq!(
+            collection_uri("mongodb+srv://cluster.example.net", "db", "c"),
+            "mongodb+srv://cluster.example.net/db/c"
+        );
+        assert_eq!(collection_uri("localhost", "db", "c"), "localhost/db/c");
+    }
+
+    #[test]
     fn staging_index_specs_skip_id_and_clustered_and_drop_ns() {
         let specs = staging_index_specs(vec![
             bson::doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
