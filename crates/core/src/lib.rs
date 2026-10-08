@@ -62,6 +62,8 @@ pub mod retry;
 pub mod rollback;
 pub mod schema;
 pub mod shard;
+#[cfg(test)]
+mod sink_forwarding;
 pub mod stage;
 pub mod staging;
 pub mod state;

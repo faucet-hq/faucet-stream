@@ -285,6 +285,9 @@ impl<'a, S: Sink + ?Sized> CleanupTracker<'a, S> {
 
 #[async_trait::async_trait]
 impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let n = self.inner.write_batch(records).await?;
         self.record(records);
@@ -388,6 +391,50 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
     }
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
+    }
+    fn write_batch_is_replay_safe(&self) -> bool {
+        self.inner.write_batch_is_replay_safe()
+    }
+    fn supports_staged_load(&self) -> bool {
+        self.inner.supports_staged_load()
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    fn supports_rollback(&self) -> bool {
+        self.inner.supports_rollback()
+    }
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &crate::rollback::RollbackOptions,
+    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
+        self.inner.rollback_run(run_id, opts).await
+    }
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.inner.forget_run(run_id).await
+    }
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.inner.rewind_commit_token(scope, token).await
+    }
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.inner.readback_source()
+    }
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
+    async fn check(
+        &self,
+        ctx: &crate::check::CheckContext,
+    ) -> Result<crate::check::CheckReport, FaucetError> {
+        self.inner.check(ctx).await
     }
 }
 
@@ -537,5 +584,23 @@ mod tests {
         let msg = seen.overflow_error(50).to_string();
         assert!(msg.contains("Nothing was deleted"), "{msg}");
         assert!(msg.contains("50"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn cleanup_tracker_forwards_every_hook() {
+        let probe = crate::sink_forwarding::HookSink::default();
+        let policy = CleanupPolicy::new(scope(), vec!["id".into()], 10).unwrap();
+        let t = CleanupTracker::new(&probe, &policy);
+        crate::sink_forwarding::assert_forwards_every_hook(
+            &t,
+            &probe,
+            &[
+                "supports_columnar",
+                "write_batch_columnar",
+                "native_load_capabilities",
+                "load_native",
+            ],
+        )
+        .await;
     }
 }

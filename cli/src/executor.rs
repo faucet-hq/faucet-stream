@@ -3666,6 +3666,9 @@ impl CapturingSink {
 
 #[async_trait]
 impl Sink for CapturingSink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     fn connector_name(&self) -> &'static str {
         self.inner.connector_name()
     }
@@ -3774,6 +3777,9 @@ impl LimitedSink {
 
 #[async_trait]
 impl Sink for LimitedSink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     fn connector_name(&self) -> &'static str {
         self.inner.connector_name()
     }
@@ -6353,6 +6359,29 @@ matrix:
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(*captured.lock().await, vec![json!({"id": 7})]);
+    }
+
+    #[tokio::test]
+    async fn capturing_and_limited_sinks_forward_admit_page() {
+        struct Refuses;
+        #[async_trait]
+        impl Sink for Refuses {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            async fn admit_page(&self, _r: &[Value]) -> Result<(), FaucetError> {
+                Err(FaucetError::Sink("over budget".into()))
+            }
+        }
+        let page = [json!({"id": 1})];
+        let limited = LimitedSink::wrap(Box::new(Refuses), 5);
+        assert!(limited.admit_page(&page).await.is_err());
+        let capturing = CapturingSink::wrap(
+            Box::new(Refuses),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Projection::Full),
+        );
+        assert!(capturing.admit_page(&page).await.is_err());
     }
 
     #[tokio::test]

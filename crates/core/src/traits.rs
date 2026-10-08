@@ -570,6 +570,15 @@ pub trait Sink: Send + Sync {
         crate::dlq::BatchAtomicity::BestEffort
     }
 
+    /// Called with a whole page before the pipeline splits it into adaptive
+    /// sub-batches. A sink enforcing a ceiling that must hold for the page as
+    /// a unit (a run budget) refuses here, so no sub-batch of a refused page
+    /// lands. Default: accept. Decorators must forward this.
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        let _ = records;
+        Ok(())
+    }
+
     /// Whether this sink can consume **columnar** (`arrow::RecordBatch`) writes
     /// via [`write_batch_columnar`](Self::write_batch_columnar) without first
     /// converting to `Value`. Default: `false`.

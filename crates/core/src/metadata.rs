@@ -199,6 +199,9 @@ impl MetadataSink {
 
 #[async_trait::async_trait]
 impl Sink for MetadataSink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         self.inner.write_batch(&self.stamp(records)).await
     }
@@ -296,11 +299,69 @@ impl Sink for MetadataSink {
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
     }
+    fn write_batch_is_replay_safe(&self) -> bool {
+        self.inner.write_batch_is_replay_safe()
+    }
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
+    fn supports_staged_load(&self) -> bool {
+        self.inner.supports_staged_load()
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    fn supports_rollback(&self) -> bool {
+        self.inner.supports_rollback()
+    }
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &crate::rollback::RollbackOptions,
+    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
+        self.inner.rollback_run(run_id, opts).await
+    }
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.inner.forget_run(run_id).await
+    }
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.inner.rewind_commit_token(scope, token).await
+    }
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.inner.readback_source()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_sink_forwards_every_hook_but_the_unstamped_paths() {
+        let probe = crate::sink_forwarding::HookSink::default();
+        let meta = CompiledMetadata::compile(&spec(&[MetadataColumn::RunId]))
+            .unwrap()
+            .unwrap();
+        let sink = MetadataSink::new(Box::new(probe.clone()), meta, ctx());
+        crate::sink_forwarding::assert_forwards_every_hook(
+            &sink,
+            &probe,
+            &[
+                "supports_columnar",
+                "write_batch_columnar",
+                "native_load_capabilities",
+                "load_native",
+            ],
+        )
+        .await;
+    }
     use serde_json::json;
     use std::sync::Mutex;
 

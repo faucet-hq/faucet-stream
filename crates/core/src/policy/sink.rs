@@ -229,6 +229,9 @@ fn walk(
 
 #[async_trait]
 impl Sink for PolicySink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let offending = self.screen(records)?;
         if offending.is_empty() {
@@ -373,6 +376,12 @@ impl Sink for PolicySink {
     }
     async fn complete_run(&self) -> Result<(), FaucetError> {
         self.inner.complete_run().await
+    }
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        self.inner.overwrite_staging_exists().await
+    }
+    fn config_schema(&self) -> Value {
+        self.inner.config_schema()
     }
     fn supports_rollback(&self) -> bool {
         self.inner.supports_rollback()
@@ -807,5 +816,29 @@ mod tests {
             "{err}"
         );
         assert!(cap.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn policy_sink_forwards_every_hook_but_native() {
+        let probe = crate::sink_forwarding::HookSink::default();
+        let s = PolicySink::new(
+            Box::new(probe.clone()),
+            policy("fail"),
+            SinkFacts {
+                id: "default".into(),
+                kind: "jsonl".into(),
+                attributes: Default::default(),
+            },
+            PolicyScope {
+                pipeline: "p".into(),
+                row: "r".into(),
+            },
+        );
+        crate::sink_forwarding::assert_forwards_every_hook(
+            &s,
+            &probe,
+            &["native_load_capabilities", "load_native"],
+        )
+        .await;
     }
 }

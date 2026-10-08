@@ -1721,6 +1721,9 @@ where
                         // resliced page mixes the two failure modes.
                         let mut had_per_row_sink_failure = false;
                         let records_len = page.records.len();
+                        if adaptive_cfg.is_some() && records_len > 0 {
+                            sink.admit_page(&page.records).await?;
+                        }
                         let mut offset = 0usize;
                         while offset < records_len {
                             let size = match adaptive_cfg.as_ref() {
@@ -2208,6 +2211,7 @@ where
                         );
                         if !page.records.is_empty() {
                             if let Some(cfg) = adaptive_cfg.as_ref() {
+                                sink.admit_page(&page.records).await?;
                                 let ctrl = controller.get_or_insert_with(|| {
                                     crate::adaptive::AimdController::new(cfg, page.records.len())
                                 });

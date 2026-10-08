@@ -231,6 +231,9 @@ impl SamplingSink {
 
 #[async_trait]
 impl Sink for SamplingSink {
+    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
+        self.inner.admit_page(records).await
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let n = self.inner.write_batch(records).await?;
         self.state.observe(records);
@@ -1567,5 +1570,22 @@ mod tests {
             .collect();
         assert!(names.contains(&"id".to_string()));
         assert!(names.contains(&"name".to_string()));
+    }
+
+    #[tokio::test]
+    async fn sampling_sink_forwards_admit_page() {
+        struct Refuses;
+        #[async_trait]
+        impl Sink for Refuses {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            async fn admit_page(&self, _r: &[Value]) -> Result<(), FaucetError> {
+                Err(FaucetError::Sink("over budget".into()))
+            }
+        }
+        let s = SamplingSink::new(Box::new(Refuses), Arc::new(SampleState::new(2)));
+        let err = s.admit_page(&[json!({"id": 1})]).await.unwrap_err();
+        assert!(err.to_string().contains("over budget"), "{err}");
     }
 }
