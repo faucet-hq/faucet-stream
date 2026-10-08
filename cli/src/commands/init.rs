@@ -54,6 +54,16 @@ pub async fn run(args: InitArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// Where `--discover` writes the Singer catalog: `catalog.json` next to the
+/// output config.
+#[cfg_attr(not(feature = "source-singer"), allow(dead_code))]
+fn catalog_path_for(output: &std::path::Path) -> std::path::PathBuf {
+    match output.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("catalog.json"),
+        _ => std::path::PathBuf::from("catalog.json"),
+    }
+}
+
 /// `faucet init --source singer --discover --executable <tap>`: run the tap's
 /// discovery, write the catalog next to the output, and scaffold a config that
 /// references it and lists the discovered streams.
@@ -69,6 +79,12 @@ async fn run_singer_discover(args: &InitArgs) -> CliResult<()> {
         CliError::Config("`--discover` requires `--executable <tap>`".to_string())
     })?;
 
+    // A hand-curated catalog is never replaced without --force.
+    let catalog_path = catalog_path_for(&args.output);
+    if catalog_path.exists() && !args.force {
+        return Err(CliError::ScaffoldExists { path: catalog_path });
+    }
+
     let cfg = faucet_source_singer::SingerSourceConfig::new(executable, "");
     let raw_catalog = faucet_source_singer::discover(&cfg).await?; // FaucetError -> CliError
     let streams = faucet_source_singer::catalog_stream_ids(&raw_catalog);
@@ -83,11 +99,6 @@ async fn run_singer_discover(args: &InitArgs) -> CliResult<()> {
         (sel.catalog, sel.selected, sel.warnings)
     };
 
-    // Write the catalog next to the output file.
-    let catalog_path = match args.output.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join("catalog.json"),
-        _ => std::path::PathBuf::from("catalog.json"),
-    };
     let catalog_json = serde_json::to_string_pretty(&catalog)
         .map_err(|e| CliError::Config(format!("failed to serialize catalog: {e}")))?;
     std::fs::write(&catalog_path, catalog_json)?;
@@ -364,6 +375,13 @@ fn render_pipeline(
     body.push_str("# Optional matrix block. Each row picks a template via ref:\n");
     body.push_str("# (omit ref: to inherit the `default` template above) and may\n");
     body.push_str("# override `type:` / `config:` per row.\n");
+    if template != "default" {
+        // No `default` template exists, so a row must name this one.
+        body.push_str("matrix:\n");
+        body.push_str(&format!("  - id: {template}\n"));
+        body.push_str(&format!("    source: {{ ref: {template} }}\n"));
+        body.push_str(&format!("    sink: {{ ref: {template} }}\n"));
+    }
     body.push_str("# matrix:\n");
     body.push_str("#   - id: users\n");
     body.push_str(&format!(
@@ -392,6 +410,41 @@ mod tests {
             executable: None,
             stream: None,
         }
+    }
+
+    /// A named template scaffolds a config that validates: the matrix row
+    /// that picks it is emitted, since no `default` template exists
+    /// (#789 CLI-159).
+    #[tokio::test]
+    async fn a_named_template_scaffold_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = args(Some("csv"), Some("jsonl"));
+        a.output = dir.path().join("p.yaml");
+        a.template = "warehouse".into();
+        super::run(a).await.unwrap();
+        let cfg = crate::config::PipelineConfig::from_path_tolerating_secrets(
+            dir.path().join("p.yaml"),
+            None,
+        )
+        .unwrap();
+        let nodes = crate::expand::expand(&cfg).expect("a fresh scaffold expands");
+        assert_eq!(nodes[0].id, "warehouse");
+    }
+
+    /// `--discover` never overwrites an existing catalog without --force
+    /// (#789 CLI-158).
+    #[cfg(feature = "source-singer")]
+    #[tokio::test]
+    async fn discover_refuses_to_overwrite_a_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("catalog.json"), "{}").unwrap();
+        let mut a = args(Some("singer"), None);
+        a.output = dir.path().join("p.yaml");
+        a.discover = true;
+        a.executable = Some("/nonexistent/tap".into());
+        let err = super::run(a).await.unwrap_err();
+        assert!(matches!(err, CliError::ScaffoldExists { .. }), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("catalog.json")).unwrap(), "{}");
     }
 
     #[test]
