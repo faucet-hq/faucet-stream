@@ -148,6 +148,27 @@ pub fn rule_applies(rule: &PolicyRule, label: &str, sink: &SinkFacts) -> bool {
 
 /// Evaluate every rule against every labelled column heading into `sink`.
 /// Deterministic order: rules in declaration order, columns as given.
+/// The violations a quarantine would cause at the DLQ: the columns of the
+/// `quarantined` violations, evaluated with `dlq` as their destination. The
+/// quarantined record reaches the DLQ in full, so a residency or deny rule
+/// that holds for the main sink must hold there too.
+pub fn dlq_violations(
+    policy: &CompiledPolicy,
+    dlq: &SinkFacts,
+    columns: &[ColumnFacts],
+    quarantined: &[Violation],
+) -> Vec<Violation> {
+    let moved: Vec<ColumnFacts> = columns
+        .iter()
+        .filter(|c| quarantined.iter().any(|v| v.column == c.name))
+        .cloned()
+        .collect();
+    if moved.is_empty() {
+        return Vec::new();
+    }
+    evaluate(policy, dlq, &moved)
+}
+
 pub fn evaluate(
     policy: &CompiledPolicy,
     sink: &SinkFacts,

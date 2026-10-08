@@ -380,16 +380,37 @@ pipeline:
         .failure()
         .stderr(contains("needs a `dlq:` block"));
 
-    // quarantine with a DLQ: the offending row lands in the DLQ, the rest is
-    // written, and the run succeeds.
+    // quarantine into a DLQ the rule does not allow either: the record would
+    // reach it in full, so the run fails instead of moving the PII there.
     let dlq = dir.path().join("dlq.jsonl");
+    let cfg = write(
+        dir.path(),
+        "q-us.yaml",
+        &base(
+            "quarantine",
+            &format!(
+                "  dlq:\n    sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                dlq.display()
+            ),
+        ),
+    );
+    faucet()
+        .args(["run"])
+        .arg(&cfg)
+        .assert()
+        .failure()
+        .stderr(contains("`dlq`"));
+    assert!(fs::read_to_string(&dlq).unwrap_or_default().is_empty());
+
+    // quarantine with a compliant DLQ: the offending row lands in the DLQ, the
+    // rest is written, and the run succeeds.
     let cfg = write(
         dir.path(),
         "q2.yaml",
         &base(
             "quarantine",
             &format!(
-                "  dlq:\n    sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                "  dlq:\n    sink: {{ type: jsonl, config: {{ path: \"{}\" }}, attributes: {{ residency: eu }} }}\n",
                 dlq.display()
             ),
         ),

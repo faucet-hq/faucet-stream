@@ -2587,7 +2587,7 @@ async fn run_one_invocation(
             let compiled =
                 faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
                     .map_err(|e| CliError::Config(format!("policy: {e}")))?;
-            let policy_sink = faucet_core::PolicySink::new(
+            let mut policy_sink = faucet_core::PolicySink::new(
                 sink,
                 Arc::new(compiled),
                 faucet_core::SinkFacts {
@@ -2600,6 +2600,9 @@ async fn run_one_invocation(
                     row: row_id.clone(),
                 },
             );
+            if let Some(dlq) = &node.dlq {
+                policy_sink = policy_sink.with_dlq_destination(crate::policy::dlq_facts(dlq));
+            }
             Box::new(match &node.masking {
                 Some(masking) => policy_sink.with_masking(Arc::new(
                     faucet_core::CompiledMasking::compile_for_sink(

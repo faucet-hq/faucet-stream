@@ -34,6 +34,7 @@ pub struct PolicySink {
     facts: SinkFacts,
     scope: PolicyScope,
     masking: Option<Arc<CompiledMasking>>,
+    dlq: Option<SinkFacts>,
 }
 
 impl PolicySink {
@@ -49,7 +50,16 @@ impl PolicySink {
             facts,
             scope,
             masking: None,
+            dlq: None,
         }
+    }
+
+    /// The DLQ a quarantined record is routed to, evaluated as a destination
+    /// of its own: a quarantine whose record the DLQ may not receive fails
+    /// the run instead.
+    pub fn with_dlq_destination(mut self, dlq: SinkFacts) -> Self {
+        self.dlq = Some(dlq);
+        self
     }
 
     /// The masking pass that ran upstream for this sink, so a column it
@@ -62,12 +72,13 @@ impl PolicySink {
 
     /// Classify one record's scalar leaves (by name and by value) and evaluate
     /// the rules; returns the violations with the harshest runtime action.
-    fn check_record(&self, record: &Value) -> Vec<Violation> {
+    fn check_record(&self, record: &Value) -> (Vec<ColumnFacts>, Vec<Violation>) {
         let columns = classify_record_masked(&self.policy, record, self.masking.as_deref());
         if columns.is_empty() {
-            return Vec::new();
+            return (columns, Vec::new());
         }
-        evaluate(&self.policy, &self.facts, &columns)
+        let violations = evaluate(&self.policy, &self.facts, &columns);
+        (columns, violations)
     }
 
     /// The runtime action for a set of violations: `fail` wins over
@@ -101,11 +112,21 @@ impl PolicySink {
     fn screen(&self, records: &[Value]) -> Result<Vec<(usize, Violation)>, FaucetError> {
         let mut offending = Vec::new();
         for (i, r) in records.iter().enumerate() {
-            let mut violations = self.check_record(r);
+            let (columns, mut violations) = self.check_record(r);
             if violations.is_empty() {
                 continue;
             }
-            let action = self.action_for(&violations);
+            let mut action = self.action_for(&violations);
+            if action == RuntimeAction::Quarantine
+                && let Some(dlq) = &self.dlq
+            {
+                let at_dlq =
+                    super::evaluate::dlq_violations(&self.policy, dlq, &columns, &violations);
+                if !at_dlq.is_empty() {
+                    action = RuntimeAction::Fail;
+                    violations = at_dlq;
+                }
+            }
             for v in &violations {
                 self.record_metric(v, action);
                 tracing::warn!(
@@ -641,6 +662,36 @@ mod tests {
             s.write_batch(&[json!({"email": "a@b.io"})]).await.unwrap(),
             1
         );
+        assert_eq!(cap.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quarantine_into_a_non_compliant_dlq_fails_instead() {
+        let dlq = |residency: &str| SinkFacts {
+            id: "dlq".into(),
+            kind: "jsonl".into(),
+            attributes: [("residency".to_string(), residency.to_string())].into(),
+        };
+        let (s, cap) = sink(policy("quarantine"), "us");
+        let s = s.with_dlq_destination(dlq("us"));
+        let err = s
+            .write_batch_partial(&[json!({"id": 1}), json!({"email": "a@b.io"})])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::PolicyViolation { column, .. } if column == "email"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("`dlq`"), "{err}");
+        assert!(cap.0.lock().unwrap().is_empty());
+
+        let (s, cap) = sink(policy("quarantine"), "us");
+        let s = s.with_dlq_destination(dlq("eu"));
+        let outcomes = s
+            .write_batch_partial(&[json!({"id": 1}), json!({"email": "a@b.io"})])
+            .await
+            .unwrap();
+        assert!(outcomes[0].is_ok() && outcomes[1].is_err());
         assert_eq!(cap.0.lock().unwrap().len(), 1);
     }
 

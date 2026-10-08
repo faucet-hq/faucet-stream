@@ -147,7 +147,21 @@ renamed (`ssn` → `tax_id`) carries the labels of its original name there too.
   `faucet run` fails with `Policy `pii-eu` violated on column `mail`` and
   `faucet serve` audits `policy.denied` by principal `runtime`.
 - `on_runtime: quarantine` — the offending rows go to the [DLQ](./dlq.md)
-  with the rule in the envelope; the rest of the page is written.
+  with the rule in the envelope; the rest of the page is written. The DLQ
+  receives the whole record, so it is evaluated as a destination too (sink
+  id `dlq`, with the `attributes:` of `dlq.sink`): when the rules would not
+  let the record reach the DLQ either, the run fails instead of moving it
+  there. `faucet validate` / `faucet policy` report those violations against
+  sink `dlq`.
+
+```yaml
+pipeline:
+  dlq:
+    sink:
+      type: jsonl
+      config: { path: /eu-bucket/quarantine.jsonl }
+      attributes: { residency: eu }
+```
 
 `faucet_policy_violations_total{pipeline,row,rule,phase,action}` counts both
 phases (`phase` = `static` | `runtime`, `action` = `refuse` | `fail` |
