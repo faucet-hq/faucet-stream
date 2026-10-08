@@ -919,7 +919,7 @@ params:
   bq_project: { type: string, required: true }
 sink:
   type: bigquery
-  config: { project_id: "${param.bq_project}", dataset_id: raw }
+  config: { project_id: "${param.bq_project}", dataset_id: raw, auth: { type: application_default } }
 per_stream:
   table_id: "${stream}"
 "#;
