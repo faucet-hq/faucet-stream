@@ -356,6 +356,20 @@ pub struct MigrateArgs {
     /// With `--state`: emit the report as JSON.
     #[arg(long, requires = "state")]
     pub json: bool,
+    /// With `--state`: rewrite even while a run holds the pipeline's lease
+    /// (only when that run is gone).
+    #[arg(long, requires = "state")]
+    pub force: bool,
+    /// With `--state`: path to a `.env` file for `${env:VAR}` interpolation.
+    #[arg(long, requires = "state", conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// With `--state`: skip auto-loading `.env` from cwd.
+    #[arg(long, requires = "state")]
+    pub no_env_file: bool,
+    /// With `--state`: select a named overlay from the config's `profiles:`
+    /// block, so the deployed state store is the one migrated.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
 }
 
 /// `faucet fmt` arguments.

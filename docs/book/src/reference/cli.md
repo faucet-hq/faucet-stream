@@ -1574,6 +1574,9 @@ faucet migrate --state orders.yaml --row cdc --json
 | `--check` | Report without writing; exits non-zero when a key is not current. |
 | `--row <id>` | Only this matrix row. |
 | `--json` | Machine-readable report (`pipeline`, `check`, `keys[]` with `row`, `key`, `owner`, `action` = `current` / `enveloped` / `migrated` / `refused`, `from_schema`, `to_schema`, `detail`). |
+| `--force` | Rewrite even while a run holds a row's lease (only when that run is gone). Without it a live run makes the command fail, so a bookmark the run persists is never overwritten with the older one. |
+| `--profile <name>` | Select a `profiles:` overlay (also `FAUCET_PROFILE`), so the deployed state store is the one migrated. |
+| `--env-file <path>` / `--no-env-file` | The `.env` used for `${env:…}` in the config. |
 
 A key this release cannot read (written by a newer faucet, or by another
 source) is reported as `refused`, left untouched, and makes the command exit

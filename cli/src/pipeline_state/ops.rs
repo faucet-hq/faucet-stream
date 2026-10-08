@@ -370,7 +370,7 @@ pub async fn show(
 // ── guards ──────────────────────────────────────────────────────────────────
 
 /// Refuse when a live lease covers any of `bases` (unless `force`).
-async fn refuse_if_running(
+pub(crate) async fn refuse_if_running(
     store: &dyn StateStore,
     bases: &[String],
     force: bool,
