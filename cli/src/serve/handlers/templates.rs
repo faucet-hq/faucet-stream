@@ -1531,7 +1531,7 @@ write_mode_aliases:
         assert_eq!(rec.labels[LABEL_TEMPLATE], "acme-exports");
         assert_eq!(rec.labels[LABEL_SINK_TEMPLATE], "local-jsonl");
         assert_eq!(rec.labels[LABEL_SINK_TEMPLATE_VERSION], "1");
-        assert_eq!(rec.name.as_deref(), Some("acme-exports"));
+        assert_eq!(rec.name.as_deref(), Some("acme-exports.local-jsonl"));
 
         // #679: a registered deployment overlay and an inline one both apply,
         // stamp provenance labels, and report what they set.

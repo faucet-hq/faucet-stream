@@ -2420,7 +2420,7 @@ write_mode_aliases:
         assert_eq!(m.template_id, "acme-exports");
         assert_eq!(m.sink_id.as_deref(), Some("local-jsonl"));
         assert_eq!(m.sink_version, Some(1));
-        assert_eq!(m.name.as_deref(), Some("acme-exports"));
+        assert_eq!(m.name.as_deref(), Some("acme-exports.local-jsonl"));
         let names: Vec<&str> = m.streams.iter().map(|p| p.stream.as_str()).collect();
         assert_eq!(names, ["orders", "customers"]);
         let body: Value = serde_json::from_str(&m.body).unwrap();

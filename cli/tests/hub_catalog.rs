@@ -163,8 +163,8 @@ fn every_compatible_pairing_is_a_runnable_pipeline() {
                 .unwrap_or_else(|e| panic!("{} × {}: load: {e}", s.name, k.name));
             assert_eq!(
                 cfg.name.as_deref(),
-                Some(s.id().as_str()),
-                "state keys are `{{source id}}::{{stream}}`"
+                Some(format!("{}.{}", s.id(), k.id()).as_str()),
+                "state keys are `{{source id}}.{{sink id}}::{{stream}}` (#789 CLI-32)"
             );
             let nodes = faucet_cli::expand::expand(&cfg)
                 .unwrap_or_else(|e| panic!("{} × {}: expand: {e}", s.name, k.name));

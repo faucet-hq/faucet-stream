@@ -54,8 +54,9 @@ impl StreamPlan {
 /// One composed pipeline plus the per-stream decisions behind it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Composition {
-    /// Pipeline `name:` — the source template's name, so state keys are
-    /// `{source}::{stream}` regardless of sink.
+    /// Pipeline `name:` — `{source}.{sink}`, so each pairing keeps its own
+    /// bookmarks (`{source}.{sink}::{stream}`); a deployment overlay with
+    /// `state_scope: source` makes it the source id, shared across sinks.
     pub name: String,
     pub source: String,
     pub sink: String,
@@ -537,7 +538,8 @@ pub fn compose_with(
 
     let mut doc = Map::new();
     doc.insert("version".into(), json!(1));
-    doc.insert("name".into(), Value::String(source.id()));
+    let name = pairing_name(&source.id(), &sink.id());
+    doc.insert("name".into(), Value::String(name.clone()));
     if !params.is_empty() {
         doc.insert(
             "params".into(),
@@ -561,7 +563,7 @@ pub fn compose_with(
     };
 
     Ok(Composition {
-        name: source.id(),
+        name,
         source: source.id(),
         sink: sink.id(),
         sink_kind: sink.sink.kind.clone(),
@@ -704,10 +706,28 @@ impl Composition {
                 ));
             }
         }
+        if overlay.state_scope == crate::hub::spec::StateScope::Source {
+            self.name = self.source.clone();
+            doc_name(&mut self.document, &self.name);
+            contributes.push("name".to_string());
+        }
         self.overlay = Some(overlay.id());
         self.overlay_contributes = contributes;
         Ok(self)
     }
+}
+
+fn doc_name(document: &mut Value, name: &str) {
+    if let Some(doc) = document.as_object_mut() {
+        doc.insert("name".into(), Value::String(name.to_string()));
+    }
+}
+
+/// The composed pipeline's name, and so its state namespace: one per
+/// source × sink pairing, so two destinations fed by one source template never
+/// resume from each other's bookmarks.
+pub fn pairing_name(source: &str, sink: &str) -> String {
+    format!("{source}.{sink}")
 }
 
 fn internal(e: serde_json::Error) -> CliError {
@@ -787,8 +807,8 @@ per_stream:
         let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         let c = compose_with(&src(), &sink, ALL).unwrap();
         assert_eq!(
-            c.name, "spend",
-            "pipeline name is the source's, so state keys survive a sink swap"
+            c.name, "spend.bigquery",
+            "one state namespace per pairing, so two sinks never share bookmarks (#789 CLI-32)"
         );
         assert_eq!(c.sink_kind, "bigquery");
         assert_eq!(c.streams[0].chosen, WriteMode::Overwrite);
@@ -1160,6 +1180,27 @@ per_stream:
     fn jsonl_pair() -> Composition {
         let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         compose_with(&src(), &k, ALL).unwrap()
+    }
+
+    /// Two sinks fed by one source template keep separate bookmarks unless a
+    /// deployment opts into `state_scope: source` (#789 CLI-32).
+    #[test]
+    fn each_pairing_owns_its_state_namespace_unless_the_overlay_shares_it() {
+        let a = jsonl_pair();
+        assert_eq!(a.document["name"], json!(a.name));
+        assert_eq!(a.name, pairing_name(&a.source, &a.sink));
+        assert_ne!(a.name, a.source);
+        let shared = a
+            .clone()
+            .apply_overlay(&overlay("kind: deployment\nname: x\nstate_scope: source\n"))
+            .unwrap();
+        assert_eq!(shared.name, shared.source);
+        assert_eq!(shared.document["name"], json!(shared.source));
+        assert!(shared.overlay_contributes.contains(&"name".to_string()));
+        let kept = a
+            .apply_overlay(&overlay("kind: deployment\nname: x\nstate_scope: pairing\n"))
+            .unwrap();
+        assert_ne!(kept.name, kept.source);
     }
 
     #[test]
