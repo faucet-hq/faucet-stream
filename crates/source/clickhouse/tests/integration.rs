@@ -11,6 +11,8 @@
 //! Run explicitly with:
 //! `cargo test -p faucet-source-clickhouse --test integration`.
 
+mod common;
+
 use std::collections::HashMap;
 
 use faucet_core::Source as _;
@@ -20,22 +22,14 @@ use futures::StreamExt as _;
 use serde_json::{Value, json};
 use testcontainers_modules::clickhouse::ClickHouse;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 // Serialize container starts so at most one runs at a time on a small CI runner.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn start_clickhouse() -> (ContainerAsync<ClickHouse>, String) {
-    let container = ClickHouse::default()
-        .start()
+    common::start_clickhouse()
         .await
-        .expect("start clickhouse container");
-    let port = container
-        .get_host_port_ipv4(8123)
-        .await
-        .expect("clickhouse host port");
-    let base = format!("http://127.0.0.1:{port}");
-    (container, base)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// POST a statement over the HTTP interface, asserting a 2xx. Used for DDL and

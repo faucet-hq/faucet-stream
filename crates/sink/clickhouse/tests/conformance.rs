@@ -8,6 +8,8 @@
 //! honest-`false` branch: Append works and no phantom commit token is recorded.
 //! Passing this battery in CI is the Tier-1 (supported) criterion.
 
+mod common;
+
 use faucet_conformance::{
     assert_capabilities_truthful, assert_config_schema_valid_value,
     assert_connector_name_nonempty_value,
@@ -17,7 +19,6 @@ use faucet_sink_clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
 use serde_json::Value;
 use testcontainers_modules::clickhouse::ClickHouse;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 /// Start a ClickHouse container, or `None` when Docker is unavailable.
 /// A missing test backend: a skip locally, a failure when CI requires the
@@ -30,19 +31,7 @@ fn backend_missing(why: &str) {
 }
 
 async fn start_clickhouse() -> Option<(ContainerAsync<ClickHouse>, String)> {
-    let started = async {
-        let container = ClickHouse::default()
-            .start()
-            .await
-            .map_err(|e| e.to_string())?;
-        let port = container
-            .get_host_port_ipv4(8123)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>((container, format!("http://127.0.0.1:{port}")))
-    }
-    .await;
-    match started {
+    match common::start_clickhouse().await {
         Ok(started) => Some(started),
         // CI sets FAUCET_REQUIRE_BACKENDS so a missing backend fails, not skips.
         Err(e) if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() => {
