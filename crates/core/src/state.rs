@@ -644,6 +644,8 @@ impl FileStateStore {
     }
 
     async fn read_entry(&self, key: &str, path: &Path) -> Result<Option<Value>, FaucetError> {
+        #[cfg(not(feature = "encryption"))]
+        let _ = key;
         match tokio::fs::read(path).await {
             Ok(bytes) => {
                 #[cfg(feature = "encryption")]
