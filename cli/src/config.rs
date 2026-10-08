@@ -587,10 +587,9 @@ pub struct PartialConnector {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransformSpec {
-    /// Built-in transform identifier. One of: `flatten`, `rename_keys`,
-    /// `snake_case`, `select`, `drop`, `set`, `rename_field`, `cast`, `redact`,
-    /// `value_case`. See the docs-site cookbook page on transforms for
-    /// per-transform config schemas.
+    /// Transform identifier, e.g. `flatten`, `select`, `rename_field`, `cast`,
+    /// `filter`, `explode`, `sql`. `faucet list` prints every transform this
+    /// build supports and `faucet schema transform <name>` its config schema.
     #[serde(rename = "type")]
     pub kind: String,
 
