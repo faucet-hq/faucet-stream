@@ -132,12 +132,15 @@ impl AzureCredentials {
 ///
 /// A connection string is a `;`-separated list of `Key=Value` segments, e.g.
 /// `DefaultEndpointsProtocol=https;AccountName=x;AccountKey=y;EndpointSuffix=core.windows.net`.
-/// Only the segments that map to an authentication/endpoint config key are
-/// emitted (`AccountName`, `AccountKey`, `SharedAccessSignature`,
-/// `BlobEndpoint`); protocol/suffix hints are ignored, so the default public-cloud
-/// endpoint is used. Pure — unit-tested without a live store.
+/// `AccountName`, `AccountKey`, `SharedAccessSignature` and `BlobEndpoint` map
+/// straight across; without a `BlobEndpoint`, `EndpointSuffix` (a sovereign
+/// cloud such as `core.chinacloudapi.cn`) and `DefaultEndpointsProtocol`
+/// build `<protocol>://<account>.blob.<suffix>`; an `http` protocol permits
+/// plaintext HTTP; and `UseDevelopmentStorage=true` targets the Azurite
+/// emulator. Pure — unit-tested without a live store.
 fn parse_connection_string(cs: &str) -> Vec<(&'static str, String)> {
     let mut entries: Vec<(&'static str, String)> = Vec::new();
+    let (mut account, mut suffix, mut protocol, mut blob_endpoint) = (None, None, None, false);
     for segment in cs.split(';') {
         let segment = segment.trim();
         if segment.is_empty() {
@@ -153,14 +156,81 @@ fn parse_connection_string(cs: &str) -> Vec<(&'static str, String)> {
         // `AccountKey` values may themselves contain `=` (base64 padding); the
         // `split_once` above keeps everything after the first `=` intact.
         match key.trim() {
-            "AccountName" => entries.push(("azure_storage_account_name", value)),
+            "AccountName" => {
+                account = Some(value.clone());
+                entries.push(("azure_storage_account_name", value));
+            }
             "AccountKey" => entries.push(("azure_storage_access_key", value)),
             "SharedAccessSignature" => entries.push(("azure_storage_sas_key", value)),
-            "BlobEndpoint" => entries.push(("azure_storage_endpoint", value)),
+            "BlobEndpoint" => {
+                blob_endpoint = true;
+                if value.to_ascii_lowercase().starts_with("http://") {
+                    entries.push(("allow_http", "true".into()));
+                }
+                entries.push(("azure_storage_endpoint", value));
+            }
+            "EndpointSuffix" => suffix = Some(value),
+            "DefaultEndpointsProtocol" => protocol = Some(value.to_ascii_lowercase()),
+            "UseDevelopmentStorage" if value.eq_ignore_ascii_case("true") => {
+                entries.push(("azure_storage_use_emulator", "true".into()));
+            }
             _ => {}
         }
     }
+    if !blob_endpoint && let (Some(account), Some(suffix)) = (&account, &suffix) {
+        let protocol = protocol.as_deref().unwrap_or("https");
+        if protocol == "http" {
+            entries.push(("allow_http", "true".into()));
+        }
+        entries.push((
+            "azure_storage_endpoint",
+            format!("{protocol}://{account}.blob.{suffix}"),
+        ));
+    }
     entries
+}
+
+/// The `AZURE_*` environment settings an explicitly configured credential
+/// still takes: the account, endpoint and HTTP-client options, plus the
+/// identity endpoint for a managed identity — never another credential, so
+/// a key, secret or workload identity in the environment cannot replace the
+/// one the config names.
+fn env_fallback(
+    auth: &AzureCredentials,
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(AzureConfigKey, String)> {
+    let managed = matches!(auth, AzureCredentials::ManagedIdentity { .. });
+    let mut out = Vec::new();
+    for (name, value) in vars {
+        if name == "IDENTITY_ENDPOINT" {
+            if managed {
+                out.push((AzureConfigKey::MsiEndpoint, value));
+            }
+            continue;
+        }
+        if !name.starts_with("AZURE_") {
+            continue;
+        }
+        let Ok(key) = AzureConfigKey::from_str(&name.to_ascii_lowercase()) else {
+            continue;
+        };
+        let keep = match key {
+            AzureConfigKey::AccountName
+            | AzureConfigKey::Endpoint
+            | AzureConfigKey::UseEmulator
+            | AzureConfigKey::ContainerName
+            | AzureConfigKey::DisableTagging
+            | AzureConfigKey::Client(_) => true,
+            AzureConfigKey::MsiEndpoint
+            | AzureConfigKey::ObjectId
+            | AzureConfigKey::MsiResourceId => managed,
+            _ => false,
+        };
+        if keep {
+            out.push((key, value));
+        }
+    }
+    out
 }
 
 /// Connection parameters shared by the Azure source and sink.
@@ -288,9 +358,12 @@ impl AzureConnection {
 
 /// Build an [`object_store`] Azure store from an [`AzureConnection`].
 ///
-/// The builder starts from [`MicrosoftAzureBuilder::from_env`] so `AZURE_*`
-/// environment variables act as a fallback; explicit config overrides them.
-/// All build failures map to [`FaucetError::Config`].
+/// With `auth: default` the builder starts from
+/// [`MicrosoftAzureBuilder::from_env`], so the environment's credential chain
+/// applies. With any other `auth` it starts empty and takes only the
+/// non-credential `AZURE_*` settings from the environment, so the configured
+/// credential is the one used. All build failures map to
+/// [`FaucetError::Config`].
 pub fn build_store(conn: &AzureConnection) -> Result<Arc<dyn ObjectStore>, FaucetError> {
     if conn.container.trim().is_empty() {
         return Err(FaucetError::Config(
@@ -299,7 +372,16 @@ pub fn build_store(conn: &AzureConnection) -> Result<Arc<dyn ObjectStore>, Fauce
     }
 
     let (options, retry) = conn.client_settings();
-    let mut builder = MicrosoftAzureBuilder::from_env()
+    let base = if conn.auth == AzureCredentials::Default {
+        MicrosoftAzureBuilder::from_env()
+    } else {
+        env_fallback(&conn.auth, std::env::vars())
+            .into_iter()
+            .fold(MicrosoftAzureBuilder::new(), |b, (k, v)| {
+                b.with_config(k, v)
+            })
+    };
+    let mut builder = base
         .with_container_name(&conn.container)
         .with_client_options(options)
         .with_retry(retry);
@@ -377,8 +459,11 @@ mod tests {
         assert!(entries.contains(&("azure_storage_account_name", "acct".to_string())));
         // AccountKey value retains its base64 padding (`=`).
         assert!(entries.contains(&("azure_storage_access_key", "a2V5==".to_string())));
-        // Protocol / suffix hints are ignored.
-        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&(
+            "azure_storage_endpoint",
+            "https://acct.blob.core.windows.net".to_string()
+        )));
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
@@ -394,6 +479,79 @@ mod tests {
             "azure_storage_endpoint",
             "http://127.0.0.1:10000/acct".to_string()
         )));
+    }
+
+    #[test]
+    fn connection_string_honours_suffix_protocol_and_development_storage() {
+        let sovereign = parse_connection_string(
+            "DefaultEndpointsProtocol=http;AccountName=acct;AccountKey=k;EndpointSuffix=core.chinacloudapi.cn",
+        );
+        assert!(sovereign.contains(&(
+            "azure_storage_endpoint",
+            "http://acct.blob.core.chinacloudapi.cn".to_string()
+        )));
+        assert!(sovereign.contains(&("allow_http", "true".to_string())));
+        let azurite = parse_connection_string("UseDevelopmentStorage=true");
+        assert_eq!(
+            azurite,
+            vec![("azure_storage_use_emulator", "true".to_string())]
+        );
+        let explicit = parse_connection_string(
+            "AccountName=a;BlobEndpoint=http://127.0.0.1:10000/a;EndpointSuffix=x",
+        );
+        assert!(explicit.contains(&("allow_http", "true".to_string())));
+        assert_eq!(
+            explicit
+                .iter()
+                .filter(|(k, _)| *k == "azure_storage_endpoint")
+                .count(),
+            1
+        );
+        for (k, _) in sovereign.iter().chain(&azurite).chain(&explicit) {
+            AzureConfigKey::from_str(k).expect("a key object_store understands");
+        }
+    }
+
+    #[test]
+    fn an_explicit_credential_ignores_credentials_in_the_environment() {
+        let vars = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let env = vars(&[
+            ("AZURE_STORAGE_ACCOUNT_KEY", "server-key"),
+            ("AZURE_CLIENT_SECRET", "s"),
+            ("AZURE_FEDERATED_TOKEN_FILE", "/t"),
+            ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+            ("AZURE_ALLOW_HTTP", "true"),
+            ("AZURE_MSI_RESOURCE_ID", "r"),
+            ("IDENTITY_ENDPOINT", "http://169.254.169.254"),
+            ("PATH", "/bin"),
+        ]);
+        let sas = AzureCredentials::SasToken {
+            sas_token: "sv=2021&sig=abc".into(),
+        };
+        let kept: Vec<_> = env_fallback(&sas, env.clone())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                AzureConfigKey::AccountName,
+                AzureConfigKey::Client(object_store::ClientConfigKey::AllowHttp)
+            ]
+        );
+        let mi = AzureCredentials::ManagedIdentity { client_id: None };
+        let kept: Vec<_> = env_fallback(&mi, env).into_iter().map(|(k, _)| k).collect();
+        assert!(kept.contains(&AzureConfigKey::MsiResourceId));
+        assert!(kept.contains(&AzureConfigKey::MsiEndpoint));
+        assert!(!kept.contains(&AzureConfigKey::AccessKey));
+
+        let conn = AzureConnection::new("c").account("acct").auth(sas);
+        assert!(build_store(&conn).is_ok());
     }
 
     #[test]
