@@ -527,18 +527,33 @@ fn lint_params(params: &crate::params::ParamsSpec, f: &mut Vec<String>) {
     }
 }
 
+/// [`lint_source`] plus the typed config validation `faucet validate` runs
+/// (#823) — what `faucet hub lint` and template registration report.
+pub fn lint_source_all(t: &SourceTemplate) -> Vec<String> {
+    let mut f = lint_source(t);
+    f.extend(super::typed::source_findings(t));
+    f
+}
+
+/// [`lint_sink`] plus the typed config validation (#823).
+pub fn lint_sink_all(t: &SinkTemplate) -> Vec<String> {
+    let mut f = lint_sink(t);
+    f.extend(super::typed::sink_findings(t));
+    f
+}
+
 /// Lint the whole catalog; returns `(template, findings)` for every template
 /// with at least one finding.
 pub fn lint_catalog(cat: &Catalog) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     for (_, s) in &cat.sources {
-        let f = lint_source(s);
+        let f = lint_source_all(s);
         if !f.is_empty() {
             out.push((format!("source-template {}", s.id()), f));
         }
     }
     for (_, k) in &cat.sinks {
-        let f = lint_sink(k);
+        let f = lint_sink_all(k);
         if !f.is_empty() {
             out.push((format!("sink-template {}", k.id()), f));
         }

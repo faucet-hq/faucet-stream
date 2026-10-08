@@ -278,10 +278,10 @@ secrets.
 
 ```bash
 faucet hub list      [--hub DIR] [--json]
-faucet hub check     --source X --sink Y [--overlay O] [--json]  # per-stream write modes; exit≠0 if incompatible
+faucet hub check     --source X --sink Y [--overlay O] [--json]  # per-stream write modes + typed config validation; exit≠0 if incompatible or invalid
 faucet hub compose   --source X --sink Y [--overlay O] [--out FILE|--json]
 faucet hub matrix    [--format table|markdown|json] [--out FILE]
-faucet hub lint      [--hub DIR] [FILE…]                   # publishability lint
+faucet hub lint      [--hub DIR] [FILE…]                   # publishability lint + typed config validation
 faucet run           --source X --sink Y [--overlay O] [--param k=v] …  # compose + run
 faucet validate      --source X --sink Y [--overlay O] [--show-composed]  # compose + validate offline
 faucet schema source-template | sink-template | deployment
@@ -570,7 +570,15 @@ repository's catalog test runs it plus a full composition of every pairing:
 - no private infrastructure or placeholder text (`.internal`, managed-DB
   hostnames, `REPLACE_ME`);
 - a `description`; `name` equal to the file stem; unique stream names; every
-  `${param.*}` reference declared.
+  `${param.*}` reference declared;
+- the configs it produces pass the typed validation `faucet validate` runs:
+  a source template is composed with a probe sink, a sink template with a probe
+  source, every placeholder-bound connector config is deserialized into its
+  typed struct and every transform chain compiled. A failure names the param
+  responsible when one is — e.g. a `type: int` param used as a whole
+  `query_params` value, which the REST source requires to be a string. A
+  connector this binary was built without is skipped. `faucet hub check` runs
+  the same validation on the composed pairing and names both template files.
 
 See also: [Parameters & pipeline templates](./templates.md) (the registry a
 composed pipeline can be registered into), [Write modes / upsert](./upsert.md),

@@ -528,8 +528,11 @@ template ./tenant-sync.yaml
 ```
 
 **Two tiers, both offline.** The default *validation* tier materializes the
-template for a combination exactly as a real trigger would, then expands it and
-compiles each row's transform chain (in topology mode it validates the graph
+template for a combination exactly as a real trigger would, then expands it,
+deserializes each row's connector configs into their typed structs and compiles
+each row's transform chain — the same checks `faucet validate` runs, so a param
+whose type the connector rejects (an `int` used as a whole `query_params`
+value) fails the case (in topology mode it validates the graph
 instead — skipping that would let a broken graph pass). No network, no data, no
 sink, which is what makes it cheap enough to run on every change. The
 *behavioural* tier feeds fixture records through the real pipeline via the
