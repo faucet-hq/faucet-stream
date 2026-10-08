@@ -1,6 +1,6 @@
 //! Webhook source stream executor.
 
-use crate::config::WebhookSourceConfig;
+use crate::config::{SignatureAlgorithm, SignatureEncoding, WebhookSignature, WebhookSourceConfig};
 use async_trait::async_trait;
 use axum::{Router, extract::State, http::StatusCode, routing::post};
 use faucet_core::FaucetError;
@@ -11,20 +11,36 @@ use tokio::sync::{Mutex, Notify};
 
 /// Shared state for the webhook HTTP handler.
 struct AppState {
-    records: Mutex<Vec<Value>>,
+    inbox: Mutex<Inbox>,
     max_payloads: Option<usize>,
     done: Notify,
     /// Optional shared secret required in the `Authorization` header.
     auth_token: Option<String>,
+    signature: Option<WebhookSignature>,
 }
+
+/// Stored payloads plus the closed flag, under one lock so a payload is either
+/// stored before the window closes or refused with a retryable status.
+#[derive(Default)]
+struct Inbox {
+    records: Vec<Value>,
+    closed: bool,
+}
+
+/// How long a refused sender is told to wait before retrying.
+const RETRY_AFTER_SECS: &str = "60";
+
+/// How long in-flight requests get to finish once the window closes.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl WebhookSource {
     fn new_state(&self) -> Arc<AppState> {
         Arc::new(AppState {
-            records: Mutex::new(Vec::new()),
+            inbox: Mutex::new(Inbox::default()),
             max_payloads: self.config.max_payloads,
             done: Notify::new(),
             auth_token: self.config.auth_token.clone(),
+            signature: self.config.signature.clone(),
         })
     }
 
@@ -54,8 +70,17 @@ impl WebhookSource {
 
     /// Start the webhook server, collect payloads, and return them.
     pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
+        self.config.validate()?;
+        self.receive(&self.config.path).await
+    }
+
+    /// Serve `path` until the window closes, then stop taking payloads (later
+    /// ones are answered `503` + `Retry-After`), let in-flight requests finish,
+    /// and return what was stored (API-14).
+    async fn receive(&self, path: &str) -> Result<Vec<Value>, FaucetError> {
+        crate::config::validate_path(path)?;
         let state = self.new_state();
-        let app = self.build_router(&self.config.path, Arc::clone(&state));
+        let app = self.build_router(path, Arc::clone(&state));
 
         let listener = tokio::net::TcpListener::bind(&self.config.listen_addr)
             .await
@@ -68,31 +93,131 @@ impl WebhookSource {
 
         tracing::info!(
             addr = %self.config.listen_addr,
-            path = %self.config.path,
+            path = %path,
             "webhook server listening"
         );
 
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = tokio::spawn(
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stop_rx.await;
+                })
+                .into_future(),
+        );
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(self.config.timeout_secs));
         let done_notified = state.done.notified();
 
-        tokio::select! {
-            result = axum::serve(listener, app).into_future() => {
-                if let Err(e) = result {
-                    return Err(FaucetError::Config(format!("webhook server error: {e}")));
-                }
-            }
+        let early = tokio::select! {
+            result = &mut server => Some(result),
             () = timeout => {
                 tracing::info!("webhook timeout reached");
+                None
             }
             () = done_notified => {
                 tracing::info!("max payloads reached");
+                None
+            }
+        };
+        state.inbox.lock().await.closed = true;
+        match early {
+            Some(result) => server_result(result)?,
+            None => {
+                let _ = stop_tx.send(());
+                if let Ok(result) = tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
+                    server_result(result)?;
+                } else {
+                    server.abort();
+                }
             }
         }
 
-        let records = state.records.lock().await.clone();
+        let records = std::mem::take(&mut state.inbox.lock().await.records);
         tracing::info!(records = records.len(), "webhook fetch complete");
         Ok(records)
     }
+}
+
+fn server_result(
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> Result<(), FaucetError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(FaucetError::Config(format!("webhook server error: {e}"))),
+        Err(e) => Err(FaucetError::Config(format!(
+            "webhook server task failed: {e}"
+        ))),
+    }
+}
+
+/// Verify an HMAC signature over the raw body (and the signed timestamp, when
+/// configured) in constant time.
+fn signature_ok(
+    sig: &WebhookSignature,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    now_unix: u64,
+) -> bool {
+    use hmac::{Mac, digest::KeyInit};
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let Some(provided) = header(&sig.header) else {
+        return false;
+    };
+    let provided = provided.trim();
+    let provided = match &sig.prefix {
+        Some(p) => match provided.strip_prefix(p.as_str()) {
+            Some(rest) => rest,
+            None => return false,
+        },
+        None => provided,
+    };
+    let mut signed: Vec<u8> = Vec::with_capacity(body.len() + 16);
+    if let Some(ts_name) = &sig.timestamp_header {
+        let Some(ts) = header(ts_name).and_then(|t| t.trim().parse::<u64>().ok()) else {
+            return false;
+        };
+        if ts.abs_diff(now_unix) > sig.tolerance_secs {
+            return false;
+        }
+        signed.extend_from_slice(ts.to_string().as_bytes());
+        signed.push(b'.');
+    }
+    signed.extend_from_slice(body);
+    let digest: Vec<u8> = match sig.algorithm {
+        SignatureAlgorithm::Sha256 => {
+            let Ok(mut mac) =
+                <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(sig.secret.as_bytes())
+            else {
+                return false;
+            };
+            mac.update(&signed);
+            mac.finalize().into_bytes().to_vec()
+        }
+        SignatureAlgorithm::Sha512 => {
+            let Ok(mut mac) =
+                <hmac::Hmac<sha2::Sha512> as KeyInit>::new_from_slice(sig.secret.as_bytes())
+            else {
+                return false;
+            };
+            mac.update(&signed);
+            mac.finalize().into_bytes().to_vec()
+        }
+    };
+    let expected = match sig.encoding {
+        SignatureEncoding::Hex => digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        SignatureEncoding::Base64 => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&digest)
+        }
+    };
+    let provided = match sig.encoding {
+        SignatureEncoding::Hex => provided.to_ascii_lowercase(),
+        SignatureEncoding::Base64 => provided.to_string(),
+    };
+    bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
 }
 
 /// Constant-time check of an `Authorization` header value against the shared
@@ -167,7 +292,8 @@ async fn webhook_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> StatusCode {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     // Optional shared-secret check: accept either the raw token or
     // `Bearer <token>` in the Authorization header (#78/#26).
     if let Some(expected) = &state.auth_token {
@@ -175,7 +301,16 @@ async fn webhook_handler(
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
         if !token_matches(provided, expected) {
-            return StatusCode::UNAUTHORIZED;
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    if let Some(sig) = &state.signature {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if !signature_ok(sig, &headers, &body, now) {
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     }
 
@@ -185,25 +320,30 @@ async fn webhook_handler(
             // If the body is not valid JSON, wrap it as a string.
             match String::from_utf8(body.to_vec()) {
                 Ok(s) => Value::String(s),
-                Err(_) => return StatusCode::BAD_REQUEST,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
             }
         }
     };
 
-    let mut records = state.records.lock().await;
+    let mut inbox = state.inbox.lock().await;
     // Decide under the lock so the cap is exact: concurrent in-flight POSTs
-    // that have already been accepted can't push the Vec past `max_payloads`
-    // — once the cap is reached we drop the surplus payload instead of
-    // storing it (#146 LOW).
-    let decision = decide_payload(records.len(), state.max_payloads);
-    if decision.accept {
-        records.push(value);
-    }
+    // that have already been accepted can't push the Vec past `max_payloads`.
+    // A payload that is not stored — over the cap, or after the window closed
+    // — is refused with a retryable status rather than a `200` the sender
+    // would read as delivered (API-14).
+    let decision = decide_payload(inbox.records.len(), state.max_payloads);
     if decision.done {
         state.done.notify_one();
     }
-
-    StatusCode::OK
+    if inbox.closed || !decision.accept {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS)],
+        )
+            .into_response();
+    }
+    inbox.records.push(value);
+    StatusCode::OK.into_response()
 }
 
 #[async_trait]
@@ -216,50 +356,24 @@ impl faucet_core::Source for WebhookSource {
             return WebhookSource::fetch_all(self).await;
         }
 
-        // Substitute context into the webhook path.
-        let resolved_path = faucet_core::util::substitute_context(&self.config.path, context);
-
-        let state = self.new_state();
-        let app = self.build_router(&resolved_path, Arc::clone(&state));
-
-        let listener = tokio::net::TcpListener::bind(&self.config.listen_addr)
-            .await
-            .map_err(|e| {
-                FaucetError::Config(format!(
-                    "failed to bind to {}: {e}",
-                    self.config.listen_addr
-                ))
-            })?;
-
-        tracing::info!(
-            addr = %self.config.listen_addr,
-            path = %resolved_path,
-            "webhook server listening (with context)"
-        );
-
-        let timeout = tokio::time::sleep(std::time::Duration::from_secs(self.config.timeout_secs));
-        let done_notified = state.done.notified();
-
-        tokio::select! {
-            result = axum::serve(listener, app).into_future() => {
-                if let Err(e) = result {
-                    return Err(FaucetError::Config(format!("webhook server error: {e}")));
-                }
-            }
-            () = timeout => {
-                tracing::info!("webhook timeout reached");
-            }
-            () = done_notified => {
-                tracing::info!("max payloads reached");
-            }
-        }
-
-        let records = state.records.lock().await.clone();
-        tracing::info!(
-            records = records.len(),
-            "webhook fetch complete (with context)"
-        );
-        Ok(records)
+        // Substitute context into the webhook path, percent-encoding each
+        // value so a parent value cannot add segments or route syntax (API-49).
+        let encoded: std::collections::HashMap<String, Value> = context
+            .iter()
+            .map(|(k, v)| {
+                let raw = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                (
+                    k.clone(),
+                    Value::String(urlencoding::encode(&raw).into_owned()),
+                )
+            })
+            .collect();
+        let resolved_path = faucet_core::util::substitute_context(&self.config.path, &encoded);
+        self.config.validate()?;
+        self.receive(&resolved_path).await
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -308,6 +422,20 @@ impl faucet_core::Source for WebhookSource {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn server_results_map_io_and_task_failures() {
+        assert!(super::server_result(Ok(Ok(()))).is_ok());
+        let io = super::server_result(Ok(Err(std::io::Error::other("boom"))))
+            .unwrap_err()
+            .to_string();
+        assert!(io.contains("webhook server error: boom"), "{io}");
+        let join = tokio::spawn(async { panic!("task died") })
+            .await
+            .unwrap_err();
+        let task = super::server_result(Err(join)).unwrap_err().to_string();
+        assert!(task.contains("webhook server task failed"), "{task}");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -424,10 +552,11 @@ mod tests {
         // them observe the cap being hit (#146 LOW).
         let max = 3usize;
         let state = Arc::new(AppState {
-            records: Mutex::new(Vec::new()),
+            inbox: Mutex::new(Inbox::default()),
             max_payloads: Some(max),
             done: Notify::new(),
             auth_token: None,
+            signature: None,
         });
 
         let mut handles = Vec::new();
@@ -438,13 +567,21 @@ mod tests {
                 webhook_handler(State(st), axum::http::HeaderMap::new(), body).await
             }));
         }
+        // API-14: exactly `max` are stored and answered 200; every surplus
+        // payload is refused with a retryable 503 + Retry-After, never a 200.
+        let mut ok = 0;
         for h in handles {
-            // Every request returns 200 (accepted or gracefully dropped — we
-            // don't surface a different status for drops to keep clients happy).
-            assert_eq!(h.await.unwrap(), StatusCode::OK);
+            let resp = h.await.unwrap();
+            if resp.status() == StatusCode::OK {
+                ok += 1;
+            } else {
+                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "60");
+            }
         }
+        assert_eq!(ok, max);
 
-        let records = state.records.lock().await;
+        let records = &state.inbox.lock().await.records;
         assert_eq!(
             records.len(),
             max,
@@ -462,10 +599,11 @@ mod tests {
             .timeout_secs(5);
 
         let state = Arc::new(AppState {
-            records: Mutex::new(Vec::new()),
+            inbox: Mutex::new(Inbox::default()),
             max_payloads: config.max_payloads,
             done: Notify::new(),
             auth_token: config.auth_token.clone(),
+            signature: None,
         });
 
         let server_state = Arc::clone(&state);
@@ -514,7 +652,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         server_handle.abort();
 
-        let records = state.records.lock().await;
+        let records = &state.inbox.lock().await.records;
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["event"], "created");
         assert_eq!(records[1]["event"], "updated");
@@ -570,10 +708,11 @@ mod tests {
     #[tokio::test]
     async fn webhook_handles_non_json_body() {
         let state = Arc::new(AppState {
-            records: Mutex::new(Vec::new()),
+            inbox: Mutex::new(Inbox::default()),
             max_payloads: Some(1),
             done: Notify::new(),
             auth_token: None,
+            signature: None,
         });
 
         let server_state = Arc::clone(&state);
@@ -608,7 +747,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         server_handle.abort();
 
-        let records = state.records.lock().await;
+        let records = &state.inbox.lock().await.records;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0], Value::String("plain text body".into()));
     }
@@ -625,5 +764,49 @@ mod tests {
             source.dataset_uri(),
             "webhook://127.0.0.1:8080/hooks/incoming"
         );
+    }
+
+    fn sig(algorithm: SignatureAlgorithm, encoding: SignatureEncoding) -> WebhookSignature {
+        WebhookSignature {
+            header: "x-sig".into(),
+            secret: "k".into(),
+            algorithm,
+            encoding,
+            prefix: None,
+            timestamp_header: None,
+            tolerance_secs: 300,
+        }
+    }
+
+    #[test]
+    fn signature_variants_verify_and_reject() {
+        use base64::Engine;
+        use hmac::{Mac, digest::KeyInit};
+        let body = b"payload";
+        let mut mac = <hmac::Hmac<sha2::Sha512> as KeyInit>::new_from_slice(b"k").unwrap();
+        mac.update(body);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-sig", b64.parse().unwrap());
+        let s512 = sig(SignatureAlgorithm::Sha512, SignatureEncoding::Base64);
+        assert!(signature_ok(&s512, &headers, body, 0));
+        assert!(!signature_ok(&s512, &headers, b"tampered", 0));
+        // Wrong prefix, missing header, unparsable timestamp.
+        let mut prefixed = s512.clone();
+        prefixed.prefix = Some("v1=".into());
+        assert!(!signature_ok(&prefixed, &headers, body, 0));
+        assert!(!signature_ok(&s512, &axum::http::HeaderMap::new(), body, 0));
+        let mut stamped = sig(SignatureAlgorithm::Sha256, SignatureEncoding::Hex);
+        stamped.timestamp_header = Some("x-ts".into());
+        headers.insert("x-ts", "not-a-number".parse().unwrap());
+        assert!(!signature_ok(&stamped, &headers, body, 0));
+    }
+
+    #[test]
+    fn signature_config_requires_header_and_secret() {
+        let mut s = sig(SignatureAlgorithm::Sha256, SignatureEncoding::Hex);
+        s.secret.clear();
+        let cfg = WebhookSourceConfig::new().signature(s);
+        assert!(cfg.validate().is_err());
     }
 }

@@ -83,7 +83,7 @@ All fields are keys under `source.config`.
 | `group_id` | string | — *(required)* | Kafka consumer group ID. Drives partition assignment and forms part of the state-store key. |
 | `auth` | `KafkaAuth` | `{ type: none }` | Authentication mode — see [Authentication](#authentication). |
 | `value_format` | `KafkaValueFormat` | `{ type: json }` | How message **value** bytes are decoded — see [Value formats](#value-formats). |
-| `key_format` | `KafkaValueFormat` \| null | `null` | How message **key** bytes are decoded. When unset, key bytes are decoded as UTF-8 (or `null` if the message carried no key). |
+| `key_format` | `KafkaValueFormat` \| null | `null` | How message **key** bytes are decoded. When unset, key bytes are decoded as UTF-8 — base64 when they are not UTF-8 — or `null` if the message carried no key. A schema-registry key format uses its own registry (falling back to the value format's). |
 
 ### Termination & polling
 
@@ -158,8 +158,8 @@ Configured via `value_format` (and optionally `key_format`); all use a `type` di
 | `json` | Parse value bytes as a JSON document. **Default.** | base |
 | `raw_string` | Decode value bytes as a UTF-8 string into `value`. | base |
 | `bytes` | Pass bytes through as a **base64-encoded string** in `value`; no parsing. | base |
-| `confluent_avro` | Confluent wire-format Avro: `[0x00][schema_id 4B][Avro binary]`. | `schema-registry` |
-| `confluent_protobuf` | Confluent wire-format Protobuf. v1 returns an error — descriptor support tracked in [#44](https://github.com/faucet-hq/faucet-stream/issues/44). | `schema-registry` |
+| `confluent_avro` | Confluent wire-format Avro: `[0x00][schema_id 4B][Avro binary]`. Logical types map like the Avro file format: `decimal` → exact decimal string, `bytes`/`fixed` → hex, `date`/`time`/`timestamp` → ISO 8601 strings. | `schema-registry` |
+| `confluent_protobuf` | Confluent wire-format Protobuf (single-message schemas). Every field is emitted, proto3 defaults (`0`, `false`, `""`) included, under its `.proto` field name (`order_id`, not `orderId`); 64-bit integers follow the proto3 JSON mapping (strings). | `schema-registry` |
 | `confluent_json_schema` | Confluent wire-format JSON: `[0x00][schema_id 4B][JSON bytes]`; optional validation. | `schema-registry` |
 
 The three Confluent formats take a `schema_registry` block (URL, optional basic auth, cache capacity, request timeout) — see the [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka) README for the full `SchemaRegistryConfig`.
@@ -192,11 +192,11 @@ Each Kafka message becomes one JSON object:
 }
 ```
 
-- `key` — the key decoded as UTF-8, or per `key_format` if set. `null` when the message carried no key.
+- `key` — the key decoded as UTF-8 (base64 when the bytes are not UTF-8), or per `key_format` if set. `null` when the message carried no key.
 - `value` — the decoded payload; shape depends on `value_format`.
 - `topic` / `partition` / `offset` — provenance for the message within its partition.
-- `timestamp` — milliseconds since the Unix epoch; `0` when the message had no timestamp.
-- `headers` — a flat string→string object; non-UTF-8 values are base64-encoded; `{}` when none were set.
+- `timestamp` — milliseconds since the Unix epoch; `null` when the message had no timestamp.
+- `headers` — an object keyed by header name; non-UTF-8 values are base64-encoded, a valueless header is `null`, and a name that appears more than once holds an array of its values in order; `{}` when none were set.
 
 ## Examples
 
@@ -298,6 +298,8 @@ When a `StateStore` is wired in (via `state:` in YAML, or `Pipeline::with_state_
 
 The bookmark records an offset for **every assigned partition**, not just those that produced a message this run. An empty-this-run partition is recorded at the consumer's current position; if it were omitted, the next resume would fall back to `auto_offset_reset` (default `latest`) and silently **skip** records that arrived meanwhile. A partition that has *never* been assigned (e.g. added to the topic after the last run) honours `auto_offset_reset` on first encounter. A bookmarked partition that has not delivered yet in this run keeps its bookmarked offset — the watermark the assignment resolved only seeds partitions nothing else knows about.
 
+**A bookmark that fell out of retention.** When a bookmarked offset is below the partition's log start (retention deleted those records while the pipeline was down), the source resumes at the log start and logs a `WARN` naming how many bookmarked records were deleted — it never lets librdkafka reset the partition to `auto_offset_reset` (default `latest`), which would also skip the still-retained backlog.
+
 **Rebalances during a run.** Outside cluster member mode nothing is committed to the consumer group, so a rebalance after the first one (another consumer joining the same `group_id`, a session-timeout rejoin) re-seeks each re-assigned partition from the start bookmark advanced by what this run already delivered, instead of restarting it at `auto_offset_reset`.
 
 **Transient broker errors.** Broker transport failures, "all brokers down", coordinator moves, request timeouts and a `max.poll.interval.ms` overrun are logged and the consumer keeps polling (librdkafka reconnects / rejoins on its own); any other consumer error fails the run. A page write plus flush that regularly outlasts `max.poll.interval.ms` (librdkafka default 300 s) costs a rejoin each time — raise it through `extra_client_config` (`max.poll.interval.ms: "900000"`) for slow sinks.
@@ -366,6 +368,7 @@ Under `faucet serve --cluster`, a top-level `shard: { count: N }` block distribu
 
 In member mode (i.e. only when a cluster coordinator applies a shard — a plain `faucet run` is unchanged) the source additionally:
 
+- **seeds the group with its starting position** for every assigned partition the group has no committed offset for (the bookmarked offset, or where `auto_offset_reset` starts), so a partition that migrates before the first durable commit resumes there rather than at `auto_offset_reset`;
 - **commits offsets to the consumer group at durable page boundaries** — after the pipeline has written a page to the sink and persisted its bookmark, plus a synchronous commit at stream end — so a partition that migrates to another member resumes from the last durable position instead of `auto_offset_reset`;
 - **defers bookmark seeks to the group's committed offsets** whenever those are ahead (another member may have durably advanced a partition past this member's bookmark); a bookmark *ahead* of the committed offset — the durable-write→commit crash window — still wins.
 
@@ -448,7 +451,7 @@ In the CLI / umbrella, enable the connector with `source-kafka`, and the registr
 | `Source` error / connection refused / timeout | Broker unreachable or wrong `brokers`. `faucet doctor` runs a non-consuming metadata probe to validate connectivity + auth without reading messages. |
 | SASL / SSL handshake failure | Wrong `auth` type or credentials, or a `key_path` / `cert_path` / `ca_path` that doesn't exist (paths are validated at config time). Confirm the broker's `security.protocol` matches. |
 | Messages fail to decode | The `value_format` doesn't match the wire data (e.g. `json` against Avro). Match the producer's format; use `on_decode_error: skip` to drop bad messages instead of aborting. |
-| `confluent_protobuf` returns an error | Protobuf decoding is not yet implemented (issue [#44](https://github.com/faucet-hq/faucet-stream/issues/44)). Use `confluent_avro` / `confluent_json_schema`, or decode raw `bytes` and parse downstream. |
+| `confluent_protobuf` fails with "only supports single-message schemas" | The record's `message_indexes` names a message other than the first in the `.proto`. Only single-message schemas are supported; use `bytes` and decode downstream. |
 | Confluent format rejected as unknown `type` | Build with the `schema-registry` feature (CLI: `kafka-schema-registry`). |
 | Throughput lower than expected | Partition the topic and run multiple instances with the same `group_id`, and/or tune `fetch.max.bytes` / `max.partition.fetch.bytes` via `extra_client_config`. |
 

@@ -62,11 +62,14 @@ async fn async_202_is_polled_to_completion() {
     let written = sink.write_batch(&make_records(3)).await.unwrap();
     assert_eq!(written, 3);
 
-    // One POST (submit) + one GET (poll).
+    // Every statement (the CREATE, then the column lookup) is one POST
+    // (submit) + one GET (poll).
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].method.as_str(), "POST");
-    assert_eq!(requests[1].method.as_str(), "GET");
+    assert_eq!(requests.len(), 4);
+    for pair in requests.chunks(2) {
+        assert_eq!(pair[0].method.as_str(), "POST");
+        assert_eq!(pair[1].method.as_str(), "GET");
+    }
 }
 
 #[tokio::test]

@@ -455,3 +455,177 @@ async fn write_batch_idempotent_zero_rows_posts_watermark_only() {
         "no data params for a zero-row page: {pnames:?}"
     );
 }
+
+/// A MERGE that outlives `job_timeout` is cancelled before the write fails,
+/// so it cannot commit after the run was reported failed (SQL-96).
+#[tokio::test]
+async fn a_job_past_job_timeout_is_cancelled() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    let running = json!({
+        "kind": "bigquery#queryResponse",
+        "jobComplete": false,
+        "jobReference": {"projectId": PROJECT_ID, "jobId": "job-slow"}
+    });
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries/job-slow")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(running))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-slow/cancel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#jobCancelResponse",
+            "job": {"jobReference": {"projectId": PROJECT_ID, "jobId": "job-slow"}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+        c.job_timeout = std::time::Duration::from_millis(300);
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect_err("a job past job_timeout must fail the write");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("job_timeout") && msg.contains("cancelled"),
+        "{msg}"
+    );
+}
+
+/// A transaction BigQuery aborts for a concurrent update on the same table is
+/// re-submitted (it committed nothing) with a fresh `requestId`, so a second
+/// writer in the dataset does not fail the run (SQL-95).
+#[tokio::test]
+async fn a_transaction_aborted_by_a_concurrent_update_is_retried() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("MERGE INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_query("job-a")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("MERGE INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_query("job-b")))
+        .mount(&server)
+        .await;
+    mount_query_done(&server, "job-eo").await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-a")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-a"},
+            "status": {"state": "DONE", "errorResult": {
+                "reason": "invalidQuery",
+                "message": "Transaction is aborted due to concurrent update against table p:d.t."
+            }}
+        })))
+        .mount(&server)
+        .await;
+    mount_job_done(&server, "job-b").await;
+    mount_job_done(&server, "job-eo").await;
+
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let n = sink
+        .write_batch_idempotent(
+            &[json!({"id": 1, "name": "a"})],
+            "pipe::row1",
+            "00000000000000000009",
+        )
+        .await
+        .expect("the conflicting transaction is retried");
+    assert_eq!(n, 1);
+
+    let ids: Vec<String> = captured_query_bodies(&server)
+        .await
+        .into_iter()
+        .filter(|b| b["query"].as_str().unwrap_or("").contains("MERGE INTO"))
+        .map(|b| b["requestId"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2, "first attempt aborted, second committed");
+    assert_ne!(ids[0], ids[1], "the retry needs a fresh requestId");
+    assert_eq!(ids[1], format!("{}-r1", ids[0]));
+}
+
+/// Any other job failure is not retried.
+#[tokio::test]
+async fn a_failed_transaction_that_was_not_a_conflict_is_not_retried() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_done(&server, "job-x").await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/job-x")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-x"},
+            "status": {"state": "DONE", "errorResult": {
+                "reason": "invalidQuery", "message": "Bad cast"
+            }}
+        })))
+        .mount(&server)
+        .await;
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect_err("a runtime failure fails the write");
+    assert!(err.to_string().contains("Bad cast"), "{err}");
+    assert_eq!(captured_query_bodies(&server).await.len(), 1);
+}
+
+/// A record field the table has no column for fails the write instead of
+/// being projected away by the MERGE (SQL-94).
+#[tokio::test]
+async fn a_field_missing_from_the_table_fails_instead_of_vanishing() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_done(&server, "job-u").await;
+    mount_job_done(&server, "job-u").await;
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a", "nickname": "x"})])
+        .await
+        .expect_err("an unknown field must not be dropped");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`nickname`") && msg.contains("on_drift"),
+        "{msg}"
+    );
+    assert!(
+        captured_query_bodies(&server)
+            .await
+            .iter()
+            .all(|b| !b["query"].as_str().unwrap_or("").contains("MERGE INTO")),
+        "nothing is written"
+    );
+}

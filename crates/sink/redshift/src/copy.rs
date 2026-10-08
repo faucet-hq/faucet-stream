@@ -95,7 +95,9 @@ pub(crate) fn copy_statement(
         // Redshift folds column names to lower case; `ignorecase` matches
         // `userId` to `userid` instead of loading NULL (SQL-18).
         RedshiftCopyFormat::Jsonl => "FORMAT AS JSON 'auto ignorecase'".to_string(),
-        RedshiftCopyFormat::Csv => "FORMAT AS CSV".to_string(),
+        RedshiftCopyFormat::Csv => {
+            format!("FORMAT AS CSV NULL AS {}", sql_string_literal(CSV_NULL))
+        }
     };
 
     let mut sql = format!(
@@ -149,6 +151,33 @@ pub(crate) fn field<'a>(
     })
 }
 
+/// Record fields (first-seen order) with no column in `known`
+/// (lower-cased names), compared ignoring case as Redshift folds identifiers.
+pub(crate) fn missing_fields(
+    records: &[Value],
+    known: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in records
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.keys())
+    {
+        let folded = key.to_lowercase();
+        if !known.contains(&folded) && !out.iter().any(|k| k.to_lowercase() == folded) {
+            out.push(key.clone());
+        }
+    }
+    out
+}
+
+/// `ALTER TABLE … ADD COLUMN` for a field first seen after the table existed,
+/// typed like an auto-created column.
+pub(crate) fn add_column_sql(table_ref: &str, column: &faucet_core::PlannedColumn) -> String {
+    let def = faucet_core::render_columns(std::slice::from_ref(column), quote_ident, redshift_type);
+    format!("ALTER TABLE {table_ref} ADD COLUMN {def}")
+}
+
 /// The set of destination columns present in at least one record, preserving
 /// the destination's declared order.
 pub(crate) fn columns_present<'a>(
@@ -188,10 +217,20 @@ pub(crate) fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, FaucetError>
     Ok(buf)
 }
 
-/// Render one CSV cell from a JSON value (RFC-4180 quoting).
+/// The CSV cell that loads as SQL NULL (`NULL AS` in the CSV `COPY`); plain
+/// text so no string-literal escaping applies. A string with this text is
+/// quoted, so it loads as the text, not as NULL.
+pub(crate) const CSV_NULL: &str = "__FAUCET_NULL__";
+
+/// Render one CSV cell from a JSON value (RFC-4180 quoting). NULL is the
+/// unquoted [`CSV_NULL`] marker and an empty string is `""`, so the two stay
+/// distinct (an unquoted empty field would load as an empty string).
 fn csv_cell(v: Option<&Value>) -> String {
     match v {
-        None | Some(Value::Null) => String::new(),
+        None | Some(Value::Null) => CSV_NULL.to_string(),
+        Some(Value::String(s)) if s.is_empty() || s == CSV_NULL => {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
         Some(Value::String(s)) => quote_csv(s),
         Some(Value::Bool(b)) => b.to_string(),
         Some(Value::Number(n)) => n.to_string(),
@@ -249,6 +288,23 @@ mod tests {
     }
 
     #[test]
+    fn missing_fields_and_add_column() {
+        let known: std::collections::HashSet<String> = ["id".to_string()].into();
+        let recs = vec![
+            json!({"ID": 1, "Extra": "x"}),
+            json!({"extra": 2, "n": 1.5}),
+            json!(3),
+        ];
+        assert_eq!(missing_fields(&recs, &known), vec!["Extra", "n"]);
+        let planned = faucet_core::plan_columns(&recs[1..2]).unwrap();
+        let n = planned.iter().find(|c| c.name == "n").unwrap();
+        assert_eq!(
+            add_column_sql("\"t\"", n),
+            "ALTER TABLE \"t\" ADD COLUMN \"n\" DOUBLE PRECISION"
+        );
+    }
+
+    #[test]
     fn table_ref_qualified_and_bare() {
         assert_eq!(qualified_table_ref(None, "events"), "\"events\"");
         assert_eq!(
@@ -301,7 +357,7 @@ mod tests {
         assert_eq!(
             sql,
             "COPY \"events\" (\"id\", \"name\") FROM 's3://b/k.csv' IAM_ROLE 'arn:role' \
-             FORMAT AS CSV REGION 'us-east-1'"
+             FORMAT AS CSV NULL AS '__FAUCET_NULL__' REGION 'us-east-1'"
         );
     }
 
@@ -392,21 +448,34 @@ mod tests {
         let records = vec![
             json!({"id": 1, "note": "hello, world"}),
             json!({"id": 2, "note": "quote\"inside"}),
-            json!({"id": 3}), // missing note → empty cell
+            json!({"id": 3}), // missing note → the NULL marker
         ];
         let out = serialize_csv(&records, &cols).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.trim_end().split('\n').collect();
         assert_eq!(lines[0], "1,\"hello, world\"");
         assert_eq!(lines[1], "2,\"quote\"\"inside\"");
-        assert_eq!(lines[2], "3,");
+        assert_eq!(lines[2], "3,__FAUCET_NULL__");
     }
 
     #[test]
     fn serialize_csv_renders_scalar_types() {
         let cols = vec!["b".to_string(), "n".to_string(), "nul".to_string()];
         let out = serialize_csv(&[json!({"b": true, "n": 4.5, "nul": null})], &cols).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "true,4.5,\n");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "true,4.5,__FAUCET_NULL__\n"
+        );
+    }
+
+    #[test]
+    fn serialize_csv_keeps_null_and_empty_string_distinct() {
+        let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let out = serialize_csv(&[json!({"a": null, "b": "", "c": CSV_NULL})], &cols).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "__FAUCET_NULL__,\"\",\"__FAUCET_NULL__\"\n"
+        );
     }
 
     #[test]

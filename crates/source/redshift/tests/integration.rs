@@ -360,6 +360,69 @@ async fn decodes_all_pg_type_arms() {
     assert_eq!(r["j"]["k"], json!(1));
 }
 
+/// Types outside the known list decode to their value, never to `NULL`
+/// (SQL-53): INTERVAL and TIMETZ explicitly, a text-like type (XML) through
+/// its text form, and an undecodable binary type (POINT) is an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmapped_types_never_become_null() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let source = RedshiftSource::new(full_config(
+        port,
+        "SELECT '1 year 2 days 03:00:01.5'::interval AS iv, \
+                '10:20:30+02'::timetz AS tz, \
+                '<a/>'::xml AS x, \
+                NULL::interval AS n",
+        1000,
+    ))
+    .expect("source");
+    let rows = source.fetch_all().await.expect("query runs");
+    assert_eq!(rows[0]["iv"], json!("P1Y2DT3H1.5S"));
+    assert_eq!(rows[0]["tz"], json!("10:20:30+02:00"));
+    assert_eq!(rows[0]["x"], json!("<a/>"));
+    assert_eq!(rows[0]["n"], Value::Null);
+
+    let source =
+        RedshiftSource::new(full_config(port, "SELECT point(1, 2) AS p", 1000)).expect("source");
+    let err = source
+        .fetch_all()
+        .await
+        .expect_err("binary point cannot be decoded");
+    assert!(err.to_string().contains("`p`"), "{err}");
+}
+
+/// The bookmark never moves backwards (SQL-162): when the row that held the
+/// stored maximum is gone, the run keeps the start bookmark.
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_bookmark_never_moves_backwards() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE inc2 (id BIGINT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    sqlx::query("INSERT INTO inc2 (id) VALUES (1),(2)")
+        .execute(&pool)
+        .await
+        .expect("seed");
+    pool.close().await;
+
+    let mut config = full_config(port, "SELECT id FROM inc2 ORDER BY id", 1000);
+    config.replication = RedshiftReplication::Incremental {
+        column: "id".into(),
+        initial_value: json!(0),
+    };
+    let source = RedshiftSource::new(config).expect("source");
+    source
+        .apply_start_bookmark(json!(9))
+        .await
+        .expect("bookmark");
+    let (records, bookmark) = drain(&source).await;
+    assert!(records.is_empty());
+    assert_eq!(bookmark, Some(json!(9)));
+}
+
 /// The `check` preflight probe passes against a reachable database.
 #[tokio::test(flavor = "multi_thread")]
 async fn check_probe_passes() {

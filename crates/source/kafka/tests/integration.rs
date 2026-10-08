@@ -490,3 +490,90 @@ async fn a_rebalance_mid_run_resumes_reassigned_partitions_from_delivered_offset
         "no record is skipped when partitions come back after a rebalance"
     );
 }
+
+/// A bookmark that fell out of topic retention resumes at the log start, not
+/// at `auto.offset.reset: latest`, so the still-retained backlog is read
+/// (#789 MSG-24).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bookmark_below_the_log_start_resumes_at_the_log_start() {
+    let (_container, brokers) = start_kafka().await;
+    let topic = "retention";
+    let msgs: Vec<String> = (1..=6).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
+    let refs: Vec<(Option<&str>, &str)> = msgs.iter().map(|m| (None, m.as_str())).collect();
+    produce(&brokers, topic, &refs).await;
+
+    let s1 = KafkaSource::new(source_config(&brokers, topic, "g-ret-1", 2))
+        .await
+        .unwrap();
+    let (first, bookmark) = s1.fetch_all_incremental().await.unwrap();
+    assert_eq!(first.len(), 2);
+    drop(s1);
+
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .unwrap();
+    let mut tpl = rdkafka::TopicPartitionList::new();
+    tpl.add_partition_offset(topic, 0, rdkafka::Offset::Offset(4))
+        .unwrap();
+    admin
+        .delete_records(&tpl, &AdminOptions::new())
+        .await
+        .expect("delete_records");
+
+    let mut cfg = source_config(&brokers, topic, "g-ret-2", 2);
+    cfg.auto_offset_reset = OffsetReset::Latest;
+    cfg.idle_timeout = Some(Duration::from_secs(15));
+    let s2 = KafkaSource::new(cfg).await.unwrap();
+    s2.apply_start_bookmark(bookmark.unwrap()).await.unwrap();
+    let (second, _) = s2.fetch_all_incremental().await.unwrap();
+    let ids: Vec<_> = second.iter().map(|r| r["value"]["id"].clone()).collect();
+    assert_eq!(ids, vec![serde_json::json!(5), serde_json::json!(6)]);
+}
+
+/// A binary key without `key_format` arrives base64 instead of failing the
+/// record; repeated headers keep every value and a valueless header is `null`
+/// (#789 MSG-95).
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_keys_and_repeated_headers_keep_their_fidelity() {
+    use rdkafka::message::{Header, OwnedHeaders};
+    let (_container, brokers) = start_kafka().await;
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .unwrap();
+    let headers = OwnedHeaders::new()
+        .insert(Header {
+            key: "h",
+            value: Some("1"),
+        })
+        .insert(Header {
+            key: "h",
+            value: Some("2"),
+        })
+        .insert(Header::<&str> {
+            key: "empty",
+            value: None,
+        });
+    producer
+        .send(
+            FutureRecord::<[u8], str>::to("fidelity")
+                .key(&[0xff_u8, 0x00][..])
+                .payload(r#"{"id":1}"#)
+                .headers(headers),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("produce");
+    let source = KafkaSource::new(source_config(&brokers, "fidelity", "g-fid", 1))
+        .await
+        .unwrap();
+    let (records, _) = source.fetch_all_incremental().await.unwrap();
+    assert_eq!(records[0]["key"], "/wA=");
+    assert_eq!(
+        records[0]["headers"],
+        serde_json::json!({"h": ["1", "2"], "empty": null})
+    );
+    assert!(records[0]["timestamp"].is_i64());
+}

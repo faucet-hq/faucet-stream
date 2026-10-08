@@ -34,8 +34,12 @@ pipeline:
 Every record call is bounded by **fuel** (a deterministic CPU limit) and by a
 **linear-memory cap**. The only host imports are `faucet_v1::log` and
 `faucet_v1::now_ns` — there is no filesystem, network, clock, or environment
-access in v1. A trap, fuel/memory exhaustion, ABI violation, or non-JSON output
-is routed by `on_error`.
+access in v1. A module may declare one linear memory and one table (at most
+100,000 elements), so `memory_limit_mb` bounds what it can allocate. A trap,
+fuel/memory exhaustion, ABI violation, or non-JSON output is routed by
+`on_error`; after a trap the instance is discarded and the next record runs on
+a fresh one, so a half-updated heap never shapes later output. `log` forwards at
+most 100 messages of up to 4 KiB per instance; the rest are counted in one warning.
 
 ## ABI (v1)
 

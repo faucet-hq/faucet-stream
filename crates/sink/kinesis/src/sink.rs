@@ -8,8 +8,71 @@ use aws_sdk_kinesis::primitives::Blob;
 use aws_sdk_kinesis::types::PutRecordsRequestEntry;
 use faucet_core::{FaucetError, RowOutcome};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
+
+/// Error codes a `PutRecords` request may succeed on when retried.
+const RETRIABLE_CODES: &[&str] = &[
+    "ProvisionedThroughputExceededException",
+    "LimitExceededException",
+    "KMSThrottlingException",
+    "ThrottlingException",
+    "InternalFailure",
+    "ServiceUnavailable",
+];
+
+/// Whether a failed request is worth retrying: a transport failure or
+/// timeout, an HTTP 5xx/429, or a throttling/availability error code. A
+/// missing stream or denied access fails at once instead of burning the retry
+/// budget (#789 MSG-91). Pure.
+pub(crate) fn retriable_request(status: Option<u16>, code: Option<&str>, transport: bool) -> bool {
+    transport
+        || matches!(status, Some(429) | Some(500..=599))
+        || code.is_some_and(|c| RETRIABLE_CODES.contains(&c))
+}
+
+impl Encoded {
+    /// What Kinesis orders by: the explicit hash key when set (it picks the
+    /// shard), else the partition key.
+    pub(crate) fn order_key(&self) -> &str {
+        self.hash_key.as_deref().unwrap_or(&self.partition_key)
+    }
+}
+
+/// Split entries into `lanes` request streams so every entry with one order
+/// key lands in the same lane, in input order. Lanes run concurrently; one
+/// lane's requests run one after another, so a key's records are never in two
+/// requests at once (#789 MSG-37). Pure.
+pub(crate) fn lanes(entries: Vec<Encoded>, lanes: usize) -> Vec<Vec<Encoded>> {
+    use std::hash::{Hash, Hasher};
+    let n = lanes.max(1);
+    let mut out: Vec<Vec<Encoded>> = (0..n).map(|_| Vec::new()).collect();
+    for e in entries {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        e.order_key().hash(&mut h);
+        out[(h.finish() % n as u64) as usize].push(e);
+    }
+    out.retain(|l| !l.is_empty());
+    out
+}
+
+/// After a partial failure, the entries to send again: each failed entry and
+/// every later entry of its order key in the request — Kinesis may have
+/// written those ahead of it, and re-sending them after it restores the key's
+/// order for consumers (#789 MSG-37). Pure.
+pub(crate) fn resend_set(pending: &[Encoded], failed: &HashSet<usize>) -> HashSet<usize> {
+    let mut first: HashMap<&str, usize> = HashMap::new();
+    for e in pending {
+        if failed.contains(&e.index) {
+            first.entry(e.order_key()).or_insert(e.index);
+        }
+    }
+    pending
+        .iter()
+        .filter(|e| first.get(e.order_key()).is_some_and(|&f| e.index >= f))
+        .map(|e| e.index)
+        .collect()
+}
 
 /// One record encoded and ready to ship, tagged with its input position so
 /// outcomes can be reported in input order.
@@ -173,26 +236,37 @@ impl KinesisSink {
             match response {
                 Ok(out) => {
                     let results = out.records();
+                    let failed: HashSet<usize> = pending
+                        .iter()
+                        .zip(results)
+                        .filter(|(_, r)| r.error_code().is_some())
+                        .map(|(e, _)| e.index)
+                        .collect();
+                    let resend = if attempt + 1 < retry_cfg.max_attempts {
+                        resend_set(&pending, &failed)
+                    } else {
+                        HashSet::new()
+                    };
                     let mut retry: Vec<Encoded> = Vec::new();
                     for (entry, result) in pending.iter().zip(results) {
+                        if resend.contains(&entry.index) {
+                            outcomes.remove(&entry.index);
+                            retry.push(entry.clone());
+                            continue;
+                        }
                         match result.error_code() {
                             None => {
                                 outcomes.insert(entry.index, Ok(()));
                             }
                             Some(code) => {
-                                if attempt + 1 < retry_cfg.max_attempts {
-                                    retry.push(entry.clone());
-                                } else {
-                                    outcomes.insert(
-                                        entry.index,
-                                        Err(FaucetError::Sink(format!(
-                                            "kinesis: record rejected after {} attempts: \
-                                             {code}: {}",
-                                            retry_cfg.max_attempts,
-                                            result.error_message().unwrap_or("(no message)")
-                                        ))),
-                                    );
-                                }
+                                outcomes.insert(
+                                    entry.index,
+                                    Err(FaucetError::Sink(format!(
+                                        "kinesis: record rejected after {} attempt(s): {code}: {}",
+                                        attempt + 1,
+                                        result.error_message().unwrap_or("(no message)")
+                                    ))),
+                                );
                             }
                         }
                     }
@@ -216,12 +290,21 @@ impl KinesisSink {
                     pending = retry;
                 }
                 Err(err) => {
+                    use aws_sdk_kinesis::error::ProvideErrorMetadata as _;
                     attempt += 1;
+                    let transport = matches!(
+                        err,
+                        aws_sdk_kinesis::error::SdkError::DispatchFailure(_)
+                            | aws_sdk_kinesis::error::SdkError::TimeoutError(_)
+                            | aws_sdk_kinesis::error::SdkError::ResponseError(_)
+                    );
+                    let status = err.raw_response().map(|r| r.status().as_u16());
+                    let retriable = retriable_request(status, err.code(), transport);
                     let service = err.into_service_error();
-                    if attempt >= retry_cfg.max_attempts {
+                    if !retriable || attempt >= retry_cfg.max_attempts {
                         return Err(FaucetError::Sink(format!(
-                            "kinesis: PutRecords to '{}' failed after {} attempts: {service}",
-                            self.config.stream_name, retry_cfg.max_attempts
+                            "kinesis: PutRecords to '{}' failed after {attempt} attempts: {service}",
+                            self.config.stream_name
                         )));
                     }
                     let delay = backoff_delay(
@@ -249,15 +332,48 @@ impl KinesisSink {
         encoded: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
         use futures::StreamExt;
-        let chunks = chunk_requests(
-            encoded,
-            self.config.batch_size,
-            self.config.max_request_bytes,
-        );
         let mut merged: BTreeMap<usize, Result<(), FaucetError>> = BTreeMap::new();
         let mut stream =
-            futures::stream::iter(chunks.into_iter().map(|chunk| self.put_chunk(chunk)))
-                .buffer_unordered(self.config.concurrency);
+            futures::stream::iter(lanes(encoded, self.config.concurrency).into_iter().map(
+                |lane| async move {
+                    // One lane's requests in order; a key whose record failed for
+                    // good fails its later records too, keeping its order intact.
+                    let mut out: BTreeMap<usize, Result<(), FaucetError>> = BTreeMap::new();
+                    let mut dead: HashSet<String> = HashSet::new();
+                    for chunk in
+                        chunk_requests(lane, self.config.batch_size, self.config.max_request_bytes)
+                    {
+                        let (send, skip): (Vec<Encoded>, Vec<Encoded>) = chunk
+                            .into_iter()
+                            .partition(|e| !dead.contains(e.order_key()));
+                        for e in skip {
+                            out.insert(
+                                e.index,
+                                Err(FaucetError::Sink(format!(
+                                    "kinesis: not sent — an earlier record with key '{}' failed",
+                                    e.order_key()
+                                ))),
+                            );
+                        }
+                        if send.is_empty() {
+                            continue;
+                        }
+                        let keys: Vec<(usize, String)> = send
+                            .iter()
+                            .map(|e| (e.index, e.order_key().to_string()))
+                            .collect();
+                        let result = self.put_chunk(send).await?;
+                        for (idx, key) in keys {
+                            if result.get(&idx).is_some_and(Result::is_err) {
+                                dead.insert(key);
+                            }
+                        }
+                        out.extend(result);
+                    }
+                    Ok::<_, FaucetError>(out)
+                },
+            ))
+            .buffer_unordered(self.config.concurrency);
         while let Some(result) = stream.next().await {
             merged.extend(result?);
         }
@@ -366,6 +482,65 @@ impl faucet_core::Sink for KinesisSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keyed(index: usize, key: &str) -> Encoded {
+        Encoded {
+            index,
+            partition_key: key.into(),
+            hash_key: None,
+            data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_key_stays_in_one_lane_in_order() {
+        let entries: Vec<Encoded> = (0..40).map(|i| keyed(i, &format!("k{}", i % 5))).collect();
+        let lanes = lanes(entries, 3);
+        assert!(lanes.len() <= 3);
+        for k in 0..5 {
+            let key = format!("k{k}");
+            let holding: Vec<&Vec<Encoded>> = lanes
+                .iter()
+                .filter(|l| l.iter().any(|e| e.partition_key == key))
+                .collect();
+            assert_eq!(holding.len(), 1, "key {key} is in exactly one lane");
+            let idx: Vec<usize> = holding[0]
+                .iter()
+                .filter(|e| e.partition_key == key)
+                .map(|e| e.index)
+                .collect();
+            assert!(idx.windows(2).all(|w| w[0] < w[1]));
+        }
+        let mut with_hash = keyed(0, "p");
+        with_hash.hash_key = Some("42".into());
+        assert_eq!(with_hash.order_key(), "42");
+    }
+
+    #[test]
+    fn a_failure_resends_the_later_records_of_its_key() {
+        let pending = vec![keyed(0, "a"), keyed(1, "a"), keyed(2, "b"), keyed(3, "a")];
+        let failed: HashSet<usize> = [1].into();
+        let mut got: Vec<usize> = resend_set(&pending, &failed).into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![1, 3]);
+    }
+
+    #[test]
+    fn only_transient_request_failures_are_retried() {
+        assert!(retriable_request(None, None, true));
+        assert!(retriable_request(Some(500), None, false));
+        assert!(retriable_request(
+            Some(400),
+            Some("ProvisionedThroughputExceededException"),
+            false
+        ));
+        assert!(!retriable_request(
+            Some(400),
+            Some("ResourceNotFoundException"),
+            false
+        ));
+        assert!(!retriable_request(None, None, false));
+    }
     use crate::config::{PartitionKey, ValueFormat};
     use serde_json::json;
 

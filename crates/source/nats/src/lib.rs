@@ -8,9 +8,10 @@
 //! `idle_timeout_secs` fires, and yields each message payload as a JSON record
 //! (valid JSON passes through; anything else becomes a JSON string).
 //!
-//! Core NATS is fire-and-forget at-least-once, so runs carry no bookmark and
-//! are not resumable/exactly-once. In JetStream mode each page's messages are
-//! acked after the page is written, giving at-least-once delivery.
+//! Core NATS is fire-and-forget (at-most-once: a message published while the
+//! source is not subscribed is never seen), so runs carry no bookmark and are
+//! not resumable. In JetStream mode each page's messages are acked after the
+//! page is written, giving at-least-once delivery.
 //!
 //! ```no_run
 //! use faucet_source_nats::{NatsSource, NatsSourceConfig};

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use faucet_common_oracle::oracle::Connection;
@@ -27,8 +27,8 @@ use crate::miner::{Assembler, LogRow, Miner, TableMeta, to_envelope};
 use crate::sql::{
     ADD_LOGFILE_SQL, ARCHIVED_LOGS_SQL, CONTAINER_SQL, CURRENT_SCN_SQL, DatabaseLogging,
     END_LOGMNR_SQL, LOGFILE_ADD, LOGFILE_NEW, LoggingReport, ONLINE_LOGS_SQL, POSITION_SQL,
-    SCN_AGE_SQL, START_LOGMNR_SQL, SUPPLEMENTAL_SQL, columns_sql, contents_sql, flush_sql,
-    flush_table_ddl, log_groups_sql, logging_report, needs_logfiles,
+    RESETLOGS_SQL, SCN_AGE_SQL, START_LOGMNR_SQL, SUPPLEMENTAL_SQL, THREADS_SQL, columns_sql,
+    contents_sql, flush_sql, flush_table_ddl, log_groups_sql, logging_report, needs_logfiles,
 };
 use crate::state::Position;
 
@@ -262,10 +262,17 @@ impl Shared {
             .map_err(|e| src_err("session setup", &e))?;
         let mut meta = self.load_meta(&conn)?;
         let send = |page: StreamPage| tx.blocking_send(page).is_ok();
+        let (resetlogs,): (u64,) = conn
+            .query_row_as(RESETLOGS_SQL, &[])
+            .map_err(|e| src_err("incarnation check", &e))?;
         let mut position = match start {
-            Some(p) => p,
+            Some(mut p) => {
+                p.bind_incarnation(resetlogs)?;
+                p
+            }
             None => {
-                let p = self.initial_position(&conn)?;
+                let mut p = self.initial_position(&conn)?;
+                p.bind_incarnation(resetlogs)?;
                 if per_txn
                     && !send(StreamPage {
                         records: Vec::new(),
@@ -280,17 +287,28 @@ impl Shared {
         let mut miner = Miner::new(self.config.on_unsupported, self.config.max_staged_records);
         let mut from = position.restart_scn.saturating_sub(1);
         let mut agg: Vec<Value> = Vec::new();
+        let mut agg_since = Instant::now();
         let mut last_activity = Instant::now();
         loop {
             let current = self.position_now(&conn)?.commit_scn;
             self.flush(&conn, current)?;
-            let to = current.min(from.saturating_add(self.config.max_scn_window));
+            let (threads, floor): (u64, Option<u64>) = conn
+                .query_row_as(THREADS_SQL, &[])
+                .map_err(|e| src_err("redo thread check", &e))?;
+            let to = window_end(current, from, self.config.max_scn_window, threads, floor);
+            let reachable = window_end(current, from, u64::MAX, threads, floor);
             let mut captured = false;
             if to > from {
                 let before = position.clone();
                 let mut open = true;
                 self.mine(&conn, from, to, &mut |row| {
-                    let Some(txn) = miner.apply(&row)? else {
+                    let applied = miner.apply(&row)?;
+                    // Reload at the DDL row so later commits in this window are typed by
+                    // the new columns, not the ones loaded before it.
+                    if !miner.take_ddl_tables().is_empty() {
+                        meta = self.load_meta(&conn)?;
+                    }
+                    let Some(txn) = applied else {
                         return Ok(true);
                     };
                     if txn.events.is_empty() || position.already_emitted(txn.commit_scn, &txn.xid) {
@@ -310,6 +328,13 @@ impl Shared {
                         });
                     } else {
                         agg.extend(records);
+                        if agg_page_due(agg.len(), agg_since.elapsed(), self.config.idle_timeout) {
+                            open = send(StreamPage {
+                                records: std::mem::take(&mut agg),
+                                bookmark: Some(position.to_value()),
+                            });
+                            agg_since = Instant::now();
+                        }
                     }
                     Ok(open)
                 })?;
@@ -327,17 +352,14 @@ impl Shared {
                 {
                     return Ok(());
                 }
-                if !miner.take_ddl_tables().is_empty() {
-                    meta = self.load_meta(&conn)?;
-                }
             }
-            if keeps_cycle_alive(captured, to, current) {
+            if keeps_cycle_alive(captured, to, reachable) {
                 last_activity = Instant::now();
             }
             if last_activity.elapsed() >= self.config.idle_timeout {
                 break;
             }
-            if to >= current {
+            if to >= reachable {
                 std::thread::sleep(self.config.poll_interval);
             }
         }
@@ -369,6 +391,35 @@ impl Shared {
             &groups,
         ))
     }
+}
+
+/// The end of the next mining window: `current`, at most `max_window` past
+/// `from`, and — with several open redo threads (RAC) — no later than the
+/// lowest thread checkpoint, since the flush reaches only the local instance
+/// and a commit on another thread above that point may not be in the redo yet.
+pub(crate) fn window_end(
+    current: u64,
+    from: u64,
+    max_window: u64,
+    open_threads: u64,
+    checkpoint_floor: Option<u64>,
+) -> u64 {
+    let end = current.min(from.saturating_add(max_window));
+    match checkpoint_floor {
+        Some(floor) if open_threads > 1 => end.min(floor),
+        _ => end,
+    }
+}
+
+/// Records a `batch_size: 0` cycle buffers before it emits a page anyway.
+pub(crate) const AGG_PAGE_RECORDS: usize = 100_000;
+
+/// Whether a `batch_size: 0` cycle must emit what it holds now: at
+/// [`AGG_PAGE_RECORDS`] records, or once records have waited `idle_timeout` —
+/// a database that never goes idle would otherwise grow the buffer without
+/// bound and never persist a bookmark.
+pub(crate) fn agg_page_due(len: usize, waited: Duration, idle_timeout: Duration) -> bool {
+    len >= AGG_PAGE_RECORDS || (len > 0 && waited >= idle_timeout)
 }
 
 impl OracleCdcSource {
@@ -688,6 +739,29 @@ mod tests {
         assert!(keeps_cycle_alive(true, 200, 200), "captured a commit");
         assert!(!keeps_cycle_alive(false, 200, 200), "caught up and quiet");
         assert!(!keeps_cycle_alive(false, 250, 200));
+    }
+
+    #[test]
+    fn window_end_respects_the_rac_checkpoint_floor() {
+        assert_eq!(window_end(1000, 100, 50, 1, Some(10)), 150);
+        assert_eq!(window_end(120, 100, 50, 1, Some(10)), 120);
+        assert_eq!(window_end(1000, 100, 50, 2, Some(130)), 130);
+        assert_eq!(window_end(1000, 100, 50, 2, Some(500)), 150);
+        assert_eq!(window_end(1000, 100, 50, 2, None), 150);
+        assert_eq!(window_end(1000, 100, u64::MAX, 3, Some(700)), 700);
+    }
+
+    #[test]
+    fn agg_pages_are_bounded() {
+        let idle = std::time::Duration::from_secs(30);
+        assert!(!agg_page_due(0, idle * 2, idle));
+        assert!(!agg_page_due(10, idle / 2, idle));
+        assert!(agg_page_due(10, idle, idle));
+        assert!(agg_page_due(
+            AGG_PAGE_RECORDS,
+            std::time::Duration::ZERO,
+            idle
+        ));
     }
 
     #[test]

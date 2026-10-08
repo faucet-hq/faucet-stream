@@ -73,7 +73,7 @@ impl DatabricksSink {
         Ok(Self {
             run_id: format!("{nanos:x}-{:x}", std::process::id()),
             config,
-            http: reqwest::Client::new(),
+            http: faucet_common_databricks::http_client()?,
             endpoint_base: None,
             auth_provider: None,
             stage,
@@ -671,8 +671,12 @@ impl Sink for DatabricksSink {
         let staging_exists = !self.describe(&staging).await?.is_empty();
         match (target_exists, staging_exists) {
             (true, true) => {
-                self.exec(sql::insert_overwrite_sql(&target, &staging), Replay::Safe)
-                    .await?;
+                let target_cols = self.describe(&target).await?;
+                self.exec(
+                    sql::insert_overwrite_sql(&target, &staging, &target_cols),
+                    Replay::Safe,
+                )
+                .await?;
                 self.exec(sql::drop_table_sql(&staging), Replay::Safe)
                     .await?;
             }

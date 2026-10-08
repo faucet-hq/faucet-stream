@@ -75,6 +75,7 @@ faucet run pipeline.yaml
 | `batch_size` | int | `1000` | Maximum rows per multi-row `INSERT` (or per `COPY` under `write_method: copy`). **`0` = no batching** — the whole page is sent in one statement. See [Streaming & batching](#streaming--batching). |
 | `max_connections` | int | `5` | Maximum connections in the `sqlx` pool. |
 | `write_method` | `"insert" \| "copy"` | `"insert"` | How append-mode rows are shipped. `copy` uses the `COPY … FROM STDIN` bulk-load fast-path — see [Bulk load](#bulk-load-write_method-copy). |
+| `write_timeout_secs` | int | `3600` | Longest one page write may wait on the server before it fails. A server that vanishes without closing the connection (failover, NAT or load-balancer idle eviction) would otherwise hang the run forever. `0` waits forever. |
 
 ### Write mode
 
@@ -91,7 +92,7 @@ faucet run pipeline.yaml
 | Variant | YAML | Description |
 |---------|------|-------------|
 | `Jsonb { column }` | `{ jsonb: { column: data } }` | Insert each record as a single `jsonb` column (default name `"data"`). Uses `unnest($1::jsonb[])` for efficient batch inserts. |
-| `AutoMap` | `auto_map` | Map top-level JSON keys directly to table columns. Column names + types are discovered from the catalog, scoped (via `to_regclass`) to exactly the relation the `INSERT` targets. Only keys matching existing columns are inserted; extra keys are silently ignored. Records with no matching keys are skipped with a warning. |
+| `AutoMap` | `auto_map` | Map top-level JSON keys directly to table columns. Column names + types are discovered from the catalog, scoped (via `to_regclass`) to exactly the relation the `INSERT` targets. Only keys matching existing columns are inserted (names are case-sensitive, as the sink quotes them); extra keys are ignored — configure a `schema:` drift policy to add or quarantine them. A record matching **no** column is an error: `write_batch` fails, and `write_batch_partial` reports that row as failed so it reaches the DLQ. |
 
 ## Examples
 
@@ -312,7 +313,7 @@ delivery: exactly_once
 Under `on_drift: evolve`, `PostgresSink::evolve_schema()` applies additive DDL in one connection:
 
 - **New columns** → `ALTER TABLE … ADD COLUMN IF NOT EXISTS` (idempotent).
-- **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN … TYPE` — gated on `allow_type_widening`.
+- **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN … TYPE` — gated on `allow_type_widening`. An integer column that starts receiving fractions becomes exact `numeric`, never `double precision`, so stored values above 2^53 keep every digit.
 - **Nullability relaxations** (a previously `NOT NULL` column absent from the page) → `ALTER COLUMN … DROP NOT NULL`.
 
 Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
@@ -461,9 +462,9 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 ## Overwrite (`write_mode: overwrite`)
 
 Full-refresh: each run atomically **replaces** the whole table. Writes are
-staged into a `LIKE` clone (`{table}__faucet_ovw`) and swapped in one
-transaction (`TRUNCATE` + `INSERT … SELECT` + `DROP`) only after the run
-succeeds, so a mid-run failure leaves the previous rows intact. No `key` is
+staged into a `LIKE … INCLUDING DEFAULTS INCLUDING GENERATED` clone
+(`{table}__faucet_ovw`) and swapped in one transaction (`TRUNCATE` +
+`INSERT … SELECT` + `DROP`) only after the run succeeds, so a mid-run failure leaves the previous rows intact. No `key` is
 needed; a missing target is created by the first run
 (staged from the first page, then renamed into place at commit — a failed first
 run leaves no table) when `create_table: true`. See the
@@ -471,8 +472,24 @@ run leaves no table) when `create_table: true`. See the
 
 **Scoped / windowed overwrite (#518):** add a `scope: { window: { column, from, to } }`
 to replace only the rows in a half-open `[from, to)` window — the swap becomes
-`DELETE FROM target WHERE <window>; INSERT … SELECT` in one transaction, leaving
-out-of-window rows intact.
+`DELETE FROM target WHERE <window>; INSERT … SELECT … WHERE <window>` in one
+transaction, leaving out-of-window rows intact. A staged row outside the window
+fails the commit (nothing is replaced): inserting it would duplicate a row the
+delete never touched, so filter the source to the window.
+
+**Identity, generated and referenced tables.** Generated columns are recomputed
+by the table rather than copied. Identity columns keep the values the records
+carry (`OVERRIDING SYSTEM VALUE`), and records that omit them get values from
+the table's own sequence. A target other tables reference by foreign key is
+emptied with `DELETE` under deferred constraints instead of `TRUNCATE` (which
+PostgreSQL refuses): children that reference a key the run brings back stay
+valid, any other reference fails the swap. A reference with `ON DELETE CASCADE`,
+`SET NULL` or `SET DEFAULT` is refused before the run loads anything, because
+replacing the rows would change the referencing table.
+
+**Long table names.** Staging and previous-copy names stay within PostgreSQL's
+63-byte identifier limit: a longer name is cut and tagged with a hash of the
+table name, so it can never collide with the target or with each other.
 
 
 **Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
@@ -492,3 +509,9 @@ watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `postgres` source config
 `faucet verify` reads the destination back with). See the [rollback
 cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).
+
+Restores are exact: each journaled image is expanded server-side with
+`jsonb_populate_record` into the table's row type, so NUMERIC, timestamps and
+JSON documents come back digit for digit. Generated columns are left to the
+table, and the previous copy of an overwrite is swapped back the same way the
+overwrite itself swaps (identity values kept, `DELETE` for a referenced table).

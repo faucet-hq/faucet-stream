@@ -14,11 +14,32 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 pub const USER: &str = "FAUCET";
 pub const PASSWORD: &str = "faucet";
 
+/// A missing test backend: a skip locally, a failure when CI requires the
+/// backends (`FAUCET_REQUIRE_BACKENDS`).
+fn backend_missing(why: &str) {
+    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
+        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
+    }
+    eprintln!("skipping: {why}");
+}
+
+/// The Oracle Free container (a multi-GB database image) does not start on
+/// the PR runners, so a start failure is fatal only where the nightly
+/// heavy-integration job asks for it (`FAUCET_REQUIRE_ORACLE`).
+fn container_missing(why: &str) {
+    if std::env::var("FAUCET_REQUIRE_ORACLE").is_ok() {
+        panic!("{why} (FAUCET_REQUIRE_ORACLE is set)");
+    }
+    eprintln!("skipping: {why}");
+}
+
 pub fn client_available() -> bool {
     match oracle::Version::client() {
         Ok(_) => true,
         Err(e) => {
-            eprintln!("skipping Oracle integration test: Instant Client unavailable: {e}");
+            backend_missing(&format!(
+                "Oracle integration test: Instant Client unavailable: {e}"
+            ));
             false
         }
     }
@@ -38,11 +59,16 @@ pub async fn start_oracle() -> Option<(ContainerAsync<GenericImage>, OracleConne
     let container = match image.start().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("skipping Oracle integration test: container failed to start: {e}");
+            container_missing(&format!(
+                "Oracle integration test: container failed to start: {e}"
+            ));
             return None;
         }
     };
-    let port = container.get_host_port_ipv4(1521).await.ok()?;
+    let port = container
+        .get_host_port_ipv4(1521)
+        .await
+        .expect("oracle container port");
     Some((
         container,
         OracleConnectionConfig::new("127.0.0.1", port, "FREEPDB1", USER, PASSWORD),

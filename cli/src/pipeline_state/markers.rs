@@ -27,18 +27,22 @@ pub struct RunMarkers {
 
 impl RunMarkers {
     /// Open the bracket: take the lease when `lease` (roots / products).
+    /// Refused when another run holds a live lease on the row, unless `force`.
     pub fn begin<'a>(
         store: Option<Arc<dyn StateStore>>,
         base: &'a str,
         run_id: &'a str,
         take_lease: bool,
-    ) -> BoxFuture<'a, Self> {
+        force: bool,
+    ) -> BoxFuture<'a, Result<Self, crate::error::CliError>> {
         Box::pin(async move {
             let lease = match (&store, take_lease) {
-                (Some(s), true) => lease::acquire(Arc::clone(s), base, run_id).await,
+                (Some(s), true) => lease::try_acquire(Arc::clone(s), base, run_id, force)
+                    .await
+                    .map_err(|held| crate::error::CliError::LeaseHeld(held.message(base)))?,
                 _ => None,
             };
-            Self { store, lease }
+            Ok(Self { store, lease })
         })
     }
 
@@ -127,7 +131,9 @@ mod tests {
     #[tokio::test]
     async fn bracket_records_and_releases() {
         let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
-        let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-1", true).await;
+        let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-1", true, false)
+            .await
+            .unwrap();
         assert!(lease::read(store.as_ref(), "p::r").await.unwrap().is_some());
         m.finish(
             "p::r".into(),
@@ -142,7 +148,9 @@ mod tests {
         let o = outcome::read(store.as_ref(), "p::r").await.unwrap();
         assert_eq!(o.last_failure.unwrap().error_kind.as_deref(), Some("Sink"));
 
-        let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-2", false).await;
+        let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-2", false, false)
+            .await
+            .unwrap();
         let extras = OutcomeExtras {
             batches: Some(faucet_core::BatchOutcomes {
                 attempted: 2,
@@ -163,7 +171,9 @@ mod tests {
         assert_eq!(success.batches.unwrap().dlq_all, 1);
         assert_eq!(success.lag, Some(faucet_core::SourceLag::bytes(10)));
 
-        let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-3", true).await;
+        let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-3", true, false)
+            .await
+            .unwrap();
         m.finish(
             "p::r".into(),
             "run-3".into(),
@@ -180,8 +190,9 @@ mod tests {
             "a cancelled run is not recorded"
         );
 
-        RunMarkers::begin(None, "p::r", "x", true)
+        RunMarkers::begin(None, "p::r", "x", true, false)
             .await
+            .unwrap()
             .finish(
                 "p::r".into(),
                 "x".into(),
@@ -201,5 +212,52 @@ mod tests {
                 Default::default(),
             )
             .await;
+    }
+
+    #[tokio::test]
+    async fn a_second_run_is_refused_while_the_first_holds_the_lease() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let first = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-a", true, false)
+            .await
+            .unwrap();
+        let err =
+            match RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-b", true, false).await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("a live lease must refuse a second run"),
+            };
+        assert!(err.contains("run-a") && err.contains("--force"), "{err}");
+        let forced = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-b", true, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            lease::read(store.as_ref(), "p::r")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_id,
+            "run-b"
+        );
+        first
+            .finish(
+                "p::r".into(),
+                "run-a".into(),
+                Ok(1),
+                1,
+                false,
+                Default::default(),
+            )
+            .await;
+        assert!(lease::read(store.as_ref(), "p::r").await.unwrap().is_some());
+        forced
+            .finish(
+                "p::r".into(),
+                "run-b".into(),
+                Ok(1),
+                1,
+                false,
+                Default::default(),
+            )
+            .await;
+        assert!(lease::read(store.as_ref(), "p::r").await.unwrap().is_none());
     }
 }

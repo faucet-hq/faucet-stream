@@ -61,18 +61,20 @@ pub fn edm_type_to_json(edm_type: &str) -> Value {
 }
 
 /// Namespace-strip a possibly-prefixed XML name (`edm:Property` → `Property`).
-fn local_name(qname: &[u8]) -> String {
-    let s = String::from_utf8_lossy(qname);
-    s.rsplit(':').next().unwrap_or(&s).to_string()
+fn local_name(qname: &str) -> String {
+    qname.rsplit(':').next().unwrap_or(qname).to_string()
 }
 
 /// Read one attribute of an element by (namespace-stripped) name.
 fn attr(e: &BytesStart, key: &str) -> Option<String> {
     e.attributes()
-        .with_checks(false)
         .flatten()
         .find(|a| local_name(a.key.as_ref()) == key)
-        .and_then(|a| a.unescape_value().ok().map(|v| v.to_string()))
+        .and_then(|a| {
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
+        })
 }
 
 /// Parse an EDMX / CSDL `$metadata` document into its entity types + sets.

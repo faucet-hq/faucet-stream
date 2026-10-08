@@ -264,7 +264,7 @@ regex = "1"
 reqwest = { version = "0.13", features = ["json", "form", "query"] }
 futures-core = "0.3"
 jsonpath-rust = "1.0.1"
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 tonic = { version = "0.13", features = ["transport", "tls-ring"] }
 prost = "0.13"
 prost-reflect = { version = "0.15", features = ["serde"] }
@@ -345,9 +345,9 @@ mongodb = "3.9"
 mysql_async = { version = "0.37", default-features = false, features = ["binlog", "default-rustls-ring"] }
 csv = "1.3"
 csv-async = { version = "1.3", features = ["tokio"] }
-calamine = { version = "0.26", features = ["dates"] }
+calamine = { version = "0.36", features = ["dates"] }
 rust_xlsxwriter = "0.99"
-redis = { version = "0.29", features = ["tokio-comp", "aio"] }
+redis = { version = "0.29", features = ["tokio-comp", "aio", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 axum = "0.8"
 subtle = "2"
 tower-http = { version = "0.6", features = ["limit", "cors", "trace", "request-id", "util"] }

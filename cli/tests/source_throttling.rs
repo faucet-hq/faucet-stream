@@ -29,6 +29,7 @@ impl Respond for TwiceThrottled {
 fn opts() -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: "throttled".into(),
         run_id: None,
         execution: None,

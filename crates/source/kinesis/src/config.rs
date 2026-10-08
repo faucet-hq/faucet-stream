@@ -104,6 +104,27 @@ pub struct KinesisSourceConfig {
     /// the "no batching" sentinel: one page per drain cycle. Default 1000.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// What a record whose payload `value_format` cannot decode does: `fail`
+    /// (default) fails the run naming the record; `skip` drops it (with a
+    /// warning) and moves the shard's bookmark past it; `raw` emits it with
+    /// `data: { raw_base64, error }`. Without `skip`/`raw` one bad record
+    /// blocks its shard on every run.
+    #[serde(default)]
+    pub on_decode_error: OnDecodeError,
+}
+
+/// [`KinesisSourceConfig::on_decode_error`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDecodeError {
+    /// Fail the run.
+    #[default]
+    Fail,
+    /// Drop the record and advance past it.
+    Skip,
+    /// Emit the raw bytes (base64) with the decode error.
+    Raw,
 }
 
 fn default_poll_interval_ms() -> u64 {
@@ -137,6 +158,7 @@ impl KinesisSourceConfig {
             max_messages: None,
             value_format: ValueFormat::default(),
             batch_size: default_batch_size(),
+            on_decode_error: OnDecodeError::default(),
         }
     }
 
@@ -177,6 +199,19 @@ impl KinesisSourceConfig {
                 "kinesis source: max_messages must be at least 1".into(),
             ));
         }
+        // A sequence number belongs to one shard, so a sequence start position
+        // must name exactly that shard (#789 MSG-95).
+        if matches!(
+            self.start_position,
+            StartPosition::AtSequenceNumber { .. } | StartPosition::AfterSequenceNumber { .. }
+        ) && self.shard_ids.len() != 1
+        {
+            return Err(FaucetError::Config(
+                "kinesis source: a sequence-number start_position applies to one shard — list \
+                 exactly that shard in shard_ids"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -205,6 +240,27 @@ mod tests {
         assert_eq!(c.shard_concurrency, 4);
         assert_eq!(c.poll_interval_ms, 1000);
         assert!(!c.include_closed);
+    }
+
+    #[test]
+    fn a_sequence_start_position_names_exactly_one_shard() {
+        for start in [
+            StartPosition::AtSequenceNumber {
+                sequence: "4959".into(),
+            },
+            StartPosition::AfterSequenceNumber {
+                sequence: "4959".into(),
+            },
+        ] {
+            let mut c = valid();
+            c.start_position = start;
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("applies to one shard"), "{err}");
+            c.shard_ids = vec!["a".into(), "b".into()];
+            assert!(c.validate().is_err());
+            c.shard_ids = vec!["shardId-000000000000".into()];
+            c.validate().unwrap();
+        }
     }
 
     #[test]

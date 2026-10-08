@@ -416,6 +416,12 @@ pub enum CliError {
     #[error("config error: {0}")]
     Config(String),
 
+    /// Another run holds the row's live run lease (`faucet run --force` takes
+    /// it). An orchestrator treats it as a failure of the whole run, never as
+    /// a per-unit failure to retry or skip.
+    #[error("{0}")]
+    LeaseHeld(String),
+
     /// Pass-through for failures bubbling up from `faucet-core` or a connector.
     #[error(transparent)]
     Faucet(#[from] faucet_core::FaucetError),

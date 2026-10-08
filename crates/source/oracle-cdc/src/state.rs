@@ -10,6 +10,9 @@
 //! - `restart_scn` — where mining resumes: the first SCN of the oldest
 //!   transaction still open at the bookmark, so its changes are rebuilt from
 //!   the start rather than lost.
+//! - `resetlogs_scn` — the database incarnation (`RESETLOGS_CHANGE#`) the
+//!   bookmark was taken in; a resume in another incarnation fails, since the
+//!   SCNs after a RESETLOGS name different changes.
 
 use faucet_core::FaucetError;
 use serde_json::{Value, json};
@@ -23,6 +26,9 @@ pub struct Position {
     pub restart_scn: u64,
     /// Transactions already emitted at exactly `commit_scn`.
     pub committed_xids: Vec<String>,
+    /// `RESETLOGS_CHANGE#` of the incarnation the position belongs to; absent
+    /// in bookmarks written before it was recorded.
+    pub resetlogs_scn: Option<u64>,
 }
 
 impl Position {
@@ -33,6 +39,26 @@ impl Position {
             commit_scn: scn,
             restart_scn: restart.min(scn.saturating_add(1)),
             committed_xids: Vec::new(),
+            resetlogs_scn: None,
+        }
+    }
+
+    /// Tie the position to the database incarnation whose `RESETLOGS_CHANGE#`
+    /// is `current`, refusing a position taken in another incarnation (after
+    /// a point-in-time recovery or flashback its later SCNs name changes that
+    /// no longer exist, and the new branch reuses them).
+    pub fn bind_incarnation(&mut self, current: u64) -> Result<(), FaucetError> {
+        match self.resetlogs_scn {
+            Some(r) if r != current => Err(FaucetError::Source(format!(
+                "oracle-cdc: the bookmark was taken in the database incarnation that began at \
+                 SCN {r}, but the database was opened with RESETLOGS at SCN {current}; its \
+                 changes after the branch point may no longer exist. Re-snapshot the tables \
+                 and reset the bookmark"
+            ))),
+            _ => {
+                self.resetlogs_scn = Some(current);
+                Ok(())
+            }
         }
     }
 
@@ -75,11 +101,15 @@ impl Position {
 
     /// Serialize for the state store.
     pub fn to_value(&self) -> Value {
-        json!({
+        let mut v = json!({
             "commit_scn": self.commit_scn,
             "restart_scn": self.restart_scn,
             "committed_xids": self.committed_xids,
-        })
+        });
+        if let Some(r) = self.resetlogs_scn {
+            v["resetlogs_scn"] = json!(r);
+        }
+        v
     }
 
     /// Parse a stored bookmark.
@@ -103,10 +133,15 @@ impl Position {
                 .collect::<Result<_, _>>()?,
             Some(_) => return Err(bad("`committed_xids` must be an array")),
         };
+        let resetlogs_scn = match obj.get("resetlogs_scn") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(scn("resetlogs_scn")?),
+        };
         Ok(Self {
             commit_scn: scn("commit_scn")?,
             restart_scn: scn("restart_scn")?,
             committed_xids: xids,
+            resetlogs_scn,
         })
     }
 }
@@ -126,6 +161,30 @@ pub fn position_le(a: &Value, b: &Value) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn incarnation_is_recorded_and_enforced() {
+        let mut p = super::Position::at(10, 5);
+        p.bind_incarnation(100).unwrap();
+        assert_eq!(p.resetlogs_scn, Some(100));
+        let v = p.to_value();
+        assert_eq!(v["resetlogs_scn"], 100);
+        let mut back = super::Position::from_value(&v).unwrap();
+        back.bind_incarnation(100).unwrap();
+        let err = back.bind_incarnation(200).unwrap_err();
+        assert!(err.to_string().contains("RESETLOGS at SCN 200"), "{err}");
+        let legacy = super::Position::from_value(&serde_json::json!({
+            "commit_scn": 1, "restart_scn": 1, "resetlogs_scn": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.resetlogs_scn, None);
+        assert!(
+            super::Position::from_value(&serde_json::json!({
+                "commit_scn": 1, "restart_scn": 1, "resetlogs_scn": "x"
+            }))
+            .is_err()
+        );
+    }
+
     use super::*;
 
     #[test]

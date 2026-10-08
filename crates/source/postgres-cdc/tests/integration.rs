@@ -77,6 +77,7 @@ fn cfg(url: &str, slot: &str, publication: &str) -> PostgresCdcSourceConfig {
         max_messages: None,
         max_cycle_duration: std::time::Duration::from_secs(300),
         max_staged_records: None,
+        max_buffered_events: 100_000,
         status_update_interval: Duration::from_secs(1),
         tcp_keepalive: Duration::from_secs(60),
         batch_size: faucet_core::DEFAULT_BATCH_SIZE,
@@ -169,6 +170,23 @@ async fn update_and_delete_emit_before_after() {
     assert_eq!(update["after"]["name"], "alice2");
     assert_eq!(delete["before"]["id"], 1);
     assert_eq!(delete["after"], serde_json::Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn check_reports_a_passing_server_version_probe() {
+    use faucet_core::check::{CheckContext, ProbeStatus};
+    let (_pg, url) = start_postgres().await;
+    let source = PostgresCdcSource::new(cfg(&url, "doctor_slot", "faucet_pub"))
+        .await
+        .expect("source");
+    let report = source.check(&CheckContext::default()).await.expect("check");
+    let version = report
+        .probes
+        .iter()
+        .find(|p| p.name == "server_version")
+        .expect("server_version probe");
+    assert!(matches!(version.status, ProbeStatus::Pass), "{version:?}");
+    assert!(report.probes.iter().any(|p| p.name == "slot"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -494,15 +512,18 @@ async fn capture_over_existing_slot_anchors_on_slot_consistent_point() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn capture_resume_position_rejects_temporary_slot() {
+async fn temporary_slots_are_refused_at_config_load() {
     let (_pg, url) = start_postgres().await;
     let mut c = cfg(&url, "temp_slot", "faucet_pub");
     c.slot_type = faucet_source_postgres_cdc::SlotType::Temporary;
-    let source = PostgresCdcSource::new(c).await.expect("source");
-    let err = source.capture_resume_position().await.unwrap_err();
+    let err = PostgresCdcSource::new(c)
+        .await
+        .err()
+        .expect("temporary is refused");
     assert!(
-        err.to_string().contains("permanent slot"),
-        "expected a permanent-slot error, got: {err}"
+        err.to_string()
+            .contains("slot_type: temporary is not supported"),
+        "expected the temporary-slot refusal, got: {err}"
     );
 }
 

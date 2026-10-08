@@ -61,7 +61,7 @@ All fields live under `pipeline.source.config`.
 |-------|------|---------|-------------|
 | `connection_url` | string | — *(required)* | PostgreSQL connection URL (`postgres://user:pass@host:5432/db`). Masked in `Debug` output and stripped from the lineage URI. |
 | `query` | string | — *(required)* | SQL query to execute. May contain positional placeholders `$1`, `$2`, … and `${parent.path}` matrix-context tokens. |
-| `params` | array | `[]` | Bind parameters for the query, in positional order. Each value is bound as its native scalar type (string / integer / float / bool / null). Integer params bind exactly — any JSON integer up to `u64::MAX` round-trips without the precision loss an `f64` cast would cause, so large 64-bit ids compare correctly. |
+| `params` | array | `[]` | Bind parameters for the query, in positional order. Each value is bound as its native scalar type (string / integer / float / bool / null). Integer params bind exactly as `int8` — no `f64` precision loss, so large 64-bit ids compare correctly. A value above `i64::MAX` (Postgres has no unsigned 64-bit type) is refused; pass it as a string and cast it (`$1::numeric`). |
 
 ### Reliability & batching
 
@@ -69,6 +69,8 @@ All fields live under `pipeline.source.config`.
 |-------|------|---------|-------------|
 | `max_connections` | int | `10` | Maximum connections in the `sqlx` pool. |
 | `batch_size` | int | `1000` | Rows per `StreamPage`. **`0` = no batching** — the cursor is fully drained and the entire result set is emitted in a single page (see [Streaming & batching](#streaming--batching)). Values above `MAX_BATCH_SIZE` (1,000,000) are rejected at construction. |
+| `read_timeout_secs` | int | `3600` | Longest the source waits on the server for the next row before the read fails (`0` = forever), so a peer that vanished without closing the connection (a failover, a NAT/LB idle eviction) cannot hang a run. |
+| `json_big_numbers` | `fail` \| `string` | `fail` | A number inside a JSON column that a 64-bit float cannot represent exactly (more than about 17 significant digits, or beyond the 64-bit integer range): `fail` fails the read with an error naming the column and the number's leading digits; `string` emits it as a JSON string holding its exact digits (one warning per column). Checked on the column's text, never after conversion. |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
 
 ## Examples
@@ -105,9 +107,9 @@ pipeline:
     type: postgres
     config:
       connection_url: postgres://user:pass@localhost:5432/app
-      query: SELECT * FROM events WHERE created_at < $1
+      query: SELECT * FROM events WHERE created_at < $1::timestamptz
       params:
-        - "2026-01-01T00:00:00Z"
+        - "2026-01-01T00:00:00Z"   # a string param is bound as text: cast it
       max_connections: 12
       batch_size: 5000
   sink:
@@ -173,16 +175,16 @@ Columns are converted to JSON values by probing the row's value with each candid
 
 | PostgreSQL type | JSON shape |
 |-----------------|------------|
-| `json`, `jsonb` | native JSON value |
+| `json`, `jsonb` | native JSON value; a number a 64-bit float cannot hold exactly fails the read, or is kept as an exact string with `json_big_numbers: string` |
 | `text`, `varchar`, `char` | string |
 | `int8` / `bigint` | number (i64) |
 | `int4` / `integer` | number (i32) |
 | `int2` / `smallint` | number (i16) |
 | `float8` / `double precision` | number (f64); `NaN` / `Infinity` / `-Infinity` as those strings |
-| `float4` / `real` | number (f32); non-finite values as strings |
+| `float4` / `real` | number, through the value's shortest decimal form (`0.1`, not `0.10000000149011612`); non-finite values as strings |
 | `bool` / `boolean` | boolean |
 | `timestamptz` | string (RFC 3339) |
-| `timestamp`, `date` | string (ISO-8601) |
+| `timestamp`, `date` | string (ISO-8601); `infinity` / `-infinity` as those strings (also for `timestamptz`) |
 | `time` | string, the server's own text (`24:00:00` stays `24:00:00`) |
 | `uuid` | string (canonical hyphenated) |
 | `numeric`, `decimal` | string, exact (`NaN` / `Infinity` too) |
@@ -284,7 +286,7 @@ To wire it into a streaming pipeline, hand the source to `faucet_core::Pipeline`
 - **Pool reuse** — `PostgresSource::new` validates `batch_size`, then builds one `PgPool` (`PgPoolOptions::max_connections(...)`) and stores it on the struct. Every fetch borrows a connection from the pool; nothing is reconnected per call.
 - **True cursor streaming** — `stream_pages` calls `Query::fetch` (a `sqlx` cursor) and pulls rows with `try_next()`, converting each `PgRow` to a JSON object keyed by column name. Rows are batched into a reusable buffer and the buffer is swapped (`mem::replace`) on each yield to avoid reallocation churn.
 - **Typed binding** — config and context parameters are bound as native scalars (string / i64 / f64 / bool / null), never as raw `jsonb`. Binding a `serde_json::Value` directly would encode it as `jsonb` and break comparisons against typed columns (e.g. `WHERE id = $1` against an integer column).
-- **Errors** — connection and query failures surface as `FaucetError::Config` with the underlying `sqlx` message; an out-of-range `batch_size` is rejected at construction.
+- **Errors** — a connection failure at construction surfaces as `FaucetError::Config`, a query failure as `FaucetError::Source`, each with the underlying `sqlx` message; an out-of-range `batch_size` is rejected at construction.
 
 ## Lineage dataset URI
 
@@ -299,7 +301,7 @@ This crate has no optional features of its own. Enable it in the CLI or umbrella
 | Symptom | Likely cause & fix |
 |---------|--------------------|
 | `FaucetError::Config: PostgreSQL connection failed: …` | Bad host/port/db, wrong credentials, or the server is unreachable / not accepting TCP. Verify the `connection_url` and that the DB is up and reachable from the runner. |
-| `FaucetError::Config: PostgreSQL query failed: …` | Invalid SQL, a missing table/column, or insufficient privileges. Run the query directly with `psql` to confirm it works for that role. |
+| `FaucetError::Source: PostgreSQL query failed: …` | Invalid SQL, a missing table/column, or insufficient privileges. Run the query directly with `psql` to confirm it works for that role. |
 | `operator does not exist: integer = text` (or similar) | A `params` value's JSON type doesn't match the column type. Use the matching JSON scalar — e.g. `42` (number) for an integer column, not `"42"` (string). |
 | `FaucetError::Config: batch_size must be …` | `batch_size` exceeds `MAX_BATCH_SIZE` (1,000,000). Lower it, or use `0` for a single un-chunked page. |
 | Run uses too much memory on a huge table | Lower `batch_size` so each page is smaller, and ensure the sink flushes per page. Avoid `batch_size: 0` for very large result sets — it materializes everything in one page. |

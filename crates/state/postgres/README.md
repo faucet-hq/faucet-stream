@@ -163,6 +163,8 @@ CREATE TABLE faucet_state (
 
 `ensure_table()` runs the `CREATE TABLE IF NOT EXISTS` form (the identifier is double-quoted via `faucet_core::util::quote_ident`). If you manage schema with migrations, skip it.
 
+JSONB cannot hold the character U+0000, so a value that contains it (an opaque API cursor, a text bookmark) is stored as its JSON text inside a one-key envelope `{"$faucet_nul_escaped_json": "…"}` and unwrapped on read; every other value is stored as-is.
+
 ### Operations
 
 | Trait method | SQL | Notes |
@@ -172,6 +174,7 @@ CREATE TABLE faucet_state (
 | `delete(key)` | `DELETE FROM <table> WHERE key = $1` | A missing row is not an error. |
 | `list(prefix)` | `SELECT key FROM <table> WHERE left(key, char_length($1)) = $1 ORDER BY key` | Literal prefix match (no `LIKE` wildcards) — how `faucet state show\|export` enumerate a pipeline's keys. |
 | `put_batch(entries)` | the upsert above, once per entry, in one transaction | All-or-nothing (`supports_atomic_batch() == true`) — what `faucet state import` uses. |
+| `compare_and_put(key, expected, value)` | `UPDATE <table> SET value = $2, updated_at = NOW() WHERE key = $1 AND value = $3`, or `INSERT … ON CONFLICT (key) DO NOTHING` when `expected` is absent | Writes only when the stored value still equals `expected` (JSONB equality, so key order does not matter); returns whether a row changed. Atomic across processes (`supports_compare_and_put() == true`) — the run lease takes with it, so two `faucet run` processes sharing this table cannot both start the same row. |
 
 The pipeline reads the bookmark **before** fetching and writes it **only after the sink confirms** the batch, so a crash mid-write never advances state past delivered data.
 

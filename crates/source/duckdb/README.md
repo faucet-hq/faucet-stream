@@ -36,21 +36,38 @@ pipeline:
 
 ## Type mapping
 
-Scalar DuckDB types map exactly to JSON (integers → number, `DOUBLE`/`FLOAT` →
-number, `BOOLEAN` → bool, `VARCHAR` → string). `BLOB` is base64-encoded so
-binary survives the JSON round-trip. `DECIMAL` is emitted as its exact decimal
-string (DuckDB types a bare literal such as `2.5` as `DECIMAL`, so it arrives as
-`"2.5"`; `CAST` to `DOUBLE` for a JSON number). Temporal
-(`TIMESTAMP`/`DATE`/`TIME`) and nested (`LIST`/`STRUCT`/`MAP`) values are
-best-effort: temporal types surface their raw integer representation and the
-rest fall back to a stable string. A future Arrow-native columnar fast path is
-tracked separately.
+Results are read through DuckDB's **streaming** Arrow interface, one chunk
+(about 2,048 rows) at a time, so memory is bounded by `batch_size` rather than
+the result size and the first page arrives before the query finishes. (A
+statement that cannot be wrapped in a subquery — `PRAGMA`, `SHOW`, … — is read
+as a materialized result.)
 
-A value the DuckDB driver cannot decode — a `DECIMAL` wider than 28
-significant digits or a nanosecond `TIME` — fails the run with an error naming
-the column (`CAST` it to `VARCHAR` in the query), and a reader that stops early
-for any other reason fails the run too, rather than ending the stream as if the
-result were complete.
+| DuckDB type | JSON |
+|-------------|------|
+| integer types, `UBIGINT` | number |
+| `HUGEINT` | number when it fits `i64`, else its exact decimal string |
+| `UHUGEINT`, `BIGNUM` | exact decimal string |
+| `DECIMAL` | exact decimal string (a bare literal such as `2.5` is a `DECIMAL`, so it arrives as `"2.5"`; `CAST` to `DOUBLE` for a JSON number) |
+| `DOUBLE` / `REAL` | number (`REAL` through its shortest decimal form, so `0.1` stays `0.1`); NaN / ±Inf as `"NaN"` / `"Infinity"` / `"-Infinity"` |
+| `BOOLEAN` | bool |
+| `VARCHAR`, `UUID`, `ENUM` | string |
+| `BLOB` | base64 string |
+| `BIT` | its bit string (`"101"`) |
+| `DATE` | `"2024-01-02"` |
+| `TIME` | `"10:11:12.500"` |
+| `TIMETZ` | `"10:00:00+05"` |
+| `TIMESTAMP` / `TIMESTAMP_S` / `_MS` / `_NS` | ISO-8601 at the column's precision, `"2024-01-01T10:00:00.123456789"` |
+| `TIMESTAMPTZ` | ISO-8601 UTC, `"2024-01-01T04:30:00Z"` |
+| `infinity` / `-infinity` dates and timestamps | `"infinity"` / `"-infinity"` |
+| `INTERVAL` | `{"months": …, "days": …, "nanos": …}` |
+| `LIST` / `ARRAY` | array |
+| `STRUCT` | object |
+| `MAP` | object when the keys are strings, else `[{"key": …, "value": …}]` |
+| `UNION` | the value of its active member |
+
+A query whose result has two columns with the same name (`SELECT * FROM a JOIN
+b`) is refused with an error naming the column — a JSON row holds one value per
+name, so one of them would be lost. Alias the columns.
 
 ## Conformance
 

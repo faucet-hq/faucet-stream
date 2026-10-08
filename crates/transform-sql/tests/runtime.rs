@@ -542,3 +542,78 @@ fn the_validation_placeholder_never_reaches_output() {
     let out = run("SELECT * FROM batch", vec![json!({"id": 1, "v": "a"})]);
     assert_eq!(out, vec![json!({"id": 1, "v": "a"})]);
 }
+
+fn compile_and_run(query: &str) -> Result<Vec<Value>, String> {
+    let t = SqlTransform::compile(&SqlTransformConfig {
+        query: query.into(),
+        relations: vec![],
+        memory_limit: None,
+        threads: None,
+    })
+    .map_err(|e| e.to_string())?;
+    let s = compile_stage(&t.into_page_stage()).map_err(|e| e.to_string())?;
+    apply_stages_to_page(vec![json!({"id": 1})], &[s]).map_err(|e| e.to_string())
+}
+
+#[test]
+fn queries_cannot_reach_the_host_or_change_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, "top secret").unwrap();
+    let path = secret.display().to_string();
+    let read = compile_and_run(&format!("SELECT content FROM read_text('{path}')"));
+    assert!(read.is_err(), "read_text must be refused: {read:?}");
+    let out = dir.path().join("out.csv");
+    let copy = compile_and_run(&format!(
+        "COPY (SELECT * FROM batch) TO '{}'",
+        out.display()
+    ));
+    assert!(copy.is_err(), "COPY TO must be refused: {copy:?}");
+    assert!(!out.exists());
+    let set = compile_and_run("SET memory_limit='100GB'");
+    assert!(set.is_err(), "SET must be refused: {set:?}");
+    let install = compile_and_run("INSTALL httpfs");
+    assert!(install.is_err(), "INSTALL must be refused: {install:?}");
+}
+
+#[test]
+fn absent_keys_stay_absent_and_explicit_nulls_stay_null() {
+    let out = run(
+        "SELECT * FROM batch",
+        vec![
+            json!({"id": 1, "email": "a@x"}),
+            json!({"id": 2}),
+            json!({"id": 3, "email": null}),
+        ],
+    );
+    assert_eq!(
+        out,
+        vec![
+            json!({"id": 1, "email": "a@x"}),
+            json!({"id": 2}),
+            json!({"id": 3, "email": null}),
+        ]
+    );
+    let out = run(
+        "SELECT * FROM batch WHERE id > 1",
+        vec![json!({"id": 1, "n": 1}), json!({"id": 2})],
+    );
+    assert_eq!(out, vec![json!({"id": 2})]);
+    let out = run(
+        "SELECT *, 'x' AS tag FROM batch",
+        vec![json!({"id": 1, "v": 1}), json!({"id": 2})],
+    );
+    assert_eq!(out[1], json!({"id": 2, "tag": "x"}));
+}
+
+#[test]
+fn mixed_number_and_string_field_coerces_to_string() {
+    let out = run(
+        "SELECT * FROM batch ORDER BY k",
+        vec![json!({"k": 1, "v": 1}), json!({"k": "2", "v": "x"})],
+    );
+    assert_eq!(
+        out,
+        vec![json!({"k": "1", "v": "1"}), json!({"k": "2", "v": "x"})]
+    );
+}

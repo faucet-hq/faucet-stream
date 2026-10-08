@@ -2135,6 +2135,12 @@ pub struct RunArgs {
     /// Stop after fetching from the source — write nothing to the sink.
     #[arg(long)]
     pub dry_run: bool,
+    /// Start even though another process holds a row's live run lease. Two
+    /// runs of one row start from the same bookmark and race it, so use this
+    /// only when that run is known to be gone (a lease also expires on its own
+    /// a minute after its run stops renewing it).
+    #[arg(long)]
+    pub force: bool,
     /// Stop after writing this many records to the sink. Default: unlimited.
     /// A `write_mode: overwrite` destination is left unchanged (the sample is
     /// discarded).

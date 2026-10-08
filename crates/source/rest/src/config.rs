@@ -173,6 +173,13 @@ pub struct RestStreamConfig {
     /// single object, which is emitted as one record).
     #[serde(default)]
     pub records_path: Option<String>,
+    /// Accept a response in which `records_path` resolves to nothing (the key
+    /// is absent) as an empty page. Off by default: a missing key usually means
+    /// an error body served with HTTP 200 or a renamed field, and treating it
+    /// as "no more records" ends the run green with rows unread. Enable it
+    /// only for APIs that omit the records key on an empty result.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_missing_records_path: bool,
     /// Optional cap on pages fetched per pass, across every pagination style.
     /// Unset by default: each pagination style already stops on its own end
     /// signal and loop guards. When the cap cuts a pass short, only a persisted
@@ -193,7 +200,8 @@ pub struct RestStreamConfig {
         default = "default_timeout"
     )]
     /// Per-request timeout in seconds. Covers one HTTP request, not the whole
-    /// run, so a paginated extract is bounded per page.
+    /// run, so a paginated extract is bounded per page. A streamed `async_job`
+    /// result download is bounded per connect and per idle read instead.
     #[schemars(with = "Option<u64>")]
     pub timeout: Option<Duration>,
     /// Number of retries (after the first attempt) for transient request
@@ -794,6 +802,7 @@ impl Default for RestStreamConfig {
             records_route: None,
             persist_cursor: false,
             discovery: None,
+            allow_missing_records_path: false,
         }
     }
 }
@@ -815,6 +824,7 @@ impl RestStreamConfig {
         // Static custom headers: reject an invalid header name/value at load
         // time rather than panicking on the first request (#539).
         build_header_map(&self.headers)?;
+        crate::decode::validate_steps(&self.decode)?;
         if let Some(key) = &self.replication_key {
             ReplicationKey::parse(key)
                 .map_err(|e| faucet_core::FaucetError::Config(format!("rest: {e}")))?;
@@ -1118,6 +1128,41 @@ impl RestStreamConfig {
             if self.window.is_some() {
                 return Err(faucet_core::FaucetError::Config(
                     "rest: `persist_cursor` and `window` slicing are mutually exclusive".into(),
+                ));
+            }
+        }
+        if self.persist_cursor && self.partitions.len() > 1 {
+            return Err(faucet_core::FaucetError::Config(
+                "rest: `persist_cursor` resumes one cursor, so it cannot be combined with \
+                 several `requests:` entries — each would be seeded with another entry's cursor"
+                    .into(),
+            ));
+        }
+        if self.async_job.is_some() && !self.partitions.is_empty() {
+            return Err(faucet_core::FaucetError::Config(
+                "rest: `async_job` and `requests:` are mutually exclusive — the job templates \
+                 take no request context, so every entry would submit the same job"
+                    .into(),
+            ));
+        }
+        if let PaginationStyle::Offset {
+            rows_path: None, ..
+        } = &self.pagination
+        {
+            let fans_out = self
+                .record_ancestors
+                .as_ref()
+                .is_some_and(|a| !a.is_empty())
+                || self
+                    .records_path
+                    .as_deref()
+                    .is_some_and(|p| p.matches("[*]").count() + p.matches("..").count() > 1);
+            if fans_out {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `pagination: Offset` advances by the record count, but this \
+                     `records_path`/`record_ancestors` yields nested child records rather than \
+                     server rows — set `pagination.rows_path` to the server's row array"
+                        .into(),
                 ));
             }
         }
@@ -1907,5 +1952,76 @@ mod tests {
         assert!(c.validate().is_ok());
         c.records_path = Some("$.x".into());
         assert!(c.validate().unwrap_err().to_string().contains("jsonl"));
+    }
+
+    #[test]
+    fn validate_rejects_partition_unsafe_combinations() {
+        let base = || -> RestStreamConfig {
+            serde_json::from_value(serde_json::json!({
+                "base_url": "https://api.example.com",
+                "path": "/x/{id}",
+                "auth": {"type": "none"},
+            }))
+            .unwrap()
+        };
+        let two = vec![
+            HashMap::from([("id".to_string(), serde_json::json!(1))]),
+            HashMap::from([("id".to_string(), serde_json::json!(2))]),
+        ];
+        // API-35: one persisted cursor seeded every request entry.
+        let mut c = base();
+        c.persist_cursor = true;
+        c.pagination = PaginationStyle::Cursor {
+            next_token_path: "$.next".into(),
+            param_name: "cursor".into(),
+        };
+        c.partitions = two.clone();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("several `requests:`"), "{err}");
+        c.partitions.truncate(1);
+        assert!(c.validate().is_ok());
+        // API-54: every entry submitted the same async job.
+        let mut c = base();
+        c.async_job = Some(
+            serde_json::from_value(serde_json::json!({
+                "submit": { "url": "/jobs" },
+                "job_id": "$.id",
+                "poll": { "url": "/jobs/${job_id}" },
+                "status": { "path": "$.state", "success": ["Done"] },
+                "fetch": { "url": "/jobs/${job_id}/result" }
+            }))
+            .unwrap(),
+        );
+        c.partitions = two;
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("`async_job` and `requests:`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_requires_rows_path_for_fanned_out_offset_paging() {
+        // API-36: the offset advanced by child records, not server rows.
+        let offset = |rows_path: Option<&str>| PaginationStyle::Offset {
+            offset_param: "offset".into(),
+            limit_param: "limit".into(),
+            limit: 100,
+            total_path: None,
+            rows_path: rows_path.map(str::to_string),
+        };
+        let mut c = RestStreamConfig::new("https://api.example.com", "/orders")
+            .records_path("$.orders[*].lines[*]")
+            .pagination(offset(None));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("rows_path"), "{err}");
+        c.pagination = offset(Some("$.orders"));
+        assert!(c.validate().is_ok());
+        let mut c = RestStreamConfig::new("https://api.example.com", "/orders")
+            .records_path("$.data[*].object")
+            .pagination(offset(None));
+        assert!(c.validate().is_ok());
+        c.record_ancestors = Some(HashMap::from([("e".to_string(), "id".to_string())]));
+        assert!(c.validate().is_err());
     }
 }

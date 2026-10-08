@@ -30,6 +30,7 @@ fn base_config(url: &str) -> WebsocketSourceConfig {
         max_reconnect_attempts: None,
         max_message_bytes: None,
         batch_size: 1000,
+        connect_timeout: Duration::from_secs(30),
     }
 }
 
@@ -560,4 +561,93 @@ async fn a_rejected_handshake_refreshes_the_shared_token() {
         .with_auth_provider(Arc::new(RevokedThenRefreshed::default()));
     let records = src.fetch_all().await.unwrap();
     assert_eq!(records.len(), 1);
+}
+
+/// A server that completes the upgrade, then closes with `code`.
+async fn spawn_accept_then_close(
+    code: u16,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            seen.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                let _ = ws
+                    .close(Some(CloseFrame {
+                        code: code.into(),
+                        reason: "nope".into(),
+                    }))
+                    .await;
+            }
+        }
+    });
+    (format!("ws://{addr}/feed"), accepted)
+}
+
+/// API-33: a server that accepts the handshake and then closes used to reset
+/// the attempt counter every time, so the cap never tripped.
+#[tokio::test]
+async fn accept_then_close_loops_hit_the_reconnect_cap() {
+    let (url, accepted) = spawn_accept_then_close(1011).await;
+    let mut cfg = base_config(&url);
+    cfg.reconnect = true;
+    cfg.reconnect_backoff = Duration::from_millis(5);
+    cfg.max_reconnect_attempts = Some(2);
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    let source = WebsocketSource::new(cfg).unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(20), source.fetch_all())
+        .await
+        .expect("must not loop forever")
+        .unwrap_err();
+    assert!(err.to_string().contains("max_reconnect_attempts"), "{err}");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+/// API-33: a policy / application close rejects the session; reconnecting
+/// cannot fix it.
+#[tokio::test]
+async fn a_rejecting_close_code_is_fatal() {
+    let (url, accepted) = spawn_accept_then_close(4001).await;
+    let mut cfg = base_config(&url);
+    cfg.reconnect = true;
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    let err = WebsocketSource::new(cfg)
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("4001"), "{err}");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// API-34 / API-53: a peer that accepts TCP and never answers the upgrade
+/// times out, and the error never carries the URL's query token.
+#[tokio::test]
+async fn a_stalled_upgrade_times_out_without_leaking_the_url_query() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+    let mut cfg = base_config(&format!("ws://{addr}/feed?token=s3cret"));
+    cfg.connect_timeout = Duration::from_millis(300);
+    cfg.max_messages = Some(1);
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        WebsocketSource::new(cfg).unwrap().fetch_all(),
+    )
+    .await
+    .expect("connect must time out")
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("timed out"), "{msg}");
+    assert!(!msg.contains("s3cret"), "{msg}");
 }

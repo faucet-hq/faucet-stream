@@ -178,6 +178,7 @@ async fn test_offset_pagination_terminates_when_server_ignores_offset() {
                 limit_param: "limit".into(),
                 limit: 2,
                 total_path: None,
+                rows_path: None,
             }),
     )
     .unwrap();
@@ -222,13 +223,21 @@ async fn test_offset_pagination_paginates_to_completion_when_pages_differ() {
         .mount(&server)
         .await;
 
-    // Short final page → stops via the record-count heuristic.
+    // A short page (the server capping `limit`) does not end paging (API-15);
+    // the empty page after it does.
     Mock::given(method("GET"))
         .and(path("/api/items"))
         .and(query_param("offset", "4"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "items": [{"id": 5}]
         })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .and(query_param("offset", "5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -240,6 +249,7 @@ async fn test_offset_pagination_paginates_to_completion_when_pages_differ() {
                 limit_param: "limit".into(),
                 limit: 2,
                 total_path: None,
+                rows_path: None,
             }),
     )
     .unwrap();
@@ -625,9 +635,12 @@ async fn test_incremental_replication_filters_old_records() {
     .unwrap();
 
     let records = stream.fetch_all().await.unwrap();
-    // Records at or before "2024-06-01" are filtered out; only id=3 remains.
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["id"], 3);
+    // Records before "2024-06-01" are filtered out. The record AT the bookmark
+    // is kept: a row written in the bookmark's instant after the previous run
+    // read it would otherwise be lost (API-19).
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["id"], 2);
+    assert_eq!(records[1]["id"], 3);
 }
 
 #[tokio::test]
@@ -840,6 +853,67 @@ async fn test_429_retries_after_header_delay() {
     .unwrap();
 
     let records = stream.fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+}
+
+#[tokio::test]
+async fn test_429_with_a_day_long_retry_after_fails_instead_of_sleeping() {
+    // API-18: a `Retry-After: 86400` used to park the run for a day.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .respond_with(ResponseTemplate::new(429).append_header("retry-after", "86400"))
+        .mount(&server)
+        .await;
+    let stream = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/api/items").records_path("$.items[*]"),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(30), stream.fetch_all())
+        .await
+        .expect("must not sleep")
+        .unwrap_err();
+    assert!(err.to_string().contains("86400s"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn a_200_error_body_mid_pagination_fails_instead_of_ending_green() {
+    // API-23: a missing records key read as "empty page" and ended the run.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"error": "busy"})))
+        .mount(&server)
+        .await;
+    let config = || {
+        RestStreamConfig::new(&server.uri(), "/api/items")
+            .records_path("$.items[*]")
+            .pagination(PaginationStyle::PageNumber {
+                param_name: "page".into(),
+                start_page: 1,
+                page_size: None,
+                page_size_param: None,
+            })
+    };
+    let err = RestStream::new(config())
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("matched nothing"), "{err}");
+    assert!(err.to_string().contains("busy"), "{err}");
+    let mut lenient = config();
+    lenient.allow_missing_records_path = true;
+    let records = RestStream::new(lenient).unwrap().fetch_all().await.unwrap();
     assert_eq!(records.len(), 1);
 }
 

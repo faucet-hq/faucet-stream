@@ -417,3 +417,33 @@ async fn enumerate_shards_caps_at_partition_count() {
     let two = source.enumerate_shards(2).await.unwrap();
     assert_eq!(two.len(), 2, "a target below the partition count is kept");
 }
+
+/// A fresh group's first member seeds its starting positions into the group
+/// at assignment, so a member that takes a partition over before any durable
+/// commit resumes there instead of at `auto.offset.reset: latest` — which
+/// would skip everything produced in between (#789 MSG-72).
+#[tokio::test(flavor = "multi_thread")]
+async fn first_member_seeds_group_offsets_for_a_later_member() {
+    let (_container, brokers) = start_kafka().await;
+    let topic = "cluster-seed";
+    let group = "g-cluster-seed";
+    let partitions = 2i32;
+    create_topic(&brokers, topic, partitions).await;
+    produce_across_partitions(&brokers, topic, partitions, 3).await;
+
+    let mut cfg = member_config(&brokers, topic, group, Duration::from_secs(8), 0);
+    cfg.auto_offset_reset = OffsetReset::Latest;
+    let m0 = KafkaSource::new(cfg.clone()).await.unwrap();
+    m0.apply_shard(&member_shard(2, 0)).await.unwrap();
+    assert!(drain(&m0).await.is_empty(), "latest starts at the end");
+    drop(m0);
+
+    produce_across_partitions(&brokers, topic, partitions, 2).await;
+    let m1 = KafkaSource::new(cfg).await.unwrap();
+    m1.apply_shard(&member_shard(2, 1)).await.unwrap();
+    let got = identities(&drain(&m1).await);
+    let expected: HashSet<(i64, i64)> = (0..partitions as i64)
+        .flat_map(|p| (3..5i64).map(move |o| (p, o)))
+        .collect();
+    assert_eq!(got.iter().copied().collect::<HashSet<_>>(), expected);
+}

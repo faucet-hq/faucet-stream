@@ -6,10 +6,10 @@
 //! the tiberius pool. Only enabled with the `staging` feature.
 //!
 //! **Azure only.** `COPY INTO` reads Azure Blob / ADLS Gen2 (not S3/GCS), so a
-//! MSSQL staging `location` must be `az://…`. **Column order matters:** `COPY
-//! INTO` maps CSV columns by *position*, so the staged CSV column order must
-//! match the target table's column order — align the table or stage a column
-//! subset accordingly.
+//! MSSQL staging `location` must be `az://…`. `COPY INTO` maps CSV fields by
+//! *position*, so the statement names the target columns in the staged CSV's
+//! own header order (the union of the page's keys); a key with no column
+//! fails the load rather than landing in the wrong column.
 
 use faucet_core::FaucetError;
 use faucet_core::staging::{StageUploader, StagedFile, StagingFormat, StagingScheme};
@@ -44,6 +44,7 @@ pub(crate) async fn build_staged_copy_sql(
     // The staged CSV carries a header row → skip it with FIRSTROW = 2.
     let sql = mssql_copy_into_sql(
         table_quoted,
+        &csv_columns(records),
         &url,
         staging.spec.format,
         staging.sas_token.as_deref(),
@@ -100,6 +101,22 @@ pub fn staged_azure_url(
     ))
 }
 
+/// The staged CSV's header: the union of the records' top-level keys in
+/// first-seen order — the order `faucet_core::staging` writes them.
+pub(crate) fn csv_columns(records: &[Value]) -> Vec<String> {
+    let mut columns: Vec<String> = Vec::new();
+    for key in records
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|m| m.keys())
+    {
+        if !columns.contains(key) {
+            columns.push(key.clone());
+        }
+    }
+    columns
+}
+
 /// Build the `COPY INTO <table> FROM '<url>' WITH (…)` statement for one staged
 /// object. `table` must already be identifier-quoted by the caller. `first_row`
 /// is the 1-based first data row (2 when the CSV carries a header). A SAS token,
@@ -108,6 +125,7 @@ pub fn staged_azure_url(
 /// single-quote-escaped.
 pub fn mssql_copy_into_sql(
     quoted_table: &str,
+    columns: &[String],
     url: &str,
     format: StagingFormat,
     sas_token: Option<&str>,
@@ -124,8 +142,17 @@ pub fn mssql_copy_into_sql(
             sql_quote(sas)
         ));
     }
+    let column_list = if columns.is_empty() {
+        String::new()
+    } else {
+        let quoted = columns
+            .iter()
+            .map(|c| faucet_common_mssql::quote_ident_mssql(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        format!(" ({})", quoted.join(", "))
+    };
     Ok(format!(
-        "COPY INTO {quoted_table} FROM '{}' WITH (\n    {}\n)",
+        "COPY INTO {quoted_table}{column_list} FROM '{}' WITH (\n    {}\n)",
         sql_quote(url),
         opts.join(",\n    ")
     ))
@@ -212,6 +239,7 @@ mod tests {
     fn copy_into_with_sas() {
         let sql = mssql_copy_into_sql(
             "[dbo].[events]",
+            &[],
             "https://acct.blob.core.windows.net/c/part-00001.csv",
             StagingFormat::Csv,
             Some("sv=2022&sig=ab'c"),
@@ -229,6 +257,7 @@ mod tests {
     fn copy_into_without_credential() {
         let sql = mssql_copy_into_sql(
             "[t]",
+            &["b".to_string(), "a".to_string()],
             "https://a.blob.core.windows.net/c/k.csv",
             StagingFormat::Csv,
             None,
@@ -236,12 +265,13 @@ mod tests {
         )
         .unwrap();
         assert!(!sql.contains("CREDENTIAL"));
+        assert!(sql.starts_with("COPY INTO [t] ([b], [a]) FROM"), "{sql}");
         assert!(sql.contains("FILE_TYPE = 'CSV'"));
     }
 
     #[test]
     fn copy_into_rejects_non_csv() {
-        assert!(mssql_copy_into_sql("[t]", "u", StagingFormat::Jsonl, None, 2).is_err());
+        assert!(mssql_copy_into_sql("[t]", &[], "u", StagingFormat::Jsonl, None, 2).is_err());
     }
 
     // Covers the staged upload + Azure URL + COPY INTO build against an
@@ -262,7 +292,16 @@ mod tests {
                 "sas_token": "sv=2022&sig=abc",
             }))
             .unwrap();
-        let recs = vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})];
+        let recs = vec![
+            serde_json::json!({"id": 1}),
+            serde_json::json!({"id": 2, "name": "x"}),
+            serde_json::json!(3),
+        ];
+        assert_eq!(
+            csv_columns(&recs),
+            vec!["id".to_string(), "name".to_string()]
+        );
+        let recs = &recs[..2];
 
         let (staged, sql) = build_staged_copy_sql(
             &uploader,
@@ -270,7 +309,7 @@ mod tests {
             "dbo.events",
             "run-1",
             0,
-            &recs,
+            recs,
             &staging,
         )
         .await
@@ -278,7 +317,7 @@ mod tests {
 
         assert_eq!(staged.rows, 2);
         assert!(sql.starts_with(
-            "COPY INTO [dbo].[events] FROM 'https://acct.blob.core.windows.net/container/"
+            "COPY INTO [dbo].[events] ([id], [name]) FROM 'https://acct.blob.core.windows.net/container/"
         ));
         assert!(sql.contains("FILE_TYPE = 'CSV'"));
         assert!(sql.contains("FIRSTROW = 2"));

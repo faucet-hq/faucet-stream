@@ -16,6 +16,9 @@ use gcloud_pubsub::publisher::{Publisher, PublisherConfig};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// How long one message may wait for its publish confirmation.
+const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Google Cloud Pub/Sub sink. See the crate README for semantics.
 pub struct PubsubSink {
     config: PubsubSinkConfig,
@@ -48,6 +51,49 @@ pub(crate) fn encode_records(
     (prepared, failures)
 }
 
+/// The SDK publisher sized from the config: `batch_size` messages per
+/// `Publish` RPC and `concurrency` publishing workers. The SDK defaults (3 and
+/// 3) turned a 1000-record page into ~334 RPCs whatever the config said
+/// (#789 MSG-66).
+pub(crate) fn publisher_config(config: &PubsubSinkConfig) -> PublisherConfig {
+    PublisherConfig {
+        bundle_size: config.batch_size.max(1),
+        workers: config.concurrency.max(1),
+        ..PublisherConfig::default()
+    }
+}
+
+/// Fail every row published after a failed row with the same ordering key.
+/// Pub/Sub delivers same-key messages in publish order, and the SDK cannot
+/// pause a key after a failure, so the later rows of that key reached the
+/// topic *ahead of* the failed one; reporting them failed sends them to the
+/// DLQ / retry together, keeping the key's order recoverable (#789 MSG-36).
+pub(crate) fn fail_after_key_failure(
+    keys: &BTreeMap<usize, String>,
+    outcomes: &mut BTreeMap<usize, Result<(), FaucetError>>,
+) {
+    let mut first_failure: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, result) in outcomes.iter() {
+        if result.is_err()
+            && let Some(key) = keys.get(index)
+        {
+            first_failure.entry(key.as_str()).or_insert(*index);
+        }
+    }
+    for (index, result) in outcomes.iter_mut() {
+        if let Some(key) = keys.get(index)
+            && let Some(&failed) = first_failure.get(key.as_str())
+            && *index > failed
+            && result.is_ok()
+        {
+            *result = Err(FaucetError::Sink(format!(
+                "pubsub: published after an earlier message with ordering key '{key}' failed; \
+                 re-send it with that message to keep the key's order"
+            )));
+        }
+    }
+}
+
 /// Merge encode failures + publish outcomes into input-ordered per-row
 /// results. Pure.
 pub(crate) fn assemble_row_outcomes(
@@ -77,7 +123,7 @@ impl PubsubSink {
         let client = faucet_common_pubsub::build_client(&config.connection).await?;
         let publisher = client
             .topic(&config.topic)
-            .new_publisher(Some(PublisherConfig::default()));
+            .new_publisher(Some(publisher_config(&config)));
         Ok(Self {
             config,
             client,
@@ -94,7 +140,11 @@ impl PubsubSink {
         use futures::StreamExt;
         // Enqueue every message; the publisher bundles them internally.
         let mut awaiters = Vec::with_capacity(chunk.len());
+        let mut keys: BTreeMap<usize, String> = BTreeMap::new();
         for (index, p) in chunk {
+            if !p.ordering_key.is_empty() {
+                keys.insert(index, p.ordering_key.clone());
+            }
             let msg = PubsubMessage {
                 data: p.data,
                 attributes: p.attributes,
@@ -107,17 +157,23 @@ impl PubsubSink {
         let mut outcomes = BTreeMap::new();
         let mut stream =
             futures::stream::iter(awaiters.into_iter().map(|(index, awaiter)| async move {
-                let result = awaiter
-                    .get()
-                    .await
-                    .map(|_message_id| ())
-                    .map_err(|e| FaucetError::Sink(format!("pubsub: publish failed: {e}")));
+                // Bounded: a dropped connection must fail the row, not hang
+                // the run (#789 MSG-60).
+                let result = match tokio::time::timeout(PUBLISH_TIMEOUT, awaiter.get()).await {
+                    Ok(r) => r
+                        .map(|_message_id| ())
+                        .map_err(|e| FaucetError::Sink(format!("pubsub: publish failed: {e}"))),
+                    Err(_) => Err(FaucetError::Sink(format!(
+                        "pubsub: publish not confirmed within {PUBLISH_TIMEOUT:?}"
+                    ))),
+                };
                 (index, result)
             }))
             .buffer_unordered(self.config.concurrency);
         while let Some((index, result)) = stream.next().await {
             outcomes.insert(index, result);
         }
+        fail_after_key_failure(&keys, &mut outcomes);
         outcomes
     }
 
@@ -238,6 +294,37 @@ mod tests {
     use super::*;
     use crate::config::{OrderingKey, ValueFormat};
     use serde_json::json;
+
+    #[test]
+    fn publisher_is_sized_from_batch_size_and_concurrency() {
+        let mut cfg = PubsubSinkConfig::new("t");
+        cfg.batch_size = 500;
+        cfg.concurrency = 8;
+        let p = publisher_config(&cfg);
+        assert_eq!((p.bundle_size, p.workers), (500, 8));
+    }
+
+    #[test]
+    fn a_key_failure_fails_the_later_rows_of_that_key_only() {
+        let keys: BTreeMap<usize, String> = [(0, "a"), (1, "a"), (2, "b"), (3, "a"), (4, "b")]
+            .into_iter()
+            .map(|(i, k)| (i, k.to_string()))
+            .collect();
+        let mut outcomes: BTreeMap<usize, Result<(), FaucetError>> =
+            (0..6).map(|i| (i, Ok(()))).collect();
+        outcomes.insert(1, Err(FaucetError::Sink("rejected".into())));
+        fail_after_key_failure(&keys, &mut outcomes);
+        assert!(outcomes[&0].is_ok(), "earlier same-key row is unaffected");
+        assert!(outcomes[&1].is_err());
+        assert!(
+            outcomes[&3]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("'a'")
+        );
+        assert!(outcomes[&2].is_ok() && outcomes[&4].is_ok() && outcomes[&5].is_ok());
+    }
 
     #[test]
     fn encode_records_partitions_failures_by_index() {

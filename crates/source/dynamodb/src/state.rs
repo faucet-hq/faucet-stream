@@ -10,6 +10,9 @@
 //! Every page carries the cumulative map. An empty sequence string marks a
 //! shard that was opened but yielded nothing yet (resumes from its trim
 //! horizon, never skipping). `finished` lists closed shards fully drained.
+//! `verified_at` holds, for each such empty shard, the unix time it was last
+//! known to hold nothing unread (opened, or read to its end at the trim
+//! horizon), so a resume after the 24 h retention is reported as a gap.
 
 use crate::config::ReadMode;
 use serde::{Deserialize, Serialize};
@@ -80,6 +83,17 @@ pub struct StreamBookmark {
     /// Closed shards fully drained.
     #[serde(default)]
     pub finished: BTreeSet<String>,
+    /// Empty-position shard → unix seconds it was last known to hold nothing unread.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub verified_at: BTreeMap<String, i64>,
+}
+
+/// Seconds since the unix epoch.
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl StreamBookmark {
@@ -100,17 +114,34 @@ impl StreamBookmark {
 
     /// Record that a shard was opened (keeps an existing position).
     pub fn open(&mut self, shard: &str) {
-        self.shards.entry(shard.to_string()).or_default();
+        self.open_at(shard, unix_now());
+    }
+
+    /// [`open`](Self::open) at an explicit time.
+    pub fn open_at(&mut self, shard: &str, now: i64) {
+        let seq = self.shards.entry(shard.to_string()).or_default();
+        if seq.is_empty() {
+            self.verified_at.entry(shard.to_string()).or_insert(now);
+        }
+    }
+
+    /// An empty-position shard was read to its end: nothing retained is unread.
+    pub fn verify_empty(&mut self, shard: &str, now: i64) {
+        if self.shards.get(shard).is_some_and(String::is_empty) {
+            self.verified_at.insert(shard.to_string(), now);
+        }
     }
 
     /// Record a shard's newest emitted sequence.
     pub fn advance(&mut self, shard: &str, sequence: &str) {
         self.shards.insert(shard.to_string(), sequence.to_string());
+        self.verified_at.remove(shard);
     }
 
     /// Record a closed shard as fully drained.
     pub fn finish(&mut self, shard: &str) {
         self.shards.remove(shard);
+        self.verified_at.remove(shard);
         self.finished.insert(shard.to_string());
     }
 
@@ -184,6 +215,36 @@ mod tests {
         assert_eq!(
             StreamBookmark::from_value(&json!(3)),
             StreamBookmark::default()
+        );
+    }
+
+    #[test]
+    fn empty_shards_carry_their_verification_time() {
+        let mut b = StreamBookmark::default();
+        b.open_at("s1", 100);
+        b.open_at("s1", 200);
+        assert_eq!(b.verified_at["s1"], 100, "re-opening keeps the first time");
+        b.verify_empty("s1", 300);
+        assert_eq!(b.verified_at["s1"], 300);
+        b.verify_empty("unknown", 300);
+        assert!(!b.verified_at.contains_key("unknown"));
+        let v = b.to_value();
+        assert_eq!(v["verified_at"]["s1"], 300);
+        assert_eq!(StreamBookmark::from_value(&v), b);
+        b.advance("s1", "7");
+        assert!(b.verified_at.is_empty());
+        b.open_at("s1", 400);
+        assert!(b.verified_at.is_empty(), "a positioned shard needs no time");
+        b.verify_empty("s1", 500);
+        assert!(b.verified_at.is_empty());
+        b.open_at("s2", 1);
+        b.finish("s2");
+        assert!(b.verified_at.is_empty());
+        assert!(
+            StreamBookmark::default()
+                .to_value()
+                .get("verified_at")
+                .is_none()
         );
     }
 

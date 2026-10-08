@@ -58,6 +58,35 @@ async fn pull_messages(
         .map_err(|e| FaucetError::Source(format!("pubsub: pull failed: {e}")))
 }
 
+/// Return messages to the subscription for immediate redelivery (a pull
+/// response the run will not process). Best-effort. Thin SDK shim.
+async fn nack_messages(messages: Vec<ReceivedMessage>) {
+    use futures::StreamExt;
+    futures::stream::iter(messages)
+        .map(|m| async move {
+            if let Err(e) = m.nack().await {
+                tracing::warn!(error = %e, "pubsub: nack failed; the message redelivers after its ack deadline");
+            }
+        })
+        .buffer_unordered(RENEW_CONCURRENCY)
+        .collect::<Vec<()>>()
+        .await;
+}
+
+/// How many messages one pull asks for: never more than the run still needs,
+/// so `max_messages` does not strand a pulled tail that is neither acked nor
+/// nacked (#789 MSG-46). Pure.
+pub(crate) fn pull_size(per_pull: usize, max_messages: Option<usize>, total: usize) -> usize {
+    match max_messages {
+        Some(max) => per_pull.min(max.saturating_sub(total)).max(1),
+        None => per_pull,
+    }
+}
+
+/// How long an idle-terminated run waits for a pull response already in
+/// flight before cancelling it.
+const LATE_PULL_GRACE: Duration = Duration::from_secs(2);
+
 /// Ack ids per `Acknowledge` RPC — well under the request-size limit.
 const ACK_BATCH: usize = 500;
 /// Concurrent `ModifyAckDeadline` calls while renewing held messages.
@@ -175,21 +204,38 @@ impl faucet_core::Source for PubsubSource {
                     hold(&page_msgs, &pending);
                 }
 
-                let pull = pull_messages(&subscription, per_pull);
-                let messages = match idle {
-                    Some(window) => match tokio::time::timeout(window, pull).await {
-                        Ok(res) => res?,
+                let want = pull_size(per_pull, max_messages, total);
+                // The pull runs as its own task so an idle timeout does not
+                // drop a response the server already leased: the late
+                // messages are nacked for prompt redelivery instead of
+                // waiting out their ack deadline (#789 MSG-82). Every RPC is
+                // bounded by the client's deadline (#789 MSG-60).
+                let pull_sub = self.subscription();
+                let mut pull = tokio::spawn(async move { pull_messages(&pull_sub, want).await });
+                let joined = match idle {
+                    Some(window) => match tokio::time::timeout(window, &mut pull).await {
+                        Ok(joined) => joined,
                         Err(_) => {
                             tracing::info!(
                                 subscription = %self.config.subscription,
                                 idle_secs = window.as_secs(),
                                 "pubsub: idle termination reached"
                             );
+                            // A response already on its way is nacked; a pull
+                            // still parked server-side is cancelled, which
+                            // leases nothing.
+                            match tokio::time::timeout(LATE_PULL_GRACE, &mut pull).await {
+                                Ok(Ok(Ok(late))) if !late.is_empty() => nack_messages(late).await,
+                                Ok(_) => {}
+                                Err(_) => pull.abort(),
+                            }
                             break 'consume;
                         }
                     },
-                    None => pull.await?,
+                    None => pull.await,
                 };
+                let messages = joined
+                    .map_err(|e| FaucetError::Source(format!("pubsub: pull task failed: {e}")))??;
 
                 if messages.is_empty() {
                     if let Some(window) = idle
@@ -214,7 +260,8 @@ impl faucet_core::Source for PubsubSource {
                     hold(&pulled, &pending);
                 }
 
-                for m in messages {
+                let mut messages = messages.into_iter();
+                while let Some(m) = messages.next() {
                     let record = record_with_policy(
                         &MessageParts {
                             data: &m.message.data,
@@ -251,6 +298,11 @@ impl faucet_core::Source for PubsubSource {
                             max,
                             "pubsub: max_messages reached"
                         );
+                        // Defensive: a server returning more than requested.
+                        let rest: Vec<ReceivedMessage> = messages.collect();
+                        if !rest.is_empty() {
+                            nack_messages(rest).await;
+                        }
                         break 'consume;
                     }
                 }
@@ -351,6 +403,14 @@ mod tests {
     // Constructing a live client needs the emulator or real GCP, so the
     // network-bound trait methods are exercised by `tests/integration.rs`
     // (emulator-gated). Here we cover the offline, pure-ish surface.
+
+    #[test]
+    fn pulls_never_exceed_what_the_run_still_needs() {
+        assert_eq!(pull_size(1000, None, 50), 1000);
+        assert_eq!(pull_size(1000, Some(30), 25), 5);
+        assert_eq!(pull_size(10, Some(30), 0), 10);
+        assert_eq!(pull_size(10, Some(30), 30), 1);
+    }
 
     #[test]
     fn state_key_and_dataset_uri_helpers() {

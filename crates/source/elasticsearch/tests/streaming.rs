@@ -215,46 +215,23 @@ async fn stream_pages_partial_final_page() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stream_pages_batch_size_zero_uses_single_search_no_scroll() {
-    // batch_size = 0 must skip scroll entirely. We mount the search handler
-    // with a one-shot 10_000-doc response and assert that:
-    //   1. The scroll endpoint is *never* called.
-    //   2. Exactly one page is emitted.
+async fn stream_pages_batch_size_zero_drains_the_scroll_into_one_page() {
+    // batch_size = 0 drains every scroll page into ONE emitted page. It used
+    // to issue a single capped `_search` (size 10 000) and silently drop every
+    // hit beyond it (#789 MSG-90), which the old version of this test pinned.
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/test/_search"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "hits": {
-                "total": {"value": 1234, "relation": "eq"},
-                "hits": make_docs(0, 1234)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, doc)| json!({
-                        "_index": "test",
-                        "_id": format!("{i}"),
-                        "_source": doc,
-                    }))
-                    .collect::<Vec<_>>(),
-            }
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // Set scroll endpoints to fail loudly if they ARE called — the
-    // batch_size = 0 path must not touch them.
-    Mock::given(method("POST"))
-        .and(path("/_search/scroll"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/_search/scroll"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&server)
-        .await;
+    mount_paged_responder(
+        &server,
+        PagedResponder::new(vec![
+            ScrollPage {
+                docs: make_docs(0, 1234),
+            },
+            ScrollPage {
+                docs: make_docs(1234, 766),
+            },
+        ]),
+    )
+    .await;
 
     let config = ElasticsearchSourceConfig::new(server.uri(), "test").with_batch_size(0);
     let source = ElasticsearchSource::new(config).unwrap();
@@ -268,12 +245,9 @@ async fn stream_pages_batch_size_zero_uses_single_search_no_scroll() {
     }
     assert_eq!(
         collected,
-        vec![1234],
+        vec![2000],
         "batch_size = 0 must emit exactly one page covering all docs"
     );
-
-    // wiremock asserts the expect(1)/expect(0) counts on Drop.
-    drop(server);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -458,4 +432,42 @@ async fn stream_pages_respects_max_pages_cap() {
         count += 1;
     }
     assert_eq!(count, 3, "max_pages=3 caps emitted pages at 3");
+}
+
+/// A parent value substituted into the index is percent-encoded, so it stays
+/// one path segment (#789 MSG-94).
+#[tokio::test(flavor = "multi_thread")]
+async fn substituted_index_values_are_path_encoded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs-a%2Fb%3Fx/_search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {"hits": [{"_source": {"ok": true}}]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let source =
+        ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "logs-{p.t}"))
+            .unwrap();
+    let ctx: HashMap<String, Value> = [("p.t".to_string(), json!("a/b?x"))].into();
+    let records = source.fetch_with_context(&ctx).await.unwrap();
+    assert_eq!(records, vec![json!({"ok": true})]);
+}
+
+/// A hung cluster fails the request after `request_timeout_secs` (MSG-58).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hung_search_times_out() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/test/_search"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let mut config = ElasticsearchSourceConfig::new(server.uri(), "test");
+    config.request_timeout_secs = 1;
+    let source = ElasticsearchSource::new(config).unwrap();
+    let started = std::time::Instant::now();
+    assert!(source.fetch_all().await.is_err());
+    assert!(started.elapsed() < Duration::from_secs(10));
 }

@@ -21,6 +21,7 @@ tracing.workspace = true
 reqwest.workspace = true
 async-stream = { workspace = true }
 futures.workspace = true
+urlencoding.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]

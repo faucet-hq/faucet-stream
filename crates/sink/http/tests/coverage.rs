@@ -340,3 +340,27 @@ async fn config_schema_describes_the_config_struct() {
         "schema documents `max_retries`"
     );
 }
+
+/// API-51: a 429 with `Retry-After` used to be retried on the 250 ms backoff.
+#[tokio::test]
+async fn a_429_retry_after_is_honoured() {
+    use faucet_core::Sink;
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let mut cfg = faucet_sink_http::HttpSinkConfig::new(format!("{}/in", server.uri()));
+    cfg.max_retries = 2;
+    let sink = faucet_sink_http::HttpSink::new(cfg);
+    let started = std::time::Instant::now();
+    sink.write_batch(&[serde_json::json!({"a": 1})])
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+}

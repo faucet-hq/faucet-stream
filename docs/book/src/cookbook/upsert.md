@@ -332,9 +332,9 @@ types you add after the first run survive every refresh. With
 
 | Sink | Atomic swap |
 |---|---|
-| `postgres` | one transaction: `TRUNCATE` + `INSERT … SELECT` from a `LIKE` staging clone + `DROP` |
+| `postgres` | one transaction: `TRUNCATE` + `INSERT … SELECT` from a `LIKE` staging clone + `DROP`. Generated columns are recomputed, identity columns keep the staged values (`OVERRIDING SYSTEM VALUE`), and a target other tables reference by foreign key is emptied with `DELETE` under deferred constraints (a cascading reference is refused up front) |
 | `sqlite` | one transaction: `DELETE` + `INSERT … SELECT` from a `SELECT … WHERE 0` clone + `DROP` |
-| `mysql` | `CREATE TABLE staging LIKE target`, then an atomic `RENAME TABLE` swap (MySQL auto-commits DDL, so a transaction can't span it) |
+| `mysql` | `CREATE TABLE staging LIKE target`, then an atomic `RENAME TABLE` swap (MySQL auto-commits DDL, so a transaction can't span it). A target with foreign keys or triggers is instead refilled in place — `DELETE` + `INSERT … SELECT` in one transaction — so they survive (its triggers fire for those rows); a target **other** tables reference by foreign key is refused before the run |
 | `mssql` | one transaction: `DELETE` + `INSERT` (explicit non-IDENTITY column list) from a `SELECT … INTO … WHERE 1=0` clone + `DROP` |
 | `mongodb` | load a `{collection}__faucet_ovw` staging collection created with the target's options and secondary indexes, then atomic `renameCollection(dropTarget: true)` (needs the rename privilege; unsupported on sharded collections) |
 | `bigquery` | **bucket-free** — load a `LIKE` temp table via the query API, then `BEGIN TRANSACTION; TRUNCATE; INSERT … SELECT; COMMIT` (preserves the target's partitioning/clustering); no GCS staging bucket required |
@@ -356,6 +356,7 @@ creates the alias); a concrete index of that name is rejected at `begin`.
 - `schema.on_drift: evolve` — the staging target is a pre-run clone, so evolving the live target mid-run would leave the staged data a column short at swap time.
 - Scoped cleanup (`complete_for`) — cleanup requires `write_mode: upsert`; a full overwrite already removes source-deleted rows wholesale.
 - `shard:` — each shard would swap in only its own slice, replacing the rest of the table.
+- A source that acknowledges messages as it reads them (`rabbitmq`, `pubsub`, `sqs`, `nats` with `jetstream_stream`) — each page is acked once it lands in staging, and a failed or cancelled run discards staging, so those messages would be gone.
 - A post-run `verify:` check (`after_run`, the default) — the swap happens after the run, so the check would read the replaced table. Set `after_run: false` and run `faucet verify` afterwards.
 
 ### Every writer of a destination swaps together

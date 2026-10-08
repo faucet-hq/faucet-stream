@@ -309,3 +309,44 @@ async fn dataset_uri_for_both_topic_modes() {
         "unexpected from_path dataset_uri: {uri}"
     );
 }
+
+/// A key field that is present but `null` must reach `on_key_error` instead of
+/// collapsing every such record onto the literal key `"null"` (#789 MSG-21).
+/// Both key arms refuse before anything is produced, so no broker is needed.
+#[tokio::test(flavor = "multi_thread")]
+async fn null_key_is_unresolved_for_both_key_arms() {
+    let mut cfg = sink_config("127.0.0.1:1", KafkaSinkTopic::Fixed { name: "t".into() });
+    cfg.key_path = Some("$.user_id".into());
+    cfg.on_key_error = OnKeyError::Fail;
+    let sink = KafkaSink::new(cfg.clone()).await.unwrap();
+    let err = sink
+        .write_batch(&[json!({"user_id": null, "v": 1})])
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("did not resolve"), "{err}");
+
+    cfg.key_format = Some(KafkaValueFormat::Json);
+    let sink = KafkaSink::new(cfg).await.unwrap();
+    let err = sink
+        .write_batch(&[json!({"user_id": null, "v": 1})])
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("did not resolve"), "{err}");
+}
+
+/// A `topic.path` resolving to `null` is a routing failure, not topic `"null"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn null_topic_path_is_unresolved() {
+    let cfg = sink_config(
+        "127.0.0.1:1",
+        KafkaSinkTopic::FromPath {
+            path: "$.dest".into(),
+        },
+    );
+    let sink = KafkaSink::new(cfg).await.unwrap();
+    let err = sink
+        .write_batch(&[json!({"dest": null, "v": 1})])
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("did not resolve"), "{err}");
+}

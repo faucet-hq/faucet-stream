@@ -8,7 +8,7 @@ use faucet_core::FaucetError;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 
-use crate::config::{RedshiftConnection, RedshiftCredentials};
+use crate::config::{RedshiftConnection, RedshiftCredentials, RedshiftTlsMode};
 
 /// Resolve the password for the connection's credentials.
 ///
@@ -52,19 +52,35 @@ pub fn build_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptio
         ));
     }
     let password = resolve_password(&conn.credentials)?;
-    let ssl_mode = if conn.tls {
-        PgSslMode::Require
-    } else {
-        PgSslMode::Prefer
+    let ssl_mode = match conn.tls_mode {
+        Some(RedshiftTlsMode::Disable) => PgSslMode::Disable,
+        Some(RedshiftTlsMode::Prefer) => PgSslMode::Prefer,
+        Some(RedshiftTlsMode::Require) => PgSslMode::Require,
+        Some(RedshiftTlsMode::VerifyCa) => PgSslMode::VerifyCa,
+        Some(RedshiftTlsMode::VerifyFull) => PgSslMode::VerifyFull,
+        None if conn.tls => PgSslMode::Require,
+        None => PgSslMode::Prefer,
     };
-    Ok(PgConnectOptions::new()
+    if conn.ssl_root_cert.is_some()
+        && !matches!(ssl_mode, PgSslMode::VerifyCa | PgSslMode::VerifyFull)
+    {
+        return Err(FaucetError::Config(
+            "redshift: `ssl_root_cert` is only used with `tls_mode: verify_ca` or `verify_full`"
+                .into(),
+        ));
+    }
+    let mut opts = PgConnectOptions::new()
         .host(&conn.host)
         .port(conn.port)
         .database(&conn.database)
         .username(&conn.user)
         .password(password)
         .ssl_mode(ssl_mode)
-        .application_name("faucet"))
+        .application_name("faucet");
+    if let Some(cert) = &conn.ssl_root_cert {
+        opts = opts.ssl_root_cert(cert.as_str());
+    }
+    Ok(opts)
 }
 
 /// Build a lazily-connected pool (no I/O at construction). The first query
@@ -106,6 +122,46 @@ mod tests {
     #[test]
     fn build_options_succeeds_for_password() {
         assert!(build_connect_options(&conn()).is_ok());
+    }
+
+    #[test]
+    fn tls_mode_overrides_the_toggle_and_root_cert_needs_verification() {
+        let mode = |m: Option<RedshiftTlsMode>, tls: bool| {
+            let mut c = conn();
+            c.tls = tls;
+            c.tls_mode = m;
+            build_connect_options(&c).unwrap().get_ssl_mode()
+        };
+        assert!(matches!(mode(None, true), PgSslMode::Require));
+        assert!(matches!(mode(None, false), PgSslMode::Prefer));
+        assert!(matches!(
+            mode(Some(RedshiftTlsMode::Disable), true),
+            PgSslMode::Disable
+        ));
+        assert!(matches!(
+            mode(Some(RedshiftTlsMode::Prefer), true),
+            PgSslMode::Prefer
+        ));
+        assert!(matches!(
+            mode(Some(RedshiftTlsMode::Require), false),
+            PgSslMode::Require
+        ));
+        assert!(matches!(
+            mode(Some(RedshiftTlsMode::VerifyCa), false),
+            PgSslMode::VerifyCa
+        ));
+        let mut c = conn();
+        c.tls_mode = Some(RedshiftTlsMode::VerifyFull);
+        c.ssl_root_cert = Some("/etc/redshift-ca.pem".into());
+        assert!(matches!(
+            build_connect_options(&c).unwrap().get_ssl_mode(),
+            PgSslMode::VerifyFull
+        ));
+        c.tls_mode = Some(RedshiftTlsMode::Require);
+        assert!(matches!(
+            build_connect_options(&c),
+            Err(FaucetError::Config(_))
+        ));
     }
 
     #[test]

@@ -60,8 +60,18 @@ pub enum KafkaAuth {
     SaslSsl {
         /// Inner SASL auth (must be `SaslPlain` or `SaslScram`).
         sasl: Box<KafkaAuth>,
-        /// TLS layer (must be `Ssl`).
+        /// TLS layer: `tls` (server-authenticated TLS, the usual shape for
+        /// managed clusters), `ssl` (with a client certificate), or `none`
+        /// (TLS with the system trust store).
         ssl: Box<KafkaAuth>,
+    },
+    /// Server-authenticated TLS without a client certificate. Inside
+    /// `sasl_ssl` this is SASL over TLS; on its own it is an encrypted,
+    /// unauthenticated connection.
+    Tls {
+        /// CA certificate file to trust; the system trust store when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca_path: Option<PathBuf>,
     },
 }
 
@@ -117,6 +127,13 @@ impl KafkaAuth {
                     config.set("ssl.key.password", pw);
                 }
             }
+            KafkaAuth::Tls { ca_path } => {
+                config.set("security.protocol", "SSL");
+                if let Some(ca) = ca_path {
+                    Self::require_path("ca_path", ca)?;
+                    config.set("ssl.ca.location", path_str(ca));
+                }
+            }
             KafkaAuth::SaslSsl { sasl, ssl } => {
                 // Apply SSL settings first, then SASL settings, then override
                 // security.protocol to SASL_SSL.
@@ -166,6 +183,40 @@ fn path_str(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sasl_over_tls_needs_no_client_certificate() {
+        let auth: KafkaAuth = serde_json::from_value(serde_json::json!({
+            "type": "sasl_ssl",
+            "config": {
+                "sasl": {"type": "sasl_plain", "config": {"username": "u", "password": "p"}},
+                "ssl": {"type": "tls", "config": {}}
+            }
+        }))
+        .unwrap();
+        let mut cfg = ClientConfig::new();
+        auth.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.get("security.protocol"), Some("SASL_SSL"));
+        assert_eq!(cfg.get("sasl.mechanism"), Some("PLAIN"));
+        assert_eq!(cfg.get("ssl.certificate.location"), None);
+
+        let ca = std::env::temp_dir();
+        let mut cfg = ClientConfig::new();
+        KafkaAuth::Tls {
+            ca_path: Some(ca.clone()),
+        }
+        .apply(&mut cfg)
+        .unwrap();
+        assert_eq!(cfg.get("security.protocol"), Some("SSL"));
+        assert_eq!(cfg.get("ssl.ca.location"), Some(path_str(&ca).as_str()));
+        assert!(
+            KafkaAuth::Tls {
+                ca_path: Some("/no/such/ca.pem".into())
+            }
+            .apply(&mut ClientConfig::new())
+            .is_err()
+        );
+    }
 
     #[test]
     fn apply_none_sets_plaintext() {

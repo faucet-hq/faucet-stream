@@ -306,6 +306,7 @@ notifications:
             nodes,
             faucet_cli::executor::ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "drift_pipeline".into(),
                 run_id: None,
                 execution: None,
@@ -446,6 +447,7 @@ notifications:
 
     let opts = faucet_cli::executor::ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: "cb_pipeline".into(),
         run_id: Some("submitted-run-42".into()),
         execution: None,

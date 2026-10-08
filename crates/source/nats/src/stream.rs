@@ -2,7 +2,7 @@
 //!
 //! Two modes, selected by config:
 //! - **Core NATS** — `client.subscribe(subject)` (optionally a queue group).
-//!   Fire-and-forget delivery: no bookmark, not resumable.
+//!   Fire-and-forget (at-most-once) delivery: no bookmark, not resumable.
 //! - **JetStream** — pull from a durable consumer bound to an existing stream.
 //!   Each page's messages are acked *after* the page is yielded (i.e. after the
 //!   pipeline has written the previous page to the sink), giving at-least-once
@@ -138,6 +138,8 @@ impl Source for NatsSource {
         let format = self.config.value_format;
         let poll_fallback = Duration::from_millis(500);
 
+        let with_meta = self.config.include_metadata;
+
         Box::pin(async_stream::try_stream! {
             let client = self.client().await?;
 
@@ -154,7 +156,7 @@ impl Source for NatsSource {
                     .as_deref()
                     .expect("validated: jetstream_consumer is Some in JetStream mode");
 
-                let js = async_nats::jetstream::new(client);
+                let js = async_nats::jetstream::new(client.clone());
                 let js_stream = js
                     .get_stream(stream_name)
                     .await
@@ -163,10 +165,10 @@ impl Source for NatsSource {
                     .get_consumer(consumer_name)
                     .await
                     .map_err(|e| FaucetError::Source(format!("nats jetstream get_consumer '{consumer_name}': {e}")))?;
-                let mut messages = consumer
-                    .messages()
-                    .await
-                    .map_err(|e| FaucetError::Source(format!("nats jetstream messages(): {e}")))?;
+                // Acks happen only after a page is written, so a page larger
+                // than the consumer's `max_ack_pending` would stall: the server
+                // stops delivering and later redelivers (#789 MSG-47).
+                let page_cap = page_capacity(page_chunk, consumer.cached_info().config.max_ack_pending);
 
                 let mut buffer: Vec<Value> = Vec::with_capacity(cap);
                 // Messages for the page currently being buffered, acked after
@@ -187,65 +189,44 @@ impl Source for NatsSource {
 
                 loop {
                     if !to_ack.is_empty() {
-                        ack_all(std::mem::take(&mut to_ack)).await;
+                        ack_all(&client, std::mem::take(&mut to_ack)).await;
                         hold(&page_msgs, &to_ack);
                     }
 
+                    // Pull exactly what the page and the run still need — never
+                    // a prefetch past `max_messages` that would sit leased,
+                    // unacked, until `ack_wait` (#789 MSG-45).
+                    let want = pull_size(page_cap, buffer.len(), max_messages, total);
                     let (budget, deadline) = poll_budget(idle, last_at, poll_fallback);
-                    let mut stop = false;
-                    let mut fatal: Option<FaucetError> = None;
-
-                    let polled = tokio::select! {
-                        biased;
-                        _ = tokio::signal::ctrl_c() => {
-                            tracing::info!("nats source: ctrl_c received, stopping");
-                            Polled::Closed
+                    let mut batch = Box::pin(
+                        consumer
+                            .batch()
+                            .max_messages(want)
+                            .expires(budget.max(Duration::from_millis(100)))
+                            .messages()
+                            .await
+                            .map_err(|e| FaucetError::Source(format!("nats jetstream pull: {e}")))?,
+                    );
+                    let mut got = 0usize;
+                    while let Some(item) = batch.next().await {
+                        let msg = item.map_err(|e| FaucetError::Source(format!("nats jetstream recv: {e}")))?;
+                        let mut record = payload_to_value(&msg.payload, format, &msg.subject)?;
+                        if with_meta {
+                            let seq = msg.info().ok().map(|i| i.stream_sequence);
+                            record = with_metadata(record, &msg.subject, seq, message_id(msg.headers.as_ref()));
                         }
-                        next = tokio::time::timeout(budget, messages.next()) => match next {
-                            Ok(Some(Ok(msg))) => {
-                                last_at = Instant::now();
-                                match payload_to_value(&msg.payload, format, &msg.subject) {
-                                    Ok(record) => {
-                                        page_msgs.push(msg);
-                                        hold(&page_msgs, &to_ack);
-                                        Polled::Record(record)
-                                    }
-                                    Err(e) => {
-                                        fatal = Some(e);
-                                        Polled::Idle
-                                    }
-                                }
-                            }
-                            Ok(Some(Err(e))) => {
-                                fatal = Some(FaucetError::Source(format!("nats jetstream recv: {e}")));
-                                Polled::Idle
-                            }
-                            Ok(None) => Polled::Closed,
-                            Err(_elapsed) => Polled::Idle,
-                        }
-                    };
-
-                    if let Some(e) = fatal {
-                        Err(e)?;
+                        page_msgs.push(msg);
+                        hold(&page_msgs, &to_ack);
+                        buffer.push(record);
+                        total += 1;
+                        got += 1;
                     }
-
-                    match polled {
-                        Polled::Record(record) => {
-                            buffer.push(record);
-                            total += 1;
-                            if total >= max_messages {
-                                stop = true;
-                            }
-                        }
-                        Polled::Closed => stop = true,
-                        Polled::Idle => {
-                            if idle_expired(deadline) {
-                                stop = true;
-                            }
-                        }
+                    if got > 0 {
+                        last_at = Instant::now();
                     }
+                    let stop = total >= max_messages || (got == 0 && idle_expired(deadline));
 
-                    if !buffer.is_empty() && buffer.len() >= page_chunk {
+                    if !buffer.is_empty() && buffer.len() >= page_cap {
                         let records = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
                         to_ack = std::mem::take(&mut page_msgs);
                         // The bookmark makes the pipeline flush the sink before
@@ -263,13 +244,13 @@ impl Source for NatsSource {
 
                 // Flush any acks pending from the last full page, then the
                 // trailing partial page (and its acks).
-                ack_all(std::mem::take(&mut to_ack)).await;
+                ack_all(&client, std::mem::take(&mut to_ack)).await;
                 if !buffer.is_empty() {
                     yield StreamPage {
                         records: buffer,
                         bookmark: Some(page_bookmark(stream_name, consumer_name, total)),
                     };
-                    ack_all(std::mem::take(&mut page_msgs)).await;
+                    ack_all(&client, std::mem::take(&mut page_msgs)).await;
                 }
                 drop(lease);
                 tracing::info!(messages = total, "nats source: jetstream stream complete");
@@ -290,37 +271,24 @@ impl Source for NatsSource {
                 let mut total = 0usize;
                 let mut last_at = Instant::now();
 
+                // Shutdown is the pipeline's cancel token, not a process-wide
+                // signal handler a library must not install (#789 MSG-89).
                 loop {
                     let (budget, deadline) = poll_budget(idle, last_at, poll_fallback);
-                    let mut stop = false;
-                    let mut fatal: Option<FaucetError> = None;
-
-                    let polled = tokio::select! {
-                        biased;
-                        _ = tokio::signal::ctrl_c() => {
-                            tracing::info!("nats source: ctrl_c received, stopping");
-                            Polled::Closed
-                        }
-                        next = tokio::time::timeout(budget, sub.next()) => match next {
-                            Ok(Some(msg)) => {
-                                last_at = Instant::now();
-                                match payload_to_value(&msg.payload, format, &msg.subject) {
-                                    Ok(record) => Polled::Record(record),
-                                    Err(e) => {
-                                        fatal = Some(e);
-                                        Polled::Idle
-                                    }
-                                }
+                    let polled = match tokio::time::timeout(budget, sub.next()).await {
+                        Ok(Some(msg)) => {
+                            last_at = Instant::now();
+                            let mut record = payload_to_value(&msg.payload, format, &msg.subject)?;
+                            if with_meta {
+                                record = with_metadata(record, &msg.subject, None, message_id(msg.headers.as_ref()));
                             }
-                            Ok(None) => Polled::Closed,
-                            Err(_elapsed) => Polled::Idle,
+                            Polled::Record(record)
                         }
+                        Ok(None) => Polled::Closed,
+                        Err(_elapsed) => Polled::Idle,
                     };
 
-                    if let Some(e) = fatal {
-                        Err(e)?;
-                    }
-
+                    let mut stop = false;
                     match polled {
                         Polled::Record(record) => {
                             buffer.push(record);
@@ -417,17 +385,94 @@ async fn mark_in_progress(messages: Vec<async_nats::jetstream::Message>) {
 
 /// Ack a page's JetStream messages best-effort — a failed ack triggers at most
 /// a redelivery (at-least-once), never data loss, so it is logged not fatal.
-async fn ack_all(messages: Vec<async_nats::jetstream::Message>) {
+/// `ack` only queues the publish, so the client is flushed: the final page's
+/// acks would otherwise be lost when the run exits right after (#789 MSG-81).
+async fn ack_all(client: &async_nats::Client, messages: Vec<async_nats::jetstream::Message>) {
+    if messages.is_empty() {
+        return;
+    }
     for msg in messages {
         if let Err(e) = msg.ack().await {
             tracing::warn!(error = %e, "nats source: jetstream ack failed (message may be redelivered)");
         }
     }
+    if let Err(e) = client.flush().await {
+        tracing::warn!(error = %e, "nats source: flushing acks failed (messages may be redelivered)");
+    }
+}
+
+/// The page size that never exceeds the consumer's `max_ack_pending`
+/// (`<= 0` = unlimited).
+fn page_capacity(page_chunk: usize, max_ack_pending: i64) -> usize {
+    if max_ack_pending > 0 {
+        page_chunk.min(max_ack_pending as usize)
+    } else {
+        page_chunk
+    }
+}
+
+/// How many messages one pull requests: what the page and the run still need,
+/// capped at the server's per-request batch limit.
+fn pull_size(page_cap: usize, buffered: usize, max_messages: usize, total: usize) -> usize {
+    page_cap
+        .saturating_sub(buffered)
+        .min(max_messages.saturating_sub(total))
+        .clamp(1, 10_000)
+}
+
+/// The `Nats-Msg-Id` header, the publisher's deduplication id.
+fn message_id(headers: Option<&async_nats::HeaderMap>) -> Option<String> {
+    headers
+        .and_then(|h| h.get("Nats-Msg-Id"))
+        .map(|v| v.as_str().to_string())
+}
+
+/// `{ subject, sequence, message_id, payload }` (`include_metadata: true`).
+fn with_metadata(
+    payload: Value,
+    subject: &str,
+    sequence: Option<u64>,
+    message_id: Option<String>,
+) -> Value {
+    serde_json::json!({
+        "subject": subject,
+        "sequence": sequence,
+        "message_id": message_id,
+        "payload": payload,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pulls_never_exceed_the_page_the_run_or_max_ack_pending() {
+        assert_eq!(page_capacity(1000, 200), 200);
+        assert_eq!(page_capacity(1000, -1), 1000);
+        assert_eq!(page_capacity(50, 200), 50);
+        assert_eq!(pull_size(200, 150, 10_000, 0), 50);
+        assert_eq!(pull_size(200, 0, 30, 25), 5);
+        assert_eq!(pull_size(usize::MAX, 0, usize::MAX, 0), 10_000);
+        assert_eq!(pull_size(10, 10, 100, 0), 1);
+    }
+
+    #[test]
+    fn metadata_wraps_the_payload() {
+        let mut h = async_nats::HeaderMap::new();
+        h.insert("Nats-Msg-Id", "m-1");
+        assert_eq!(message_id(Some(&h)).as_deref(), Some("m-1"));
+        assert_eq!(message_id(None), None);
+        assert_eq!(
+            with_metadata(
+                serde_json::json!({"a": 1}),
+                "s.x",
+                Some(7),
+                Some("m-1".into())
+            ),
+            serde_json::json!({"subject": "s.x", "sequence": 7, "message_id": "m-1", "payload": {"a": 1}})
+        );
+    }
 
     #[test]
     fn every_jetstream_page_carries_an_informational_bookmark() {

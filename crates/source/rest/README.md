@@ -78,7 +78,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `base_url` | string | `""` | Base URL of the API (trailing slash trimmed). |
-| `path` | string | `""` | URL path relative to `base_url`. Supports `{key}` placeholders for partition substitution (e.g. `/orgs/{org_id}/users`). |
+| `path` | string | `""` | URL path relative to `base_url`. Supports `{key}` placeholders for partition substitution (e.g. `/orgs/{org_id}/users`). Substituted values are percent-encoded, so `/`, `?` or `#` in a value stays inside its segment; a value of exactly `.` or `..` is refused. |
 | `method` | string | `GET` | HTTP method for the request. |
 | `auth` | `Auth` / `{ ref }` | `none` | Inline `{ type, config }` auth, or a `{ ref: <name> }` pointer to a shared provider. See [Authentication](#authentication). |
 | `headers` | map<string,string> | empty | Static HTTP headers sent on **every** request (data pages, async-job requests, and OData `$metadata` probes). Applied *before* auth, so an auth header of the same name wins on a clash. Values honor `${env:}` / `${param.*}` interpolation and pass through the secrets/redaction boundary. An invalid header name/value is rejected at config load. See [Custom request headers](#custom-request-headers). |
@@ -118,6 +118,7 @@ the secrets/redaction boundary like any other config string.
 |-------|------|---------|-------------|
 | `pagination` | `PaginationStyle` | `None` | Pagination strategy. See [Pagination](#pagination). |
 | `records_path` | string / null | `null` | JSONPath expression to extract the record array from each response body (e.g. `$.data[*]`). When unset, the whole body is treated as the record set. |
+| `allow_missing_records_path` | bool | `false` | By default a response in which `records_path` resolves to nothing — the key is absent, not an empty array — fails the run (it is usually an error body served with HTTP 200, or a renamed field) instead of ending pagination green. Set `true` for APIs that omit the records key on an empty result. |
 | `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
 | `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short persists no record-derived or window bookmark (it would skip the unread pages); only a `persist_cursor` bookmark is kept, and a windowed sweep stops at that window. |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
@@ -136,7 +137,7 @@ pagination: { type: RecordFieldCursor, field: JournalNumber, into: query, param:
 
 Both stop on a short page (fewer than `limit`/`page_size` records) and guard against a non-advancing cursor.
 
-**Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start.
+**Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start. It resumes **one** cursor, so it is refused with more than one `requests:` entry.
 
 ### Multi-array fan-out (`records_multi`) & envelope carry (`record_ancestors`)
 
@@ -161,11 +162,11 @@ record_ancestors: { event_id: id, event_created: created }
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `timeout` | int (seconds) / null | `30` | Per-request HTTP timeout. |
+| `timeout` | int (seconds) / null | `30` | Per-request HTTP timeout. For a streamed `async_job` result download (JSONL / CSV) it bounds the connect and each idle read instead of the whole body, so a multi-GB export that keeps flowing is never cut off. |
 | `max_retries` | int | `3` | Max retries on transient failures. |
-| `retry_backoff` | int (seconds) | `1` | Base for exponential backoff. Per-attempt sleep is `retry_backoff × 2^attempt`, **capped at 60 s** and scaled by random jitter in `[0.5, 1.5)` (decorrelated across concurrent retries). On `429`, the server's `Retry-After` (delta-seconds **or** an RFC 7231 HTTP-date) is honoured instead. |
+| `retry_backoff` | int (seconds) | `1` | Base for exponential backoff. Per-attempt sleep is `retry_backoff × 2^attempt`, **capped at 60 s** and scaled by random jitter in `[0.5, 1.5)` (decorrelated across concurrent retries). On `429`, the server's `Retry-After` (delta-seconds **or** an RFC 7231 HTTP-date) is honoured instead; a stated wait over 3600 s fails the run rather than sleeping. |
 | `tolerated_http_errors` | array<int> | `[]` | HTTP status codes treated as an empty page **on the first request only**. Mid-pagination, a tolerated status surfaces as an error instead of silently ending the stream (otherwise a transient failure on page _N_ would drop every later page as a "successful" run). Only safe for genuinely-empty resources. |
-| `retry_on_response` | array of matchers | `[]` | Treat a non-2xx response as **throttling** and retry it with backoff — for APIs that signal a rate limit with a 4xx other than 429 plus a code in the body. Each matcher has `status` (list; empty = any non-2xx), `body_path` (JSONPath into the JSON error body) + `values` (numbers and strings compare by text), optional `header` (must be present; compared with `values` when there is no `body_path`), optional `match_success: true` (also match a 2xx, e.g. `x-ratelimit-remaining: 0`; requires `body_path` or `header`), optional `backoff_from` (read the wait from the response: `{type: header, config: {name, unit}}`, `{type: header_json, config: {name, path, unit}}`, `{type: body, config: {path, unit}}` or `{type: cost_bucket, config: {requested, available, restore_rate}}`; `unit` is `seconds`, `ms`, `minutes`, `epoch_s`, `epoch_ms` or `rfc3339`, an absolute instant measured from the response's `Date` header), optional `backoff_secs` (fixed wait), and optional `max_wait_secs` (default 3600; a longer stated wait fails the run instead of parking it). The wait is `backoff_from`, else `backoff_secs`, else `Retry-After`, else the exponential `retry_backoff`. A match is counted as a rate-limit response (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`, `faucet_source_throttle_wait_seconds`), is checked before `tolerated_http_errors`, and applies to data pages, `async_job` requests (success-matching only on submit/poll, not streamed results) and discovery requests. After `max_retries` consecutive matches the original error (status + body) is surfaced; a 2xx that still matches fails rather than being read as data. A non-JSON body never matches. |
+| `retry_on_response` | array of matchers | `[]` | Treat a non-2xx response as **throttling** and retry it with backoff — for APIs that signal a rate limit with a 4xx other than 429 plus a code in the body. Each matcher has `status` (list; empty = any non-2xx), `body_path` (JSONPath into the JSON error body) + `values` (numbers and strings compare by text), optional `header` (must be present; compared with `values` when there is no `body_path`), optional `match_success: true` (also match a 2xx, e.g. `x-ratelimit-remaining: 0`; requires `body_path` or `header`), optional `backoff_from` (read the wait from the response: `{type: header, config: {name, unit}}`, `{type: header_json, config: {name, path, unit}}`, `{type: body, config: {path, unit}}` or `{type: cost_bucket, config: {requested, available, restore_rate}}`; `unit` is `seconds`, `ms`, `minutes`, `epoch_s`, `epoch_ms` or `rfc3339`, an absolute instant measured from the response's `Date` header), optional `backoff_secs` (fixed wait), and optional `max_wait_secs` (default 3600; a longer wait — from `backoff_from`, `backoff_secs` or `Retry-After` — fails the run instead of parking it). The wait is `backoff_from`, else `backoff_secs`, else `Retry-After`, else the exponential `retry_backoff`. A match is counted as a rate-limit response (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`, `faucet_source_throttle_wait_seconds`), is checked before `tolerated_http_errors`, and applies to data pages, `async_job` requests (success-matching only on submit/poll, not streamed results) and discovery requests. After `max_retries` consecutive matches the original error (status + body) is surfaced; a 2xx that still matches fails rather than being read as data. A non-JSON body never matches. |
 
 **Throttling is metered (#734):** every `429` counts in `faucet_source_throttled_total`, the time actually slept on it (not the header's value — a cancelled sleep records the partial wait) in `faucet_source_throttle_wait_seconds`, and every retry by class in `faucet_source_retries_total{class}`. The totals land on the run's usage record, so `faucet run` / `faucet usage` print `throttled 312× · waited 41 min`, and a run that spent more than 10 % of its time rate-limited logs a warning. See [source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html#source-side-throttling).
 
@@ -208,7 +209,7 @@ Because the REST source keeps its own `429`/`Retry-After`-aware retry runner, it
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `replication_method` | `{ type: FullTable \| Incremental }` | `FullTable` | `FullTable` fetches all records; `Incremental` filters by bookmark. |
+| `replication_method` | `{ type: FullTable \| Incremental }` | `FullTable` | `FullTable` fetches all records; `Incremental` keeps records whose `replication_key` is **at or after** the bookmark. The comparison is inclusive so a row sharing the bookmark's value but written after the previous run read it is not lost; the boundary rows are re-delivered each run (at-least-once — pair with a keyed `write_mode: upsert` sink to absorb them). |
 | `replication_key` | string / null | `null` | Field used for incremental bookmarking: a top-level name (`updated_at`), a dot path into nested objects (`fields.updated`, `items.0.date` — a literal top-level field of that exact name wins), or a JSON Pointer (`/fields/updated`) for names containing dots. Not a JSONPath. With `async_job`, it is injected into the submit query verbatim, so use a field name or a dotted relationship path there. |
 | `on_missing_key` | `keep \| drop \| fail` | `keep` | A record whose key is missing or `null` is kept (default), dropped, or fails the run. Kept and dropped records are counted in `faucet_source_replication_key_missing_total` and warned about once per run — never dropped silently. |
 | `start_replication_value` | JSON / null | `null` | Bookmark value; records where `record[replication_key] <= start_replication_value` are filtered out in `Incremental` mode. |
@@ -390,7 +391,7 @@ a catalog endpoint, a REST admin API) is pure YAML, never a code path.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`. Omit when `objects` is supplied directly. |
+| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`, and `next` (JSONPath to the next page's URL — absolute or relative to `base_url`; pages are followed until it is null/empty/repeats; without it only the first page is read). Omit when `objects` is supplied directly. |
 | `objects` | array<string> **or** string | `[]` | Datasets supplied directly — a list or a comma-separated string, so one run-param can drive it (`objects: "${param.objects}"`). |
 | `describe` | object / null | — | Step 2: per-dataset field discovery — `get` (templated path), `fields`/`field_name`/`field_type`/`field_nullable` JSONPaths, a `type_map`, and `skip_types`. Omit when the source returns every column by default. |
 | `emit.config` | object | — | Step 3: JSON deep-merged into the dataset's source config (e.g. a query built from `${field_names}`). Every string leaf is templated. |
@@ -474,8 +475,8 @@ extraction (replaces `response_format` parsing; requires `pagination: none`):
 |------|------|--------|
 | `extract` | `{ extract: "$.d.reportBytes" }` | Pull a string field out of a JSON envelope. |
 | `base64` | `base64` | Base64-decode the buffer. |
-| `gunzip` | `gunzip` | Gzip-decompress. |
-| `unzip` | `{ unzip: { member: "*.csv" } }` | Extract a zip member (glob; first file if omitted). |
+| `gunzip` | `gunzip` | Gzip-decompress (at most 1 GiB decompressed). |
+| `unzip` | `{ unzip: { member: "*.csv" } }` | Extract a zip member (glob; the whole archive if omitted). Exactly one file must match — several matches fail with their names. At most 1 GiB decompressed. |
 | `parse` | `{ parse: { format: json\|csv\|xlsx\|xml, … } }` | Terminal: parse bytes → records. |
 
 ```yaml
@@ -495,7 +496,7 @@ job → poll a status endpoint until terminal → fetch the result → hand it t
 |-------|-------------|
 | `submit` | `{ method, url, headers, query, json }` — job-creation request. |
 | `job_id` | JSONPath to the job id in the submit response. |
-| `poll` | `{ url, method, interval_secs (5), timeout_secs (1800) }` — `${job_id}` substituted. `interval_secs` is the **ceiling** on the poll cadence, not a fixed wait: polling starts at 1s and doubles up to the cap, so a fast job is noticed in ~1s while a long one isn't hammered. |
+| `poll` | `{ url, method, interval_secs (5), timeout_secs (1800) }` — `${job_id}` substituted. `interval_secs` is the **ceiling** on the poll cadence, not a fixed wait: polling starts at 1s and doubles up to the cap, so a fast job is noticed in ~1s while a long one isn't hammered. A value of `0` is treated as `1`. `async_job` cannot be combined with `requests:` (every entry would submit the same job). |
 | `lookback` | Incremental only: re-read margin subtracted from the persisted bookmark (`45s` / `30m` / `6h`, default `5m`) — see below. |
 | `status` | `{ path, success: [...], failure: [...] }` — classify the poll response. |
 | `fetch` | `{ method, url \| url_from, headers, query, json }` — result download; body flows through `decode:`. Set **exactly one** of `url` (a `${job_id}`-templated path) or `url_from` (a JSONPath into the last poll body — see below). |
@@ -955,7 +956,7 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
 | `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same body returned twice in a row (content-stagnation detection for APIs that clamp out-of-range pages). |
-| `Offset` | `offset_param`, `limit_param`, `limit`, `total_path` | A zero-record page, offset reaches `total` (via `total_path`), or a page returns fewer records than `limit`. |
+| `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it. The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
 
 An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. `$top`/`$skip` paging) terminates cleanly rather than erroring.
 
@@ -970,7 +971,7 @@ The inherent `stream_pages()` method (yielding `Vec<Value>` pages, no per-page b
 This source supports resumable runs. Set `state_key` and configure a `state:` block (or call `Pipeline::with_state_store` from Rust). On each run the pipeline:
 
 1. loads the previously persisted bookmark and applies it via `apply_start_bookmark` (overriding `start_replication_value`);
-2. fetches only records newer than the bookmark (`replication_method: Incremental` + `replication_key`);
+2. fetches only records at or after the bookmark (`replication_method: Incremental` + `replication_key`; inclusive, so rows sharing the bookmark's value are never skipped);
 3. persists the new bookmark **only after the sink confirms** the batch — so a crash mid-run re-fetches rather than skips.
 
 `state_key` must satisfy `faucet_core::state::validate_state_key`. See the second [example](#oauth2--incremental-replication-with-a-persisted-bookmark) above.

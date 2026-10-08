@@ -621,3 +621,99 @@ async fn anchor_types_and_compressed_transactions() {
         "resume after a compressed transaction"
     );
 }
+
+/// #789 SQL-59 / SQL-60 / SQL-117 / SQL-118 / SQL-166 against a live server:
+/// savepoints stay inside their transaction, an XA transaction is emitted only
+/// once committed (and never when rolled back), TRUNCATE is a `truncate`
+/// record, binary columns are always base64, a delete without before-images
+/// still carries its key, and small transactions share pages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn savepoints_xa_truncate_binary_and_batched_pages() {
+    let (_container, url) = start_mysql_cdc().await;
+    {
+        let mut conn = connect(&url).await;
+        conn.query_drop(
+            "CREATE TABLE test.t (id INT PRIMARY KEY, label VARCHAR(10), \
+             raw VARBINARY(8), flag BIT(1))",
+        )
+        .await
+        .expect("create");
+    }
+    let mut config = build_config(&url);
+    config.batch_size = 100;
+    config.include_columns = false;
+    let source = MysqlCdcSource::new(config).await.expect("source new");
+
+    let writer_url = url.clone();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut c = connect(&writer_url).await;
+        for sql in [
+            "BEGIN",
+            "INSERT INTO test.t VALUES (1, 'a', X'41', b'1')",
+            "SAVEPOINT s1",
+            "INSERT INTO test.t VALUES (2, 'b', X'00FF', b'0')",
+            "ROLLBACK TO SAVEPOINT s1",
+            "INSERT INTO test.t VALUES (3, 'c', NULL, NULL)",
+            "RELEASE SAVEPOINT s1",
+            "COMMIT",
+            "XA START 'gone'",
+            "INSERT INTO test.t VALUES (10, 'x', NULL, NULL)",
+            "XA END 'gone'",
+            "XA PREPARE 'gone'",
+            "XA ROLLBACK 'gone'",
+            "XA START 'kept'",
+            "INSERT INTO test.t VALUES (11, 'y', NULL, NULL)",
+            "XA END 'kept'",
+            "XA PREPARE 'kept'",
+            "XA COMMIT 'kept'",
+            "DELETE FROM test.t WHERE id = 3",
+            "TRUNCATE TABLE test.t",
+        ] {
+            c.query_drop(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    });
+
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut stream = source.stream_pages(&ctx, 100);
+    let mut pages = Vec::new();
+    while let Some(page) = stream.next().await {
+        pages.push(page.expect("page"));
+    }
+    writer.await.expect("writer");
+    let records: Vec<Value> = pages.iter().flat_map(|p| p.records.clone()).collect();
+    let ids: Vec<Value> = records
+        .iter()
+        .filter(|r| r["op"] == "c")
+        .map(|r| r["after"]["id"].clone())
+        .collect();
+    assert_eq!(ids, vec![json!(1), json!(3), json!(11)], "{records:?}");
+    let first = records.iter().find(|r| r["after"]["id"] == 1).unwrap();
+    assert_eq!(
+        first["after"]["raw"],
+        json!("QQ=="),
+        "binary is always base64"
+    );
+    assert_eq!(
+        first["after"]["flag"],
+        json!("AQ=="),
+        "BIT is base64 like the snapshot"
+    );
+    assert_eq!(first["after"]["label"], json!("a"));
+    let delete = records.iter().find(|r| r["op"] == "d").expect("delete");
+    assert_eq!(delete["before"], json!({"id": 3}), "a delete keeps its key");
+    let truncate = records
+        .iter()
+        .find(|r| r["op"] == "truncate")
+        .expect("truncate");
+    assert_eq!(truncate["schema"], "test");
+    assert_eq!(truncate["table"], "t");
+    let with_records = pages.iter().filter(|p| !p.records.is_empty()).count();
+    assert!(
+        with_records < 5,
+        "small transactions share pages, got {with_records} pages"
+    );
+    assert!(pages.last().unwrap().bookmark.is_some());
+}

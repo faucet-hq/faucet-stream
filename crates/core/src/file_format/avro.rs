@@ -234,6 +234,23 @@ pub(crate) fn is_complex_union(u: &UnionSchema) -> bool {
         > 1
 }
 
+/// Convert one decoded Avro datum to JSON with the logical-type mapping in the
+/// module docs (exact decimal strings, hex bytes, ISO temporals). Unlike the
+/// file reader, a non-record datum is returned as-is rather than wrapped in
+/// [`VALUE_FIELD`] — the shape a single-message codec (a Kafka value) wants.
+pub fn datum_to_json(datum: &Av, schema: &Schema) -> Result<Value, FaucetError> {
+    let names = named(schema);
+    to_json(datum, schema, &names, Mode::Record, &mut Vec::new())
+}
+
+/// Build the Avro datum for `value` under `schema`, accepting the JSON shapes
+/// [`datum_to_json`] produces (the inverse mapping). The error names the path
+/// that did not fit.
+pub fn datum_from_json(value: &Value, schema: &Schema) -> Result<Av, String> {
+    let names = named(schema);
+    from_json(value, schema, &names, "")
+}
+
 fn root_to_json(
     v: &Av,
     schema: &Schema,
@@ -1201,6 +1218,27 @@ pub fn read_batches<R: std::io::Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn datum_conversion_keeps_logical_types_exact_and_round_trips() {
+        let schema = Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[
+                {"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}},
+                {"name":"raw","type":"bytes"},
+                {"name":"day","type":{"type":"int","logicalType":"date"}}
+            ]}"#,
+        )
+        .unwrap();
+        let v = json!({"amount": "12.34", "raw": "0aff", "day": "2026-10-07"});
+        let datum = datum_from_json(&v, &schema).unwrap();
+        assert_eq!(datum_to_json(&datum, &schema).unwrap(), v);
+        assert_eq!(
+            datum_to_json(&Av::Long(7), &Schema::Long).unwrap(),
+            json!(7),
+            "a non-record datum is not wrapped"
+        );
+        assert!(datum_from_json(&json!({"amount": 1}), &schema).is_err());
+    }
 
     fn logical_schema() -> Value {
         json!({

@@ -49,6 +49,9 @@ async fn exchange_kind_mismatch_is_a_config_error() {
     let mut cfg = sink_cfg(&broker.url, "k");
     cfg.exchange = "typed".into();
     cfg.exchange_kind = Some(RabbitMqExchangeKind::Fanout);
+    // Nothing is bound to the exchange; `mandatory` (default true since #789
+    // MSG-75) would turn the publish into a row error this test is not about.
+    cfg.mandatory = false;
     RabbitMqSink::new(cfg.clone())
         .await
         .unwrap()
@@ -107,4 +110,23 @@ async fn check_probes_connect_and_exchange() {
         .unwrap();
     assert_eq!(report.failed_count(), 0);
     assert!(matches!(report.probes[1].status, ProbeStatus::Skip { .. }));
+}
+
+/// With the default settings a message no queue receives is a row error, not
+/// a confirmed-and-dropped publish (#789 MSG-75).
+#[tokio::test(flavor = "multi_thread")]
+async fn unroutable_messages_fail_by_default() {
+    let broker = start_broker().await;
+    let sink = RabbitMqSink::new(sink_cfg(&broker.url, "no-such-queue"))
+        .await
+        .unwrap();
+    let outcomes = sink.write_batch_partial(&[json!({"a": 1})]).await.unwrap();
+    assert!(
+        outcomes[0]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("unroutable"),
+        "{outcomes:?}"
+    );
 }

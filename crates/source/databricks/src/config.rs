@@ -47,6 +47,10 @@ fn default_wait_timeout() -> u64 {
     50
 }
 
+fn default_statement_timeout() -> u64 {
+    3600
+}
+
 fn default_poll_interval() -> u64 {
     1
 }
@@ -163,6 +167,10 @@ pub struct DatabricksSourceConfig {
     /// Client poll cadence while the statement is `PENDING`/`RUNNING` (seconds).
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+    /// Client deadline for the statement to finish, in seconds; on expiry it is
+    /// cancelled and the read fails. `0` waits indefinitely. Defaults to 3600.
+    #[serde(default = "default_statement_timeout")]
+    pub statement_timeout_secs: u64,
     /// Page size — rows accumulated before a `StreamPage` is emitted.
     /// Defaults to [`DEFAULT_BATCH_SIZE`](faucet_core::DEFAULT_BATCH_SIZE).
     ///
@@ -263,6 +271,7 @@ mod tests {
             parameters: Vec::new(),
             wait_timeout_secs: default_wait_timeout(),
             poll_interval_secs: default_poll_interval(),
+            statement_timeout_secs: default_statement_timeout(),
             batch_size: DEFAULT_BATCH_SIZE,
             arrow_native: false,
             result_disposition: ResultDisposition::default(),

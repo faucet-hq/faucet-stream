@@ -4654,6 +4654,13 @@
             "type": {
               "type": "string",
               "const": "Offset"
+            },
+            "rows_path": {
+              "description": "JSONPath whose matches are counted to advance the offset, instead of\nthe extracted record count. Required when `records_path` fans out\nto nested children or `record_ancestors` is set, where the record\ncount is not the number of server rows (API-36). An array counts its\nelements, an object 1, null or no match 0 (which ends pagination).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         },
@@ -5489,7 +5496,7 @@
           "description": "JSON request body (#768) — for status checks that are a `POST` with a\nquery body, such as a GraphQL `node(id:)` lookup. `${job_id}` is\nsubstituted in every string leaf."
         },
         "interval_secs": {
-          "description": "Ceiling on the poll cadence in seconds (default `5`). Polling starts at\n1s and doubles up to this cap, so a job that finishes seconds after\nsubmit is noticed quickly while a long-running one isn't hammered. Set\nit to the slowest acceptable poll rate — it is the maximum gap between\npolls, not a fixed wait.",
+          "description": "Ceiling on the poll cadence in seconds (default `5`). Polling starts at\n1s and doubles up to this cap, so a job that finishes seconds after\nsubmit is noticed quickly while a long-running one isn't hammered. Set\nit to the slowest acceptable poll rate — it is the maximum gap between\npolls, not a fixed wait. Values below 1 are treated as 1, so polls are\nnever sent back-to-back.",
           "type": [
             "integer",
             "string"
@@ -5807,6 +5814,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "next": {
+          "description": "JSONPath to the next listing page's URL (absolute, or a path relative to\n`base_url`) in each response, e.g. `$.next`. Pages are followed until it\nis absent, null, empty or repeats. Without it only the first page is\nread, so set it for a paginated listing.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": true
@@ -5994,11 +6008,11 @@
           "$ref": "#/$defs/source_graphql__OffsetPaginationKind"
         },
         "offset_variable": {
-          "description": "Name of the GraphQL variable that receives the current offset. It is\ninjected as a JSON number (starting at `0`, incremented by `page_size`\nafter each page). Reference it from the query string or as a variable\n(e.g. `${q_offset}` inside the query string).",
+          "description": "Name of the GraphQL variable that receives the current offset. It is\ninjected as a JSON number (starting at `0`, advanced by the number of\nrecords each page returned). Reference it from the query string or as a variable\n(e.g. `${q_offset}` inside the query string).",
           "type": "string"
         },
         "page_size": {
-          "description": "Records requested per page. Used both to advance the offset\n(`offset += page_size`) and, with `stop_when_short`, to detect the final\npage. Must be greater than `0`. This value is **not** injected into the\nrequest — bake the limit into your query (`LIMIT 250 OFFSET ${q_offset}`).",
+          "description": "Records requested per page, used with `stop_when_short` to detect the\nfinal page; the offset advances by the records each page actually\nreturned. Must be greater than `0`. This value is **not** injected into the\nrequest — bake the limit into your query (`LIMIT 250 OFFSET ${q_offset}`).",
           "type": [
             "integer",
             "string"
@@ -6007,12 +6021,12 @@
           "minimum": 0
         },
         "stop_when_short": {
-          "description": "Terminate when a page yields fewer than `page_size` records (default\n`true`). When `false`, pagination continues until a fully empty page (or\n`max_pages`) is reached.",
+          "description": "Terminate when a page yields fewer than `page_size` records (default\n`false`: pagination continues until a fully empty page, an identical\nrepeated page, or `max_pages`). A server that caps the page below\n`page_size` returns short pages mid-stream, so enable this only when the\nAPI is known never to clamp.",
           "type": [
             "boolean",
             "string"
           ],
-          "default": true
+          "default": false
         },
         "substitute_in_query": {
           "description": "Substitute `${offset_variable}` occurrences in the **query string** with\nthe current offset before each request, instead of sending it as a\nGraphQL variable. Required for query languages that embed the offset in a\nstring-literal argument — e.g.\n`reportQuery(query: \"… LIMIT 250 OFFSET ${q_offset}\")`, where a GraphQL\nvariable cannot interpolate into a string literal (#569). Default\n`false` (variable injection, the #550 behavior).",
@@ -6642,7 +6656,7 @@
           "const": "permanent"
         },
         {
-          "description": "Auto-dropped by the server when the replication connection closes.",
+          "description": "Refused at config load: dropped with the session that creates it,\nbefore replication starts.",
           "type": "string",
           "const": "temporary"
         }
@@ -6748,7 +6762,7 @@
       "description": "MSSQL encryption mode.",
       "oneOf": [
         {
-          "description": "Encrypt the connection if the server supports it (the safe modern\ndefault). Maps to `tiberius` `EncryptionLevel::On`.",
+          "description": "The default; encrypts the connection and **fails** against a server\nthat offers no encryption (there is no plaintext fallback — tiberius\ncannot negotiate one without panicking). Same as `require`.",
           "type": "string",
           "const": "prefer"
         },
@@ -6758,7 +6772,7 @@
           "const": "require"
         },
         {
-          "description": "Encrypt and accept the server certificate without validating its chain\n(self-signed dev servers). Maps to `EncryptionLevel::On` + `trust_cert()`.\n**Insecure against MITM — never use in production.**",
+          "description": "Encrypt and accept the server certificate without validating its chain\n(self-signed dev servers); `ca_cert_path` cannot be combined with it.\n**Insecure against MITM — never use in production.**",
           "type": "string",
           "const": "trust_server_certificate"
         },
@@ -7646,7 +7660,7 @@
           }
         },
         {
-          "description": "Start at the earliest retained oplog entry (errors if it has rolled).",
+          "description": "Start at the oldest entry still in the oplog.",
           "type": "object",
           "properties": {
             "type": {
@@ -7656,7 +7670,7 @@
           }
         },
         {
-          "description": "Resume after a specific opaque token. Overrides a persisted bookmark.",
+          "description": "Resume after a specific opaque token.",
           "type": "object",
           "properties": {
             "token": true,
@@ -7667,7 +7681,7 @@
           }
         },
         {
-          "description": "Start at a wall-clock second. Overrides a persisted bookmark.",
+          "description": "Start at a wall-clock second.",
           "type": "object",
           "properties": {
             "timestamp_secs": {
@@ -7824,7 +7838,7 @@
       "description": "MSSQL encryption mode.",
       "oneOf": [
         {
-          "description": "Encrypt the connection if the server supports it (the safe modern\ndefault). Maps to `tiberius` `EncryptionLevel::On`.",
+          "description": "The default; encrypts the connection and **fails** against a server\nthat offers no encryption (there is no plaintext fallback — tiberius\ncannot negotiate one without panicking). Same as `require`.",
           "type": "string",
           "const": "prefer"
         },
@@ -7834,7 +7848,7 @@
           "const": "require"
         },
         {
-          "description": "Encrypt and accept the server certificate without validating its chain\n(self-signed dev servers). Maps to `EncryptionLevel::On` + `trust_cert()`.\n**Insecure against MITM — never use in production.**",
+          "description": "Encrypt and accept the server certificate without validating its chain\n(self-signed dev servers); `ca_cert_path` cannot be combined with it.\n**Insecure against MITM — never use in production.**",
           "type": "string",
           "const": "trust_server_certificate"
         },
@@ -8420,7 +8434,7 @@
           }
         },
         {
-          "description": "Read entries from a Redis stream via `XRANGE` (or `XREAD` / `XREADGROUP`\nfor the consumer-group convenience path on `fetch_all`).",
+          "description": "Read entries from a Redis stream via `XRANGE`.",
           "type": "object",
           "properties": {
             "key": {
@@ -8428,21 +8442,21 @@
               "type": "string"
             },
             "group": {
-              "description": "Optional consumer group name. When set, [`fetch_all`](super::RedisSource::fetch_all)\nuses `XREADGROUP`. Streaming via [`stream_pages`](faucet_core::Source::stream_pages)\nalways uses `XRANGE` (consumer-group semantics are incompatible\nwith the page-then-write streaming contract).",
+              "description": "Ignored. Every read path uses `XRANGE`, which never touches a\nconsumer group's pending-entries list; reading through a group\nwould withhold entries from the group's other consumers. A\nconfigured value logs a warning.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "consumer": {
-              "description": "Consumer name within the group (required when `group` is set).",
+              "description": "Ignored (see `group`).",
               "type": [
                 "string",
                 "null"
               ]
             },
             "count": {
-              "description": "Maximum number of entries to read per call. Used by\n[`fetch_all`](super::RedisSource::fetch_all)'s `XREAD` / `XREADGROUP`\npath; ignored by streaming, which uses\n[`RedisSourceConfig::batch_size`] as both the per-page count and\nthe `XRANGE COUNT` hint.",
+              "description": "Ignored; [`RedisSourceConfig::batch_size`] is the `XRANGE COUNT`.",
               "type": [
                 "integer",
                 "null",
@@ -8458,7 +8472,7 @@
           }
         },
         {
-          "description": "Scan for keys matching a pattern, then `MGET` each batch.",
+          "description": "Scan for keys matching a pattern, then `MGET` each batch. Only string\nkeys carry a value `MGET` can read; a matched key of another type\n(hash, set, list, zset, stream) is skipped and counted in a warning.",
           "type": "object",
           "properties": {
             "pattern": {
@@ -8824,8 +8838,30 @@
                   "$ref": "#/$defs/source_kafka__KafkaAuth"
                 },
                 "ssl": {
-                  "description": "TLS layer (must be `Ssl`).",
+                  "description": "TLS layer: `tls` (server-authenticated TLS, the usual shape for\nmanaged clusters), `ssl` (with a client certificate), or `none`\n(TLS with the system trust store).",
                   "$ref": "#/$defs/source_kafka__KafkaAuth"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Server-authenticated TLS without a client certificate. Inside\n`sasl_ssl` this is SASL over TLS; on its own it is an encrypted,\nunauthenticated connection.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "tls"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "ca_path": {
+                  "description": "CA certificate file to trust; the system trust store when omitted.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               }
             }
@@ -10156,7 +10192,7 @@
           }
         },
         "write_disposition": {
-          "description": "BigQuery load `writeDisposition` — `WRITE_APPEND` (default),\n`WRITE_TRUNCATE`, or `WRITE_EMPTY`.",
+          "description": "BigQuery load `writeDisposition`. Only `WRITE_APPEND` (the default) is\naccepted: the staged path runs one load job per batch, so a truncating\nor empty-only disposition would keep only the last batch or fail on the\nsecond. Use `write_mode: overwrite` (bucket-free) for a full refresh.",
           "type": "string",
           "default": "WRITE_APPEND"
         },
@@ -10875,7 +10911,7 @@
       "description": "MSSQL encryption mode.",
       "oneOf": [
         {
-          "description": "Encrypt the connection if the server supports it (the safe modern\ndefault). Maps to `tiberius` `EncryptionLevel::On`.",
+          "description": "The default; encrypts the connection and **fails** against a server\nthat offers no encryption (there is no plaintext fallback — tiberius\ncannot negotiate one without panicking). Same as `require`.",
           "type": "string",
           "const": "prefer"
         },
@@ -10885,7 +10921,7 @@
           "const": "require"
         },
         {
-          "description": "Encrypt and accept the server certificate without validating its chain\n(self-signed dev servers). Maps to `EncryptionLevel::On` + `trust_cert()`.\n**Insecure against MITM — never use in production.**",
+          "description": "Encrypt and accept the server certificate without validating its chain\n(self-signed dev servers); `ca_cert_path` cannot be combined with it.\n**Insecure against MITM — never use in production.**",
           "type": "string",
           "const": "trust_server_certificate"
         },
@@ -12424,8 +12460,30 @@
                   "$ref": "#/$defs/sink_kafka__KafkaAuth"
                 },
                 "ssl": {
-                  "description": "TLS layer (must be `Ssl`).",
+                  "description": "TLS layer: `tls` (server-authenticated TLS, the usual shape for\nmanaged clusters), `ssl` (with a client certificate), or `none`\n(TLS with the system trust store).",
                   "$ref": "#/$defs/sink_kafka__KafkaAuth"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Server-authenticated TLS without a client certificate. Inside\n`sasl_ssl` this is SASL over TLS; on its own it is an encrypted,\nunauthenticated connection.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "tls"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "ca_path": {
+                  "description": "CA certificate file to trust; the system trust store when omitted.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               }
             }
@@ -14534,7 +14592,7 @@
                       "default": null
                     },
                     "timeout": {
-                      "description": "Per-request timeout in seconds. Covers one HTTP request, not the whole\nrun, so a paginated extract is bounded per page.",
+                      "description": "Per-request timeout in seconds. Covers one HTTP request, not the whole\nrun, so a paginated extract is bounded per page. A streamed `async_job`\nresult download is bounded per connect and per idle read instead.",
                       "type": [
                         "integer",
                         "null",
@@ -14851,6 +14909,13 @@
                         {
                           "type": "null"
                         }
+                      ]
+                    },
+                    "allow_missing_records_path": {
+                      "description": "Accept a response in which `records_path` resolves to nothing (the key\nis absent) as an empty page. Off by default: a missing key usually means\nan error body served with HTTP 200 or a renamed field, and treating it\nas \"no more records\" ends the run green with rows unread. Enable it\nonly for APIs that omit the records key on an empty result.",
+                      "type": [
+                        "boolean",
+                        "string"
                       ]
                     }
                   }
@@ -15414,7 +15479,10 @@
                       "minimum": 0,
                       "default": 300
                     }
-                  }
+                  },
+                  "x-faucet-aliases": [
+                    "max_reconnect_attempts"
+                  ]
                 },
                 true
               ]
@@ -15499,6 +15567,21 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "read_timeout_secs": {
+                      "description": "Longest the source waits on the server for the next row (or for a\nwhole result in `fetch_all`), in seconds, before the read fails.\nDefaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle eviction by a NAT or load balancer) otherwise leaves the read\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
+                    },
+                    "json_big_numbers": {
+                      "description": "What to do with a number inside a JSON column that a 64-bit float\ncannot represent exactly (more than about 17 significant digits, or\nbeyond the `u64` / `i64` range): `fail` (default) fails the read with\nan error naming the column, `string` emits the number as a JSON string\nholding its exact digits (with one warning per column).",
+                      "$ref": "#/$defs/source_postgres__JsonBigNumbers",
+                      "default": "fail"
                     }
                   }
                 },
@@ -15562,7 +15645,7 @@
                       "default": true
                     },
                     "slot_type": {
-                      "description": "Whether a newly-created slot is `permanent` (survives disconnect) or\n`temporary` (auto-dropped when the replication connection closes).\n\nDefault `permanent` (back-compatible). **A permanent slot pins WAL on\nthe server until it is consumed or dropped** — an abandoned permanent\nslot fills `pg_wal` and can take the whole instance down. Use\n`temporary` for ephemeral / test runs (note: a temporary slot resets on\nreconnect, so bookmark-based resume across runs requires a permanent\nslot). Drop an unused permanent slot explicitly with\n[`PostgresCdcSource::drop_slot`](crate::PostgresCdcSource::drop_slot).",
+                      "description": "Lifetime of a newly-created slot. Only `permanent` (the default) is\naccepted: a `temporary` slot is dropped with the session that creates\nit, before replication can start on its own connection, so it is\nrefused at config load.\n\n**A permanent slot pins WAL on the server until it is consumed or\ndropped** — an abandoned permanent slot fills `pg_wal` and can take the\nwhole instance down. Drop an unused slot explicitly with\n[`PostgresCdcSource::drop_slot`](crate::PostgresCdcSource::drop_slot).",
                       "$ref": "#/$defs/source_postgres-cdc__SlotType",
                       "default": "permanent"
                     },
@@ -15643,6 +15726,16 @@
                       "minimum": 0,
                       "default": null
                     },
+                    "max_buffered_events": {
+                      "description": "Replication events read ahead while the pipeline is busy writing a\npage. Reading ahead keeps the replication client sending its status\nupdates, so a long sink write does not let the server's\n`wal_sender_timeout` (default 60 s) end the connection. Past this many\nbuffered events reading pauses until the pipeline catches up — keep a\npage write well under `wal_sender_timeout`, or raise it, if a page\nwrite can outlast that much change volume. Default 100 000.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 100000
+                    },
                     "status_update_interval": {
                       "description": "Interval at which Standby Status Update keepalives are sent to the\nserver. Must be shorter than `idle_timeout` and well under the\nserver's `wal_sender_timeout` (default 60 s). Default: 10 s.",
                       "type": [
@@ -15654,7 +15747,7 @@
                       "default": 10
                     },
                     "tcp_keepalive": {
-                      "description": "TCP keepalive for the replication connection. Default: 60 s.",
+                      "description": "Accepted for compatibility and ignored: the replication client sets no\nsocket keepalive (a non-default value logs a warning). A dead\nreplication connection is detected through `status_update_interval`\nand the server's `wal_sender_timeout`. Default: 60 s.",
                       "type": [
                         "integer",
                         "string"
@@ -15752,6 +15845,31 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "read_timeout_secs": {
+                      "description": "Longest the source waits on the server for the next row (or for a\nwhole result in `fetch_all`), in seconds, before the read fails.\nDefaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle eviction by a NAT or load balancer) otherwise leaves the read\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
+                    },
+                    "json_big_numbers": {
+                      "description": "What to do with a number inside a JSON column that a 64-bit float\ncannot represent exactly (more than about 17 significant digits, or\nbeyond the `u64` / `i64` range): `fail` (default) fails the read with\nan error naming the column, `string` emits the number as a JSON string\nholding its exact digits (with one warning per column).",
+                      "$ref": "#/$defs/source_mysql__JsonBigNumbers",
+                      "default": "fail"
+                    },
+                    "net_write_timeout_secs": {
+                      "description": "The session's `net_write_timeout`, in seconds: how long the server\nwaits for the source to read more of a result before it aborts the\nquery. The pipeline stops reading while the sink writes a page, so the\nserver default (60 s) kills large extracts behind a slow sink.\nDefaults to 3600; `0` keeps the server's setting.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
                     }
                   }
                 },
@@ -16140,6 +16258,14 @@
                       "format": "uint32",
                       "minimum": 0,
                       "default": 60
+                    },
+                    "include_metadata": {
+                      "description": "Wrap each record as `{ message_id, attributes, payload }`: the SQS\n`MessageId` (for downstream deduplication of redeliveries) and the\nmessage attributes, which are requested only when this is on. Default\n`false` (the decoded body alone).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
                     }
                   }
                 },
@@ -16279,6 +16405,14 @@
                       "description": "How a message payload becomes a record: `auto` (default — JSON when\nit parses, else the UTF-8 text), `json`, `string` or `bytes`\n(base64). A payload the format cannot represent fails the run rather\nthan being altered (#789 MSG-39).",
                       "$ref": "#/$defs/source_nats__NatsValueFormat",
                       "default": "auto"
+                    },
+                    "include_metadata": {
+                      "description": "Wrap each record as `{ subject, sequence, message_id, payload }` so a\ndownstream consumer can deduplicate redeliveries: `sequence` is the\nJetStream stream sequence (`null` in core mode) and `message_id` the\n`Nats-Msg-Id` header (`null` when absent). Default `false` (the\npayload alone).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
                     }
                   },
                   "title": "NatsSourceConfig",
@@ -17027,7 +17161,7 @@
                       "default": "off"
                     },
                     "start_from": {
-                      "description": "Start position on a fresh run (ignored once a bookmark exists, except an\nexplicit `resume_token`/`timestamp` which overrides the bookmark).",
+                      "description": "Start position on a fresh run; ignored once a bookmark exists.",
                       "$ref": "#/$defs/source_mongodb-cdc__StartFrom",
                       "default": {
                         "type": "now"
@@ -17325,7 +17459,7 @@
                       "default": 1000
                     },
                     "max_connections": {
-                      "description": "Maximum pooled connections. Defaults to 5.",
+                      "description": "Maximum pooled connections. Defaults to 5; raised to the number of\ncapture instances, since a poll reads every instance's changes at once\nto merge them in commit order.",
                       "type": [
                         "integer",
                         "string"
@@ -17424,7 +17558,7 @@
                       "$ref": "#/$defs/source_redshift__RedshiftCredentials"
                     },
                     "tls": {
-                      "description": "Whether to require TLS. Defaults to `true` (Redshift clusters require SSL\nby default). `true` maps to `sslmode=require`; `false` maps to\n`sslmode=prefer` (opportunistic TLS with plaintext fallback) — it never\nforbids encryption outright.",
+                      "description": "Whether to require TLS. Defaults to `true` (Redshift clusters require SSL\nby default). `true` maps to `sslmode=require` (encrypted, but the server\ncertificate is **not** verified); `false` maps to `sslmode=prefer`\n(opportunistic TLS with plaintext fallback). Ignored when `tls_mode` is\nset.",
                       "type": [
                         "boolean",
                         "string"
@@ -17470,6 +17604,24 @@
                     },
                     "state_key": {
                       "description": "Explicit state-store key for the incremental bookmark. When unset, a key\nis derived from the host / database and a query fingerprint.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "tls_mode": {
+                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or the system roots),\nthe latter also its host name.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_redshift__RedshiftTlsMode"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "ssl_root_cert": {
+                      "description": "PEM file of the CA that signed the server certificate (the Redshift CA\nbundle), for `tls_mode: verify_ca | verify_full`.",
                       "type": [
                         "string",
                         "null"
@@ -18039,6 +18191,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "parse_json": {
+                      "description": "Which values are parsed as JSON. `containers` (default) parses a value\nonly when it is a JSON object or array, so `\"1.10\"`, `\"true\"` and long\nnumeric ids stay the strings Redis holds; `all` also parses scalars;\n`none` keeps every value a string.",
+                      "$ref": "#/$defs/source_redis__RedisJsonParsing",
+                      "default": "containers"
+                    },
+                    "binary": {
+                      "description": "What to do with a value that is not valid UTF-8 (msgpack, gzip, …):\n`base64` (default) emits it base64-encoded, `lossy` replaces invalid\nsequences with U+FFFD, `error` fails the run naming the key.",
+                      "$ref": "#/$defs/source_redis__RedisBinary",
+                      "default": "base64"
                     }
                   }
                 },
@@ -18139,6 +18301,17 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "signature": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_webhook__WebhookSignature"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional HMAC request-signature verification for senders that sign the\nraw body instead of sending a static secret. Unsigned or mis-signed\nrequests are rejected with `401`."
                     }
                   }
                 },
@@ -18270,7 +18443,7 @@
                       "default": 1
                     },
                     "reconnect_max_attempts": {
-                      "description": "Cap on *consecutive* failed reconnects (resets on any received\nmessage). `None` = unlimited (then `idle_timeout` is the natural cap).\n\nSpelled `reconnect_max_attempts` on the wire, matching the gRPC\nsource's `reconnect_*` prefix; the historical `max_reconnect_attempts`\nstays accepted as an alias (#654 M20). The prefix used to be reversed\nbetween the two connectors, so a user who learned one spelling had the\nother silently ignored and reconnected without a bound.",
+                      "description": "Cap on *consecutive* failed reconnects (resets on a received data\nframe — a handshake the server accepts and then closes still counts). `None` = unlimited (then `idle_timeout` is the natural cap).\n\nSpelled `reconnect_max_attempts` on the wire, matching the gRPC\nsource's `reconnect_*` prefix; the historical `max_reconnect_attempts`\nstays accepted as an alias (#654 M20). The prefix used to be reversed\nbetween the two connectors, so a user who learned one spelling had the\nother silently ignored and reconnected without a bound.",
                       "type": [
                         "integer",
                         "null",
@@ -18298,6 +18471,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "connect_timeout": {
+                      "default": 30,
+                      "description": "Seconds allowed for the TCP connect + upgrade handshake and for sending\nthe subscribe frames (default 30). Expiry counts as a connect failure,\nso `reconnect` retries it.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   },
                   "additionalProperties": true
@@ -18489,7 +18672,7 @@
                       "default": true
                     },
                     "idle_timeout_secs": {
-                      "description": "Abort the run if no line arrives from the tap within this many seconds.\n`None` (default) waits indefinitely.",
+                      "description": "Abort the run if no line arrives from the tap within this many seconds\n(default 3600). `null` waits indefinitely — a stalled tap then hangs\nthe run.",
                       "type": [
                         "integer",
                         "null",
@@ -18497,7 +18680,7 @@
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": null
+                      "default": 3600
                     },
                     "on_malformed": {
                       "description": "How to handle a line that is not valid Singer JSON. Default\n[`MalformedPolicy::Skip`].",
@@ -18508,6 +18691,16 @@
                       "description": "Which of faucet's environment variables the tap receives: `true`\n(default) the whole environment, `false` only `PATH`, `HOME`, `LANG`,\n`LC_ALL` and `TMPDIR`, or a list of variable names passed on top of\nthat baseline. Set it to keep faucet's own credentials away from the tap.",
                       "$ref": "#/$defs/source_singer__InheritEnv",
                       "default": true
+                    },
+                    "max_line_bytes": {
+                      "default": 67108864,
+                      "description": "Longest tap output line accepted, in bytes (default 64 MiB). A longer\nline — a huge RECORD, or binary output with no newline — fails the run\ninstead of exhausting memory.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
                     }
                   }
                 },
@@ -18562,8 +18755,9 @@
                       "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`."
                     },
                     "scroll_timeout": {
-                      "description": "Scroll context timeout (e.g. `\"1m\"`). Defaults to `\"1m\"`.",
-                      "type": "string"
+                      "description": "Scroll context keep-alive (e.g. `\"5m\"`), renewed by every scroll\nrequest — so it must outlast the slowest page *write* between two\nrequests, or the context expires mid-run. Defaults to `\"5m\"`.",
+                      "type": "string",
+                      "default": "5m"
                     },
                     "auth": {
                       "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
@@ -18580,7 +18774,7 @@
                       "minimum": 0
                     },
                     "batch_size": {
-                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage), which is\nalso the `size` parameter passed to the Elasticsearch scroll API\n(`POST /{index}/_search?scroll={timeout}&size={batch_size}`). Each\nscroll response becomes exactly one `StreamPage`. Defaults to\n[`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the source issues a\nsingle non-scroll `_search` request with `size = 10_000` (the default\n`index.max_result_window`) and emits one `StreamPage`. Use it for\nsmall indices or for sinks (e.g. SQL `COPY`, BigQuery load jobs) that\nprefer one large request to many small ones. Indices that have raised\ntheir `max_result_window` will still cap at 10_000 — raise this knob\nor switch back to scroll if you need more.",
+                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage), which is\nalso the `size` parameter passed to the Elasticsearch scroll API\n(`POST /{index}/_search?scroll={timeout}&size={batch_size}`). Each\nscroll response becomes exactly one `StreamPage`. Defaults to\n[`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the whole result set\nis drained through the scroll API (10 000 documents per request) and\nemitted as one `StreamPage`. Use it for small indices or for sinks\n(e.g. SQL `COPY`, BigQuery load jobs) that prefer one large request to\nmany small ones.",
                       "type": [
                         "integer",
                         "string"
@@ -18588,6 +18782,26 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Seconds to wait for a TCP/TLS connection to the cluster. Default `10`.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "request_timeout_secs": {
+                      "description": "Seconds one search or scroll request may take end to end before it\nfails as retriable. Default `300`, so a half-open connection or a\nwedged node cannot hang a run forever.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 300
                     }
                   }
                 },
@@ -18670,7 +18884,7 @@
                       ]
                     },
                     "auto_offset_reset": {
-                      "description": "Where to start when the group has no committed offset: `earliest`\n(default) replays the retained log, `latest` consumes only new messages.\nIgnored once a bookmark or committed offset exists.",
+                      "description": "Where to start when the group has no committed offset: `latest`\n(default) consumes only new messages, `earliest` replays the retained\nlog. Ignored once a bookmark or committed offset exists.",
                       "$ref": "#/$defs/source_kafka__OffsetReset",
                       "default": "latest"
                     },
@@ -18889,6 +19103,11 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "on_decode_error": {
+                      "description": "What a record whose payload `value_format` cannot decode does: `fail`\n(default) fails the run naming the record; `skip` drops it (with a\nwarning) and moves the shard's bookmark past it; `raw` emits it with\n`data: { raw_base64, error }`. Without `skip`/`raw` one bad record\nblocks its shard on every run.",
+                      "$ref": "#/$defs/source_kinesis__OnDecodeError",
+                      "default": "fail"
                     }
                   }
                 },
@@ -19327,6 +19546,16 @@
                       "$ref": "#/$defs/source_databricks__ResultDisposition",
                       "default": "external_links",
                       "description": "How the row path fetches results: `external_links` (default) downloads\neach chunk from a presigned URL, so results of any size stream;\n`inline` keeps them in the API response, which Databricks caps at\n25 MiB. Use `inline` only when the client cannot reach the workspace's\ncloud storage."
+                    },
+                    "statement_timeout_secs": {
+                      "description": "Client deadline for the statement to finish, in seconds; on expiry it is\ncancelled and the read fails. `0` waits indefinitely. Defaults to 3600.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
                     }
                   }
                 },
@@ -19741,14 +19970,14 @@
                       "default": []
                     },
                     "statement_timeout": {
-                      "description": "Per-statement server-side timeout. Defaults to 60 seconds. Passed\nthrough as the `timeout` field on the `POST /api/v2/statements` request\nbody. The HTTP-level timeout for each individual request is configured\nseparately by the source via the underlying `reqwest` client defaults.",
+                      "description": "Server-side statement timeout, sent as the `timeout` field of\n`POST /api/v2/statements`. Snowflake **cancels** a statement that runs\nlonger (error 000630). Defaults to `0`: Snowflake's maximum. This is not\nhow long the submit waits before going async — that is fixed by the\nSQL API; see [`poll_timeout`](Self::poll_timeout) for the client cap.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": 60
+                      "default": 0
                     },
                     "poll_timeout": {
                       "description": "Maximum wall-clock time the source will spend polling an asynchronous\nstatement (one for which the initial `POST /api/v2/statements`\nreturns HTTP 202) before giving up with\n[`FaucetError::Source`](faucet_core::FaucetError::Source).\nWithout this cap a statement that never finishes would loop forever.\nDefaults to 300 seconds. Set to `0` to disable the cap and poll\nindefinitely.",
@@ -20360,7 +20589,7 @@
                   "properties": {
                     "batch_size": {
                       "default": 1000,
-                      "description": "`0` accumulates every change into one trailing page; otherwise each\ncommitted transaction is its own page. Default [`DEFAULT_BATCH_SIZE`].",
+                      "description": "`0` aggregates committed transactions into pages of up to 100,000\nrecords, emitted at least every `idle_timeout`, each with its bookmark;\notherwise each committed transaction is its own page. Default\n[`DEFAULT_BATCH_SIZE`].",
                       "format": "uint",
                       "minimum": 0,
                       "type": [
@@ -21366,6 +21595,16 @@
                         "null"
                       ]
                     },
+                    "job_timeout": {
+                      "description": "Longest the sink waits, in seconds, for one BigQuery job it started (a\nMERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before\ncancelling it and failing the write. Default `3600`; `0` waits for as\nlong as the job runs. A job that times out is cancelled so it cannot\ncommit after the run has been reported failed.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
+                    },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",
                       "$ref": "#/$defs/sink_bigquery__WriteMode",
@@ -21697,6 +21936,16 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "write_timeout_secs": {
+                      "description": "Longest a page write may wait on the server, in seconds, before it\nfails. Defaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle-eviction by a NAT or load balancer) otherwise leaves the write\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
                     }
                   },
                   "title": "PostgresSinkConfig",
@@ -21877,7 +22126,7 @@
                       "type": "string"
                     },
                     "create_table": {
-                      "description": "Create the target table if it does not exist, inferring the column\n**names** from the first written page (#580). Enabled by default: a\nfirst-ever sync cannot assume the destination already exists.\n\nColumns are created as nullable `STRING`, not as inferred types,\nbecause the insert path projects every value with `::string` — a\n`NUMBER` column would reject its own writer's cast. Define the table\nyourself and set `create_table: false` when you want typed columns\n(then use `schema:` drift to keep them aligned).",
+                      "description": "Create the target table if it does not exist, inferring the column\n**names** from the first written page (#580), and add a nullable\n`STRING` column for any field a later page brings that the table lacks.\nEnabled by default: a first-ever sync cannot assume the destination\nalready exists.\n\nColumns are created as nullable `STRING`, not as inferred types,\nbecause the insert path projects every value with `::string` — a\n`NUMBER` column would reject its own writer's cast. Define the table\nyourself and set `create_table: false` when you want typed columns;\na record field the table lacks then fails the write naming the field.\n(`schema:` drift policies do not apply: this sink reports no schema.)",
                       "type": [
                         "boolean",
                         "string"
@@ -21938,6 +22187,23 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "role": {
+                      "description": "Optional role to assume for the session; without it Snowflake uses the\nuser's default role.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "statement_timeout": {
+                      "description": "Server-side statement timeout, sent as the `timeout` field of every\nstatement. Snowflake **cancels** a statement that runs longer. Defaults\nto `0`: Snowflake's maximum.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 0
                     }
                   }
                 },
@@ -22046,6 +22312,16 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "write_timeout_secs": {
+                      "description": "Longest a page write may wait on the server, in seconds, before it\nfails. Defaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle-eviction by a NAT or load balancer) otherwise leaves the write\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 3600
                     }
                   },
                   "title": "MysqlSinkConfig",
@@ -22282,6 +22558,16 @@
                       ],
                       "default": true
                     },
+                    "busy_timeout_secs": {
+                      "description": "How long a write waits for another connection's write lock before\nfailing with `SQLITE_BUSY`, in seconds. Defaults to 60.\n\nSQLite has one writer per database file. When several pipelines (matrix\nrows, mirrored tables) write one file, a long write transaction — a\nlarge page or an overwrite commit — holds the lock; raise this when such\na transaction can last longer.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 60
+                    },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",
                       "$ref": "#/$defs/sink_sqlite__WriteMode",
@@ -22353,7 +22639,7 @@
                   "type": "object",
                   "properties": {
                     "database": {
-                      "description": "Path to the DuckDB database file, or `:memory:`. A `duckdb://` /\n`duckdb:` scheme prefix is accepted and stripped. The target table must\nalready exist.",
+                      "description": "Path to the DuckDB database file, or `:memory:`. A `duckdb://` /\n`duckdb:` scheme prefix is accepted and stripped.",
                       "type": "string"
                     },
                     "table_name": {
@@ -22469,7 +22755,7 @@
                       "default": 10
                     },
                     "concurrency": {
-                      "description": "Bounded concurrent in-flight `SendMessageBatch` requests. Default 4.",
+                      "description": "Bounded concurrent in-flight `SendMessageBatch` requests. Default 4.\nA FIFO queue (`.fifo`) always sends one request at a time, so a\nmessage group's order is preserved.",
                       "type": [
                         "integer",
                         "string"
@@ -22591,7 +22877,7 @@
                       ]
                     },
                     "batch_size": {
-                      "description": "Records per publish batch. Records are published one NATS message each;\nafter every `batch_size` records the client is flushed so nothing is\nlost. Defaults to [`DEFAULT_BATCH_SIZE`]. `0` publishes the whole batch\nhanded by the pipeline, flushing once at the end.",
+                      "description": "Records per publish batch: the client is flushed (core NATS) or the\nacks awaited (JetStream) after every `batch_size` records. Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` publishes the whole page handed by the\npipeline before flushing / awaiting once.",
                       "type": [
                         "integer",
                         "string"
@@ -22599,6 +22885,24 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "jetstream": {
+                      "description": "Publish through JetStream and await each message's acknowledgement, so\na publish no stream stores (no stream bound to the subject, a stream\nlimit, a rejected message) fails its row instead of vanishing. Each row\ngets its own outcome, so failed rows can go to a DLQ. Default `false`:\ncore NATS publish, which only confirms the server received the bytes.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "publish_timeout_secs": {
+                      "description": "Seconds a publish batch (publishes plus the flush, or the JetStream\nacks) may take before the write fails as retriable, so a server outage\ncannot wedge the run. Default `30`.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
                     }
                   },
                   "title": "NatsSinkConfig",
@@ -22766,12 +23070,12 @@
                       "default": true
                     },
                     "mandatory": {
-                      "description": "Publish with the `mandatory` flag: a message no queue is bound to\nreceive is returned by the broker and surfaces as a per-row error\n(DLQ-routable) instead of being silently dropped. Requires `confirm`.\nDefaults to `false`.",
+                      "description": "Publish with the `mandatory` flag: a message no queue is bound to\nreceive is returned by the broker and surfaces as a per-row error\n(DLQ-routable) instead of being silently dropped. Takes effect with\n`confirm` (returns are matched to rows through the confirms) and is\nignored without it. Defaults to `true`.",
                       "type": [
                         "boolean",
                         "string"
                       ],
-                      "default": false
+                      "default": true
                     },
                     "confirm": {
                       "description": "Enable publisher confirms: every batch waits for the broker to\nacknowledge each message before the write returns. Defaults to `true`\n(the reliable setting — without it a broker-side failure is invisible).",
@@ -22790,6 +23094,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "publish_timeout_secs": {
+                      "description": "Seconds one publish group (its publishes and their confirms) may take\nbefore the write fails as retriable — a broker under a memory or disk\nalarm blocks publishers indefinitely. Default `60`.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 60
                     }
                   },
                   "title": "RabbitMqSinkConfig",
@@ -23117,7 +23431,7 @@
                     },
                     "flush_timeout_secs": {
                       "default": 600,
-                      "description": "How long a flush waits for the target to echo `STATE` (or to exit, with\n`flush_on: exit`) before failing. Default 600.",
+                      "description": "How long a flush waits for the target to echo `STATE` (or to exit, with\n`flush_on: exit`) before failing, and how long one write may block on a\ntarget that stopped reading its stdin. Default 600.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -23524,6 +23838,26 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "ttl_secs": {
+                      "description": "`KeyValue` only: expire every written key after this many seconds\n(`SET … EX`). Keys never expire when unset.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "stream_max_len": {
+                      "description": "`Stream` only: cap the stream at about this many entries\n(`XADD … MAXLEN ~ n`), trimming the oldest. Unbounded when unset.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
                     }
                   }
                 },
@@ -23700,6 +24034,31 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Seconds to wait for a TCP/TLS connection to the cluster. Default `10`.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "request_timeout_secs": {
+                      "description": "Seconds one HTTP request (a `_bulk`, `_delete_by_query`, mapping call)\nmay take end to end before it fails as retriable. Default `300`, so a\nhalf-open connection or wedged node cannot hang a run forever.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 300
+                    },
+                    "op_type": {
+                      "description": "The `_bulk` action for `append` writes: `index` (default; overwrites a\ndocument with the same `_id`) or `create` (required by data streams,\nwhich reject `index`; a document whose `_id` already exists is a\nper-row error). `upsert` / `delete` / `overwrite` always use `index`.",
+                      "$ref": "#/$defs/sink_elasticsearch__ElasticsearchOpType",
+                      "default": "index"
                     }
                   },
                   "title": "ElasticsearchSinkConfig",
@@ -24264,15 +24623,22 @@
                     },
                     "method": {
                       "description": "HTTP method (default: POST).",
-                      "type": "string"
+                      "type": "string",
+                      "default": "POST"
                     },
                     "auth": {
-                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
-                      "$ref": "#/$defs/sink_http__AuthSpec"
+                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.\nDefaults to no authentication.",
+                      "$ref": "#/$defs/sink_http__AuthSpec",
+                      "default": {
+                        "type": "none"
+                      }
                     },
                     "batch_mode": {
-                      "description": "How to batch records in requests.",
-                      "$ref": "#/$defs/sink_http__HttpBatchMode"
+                      "description": "How to batch records in requests (default: `Individual`).",
+                      "$ref": "#/$defs/sink_http__HttpBatchMode",
+                      "default": {
+                        "type": "Individual"
+                      }
                     },
                     "max_retries": {
                       "description": "Number of retries on transient failures (default: 0).",
@@ -24281,16 +24647,18 @@
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 0
                     },
                     "concurrency": {
-                      "description": "Maximum number of concurrent requests in Individual mode (default: 10).",
+                      "description": "Maximum number of concurrent requests in Individual mode (default: 10).\nAbove 1 the records of a page are sent in parallel and can reach the\nendpoint out of order — use `1` for a last-write-wins endpoint that\nreceives several updates to one entity per page.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 10
                     },
                     "batch_size": {
                       "description": "Maximum number of records sent per outbound HTTP request. Defaults to\n[`DEFAULT_BATCH_SIZE`] (1000).\n\nInterpretation depends on [`batch_mode`](Self::batch_mode):\n\n- In [`HttpBatchMode::Array`] mode, `write_batch` re-chunks the\n  incoming slice into `batch_size`-row chunks and issues one POST\n  request per chunk, with each request body a JSON array of up to\n  `batch_size` records. `batch_size = 0` is the **\"no batching\"\n  sentinel**: the entire upstream `StreamPage` is forwarded as a\n  single JSON array — useful when the source already chunks to a\n  size the destination endpoint accepts.\n- In [`HttpBatchMode::Individual`] mode the sink already sends one\n  request per record, so `batch_size` has no effect on wire framing;\n  the field is accepted for config-shape parity with other sinks\n  and validated via [`faucet_core::validate_batch_size`] at load\n  time.\n\nRecommended value for HTTP POST endpoints that accept arrays:\nmatch the destination's documented batch limit (commonly 100–1000\nrecords per request).",
@@ -24994,7 +25362,7 @@
                       "$ref": "#/$defs/sink_redshift__RedshiftCredentials"
                     },
                     "tls": {
-                      "description": "Whether to require TLS. Defaults to `true` (Redshift clusters require SSL\nby default). `true` maps to `sslmode=require`; `false` maps to\n`sslmode=prefer` (opportunistic TLS with plaintext fallback) — it never\nforbids encryption outright.",
+                      "description": "Whether to require TLS. Defaults to `true` (Redshift clusters require SSL\nby default). `true` maps to `sslmode=require` (encrypted, but the server\ncertificate is **not** verified); `false` maps to `sslmode=prefer`\n(opportunistic TLS with plaintext fallback). Ignored when `tls_mode` is\nset.",
                       "type": [
                         "boolean",
                         "string"
@@ -25113,6 +25481,24 @@
                       "format": "uint32",
                       "minimum": 0,
                       "default": 5
+                    },
+                    "tls_mode": {
+                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or the system roots),\nthe latter also its host name.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_redshift__RedshiftTlsMode"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "ssl_root_cert": {
+                      "description": "PEM file of the CA that signed the server certificate (the Redshift CA\nbundle), for `tls_mode: verify_ca | verify_full`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "title": "RedshiftSinkConfig",
@@ -29208,7 +29594,7 @@
           "minimum": 0
         },
         "max_wait_secs": {
-          "description": "Longest wait `backoff_from` may ask for (default 3600). A longer one\nfails the run with an error naming the reset instead of parking it.",
+          "description": "Longest wait a matched response may ask for — from `backoff_from`,\n`backoff_secs` or `Retry-After` (default 3600). A longer one fails the\nrun with an error naming the reset instead of parking it.",
           "type": [
             "integer",
             "null",
@@ -29639,7 +30025,7 @@
           "minimum": 0
         },
         "max_wait_secs": {
-          "description": "Longest wait `backoff_from` may ask for (default 3600). A longer one\nfails the run with an error naming the reset instead of parking it.",
+          "description": "Longest wait a matched response may ask for — from `backoff_from`,\n`backoff_secs` or `Retry-After` (default 3600). A longer one fails the\nrun with an error naming the reset instead of parking it.",
           "type": [
             "integer",
             "null",
@@ -31484,6 +31870,250 @@
           "description": "The raw bytes, base64-encoded into a JSON string.",
           "type": "string",
           "const": "bytes"
+        }
+      ]
+    },
+    "source_postgres__JsonBigNumbers": {
+      "description": "What to do with a number inside a JSON / JSONB column that a 64-bit float\ncannot hold exactly.",
+      "oneOf": [
+        {
+          "description": "Fail the read with an error naming the column (default): no silent\nrounding.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Emit that number as a JSON string holding its exact digits.",
+          "type": "string",
+          "const": "string"
+        }
+      ]
+    },
+    "source_mysql__JsonBigNumbers": {
+      "description": "What to do with a number inside a JSON / JSONB column that a 64-bit float\ncannot hold exactly.",
+      "oneOf": [
+        {
+          "description": "Fail the read with an error naming the column (default): no silent\nrounding.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Emit that number as a JSON string holding its exact digits.",
+          "type": "string",
+          "const": "string"
+        }
+      ]
+    },
+    "source_webhook__SignatureAlgorithm": {
+      "description": "HMAC digest for [`WebhookSignature`].",
+      "oneOf": [
+        {
+          "const": "sha256",
+          "description": "HMAC-SHA256.",
+          "type": "string"
+        },
+        {
+          "const": "sha512",
+          "description": "HMAC-SHA512.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_webhook__SignatureEncoding": {
+      "description": "Text encoding of the signature digest.",
+      "oneOf": [
+        {
+          "const": "hex",
+          "description": "Hexadecimal (case-insensitive).",
+          "type": "string"
+        },
+        {
+          "const": "base64",
+          "description": "Standard base64.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_webhook__WebhookSignature": {
+      "additionalProperties": true,
+      "description": "HMAC signature verification over the raw request body.",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/source_webhook__SignatureAlgorithm",
+          "default": "sha256",
+          "description": "HMAC digest (default `sha256`)."
+        },
+        "encoding": {
+          "$ref": "#/$defs/source_webhook__SignatureEncoding",
+          "default": "hex",
+          "description": "How the digest is written in the header (default `hex`)."
+        },
+        "header": {
+          "description": "Request header carrying the signature (e.g. `X-Hub-Signature-256`).",
+          "type": "string"
+        },
+        "prefix": {
+          "description": "Text before the digest in the header value (e.g. `sha256=`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "description": "The shared signing secret.",
+          "type": "string"
+        },
+        "timestamp_header": {
+          "description": "Header carrying the Unix-seconds timestamp the sender signed. When set,\nthe signed content is `<timestamp>.<body>` and a timestamp more than\n`tolerance_secs` from now is rejected (replay protection).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tolerance_secs": {
+          "default": 300,
+          "description": "Accepted clock difference for `timestamp_header`, in seconds (default 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "source_redshift__RedshiftTlsMode": {
+      "description": "How a Redshift connection uses TLS.",
+      "oneOf": [
+        {
+          "description": "Plaintext only.",
+          "type": "string",
+          "const": "disable"
+        },
+        {
+          "description": "TLS when the server offers it, else plaintext.",
+          "type": "string",
+          "const": "prefer"
+        },
+        {
+          "description": "TLS required; the certificate is not verified.",
+          "type": "string",
+          "const": "require"
+        },
+        {
+          "description": "TLS required and the certificate chain verified.",
+          "type": "string",
+          "const": "verify_ca"
+        },
+        {
+          "description": "As `verify_ca`, plus the certificate must name the host.",
+          "type": "string",
+          "const": "verify_full"
+        }
+      ]
+    },
+    "source_redis__RedisJsonParsing": {
+      "description": "Which Redis values the source parses as JSON.",
+      "oneOf": [
+        {
+          "description": "Parse objects and arrays only; scalars stay strings.",
+          "type": "string",
+          "const": "containers"
+        },
+        {
+          "description": "Parse any value that is valid JSON.",
+          "type": "string",
+          "const": "all"
+        },
+        {
+          "description": "Never parse; every value is a string.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "source_redis__RedisBinary": {
+      "description": "How the source renders a value that is not valid UTF-8.",
+      "oneOf": [
+        {
+          "description": "Standard base64 (padded) string.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "UTF-8 with invalid sequences replaced by U+FFFD.",
+          "type": "string",
+          "const": "lossy"
+        },
+        {
+          "description": "Fail the run.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "source_kinesis__OnDecodeError": {
+      "description": "[`KinesisSourceConfig::on_decode_error`].",
+      "oneOf": [
+        {
+          "description": "Fail the run.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Drop the record and advance past it.",
+          "type": "string",
+          "const": "skip"
+        },
+        {
+          "description": "Emit the raw bytes (base64) with the decode error.",
+          "type": "string",
+          "const": "raw"
+        }
+      ]
+    },
+    "sink_elasticsearch__ElasticsearchOpType": {
+      "description": "The `_bulk` action an append write issues.",
+      "oneOf": [
+        {
+          "description": "`index`: create or replace by `_id`.",
+          "type": "string",
+          "const": "index"
+        },
+        {
+          "description": "`create`: create only (data streams).",
+          "type": "string",
+          "const": "create"
+        }
+      ]
+    },
+    "sink_redshift__RedshiftTlsMode": {
+      "description": "How a Redshift connection uses TLS.",
+      "oneOf": [
+        {
+          "description": "Plaintext only.",
+          "type": "string",
+          "const": "disable"
+        },
+        {
+          "description": "TLS when the server offers it, else plaintext.",
+          "type": "string",
+          "const": "prefer"
+        },
+        {
+          "description": "TLS required; the certificate is not verified.",
+          "type": "string",
+          "const": "require"
+        },
+        {
+          "description": "TLS required and the certificate chain verified.",
+          "type": "string",
+          "const": "verify_ca"
+        },
+        {
+          "description": "As `verify_ca`, plus the certificate must name the host.",
+          "type": "string",
+          "const": "verify_full"
         }
       ]
     }

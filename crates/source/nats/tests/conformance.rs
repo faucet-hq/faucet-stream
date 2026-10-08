@@ -288,4 +288,91 @@ mod docker {
             "without in-progress acks the held messages come back (proves the test can fail)"
         );
     }
+
+    async fn jetstream_with(server: &str, max_ack_pending: i64, n: usize) {
+        use async_nats::jetstream::consumer::pull::Config as PullConfig;
+        let client = async_nats::connect(server).await.expect("connect");
+        let js = async_nats::jetstream::new(client);
+        let stream = js
+            .create_stream(async_nats::jetstream::stream::Config {
+                name: "EVENTS".into(),
+                subjects: vec!["events.>".into()],
+                ..Default::default()
+            })
+            .await
+            .expect("stream");
+        stream
+            .create_consumer(PullConfig {
+                durable_name: Some("faucet".into()),
+                ack_wait: std::time::Duration::from_secs(60),
+                max_ack_pending,
+                ..Default::default()
+            })
+            .await
+            .expect("consumer");
+        for i in 0..n {
+            js.publish("events.x", format!(r#"{{"i":{i}}}"#).into())
+                .await
+                .expect("publish")
+                .await
+                .expect("ack");
+        }
+    }
+
+    fn js_config(server: &str, max: usize) -> NatsSourceConfig {
+        let mut cfg = NatsSourceConfig::new("events.>");
+        cfg.connection.servers = vec![server.to_string()];
+        cfg.jetstream_stream = Some("EVENTS".into());
+        cfg.jetstream_consumer = Some("faucet".into());
+        cfg.max_messages = Some(max);
+        cfg.idle_timeout_secs = None;
+        cfg.batch_size = 4;
+        cfg.include_metadata = true;
+        cfg
+    }
+
+    /// `max_messages` pulls only what it needs, so the next run gets the rest
+    /// immediately instead of after `ack_wait` (MSG-45); every record carries
+    /// its stream sequence for downstream dedupe (MSG-91).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn max_messages_leaves_the_backlog_unleased() {
+        let (_container, server) = start_jetstream().await;
+        jetstream_with(&server, -1, 10).await;
+        let first = drain(&NatsSource::new(js_config(&server, 3)).await.unwrap()).await;
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0]["sequence"], 1);
+        assert_eq!(first[0]["payload"], serde_json::json!({"i": 0}));
+        let rest = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            drain(&NatsSource::new(js_config(&server, 7)).await.unwrap()),
+        )
+        .await
+        .expect("the rest is deliverable at once, not after ack_wait");
+        let seqs: Vec<_> = rest
+            .iter()
+            .map(|r| r["sequence"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, (4..=10).collect::<Vec<u64>>());
+    }
+
+    /// Pages are capped at the consumer's `max_ack_pending`, so a run with
+    /// only `max_messages` never stalls waiting on its own unacked page
+    /// (MSG-47).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pages_never_exceed_max_ack_pending() {
+        let (_container, server) = start_jetstream().await;
+        jetstream_with(&server, 2, 6).await;
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            drain(&NatsSource::new(js_config(&server, 6)).await.unwrap()),
+        )
+        .await
+        .expect("the run completes");
+        let mut seqs: Vec<_> = got
+            .iter()
+            .map(|r| r["sequence"].as_u64().unwrap())
+            .collect();
+        seqs.dedup();
+        assert_eq!(seqs, (1..=6).collect::<Vec<u64>>(), "no duplicates");
+    }
 }

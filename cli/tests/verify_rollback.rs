@@ -19,6 +19,7 @@ use std::path::Path;
 fn opts(name: &str, cfg: &PipelineConfig) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: name.into(),
         run_id: None,
         execution: None,

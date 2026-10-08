@@ -119,10 +119,25 @@ fn fits(dest: &Value, page: &Value) -> bool {
     if pnull && !dnull {
         return false;
     }
+    let also: Vec<&str> = dest
+        .get(DRIFT_ALSO_ACCEPTS)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     // Every page base type must be accepted by the destination.
-    pn.iter()
-        .all(|t| dn.contains(t) || (t == "integer" && dn.iter().any(|d| d == "number")))
+    pn.iter().all(|t| {
+        dn.contains(t)
+            || also.contains(&t.as_str())
+            || (t == "integer" && dn.iter().any(|d| d == "number"))
+    })
 }
+
+/// Key a sink may add to a column fragment in [`crate::Sink::current_schema`]
+/// listing extra JSON types the column stores faithfully without changing its
+/// declared type — e.g. `{"type":"integer","x-faucet-also-accepts":["boolean"]}`
+/// for a column the sink itself creates for booleans. Such page types fit the
+/// column; they never take part in widening.
+pub const DRIFT_ALSO_ACCEPTS: &str = "x-faucet-also-accepts";
 
 /// Can the destination column losslessly evolve to accept the page?
 ///
@@ -374,6 +389,25 @@ mod tests {
 
     fn schema(props: Value) -> Value {
         json!({ "type": "object", "properties": props })
+    }
+
+    #[test]
+    fn also_accepts_lets_extra_types_fit_without_widening() {
+        let dest = schema(json!({
+            "flag": {"type": ["integer", "null"], DRIFT_ALSO_ACCEPTS: ["boolean"]},
+            "doc": {"type": ["string", "null"], DRIFT_ALSO_ACCEPTS: ["object", "array"]},
+        }));
+        let page = schema(json!({
+            "flag": {"type": "boolean"},
+            "doc": {"type": ["object", "array"]},
+        }));
+        assert!(diff_schema(&dest, &page, true).is_empty());
+        let page = schema(json!({"flag": {"type": "number"}}));
+        let d = diff_schema(&dest, &page, true);
+        assert_eq!(d.widenings.len(), 1);
+        let plain = schema(json!({"flag": {"type": ["integer", "null"]}}));
+        let page = schema(json!({"flag": {"type": "boolean"}}));
+        assert_eq!(diff_schema(&plain, &page, true).incompatible.len(), 1);
     }
 
     #[test]

@@ -15,23 +15,43 @@
 use crate::schema_registry::{client::SchemaRegistryClient, envelope};
 use faucet_core::FaucetError;
 use prost::Message as _;
-use prost_reflect::{DescriptorPool, DynamicMessage};
+use prost_reflect::{DescriptorPool, DynamicMessage, SerializeOptions};
 use serde_json::Value;
+use std::sync::Arc;
+
+fn compiled(
+    client: &SchemaRegistryClient,
+    proto_source: &str,
+) -> Result<Arc<(DescriptorPool, String)>, FaucetError> {
+    client.parsed("protobuf", proto_source, compile_proto)
+}
+
+/// JSON for a decoded message: every field present (proto3 defaults such as
+/// `0`, `false` and `""` included) under its `.proto` name (#789 MSG-28).
+fn message_to_json(message: &DynamicMessage) -> Result<Value, FaucetError> {
+    let options = SerializeOptions::new()
+        .skip_default_fields(false)
+        .use_proto_field_name(true);
+    message
+        .serialize_with_options(serde_json::value::Serializer, &options)
+        .map_err(FaucetError::Json)
+}
 
 /// Decode `bytes` (with Confluent envelope + message-index prefix) into JSON.
 pub async fn decode(client: &SchemaRegistryClient, bytes: &[u8]) -> Result<Value, FaucetError> {
     let (schema_id, body) = envelope::decode(bytes)?;
     let registered = client.get_schema(schema_id).await?;
     let payload = parse_message_indexes(body)?;
-    let (pool, message_name) = compile_proto(&registered.schema)?;
-    let message_descriptor = pool.get_message_by_name(&message_name).ok_or_else(|| {
+    let compiled = compiled(client, &registered.schema)?;
+    let (pool, message_name) = &*compiled;
+    let message_descriptor = pool.get_message_by_name(message_name).ok_or_else(|| {
         FaucetError::Source(format!(
             "protobuf: message '{message_name}' not found in compiled schema"
         ))
     })?;
     let dynamic = DynamicMessage::decode(message_descriptor, payload)
         .map_err(|e| FaucetError::Source(format!("protobuf decode: {e}")))?;
-    serde_json::to_value(&dynamic).map_err(FaucetError::Json)
+    message_to_json(&dynamic)
 }
 
 /// Encode `value` as the first message in `proto_source` under `subject`.
@@ -42,8 +62,9 @@ pub async fn encode(
     proto_source: &str,
     value: &Value,
 ) -> Result<Vec<u8>, FaucetError> {
-    let (pool, message_name) = compile_proto(proto_source)?;
-    let message_descriptor = pool.get_message_by_name(&message_name).ok_or_else(|| {
+    let compiled = compiled(client, proto_source)?;
+    let (pool, message_name) = &*compiled;
+    let message_descriptor = pool.get_message_by_name(message_name).ok_or_else(|| {
         FaucetError::Config(format!(
             "protobuf: message '{message_name}' not found in schema"
         ))
@@ -183,6 +204,44 @@ mod tests {
         // proto3 int64 round-trips through JSON as a string per the proto3 JSON mapping spec.
         assert_eq!(decoded["id"], serde_json::json!("42"));
         assert_eq!(decoded["name"], serde_json::json!("alice"));
+    }
+
+    #[tokio::test]
+    async fn defaults_survive_and_names_stay_snake_case() {
+        let proto = "syntax = \"proto3\";\npackage p;\nmessage Order { int32 order_id = 1; bool paid = 2; string note = 3; }\n";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/subjects/o-value/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 5})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": proto,
+                "schemaType": "PROTOBUF",
+            })))
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        let bytes = encode(
+            &client,
+            "o-value",
+            proto,
+            &serde_json::json!({"order_id": 0, "paid": false, "note": ""}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decode(&client, &bytes).await.unwrap(),
+            serde_json::json!({"order_id": 0, "paid": false, "note": ""})
+        );
+        let a = compiled(&client, proto).unwrap();
+        let b = compiled(&client, proto).unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the compiled descriptor pool is cached"
+        );
     }
 
     #[test]

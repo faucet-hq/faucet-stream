@@ -14,6 +14,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn opts(clock: &str) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: "clocked".into(),
         run_id: None,
         execution: None,

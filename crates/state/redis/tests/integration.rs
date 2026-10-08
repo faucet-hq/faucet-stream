@@ -22,6 +22,19 @@ async fn start_redis() -> (ContainerAsync<Redis>, String) {
         .await
         .expect("redis port");
     let url = format!("redis://127.0.0.1:{port}");
+    // The mapped port can accept before Redis does; wait for a PING.
+    let client = redis::Client::open(url.as_str()).expect("client");
+    for _ in 0..50 {
+        if let Ok(mut conn) = client.get_multiplexed_async_connection().await
+            && redis::cmd("PING")
+                .query_async::<String>(&mut conn)
+                .await
+                .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     (container, url)
 }
 
@@ -190,4 +203,187 @@ async fn list_by_prefix_and_atomic_batch() {
             .await
             .is_err()
     );
+}
+
+/// #789 SQL-89 / SQL-120: a dropped connection is re-established instead of
+/// failing every later call, and `list` walks every SCAN page.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnects_after_a_dropped_connection_and_lists_every_page() {
+    let (_container, url) = start_redis().await;
+    let store = RedisStateStore::connect(&url, "faucet")
+        .await
+        .expect("connect");
+    store.put("before", &json!(1)).await.expect("put");
+
+    let client = redis::Client::open(url.as_str()).expect("client");
+    let mut admin = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("admin");
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("TYPE")
+        .arg("normal")
+        .arg("SKIPME")
+        .arg("yes")
+        .query_async(&mut admin)
+        .await
+        .expect("client kill");
+    assert!(killed >= 1, "the store's connection must have been killed");
+
+    assert_eq!(
+        store.get("before").await.expect("get after kill"),
+        Some(json!(1))
+    );
+    store.put("after", &json!(2)).await.expect("put after kill");
+
+    let entries: Vec<(String, serde_json::Value)> = (0..1_200)
+        .map(|i| (format!("orders::{i:04}"), json!(i)))
+        .collect();
+    store.put_batch(&entries).await.expect("batch");
+    let listed = store.list("orders::").await.expect("list");
+    assert_eq!(listed.len(), 1_200);
+    assert_eq!(listed[0], "orders::0000");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_and_put_is_atomic_across_concurrent_callers() {
+    let (_container, url) = start_redis().await;
+    let store = std::sync::Arc::new(
+        RedisStateStore::connect(&url, "faucet")
+            .await
+            .expect("connect"),
+    );
+    assert!(store.supports_compare_and_put());
+
+    let mut tasks = Vec::new();
+    for i in 0..32 {
+        let s = store.clone();
+        tasks.push(tokio::spawn(async move {
+            s.compare_and_put("lease", None, &json!({ "by": i }))
+                .await
+                .expect("cas")
+        }));
+    }
+    let mut winners = 0;
+    for t in tasks {
+        if t.await.expect("join") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one absent-expected take may win");
+    let held = store.get("lease").await.expect("get").expect("lease held");
+
+    let mut tasks = Vec::new();
+    for i in 0..32 {
+        let (s, held) = (store.clone(), held.clone());
+        tasks.push(tokio::spawn(async move {
+            s.compare_and_put("lease", Some(&held), &json!({ "next": i }))
+                .await
+                .expect("cas")
+        }));
+    }
+    let mut winners = 0;
+    for t in tasks {
+        if t.await.expect("join") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one swap from the held value may win");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_and_put_mismatch_leaves_the_value() {
+    let (_container, url) = start_redis().await;
+    let store = RedisStateStore::connect(&url, "faucet")
+        .await
+        .expect("connect");
+    let a = json!({"a": 1, "b": [1, 2]});
+    let b = json!({"b": 2});
+
+    assert!(store.compare_and_put("k", None, &a).await.unwrap());
+    assert!(!store.compare_and_put("k", None, &b).await.unwrap());
+    assert!(!store.compare_and_put("k", Some(&b), &b).await.unwrap());
+    assert!(
+        !store.compare_and_put("absent", Some(&a), &b).await.unwrap(),
+        "an expected value never matches an absent key"
+    );
+    assert_eq!(store.get("absent").await.unwrap(), None);
+    assert_eq!(store.get("k").await.unwrap(), Some(a.clone()));
+
+    assert!(store.compare_and_put("k", Some(&a), &b).await.unwrap());
+    assert_eq!(store.get("k").await.unwrap(), Some(b));
+    assert!(store.compare_and_put("bad key!", None, &a).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_errors_and_corrupt_values_surface_as_state_errors() {
+    let (_container, url) = start_redis().await;
+    let store = RedisStateStore::connect(&url, "ns").await.expect("connect");
+    let client = redis::Client::open(url.as_str()).expect("client");
+    let mut raw = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("conn");
+    let _: i64 = redis::cmd("LPUSH")
+        .arg("ns:listkey")
+        .arg("x")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("ns:corrupt")
+        .arg("not json")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+
+    let err = store.get("listkey").await.unwrap_err().to_string();
+    assert!(err.contains("Redis GET for key 'listkey' failed"), "{err}");
+    let err = store
+        .compare_and_put("listkey", None, &json!(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Redis GET for key 'listkey' failed"), "{err}");
+    let err = store
+        .compare_and_put("corrupt", None, &json!(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is not valid JSON"), "{err}");
+
+    // A server that refuses writes (out of memory) fails every write path.
+    let _: () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory-policy")
+        .arg("noeviction")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory")
+        .arg("1")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let err = store.put("k", &json!(1)).await.unwrap_err().to_string();
+    assert!(err.contains("Redis SET for key 'k' failed"), "{err}");
+    let err = store
+        .put_batch(&[("k".to_string(), json!(1))])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Redis MSET failed"), "{err}");
+    let err = store
+        .compare_and_put("fresh", None, &json!(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Redis compare-and-set for key 'fresh' failed"),
+        "{err}"
+    );
+    assert_eq!(store.get("fresh").await.unwrap(), None);
 }

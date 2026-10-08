@@ -117,6 +117,30 @@ impl TransformingSource {
     }
 }
 
+/// Run a CPU-bound page transform without pinning a runtime worker: on a
+/// multi-thread runtime the worker hands its other tasks off first
+/// (`block_in_place`); elsewhere (current-thread runtime, no runtime) it runs inline.
+fn run_blocking<T>(heavy: bool, f: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if heavy && multi_thread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+impl TransformingSource {
+    /// Page-level stages (SQL, WASM, custom page fns) may run for seconds.
+    fn blocking<T>(&self, f: impl FnOnce() -> T) -> T {
+        let heavy = self
+            .stages
+            .iter()
+            .any(|s| matches!(s, CompiledStage::PageFn(_)));
+        run_blocking(heavy, f)
+    }
+}
+
 #[async_trait]
 impl Source for TransformingSource {
     async fn fetch_with_context(
@@ -124,7 +148,7 @@ impl Source for TransformingSource {
         ctx: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
         let records = self.inner.fetch_with_context(ctx).await?;
-        instrumented_apply_stages(records, &self.stages, &self.labels)
+        self.blocking(|| instrumented_apply_stages(records, &self.stages, &self.labels))
     }
 
     async fn fetch_with_context_incremental(
@@ -132,7 +156,8 @@ impl Source for TransformingSource {
         ctx: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let (records, bookmark) = self.inner.fetch_with_context_incremental(ctx).await?;
-        let transformed = instrumented_apply_stages(records, &self.stages, &self.labels)?;
+        let transformed =
+            self.blocking(|| instrumented_apply_stages(records, &self.stages, &self.labels))?;
         Ok((transformed, bookmark))
     }
 
@@ -154,9 +179,10 @@ impl Source for TransformingSource {
                 // never chunk smaller than the inner page; only bound *growth*
                 // from a 1→N stage (explode) at that inner size.
                 let page_len = page.records.len();
-                let out = instrumented_apply_stages(
-                    page.records, &self.stages, &self.labels,
-                )?;
+                let records = page.records;
+                let out = self.blocking(|| {
+                    instrumented_apply_stages(records, &self.stages, &self.labels)
+                })?;
                 if out.is_empty() {
                     yield StreamPage { records: vec![], bookmark: page.bookmark };
                     continue;
@@ -222,7 +248,7 @@ impl Source for TransformingSource {
                 // both keeps a dashboard identical across the two paths.
                 let n_in = batch.num_rows();
                 for bf in self.batch_fns.iter().flatten() {
-                    batch = bf(batch).inspect_err(|_| {
+                    batch = run_blocking(true, || bf(batch)).inspect_err(|_| {
                         counter!("faucet_transform_errors_total", metric_labels.clone())
                             .increment(1);
                     })?;
@@ -331,6 +357,70 @@ impl Source for TransformingSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OnePage;
+
+    #[async_trait::async_trait]
+    impl crate::Source for OnePage {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![serde_json::json!({"a": 1})])
+        }
+    }
+
+    fn slow_page_source() -> TransformingSource {
+        let slow: crate::stage::PageFnBox = std::sync::Arc::new(|records: Vec<Value>| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(records)
+        });
+        TransformingSource::new(
+            Box::new(OnePage),
+            vec![TransformStage::PageFn(slow)],
+            Labels::for_named("slow"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_page_transform_does_not_pin_the_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                t.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let src = slow_page_source();
+        let during = tokio::spawn(async move {
+            let ctx = HashMap::new();
+            let mut pages = src.stream_pages(&ctx, 10);
+            let before = ticks.load(Ordering::SeqCst);
+            let page = pages.next().await.unwrap().unwrap();
+            assert_eq!(page.records.len(), 1);
+            let (records, _) = src.fetch_with_context_incremental(&ctx).await.unwrap();
+            assert_eq!(records.len(), 1);
+            ticks.load(Ordering::SeqCst) - before
+        })
+        .await
+        .unwrap();
+        ticker.abort();
+        assert!(during >= 20, "the ticker starved: {during} ticks");
+    }
+
+    #[tokio::test]
+    async fn a_slow_page_transform_runs_inline_on_a_current_thread_runtime() {
+        let src = slow_page_source();
+        assert_eq!(
+            src.fetch_with_context(&HashMap::new()).await.unwrap().len(),
+            1
+        );
+        assert_eq!(run_blocking(true, || 7), 7);
+    }
 
     /// A change-stream double with its own multi-table hooks (#731).
     #[tokio::test]

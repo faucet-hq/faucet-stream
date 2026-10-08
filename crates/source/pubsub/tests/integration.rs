@@ -366,3 +366,45 @@ async fn held_messages_are_not_redelivered_while_a_page_is_assembled() {
         "without renewal the held messages come back (proves the test can fail)"
     );
 }
+
+/// `max_messages` pulls only what the run still needs, so the rest of the
+/// backlog is deliverable to the next run at once instead of sitting leased
+/// until its ack deadline (#789 MSG-46).
+#[tokio::test(flavor = "multi_thread")]
+async fn max_messages_strands_no_pulled_tail() {
+    let emu = emulator().await;
+    let host = emu.host.as_str();
+    let client = setup_client().await;
+    create_topic_sub(&client, "src-max-t", "src-max-s").await;
+    publish(
+        &client,
+        "src-max-t",
+        (0..5)
+            .map(|i| msg(format!(r#"{{"n":{i}}}"#).as_bytes(), &[], ""))
+            .collect(),
+    )
+    .await;
+    let run = |max: usize| {
+        let mut cfg = PubsubSourceConfig::new("src-max-s");
+        cfg.connection = conn(host);
+        cfg.value_format = ValueFormat::Json;
+        cfg.idle_termination_secs = Some(3);
+        cfg.max_messages = Some(max);
+        cfg.max_messages_per_pull = 100;
+        cfg
+    };
+    let first = PubsubSource::new(run(2))
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    let rest = PubsubSource::new(run(10))
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(rest.len(), 3, "the other three are delivered right away");
+}

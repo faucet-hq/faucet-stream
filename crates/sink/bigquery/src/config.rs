@@ -46,6 +46,17 @@ pub struct BigQuerySinkConfig {
     /// inserted without an `insertId` (no dedup for that row).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insert_id_field: Option<String>,
+    /// Longest the sink waits, in seconds, for one BigQuery job it started (a
+    /// MERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before
+    /// cancelling it and failing the write. Default `3600`; `0` waits for as
+    /// long as the job runs. A job that times out is cancelled so it cannot
+    /// commit after the run has been reported failed.
+    #[serde(
+        default = "default_job_timeout",
+        with = "faucet_core::config::duration_secs"
+    )]
+    #[schemars(with = "u64")]
+    pub job_timeout: std::time::Duration,
     /// Write mode (append / upsert / delete) plus the `key` columns and optional
     /// `delete_marker`. Flattened, so `write_mode` / `key` / `delete_marker`
     /// appear at the config top level. Defaults to append (every existing
@@ -174,14 +185,32 @@ pub struct BigQueryLoadConfig {
     /// Credentials.
     #[serde(default)]
     pub gcs_auth: faucet_common_gcs::GcsCredentials,
-    /// BigQuery load `writeDisposition` — `WRITE_APPEND` (default),
-    /// `WRITE_TRUNCATE`, or `WRITE_EMPTY`.
+    /// BigQuery load `writeDisposition`. Only `WRITE_APPEND` (the default) is
+    /// accepted: the staged path runs one load job per batch, so a truncating
+    /// or empty-only disposition would keep only the last batch or fail on the
+    /// second. Use `write_mode: overwrite` (bucket-free) for a full refresh.
     #[serde(default = "default_write_disposition")]
     pub write_disposition: String,
     /// Optional GCS storage endpoint override (e.g. a fake-gcs-server host for
     /// tests). `None` uses the real Google endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_host: Option<String>,
+}
+
+#[cfg(feature = "arrow")]
+impl BigQueryLoadConfig {
+    /// Refuse a `write_disposition` other than `WRITE_APPEND` (SQL-100).
+    pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        if self.write_disposition == "WRITE_APPEND" {
+            return Ok(());
+        }
+        Err(faucet_core::FaucetError::Config(format!(
+            "BigQuery bulk_load.write_disposition `{}` is not supported: the staged path \
+             runs one load job per batch, so it would keep only the last batch. Use \
+             WRITE_APPEND, or `write_mode: overwrite` without `bulk_load` for a full refresh",
+            self.write_disposition
+        )))
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -192,6 +221,10 @@ fn default_staging_prefix() -> String {
 #[cfg(feature = "arrow")]
 fn default_write_disposition() -> String {
     "WRITE_APPEND".to_string()
+}
+
+fn default_job_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(3600)
 }
 
 fn default_true() -> bool {
@@ -221,6 +254,7 @@ impl BigQuerySinkConfig {
             auth: credentials,
             batch_size: DEFAULT_BATCH_SIZE,
             insert_id_field: None,
+            job_timeout: default_job_timeout(),
             write: faucet_core::WriteSpec::default(),
             scope: None,
             create_table: default_create_table(),
@@ -459,6 +493,31 @@ mod tests {
         assert_eq!(l.staging_prefix, "faucet-bq-load/");
         assert_eq!(l.write_disposition, "WRITE_APPEND");
         assert!(l.storage_host.is_none());
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn bulk_load_refuses_non_append_dispositions() {
+        let mut load: BigQueryLoadConfig =
+            serde_json::from_value(serde_json::json!({"staging_bucket": "b"})).unwrap();
+        load.validate().unwrap();
+        for d in ["WRITE_TRUNCATE", "WRITE_EMPTY", "write_append"] {
+            load.write_disposition = d.into();
+            let err = load.validate().unwrap_err().to_string();
+            assert!(err.contains(d) && err.contains("last batch"), "{err}");
+        }
+    }
+
+    #[test]
+    fn job_timeout_defaults_to_an_hour_and_reads_seconds() {
+        let c = BigQuerySinkConfig::new("p", "d", "t", BigQueryCredentials::ApplicationDefault);
+        assert_eq!(c.job_timeout, std::time::Duration::from_secs(3600));
+        let c: BigQuerySinkConfig = serde_json::from_value(serde_json::json!({
+            "project_id": "p", "dataset_id": "d", "table_id": "t",
+            "auth": {"type": "application_default"}, "job_timeout": 0
+        }))
+        .unwrap();
+        assert!(c.job_timeout.is_zero());
     }
 
     #[test]

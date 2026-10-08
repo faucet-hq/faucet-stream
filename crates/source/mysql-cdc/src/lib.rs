@@ -5,8 +5,10 @@
 //! change events as a CDC envelope, resumable via a `{file,pos}` or
 //! `{gtid_set}` bookmark.
 
+mod batch;
 mod config;
 mod convert;
+mod query;
 mod state;
 mod stream;
 

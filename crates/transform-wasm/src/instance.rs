@@ -37,6 +37,7 @@ pub(crate) struct WasmInstance {
     error_len: Option<TypedFunc<(), i32>>,
     fuel_limit: u64,
     peak_memory: u64,
+    trapped: bool,
 }
 
 impl WasmInstance {
@@ -82,7 +83,19 @@ impl WasmInstance {
             error_len,
             fuel_limit,
             peak_memory: 0,
+            trapped: false,
         })
+    }
+
+    /// Whether a guest call trapped: the heap and globals may be inconsistent,
+    /// so the instance must not run another record.
+    pub(crate) fn trapped(&self) -> bool {
+        self.trapped
+    }
+
+    /// `faucet_v1::log` calls dropped by the per-instance cap.
+    pub(crate) fn dropped_logs(&self) -> u64 {
+        self.store.data().logs_dropped
     }
 
     /// Peak linear-memory size seen so far on this instance (bytes).
@@ -112,6 +125,7 @@ impl WasmInstance {
         let in_ptr = match self.alloc.call(&mut self.store, len) {
             Ok(p) => p,
             Err(e) => {
+                self.trapped = true;
                 return Ok(self.finish(Outcome::Error(trap_msg("alloc", &e))));
             }
         };
@@ -126,7 +140,7 @@ impl WasmInstance {
         let ret = match self.transform.call(&mut self.store, (in_ptr, len)) {
             Ok(r) => r,
             Err(e) => {
-                self.free_buf(in_ptr, len);
+                self.trapped = true;
                 return Ok(self.finish(Outcome::Error(trap_msg("transform", &e))));
             }
         };

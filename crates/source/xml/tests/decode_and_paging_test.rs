@@ -169,3 +169,231 @@ async fn decode_pipeline_parses_xml_with_attributes() {
         assert!(text.contains(needle), "{needle} in {text}");
     }
 }
+
+/// API-25: parent-record values and the body-cursor token are XML-escaped in
+/// the request body, so `A&B Ltd` and markup-bearing values stay data.
+#[tokio::test]
+async fn body_values_are_xml_escaped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/gw"))
+        .and(body_string_contains("<name>A&amp;B Ltd</name>"))
+        .and(body_string_contains("<f>&lt;/f&gt;&lt;x&gt;{id}</f>"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<response><data><row><id>1</id></row></data><resultId>a&amp;b&lt;</resultId></response>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/gw"))
+        .and(body_string_contains("<resultId>a&amp;b&lt;</resultId>"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<response><data><row><id>2</id></row></data></response>"),
+        )
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/gw")
+        .method(reqwest::Method::POST)
+        .body("<q><name>{company}</name><f>{filter}</f></q>")
+        .records_element_path("response.data.row")
+        .pagination(XmlPagination::BodyCursor {
+            next_token_path: "resultId".into(),
+            next_body: "<readMore><resultId>${next_token}</resultId></readMore>".into(),
+        });
+    let ctx: HashMap<String, serde_json::Value> = [
+        ("company".to_string(), serde_json::json!("A&B Ltd")),
+        ("filter".to_string(), serde_json::json!("</f><x>{id}")),
+        ("id".to_string(), serde_json::json!("SHOULD-NOT-APPEAR")),
+    ]
+    .into_iter()
+    .collect();
+    let records = XmlStream::new(config)
+        .fetch_with_context(&ctx)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+}
+
+/// API-31: body-cursor paging yields each HTTP page as it arrives instead of
+/// buffering the whole run first.
+#[tokio::test]
+async fn body_cursor_pages_stream_before_the_next_request() {
+    use futures::StreamExt;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/gw"))
+        .and(body_string_contains("readByQuery"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<response><data><row><id>1</id></row></data><resultId>T1</resultId></response>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/gw"))
+        .and(body_string_contains("readMore"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<response><data><row><id>2</id></row></data></response>"),
+        )
+        .mount(&server)
+        .await;
+    let mut config = XmlStreamConfig::new(server.uri(), "/gw")
+        .method(reqwest::Method::POST)
+        .body("<readByQuery/>")
+        .records_element_path("response.data.row")
+        .pagination(XmlPagination::BodyCursor {
+            next_token_path: "resultId".into(),
+            next_body: "<readMore>${next_token}</readMore>".into(),
+        });
+    config.batch_size = 1;
+    let stream = XmlStream::new(config);
+    let ctx = HashMap::new();
+    let mut pages = stream.stream_pages(&ctx, 1);
+    let first = pages.next().await.unwrap().unwrap();
+    assert_eq!(first.records[0]["id"], "1");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let second = pages.next().await.unwrap().unwrap();
+    assert_eq!(second.records[0]["id"], "2");
+    assert!(pages.next().await.is_none());
+}
+
+/// A gzipped, base64-wrapped CSV report decodes through every step.
+#[tokio::test]
+async fn decode_pipeline_gunzips_a_compressed_report() {
+    use std::io::Write as _;
+    let server = MockServer::start().await;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(b"id,name\n1,alice\n").unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(gz.finish().unwrap());
+    let body = format!("<r><bytes>{b64}</bytes></r>");
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<runReport/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "bytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            DecodeStep::Simple(SimpleStep::Gunzip),
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Csv,
+                    records_path: None,
+                    delimiter: None,
+                    has_headers: true,
+                    sheet: None,
+                    header_row: 0,
+                },
+            },
+        ]);
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["name"], "alice");
+}
+
+/// A SOAP fault answered to a decode-pipeline request is a fault, not a
+/// decode failure: zero records under `fault_as_error: false`.
+#[tokio::test]
+async fn a_soap_fault_is_detected_before_the_decode_pipeline() {
+    let server = MockServer::start().await;
+    let fault = "<Envelope xmlns=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body>\
+         <Fault><faultstring>busy</faultstring></Fault></Body></Envelope>";
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fault))
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .with_soap(faucet_source_xml::SoapConfig {
+            body_inner: Some("<runReport/>".into()),
+            fault_as_error: false,
+            ..Default::default()
+        })
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "runReportResponse.reportBytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+        ]);
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert!(records.is_empty());
+}
+
+/// #789 API-40: Excel date, datetime and duration cells — including one used
+/// as a header — arrive as ISO text through the HTTP decode path, not as their
+/// serial numbers.
+#[cfg(feature = "excel")]
+#[tokio::test]
+async fn decode_pipeline_renders_excel_dates_as_iso_text() {
+    use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+
+    let day = Format::new().set_num_format("yyyy-mm-dd");
+    let stamp = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
+    let span = Format::new().set_num_format("[h]:mm:ss");
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.write_string(0, 0, "day").unwrap();
+    ws.write_string(0, 1, "at").unwrap();
+    ws.write_string(0, 2, "took").unwrap();
+    ws.write_datetime_with_format(0, 3, ExcelDateTime::from_ymd(2024, 1, 31).unwrap(), &day)
+        .unwrap();
+    ws.write_datetime_with_format(1, 0, ExcelDateTime::from_ymd(2023, 3, 15).unwrap(), &day)
+        .unwrap();
+    ws.write_datetime_with_format(
+        1,
+        1,
+        ExcelDateTime::parse_from_str("2023-03-15 12:30:00").unwrap(),
+        &stamp,
+    )
+    .unwrap();
+    ws.write_number_with_format(1, 2, 1.5, &span).unwrap();
+    ws.write_number(1, 3, 7).unwrap();
+    let xlsx = wb.save_to_buffer().unwrap();
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(xlsx);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/report"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("<report><bytes>{b64}</bytes></report>")),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = XmlStreamConfig::new(server.uri(), "/report").decode(vec![
+        DecodeStep::Extract {
+            extract: "report.bytes".into(),
+        },
+        DecodeStep::Simple(SimpleStep::Base64),
+        DecodeStep::Parse {
+            parse: ParseSpec {
+                format: ParseFormat::Xlsx,
+                records_path: None,
+                delimiter: None,
+                has_headers: true,
+                sheet: None,
+                header_row: 0,
+            },
+        },
+    ]);
+    config.batch_size = 0;
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+
+    assert_eq!(records.len(), 1, "{records:?}");
+    let row = &records[0];
+    assert_eq!(row["day"], "2023-03-15");
+    assert_eq!(row["at"], "2023-03-15T12:30:00");
+    assert_eq!(row["took"], "PT129600S", "1.5 days as an ISO 8601 duration");
+    assert_eq!(
+        row["2024-01-31"], 7.0,
+        "a date header is named by its ISO date"
+    );
+}

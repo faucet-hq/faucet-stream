@@ -21,9 +21,10 @@ sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"
 base64.workspace = true
 async-stream = { workspace = true }
 futures.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 serde_json.workspace = true
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }

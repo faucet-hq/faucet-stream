@@ -82,7 +82,9 @@ async fn count_messages(brokers: &str, topic: &str) -> usize {
     consumer.subscribe(&[topic]).expect("subscribe");
     let mut count = 0usize;
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), consumer.recv()).await {
+        // The first record waits out the group join; later gaps mean done.
+        let wait = if count == 0 { 30 } else { 5 };
+        match tokio::time::timeout(Duration::from_secs(wait), consumer.recv()).await {
             Ok(Ok(_msg)) => count += 1,
             Ok(Err(e)) => panic!("verifier recv error: {e}"),
             Err(_) => break, // idle timeout — done
@@ -193,5 +195,77 @@ async fn a_transactional_id_prefix_isolates_commit_tokens() {
     assert_eq!(
         staging.last_committed_token(scope).await.unwrap(),
         Some(format_token(7))
+    );
+}
+
+/// A page far larger than the sink's `batch_size` commits: the transactional
+/// producer's queue is no longer capped at `batch_size`, and a full queue
+/// waits for room instead of failing after `3 × 100 ms` (#789 MSG-56).
+#[tokio::test]
+async fn a_page_larger_than_batch_size_commits_in_one_transaction() {
+    let (_container, brokers) = start_kafka().await;
+    let mut cfg = eo_config(&brokers, "eo_big");
+    cfg.batch_size = 10;
+    let sink = KafkaSink::new(cfg).await.unwrap();
+    let page: Vec<_> = (0..3000).map(|i| json!({"id": i})).collect();
+    let n = sink
+        .write_batch_idempotent(&page, "big::row", &format_token(1))
+        .await
+        .expect("a 3000-record page commits");
+    assert_eq!(n, 3000);
+    assert_eq!(count_messages(&brokers, "eo_big").await, 3000);
+}
+
+/// Another scope's open transaction on the shared side-topic holds the Last
+/// Stable Offset below this scope's newer token. The reader waits for it to
+/// end instead of returning the older token (#789 MSG-73), and a pre-created
+/// side-topic is used without a create call (#789 MSG-57).
+#[tokio::test]
+async fn the_token_reader_waits_out_another_scopes_open_transaction() {
+    use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+    let (_container, brokers) = start_kafka().await;
+    let sink = KafkaSink::new(eo_config(&brokers, "eo_lso")).await.unwrap();
+    sink.write_batch_idempotent(&[json!({"id": 1})], "a::row", &format_token(1))
+        .await
+        .unwrap();
+
+    let other: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("transactional.id", "someone-else")
+        .set("transaction.timeout.ms", "60000")
+        .create()
+        .unwrap();
+    other.init_transactions(Duration::from_secs(15)).unwrap();
+    other.begin_transaction().unwrap();
+    other
+        .send(
+            FutureRecord::<str, str>::to("__faucet_commit_token")
+                .key("b::row")
+                .payload(&format_token(1)),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+    sink.write_batch_idempotent(&[json!({"id": 2})], "a::row", &format_token(2))
+        .await
+        .unwrap();
+
+    let aborter = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        other.abort_transaction(Duration::from_secs(15)).unwrap();
+    });
+    let reader = KafkaSink::new(eo_config(&brokers, "eo_lso")).await.unwrap();
+    let started = std::time::Instant::now();
+    let token = reader.last_committed_token("a::row").await.unwrap();
+    aborter.join().unwrap();
+    assert_eq!(
+        token.as_deref(),
+        Some(format_token(2).as_str()),
+        "the newer token behind the open transaction must be read"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the read waited for the open transaction"
     );
 }

@@ -88,7 +88,8 @@ pub struct SingerSinkConfig {
     pub flush_on: FlushOn,
 
     /// How long a flush waits for the target to echo `STATE` (or to exit, with
-    /// `flush_on: exit`) before failing. Default 600.
+    /// `flush_on: exit`) before failing, and how long one write may block on a
+    /// target that stopped reading its stdin. Default 600.
     #[serde(default = "default_flush_timeout")]
     pub flush_timeout_secs: u64,
 

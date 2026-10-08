@@ -40,11 +40,11 @@ pub enum StartFrom {
     /// Start at the current cluster time (default — do not replay history).
     #[default]
     Now,
-    /// Start at the earliest retained oplog entry (errors if it has rolled).
+    /// Start at the oldest entry still in the oplog.
     Earliest,
-    /// Resume after a specific opaque token. Overrides a persisted bookmark.
+    /// Resume after a specific opaque token.
     ResumeToken { token: Value },
-    /// Start at a wall-clock second. Overrides a persisted bookmark.
+    /// Start at a wall-clock second.
     Timestamp { timestamp_secs: u32 },
 }
 
@@ -95,8 +95,7 @@ pub struct MongoCdcSourceConfig {
     /// Pre-image inclusion mode (MongoDB 6.0+).
     #[serde(default)]
     pub full_document_before_change: FullDocumentBeforeChange,
-    /// Start position on a fresh run (ignored once a bookmark exists, except an
-    /// explicit `resume_token`/`timestamp` which overrides the bookmark).
+    /// Start position on a fresh run; ignored once a bookmark exists.
     #[serde(default)]
     pub start_from: StartFrom,
     /// Optional extra aggregation-pipeline stages, each a JSON object, appended

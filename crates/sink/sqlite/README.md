@@ -7,13 +7,13 @@
 
 **SQLite** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes JSON records into a SQLite table — either as serialized JSON text in a single column, or with top-level JSON keys auto-mapped to real table columns.
 
-Reach for it when you want a zero-dependency, embedded landing table on local disk (or in memory) — a fast, transactional destination for events, change-data-capture mirrors, dev/test fixtures, or any pipeline that just needs a queryable file. The whole batch commits atomically inside a `BEGIN`/`COMMIT` transaction, so a partial write never leaves the table half-populated.
+Reach for it when you want a zero-dependency, embedded landing table on local disk (or in memory) — a fast, transactional destination for events, change-data-capture mirrors, dev/test fixtures, or any pipeline that just needs a queryable file. Each chunk commits inside one `BEGIN`/`COMMIT` transaction (keyed writes are one transaction per page), so a failed chunk never leaves rows of itself behind — see [Batch atomicity](#batch-atomicity) for what a failed page leaves.
 
 ## Feature highlights
 
 - **Two write strategies** — store each record as a serialized JSON text value (`json` mode), or auto-map top-level JSON keys directly onto table columns (`auto_map` mode) discovered via `PRAGMA table_info`.
 - **Transactional batches** — every chunk is one multi-row `INSERT` wrapped in a `BEGIN`/`COMMIT`, so a batch commits all-or-nothing.
-- **High write throughput** — multi-row INSERTs, WAL journal mode, and a 5-second `busy_timeout` keep the single writer fast and lock-tolerant.
+- **High write throughput** — multi-row INSERTs, WAL journal mode, and a configurable `busy_timeout` (60 s by default) keep the single writer fast and lock-tolerant.
 - **Parameter-limit aware** — in `auto_map` mode the sink splits each chunk so `rows × columns` never exceeds SQLite's `SQLITE_MAX_VARIABLE_NUMBER`, so wide tables never fail with "too many SQL variables".
 - **Native-typed binds** — in `auto_map` mode strings bind as `TEXT`, JSON numbers as `INTEGER`/`REAL`, booleans as `INTEGER` 0/1; arrays/objects bind as JSON text — so column affinity round-trips correctly.
 - **Write modes** — `append` (default), `upsert` (`INSERT … ON CONFLICT … DO UPDATE`), and `delete`, all keyed on a UNIQUE/PRIMARY KEY column set.
@@ -72,7 +72,8 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `batch_size` | int | `1000` | Maximum rows per multi-row INSERT. **`0` = no batching** (write the whole page in one transaction). See [Streaming & batching](#streaming--batching). |
-| `max_connections` | int | `1` | Connections in the pool. SQLite serializes writers at the file level, so one writer is the safe default — a multi-connection pool against one file races for the write lock and risks `SQLITE_BUSY`. Connections open in WAL mode with a 5s `busy_timeout`, so raising this lets extra connections read concurrently with the single writer. |
+| `max_connections` | int | `1` | Connections in the pool. SQLite serializes writers at the file level, so one writer is the safe default — a multi-connection pool against one file races for the write lock and risks `SQLITE_BUSY`. Connections open in WAL mode with the `busy_timeout_secs` wait, so raising this lets extra connections read concurrently with the single writer. |
+| `busy_timeout_secs` | int | `60` | How long a write waits for another connection's write lock before failing with `SQLITE_BUSY`. Several pipelines writing one file (matrix rows, mirrored tables) wait for each other's transactions; raise it when one transaction (a large page, an overwrite commit) can take longer. |
 
 ### Write mode
 
@@ -87,7 +88,7 @@ faucet run pipeline.yaml
 | Variant | YAML | Description |
 |---------|------|-------------|
 | `Json { column }` | `{ json: { column: "data" } }` | Insert each record as a serialized JSON text string in a single column. The column name defaults to `"data"`. |
-| `AutoMap` | `auto_map` | Map top-level JSON keys directly to table columns, discovered via `PRAGMA table_info(table_name)`. Only keys matching existing columns are inserted; extra keys are silently ignored. Records with no matching keys are skipped with a warning. |
+| `AutoMap` | `auto_map` | Map top-level JSON keys directly to table columns, discovered via `PRAGMA table_info(table_name)`. Fields match columns exactly, else ignoring ASCII case (SQLite column names are case-insensitive). Fields matching no column are not written and reported once per sink in a warning — configure a `schema:` drift policy to add or quarantine them. A record matching **no** column is an error: `write_batch` fails, and `write_batch_partial` reports that row as failed so it reaches the DLQ. |
 
 ## Examples
 
@@ -171,6 +172,7 @@ By default the sink uses `write_mode: append` — every record is inserted as a 
 - `column_mapping` must be `auto_map` — key columns must be real table columns, not embedded inside a JSON blob.
 - The table must have a `UNIQUE` or `PRIMARY KEY` constraint on the `key` column(s) so SQLite's `ON CONFLICT` clause can enforce uniqueness.
 - Rows within a single batch are deduped by key (last-write-wins) before writing, so a batch never conflicts with itself.
+- An upsert sets only the columns a record carries: a column the record omits keeps its stored value (records are grouped by the columns they carry, so a page of mixed shapes never writes NULL over a value).
 - A row missing or null in a key column fails. With a `dlq:` block configured, the good rows are still written and only the missing/null-key rows are routed to the DLQ per-row; without a DLQ the whole batch fails.
 
 ### CDC mirror with upsert + delete marker
@@ -206,10 +208,16 @@ pipeline:
 
 `SqliteSink` implements `Sink::supports_cleanup` (`true` in `auto_map` mode) and `Sink::cleanup_scope`, so an incremental sync can remove rows that were **deleted at the source** — something `write_mode: upsert` alone can never do, because a deleted record simply stops appearing in the feed.
 
-Opt in with `cleanup: delete_missing` alongside `write_mode: upsert`, and pair it with a source that declares a completeness claim (`complete_for`):
+The opt-in lives on the **source**: give it a completeness claim (`complete_for` with `on_missing: delete`) and use `write_mode: upsert` on this sink:
 
 ```yaml
 pipeline:
+  source:
+    type: rest
+    config: { url: "https://api.example.com/contacts/${contacts.id}/associations" }
+    complete_for:
+      scope: { contact_id: "${contacts.id}" }
+      on_missing: delete
   sink:
     type: sqlite
     config:
@@ -218,7 +226,6 @@ pipeline:
       column_mapping: auto_map
       write_mode: upsert
       key: [contact_id, association_id]
-      cleanup: delete_missing
 ```
 
 After a successful, uncancelled invocation the sink deletes every row matching the claimed scope whose key this run did not write:
@@ -227,7 +234,8 @@ After a successful, uncancelled invocation the sink deletes every row matching t
 - The whole thing runs in **one transaction**, so the delete is all-or-nothing — a partial delete would remove rows the run actually wrote.
 - **An empty result set is not a no-op**: if the source reports the scope as empty, every row in that scope is deleted. That is the case the feature exists for.
 - Scope and `key` columns are validated against `PRAGMA table_info` first, so a name that is not a real column fails with a clear error naming the column and table instead of a mid-`DELETE` SQL failure. They are written in **destination** column terms.
-- Identifiers in the cleanup SQL are **backtick**-quoted, not double-quoted: SQLite's double-quoted-string misfeature would silently turn an unresolvable column into a string literal, and in a `DELETE` predicate that is the difference between an error and deleting the wrong rows.
+- Identifiers in every statement the sink issues are **backtick**-quoted, not double-quoted: SQLite's double-quoted-string misfeature would silently turn an unresolvable column into a string literal, and in a `DELETE` predicate that is the difference between an error and deleting the wrong rows (a `write_mode: delete` with a misspelt `key` used to delete nothing and report success).
+- The key comparison puts the destination column on the left, so a key column declared `COLLATE NOCASE` compares the same way the upsert matched it.
 
 `cleanup` requires `write_mode: upsert` with a non-empty `key`, and `column_mapping: auto_map` — a single JSON payload column has no real columns for the scope predicate to address.
 
@@ -359,7 +367,7 @@ let sink = SqliteSink::new(config).await?;
 
 ## How it works
 
-- A connection pool is created in `SqliteSink::new()` using `sqlx::SqlitePool` with the configured `max_connections` (default `1`). Each connection opens in WAL journal mode with a 5-second `busy_timeout` and `create_if_missing`, so a writer and readers proceed concurrently and lock contention waits-and-retries instead of failing immediately with `SQLITE_BUSY`. WAL on a `sqlite::memory:` database is a harmless no-op.
+- A connection pool is created in `SqliteSink::new()` using `sqlx::SqlitePool` with the configured `max_connections` (default `1`). Each connection opens in WAL journal mode with the configured `busy_timeout_secs` (default 60) and `create_if_missing`, so a writer and readers proceed concurrently and lock contention waits-and-retries instead of failing immediately with `SQLITE_BUSY`. WAL on a `sqlite::memory:` database is a harmless no-op.
 - `write_batch()` slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`). Each chunk is inserted with a single multi-row INSERT wrapped in a `BEGIN`/`COMMIT` transaction.
 - In **JSON mode**, each record is serialized to a JSON string and inserted as `INSERT INTO t (col) VALUES (?), (?), …`.
 - In **AutoMap mode**, column names are discovered via `PRAGMA table_info(table_name)`. The INSERT column set is the **union** of record keys across the batch (in table order), so a field present only in a later record is still written; a row missing a column binds SQL `NULL`. Values bind as native SQLite types (`TEXT`/`INTEGER`/`REAL`; booleans as `0`/`1`; arrays/objects as JSON text).
@@ -382,7 +390,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 |---------|--------------------|
 | `SQLITE_BUSY` / "database is locked" | Multiple writers contending for the file. Keep `max_connections: 1` (the default); only raise it for read-heavy WAL workloads. Ensure no external process holds a long write lock. |
 | "too many SQL variables" | In JSON/`batch_size: 0` mode a single page exceeds SQLite's per-statement parameter limit (32766). Lower `batch_size` (e.g. `1000`). AutoMap mode auto-splits, so this is JSON-mode/large-page-specific. |
-| AutoMap inserts nothing / "skipped with no matching keys" warning | Record keys don't match any column. Confirm the table exists and column names match the JSON top-level keys (AutoMap silently drops unmatched keys). |
+| "record N has no field matching a column" | No record field names a column of the table. Confirm the table exists and that the JSON top-level keys match its columns (matching ignores ASCII case). |
 | Upsert fails with `ON CONFLICT` error | The table has no `UNIQUE`/`PRIMARY KEY` on the `key` column(s). Add a constraint, e.g. `CREATE UNIQUE INDEX ON users(id)`. |
 | Upsert/delete rejected at config load | `column_mapping` is not `auto_map`, or `key` is empty. Upsert/delete require `auto_map` and a non-empty `key`. |
 | Effectively-once rejected by `faucet validate` | One of the four requirements is unmet: a CDC source, this sink, a `state:` block, and **no** `dlq:` block. |
@@ -456,3 +464,9 @@ watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `sqlite` source config
 `faucet verify` reads the destination back with). See the [rollback
 cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).
+
+Before-images are exact: REAL values are journaled with 17 significant digits
+and BLOBs as hex, and the restore reads them back from the journal in SQL, so
+neither passes through a rounded text form. The first overwrite of a table that
+did not exist keeps an empty previous copy, so rolling that run back empties the
+table it created.

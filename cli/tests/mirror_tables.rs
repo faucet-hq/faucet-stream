@@ -836,3 +836,57 @@ async fn sharded_snapshots_and_a_re_sync_under_exactly_once() {
     verify_table(&url, &state, "shop.big", "mirror_big", "id").await;
     verify_table(&url, &state, "shop.pre", "mirror_pre", "id").await;
 }
+
+/// #789: a table whose run is refused by another run's live lease fails the
+/// whole mirror; it is never recorded as a table failure while the run
+/// returns `Ok`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_table_lease_fails_the_mirror() {
+    use faucet_cli::pipeline_state::{keys::lease_key, lease::RunLease};
+    let (_pg, url) = start_postgres().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    sql(
+        &url,
+        "CREATE SCHEMA shop; \
+         CREATE TABLE shop.orders (id int8 PRIMARY KEY, amount int8); \
+         CREATE PUBLICATION shop_pub FOR TABLES IN SCHEMA shop; \
+         INSERT INTO shop.orders VALUES (1, 1);",
+    )
+    .await;
+    let yaml = config(&url, &state, false, "at_least_once", "");
+    run(&yaml).await;
+    let id = marker(&state).await.unwrap().tables["shop.orders"]
+        .id
+        .clone();
+    let now = chrono::Utc::now();
+    let held = RunLease {
+        run_id: "elsewhere".into(),
+        pid: 1,
+        host: Some("another-host.invalid".into()),
+        pid_ns: None,
+        acquired_at: now,
+        expires_at: now + chrono::Duration::seconds(60),
+    };
+    faucet_core::FileStateStore::new(&state)
+        .put(
+            &lease_key(&format!("shop::{id}")),
+            &serde_json::to_value(&held).unwrap(),
+        )
+        .await
+        .unwrap();
+    sql(&url, "INSERT INTO shop.orders VALUES (2, 2);").await;
+    let (cfg, compiled) = load(&yaml);
+    let err = run_replication(&cfg, &compiled, options())
+        .await
+        .expect_err("a held lease fails the mirror");
+    assert!(
+        matches!(err, faucet_cli::error::CliError::LeaseHeld(_)),
+        "{err}"
+    );
+    let m = marker(&state).await.unwrap();
+    assert_eq!(
+        m.tables["shop.orders"].consecutive_failures, 0,
+        "a lease refusal is not a table failure"
+    );
+}

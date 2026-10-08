@@ -379,3 +379,89 @@ async fn landed_rows_are_not_restored_and_a_clean_page_reports_all_rows() {
     assert!(outcomes.iter().all(Result::is_ok));
     assert_eq!(count_of(&base, "SELECT count() AS n FROM landed").await, 15);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc3339_timestamps_load_into_datetime_columns() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE ts_events (id UInt32, at DateTime('UTC'), at64 DateTime64(3, 'UTC')) \
+         ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "ts_events")).expect("sink");
+    let rows = vec![json!({
+        "id": 1,
+        "at": "2024-01-01T05:00:00+05:30",
+        "at64": "2024-01-01T00:00:00.123Z"
+    })];
+    sink.write_batch(&rows).await.expect("write_batch");
+    sink.flush().await.expect("flush");
+    let back = read_rows(
+        &base,
+        "SELECT toString(at) AS at, toString(at64) AS at64 FROM ts_events",
+    )
+    .await;
+    assert_eq!(back[0]["at"], json!("2023-12-31 23:30:00"));
+    assert_eq!(back[0]["at64"], json!("2024-01-01 00:00:00.123"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_create_quotes_hostile_column_names() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "hostile")).expect("sink");
+    let evil = "x\\\" Int64, y String) ENGINE=Log --";
+    let mut row = serde_json::Map::new();
+    row.insert(evil.to_string(), json!("v"));
+    row.insert("trail\\".to_string(), json!("w"));
+    sink.write_batch(&[Value::Object(row)])
+        .await
+        .expect("write_batch");
+    sink.flush().await.expect("flush");
+    let cols = read_rows(
+        &base,
+        "SELECT name FROM system.columns WHERE table = 'hostile' ORDER BY name",
+    )
+    .await;
+    let names: Vec<&str> = cols.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["trail\\", evil]);
+    let engine = read_rows(
+        &base,
+        "SELECT engine FROM system.tables WHERE name = 'hostile'",
+    )
+    .await;
+    assert_eq!(engine[0]["engine"], json!("MergeTree"));
+}
+
+/// SQL-82: a field first seen after the table existed becomes a column with
+/// `create_table`, and fails loudly (never silently dropped) without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_field_becomes_a_column_or_fails_loudly() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "evolving")).expect("sink");
+    sink.write_batch(&[json!({"id": 1})]).await.expect("page 1");
+    sink.write_batch(&[json!({"id": 2, "extra": "x"})])
+        .await
+        .expect("page 2");
+    sink.flush().await.expect("flush");
+    let rows = read_rows(&base, "SELECT id, extra FROM evolving ORDER BY id").await;
+    assert_eq!(rows[1]["extra"], json!("x"));
+
+    http_exec(
+        &base,
+        "CREATE TABLE fixed (id Int64) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let sink =
+        ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "fixed").with_create_table(false))
+            .expect("sink");
+    let err = sink
+        .write_batch(&[json!({"id": 1, "surprise": 2})])
+        .await
+        .expect_err("no column for the field");
+    assert!(err.to_string().contains("surprise"), "{err}");
+}

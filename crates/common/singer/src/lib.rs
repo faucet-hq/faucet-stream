@@ -11,15 +11,20 @@
 //! - [`redact`] — the conservative config-value [`Redactor`] applied to
 //!   anything echoed from the subprocess.
 //! - [`temp`] — private (0600) temp files for `--config` and friends.
+//! - [`spawn`] — start the subprocess, retrying a transient `ETXTBSY`.
 //! - [`env`](mod@env) — [`InheritEnv`], which of faucet's environment variables the
 //!   subprocess receives.
 
 pub mod env;
+pub mod lines;
 pub mod message;
 pub mod redact;
+pub mod spawn;
 pub mod temp;
 
 pub use env::{BASELINE_ENV, InheritEnv};
+pub use lines::{CappedLine, DEFAULT_MAX_LINE_BYTES, read_capped_line};
 pub use message::{SingerMessage, parse_line};
 pub use redact::{Redactor, secret_like_values};
+pub use spawn::spawn_command;
 pub use temp::write_private_json;

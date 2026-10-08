@@ -34,15 +34,26 @@ sink:
 | `region` | SDK default chain | |
 | `endpoint_url` | — | LocalStack / VPC endpoint override. |
 | `credentials` | `{ type: default }` | `default` \| `profile` \| `access_key` \| `assume_role` \| `web_identity` — see `faucet-common-sqs`. |
-| `message_group_id` | — | Applied to every message. Required by FIFO queues. |
+| `message_group_id` | — | Applied to every message. Required (validated) for a FIFO queue — a `queue_url` ending in `.fifo`. |
 | `message_deduplication_id_field` | — | Record field whose stringified value is the `MessageDeduplicationId`. Missing / non-scalar → per-record failure (DLQ-routable). |
 | `batch_size` | `10` | Entries per `SendMessageBatch` (1–10, the API cap). The house `batch_size: 0` "no batching" sentinel does **not** apply — `0` is rejected at config load, since a whole-page request cannot exceed the 10-entry API cap. |
-| `concurrency` | `4` | Bounded concurrent in-flight requests. |
+| `concurrency` | `4` | Bounded concurrent in-flight requests. A FIFO queue always sends one request at a time, so a group's messages arrive in order. |
 | `retry` | `{}` | Per-record partial-failure retry, grouped: `max_attempts` (`5`), `initial_backoff_ms` (`100`), `max_backoff_ms` (`30000`). The flat `retry_max_attempts` / `retry_initial_backoff_ms` / `retry_max_backoff_ms` keys are still accepted (**deprecated** since #654) and are superseded wholesale when `retry:` is present. |
 
 Each record is serialized to a JSON string as the message body. A body over
-256 KiB (the SQS limit) fails per-record (never sent) rather than panicking.
-Requests are re-chunked to both the 10-entry and 256 KiB request ceilings.
+1 MiB (the SQS limit) fails per-record (never sent); a queue whose
+`MaximumMessageSize` is lower rejects the entry per row. Requests are
+re-chunked to both the 10-entry and 1 MiB request ceilings, and re-split to
+256 KiB requests when a service still enforcing the older request limit
+refuses a batch as too long.
+
+Only transient request failures (transport errors, 5xx/429, throttling) are
+retried; a missing queue or denied access fails at once. A request that fails
+for good is reported on each of its entries, so the outcomes of the requests
+that landed are kept. On a FIFO queue, an entry that fails is re-sent together
+with every later entry of its group from the same request, and the later
+entries of a group whose message failed for good are reported failed too, so a
+retry or DLQ replay can restore the group's order.
 
 ## Delivery semantics
 

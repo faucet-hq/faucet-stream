@@ -116,9 +116,16 @@ impl fmt::Debug for MongoSinkConfig {
 }
 
 impl MongoSinkConfig {
-    /// What a failed batch write leaves behind (#737): insert_many and per-document upserts are not transactional.
+    /// What a failed batch write leaves behind (#737): inserts (append /
+    /// overwrite) report per-row outcomes and fail outright only while
+    /// nothing is inserted; per-document upserts/deletes are best effort.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        faucet_core::BatchAtomicity::BestEffort
+        match self.write.write_mode {
+            faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete => {
+                faucet_core::BatchAtomicity::BestEffort
+            }
+            _ => faucet_core::BatchAtomicity::PerRow,
+        }
     }
 }
 
@@ -196,6 +203,8 @@ mod tests {
     #[test]
     fn batch_atomicity_matches_the_write_path() {
         let c: MongoSinkConfig = serde_json::from_value(serde_json::json!({"connection_uri": "mongodb://localhost:27017", "database": "db", "collection": "c"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::PerRow);
+        let c: MongoSinkConfig = serde_json::from_value(serde_json::json!({"connection_uri": "mongodb://localhost:27017", "database": "db", "collection": "c", "write_mode": "upsert", "key": ["id"]})).unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

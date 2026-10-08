@@ -56,7 +56,29 @@ pub(crate) fn build_connection(
             reloadables.push(r);
         }
     }
+    sandbox(&conn, &reloadables)?;
     Ok((conn, reloadables))
+}
+
+/// Close the connection to the host: no file or network access beyond the
+/// reloadable relation files, no extension install/autoload, and no further
+/// `SET` (so a query cannot lift its own memory limit).
+fn sandbox(conn: &Connection, reloadables: &[Reloadable]) -> Result<(), FaucetError> {
+    let mut stmts = vec![
+        "SET autoinstall_known_extensions=false;".to_string(),
+        "SET autoload_known_extensions=false;".to_string(),
+    ];
+    if !reloadables.is_empty() {
+        let paths: Vec<String> = reloadables
+            .iter()
+            .map(|r| format!("'{}'", sql_escape(&r.path)))
+            .collect();
+        stmts.push(format!("SET allowed_paths=[{}];", paths.join(", ")));
+    }
+    stmts.push("SET enable_external_access=false;".to_string());
+    stmts.push("SET lock_configuration=true;".to_string());
+    conn.execute_batch(&stmts.concat())
+        .map_err(|e| cfg_err(format!("sandbox duckdb: {e}")))
 }
 
 fn validate_ident(name: &str) -> Result<(), FaucetError> {

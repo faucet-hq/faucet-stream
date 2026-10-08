@@ -33,11 +33,28 @@ impl ShardBookmarks {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
 
-    /// Parse a bookmark `Value`; a malformed value is treated as absent
-    /// (never fails a run — worst case the shard re-reads from the start
-    /// position, which is at-least-once-safe).
+    /// Parse a bookmark `Value`; a malformed value is treated as absent.
+    /// Prefer [`try_from_value`](Self::try_from_value): under a `latest`
+    /// start position "absent" skips everything written since the bookmark.
     pub fn from_value(v: &Value) -> Self {
-        serde_json::from_value(v.clone()).unwrap_or_default()
+        Self::try_from_value(v).unwrap_or_default()
+    }
+
+    /// Parse a bookmark `Value`, refusing a malformed one rather than
+    /// silently restarting every shard at the start position (#789 MSG-95).
+    pub fn try_from_value(v: &Value) -> Result<Self, faucet_core::FaucetError> {
+        serde_json::from_value(v.clone()).map_err(|e| {
+            faucet_core::FaucetError::State(format!(
+                "kinesis: the stored bookmark is malformed ({e}); refusing to resume from it — \
+                 reset the state to start over"
+            ))
+        })
+    }
+
+    /// Drop bookmarks of shards the stream no longer lists (expired after a
+    /// reshard), so the map does not grow forever (#789 MSG-91).
+    pub fn retain_listed(&mut self, listed: &std::collections::HashSet<String>) {
+        self.shards.retain(|id, _| listed.contains(id));
     }
 }
 
@@ -75,6 +92,17 @@ mod tests {
             ShardBookmarks::from_value(&json!(null)),
             ShardBookmarks::default()
         );
+    }
+
+    #[test]
+    fn malformed_bookmarks_are_refused_and_expired_shards_pruned() {
+        assert!(ShardBookmarks::try_from_value(&json!("not-a-map")).is_err());
+        let mut b = ShardBookmarks::default();
+        b.advance("a", "1");
+        b.advance("gone", "2");
+        b.retain_listed(&["a".to_string()].into());
+        assert_eq!(b.shards.len(), 1);
+        assert_eq!(b.get("a"), Some("1"));
     }
 
     #[test]

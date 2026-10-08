@@ -117,6 +117,7 @@ async fn run_rows(rows: Rows, opts: ExecuteOptions) -> CliResult<RunSummary> {
                 clock: Some(opts.clock),
                 budget: opts.budget.clone(),
                 run_id: opts.run_id.clone(),
+                force_lease: opts.force_lease,
             };
             crate::topology::run_topology(&cfg, &opts.auth, run).await
         }
@@ -316,6 +317,7 @@ fn make_opts(
 ) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
+        force_lease: false,
         pipeline_name: pipeline_name.to_string(),
         run_id: None,
         execution: execution.clone(),

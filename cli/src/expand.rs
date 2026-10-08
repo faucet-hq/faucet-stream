@@ -125,8 +125,8 @@ pub struct ExpandedNode {
     /// Scoped-cleanup claim (#478): the source's `complete_for` scope, still
     /// carrying any `${parent.*}` / `${now.*}` tokens — the executor resolves
     /// them per invocation, like the connector configs. `Some` only when the
-    /// destination sink also opted in with `cleanup: delete_missing`, so this
-    /// being present already means a cleanup is intended.
+    /// claim sets `on_missing: delete`, so this being present already means a
+    /// cleanup is intended.
     pub cleanup_scope: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// Pipeline-level `_faucet_*` metadata columns (#510), shared by every node;
     /// the executor wraps the sink in a `MetadataSink` decorator when present.
@@ -1034,6 +1034,32 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             }
         }
 
+        // postgres-cdc gate (#789 SQL-131): the replication slot only advances
+        // from a persisted bookmark, so without state every run replays from
+        // the slot's original position and the primary keeps the WAL.
+        if merged_source.kind == "postgres-cdc" {
+            match state.as_ref() {
+                None => {
+                    return Err(CliError::Config(format!(
+                        "row '{row_id}': postgres-cdc needs a `state:` block — the slot only \
+                         advances from a persisted bookmark, so without one every run \
+                         replays from the slot's start and the server retains WAL \
+                         (use `file`, `redis`, or `postgres`)"
+                    )));
+                }
+                Some(s) if s.kind == "memory" => {
+                    tracing::warn!(
+                        row = %row_id,
+                        "postgres-cdc: the `memory` state store resets on process exit — the \
+                         slot only advances within one `faucet schedule`/`serve` process and \
+                         a restart replays from the slot's start; use `file`, `redis`, or \
+                         `postgres`"
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+
         // Rollback gate (#706): an undoable run needs a durable state store
         // (the pre-run marker and bookmark live there), a sink that can undo
         // its own writes, and the run-id column the metadata decorator stamps.
@@ -1143,6 +1169,18 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         // derivation so an EO source + idempotent sink cannot slip overwrite
         // onto the atomic-watermark path.
         if matches!(mode, faucet_core::WriteMode::Overwrite) {
+            if crate::registry::source_kind_consumes_destructively(
+                &merged_source.kind,
+                &merged_source.config,
+            ) {
+                return Err(CliError::Config(format!(
+                    "row '{}': write_mode: overwrite cannot read from source '{}' — it \
+                     acknowledges each page once it is written into the staging copy, and a \
+                     failed or cancelled run discards staging, losing those messages for \
+                     good. Use write_mode: append or upsert",
+                    ids[i], merged_source.kind
+                )));
+            }
             if cfg.shard.is_some() {
                 return Err(CliError::Config(format!(
                     "row '{}': write_mode: overwrite cannot be combined with `shard:` — each \
@@ -3791,6 +3829,26 @@ pipeline:
     }
 
     #[test]
+    fn postgres_cdc_requires_a_state_block() {
+        let yaml = r#"
+version: 1
+pipeline:
+  source: { type: postgres-cdc, config: {} }
+  sink:   { type: stdout, config: {} }
+"#;
+        let cfg = parse_with_extension(yaml, "yaml").unwrap();
+        match expand(&cfg).unwrap_err() {
+            CliError::Config(msg) => {
+                assert!(msg.contains("postgres-cdc needs a `state:`"), "{msg}")
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+        let with_memory = format!("{yaml}  state: {{ type: memory, config: {{}} }}\n");
+        let cfg = parse_with_extension(&with_memory, "yaml").unwrap();
+        assert_eq!(expand(&cfg).unwrap().len(), 1, "memory state only warns");
+    }
+
+    #[test]
     fn exactly_once_rejects_non_idempotent_sink() {
         // postgres-cdc→stdout: source is OK but stdout is not idempotent.
         let yaml = r#"
@@ -4209,6 +4267,43 @@ pipeline:
             msg.contains("overwrite") && msg.contains("exactly_once"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn rejects_overwrite_from_ack_on_consume_sources() {
+        for source in [
+            r#"{ type: rabbitmq, config: { url: "amqp://x", queue: q, idle_timeout_secs: 1 } }"#,
+            r#"{ type: pubsub, config: { project_id: p, subscription: s, max_messages: 1 } }"#,
+            r#"{ type: nats, config: { url: "nats://x", subject: s, jetstream_stream: S } }"#,
+        ] {
+            let c = cfg(&format!(
+                r#"
+version: 1
+name: t
+pipeline:
+  source: {source}
+  sink:   {{ type: postgres, config: {{ connection_url: "postgres://x", table_name: t, column_mapping: auto_map, write_mode: overwrite }} }}
+"#
+            ));
+            let msg = format!("{}", expand(&c).unwrap_err());
+            assert!(
+                msg.contains("write_mode: overwrite cannot read from source"),
+                "{source}: {msg}"
+            );
+        }
+        let c = cfg(r#"
+version: 1
+name: t
+pipeline:
+  source: { type: nats, config: { url: "nats://x", subject: s } }
+  sink:   { type: postgres, config: { connection_url: "postgres://x", table_name: t, column_mapping: auto_map, write_mode: overwrite } }
+"#);
+        if let Err(e) = expand(&c) {
+            assert!(
+                !format!("{e}").contains("cannot read from source"),
+                "core NATS does not ack: {e}"
+            );
+        }
     }
 
     #[test]

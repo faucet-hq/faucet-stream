@@ -166,6 +166,65 @@ async fn current_schema_maps_table_fields() {
     );
 }
 
+/// A table holding a column type the REST client cannot decode (`RANGE`)
+/// still yields its schema: the typed `tables.get` fails to decode, the raw
+/// fallback reads the same resource and types the column as a string (SQL-172).
+#[tokio::test]
+async fn current_schema_tolerates_a_range_column() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    let table = json!({
+        "tableReference": {"projectId": PROJECT_ID, "datasetId": DATASET_ID, "tableId": TABLE_ID},
+        "schema": {"fields": [
+            {"name": "id", "type": "INTEGER", "mode": "REQUIRED"},
+            {"name": "span", "type": "RANGE", "rangeElementType": {"type": "DATE"}}
+        ]}
+    });
+    for p in [
+        tables_get_path(),
+        format!("/bigquery/v2{}", tables_get_path()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_json(table.clone()))
+            .mount(&server)
+            .await;
+    }
+    let sa_json = dummy_service_account_json(&server.uri());
+    let sa_file = tempfile::NamedTempFile::new().expect("sa tempfile");
+    std::fs::write(sa_file.path(), sa_json.to_string()).expect("write sa");
+    let client = ClientBuilder::new()
+        .with_auth_base_url(format!("{}{AUTH_SCOPE_BASE}", server.uri()))
+        .with_v2_base_url(server.uri())
+        .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+        .await
+        .expect("client");
+    let mut config = BigQuerySinkConfig::new(
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ServiceAccountKeyPath {
+            path: sa_file.path().to_str().unwrap().into(),
+        },
+    );
+    config.upload_base_url = Some(server.uri());
+    let sink = BigQuerySink::from_parts(config, client);
+
+    let schema = sink
+        .current_schema()
+        .await
+        .expect("a RANGE column must not fail the schema read")
+        .unwrap();
+    assert_eq!(
+        schema["properties"]["span"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        schema["properties"]["id"]["type"],
+        json!(["integer", "null"])
+    );
+}
+
 #[tokio::test]
 async fn current_schema_none_for_missing_table() {
     // A 404 on tables.get → Ok(None), so the drift pass treats the target as

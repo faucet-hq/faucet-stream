@@ -13,6 +13,7 @@ This crate holds what both sides need:
 | `message` | `SingerMessage`, `parse_line` (one stdout line → message), and the `write_schema` / `write_record` / `write_state` / `write_activate_version` encoders |
 | `redact` | `Redactor` (scrubs config string values out of echoed stderr) and `secret_like_values` (values under secret-looking keys, for a process-wide log redactor) |
 | `temp` | `write_private_json` — a 0600 temp file for `--config` / `--catalog` / `--state` |
+| `spawn` | `spawn_command` — starts the tap/target, retrying a transient `ETXTBSY` ("Text file busy") a few times with a short backoff |
 | `env` | `InheritEnv` — the `inherit_env` setting: inherit faucet's whole environment (`true`, default), only the `BASELINE_ENV` (`false`), or the baseline plus named variables (a list) |
 
 You normally depend on the source or sink crate, which re-export these types.

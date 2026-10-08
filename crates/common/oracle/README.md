@@ -28,7 +28,7 @@ These fields are flattened into every Oracle connector config.
 | `sid` | — | Legacy SID. |
 | `username` / `password` | — | Database credentials. Required unless `external_auth`. |
 | `external_auth` | `false` | Use OS authentication or wallet-held credentials instead. |
-| `tls.enabled` | `false` | Connect over TCPS (`host` form). |
+| `tls.enabled` | `false` | Connect over TCPS (`host` form). Setting any other `tls.*` option without `enabled: true` is a config error, so a configured wallet never silently falls back to plain TCP. |
 | `tls.wallet_location` | — | Wallet directory holding the trusted CA (and client certificate for mutual TLS). |
 | `tls.server_dn_match` | `true` | Check the server certificate's DN against the host. |
 | `tls.server_cert_dn` | — | Expected server DN when it differs from the host. |

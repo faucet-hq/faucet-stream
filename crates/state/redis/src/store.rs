@@ -5,14 +5,83 @@ use faucet_core::state::{DOCTOR_SENTINEL_KEY, StateStore, validate_state_key};
 use faucet_core::{FaucetError, Value};
 use redis::AsyncCommands;
 
+/// Longest a (re)connect may take before the operation fails.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Longest one command may wait for Redis's reply before it fails.
+pub const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A `StateStore` that persists each entry as a single Redis string under
 /// `{namespace}:{key}`.
 ///
-/// The connection is opened in [`RedisStateStore::connect`] and reused across
-/// all calls — `redis::aio::MultiplexedConnection` is cheaply cloneable.
+/// [`RedisStateStore::connect`] holds a `redis::aio::ConnectionManager`: a
+/// dropped connection (a Redis restart, failover or idle cut) is re-established
+/// instead of failing every later call, and connects and replies are bounded
+/// by [`CONNECT_TIMEOUT`] / [`RESPONSE_TIMEOUT`] so a black-holed server cannot
+/// stall a run.
 pub struct RedisStateStore {
     namespace: String,
-    conn: redis::aio::MultiplexedConnection,
+    conn: std::panic::AssertUnwindSafe<Conn>,
+}
+
+/// The store's connection: a self-healing manager, or a caller-supplied
+/// multiplexed connection ([`RedisStateStore::from_connection`]).
+#[derive(Clone)]
+enum Conn {
+    Managed(redis::aio::ConnectionManager),
+    Shared(redis::aio::MultiplexedConnection),
+}
+
+impl redis::aio::ConnectionLike for Conn {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        match self {
+            Conn::Managed(c) => c.req_packed_command(cmd),
+            Conn::Shared(c) => c.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        match self {
+            Conn::Managed(c) => c.req_packed_commands(cmd, offset, count),
+            Conn::Shared(c) => c.req_packed_commands(cmd, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Conn::Managed(c) => c.get_db(),
+            Conn::Shared(c) => c.get_db(),
+        }
+    }
+}
+
+/// Whether `e` means the connection itself failed (the manager reconnects,
+/// so the operation is worth one more try).
+fn is_connection_error(e: &redis::RedisError) -> bool {
+    e.is_connection_dropped() || e.is_connection_refusal() || e.is_io_error() || e.is_timeout()
+}
+
+/// Run `op` on a fresh clone of `conn`, retrying once after a connection
+/// failure (by then the manager has reconnected).
+async fn with_retry<T, F, Fut>(conn: &Conn, mut op: F) -> redis::RedisResult<T>
+where
+    F: FnMut(Conn) -> Fut,
+    Fut: std::future::Future<Output = redis::RedisResult<T>>,
+{
+    match op(conn.clone()).await {
+        Err(e) if is_connection_error(&e) && matches!(conn, Conn::Managed(_)) => {
+            tracing::warn!(error = %e, "Redis state connection failed; retrying once");
+            op(conn.clone()).await
+        }
+        other => other,
+    }
 }
 
 impl RedisStateStore {
@@ -25,13 +94,30 @@ impl RedisStateStore {
     ) -> Result<Self, FaucetError> {
         let namespace = namespace.into();
         validate_namespace(&namespace)?;
+        // `rediss://` builds a rustls config from the process-wide provider; a
+        // build that links two providers has no default, so pick one.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = redis::Client::open(url.as_ref())
             .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
-        let conn = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| FaucetError::State(format!("Redis connection failed: {e}")))?;
-        Ok(Self { namespace, conn })
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(CONNECT_TIMEOUT)
+            .set_response_timeout(RESPONSE_TIMEOUT)
+            .set_number_of_retries(3);
+        let conn = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            redis::aio::ConnectionManager::new_with_config(client, config),
+        )
+        .await
+        .map_err(|_| {
+            FaucetError::State(format!(
+                "Redis connection timed out after {CONNECT_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(|e| FaucetError::State(format!("Redis connection failed: {e}")))?;
+        Ok(Self {
+            namespace,
+            conn: std::panic::AssertUnwindSafe(Conn::Managed(conn)),
+        })
     }
 
     /// Construct from an existing async connection. Useful for tests and for
@@ -42,7 +128,10 @@ impl RedisStateStore {
     ) -> Result<Self, FaucetError> {
         let namespace = namespace.into();
         validate_namespace(&namespace)?;
-        Ok(Self { namespace, conn })
+        Ok(Self {
+            namespace,
+            conn: std::panic::AssertUnwindSafe(Conn::Shared(conn)),
+        })
     }
 
     /// Returns the fully-qualified Redis key for a given state key.
@@ -51,12 +140,32 @@ impl RedisStateStore {
     }
 }
 
+/// Keys asked of each `SCAN` page.
+const SCAN_COUNT: usize = 500;
+
 /// Format the namespaced Redis key. Exposed as a free function so it can be
 /// unit-tested without constructing a `RedisStateStore` (which needs a real
 /// Redis connection).
 pub(crate) fn build_redis_key(namespace: &str, key: &str) -> String {
     format!("{namespace}:{key}")
 }
+
+/// Sets `KEYS[1]` to `ARGV[3]` when it holds exactly `ARGV[2]` (`ARGV[1]` =
+/// `1`) or is absent (`ARGV[1]` = `0`); returns 1 when it wrote.
+pub(crate) const COMPARE_AND_SET_LUA: &str = r"
+local cur = redis.call('GET', KEYS[1])
+if ARGV[1] == '0' then
+  if cur then return 0 end
+elseif cur ~= ARGV[2] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[3])
+return 1
+";
+
+/// Retries when the stored string changed between the read and the script but
+/// still decodes to the expected value (an equal value re-written).
+const CAS_ATTEMPTS: usize = 8;
 
 /// The `SCAN MATCH` pattern for keys starting with `prefix`. Neither the
 /// namespace nor a valid key can hold a glob metacharacter, so no escaping.
@@ -90,11 +199,13 @@ pub(crate) fn validate_namespace(namespace: &str) -> Result<(), FaucetError> {
 impl StateStore for RedisStateStore {
     async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
         validate_state_key(key)?;
-        let mut conn = self.conn.clone();
-        let raw: Option<String> = conn
-            .get(self.redis_key(key))
-            .await
-            .map_err(|e| FaucetError::State(format!("Redis GET for key '{key}' failed: {e}")))?;
+        let rkey = self.redis_key(key);
+        let raw: Option<String> = with_retry(&self.conn.0, |mut c| {
+            let rkey = rkey.clone();
+            async move { c.get(rkey).await }
+        })
+        .await
+        .map_err(|e| FaucetError::State(format!("Redis GET for key '{key}' failed: {e}")))?;
         match raw {
             None => Ok(None),
             Some(s) => {
@@ -113,22 +224,26 @@ impl StateStore for RedisStateStore {
         let serialized = serde_json::to_string(value).map_err(|e| {
             FaucetError::State(format!("failed to serialize state for key '{key}': {e}"))
         })?;
-        let mut conn = self.conn.clone();
-        let _: () = conn
-            .set(self.redis_key(key), serialized)
-            .await
-            .map_err(|e| FaucetError::State(format!("Redis SET for key '{key}' failed: {e}")))?;
+        let rkey = self.redis_key(key);
+        let _: () = with_retry(&self.conn.0, |mut c| {
+            let (rkey, serialized) = (rkey.clone(), serialized.clone());
+            async move { c.set(rkey, serialized).await }
+        })
+        .await
+        .map_err(|e| FaucetError::State(format!("Redis SET for key '{key}' failed: {e}")))?;
         tracing::debug!(key, namespace = %self.namespace, "state written to Redis");
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
         validate_state_key(key)?;
-        let mut conn = self.conn.clone();
-        let _: i64 = conn
-            .del(self.redis_key(key))
-            .await
-            .map_err(|e| FaucetError::State(format!("Redis DEL for key '{key}' failed: {e}")))?;
+        let rkey = self.redis_key(key);
+        let _: i64 = with_retry(&self.conn.0, |mut c| {
+            let rkey = rkey.clone();
+            async move { c.del(rkey).await }
+        })
+        .await
+        .map_err(|e| FaucetError::State(format!("Redis DEL for key '{key}' failed: {e}")))?;
         Ok(())
     }
 
@@ -137,23 +252,102 @@ impl StateStore for RedisStateStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
-        let mut conn = self.conn.clone();
         let pattern = scan_pattern(&self.namespace, prefix);
-        let mut iter: redis::AsyncIter<String> = conn
-            .scan_match(&pattern)
+        // Drive the cursor by hand: the iterator form ends silently when a
+        // later page fails, which would return a truncated key set.
+        let mut keys = Vec::new();
+        let mut cursor: u64 = 0;
+        loop {
+            let (next, batch): (u64, Vec<String>) = with_retry(&self.conn.0, |mut c| {
+                let pattern = pattern.clone();
+                async move {
+                    redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(pattern)
+                        .arg("COUNT")
+                        .arg(SCAN_COUNT)
+                        .query_async(&mut c)
+                        .await
+                }
+            })
             .await
             .map_err(|e| FaucetError::State(format!("Redis SCAN for '{pattern}' failed: {e}")))?;
-        let mut keys = Vec::new();
-        while let Some(raw) = iter.next_item().await {
-            if let Some(key) = strip_namespace(&self.namespace, &raw)
-                && key.starts_with(prefix)
-            {
-                keys.push(key.to_owned());
+            keys.extend(
+                batch
+                    .iter()
+                    .filter_map(|raw| strip_namespace(&self.namespace, raw))
+                    .filter(|key| key.starts_with(prefix))
+                    .map(str::to_owned),
+            );
+            if next == 0 {
+                break;
             }
+            cursor = next;
         }
         keys.sort();
         keys.dedup();
         Ok(keys)
+    }
+
+    fn supports_compare_and_put(&self) -> bool {
+        true
+    }
+
+    /// Atomic: a Lua script swaps the value only while the stored string is
+    /// still the one this call compared (or the key is still absent).
+    async fn compare_and_put(
+        &self,
+        key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        validate_state_key(key)?;
+        let serialized = serde_json::to_string(value).map_err(|e| {
+            FaucetError::State(format!("failed to serialize state for key '{key}': {e}"))
+        })?;
+        let redis_key = self.redis_key(key);
+        let script = redis::Script::new(COMPARE_AND_SET_LUA);
+        let mut conn = self.conn.0.clone();
+        for _ in 0..CAS_ATTEMPTS {
+            let raw: Option<String> = with_retry(&self.conn.0, |mut c| {
+                let rkey = redis_key.clone();
+                async move { c.get(rkey).await }
+            })
+            .await
+            .map_err(|e| FaucetError::State(format!("Redis GET for key '{key}' failed: {e}")))?;
+            let current = raw
+                .as_deref()
+                .map(|s| {
+                    serde_json::from_str::<Value>(s).map_err(|e| {
+                        FaucetError::State(format!(
+                            "stored value for key '{key}' is not valid JSON: {e}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            if current.as_ref() != expected {
+                return Ok(false);
+            }
+            let mut call = script.key(&redis_key);
+            match &raw {
+                Some(guard) => call.arg("1").arg(guard),
+                None => call.arg("0").arg(""),
+            };
+            // Not retried: a lost reply after a successful swap would read
+            // back as a mismatch.
+            let swapped: i64 = call
+                .arg(&serialized)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(|e| {
+                    FaucetError::State(format!("Redis compare-and-set for key '{key}' failed: {e}"))
+                })?;
+            if swapped == 1 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn supports_atomic_batch(&self) -> bool {
@@ -172,11 +366,12 @@ impl StateStore for RedisStateStore {
             })?;
             pairs.push((self.redis_key(key), serialized));
         }
-        let mut conn = self.conn.clone();
-        let _: () = conn
-            .mset(&pairs)
-            .await
-            .map_err(|e| FaucetError::State(format!("Redis MSET failed: {e}")))?;
+        let _: () = with_retry(&self.conn.0, |mut c| {
+            let pairs = pairs.clone();
+            async move { c.mset(&pairs).await }
+        })
+        .await
+        .map_err(|e| FaucetError::State(format!("Redis MSET failed: {e}")))?;
         Ok(())
     }
 
@@ -233,7 +428,55 @@ impl RedisStateStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keeps_its_auto_traits() {
+        fn assert<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert::<super::RedisStateStore>();
+    }
+
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn both_connection_kinds_carry_pipelines_and_report_their_database() {
+        use redis::aio::ConnectionLike as _;
+        use testcontainers::runners::AsyncRunner as _;
+        let container = testcontainers_modules::redis::Redis::default()
+            .start()
+            .await
+            .expect("redis container start");
+        let port = container.get_host_port_ipv4(6379).await.expect("port");
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}/0")).unwrap();
+        let mut shared = None;
+        for _ in 0..50 {
+            if let Ok(c) = client.get_multiplexed_async_connection().await {
+                shared = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let managed = redis::aio::ConnectionManager::new(client.clone())
+            .await
+            .unwrap();
+        for mut conn in [
+            Conn::Shared(shared.expect("connection")),
+            Conn::Managed(managed),
+        ] {
+            assert_eq!(conn.get_db(), 0);
+            let (a, b): (String, i64) = redis::pipe()
+                .cmd("SET")
+                .arg("p")
+                .arg("1")
+                .ignore()
+                .cmd("GET")
+                .arg("p")
+                .cmd("INCR")
+                .arg("p")
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(a.parse::<i64>().unwrap() + 1, b);
+        }
+    }
 
     #[test]
     fn build_redis_key_namespaces_consistently() {

@@ -369,18 +369,87 @@ pub async fn show(
 
 // ── guards ──────────────────────────────────────────────────────────────────
 
+/// Which live leases a state change must respect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseScope {
+    /// The changed bases, the child rows under them, and every invocation of
+    /// the pipeline that is no matrix row's (mirror tables, backfill units).
+    Bases,
+    /// Every lease under the pipeline's namespace (an import replaces it all).
+    Namespace,
+}
+
+/// Every live lease under `target`'s namespace, as `(base, lease)` — listed
+/// where the store can enumerate, else the rows' and mirror tables' bases.
+async fn live_leases(
+    store: &dyn StateStore,
+    target: &PipelineTarget,
+    now: DateTime<Utc>,
+) -> CliResult<Vec<(String, RunLease)>> {
+    let suffix = super::keys::lease_key("");
+    let bases: Vec<String> = if store.supports_list() {
+        store
+            .list(&namespace_prefix(&target.pipeline))
+            .await?
+            .into_iter()
+            .filter_map(|k| k.strip_suffix(&suffix).map(str::to_string))
+            .collect()
+    } else {
+        let mut b: Vec<String> = target.rows.iter().map(|r| target.base_key(&r.id)).collect();
+        b.push(format!("{}::cdc", target.pipeline));
+        b.push(format!("{}::snapshot", target.pipeline));
+        let marker = crate::replication::state::marker_key(&target.pipeline);
+        if let Some(v) = store.get(&marker).await?
+            && let Ok(m) = crate::replication::multi_state::MirrorState::from_value(v)
+        {
+            b.extend(
+                m.tables
+                    .values()
+                    .map(|t| crate::executor::build_state_key(&target.pipeline, &t.id, None)),
+            );
+        }
+        b
+    };
+    let mut out = Vec::new();
+    for base in bases {
+        if let Some(l) = lease::read(store, &base).await?
+            && l.is_live(now)
+        {
+            out.push((base, l));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a live lease on `held` blocks a change to `bases`.
+fn lease_blocks(target: &PipelineTarget, bases: &[String], held: &str, scope: LeaseScope) -> bool {
+    let under = |b: &str| held == b || held.starts_with(&format!("{b}::"));
+    scope == LeaseScope::Namespace
+        || bases.iter().any(|b| under(b))
+        || !target.rows.iter().any(|r| under(&target.base_key(&r.id)))
+}
+
 /// Refuse when a live lease covers any of `bases` (unless `force`).
 async fn refuse_if_running(
     store: &dyn StateStore,
+    target: &PipelineTarget,
     bases: &[String],
+    scope: LeaseScope,
     force: bool,
     now: DateTime<Utc>,
 ) -> CliResult<Vec<String>> {
     let mut warnings = Vec::new();
+    let mut held = live_leases(store, target, now).await?;
     for base in bases {
-        if let Some(l) = lease::read(store, base).await?
+        if !held.iter().any(|(b, _)| b == base)
+            && let Some(l) = lease::read(store, base).await?
             && l.is_live(now)
         {
+            held.push((base.clone(), l));
+        }
+    }
+    for (base, l) in held {
+        if lease_blocks(target, bases, &base, scope) {
             let msg = format!(
                 "'{base}' is held by run {} (pid {}{}) since {}",
                 l.run_id,
@@ -595,7 +664,9 @@ pub async fn set(
     let key = row_key(target, row, req.parent_key.as_deref())?;
     let mut warnings = refuse_if_running(
         store.as_ref(),
+        target,
         &[target.base_key(&row.id), key.clone()],
+        LeaseScope::Bases,
         req.force,
         now,
     )
@@ -701,7 +772,15 @@ pub async fn reset(
     let mut bases: Vec<String> = vec![base.clone()];
     bases.extend(targets.iter().filter_map(|e| e.key.base(&target.pipeline)));
     bases.dedup();
-    let mut warnings = refuse_if_running(store.as_ref(), &bases, req.force, now).await?;
+    let mut warnings = refuse_if_running(
+        store.as_ref(),
+        target,
+        &bases,
+        LeaseScope::Bases,
+        req.force,
+        now,
+    )
+    .await?;
 
     let mut changes = Vec::new();
     let mut exactly_once = None;
@@ -852,16 +931,18 @@ pub async fn import(
             existing.len()
         )));
     }
-    let mut bases: Vec<(String, Arc<dyn StateStore>)> = Vec::new();
-    for r in &target.rows {
-        if let Some(s) = stores.for_row(&r.id) {
-            bases.push((target.base_key(&r.id), Arc::clone(s)));
-        }
-    }
     let mut warnings = Vec::new();
-    for (base, store) in &bases {
+    for (_, store) in stores.all() {
         warnings.extend(
-            refuse_if_running(store.as_ref(), std::slice::from_ref(base), req.force, now).await?,
+            refuse_if_running(
+                store.as_ref(),
+                target,
+                &[],
+                LeaseScope::Namespace,
+                req.force,
+                now,
+            )
+            .await?,
         );
     }
 
@@ -1157,6 +1238,150 @@ matrix:
         .unwrap_err();
         assert!(err.to_string().contains("held by run"));
         g.release().await;
+    }
+
+    /// #789 CLI-35: a running child row, backfill unit or mirror table blocks
+    /// the state changes it would overwrite.
+    #[tokio::test]
+    async fn children_backfill_units_and_mirror_tables_block_state_changes() {
+        let t = target("");
+        let (s, store) = stores(&t).await;
+        let auth = AuthCatalog::new();
+        let set_req = |row: &str, parent_key: Option<&str>| SetRequest {
+            row: row.into(),
+            parent_key: parent_key.map(str::to_string),
+            bookmark: json!(1),
+            force: false,
+            dry_run: true,
+            skip_watermark_check: false,
+        };
+        let child = lease::acquire(Arc::clone(&store), "orders::kid::7", "child-run")
+            .await
+            .unwrap();
+        let err = set(&t, &s, &auth, &set_req("kid", Some("7")), now())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("child-run"), "{err}");
+        let err = reset(
+            &t,
+            &s,
+            &auth,
+            &ResetRequest {
+                row: "kid".into(),
+                ..Default::default()
+            },
+            now(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("child-run"), "{err}");
+        set(&t, &s, &auth, &set_req("a", None), now())
+            .await
+            .expect("another row's child does not block row a");
+        child.release().await;
+
+        let unit = lease::acquire(Arc::clone(&store), "orders::backfill::h::u1", "unit-run")
+            .await
+            .unwrap();
+        let err = set(&t, &s, &auth, &set_req("a", None), now())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unit-run"), "{err}");
+        unit.release().await;
+
+        let table = lease::acquire(Arc::clone(&store), "orders::shop_orders", "table-run")
+            .await
+            .unwrap();
+        let export = StateExport::new("orders");
+        let err = import(
+            &t,
+            &s,
+            &ImportRequest {
+                export,
+                overwrite: true,
+                force: false,
+                dry_run: true,
+            },
+            now(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("table-run"), "{err}");
+        table.release().await;
+    }
+
+    #[test]
+    fn leases_block_their_bases_children_and_non_row_invocations() {
+        let t = target("");
+        let bases = vec!["orders::a".to_string()];
+        assert!(lease_blocks(&t, &bases, "orders::a", LeaseScope::Bases));
+        assert!(lease_blocks(&t, &bases, "orders::a::1", LeaseScope::Bases));
+        assert!(!lease_blocks(
+            &t,
+            &bases,
+            "orders::kid::1",
+            LeaseScope::Bases
+        ));
+        assert!(lease_blocks(&t, &bases, "orders::cdc", LeaseScope::Bases));
+        assert!(lease_blocks(
+            &t,
+            &[],
+            "orders::kid::1",
+            LeaseScope::Namespace
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_list_still_sees_row_and_mirror_table_leases() {
+        struct NoList(MemoryStateStore);
+        #[faucet_core::async_trait]
+        impl StateStore for NoList {
+            async fn get(&self, k: &str) -> Result<Option<Value>, faucet_core::FaucetError> {
+                self.0.get(k).await
+            }
+            async fn put(&self, k: &str, v: &Value) -> Result<(), faucet_core::FaucetError> {
+                self.0.put(k, v).await
+            }
+            async fn delete(&self, k: &str) -> Result<(), faucet_core::FaucetError> {
+                self.0.delete(k).await
+            }
+        }
+        let t = target("");
+        let store: Arc<dyn StateStore> = Arc::new(NoList(MemoryStateStore::new()));
+        let mut m = crate::replication::multi_state::MirrorState::new(now());
+        m.tables.insert(
+            "shop.orders".into(),
+            serde_json::from_value(json!({
+                "id": "shop_orders",
+                "phase": "active",
+                "since": now(),
+            }))
+            .unwrap(),
+        );
+        store
+            .put(
+                &crate::replication::state::marker_key("orders"),
+                &m.to_value().unwrap(),
+            )
+            .await
+            .unwrap();
+        let g = lease::acquire(Arc::clone(&store), "orders::shop_orders", "table-run")
+            .await
+            .unwrap();
+        let held = live_leases(store.as_ref(), &t, now()).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, "orders::shop_orders");
+        g.release().await;
+        assert!(
+            live_leases(store.as_ref(), &t, now())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

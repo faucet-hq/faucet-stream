@@ -101,6 +101,36 @@ async fn columnar_is_advertised_for_append_and_overwrite_with_or_without_a_bucke
     }
 }
 
+/// A staged load runs one job per batch, so a truncating disposition would
+/// keep only the last batch (SQL-100): it is refused before any upload.
+#[tokio::test]
+async fn a_staged_truncate_disposition_is_refused_before_any_upload() {
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let (client, _sa) = offline_client().await;
+    for disposition in ["WRITE_TRUNCATE", "WRITE_EMPTY"] {
+        let mut load = load_cfg();
+        load.write_disposition = disposition.into();
+        let sink = BigQuerySink::from_parts(
+            BigQuerySinkConfig::new("p", "d", "t", BigQueryCredentials::ApplicationDefault)
+                .with_bulk_load(load),
+            client.clone(),
+        );
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+        )])
+        .expect("batch");
+        let err = sink
+            .write_batch_columnar(&batch)
+            .await
+            .expect_err("a non-append staged disposition must be refused");
+        assert!(err.to_string().contains(disposition), "{err}");
+    }
+}
+
 /// A staged (`bulk_load`) overwrite is refused rather than silently producing
 /// the wrong result: that path's write disposition is fixed per config, so it
 /// cannot truncate on the first batch and append on the rest, and loading

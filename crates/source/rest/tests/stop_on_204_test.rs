@@ -46,6 +46,7 @@ async fn offset_pagination_stops_cleanly_on_204() {
                 limit_param: "$top".into(),
                 limit: 2,
                 total_path: None,
+                rows_path: None,
             }),
     )
     .unwrap();

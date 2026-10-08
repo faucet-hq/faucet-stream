@@ -16,6 +16,38 @@ use std::time::Duration;
 /// for minutes while its siblings drain.
 const MAX_THROTTLE_BACKOFF: Duration = Duration::from_secs(10);
 
+/// Slack under a `Latest` acquisition time: `ApproximateCreationDateTime`
+/// may be rounded down to the minute and clocks drift, so keep a margin (a
+/// few duplicates, never a skipped record).
+pub(crate) const LATEST_REPLAY_SLACK_MS: i64 = 120_000;
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Where to re-acquire an expired iterator. A `Latest` lease that has read
+/// nothing yet goes back to its trim horizon (records older than the first
+/// acquisition are filtered by [`keep_after_latest`]); everything else
+/// resumes at its position. Pure.
+pub(crate) fn reacquire_position(lease: &Lease) -> StartAt {
+    match (&lease.position, lease.latest_since_ms) {
+        (StartAt::Latest, Some(_)) => StartAt::TrimHorizon,
+        (p, _) => p.clone(),
+    }
+}
+
+/// Whether a record created at `created_ms` is new enough for a `Latest`
+/// lease re-read from the trim horizon. Records with no creation time are kept. Pure.
+pub(crate) fn keep_after_latest(since_ms: Option<i64>, created_ms: Option<i64>) -> bool {
+    match (since_ms, created_ms) {
+        (Some(since), Some(created)) => created >= since - LATEST_REPLAY_SLACK_MS,
+        _ => true,
+    }
+}
+
 /// Iterator type + sequence for a [`StartAt`]. Pure.
 pub(crate) fn iterator_request(start: &StartAt) -> (ShardIteratorType, Option<String>) {
     match start {
@@ -147,7 +179,11 @@ pub(crate) async fn read_slice(
     let shard_id = lease.shard_id.clone();
     let fail = |shard_id: String, error: FaucetError| ShardEvent::Failed { shard_id, error };
     if lease.iterator.is_none() {
-        match acquire_iterator(&client, &stream_arn, &shard_id, &lease.position).await {
+        let start = reacquire_position(&lease);
+        if lease.position == StartAt::Latest && lease.latest_since_ms.is_none() {
+            lease.latest_since_ms = Some(unix_now_ms());
+        }
+        match acquire_iterator(&client, &stream_arn, &shard_id, &start).await {
             Ok(IteratorOutcome::Ready(it)) => lease.iterator = it,
             Ok(IteratorOutcome::Trimmed) => {
                 let _ = tx.send(fail(shard_id.clone(), gap_error(&shard_id))).await;
@@ -189,6 +225,15 @@ pub(crate) async fn read_slice(
                 batches += 1;
                 let mut decoded = Vec::with_capacity(out.records().len());
                 for r in out.records() {
+                    if lease.position == StartAt::Latest {
+                        let created = r
+                            .dynamodb()
+                            .and_then(|sr| sr.approximate_creation_date_time())
+                            .and_then(|t| t.to_millis().ok());
+                        if !keep_after_latest(lease.latest_since_ms, created) {
+                            continue;
+                        }
+                    }
                     match record_to_envelope(r, &shard_id, &config.table_name) {
                         Ok(pair) => decoded.push(pair),
                         Err(error) => {
@@ -229,8 +274,13 @@ pub(crate) async fn read_slice(
                 let (code, message) = sdk_error_parts(&e);
                 match code.as_deref() {
                     Some("ExpiredIteratorException") => {
-                        match acquire_iterator(&client, &stream_arn, &shard_id, &lease.position)
-                            .await
+                        match acquire_iterator(
+                            &client,
+                            &stream_arn,
+                            &shard_id,
+                            &reacquire_position(&lease),
+                        )
+                        .await
                         {
                             Ok(IteratorOutcome::Ready(it)) => {
                                 lease.iterator = it;
@@ -738,5 +788,86 @@ mod tests {
         on(&server, RECORDS, err(400, "ExpiredIteratorException"), 1).await;
         let (events, _) = drive(&server, cfg(), 2).await;
         assert!(matches!(events[..], [ShardEvent::Done { .. }]));
+    }
+
+    #[test]
+    fn latest_leases_reacquire_at_the_trim_horizon_with_a_floor() {
+        let mut lease = Lease::new("s1", StartAt::Latest);
+        assert_eq!(reacquire_position(&lease), StartAt::Latest);
+        lease.latest_since_ms = Some(1_000_000);
+        assert_eq!(reacquire_position(&lease), StartAt::TrimHorizon);
+        lease.position = StartAt::After("9".into());
+        assert_eq!(reacquire_position(&lease), StartAt::After("9".into()));
+        assert!(keep_after_latest(None, Some(0)));
+        assert!(keep_after_latest(Some(1_000_000), None));
+        assert!(keep_after_latest(
+            Some(1_000_000),
+            Some(1_000_000 - LATEST_REPLAY_SLACK_MS)
+        ));
+        assert!(!keep_after_latest(
+            Some(1_000_000),
+            Some(1_000_000 - LATEST_REPLAY_SLACK_MS - 1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_expired_latest_iterator_does_not_skip_records() {
+        use wiremock::Mock;
+        use wiremock::matchers::{body_partial_json, header, method};
+        let server = MockServer::start().await;
+        let iter = |kind: &str, it: &str| {
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", ITER))
+                .and(body_partial_json(json!({"ShardIteratorType": kind})))
+                .respond_with(ok(json!({"ShardIterator": it})))
+        };
+        iter("LATEST", "it-latest")
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        iter("TRIM_HORIZON", "it-th").mount(&server).await;
+        let records = |it: &str| {
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", RECORDS))
+                .and(body_partial_json(json!({"ShardIterator": it})))
+        };
+        records("it-latest")
+            .respond_with(err(400, "ExpiredIteratorException"))
+            .mount(&server)
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut old = record("1");
+        old["dynamodb"]["ApproximateCreationDateTime"] = json!(1_000_000_000);
+        let mut new = record("2");
+        new["dynamodb"]["ApproximateCreationDateTime"] = json!(now);
+        records("it-th")
+            .respond_with(ok(json!({"Records": [old, new]})))
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        read_slice(
+            streams(&server.uri()),
+            cfg(),
+            "arn".into(),
+            Lease::new("s1", StartAt::Latest),
+            tx,
+        )
+        .await;
+        let mut seqs = Vec::new();
+        let mut done = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ShardEvent::Records { records, .. } => {
+                    seqs.extend(records.into_iter().map(|(s, _)| s))
+                }
+                ShardEvent::Done { .. } => done = true,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(seqs, vec!["2".to_string()]);
+        assert!(done);
     }
 }

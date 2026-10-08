@@ -38,6 +38,7 @@ pub fn json_to_record_batch(
     schema: SchemaRef,
 ) -> Result<RecordBatch, FaucetError> {
     let mut decoder = arrow_json::ReaderBuilder::new(schema.clone())
+        .with_coerce_primitive(true)
         .build_decoder()
         .map_err(|e| te("decoder build", e))?;
     decoder.serialize(records).map_err(|e| te("encode", e))?;
@@ -76,6 +77,56 @@ pub fn record_batches_to_json(batches: &[RecordBatch]) -> Result<Vec<Value>, Fau
     }
     let rows: Vec<Value> = serde_json::from_slice(&buf).map_err(|e| te("json parse", e))?;
     Ok(rows)
+}
+
+/// Hidden column listing the fields a record did not carry, so output rows can
+/// drop the nulls Arrow had to invent for them (keys a sibling record had).
+pub const ABSENT_MARKER: &str = "__faucet_absent";
+
+/// Mark each record with the schema fields it lacks. Returns `false` (and
+/// leaves the page untouched) when every record carries every field.
+pub fn mark_absent_fields(records: &mut [Value], schema: &Schema) -> bool {
+    let absent: Vec<Vec<&str>> = records
+        .iter()
+        .map(|r| match r.as_object() {
+            Some(o) => schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .filter(|n| !o.contains_key(*n))
+                .collect(),
+            None => Vec::new(),
+        })
+        .collect();
+    if absent.iter().all(Vec::is_empty) {
+        return false;
+    }
+    for (r, missing) in records.iter_mut().zip(absent) {
+        if let Some(o) = r.as_object_mut() {
+            let v = if missing.is_empty() {
+                Value::Null
+            } else {
+                Value::String(missing.join("\u{1f}"))
+            };
+            o.insert(ABSENT_MARKER.to_string(), v);
+        }
+    }
+    true
+}
+
+/// Remove the [`ABSENT_MARKER`] column from output rows, dropping each listed
+/// field that came back `null` (a value the query computed is kept).
+pub fn strip_absent_fields(rows: &mut [Value]) {
+    for r in rows {
+        let Some(o) = r.as_object_mut() else { continue };
+        if let Some(Value::String(list)) = o.remove(ABSENT_MARKER) {
+            for name in list.split('\u{1f}') {
+                if o.get(name).is_some_and(Value::is_null) {
+                    o.remove(name);
+                }
+            }
+        }
+    }
 }
 
 /// Build a [`RecordBatch`] from inline `columns` + `rows` (the `values` relation).

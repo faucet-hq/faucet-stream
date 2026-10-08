@@ -73,6 +73,15 @@ pub struct SqliteSinkConfig {
     /// typo rather than a first run).
     #[serde(default = "default_create_table")]
     pub create_table: bool,
+    /// How long a write waits for another connection's write lock before
+    /// failing with `SQLITE_BUSY`, in seconds. Defaults to 60.
+    ///
+    /// SQLite has one writer per database file. When several pipelines (matrix
+    /// rows, mirrored tables) write one file, a long write transaction — a
+    /// large page or an overwrite commit — holds the lock; raise this when such
+    /// a transaction can last longer.
+    #[serde(default = "default_busy_timeout_secs")]
+    pub busy_timeout_secs: u64,
     /// Write mode, key columns, and optional delete marker. `write_mode`
     /// defaults to `append`. Upsert/delete require `column_mapping: auto_map`
     /// and a UNIQUE/PRIMARY KEY constraint on `key`.
@@ -86,6 +95,10 @@ fn default_batch_size() -> usize {
 
 fn default_create_table() -> bool {
     true
+}
+
+fn default_busy_timeout_secs() -> u64 {
+    60
 }
 
 fn default_max_connections() -> u32 {
@@ -102,6 +115,7 @@ impl SqliteSinkConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             max_connections: default_max_connections(),
             create_table: default_create_table(),
+            busy_timeout_secs: default_busy_timeout_secs(),
             write: faucet_core::WriteSpec::default(),
         }
     }
@@ -131,6 +145,12 @@ impl SqliteSinkConfig {
     /// Set the maximum number of connections in the pool.
     pub fn max_connections(mut self, n: u32) -> Self {
         self.max_connections = n;
+        self
+    }
+
+    /// Set how long a write waits for the database's write lock, in seconds.
+    pub fn with_busy_timeout_secs(mut self, secs: u64) -> Self {
+        self.busy_timeout_secs = secs;
         self
     }
 }

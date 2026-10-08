@@ -10,13 +10,18 @@ by default valid JSON passes through and other UTF-8 text becomes a JSON string;
 cannot represent (binary under the default) fails the run rather than being
 altered.
 
-Core NATS is fire-and-forget at-least-once, so runs carry **no bookmark** and
-are not resumable/exactly-once. In JetStream mode each page's messages are
+Core NATS is fire-and-forget — at-most-once: a message published while the
+source is not subscribed is never seen — so runs carry **no bookmark** and are
+not resumable/exactly-once. In JetStream mode each page's messages are
 **acked after the page is written and flushed**, giving at-least-once delivery:
 every JetStream page carries an informational `{stream, consumer, consumed}`
 bookmark so the pipeline flushes a buffering sink before the page is acked, and
 held messages get in-progress acks every `progress_interval_secs` so a slow page
-is not redelivered into the same run.
+is not redelivered into the same run. JetStream messages are pulled in explicit
+batches sized to what the page and the run still need, so `max_messages` never
+leaves a prefetched tail leased and unacked until `ack_wait`, and a page never
+exceeds the consumer's `max_ack_pending` (which would stall the run on its own
+unacked page). The final page's acks are flushed before the run ends.
 
 ## Configuration
 
@@ -30,11 +35,16 @@ in alongside these fields:
 | `queue_group`       | `Option<String>` | —       | core-NATS queue group for load-balanced subscriptions.             |
 | `jetstream_stream`  | `Option<String>` | —       | JetStream stream name (enables JetStream mode).                    |
 | `jetstream_consumer`| `Option<String>` | —       | durable pull-consumer name; required with `jetstream_stream`.      |
-| `max_messages`      | `Option<usize>`  | —       | stop after this many messages.                                     |
-| `idle_timeout_secs` | `Option<u64>`    | —       | stop after this many seconds with no new message.                  |
+| `max_messages`      | `Option<usize>`  | —       | stop after this many messages (> 0).                               |
+| `idle_timeout_secs` | `Option<u64>`    | —       | stop after this many seconds with no new message (> 0).            |
 | `batch_size`        | `usize`          | `1000`  | records per emitted page (`0` = one page for the whole run window).|
-| `progress_interval_secs` | `u64`       | `10`    | JetStream only: in-progress ack (`+WPI`) every N s for every message pulled but not yet acked, so a slow page is not redelivered into the same run. Keep it below the consumer's `ack_wait`. `0` disables. |
+| `progress_interval_secs` | `u64`       | `10`    | JetStream only: in-progress ack (`+WPI`) every N s for every message pulled but not yet acked, so a slow page is not redelivered into the same run. JetStream messages are pulled in explicit
+batches sized to what the page and the run still need, so `max_messages` never
+leaves a prefetched tail leased and unacked until `ack_wait`, and a page never
+exceeds the consumer's `max_ack_pending` (which would stall the run on its own
+unacked page). The final page's acks are flushed before the run ends. Keep it below the consumer's `ack_wait`. `0` disables. |
 | `value_format`      | `auto` \| `json` \| `string` \| `bytes` | `auto` | how a payload becomes a record: `auto` (JSON, else UTF-8 text), `json` (must parse), `string` (UTF-8 text), `bytes` (base64). Non-UTF-8 under `auto` / `string` fails the run. |
+| `include_metadata`  | `bool`           | `false` | wrap each record as `{subject, sequence, message_id, payload}` — the JetStream stream sequence (`null` in core mode) and the `Nats-Msg-Id` header — so a downstream consumer can deduplicate redeliveries. |
 
 At least one of `max_messages` / `idle_timeout_secs` must be set so the run
 terminates.
@@ -74,3 +84,6 @@ pipeline:
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.
+
+The source installs no signal handler: a run stops at its terminators or when
+the pipeline is cancelled.

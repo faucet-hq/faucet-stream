@@ -148,6 +148,31 @@ pub fn detect_gaps(bm: &StreamBookmark, stream_arn: &str, described: &[ShardInfo
     gaps
 }
 
+/// DynamoDB Streams keeps records for 24 h; an empty-position shard not
+/// verified within this window may have had records written and trimmed.
+pub const EMPTY_SHARD_MAX_AGE_SECS: i64 = 23 * 3600;
+
+/// Shards bookmarked with no position (resumed at their trim horizon, which
+/// never reports trimming) that were last known empty longer ago than the
+/// retention window: records may have been written and trimmed since.
+pub fn stale_empty_shards(bm: &StreamBookmark, described: &[ShardInfo], now: i64) -> Vec<String> {
+    let (ids, _) = ids_and_parents(described);
+    bm.shards
+        .iter()
+        .filter(|(id, seq)| seq.is_empty() && ids.contains(*id))
+        .filter_map(|(id, _)| {
+            let at = *bm.verified_at.get(id)?;
+            (now - at > EMPTY_SHARD_MAX_AGE_SECS).then(|| {
+                format!(
+                    "shard {id} was last read {}h ago with nothing to read; records written \
+                     since may have been trimmed",
+                    (now - at) / 3600
+                )
+            })
+        })
+        .collect()
+}
+
 /// The resume position `capture_resume_position` returns: every current
 /// shard opened at its trim horizon. Replaying the retained window after a
 /// snapshot converges on an upsert sink.
@@ -273,5 +298,25 @@ mod tests {
         assert!(bm.shards.values().all(String::is_empty));
         let (ids, parents) = ids_and_parents(&[shard("b", Some("a"), false)]);
         assert!(ids.contains("b") && parents.contains("a"));
+    }
+
+    #[test]
+    fn empty_shards_older_than_retention_are_gaps() {
+        let described = vec![shard("a", None, false), shard("b", None, false)];
+        let mut bm = StreamBookmark::default();
+        bm.open_at("a", 0);
+        bm.open_at("b", 0);
+        bm.advance("b", "5");
+        bm.open_at("gone", 0);
+        let now = EMPTY_SHARD_MAX_AGE_SECS + 1;
+        let gaps = stale_empty_shards(&bm, &described, now);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("shard a"), "{gaps:?}");
+        assert!(stale_empty_shards(&bm, &described, EMPTY_SHARD_MAX_AGE_SECS).is_empty());
+        bm.verify_empty("a", now);
+        assert!(stale_empty_shards(&bm, &described, now).is_empty());
+        let mut legacy = StreamBookmark::default();
+        legacy.shards.insert("a".into(), String::new());
+        assert!(stale_empty_shards(&legacy, &described, now).is_empty());
     }
 }

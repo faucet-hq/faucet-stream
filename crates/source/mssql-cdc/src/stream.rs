@@ -2,10 +2,11 @@
 //!
 //! Polls native SQL Server change data capture: for each configured capture
 //! instance it reads `sys.fn_cdc_get_max_lsn()` / `sys.fn_cdc_get_min_lsn()` for
-//! the retained range, then streams `cdc.fn_cdc_get_all_changes_<ci>(from, to,
-//! 'all')` in commit order, buffering by commit LSN (`__$start_lsn`) so a single
-//! transaction is never split across a bookmark boundary — mirroring the
-//! per-transaction durability contract of postgres-cdc / mysql-cdc.
+//! the retained range, then opens `cdc.fn_cdc_get_all_changes_<ci>(from, to,
+//! 'all')` for every instance at once and merges the streams by
+//! (`__$start_lsn`, `__$seqval`), buffering by commit LSN so a transaction —
+//! including one that touches several captured tables — is emitted whole, in
+//! its own order, and never split across a bookmark boundary.
 //!
 //! **Resumability.** The durable bookmark is a map of capture-instance → last
 //! committed LSN (hex). On resume the next poll starts at `increment(bookmark)`,
@@ -31,10 +32,10 @@ use tiberius::{QueryItem, ToSql};
 use faucet_common_mssql::{MssqlPool, MssqlPooledConnection, build_pool, with_statement_timeout};
 
 use crate::change::{
-    LSN_ALIAS, OP_COLUMN, OpAction, PollPlan, SEQVAL_ALIAS, build_change_envelope,
+    LSN_ALIAS, LsnBounds, OP_COLUMN, OpAction, PollPlan, SEQVAL_ALIAS, build_change_envelope,
     business_columns, op_action, plan_poll,
 };
-use crate::config::MssqlCdcSourceConfig;
+use crate::config::{MssqlCdcSourceConfig, OnGap, StartPosition};
 use crate::decode::row_to_json;
 use crate::lsn::Lsn;
 use crate::state::Bookmarks;
@@ -61,7 +62,7 @@ impl MssqlCdcSource {
     /// instance exists).
     pub async fn new(config: MssqlCdcSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let pool = build_pool(&config.connection, config.max_connections).await?;
+        let pool = build_pool(&config.connection, config.pool_size()).await?;
         let state_key_value = config.resolved_state_key();
 
         let mut conn = pool
@@ -368,18 +369,52 @@ impl MssqlCdcSource {
         &self,
         conn: &mut MssqlPooledConnection<'_>,
         capture_instance: &str,
-    ) -> Result<(Option<Lsn>, Option<Lsn>), FaucetError> {
+    ) -> Result<LsnBounds, FaucetError> {
         const SQL: &str = "SELECT CONVERT(VARCHAR(20), sys.fn_cdc_get_min_lsn(@P1), 2) AS min_lsn, \
-                                  CONVERT(VARCHAR(20), sys.fn_cdc_get_max_lsn(), 2) AS max_lsn";
+                                  CONVERT(VARCHAR(20), sys.fn_cdc_get_max_lsn(), 2) AS max_lsn, \
+                                  (SELECT CONVERT(VARCHAR(20), start_lsn, 2) FROM cdc.change_tables \
+                                   WHERE capture_instance = @P1) AS start_lsn";
         // Bind an owned String (guaranteed `ToSql`) for the capture-instance
         // name — never interpolate it into the SQL text.
         let ci_owned = capture_instance.to_string();
         let ci: &dyn ToSql = &ci_owned;
         let rows = self.run_collect(conn, SQL, &[ci]).await?;
         let Some(row) = rows.first() else {
-            return Ok((None, None));
+            return Ok(LsnBounds::default());
         };
-        Ok((opt_lsn(row, "min_lsn")?, opt_lsn(row, "max_lsn")?))
+        Ok(LsnBounds {
+            min: opt_lsn(row, "min_lsn")?,
+            max: opt_lsn(row, "max_lsn")?,
+            start: opt_lsn(row, "start_lsn")?,
+        })
+    }
+
+    /// Open `fn_cdc_get_all_changes` for one capture instance (the statement
+    /// timeout bounds opening it).
+    async fn open_changes<'c>(
+        &self,
+        conn: &'c mut MssqlPooledConnection<'_>,
+        q: &ChangeQuery,
+    ) -> Result<tiberius::QueryStream<'c>, FaucetError> {
+        let sql = changes_sql(&q.ci);
+        let (from_hex, to_hex) = (q.from.to_hex(), q.to.to_hex());
+        let params: [&dyn ToSql; 2] = [&from_hex, &to_hex];
+        let failed = |e: tiberius::error::Error| {
+            FaucetError::Source(format!(
+                "mssql-cdc: get_all_changes failed for {}: {e}",
+                q.ci
+            ))
+        };
+        let query_fut = conn.query(&sql, &params);
+        match self.timeout() {
+            Some(t) => {
+                with_statement_timeout(t, async { query_fut.await.map_err(failed) }, || {
+                    FaucetError::Source("mssql-cdc: get_all_changes timed out".into())
+                })
+                .await
+            }
+            None => query_fut.await.map_err(failed),
+        }
     }
 
     /// Run a query and collect its first result set, honouring the statement
@@ -521,12 +556,6 @@ impl MssqlCdcSource {
                 .take()
                 .unwrap_or_default();
 
-            let mut conn = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| FaucetError::Source(format!("mssql-cdc: pool checkout failed: {e}")))?;
-
             // Aggregate-mode accumulator (batch_size == 0).
             let mut agg: Vec<Value> = Vec::new();
             let mut agg_dirty = false;
@@ -536,24 +565,19 @@ impl MssqlCdcSource {
             loop {
                 let mut any_rows = false;
 
-                for ci in &self.config.capture_instances {
-                    let (schema, table) = self
-                        .tables
-                        .get(ci)
-                        .cloned()
-                        .unwrap_or_else(|| ("".to_string(), ci.clone()));
-
-                    let (min_lsn, max_lsn) = self.query_lsn_bounds(&mut conn, ci).await?;
-                    let plan = plan_poll(marks.get(ci), min_lsn, max_lsn, start_position);
-
-                    match plan {
-                        PollPlan::NoChanges { set_bookmark } => {
-                            // Fresh `current` start: anchor the bookmark at the
-                            // live max and persist it so history is skipped.
-                            if let Some(anchor) = set_bookmark
-                                && marks.get(ci).is_none()
-                            {
-                                marks.set(ci.clone(), anchor);
+                // Plan every capture instance on one connection, released
+                // before the change streams open.
+                let mut queries: Vec<ChangeQuery> = Vec::new();
+                {
+                    let mut conn = self.pool.get().await.map_err(|e| {
+                        FaucetError::Source(format!("mssql-cdc: pool checkout failed: {e}"))
+                    })?;
+                    for ci in &self.config.capture_instances {
+                        let bounds = self.query_lsn_bounds(&mut conn, ci).await?;
+                        match plan_instance(ci, &self.tables, bounds, &mut marks, start_position, self.config.on_gap)? {
+                            InstanceStep::Idle => {}
+                            InstanceStep::Query(q) => queries.push(q),
+                            InstanceStep::Anchored => {
                                 if per_transaction {
                                     yield StreamPage {
                                         records: Vec::new(),
@@ -564,129 +588,34 @@ impl MssqlCdcSource {
                                 }
                             }
                         }
-                        PollPlan::Query { from, to, gap } => {
-                            if gap {
-                                crate::change::check_gap(self.config.on_gap, ci, &from.to_hex())?;
-                            }
+                    }
+                }
 
-                            let sql = changes_sql(ci);
-                            let from_hex = from.to_hex();
-                            let to_hex = to.to_hex();
+                if !queries.is_empty() {
+                    // One connection per capture instance, so their change
+                    // streams can be merged in commit order: a transaction that
+                    // touches several tables is emitted whole, in its own order.
+                    let mut conns = Vec::with_capacity(queries.len());
+                    for _ in &queries {
+                        conns.push(self.pool.get().await.map_err(|e| {
+                            FaucetError::Source(format!("mssql-cdc: pool checkout failed: {e}"))
+                        })?);
+                    }
+                    let mut streams = Vec::with_capacity(queries.len());
+                    for (conn, q) in conns.iter_mut().zip(&queries) {
+                        streams.push(self.open_changes(conn, q).await?);
+                    }
+                    let mut heads = Vec::with_capacity(streams.len());
+                    for (stream, q) in streams.iter_mut().zip(&queries) {
+                        heads.push(next_change(stream, &q.ci).await?);
+                    }
 
-                            // Open the change stream (timeout only wraps opening
-                            // it; the QueryStream borrows `conn`, not the params).
-                            let mut stream = {
-                                // `params` is a named local so it outlives the
-                                // `.await` below (tiberius borrows the params
-                                // only until the query future resolves, not for
-                                // the returned QueryStream's lifetime).
-                                let params: [&dyn ToSql; 2] = [&from_hex, &to_hex];
-                                let query_fut = conn.query(&sql, &params);
-                                match self.timeout() {
-                                    Some(t) => {
-                                        with_statement_timeout(t, async {
-                                            query_fut.await.map_err(|e| {
-                                                FaucetError::Source(format!(
-                                                    "mssql-cdc: get_all_changes failed for {ci}: {e}"
-                                                ))
-                                            })
-                                        }, || FaucetError::Source(
-                                            "mssql-cdc: get_all_changes timed out".into()
-                                        ))
-                                        .await?
-                                    }
-                                    None => query_fut.await.map_err(|e| {
-                                        FaucetError::Source(format!(
-                                            "mssql-cdc: get_all_changes failed for {ci}: {e}"
-                                        ))
-                                    })?,
-                                }
-                            };
-
-                            let mut buffer: Vec<Value> = Vec::new();
-                            let mut cur_lsn: Option<Lsn> = None;
-
-                            while let Some(item) = stream.try_next().await.map_err(|e| {
-                                FaucetError::Source(format!(
-                                    "mssql-cdc: change row stream failed for {ci}: {e}"
-                                ))
-                            })? {
-                                let QueryItem::Row(row) = item else { continue };
-                                let decoded = row_to_json(&row)?;
-
-                                let lsn_hex = decoded
-                                    .get(LSN_ALIAS)
-                                    .and_then(Value::as_str)
-                                    .ok_or_else(|| FaucetError::Source(
-                                        "mssql-cdc: change row missing __$start_lsn".into()
-                                    ))?;
-                                let row_lsn = Lsn::from_hex(lsn_hex)?;
-                                let seqval_hex = decoded
-                                    .get(SEQVAL_ALIAS)
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string);
-                                let op_code = decoded
-                                    .get(OP_COLUMN)
-                                    .and_then(Value::as_i64)
-                                    .ok_or_else(|| FaucetError::Source(
-                                        "mssql-cdc: change row missing __$operation".into()
-                                    ))?;
-
-                                // Commit boundary: a new __$start_lsn closes the
-                                // previous transaction. Emit it bookmarked at the
-                                // completed commit LSN (a safe resume point).
-                                if let Some(prev) = cur_lsn
-                                    && prev != row_lsn
-                                {
-                                    marks.set(ci.clone(), prev);
-                                    let recs = std::mem::take(&mut buffer);
-                                    if per_transaction {
-                                        yield StreamPage {
-                                            records: recs,
-                                            bookmark: Some(self.note_emitted(&marks)?),
-                                        };
-                                    } else {
-                                        agg.extend(recs);
-                                        agg_dirty = true;
-                                    }
-                                }
-                                cur_lsn = Some(row_lsn);
-
-                                match op_action(op_code)? {
-                                    OpAction::Skip => continue,
-                                    OpAction::Emit(op) => {
-                                        if let Some(max) = max_staged
-                                            && buffer.len() >= max
-                                        {
-                                            Err(FaucetError::Source(format!(
-                                                "mssql-cdc: in-progress transaction for {ci} exceeded \
-                                                 max_staged_records ({max}); aborting to avoid \
-                                                 unbounded memory growth. Raise max_staged_records \
-                                                 or reduce the source transaction size."
-                                            )))?;
-                                        }
-                                        let cols = business_columns(&decoded);
-                                        let env = build_change_envelope(
-                                            op,
-                                            &schema,
-                                            &table,
-                                            lsn_hex,
-                                            seqval_hex.as_deref(),
-                                            cols,
-                                        );
-                                        buffer.push(env);
-                                        any_rows = true;
-                                    }
-                                }
-                            }
-                            // Drop the change stream (release the conn borrow) by
-                            // ending the while-loop scope, then flush the tail.
-                            drop(stream);
-
-                            // Final flush: advance to `to` (everything <= to is
-                            // consumed) so we never re-scan this range.
-                            marks.set(ci.clone(), to);
-                            let recs = std::mem::take(&mut buffer);
+                    let mut tx = TxAssembler::new(max_staged);
+                    while let Some(i) = next_head(&heads) {
+                        let change = heads[i].take().expect("next_head picks a present head");
+                        heads[i] = next_change(&mut streams[i], &queries[i].ci).await?;
+                        if let Some((prev, recs)) = tx.push(change, &queries[i])? {
+                            advance_marks(&mut marks, &queries, prev);
                             if per_transaction {
                                 yield StreamPage {
                                     records: recs,
@@ -697,6 +626,21 @@ impl MssqlCdcSource {
                                 agg_dirty = true;
                             }
                         }
+                    }
+                    any_rows |= tx.emitted;
+                    drop(streams);
+                    drop(conns);
+
+                    consume_all(&mut marks, &queries);
+                    let recs = tx.finish();
+                    if per_transaction {
+                        yield StreamPage {
+                            records: recs,
+                            bookmark: Some(self.note_emitted(&marks)?),
+                        };
+                    } else {
+                        agg.extend(recs);
+                        agg_dirty = true;
                     }
                 }
 
@@ -726,6 +670,203 @@ impl MssqlCdcSource {
                 "mssql-cdc fetch cycle complete",
             );
         })
+    }
+}
+
+/// One capture instance's change query for a poll.
+struct ChangeQuery {
+    ci: String,
+    schema: String,
+    table: String,
+    from: Lsn,
+    to: Lsn,
+}
+
+/// One decoded change row.
+struct Change {
+    lsn: Lsn,
+    lsn_hex: String,
+    seqval_hex: Option<String>,
+    op_code: i64,
+    decoded: Value,
+}
+
+/// The next change row of one capture instance's stream.
+async fn next_change(
+    stream: &mut tiberius::QueryStream<'_>,
+    ci: &str,
+) -> Result<Option<Change>, FaucetError> {
+    while let Some(item) = stream.try_next().await.map_err(|e| {
+        FaucetError::Source(format!("mssql-cdc: change row stream failed for {ci}: {e}"))
+    })? {
+        let QueryItem::Row(row) = item else { continue };
+        return decode_change(row_to_json(&row)?).map(Some);
+    }
+    Ok(None)
+}
+
+/// Pull the commit LSN, sequence value and operation out of a decoded row.
+fn decode_change(decoded: Value) -> Result<Change, FaucetError> {
+    let lsn_hex = decoded
+        .get(LSN_ALIAS)
+        .and_then(Value::as_str)
+        .ok_or_else(|| FaucetError::Source("mssql-cdc: change row missing __$start_lsn".into()))?
+        .to_string();
+    let seqval_hex = decoded
+        .get(SEQVAL_ALIAS)
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let op_code = decoded
+        .get(OP_COLUMN)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| FaucetError::Source("mssql-cdc: change row missing __$operation".into()))?;
+    Ok(Change {
+        lsn: Lsn::from_hex(&lsn_hex)?,
+        lsn_hex,
+        seqval_hex,
+        op_code,
+        decoded,
+    })
+}
+
+/// What one capture instance contributes to a poll.
+enum InstanceStep {
+    /// Nothing to read.
+    Idle,
+    /// A fresh `current` start anchored the instance's bookmark; persist it.
+    Anchored,
+    /// Read this range of changes.
+    Query(ChangeQuery),
+}
+
+/// Plan one capture instance's poll from its LSN bounds, anchoring a fresh
+/// `current` start in `marks` and applying the `on_gap` policy.
+fn plan_instance(
+    ci: &str,
+    tables: &HashMap<String, (String, String)>,
+    bounds: LsnBounds,
+    marks: &mut Bookmarks,
+    start: StartPosition,
+    on_gap: OnGap,
+) -> Result<InstanceStep, FaucetError> {
+    match plan_poll(marks.get(ci), bounds, start) {
+        PollPlan::NoChanges {
+            set_bookmark: Some(anchor),
+        } if marks.get(ci).is_none() => {
+            marks.set(ci, anchor);
+            Ok(InstanceStep::Anchored)
+        }
+        PollPlan::NoChanges { .. } => Ok(InstanceStep::Idle),
+        PollPlan::Query { from, to, gap } => {
+            if gap {
+                crate::change::check_gap(on_gap, ci, &from.to_hex())?;
+            }
+            let (schema, table) = tables
+                .get(ci)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), ci.to_string()));
+            Ok(InstanceStep::Query(ChangeQuery {
+                ci: ci.to_string(),
+                schema,
+                table,
+                from,
+                to,
+            }))
+        }
+    }
+}
+
+/// Groups merged changes into whole transactions by commit LSN.
+struct TxAssembler {
+    buffer: Vec<Value>,
+    cur: Option<Lsn>,
+    max_staged: Option<usize>,
+    /// Whether any change was turned into a record.
+    emitted: bool,
+}
+
+impl TxAssembler {
+    fn new(max_staged: Option<usize>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            cur: None,
+            max_staged,
+            emitted: false,
+        }
+    }
+
+    /// Feed the next change in commit order. When it starts a new commit LSN,
+    /// the previous transaction is complete and is returned with its LSN.
+    fn push(
+        &mut self,
+        change: Change,
+        q: &ChangeQuery,
+    ) -> Result<Option<(Lsn, Vec<Value>)>, FaucetError> {
+        let closed = match self.cur {
+            Some(prev) if prev != change.lsn => Some((prev, std::mem::take(&mut self.buffer))),
+            _ => None,
+        };
+        self.cur = Some(change.lsn);
+        if let OpAction::Emit(op) = op_action(change.op_code)? {
+            if let Some(max) = self.max_staged
+                && self.buffer.len() >= max
+            {
+                return Err(FaucetError::Source(format!(
+                    "mssql-cdc: in-progress transaction exceeded \
+                     max_staged_records ({max}); aborting to avoid \
+                     unbounded memory growth. Raise max_staged_records \
+                     or reduce the source transaction size."
+                )));
+            }
+            self.buffer.push(build_change_envelope(
+                op,
+                &q.schema,
+                &q.table,
+                &change.lsn_hex,
+                change.seqval_hex.as_deref(),
+                business_columns(&change.decoded),
+            ));
+            self.emitted = true;
+        }
+        Ok(closed)
+    }
+
+    /// The records of the last, still-open transaction.
+    fn finish(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.buffer)
+    }
+}
+
+/// Everything up to each queried instance's `to` has been consumed.
+fn consume_all(marks: &mut Bookmarks, queries: &[ChangeQuery]) {
+    for q in queries {
+        marks.set(q.ci.clone(), q.to);
+    }
+}
+
+/// The stream whose head comes first in commit order: by commit LSN, then by
+/// `__$seqval` (the change's position within its transaction, comparable
+/// across tables because both are fixed-width hex).
+fn next_head(heads: &[Option<Change>]) -> Option<usize> {
+    heads
+        .iter()
+        .enumerate()
+        .filter_map(|(i, h)| h.as_ref().map(|c| (i, c)))
+        .min_by(|(_, a), (_, b)| {
+            a.lsn
+                .cmp(&b.lsn)
+                .then_with(|| a.seqval_hex.cmp(&b.seqval_hex))
+        })
+        .map(|(i, _)| i)
+}
+
+/// Mark every queried instance as consumed through commit `lsn`, never moving
+/// one backwards.
+fn advance_marks(marks: &mut Bookmarks, queries: &[ChangeQuery], lsn: Lsn) {
+    for q in queries {
+        if marks.get(&q.ci).is_none_or(|m| m < lsn) {
+            marks.set(q.ci.clone(), lsn);
+        }
     }
 }
 
@@ -763,6 +904,338 @@ mod tests {
             Some("dbo.Orders".into())
         );
         assert_eq!(schema_table(&serde_json::json!({"schema": "dbo"})), None);
+    }
+
+    fn change(lsn: &str, seq: &str) -> Change {
+        Change {
+            lsn: Lsn::from_hex(lsn).unwrap(),
+            lsn_hex: lsn.into(),
+            seqval_hex: Some(seq.into()),
+            op_code: 2,
+            decoded: serde_json::json!({}),
+        }
+    }
+
+    fn lsn(hex: &str) -> Lsn {
+        Lsn::from_hex(hex).unwrap()
+    }
+
+    fn query_of(step: InstanceStep) -> ChangeQuery {
+        match step {
+            InstanceStep::Query(q) => q,
+            _ => panic!("expected a query"),
+        }
+    }
+
+    fn query(ci: &str) -> ChangeQuery {
+        ChangeQuery {
+            ci: ci.into(),
+            schema: "dbo".into(),
+            table: ci.into(),
+            from: lsn("00000000000000000001"),
+            to: lsn("00000000000000000100"),
+        }
+    }
+
+    fn row(lsn_hex: &str, seq: &str, op: i64, id: i64) -> Change {
+        decode_change(serde_json::json!({
+            LSN_ALIAS: lsn_hex,
+            SEQVAL_ALIAS: seq,
+            OP_COLUMN: op,
+            "__$update_mask": "AQ==",
+            "id": id,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn decode_change_reads_metadata_and_keeps_the_row() {
+        let c = row("0000002a000000550003", "0000002a000000550002", 4, 7);
+        assert_eq!(c.lsn, lsn("0000002a000000550003"));
+        assert_eq!(c.lsn_hex, "0000002a000000550003");
+        assert_eq!(c.seqval_hex.as_deref(), Some("0000002a000000550002"));
+        assert_eq!(c.op_code, 4);
+        assert_eq!(c.decoded["id"], 7);
+    }
+
+    #[test]
+    fn decode_change_refuses_rows_without_lsn_or_operation() {
+        let no_lsn = decode_change(serde_json::json!({ OP_COLUMN: 2 }));
+        assert!(no_lsn.err().unwrap().to_string().contains("__$start_lsn"));
+        let no_op = decode_change(serde_json::json!({ LSN_ALIAS: "0000002a000000550003" }));
+        assert!(no_op.err().unwrap().to_string().contains("__$operation"));
+        let bad_lsn = decode_change(serde_json::json!({ LSN_ALIAS: "zz", OP_COLUMN: 2 }));
+        assert!(bad_lsn.is_err());
+        let no_seq = decode_change(serde_json::json!({
+            LSN_ALIAS: "0000002a000000550003", OP_COLUMN: 2
+        }))
+        .unwrap();
+        assert!(no_seq.seqval_hex.is_none());
+    }
+
+    #[test]
+    fn plan_instance_anchors_a_fresh_current_start_once() {
+        let tables = HashMap::new();
+        let bounds = LsnBounds {
+            min: Some(lsn("00000000000000000010")),
+            max: Some(lsn("00000000000000000020")),
+            start: None,
+        };
+        let mut marks = Bookmarks::new();
+        let step = plan_instance(
+            "dbo_t",
+            &tables,
+            bounds,
+            &mut marks,
+            StartPosition::Current,
+            OnGap::Fail,
+        )
+        .unwrap();
+        assert!(matches!(step, InstanceStep::Anchored));
+        assert_eq!(marks.get("dbo_t"), Some(lsn("00000000000000000020")));
+        let again = plan_instance(
+            "dbo_t",
+            &tables,
+            bounds,
+            &mut marks,
+            StartPosition::Current,
+            OnGap::Fail,
+        )
+        .unwrap();
+        assert!(matches!(again, InstanceStep::Idle));
+        assert_eq!(marks.get("dbo_t"), Some(lsn("00000000000000000020")));
+    }
+
+    #[test]
+    fn plan_instance_is_idle_without_change_activity() {
+        let mut marks = Bookmarks::new();
+        let step = plan_instance(
+            "dbo_t",
+            &HashMap::new(),
+            LsnBounds::default(),
+            &mut marks,
+            StartPosition::Earliest,
+            OnGap::Fail,
+        )
+        .unwrap();
+        assert!(matches!(step, InstanceStep::Idle));
+        assert_eq!(marks.get("dbo_t"), None);
+    }
+
+    #[test]
+    fn plan_instance_queries_with_the_resolved_table() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "dbo_Orders".to_string(),
+            ("sales".to_string(), "Orders".to_string()),
+        );
+        let bounds = LsnBounds {
+            min: Some(lsn("00000000000000000010")),
+            max: Some(lsn("00000000000000000020")),
+            start: None,
+        };
+        let mut marks = Bookmarks::new();
+        let q = query_of(
+            plan_instance(
+                "dbo_Orders",
+                &tables,
+                bounds,
+                &mut marks,
+                StartPosition::Earliest,
+                OnGap::Fail,
+            )
+            .unwrap(),
+        );
+        assert_eq!((q.schema.as_str(), q.table.as_str()), ("sales", "Orders"));
+        assert_eq!(
+            (q.from, q.to),
+            (lsn("00000000000000000010"), lsn("00000000000000000020"))
+        );
+
+        let unknown = query_of(
+            plan_instance(
+                "dbo_Other",
+                &tables,
+                bounds,
+                &mut Bookmarks::new(),
+                StartPosition::Earliest,
+                OnGap::Fail,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            (unknown.schema.as_str(), unknown.table.as_str()),
+            ("", "dbo_Other")
+        );
+    }
+
+    #[test]
+    fn plan_instance_applies_the_gap_policy() {
+        let bounds = LsnBounds {
+            min: Some(lsn("00000000000000000050")),
+            max: Some(lsn("00000000000000000090")),
+            start: None,
+        };
+        let behind = || {
+            let mut m = Bookmarks::new();
+            m.set("dbo_t", lsn("00000000000000000010"));
+            m
+        };
+        let err = plan_instance(
+            "dbo_t",
+            &HashMap::new(),
+            bounds,
+            &mut behind(),
+            StartPosition::Current,
+            OnGap::Fail,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("purged"), "{err}");
+        let q = query_of(
+            plan_instance(
+                "dbo_t",
+                &HashMap::new(),
+                bounds,
+                &mut behind(),
+                StartPosition::Current,
+                OnGap::Skip,
+            )
+            .unwrap(),
+        );
+        assert_eq!(q.from, lsn("00000000000000000050"));
+    }
+
+    #[test]
+    fn transactions_close_on_a_new_commit_lsn() {
+        let (a, b) = (query("dbo_a"), query("dbo_b"));
+        let mut tx = TxAssembler::new(None);
+        assert!(
+            tx.push(row("00000000000000000005", "01", 2, 1), &a)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tx.push(row("00000000000000000005", "02", 3, 2), &b)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tx.push(row("00000000000000000005", "03", 4, 2), &b)
+                .unwrap()
+                .is_none()
+        );
+        let (lsn5, recs) = tx
+            .push(row("00000000000000000009", "01", 1, 3), &a)
+            .unwrap()
+            .expect("the first transaction closes");
+        assert_eq!(lsn5, lsn("00000000000000000005"));
+        assert_eq!(recs.len(), 2, "the update pre-image row is skipped");
+        assert_eq!(recs[0]["op"], "i");
+        assert_eq!(recs[0]["table"], "dbo_a");
+        assert_eq!(recs[1]["op"], "u");
+        assert_eq!(recs[1]["table"], "dbo_b");
+        assert_eq!(recs[1]["after"]["id"], 2);
+        assert!(tx.emitted);
+        let tail = tx.finish();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0]["op"], "d");
+        assert_eq!(tail[0]["before"]["id"], 3);
+        assert!(tx.finish().is_empty());
+    }
+
+    #[test]
+    fn a_transaction_of_skipped_rows_still_closes_empty() {
+        let a = query("dbo_a");
+        let mut tx = TxAssembler::new(None);
+        assert!(
+            tx.push(row("00000000000000000005", "01", 3, 1), &a)
+                .unwrap()
+                .is_none()
+        );
+        let (lsn5, recs) = tx
+            .push(row("00000000000000000006", "01", 3, 1), &a)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lsn5, lsn("00000000000000000005"));
+        assert!(recs.is_empty());
+        assert!(!tx.emitted);
+    }
+
+    #[test]
+    fn transactions_refuse_unknown_operations_and_oversized_buffers() {
+        let a = query("dbo_a");
+        let mut tx = TxAssembler::new(None);
+        assert!(
+            tx.push(row("00000000000000000005", "01", 9, 1), &a)
+                .is_err()
+        );
+
+        let mut capped = TxAssembler::new(Some(2));
+        capped
+            .push(row("00000000000000000005", "01", 2, 1), &a)
+            .unwrap();
+        capped
+            .push(row("00000000000000000005", "02", 2, 2), &a)
+            .unwrap();
+        let err = capped
+            .push(row("00000000000000000005", "03", 2, 3), &a)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("max_staged_records (2)"), "{err}");
+    }
+
+    #[test]
+    fn consume_all_moves_every_instance_to_its_upper_bound() {
+        let mut marks = Bookmarks::new();
+        marks.set("dbo_a", lsn("00000000000000000003"));
+        consume_all(&mut marks, &[query("dbo_a"), query("dbo_b")]);
+        assert_eq!(marks.get("dbo_a"), Some(lsn("00000000000000000100")));
+        assert_eq!(marks.get("dbo_b"), Some(lsn("00000000000000000100")));
+    }
+
+    #[tokio::test]
+    async fn new_fails_when_the_server_is_unreachable() {
+        let cfg: MssqlCdcSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_url": "mssql://sa:pw@127.0.0.1:1/sales",
+            "capture_instances": ["dbo_Orders"],
+            "max_connections": 2
+        }))
+        .unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(60), MssqlCdcSource::new(cfg))
+            .await
+            .expect("an unreachable server fails promptly");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn merged_streams_follow_commit_order() {
+        let heads = vec![
+            Some(change("0000002a000000560001", "0000002a000000560003")),
+            None,
+            Some(change("0000002a000000550003", "0000002a000000550009")),
+            Some(change("0000002a000000550003", "0000002a000000550002")),
+        ];
+        assert_eq!(next_head(&heads), Some(3));
+        assert_eq!(next_head(&[None, None]), None);
+    }
+
+    #[test]
+    fn marks_advance_for_every_instance_but_never_back() {
+        let q = |ci: &str| ChangeQuery {
+            ci: ci.into(),
+            schema: "dbo".into(),
+            table: ci.into(),
+            from: Lsn::from_hex("00000000000000000001").unwrap(),
+            to: Lsn::from_hex("00000000000000000100").unwrap(),
+        };
+        let mut marks = Bookmarks::new();
+        let ahead = Lsn::from_hex("00000000000000000090").unwrap();
+        marks.set("b", ahead);
+        let lsn = Lsn::from_hex("00000000000000000050").unwrap();
+        advance_marks(&mut marks, &[q("a"), q("b")], lsn);
+        assert_eq!(marks.get("a"), Some(lsn));
+        assert_eq!(marks.get("b"), Some(ahead));
     }
 
     #[test]

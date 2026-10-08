@@ -19,6 +19,7 @@ async-trait.workspace = true
 tracing.workspace = true
 duckdb = { workspace = true, features = ["bundled"] }
 base64.workspace = true
+chrono.workspace = true
 async-stream.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }

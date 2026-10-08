@@ -76,6 +76,7 @@ fn base_config(url: &str) -> WebsocketSourceConfig {
         max_reconnect_attempts: None,
         max_message_bytes: None,
         batch_size: BATCH,
+        connect_timeout: std::time::Duration::from_secs(30),
     }
 }
 

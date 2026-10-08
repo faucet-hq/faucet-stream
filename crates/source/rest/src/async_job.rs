@@ -120,7 +120,8 @@ pub struct PollSpec {
     /// 1s and doubles up to this cap, so a job that finishes seconds after
     /// submit is noticed quickly while a long-running one isn't hammered. Set
     /// it to the slowest acceptable poll rate — it is the maximum gap between
-    /// polls, not a fixed wait.
+    /// polls, not a fixed wait. Values below 1 are treated as 1, so polls are
+    /// never sent back-to-back.
     #[serde(default = "default_interval")]
     pub interval_secs: u64,
     /// Give up after this many seconds (default `1800`).

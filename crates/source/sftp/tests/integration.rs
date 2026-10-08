@@ -32,7 +32,9 @@ const PASS: &str = "secret";
 /// Files are baked in with `with_copy_to`: the image creates the directory
 /// itself, and copying avoids needing a working *upload* path to test the
 /// *download* one.
-async fn start_sftp(files: &[(String, String)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
+async fn start_sftp_inner(
+    files: &[(String, String)],
+) -> Option<(ContainerAsync<GenericImage>, u16)> {
     let mut image = GenericImage::new("atmoz/sftp", "alpine")
         .with_exposed_port(22.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
@@ -239,4 +241,15 @@ async fn a_sinks_upload_scratch_is_not_read() {
     };
     let records = drain(&source(port, SftpFormat::Jsonl, 2, 1_000), 1_000).await;
     assert_eq!(records, vec![serde_json::json!({"id": 1})]);
+}
+
+/// [`start_sftp_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
+/// is set — CI provides Docker, so an unavailable backend is a failure there.
+async fn start_sftp(files: &[(String, String)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
+    let started = start_sftp_inner(files).await;
+    assert!(
+        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+        "start_sftp: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
+    );
+    started
 }

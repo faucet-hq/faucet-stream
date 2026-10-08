@@ -87,6 +87,7 @@ Flags:
 | `--overlay <id\|path>` | With `--source` / `--sink`: apply a `kind: deployment` overlay — state, DLQ, notifications, SLA and other operational blocks — over the composition. A path, or an id under `<hub>/deployments/`. See [Deployment overlays](../cookbook/template-hub.md#deployment-overlays). |
 | `--tui` | Show a live full-screen terminal UI while the pipeline runs: per-invocation source→sink route, records in/out, records/s, errors, DLQ counts, bookmark age, and a scrolling log pane. Press `q` (or `Ctrl-C`) to cancel cooperatively — in-flight invocations stop at their next page boundary and flush their sinks. Requires a binary built with the `cli-tui` feature (`cargo install faucet-cli --features cli-tui`); on a non-TTY stdout (CI, pipes) the flag logs a notice and runs normally. When the config has an `observability.prometheus` block, the `/metrics` endpoint stays up alongside the TUI; OTLP *metrics* export is skipped under `--tui` (traces are unaffected). |
 | `--quiet` | Suppress the inline live progress line. |
+| `--force` | Start even though another process holds a row's live run lease. Without it, a row whose lease is live (another `faucet run` / `schedule` process is running it against the same `state:` store) fails with the holder's run id, pid and lease expiry, because two runs would start from the same bookmark and race it. A run that is cancelled or aborted releases its lease as it stops; a run whose process died on this host (same host name and PID namespace, pid no longer running) is taken over without `--force`, and the takeover is logged. A run on another host that crashed keeps its lease until it expires, a minute after it stops renewing. Use `--force` only when that run is known to be gone. Mirror, backfill and other orchestrators fail the whole run on a held lease rather than counting it as one failed table or unit. |
 
 ### Live progress line
 
@@ -906,7 +907,11 @@ Every mutation prints the plan (before / after) first and needs `--yes`, an
 interactive confirmation on a terminal, or `--dry-run` to stop at the plan.
 It refuses while a run holds the row — a live run lease in the state store, or
 a run of the pipeline in flight in the config's `catalog:` store — unless
-`--force`.
+`--force`. Every invocation that writes a bookmark holds a lease: a row's
+fan-out children, backfill units and multi-table mirror tables included, so
+`set` / `reset` also refuse while a child of the row, a backfill or a mirror of
+the pipeline is running, and `import` refuses while any run of the pipeline
+holds a lease.
 
 ## `catalog`
 

@@ -117,7 +117,35 @@ pub enum DecodeStep {
 
 /// Run the decode chain over the response body, returning records.
 pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>, FaucetError> {
-    let mut buf = body.to_vec();
+    let body = body.to_vec();
+    let owned_steps = steps.to_vec();
+    // Base64 / gunzip / unzip are CPU-bound and can be large: run them off the
+    // async runtime (API-42).
+    let (buf, parse) = tokio::task::spawn_blocking(move || decode_bytes(body, &owned_steps))
+        .await
+        .map_err(|e| FaucetError::Source(format!("decode: worker failed: {e}")))??;
+    // No explicit `parse` → default to JSON.
+    let parse = parse.unwrap_or(ParseSpec {
+        format: ParseFormat::Json,
+        records_path: None,
+        delimiter: None,
+        has_headers: true,
+        sheet: None,
+        header_row: 0,
+    });
+    parse_records(&buf, &parse).await
+}
+
+/// Largest buffer a decompression step may produce (1 GiB); a bigger member
+/// fails instead of exhausting memory.
+pub const MAX_DECODED_BYTES: u64 = 1 << 30;
+
+/// Run the byte steps up to the first `parse`, returning the buffer and that
+/// `parse` step (if any).
+fn decode_bytes(
+    mut buf: Vec<u8>,
+    steps: &[DecodeStep],
+) -> Result<(Vec<u8>, Option<ParseSpec>), FaucetError> {
     for step in steps {
         match step {
             DecodeStep::Extract { extract } => {
@@ -125,7 +153,7 @@ pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>,
                 // text content becomes the buffer (e.g. pull a base64 file blob
                 // out of a SOAP `<reportBytes>` element). The path is matched by
                 // its trailing element names, namespace-prefix-insensitive.
-                let s = xml_extract_text(&buf, extract).ok_or_else(|| {
+                let s = xml_extract_text(&buf, extract)?.ok_or_else(|| {
                     FaucetError::Source(format!(
                         "decode `extract`: '{extract}' matched no element text in the XML body"
                     ))
@@ -141,57 +169,72 @@ pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>,
                     .map_err(|e| FaucetError::Source(format!("decode `base64`: {e}")))?;
             }
             DecodeStep::Simple(SimpleStep::Gunzip) => {
-                let mut out = Vec::new();
-                flate2::read::GzDecoder::new(Cursor::new(&buf))
-                    .read_to_end(&mut out)
-                    .map_err(|e| FaucetError::Source(format!("decode `gunzip`: {e}")))?;
-                buf = out;
+                buf = read_capped(
+                    flate2::read::GzDecoder::new(Cursor::new(&buf)),
+                    MAX_DECODED_BYTES,
+                    "gunzip",
+                )?;
             }
             DecodeStep::Unzip { unzip } => {
                 buf = unzip_member(&buf, unzip.member.as_deref())?;
             }
-            DecodeStep::Parse { parse } => {
-                return parse_records(&buf, parse).await;
-            }
+            DecodeStep::Parse { parse } => return Ok((buf, Some(parse.clone()))),
         }
     }
-    // No explicit `parse` → default to JSON.
-    parse_records(
-        &buf,
-        &ParseSpec {
-            format: ParseFormat::Json,
-            records_path: None,
-            delimiter: None,
-            has_headers: true,
-            sheet: None,
-            header_row: 0,
-        },
-    )
-    .await
+    Ok((buf, None))
+}
+
+/// Read `reader` to the end, failing once it yields more than `cap` bytes.
+fn read_capped(reader: impl Read, cap: u64, step: &str) -> Result<Vec<u8>, FaucetError> {
+    let mut out = Vec::new();
+    reader
+        .take(cap + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| FaucetError::Source(format!("decode `{step}`: {e}")))?;
+    if out.len() as u64 > cap {
+        return Err(FaucetError::Source(format!(
+            "decode `{step}`: the decompressed data exceeds {cap} bytes"
+        )));
+    }
+    Ok(out)
+}
+
+/// Check every `parse.records_path` at load time, so a typo fails the config
+/// rather than every run yielding zero records (API-62).
+pub fn validate_steps(steps: &[DecodeStep]) -> Result<(), FaucetError> {
+    for step in steps {
+        if let DecodeStep::Parse { parse } = step
+            && let Some(path) = &parse.records_path
+        {
+            Value::Null.query(path).map_err(|e| {
+                FaucetError::Config(format!(
+                    "decode `parse`: invalid `records_path` '{path}': {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Concatenated text of the first element whose ancestor stack ends with the
 /// dot-path segments (namespace-prefix-insensitive). Used by the XML `extract`
 /// decode step to pull a blob (e.g. a base64-encoded file) out of a SOAP body —
 /// e.g. `runReportResponse.runReportReturn.reportBytes`.
-pub(crate) fn xml_extract_text(bytes: &[u8], dot_path: &str) -> Option<String> {
+pub(crate) fn xml_extract_text(
+    bytes: &[u8],
+    dot_path: &str,
+) -> Result<Option<String>, FaucetError> {
     let want: Vec<String> = dot_path
         .split('.')
         .filter(|s| !s.is_empty())
         .map(|s| s.rsplit(':').next().unwrap_or(s).to_string())
         .collect();
     if want.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let text = std::str::from_utf8(bytes).ok()?;
+    let bad = |m: String| FaucetError::Source(format!("decode `extract`: {m}"));
+    let text = std::str::from_utf8(bytes).map_err(|e| bad(format!("body is not UTF-8: {e}")))?;
     let mut reader = quick_xml::Reader::from_str(text);
-    let local = |name: &[u8]| -> String {
-        String::from_utf8_lossy(name)
-            .rsplit(':')
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    };
     let ends_with = |stack: &[String]| -> bool {
         stack.len() >= want.len() && stack[stack.len() - want.len()..] == want[..]
     };
@@ -199,7 +242,8 @@ pub(crate) fn xml_extract_text(bytes: &[u8], dot_path: &str) -> Option<String> {
     let mut capture_depth: Option<usize> = None;
     let mut out = String::new();
     loop {
-        match reader.read_event().ok()? {
+        let event = reader.read_event().map_err(|e| bad(e.to_string()))?;
+        match &event {
             Event::Eof => break,
             Event::Start(e) => {
                 stack.push(local(e.name().as_ref()));
@@ -211,28 +255,30 @@ pub(crate) fn xml_extract_text(bytes: &[u8], dot_path: &str) -> Option<String> {
             Event::Empty(e) => {
                 stack.push(local(e.name().as_ref()));
                 if capture_depth.is_none() && ends_with(&stack) {
-                    return Some(String::new());
+                    return Ok(Some(String::new()));
                 }
                 stack.pop();
             }
             Event::End(_) => {
                 if capture_depth == Some(stack.len()) {
-                    return Some(out);
+                    return Ok(Some(out));
                 }
                 stack.pop();
             }
-            Event::Text(t) if capture_depth.is_some() => {
-                if let Ok(s) = t.unescape() {
-                    out.push_str(&s);
+            other if capture_depth.is_some() => {
+                if let Some(t) = crate::xmltext::event_text(other).map_err(bad)? {
+                    out.push_str(&t);
                 }
-            }
-            Event::CData(t) if capture_depth.is_some() => {
-                out.push_str(&String::from_utf8_lossy(&t));
             }
             _ => {}
         }
     }
-    None
+    Ok(None)
+}
+
+/// The local part of a (possibly prefixed) element or attribute name.
+fn local(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or_default().to_string()
 }
 
 /// Minimal glob: `*` matches any run. Supports `*.ext`, `prefix*`, `*mid*`,
@@ -267,39 +313,38 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 fn unzip_member(bytes: &[u8], member: Option<&str>) -> Result<Vec<u8>, FaucetError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| FaucetError::Source(format!("decode `unzip`: not a valid zip: {e}")))?;
-    // Resolve the member index first (immutable name scan), then read it.
-    let mut chosen: Option<usize> = None;
+    let mut matched: Vec<(usize, String)> = Vec::new();
     for i in 0..archive.len() {
         let f = archive
             .by_index(i)
             .map_err(|e| FaucetError::Source(format!("decode `unzip`: {e}")))?;
-        if !f.is_file() {
-            continue;
-        }
-        let matches = match member {
-            Some(pat) => glob_match(pat, f.name()),
-            None => true, // first file
-        };
-        if matches {
-            chosen = Some(i);
-            break;
+        if f.is_file() && member.is_none_or(|pat| glob_match(pat, f.name())) {
+            matched.push((i, f.name().to_string()));
         }
     }
-    let idx = chosen.ok_or_else(|| {
-        FaucetError::Source(format!(
-            "decode `unzip`: no member matched {}",
-            member
-                .map(|m| format!("'{m}'"))
-                .unwrap_or_else(|| "any".into())
-        ))
-    })?;
-    let mut f = archive
+    let selector = member
+        .map(|m| format!("'{m}'"))
+        .unwrap_or_else(|| "any".into());
+    let idx = match matched.as_slice() {
+        [(idx, _)] => *idx,
+        [] => {
+            return Err(FaucetError::Source(format!(
+                "decode `unzip`: no member matched {selector}"
+            )));
+        }
+        several => {
+            let names: Vec<&str> = several.iter().map(|(_, n)| n.as_str()).collect();
+            return Err(FaucetError::Source(format!(
+                "decode `unzip`: {} members match {selector} ({}); set `member` to select exactly one",
+                several.len(),
+                names.join(", ")
+            )));
+        }
+    };
+    let f = archive
         .by_index(idx)
         .map_err(|e| FaucetError::Source(format!("decode `unzip`: {e}")))?;
-    let mut out = Vec::new();
-    f.read_to_end(&mut out)
-        .map_err(|e| FaucetError::Source(format!("decode `unzip`: reading member: {e}")))?;
-    Ok(out)
+    read_capped(f, MAX_DECODED_BYTES, "unzip")
 }
 
 async fn parse_records(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, FaucetError> {
@@ -307,7 +352,7 @@ async fn parse_records(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, Fau
         ParseFormat::Json => {
             let v: Value = serde_json::from_slice(bytes)
                 .map_err(|e| FaucetError::Source(format!("decode `parse` json: {e}")))?;
-            Ok(records_from_value(v, spec.records_path.as_deref()))
+            records_from_value(v, spec.records_path.as_deref())
         }
         ParseFormat::Csv => {
             crate::format::parse_csv(bytes, spec.delimiter.unwrap_or(b','), spec.has_headers)
@@ -320,24 +365,27 @@ async fn parse_records(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, Fau
         }
         ParseFormat::Xml => {
             let v = xml_to_json(bytes)?;
-            Ok(records_from_value(v, spec.records_path.as_deref()))
+            records_from_value(v, spec.records_path.as_deref())
         }
     }
 }
 
 /// Turn a JSON value into records: apply `records_path` if given, else an array
 /// becomes the records and any other value becomes a single record.
-fn records_from_value(v: Value, records_path: Option<&str>) -> Vec<Value> {
+fn records_from_value(v: Value, records_path: Option<&str>) -> Result<Vec<Value>, FaucetError> {
     match records_path {
         Some(path) => v
             .query(path)
-            .ok()
             .map(|ms| ms.into_iter().cloned().collect())
-            .unwrap_or_default(),
-        None => match v {
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "decode `parse`: invalid `records_path` '{path}': {e}"
+                ))
+            }),
+        None => Ok(match v {
             Value::Array(a) => a,
             other => vec![other],
-        },
+        }),
     }
 }
 
@@ -381,26 +429,14 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
     // A stack of (object, text-accumulator) frames; index 0 is the document root.
     let mut stack: Vec<(Map<String, Value>, String)> = vec![(Map::new(), String::new())];
 
-    fn attrs(e: &quick_xml::events::BytesStart) -> Map<String, Value> {
+    fn attrs(e: &quick_xml::events::BytesStart) -> Result<Map<String, Value>, FaucetError> {
         let mut m = Map::new();
-        for a in e.attributes().with_checks(false).flatten() {
-            let k = String::from_utf8_lossy(a.key.as_ref())
-                .rsplit(':')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            if let Ok(v) = a.unescape_value() {
-                m.insert(format!("@{k}"), Value::String(v.to_string()));
-            }
+        for (k, v) in crate::xmltext::attributes(e)
+            .map_err(|m| FaucetError::Source(format!("decode `parse` xml: {m}")))?
+        {
+            m.insert(format!("@{}", local(&k)), Value::String(v));
         }
-        m
-    }
-    fn local(name: &[u8]) -> String {
-        String::from_utf8_lossy(name)
-            .rsplit(':')
-            .next()
-            .unwrap_or_default()
-            .to_string()
+        Ok(m)
     }
     fn insert_child(parent: &mut Map<String, Value>, key: String, val: Value) {
         match parent.get_mut(&key) {
@@ -428,15 +464,15 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
     }
 
     loop {
-        match reader
+        let event = reader
             .read_event()
-            .map_err(|e| FaucetError::Source(format!("decode `parse` xml: {e}")))?
-        {
+            .map_err(|e| FaucetError::Source(format!("decode `parse` xml: {e}")))?;
+        match &event {
             Event::Eof => break,
-            Event::Start(e) => stack.push((attrs(&e), String::new())),
+            Event::Start(e) => stack.push((attrs(e)?, String::new())),
             Event::Empty(e) => {
                 let name = local(e.name().as_ref());
-                let val = finish(attrs(&e), String::new());
+                let val = finish(attrs(e)?, String::new());
                 let top = top_frame(&mut stack, "element after the document root closed")?;
                 insert_child(&mut top.0, name, val);
             }
@@ -448,19 +484,15 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
                 let top = top_frame(&mut stack, &detail)?;
                 insert_child(&mut top.0, name, val);
             }
-            Event::Text(t) => {
-                if let Ok(s) = t.unescape() {
+            other => {
+                if let Some(t) = crate::xmltext::event_text(other)
+                    .map_err(|m| FaucetError::Source(format!("decode `parse` xml: {m}")))?
+                {
                     top_frame(&mut stack, "text after the document root closed")?
                         .1
-                        .push_str(&s);
+                        .push_str(&t);
                 }
             }
-            Event::CData(t) => {
-                top_frame(&mut stack, "CDATA after the document root closed")?
-                    .1
-                    .push_str(&String::from_utf8_lossy(&t));
-            }
-            _ => {}
         }
     }
     let (root, _) = stack.pop().unwrap_or_default();
@@ -768,6 +800,106 @@ mod tests {
         assert_eq!(
             v,
             json!({"r": {"a": [{"@x": "1", "#text": "hi"}, "there"]}})
+        );
+    }
+
+    #[test]
+    fn extract_text_resolves_references_and_fails_on_undefined_ones() {
+        // API-47: a token whose text could not be unescaped was silently dropped.
+        assert_eq!(
+            xml_extract_text(b"<r><t>a&amp;b<![CDATA[c]]></t></r>", "t").unwrap(),
+            Some("a&bc".to_string())
+        );
+        let err = xml_extract_text(b"<r><t>a&nbsp;</t></r>", "t").unwrap_err();
+        assert!(err.to_string().contains("undefined entity"), "{err}");
+        assert!(xml_extract_text(b"\xff", "t").is_err());
+        assert!(xml_extract_text(b"<r><a></b></r>", "t").is_err());
+        assert_eq!(xml_extract_text(b"<r/>", "").unwrap(), None);
+    }
+
+    #[test]
+    fn xml_parse_propagates_entity_and_attribute_errors() {
+        let err = xml_to_json(b"<r><v>&nbsp;</v></r>").unwrap_err();
+        assert!(err.to_string().contains("undefined entity"), "{err}");
+        let err = xml_to_json(br#"<r><v a="1" a="2"/></r>"#).unwrap_err();
+        assert!(err.to_string().contains("malformed attribute"), "{err}");
+        let v = xml_to_json(br#"<r><v x:a="A &amp; B">t&lt;</v></r>"#).unwrap();
+        assert_eq!(v["r"]["v"]["@a"], "A & B");
+        assert_eq!(v["r"]["v"]["#text"], "t<");
+    }
+
+    fn two_csv_zip() -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut cur = Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut cur);
+            let opts = SimpleFileOptions::default();
+            zw.start_file("a.csv", opts).unwrap();
+            zw.write_all(b"x\n1\n").unwrap();
+            zw.start_file("b.csv", opts).unwrap();
+            zw.write_all(b"x\n2\n").unwrap();
+            zw.finish().unwrap();
+        }
+        cur.into_inner()
+    }
+
+    #[tokio::test]
+    async fn unzip_refuses_several_matching_members() {
+        // API-42: only the first matching member used to be read, silently.
+        for member in [Some("*.csv".to_string()), None] {
+            let steps = vec![DecodeStep::Unzip {
+                unzip: UnzipSpec { member },
+            }];
+            let err = run_decode(&two_csv_zip(), &steps).await.unwrap_err();
+            assert!(err.to_string().contains("2 members match"), "{err}");
+            assert!(err.to_string().contains("a.csv, b.csv"), "{err}");
+        }
+        let steps = vec![
+            DecodeStep::Unzip {
+                unzip: UnzipSpec {
+                    member: Some("b.*".into()),
+                },
+            },
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Csv,
+                    ..parse_json()
+                },
+            },
+        ];
+        assert_eq!(
+            run_decode(&two_csv_zip(), &steps).await.unwrap()[0]["x"],
+            "2"
+        );
+    }
+
+    #[test]
+    fn decompression_is_capped() {
+        let data = [7u8; 64];
+        assert_eq!(read_capped(&data[..], 64, "gunzip").unwrap().len(), 64);
+        let err = read_capped(&data[..], 63, "gunzip").unwrap_err();
+        assert!(err.to_string().contains("exceeds 63 bytes"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_parse_records_path_is_an_error_not_zero_records() {
+        // API-62: a JSONPath syntax error used to yield an empty list.
+        let steps = vec![DecodeStep::Parse {
+            parse: ParseSpec {
+                records_path: Some("$.items[".into()),
+                ..parse_json()
+            },
+        }];
+        let err = run_decode(br#"{"items":[1]}"#, &steps).await.unwrap_err();
+        assert!(err.to_string().contains("invalid `records_path`"), "{err}");
+        let err = validate_steps(&steps).unwrap_err();
+        assert!(matches!(err, FaucetError::Config(_)), "{err:?}");
+        assert!(
+            validate_steps(&[DecodeStep::Parse {
+                parse: parse_json()
+            }])
+            .is_ok()
         );
     }
 }

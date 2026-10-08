@@ -22,6 +22,15 @@ pub struct Emulator {
     pub host: String,
 }
 
+/// A missing test backend: a skip locally, a failure when CI requires the
+/// backends (`FAUCET_REQUIRE_BACKENDS`).
+fn backend_missing(why: &str) {
+    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
+        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
+    }
+    eprintln!("skipping: {why}");
+}
+
 /// Start the Spanner emulator. Returns `None` when Docker is unavailable so
 /// tests skip cleanly on machines without a daemon.
 pub async fn start_emulator() -> Option<Emulator> {
@@ -30,11 +39,14 @@ pub async fn start_emulator() -> Option<Emulator> {
     let container = match image.start().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skipping: Docker not available ({e})");
+            backend_missing(&format!("Spanner emulator: Docker not available ({e})"));
             return None;
         }
     };
-    let port = container.get_host_port_ipv4(9010).await.ok()?;
+    let port = container
+        .get_host_port_ipv4(9010)
+        .await
+        .expect("emulator port");
     Some(Emulator {
         _container: container,
         host: format!("127.0.0.1:{port}"),

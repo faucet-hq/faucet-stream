@@ -84,7 +84,9 @@ Optional exports:
 Two host functions are available for the module to import (both optional):
 
 - `log(level: i32, ptr: i32, len: i32)` — emit a tracing event
-  (`0`=trace … `4`=error) with a UTF-8 message from module memory.
+  (`0`=trace … `4`=error) with a UTF-8 message from module memory. Messages are
+  truncated at 4 KiB, and an instance forwards at most 100; further calls are
+  dropped and reported in one warning per page.
 - `now_ns() -> i64` — a monotonic clock relative to the page's instance
   (not wall-clock time).
 
@@ -140,6 +142,11 @@ error return, or non-JSON output — is routed by `on_error`:
 - `skip` drops the record and logs a warning + increments
   `faucet_wasm_invocations_total{outcome="error"}`.
 - `passthrough` emits the record unchanged (and warns).
+
+After a trap (including fuel or memory exhaustion) the instance is thrown away and
+the page continues on a fresh one, so globals or a heap the trap left half-updated
+never affect later records. A module may declare only one linear memory and one
+table (at most 100,000 elements), so `memory_limit_mb` is a real ceiling.
 
 To quarantine bad records to a dead-letter queue instead of dropping them,
 pre-filter the stream, or handle the failure inside the module and emit a

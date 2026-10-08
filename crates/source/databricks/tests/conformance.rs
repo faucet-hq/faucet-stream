@@ -54,6 +54,7 @@ async fn conformance_bounded_memory() {
         parameters: Vec::new(),
         wait_timeout_secs: 50,
         poll_interval_secs: 1,
+        statement_timeout_secs: 3600,
         batch_size: batch,
         arrow_native: false,
         result_disposition: Default::default(),

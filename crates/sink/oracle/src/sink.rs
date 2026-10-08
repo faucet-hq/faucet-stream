@@ -18,12 +18,13 @@ use serde_json::Value;
 
 use crate::config::{IdentifierCase, OracleColumnMapping, OracleSinkConfig};
 use crate::plan::{
-    BindKind, COLUMNS_SQL, ColumnInfo, ORA_NAME_IN_USE, PreparedRows, TABLE_EXISTS_SQL,
+    BindKind, COLUMNS_SQL, ColumnInfo, ColumnRow, ORA_NAME_IN_USE, PreparedRows, TABLE_EXISTS_SQL,
     add_column_sql, case_records, clone_table_sql, column_from_row, create_json_table_sql,
     create_table_sql, delete_sql, dictionary_binds, drop_table_sql, drops_unknown, fold_names,
-    fold_page, ignoring, insert_sql, insertable_names, merge_sql, no_columns_error, pick_table,
-    prepare_rows, relax_null_sql, rename_sql, schema_from_columns, swap_sql, token_merge_sql,
-    token_select_sql, token_table, token_table_ddl, upsert_groups, widen_column_sql,
+    fold_page, ignoring, insert_sql, insertable_names, merge_sql, no_columns_error,
+    overwrite_swap_sql, pick_table, prepare_rows, relax_null_sql, rename_sql, schema_from_columns,
+    staging_fixups_sql, token_merge_sql, token_select_sql, token_table, token_table_ddl,
+    upsert_groups, widen_column_sql,
 };
 
 /// Oracle Database sink.
@@ -141,21 +142,13 @@ impl Inner {
     fn load_columns(&self, conn: &Connection, table: &str) -> Result<Vec<ColumnInfo>, FaucetError> {
         let (owner, name) = dictionary_binds(table)?;
         let rows = conn
-            .query_as::<(
-                String,
-                String,
-                Option<i64>,
-                Option<i64>,
-                String,
-                String,
-                String,
-            )>(COLUMNS_SQL, &[&owner, &name])
+            .query_as::<ColumnRow>(COLUMNS_SQL, &[&owner, &name])
             .map_err(|e| sink_err("column discovery", &e))?;
         let mut out = Vec::new();
         for r in rows {
-            let (n, t, p, s, nullable, virt, generation) =
-                r.map_err(|e| sink_err("column discovery", &e))?;
-            out.push(column_from_row(n, t, p, s, &nullable, &virt, &generation));
+            out.push(column_from_row(
+                r.map_err(|e| sink_err("column discovery", &e))?,
+            ));
         }
         Ok(out)
     }
@@ -658,7 +651,12 @@ impl Sink for OracleSink {
                 &conn,
                 &clone_table_sql(&i.staging_quoted, &i.target_quoted),
                 "create staging",
-            )
+            )?;
+            let target_cols = i.load_columns(&conn, &i.target)?;
+            for sql in staging_fixups_sql(&i.staging_quoted, &target_cols)? {
+                exec(&conn, &sql, "staging defaults")?;
+            }
+            Ok(())
         })
         .await
     }
@@ -679,16 +677,17 @@ impl Sink for OracleSink {
                 }
                 return Ok(());
             }
-            let cols: Vec<String> = i
-                .load_columns(&conn, &i.target)?
-                .into_iter()
-                .filter(|c| c.insertable)
-                .map(|c| c.name)
-                .collect();
-            let [delete, insert] = swap_sql(&i.target_quoted, &i.staging_quoted, &cols)?;
+            let target_cols = i.load_columns(&conn, &i.target)?;
+            let swap = overwrite_swap_sql(&i.target_quoted, &i.staging_quoted, &target_cols)?;
+            // The swap copies the whole table in one round trip each; the
+            // per-call statement timeout is for page writes, not this.
+            conn.set_call_timeout(None)
+                .map_err(|e| sink_err("set call timeout", &e))?;
             in_transaction(&conn, |c| {
-                exec(c, &delete, "overwrite swap")?;
-                exec(c, &insert, "overwrite swap")
+                for sql in &swap {
+                    exec(c, sql, "overwrite swap")?;
+                }
+                Ok(())
             })?;
             exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")
         })

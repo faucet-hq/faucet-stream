@@ -93,6 +93,8 @@ pub struct ExecuteOptions {
     /// Store bookmarks bare instead of in the versioned envelope (#736): a
     /// `faucet serve --cluster` member that predates it is still live.
     pub legacy_state_writes: bool,
+    /// Start even when another run holds the row's live lease (`faucet run --force`).
+    pub force_lease: bool,
     /// Pipeline name — used in log lines and as the first segment of every
     /// state key.
     pub pipeline_name: String,
@@ -262,6 +264,9 @@ pub enum InvocationErrorKind {
     /// page or cancelled the run. Serve marks the change request / run as
     /// over budget rather than as a generic failure.
     BudgetExceeded,
+    /// [`CliError::LeaseHeld`] — another run holds the row's live run lease.
+    /// Orchestrators fail the whole run on it rather than retrying the unit.
+    LeaseHeld,
     /// Any other failure. No consumer needs to distinguish these yet, and it
     /// stays separate from `None` (= this outcome was never classified, e.g. a
     /// synthetic placeholder outcome) so the two are never confused.
@@ -347,6 +352,7 @@ pub fn classify_error(err: &CliError) -> InvocationErrorKind {
         | CliError::PolicyViolations { .. } => InvocationErrorKind::Policy,
         CliError::Faucet(FaucetError::BudgetExceeded { .. })
         | CliError::BudgetSinkNotAllowed { .. } => InvocationErrorKind::BudgetExceeded,
+        CliError::LeaseHeld(_) => InvocationErrorKind::LeaseHeld,
         _ => InvocationErrorKind::Other,
     }
 }
@@ -414,6 +420,14 @@ impl RunSummary {
     }
     pub fn had_failures(&self) -> bool {
         self.failure_count() > 0
+    }
+    /// The first invocation refused because another run holds its row's
+    /// lease, as the error an orchestrator fails the whole run with.
+    pub fn lease_refusal(&self) -> Option<CliError> {
+        self.invocations.iter().find_map(|i| {
+            (i.error_kind == Some(InvocationErrorKind::LeaseHeld))
+                .then(|| CliError::LeaseHeld(i.error.clone().unwrap_or_default()))
+        })
     }
 }
 
@@ -1223,7 +1237,33 @@ fn inject_singer_defaults(
         );
     }
     map.entry("_activate_version")
-        .or_insert_with(|| Value::from(clock.timestamp_millis()));
+        .or_insert_with(|| Value::from(activate_version_for(clock.timestamp_millis())));
+}
+
+/// The Singer `ACTIVATE_VERSION` for a run whose clock is `clock_ms`: never
+/// below the wall clock at the run's first sink, so rerunning with a past
+/// `--clock` (a backfill unit, an old schedule tick) still activates a version
+/// newer than the live one (API-59). Memoised per clock value, so every sink
+/// instance of one run — the writers and the overwrite-lifecycle sink —
+/// agrees on it.
+fn activate_version_for(clock_ms: i64) -> i64 {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    static VERSIONS: OnceLock<Mutex<BTreeMap<i64, i64>>> = OnceLock::new();
+    let wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(clock_ms);
+    let mut versions = VERSIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if versions.len() >= 4096
+        && let Some(oldest) = versions.keys().next().copied()
+    {
+        versions.remove(&oldest);
+    }
+    *versions.entry(clock_ms).or_insert(clock_ms.max(wall_ms))
 }
 
 /// Whether a node's sink is configured for `write_mode: overwrite`. The write
@@ -1390,28 +1430,38 @@ async fn run_unit(
     // Run lease + run-outcome marker (#732 / #735): what `faucet status`
     // reports and what `faucet state` refuses to change under a live run.
     let cancel_seen = cancel.clone();
-    let markers = crate::pipeline_state::markers::RunMarkers::begin(
+    let (markers, refused) = match crate::pipeline_state::markers::RunMarkers::begin(
         markers_store(&unit.node, opts).await,
         &unit.state_key,
         &run_id,
-        matches!(unit.node.role, NodeRole::Root | NodeRole::Product { .. }),
+        true,
+        opts.force_lease,
     )
-    .await;
-    let result = boxed_run_one_invocation(
-        &unit.node,
-        unit.parent_record.as_deref(),
-        unit.product_ctx.as_ref(),
-        &unit.state_key,
-        capture,
-        opts,
-        cancel,
-        suppress_overwrite,
-        overwrite_grouped,
-        run_id.clone(),
-        observers.clone(),
-        markers.store.clone(),
-    )
-    .await;
+    .await
+    {
+        Ok(m) => (m, None),
+        Err(e) => (Default::default(), Some(e)),
+    };
+    let result = match refused {
+        Some(e) => Err(e),
+        None => {
+            boxed_run_one_invocation(
+                &unit.node,
+                unit.parent_record.as_deref(),
+                unit.product_ctx.as_ref(),
+                &unit.state_key,
+                capture,
+                opts,
+                cancel,
+                suppress_overwrite,
+                overwrite_grouped,
+                run_id.clone(),
+                observers.clone(),
+                markers.store.clone(),
+            )
+            .await
+        }
+    };
     let duration_ms = started.elapsed().as_millis() as u64;
     markers
         .finish(
@@ -4251,6 +4301,7 @@ mod tests {
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "t".into(),
                 run_id: None,
                 execution: None,
@@ -4298,6 +4349,7 @@ mod tests {
     fn exec_opts(name: &str) -> ExecuteOptions {
         ExecuteOptions {
             legacy_state_writes: false,
+            force_lease: false,
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
@@ -4355,7 +4407,15 @@ mod tests {
         let mut cfg = single[0].sink.config.clone();
         inject_singer_defaults(&single[0], "people", clock, &mut cfg);
         assert_eq!(cfg["stream"], json!("people"));
-        assert_eq!(cfg["_activate_version"], json!(clock.timestamp_millis()));
+        // A past clock activates a version at or after now, the same for
+        // every sink instance of the run (API-59).
+        let version = cfg["_activate_version"].as_i64().unwrap();
+        assert!(version >= chrono::Utc::now().timestamp_millis() - 60_000);
+        let mut again = single[0].sink.config.clone();
+        inject_singer_defaults(&single[0], "people", clock, &mut again);
+        assert_eq!(again["_activate_version"], json!(version));
+        let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
+        assert_eq!(activate_version_for(future), future);
         assert!(cfg.get("schema").is_none());
 
         let mut cfg = single[0].sink.config.clone();
@@ -4873,6 +4933,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "matrix".into(),
                 run_id: None,
                 execution: None,
@@ -4944,6 +5005,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "dagtest".into(),
                 run_id: None,
                 execution: None,
@@ -5180,6 +5242,7 @@ execution:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "stoptest".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
@@ -5276,6 +5339,7 @@ pipeline:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "bad name".into(), // space is illegal in a state key
                 run_id: None,
                 execution: None,
@@ -5346,6 +5410,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "ok".into(),
                 run_id: None,
                 execution: None,
@@ -5425,6 +5490,7 @@ execution:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "stop_parallel".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
@@ -5505,6 +5571,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "continuetest".into(),
                 run_id: None,
                 execution: None,
@@ -5794,6 +5861,7 @@ matrix:
     fn opts(name: &str) -> ExecuteOptions {
         ExecuteOptions {
             legacy_state_writes: false,
+            force_lease: false,
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
@@ -6518,6 +6586,7 @@ matrix:
             nodes,
             ExecuteOptions {
                 legacy_state_writes: false,
+                force_lease: false,
                 pipeline_name: "projtest".into(),
                 run_id: None,
                 execution: None,

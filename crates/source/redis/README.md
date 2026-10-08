@@ -14,8 +14,8 @@ Built on a lazily-opened, reused `MultiplexedConnection` and each mode's native 
 - **Three source modes** — `List` (FIFO list elements), `Stream` (entries with IDs + fields), and `Keys` (glob-matched keys with their values).
 - **Native streaming in all three modes** — `stream_pages` walks the list, stream, or keyspace in pages so the sink writes as data arrives.
 - **Server-side cursoring** — `Keys` drives the `SCAN` cursor manually and `MGET`s a page at a time, so a million-key namespace never materializes in memory at once.
-- **Consumer-group reads** — `Stream` + `group`/`consumer` uses `XREADGROUP` on the `fetch_all` path, draining all currently-pending new messages (not just one batch).
-- **JSON-aware values** — list elements, stream field values, and key values are parsed as JSON when they parse, and returned as strings otherwise.
+- **Never touches consumer groups** — every read is `XRANGE`, so a preview or run never claims entries into a group's pending list.
+- **Faithful values** — JSON objects/arrays are parsed (`parse_json`), scalars stay the strings Redis holds, and binary values are base64-encoded (`binary`) instead of failing the read.
 - **Connection reuse** — one multiplexed connection is opened on first use and cheaply cloned across every call (no per-call TCP/AUTH handshake).
 - **Secrets-safe** — the connection URL is masked in `Debug` output and credentials are stripped from the lineage dataset URI.
 
@@ -68,6 +68,10 @@ faucet run pipeline.yaml
 | `source_type` | `RedisSourceType` | — *(required)* | The Redis data structure to read from — `List`, `Stream`, or `Keys` (see below). |
 | `max_records` | int | *(unbounded)* | Optional cap on the total number of records returned. Honored by both `fetch_all` and streaming. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`, mapped onto each mode's native paging primitive. **`0` = no batching** (drain into one page). See [Streaming & batching](#streaming--batching). |
+| `parse_json` | `containers` \| `all` \| `none` | `containers` | Which values are parsed as JSON. `containers` parses only objects and arrays, so `"1.10"`, `"true"` and long numeric ids stay strings; `all` also parses scalars; `none` keeps every value a string. |
+| `binary` | `base64` \| `lossy` \| `error` | `base64` | A value that is not valid UTF-8 (msgpack, gzip, …): base64-encode it, replace invalid sequences with U+FFFD, or fail the run naming the key. |
+
+The connection reconnects on its own after the server drops it (a failover), with a short bounded retry when the server is unreachable.
 
 ### `source_type` — `RedisSourceType`
 
@@ -75,7 +79,7 @@ A tagged enum (`type` discriminator). Pick exactly one variant.
 
 #### `List`
 
-Reads list elements via `LRANGE`. Each element is parsed as JSON, falling back to a JSON string.
+Reads list elements via `LRANGE`, decoded per `parse_json` / `binary`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -84,17 +88,17 @@ Reads list elements via `LRANGE`. Each element is parsed as JSON, falling back t
 
 #### `Stream`
 
-Reads stream entries via `XRANGE` (streaming) or `XREAD` / `XREADGROUP` (the `fetch_all` consumer-group convenience path).
+Reads stream entries via `XRANGE`, on every path (`stream_pages`, `fetch_all`, preview).
 
-> **Consumer groups apply to `fetch_all` only.** The streaming path (`stream_pages`, used by `faucet run`) always uses `XRANGE` and re-reads the whole stream every run — consumer-group acknowledgement can't compose with bookmark-checkpoint draining. If you set `group`/`consumer` and the pipeline streams, the source logs a one-shot warning; use the `fetch_all` path for `XREADGROUP` consume-once semantics, or drop `group`/`consumer` to silence it.
+> **Consumer groups are ignored.** Reading through a group (`XREADGROUP`) moves entries into the group's pending list and withholds them from its other consumers, and nothing here acknowledges them — so the source never does. `group` / `consumer` / `count` are accepted for compatibility and ignored; a configured group logs a warning, and the whole stream is re-read every run.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | string | — | Literal `Stream`. |
 | `key` | string | — *(required)* | The stream key. |
-| `group` | string | *(none)* | Consumer group name. When set, `fetch_all` uses `XREADGROUP`. |
-| `consumer` | string | *(none)* | Consumer name within the group (required when `group` is set). |
-| `count` | int | `100` (for `XREADGROUP`) | Max entries read per `XREAD`/`XREADGROUP` call on the `fetch_all` path. Ignored by streaming, which uses `batch_size`. |
+| `group` | string | *(none)* | Ignored (logs a warning). |
+| `consumer` | string | *(none)* | Ignored. |
+| `count` | int | *(none)* | Ignored; `batch_size` is the `XRANGE COUNT`. |
 
 Each entry is returned as:
 
@@ -104,7 +108,7 @@ Each entry is returned as:
 
 #### `Keys`
 
-Scans keys matching a glob `pattern` via `SCAN`, then `MGET`s each batch.
+Scans keys matching a glob `pattern` via `SCAN`, then `MGET`s each batch. A key `SCAN` returns twice is emitted once. Only **string** keys have a value `MGET` can read: matched hashes, sets, lists, sorted sets and streams are skipped and counted in a `WARN` — narrow the pattern to string keys. Values substituted into the pattern from a parent record (`{parent.field}`) have their glob metacharacters escaped, so they match literally.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -117,7 +121,7 @@ Each key-value pair is returned as:
 { "key": "user:123", "value": { "name": "Alice", "email": "alice@example.com" } }
 ```
 
-Stream field values and key values are parsed as JSON when possible; otherwise returned as strings.
+Stream field values and key values are decoded per `parse_json` / `binary`.
 
 ## Examples
 
@@ -163,29 +167,6 @@ pipeline:
     config:
       path: ./order-events.jsonl
 ```
-
-### Consumer-group read
-
-```yaml
-version: 1
-pipeline:
-  source:
-    type: redis
-    config:
-      url: redis://localhost:6379
-      source_type:
-        type: Stream
-        key: events
-        group: analytics-group
-        consumer: worker-1
-        count: 200
-  sink:
-    type: stdout
-    config:
-      format: jsonl
-```
-
-> Consumer-group fields (`group` / `consumer`) apply only to the `XREADGROUP` path used by `fetch_all`. Streaming via `stream_pages` always uses `XRANGE`.
 
 ### Scan a keyspace by pattern
 

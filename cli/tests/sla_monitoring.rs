@@ -205,6 +205,7 @@ async fn dry_run_skips_sla_evaluation() {
         nodes,
         ExecuteOptions {
             legacy_state_writes: false,
+            force_lease: false,
             pipeline_name: "slatest".into(),
             run_id: None,
             execution: None,

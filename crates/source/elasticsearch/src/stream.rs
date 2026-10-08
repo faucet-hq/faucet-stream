@@ -8,9 +8,8 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use std::pin::Pin;
 
-/// `size` used by the [`Source::stream_pages`] non-scroll fallback (when
-/// `batch_size = 0`). Mirrors Elasticsearch's default `index.max_result_window`
-/// so the request stays within ES's out-of-the-box cap.
+/// Scroll `size` when `batch_size = 0` (drain into one page). Mirrors
+/// Elasticsearch's default `index.max_result_window`.
 pub(crate) const NO_BATCHING_SEARCH_SIZE: usize = 10_000;
 
 /// A source that reads documents from an Elasticsearch index using the scroll API.
@@ -29,9 +28,16 @@ impl ElasticsearchSource {
     /// `base_url` / `index` or an out-of-range `batch_size`).
     pub fn new(config: ElasticsearchSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
+        // Bounded timeouts: a half-open connection or a wedged node must fail
+        // the request, not hang the run (#789 MSG-58).
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs))
+            .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .map_err(|e| FaucetError::Config(format!("elasticsearch HTTP client: {e}")))?;
         Ok(Self {
             config,
-            client: Client::new(),
+            client,
             auth_provider: None,
         })
     }
@@ -102,37 +108,18 @@ impl ElasticsearchSource {
             .map(|s| s.to_string())
     }
 
-    /// Clear a scroll context. Best-effort: errors are logged but not propagated.
-    async fn clear_scroll(&self, scroll_id: &str) {
-        let url = format!("{}/_search/scroll", self.config.base_url);
-        let req = self
-            .client
-            .delete(&url)
-            .json(&json!({"scroll_id": scroll_id}));
-        let auth = match self.resolve_auth().await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to resolve auth for scroll cleanup");
-                return;
-            }
-        };
-        let req = Self::apply_auth_value(req, &auth);
-
-        if let Err(e) = req.send().await {
-            tracing::warn!(error = %e, "failed to clear Elasticsearch scroll context");
-        }
-    }
-
     /// Resolve the index and query under the supplied parent context. Returns
     /// `(index, query)`.
     fn resolve_index_and_query(
         &self,
         context: &std::collections::HashMap<String, Value>,
     ) -> Result<(String, Value), FaucetError> {
+        // The index is a URL path segment: a parent value is percent-encoded
+        // so `/`, `?` or `#` cannot reach another endpoint (#789 MSG-94).
         let index = if context.is_empty() {
             self.config.index.clone()
         } else {
-            faucet_core::util::substitute_context(&self.config.index, context)
+            faucet_core::util::substitute_context(&self.config.index, &encoded_context(context))
         };
         let query = if context.is_empty() {
             self.config.query.clone()
@@ -154,97 +141,13 @@ impl faucet_core::Source for ElasticsearchSource {
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Value>, FaucetError> {
-        let (index, query) = self.resolve_index_and_query(context)?;
-        // Resolve auth once; reuse the same credential across all scroll pages.
-        let auth = self.resolve_auth().await?;
-
-        let mut all_records = Vec::new();
-
-        // `batch_size = 0` is the "no batching" sentinel. Interpolating it
-        // directly as `size=0` would make Elasticsearch return zero hits, so
-        // map it to the same large page size the streaming path uses (#78/#33).
-        let page_size = if self.config.batch_size == 0 {
-            NO_BATCHING_SEARCH_SIZE
-        } else {
-            self.config.batch_size
-        };
-
-        // Initial search request with scroll.
-        let url = format!(
-            "{}/{}/_search?scroll={}&size={}",
-            self.config.base_url, index, self.config.scroll_timeout, page_size
-        );
-        let req = self.client.post(&url).json(&json!({"query": query}));
-        let req = Self::apply_auth_value(req, &auth);
-
-        let resp = req.send().await?;
-        let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let body: Value = resp.json().await?;
-
-        let mut records = Self::extract_hits(&body);
-        let mut scroll_id = Self::extract_scroll_id(&body);
-        let mut pages_fetched: usize = 1;
-
-        tracing::debug!(
-            records = records.len(),
-            page = pages_fetched,
-            "Elasticsearch initial search"
-        );
-
-        all_records.append(&mut records);
-
-        // Scroll loop.
-        while let Some(ref sid) = scroll_id {
-            // Check max_pages limit.
-            if let Some(max) = self.config.max_pages
-                && pages_fetched >= max
-            {
-                tracing::debug!(max_pages = max, "max_pages reached, stopping scroll");
-                break;
-            }
-
-            let scroll_url = format!("{}/_search/scroll", self.config.base_url);
-            let req = self.client.post(&scroll_url).json(&json!({
-                "scroll": self.config.scroll_timeout,
-                "scroll_id": sid,
-            }));
-            let req = Self::apply_auth_value(req, &auth);
-
-            let resp = req.send().await?;
-            let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-            let body: Value = resp.json().await?;
-
-            let mut page_records = Self::extract_hits(&body);
-            pages_fetched += 1;
-
-            tracing::debug!(
-                records = page_records.len(),
-                page = pages_fetched,
-                "Elasticsearch scroll page"
-            );
-
-            // Stop when no more hits are returned.
-            if page_records.is_empty() {
-                break;
-            }
-
-            // Update scroll_id for the next iteration.
-            scroll_id = Self::extract_scroll_id(&body);
-            all_records.append(&mut page_records);
+        let mut all = Vec::new();
+        let pages = self.stream_pages(context, self.config.batch_size);
+        futures::pin_mut!(pages);
+        while let Some(page) = futures::StreamExt::next(&mut pages).await {
+            all.extend(page?.records);
         }
-
-        // Clear the scroll context (best-effort).
-        if let Some(ref sid) = scroll_id {
-            self.clear_scroll(sid).await;
-        }
-
-        tracing::debug!(
-            total_records = all_records.len(),
-            pages = pages_fetched,
-            "Elasticsearch fetch complete"
-        );
-
-        Ok(all_records)
+        Ok(all)
     }
 
     /// Stream documents from Elasticsearch as scroll pages, one
@@ -277,37 +180,23 @@ impl faucet_core::Source for ElasticsearchSource {
         _batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         let batch_size = self.config.batch_size;
+        // `batch_size = 0` drains the whole scroll into one page. A single
+        // capped `_search` silently truncated any result above 10 000 hits
+        // (#789 MSG-90).
+        let (size, drain) = if batch_size == 0 {
+            (NO_BATCHING_SEARCH_SIZE, true)
+        } else {
+            (batch_size, false)
+        };
 
         Box::pin(async_stream::try_stream! {
             let (index, query) = self.resolve_index_and_query(context)?;
-            // Resolve auth once; reuse across all scroll pages and cleanup.
+            // Auth is resolved per request, so a token that expires during a
+            // long scroll is refreshed by its provider (#789 MSG-90).
             let auth = self.resolve_auth().await?;
-
-            // batch_size == 0: single non-scroll _search with size = max_result_window default.
-            if batch_size == 0 {
-                let url = format!(
-                    "{}/{}/_search?size={}",
-                    self.config.base_url, index, NO_BATCHING_SEARCH_SIZE
-                );
-                let req = self.client.post(&url).json(&json!({"query": query}));
-                let req = Self::apply_auth_value(req, &auth);
-                let resp = req.send().await?;
-                let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-                let body: Value = resp.json().await?;
-                let records = Self::extract_hits(&body);
-                tracing::info!(
-                    docs = records.len(),
-                    batch_size = 0,
-                    "Elasticsearch source stream complete (no-batching path)",
-                );
-                yield StreamPage { records, bookmark: None };
-                return;
-            }
 
             // Scroll path. Wire up a guard so the scroll context is always
             // cleared, even on early-return / error / drop.
-            // Pass the already-resolved auth so the guard's spawned cleanup
-            // tasks never need to call async auth resolution.
             let mut guard = ScrollGuard::new(
                 self.config.base_url.clone(),
                 self.client.clone(),
@@ -316,7 +205,7 @@ impl faucet_core::Source for ElasticsearchSource {
 
             let url = format!(
                 "{}/{}/_search?scroll={}&size={}",
-                self.config.base_url, index, self.config.scroll_timeout, batch_size
+                self.config.base_url, index, self.config.scroll_timeout, size
             );
             let req = self.client.post(&url).json(&json!({"query": query}));
             let req = Self::apply_auth_value(req, &auth);
@@ -326,67 +215,67 @@ impl faucet_core::Source for ElasticsearchSource {
 
             let records = Self::extract_hits(&body);
             guard.update(Self::extract_scroll_id(&body));
-            let mut pages_emitted: usize = 0;
+            let mut pages_fetched: usize = 1;
             let mut total = records.len();
+            let mut buffer: Vec<Value> = Vec::new();
 
-            // The initial search always counts as page 1, even when it
-            // returns zero hits — emit it and move on.
-            pages_emitted += 1;
-            let is_final = records.is_empty()
+            let first_is_final = records.is_empty()
                 || guard.scroll_id().is_none()
-                || matches!(self.config.max_pages, Some(max) if pages_emitted >= max);
-            yield StreamPage { records, bookmark: None };
-            if is_final {
-                guard.disarm_if_done();
-                tracing::info!(
-                    docs = total,
-                    pages = pages_emitted,
-                    batch_size,
-                    "Elasticsearch source stream complete",
-                );
-                return;
+                || matches!(self.config.max_pages, Some(max) if pages_fetched >= max);
+            if drain {
+                buffer.extend(records);
+            } else {
+                // The initial search always counts as page 1, even when it
+                // returns zero hits — emit it and move on.
+                yield StreamPage { records, bookmark: None };
             }
 
-            // Scroll loop.
-            while let Some(sid) = guard.scroll_id().map(|s| s.to_string()) {
-                let scroll_url = format!("{}/_search/scroll", self.config.base_url);
-                let req = self.client.post(&scroll_url).json(&json!({
-                    "scroll": self.config.scroll_timeout,
-                    "scroll_id": sid,
-                }));
-                let req = Self::apply_auth_value(req, &auth);
-                let resp = req.send().await?;
-                let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-                let body: Value = resp.json().await?;
+            if !first_is_final {
+                while let Some(sid) = guard.scroll_id().map(|s| s.to_string()) {
+                    let auth = self.resolve_auth().await?;
+                    guard.set_auth(auth.clone());
+                    let scroll_url = format!("{}/_search/scroll", self.config.base_url);
+                    let req = self.client.post(&scroll_url).json(&json!({
+                        "scroll": self.config.scroll_timeout,
+                        "scroll_id": sid,
+                    }));
+                    let req = Self::apply_auth_value(req, &auth);
+                    let resp = req.send().await?;
+                    let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+                    let body: Value = resp.json().await?;
 
-                let records = Self::extract_hits(&body);
-                guard.update(Self::extract_scroll_id(&body));
-                pages_emitted += 1;
-                total += records.len();
+                    let records = Self::extract_hits(&body);
+                    guard.update(Self::extract_scroll_id(&body));
+                    pages_fetched += 1;
+                    total += records.len();
 
-                let is_empty = records.is_empty();
-                let hit_cap = matches!(self.config.max_pages, Some(max) if pages_emitted >= max);
-
-                if is_empty {
-                    // Final empty page — ES uses an empty hits array as the
-                    // end-of-scroll sentinel. Drop it; nothing to emit.
-                    break;
+                    // An empty hits array is ES's end-of-scroll sentinel.
+                    if records.is_empty() {
+                        break;
+                    }
+                    let hit_cap = matches!(self.config.max_pages, Some(max) if pages_fetched >= max);
+                    if drain {
+                        buffer.extend(records);
+                    } else {
+                        yield StreamPage { records, bookmark: None };
+                    }
+                    if hit_cap {
+                        tracing::debug!(
+                            max_pages = self.config.max_pages.unwrap_or(0),
+                            "max_pages reached, stopping scroll"
+                        );
+                        break;
+                    }
                 }
+            }
 
-                yield StreamPage { records, bookmark: None };
-
-                if hit_cap {
-                    tracing::debug!(
-                        max_pages = self.config.max_pages.unwrap_or(0),
-                        "max_pages reached, stopping scroll"
-                    );
-                    break;
-                }
+            if drain {
+                yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
             }
 
             tracing::info!(
                 docs = total,
-                pages = pages_emitted,
+                pages = pages_fetched,
                 batch_size,
                 "Elasticsearch source stream complete",
             );
@@ -438,26 +327,106 @@ impl faucet_core::Source for ElasticsearchSource {
             FaucetError::Source(format!("elasticsearch: catalog discovery failed: {e}"))
         })?;
 
-        let entries = parse_cat_indices(&cat);
+        let mut entries: Vec<(String, Option<u64>, &'static str)> = parse_cat_indices(&cat)
+            .into_iter()
+            .map(|(i, n)| (i, n, "index"))
+            .collect();
+        // Data streams live in hidden `.ds-*` backing indices, which `_cat`
+        // filtering drops; list them by name (#789 MSG-94).
+        let url = format!("{}/_data_stream", self.config.base_url);
+        let req = Self::apply_auth_value(self.client.get(&url), &auth);
+        if let Ok(resp) = req.send().await
+            && resp.status().is_success()
+            && let Ok(body) = resp.json::<Value>().await
+        {
+            entries.extend(
+                parse_data_streams(&body)
+                    .into_iter()
+                    .map(|n| (n, None, "data_stream")),
+            );
+        }
+
         let mut datasets = Vec::with_capacity(entries.len());
-        for (index, doc_count) in entries {
-            let url = format!("{}/{}/_mapping", self.config.base_url, index);
-            let req = Self::apply_auth_value(self.client.get(&url), &auth);
-            let resp = req.send().await.map_err(|e| {
-                FaucetError::Source(format!(
-                    "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
-                ))
-            })?;
-            let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-            let body: Value = resp.json().await.map_err(|e| {
-                FaucetError::Source(format!(
-                    "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
-                ))
-            })?;
-            datasets.push(descriptor_for_index(&index, doc_count, &body));
+        for (index, doc_count, kind) in entries {
+            // One index whose mapping cannot be read (closed, permission) is
+            // skipped with a warning instead of failing discovery for the
+            // whole cluster (#789 MSG-83).
+            match self.read_mapping(&index, &auth).await {
+                Ok(body) => {
+                    let mut d = descriptor_for_index(&index, doc_count, &body);
+                    d.kind = kind.to_string();
+                    datasets.push(d);
+                }
+                Err(e) => {
+                    tracing::warn!(index = %index, error = %e, "elasticsearch discover: skipping an index whose mapping could not be read")
+                }
+            }
         }
         Ok(datasets)
     }
+}
+
+impl ElasticsearchSource {
+    async fn read_mapping(
+        &self,
+        index: &str,
+        auth: &ElasticsearchAuth,
+    ) -> Result<Value, FaucetError> {
+        let url = format!(
+            "{}/{}/_mapping",
+            self.config.base_url,
+            urlencoding::encode(index)
+        );
+        let req = Self::apply_auth_value(self.client.get(&url), auth);
+        let resp = req.send().await.map_err(|e| {
+            FaucetError::Source(format!(
+                "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
+            ))
+        })?;
+        let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+        resp.json().await.map_err(|e| {
+            FaucetError::Source(format!(
+                "elasticsearch: catalog discovery failed (mapping for {index:?}): {e}"
+            ))
+        })
+    }
+}
+
+/// `context` with every string value percent-encoded for a URL path segment.
+fn encoded_context(
+    context: &std::collections::HashMap<String, Value>,
+) -> std::collections::HashMap<String, Value> {
+    context
+        .iter()
+        .map(|(k, v)| {
+            let text = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (
+                k.clone(),
+                Value::String(urlencoding::encode(&text).into_owned()),
+            )
+        })
+        .collect()
+}
+
+/// Names of the non-system data streams in a `GET /_data_stream` response.
+fn parse_data_streams(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = body
+        .get("data_streams")
+        .and_then(Value::as_array)
+        .map(|streams| {
+            streams
+                .iter()
+                .filter_map(|s| s.get("name").and_then(Value::as_str))
+                .filter(|n| !n.starts_with('.'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 /// Map an Elasticsearch mapping field type to a JSON-Schema type. ES mappings
@@ -571,6 +540,10 @@ impl ScrollGuard {
         self.scroll_id.as_deref()
     }
 
+    fn set_auth(&mut self, auth: ElasticsearchAuth) {
+        self.auth = auth;
+    }
+
     fn update(&mut self, new_id: Option<String>) {
         if let Some(id) = new_id {
             self.scroll_id = Some(id);
@@ -636,6 +609,19 @@ fn apply_auth_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_values_are_path_encoded_and_non_strings_rendered() {
+        let ctx: std::collections::HashMap<String, Value> = [
+            ("a".to_string(), serde_json::json!("x/y")),
+            ("n".to_string(), serde_json::json!(7)),
+        ]
+        .into_iter()
+        .collect();
+        let enc = encoded_context(&ctx);
+        assert_eq!(enc["a"], serde_json::json!("x%2Fy"));
+        assert_eq!(enc["n"], serde_json::json!("7"));
+    }
     use faucet_core::Source;
 
     #[test]

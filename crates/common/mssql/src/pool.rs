@@ -52,12 +52,23 @@ pub fn build_config(cfg: &MssqlConnectionConfig) -> Result<Config, FaucetError> 
 }
 
 fn apply_tls(config: &mut Config, tls: &MssqlTls) -> Result<(), FaucetError> {
+    // `Required`, never `On`: tiberius panics when it asked for `On` and the
+    // server answers `Off` / `NotSupported`; `Required` negotiates TLS with
+    // any server that offers it and fails with an error otherwise.
     match tls.mode {
-        MssqlTlsMode::Prefer => config.encryption(EncryptionLevel::On),
-        MssqlTlsMode::Require => config.encryption(EncryptionLevel::Required),
+        MssqlTlsMode::Prefer | MssqlTlsMode::Require => {
+            config.encryption(EncryptionLevel::Required)
+        }
         MssqlTlsMode::Disable => config.encryption(EncryptionLevel::NotSupported),
         MssqlTlsMode::TrustServerCertificate => {
-            config.encryption(EncryptionLevel::On);
+            if tls.ca_cert_path.is_some() {
+                return Err(FaucetError::Config(
+                    "MSSQL tls: `trust_server_certificate` skips certificate validation, so \
+                     `ca_cert_path` cannot apply; use `type: require` with the CA, or drop it"
+                        .into(),
+                ));
+            }
+            config.encryption(EncryptionLevel::Required);
             config.trust_cert();
         }
     }
@@ -73,6 +84,26 @@ fn apply_tls(config: &mut Config, tls: &MssqlTls) -> Result<(), FaucetError> {
     Ok(())
 }
 
+/// Idle time before the first TCP keepalive probe on a pooled connection.
+pub const KEEPALIVE_TIME: Duration = Duration::from_secs(60);
+/// Interval between unanswered keepalive probes.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A connection manager whose sockets carry TCP keepalive, so a peer that
+/// vanished without a reset (failover, NAT idle eviction) fails the read
+/// instead of hanging a row stream or a control statement forever.
+fn manager(config: Config) -> ConnectionManager {
+    ConnectionManager::new(config).with_modify_tcp_stream(configure_tcp)
+}
+
+fn configure_tcp(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
+    tcp.set_nodelay(true)?;
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_TIME)
+        .with_interval(KEEPALIVE_INTERVAL);
+    socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive)
+}
+
 /// Build a connection pool and eagerly validate one connection so bad
 /// credentials / an unreachable host fail fast in the connector's `new()`.
 pub async fn build_pool(
@@ -80,7 +111,7 @@ pub async fn build_pool(
     max_connections: u32,
 ) -> Result<MssqlPool, FaucetError> {
     let config = build_config(cfg)?;
-    let manager = ConnectionManager::new(config);
+    let manager = manager(config);
     let pool = Pool::builder()
         .max_size(max_connections.max(1))
         .build(manager)
@@ -108,7 +139,7 @@ pub async fn replace_connection(
     conn: &mut MssqlPooledConnection<'_>,
 ) -> Result<(), FaucetError> {
     use bb8::ManageConnection;
-    let fresh = ConnectionManager::new(build_config(cfg)?)
+    let fresh = manager(build_config(cfg)?)
         .connect()
         .await
         .map_err(|e| FaucetError::Sink(format!("MSSQL reconnect failed: {e}")))?;
@@ -184,5 +215,55 @@ mod tests {
         // We can't assert tiberius Config internals (no public getters), but
         // building must not error for a well-formed URL.
         assert!(build_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn tls_modes_never_ask_for_the_panicking_level() {
+        for mode in [
+            MssqlTlsMode::Prefer,
+            MssqlTlsMode::Require,
+            MssqlTlsMode::Disable,
+            MssqlTlsMode::TrustServerCertificate,
+        ] {
+            let mut c = Config::new();
+            apply_tls(
+                &mut c,
+                &MssqlTls {
+                    mode,
+                    ca_cert_path: None,
+                },
+            )
+            .unwrap();
+        }
+        let mut c = Config::new();
+        let err = apply_tls(
+            &mut c,
+            &MssqlTls {
+                mode: MssqlTlsMode::TrustServerCertificate,
+                ca_cert_path: Some("/ca.pem".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ca_cert_path"), "{err}");
+        let mut c = Config::new();
+        apply_tls(
+            &mut c,
+            &MssqlTls {
+                mode: MssqlTlsMode::Require,
+                ca_cert_path: Some("/ca.pem".into()),
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sockets_get_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        configure_tcp(&tcp).unwrap();
+        assert!(socket2::SockRef::from(&tcp).keepalive().unwrap());
+        assert!(tcp.nodelay().unwrap());
+        let _ = manager(Config::new());
     }
 }

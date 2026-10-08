@@ -457,6 +457,7 @@ pub async fn build_source(
         "webhook" => {
             let cfg =
                 decode::<faucet_source_webhook::WebhookSourceConfig>("source", "webhook", config)?;
+            cfg.validate()?;
             Ok(Box::new(faucet_source_webhook::WebhookSource::new(cfg)))
         }
         #[cfg(feature = "source-websocket")]

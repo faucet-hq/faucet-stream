@@ -11,6 +11,7 @@ pub mod decode;
 mod format;
 pub mod serde_helpers;
 pub mod stream;
+mod xmltext;
 
 pub use faucet_core::{FaucetError, Source, TlsClientConfig};
 

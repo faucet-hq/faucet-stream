@@ -7,8 +7,6 @@
 //! `reqwest` over the shared-auth bearer token.
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -94,7 +92,7 @@ impl DatabricksSource {
         config.validate()?;
         Ok(Self {
             config,
-            client: Client::new(),
+            client: faucet_common_databricks::http_client()?,
             endpoint_base: None,
             auth_provider: None,
             start_bookmark: Mutex::new(None),
@@ -143,6 +141,8 @@ impl DatabricksSource {
             StatementOptions {
                 wait_timeout_secs: self.config.wait_timeout_secs,
                 poll_interval: Duration::from_secs(self.config.poll_interval_secs.max(1)),
+                statement_timeout: (self.config.statement_timeout_secs > 0)
+                    .then(|| Duration::from_secs(self.config.statement_timeout_secs)),
                 ..StatementOptions::default()
             },
             ErrorSide::Source,
@@ -349,11 +349,15 @@ fn decode_arrow_ipc(data: bytes::Bytes) -> Result<Vec<arrow::array::RecordBatch>
 
 /// Derive a stable state key from the workspace, warehouse, and query.
 fn default_state_key(config: &DatabricksSourceConfig) -> String {
-    let mut h = DefaultHasher::new();
-    config.workspace_url.hash(&mut h);
-    config.warehouse_id.hash(&mut h);
-    config.sql.hash(&mut h);
-    format!("databricks:{:016x}", h.finish())
+    // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
+    let material = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        config.workspace_url, config.warehouse_id, config.sql
+    );
+    format!(
+        "databricks:{:016x}",
+        faucet_core::shard::shard_hash(&material)
+    )
 }
 
 /// Decode a raw result chunk.
@@ -667,6 +671,7 @@ mod tests {
             }],
             wait_timeout_secs: 50,
             poll_interval_secs: 1,
+            statement_timeout_secs: 3600,
             batch_size: 1000,
             arrow_native: false,
             result_disposition: ResultDisposition::default(),
@@ -745,6 +750,15 @@ mod tests {
         let k2 = source(cfg()).state_key().unwrap();
         assert_eq!(k1, k2);
         assert!(k1.starts_with("databricks:"));
+        let c = cfg();
+        let material = format!("{}\u{1f}{}\u{1f}{}", c.workspace_url, c.warehouse_id, c.sql);
+        assert_eq!(
+            k1,
+            format!(
+                "databricks:{:016x}",
+                faucet_core::shard::shard_hash(&material)
+            )
+        );
     }
 
     #[tokio::test]

@@ -119,6 +119,18 @@ pub(crate) fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+/// A JSON scalar as a GoogleSQL literal: strings through [`sql_str`] (so a
+/// backslash cannot escape the closing quote), numbers and booleans verbatim,
+/// anything else `NULL`.
+pub(crate) fn sql_literal(v: &Value) -> String {
+    match v {
+        Value::String(s) => sql_str(s),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => "NULL".to_owned(),
+    }
+}
+
 /// Backtick-quoted identifier, with backslash and backtick **escaped** — the
 /// representation BigQuery's quoted-identifier grammar defines.
 ///
@@ -340,6 +352,19 @@ pub fn build_transaction_sql(
     )
 }
 
+/// Top-level record fields with no matching column in `columns`, sorted and
+/// deduplicated (SQL-94). Non-object records contribute nothing.
+pub(crate) fn unknown_fields(columns: &[FieldSpec], records: &[Value]) -> Vec<String> {
+    let known: std::collections::HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for r in records {
+        if let Some(obj) = r.as_object() {
+            out.extend(obj.keys().filter(|k| !known.contains(k.as_str())).cloned());
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Deterministic, sanitized `requestId` for transport-retry dedup. Correctness
 /// does not depend on it (the transaction + core skip logic are authoritative);
 /// it just suppresses duplicate jobs from a retried HTTP request within
@@ -405,7 +430,18 @@ pub fn fieldspecs_to_json_schema(fields: &[FieldSpec]) -> Value {
         let fragment = if f.repeated {
             json!({ "type": ["array", "null"] })
         } else {
-            json!({ "type": [bq_to_json_base(&f.ty), "null"] })
+            match f.ty {
+                // A JSON column holds any value the sink writes into it.
+                BqType::Json => {
+                    json!({ "type": ["string", "number", "integer", "boolean", "object", "array", "null"] })
+                }
+                // Decimals arrive as numbers or as exact decimal text (the
+                // BigQuery source emits NUMERIC as strings).
+                BqType::Numeric | BqType::BigNumeric => {
+                    json!({ "type": ["number", "string", "null"] })
+                }
+                _ => json!({ "type": [bq_to_json_base(&f.ty), "null"] }),
+            }
         };
         props.insert(f.name.clone(), fragment);
     }
@@ -498,6 +534,16 @@ pub fn bq_column_type(field_spec: &serde_json::Value) -> &'static str {
         },
         Some("object") | Some("array") => "JSON",
         _ => "STRING",
+    }
+}
+
+/// Turn a [`build_create_table_ddl`] statement into `CREATE TABLE IF NOT
+/// EXISTS`, for a table that does not exist (REPLACE is only for a verified
+/// schemaless one).
+pub fn create_if_missing(ddl: &str) -> String {
+    match ddl.strip_prefix("CREATE OR REPLACE TABLE ") {
+        Some(rest) => format!("CREATE TABLE IF NOT EXISTS {rest}"),
+        None => ddl.to_owned(),
     }
 }
 
@@ -852,6 +898,24 @@ mod tests {
     }
 
     #[test]
+    fn unknown_fields_lists_record_keys_without_a_column() {
+        let col = |n: &str| FieldSpec {
+            name: n.into(),
+            ty: BqType::String,
+            repeated: false,
+            fields: vec![],
+        };
+        let columns = vec![col("id"), col("name")];
+        let records = vec![
+            json!({"id": 1, "name": "a", "extra": 1}),
+            json!({"id": 2, "added": true, "extra": 2}),
+            json!(5),
+        ];
+        assert_eq!(unknown_fields(&columns, &records), vec!["added", "extra"]);
+        assert!(unknown_fields(&columns, &[json!({"id": 1})]).is_empty());
+    }
+
+    #[test]
     fn request_id_is_deterministic_and_sanitized() {
         let a = build_request_id("pipe::row1", "00000000000000000007");
         let b = build_request_id("pipe::row1", "00000000000000000007");
@@ -863,6 +927,28 @@ mod tests {
         );
         assert!(a.ends_with("_00000000000000000007"), "got: {a}");
         assert_ne!(a, build_request_id("pipe::row2", "00000000000000000007"));
+    }
+
+    #[test]
+    fn create_if_missing_rewrites_only_create_or_replace() {
+        assert_eq!(
+            create_if_missing("CREATE OR REPLACE TABLE `p.d.t` (a INT64)"),
+            "CREATE TABLE IF NOT EXISTS `p.d.t` (a INT64)"
+        );
+        assert_eq!(create_if_missing("SELECT 1"), "SELECT 1");
+    }
+
+    #[test]
+    fn sql_literal_keeps_a_backslash_quote_bound_inside_the_literal() {
+        let scope = faucet_core::OverwriteScope::Window {
+            column: "d".into(),
+            from: json!("x\\' OR TRUE;--"),
+            to: json!(10),
+        };
+        let whr = scope.render_where_with("`d`", sql_literal);
+        assert_eq!(whr, r"`d` >= 'x\\\' OR TRUE;--' AND `d` < 10");
+        assert_eq!(sql_literal(&json!(true)), "true");
+        assert_eq!(sql_literal(&Value::Null), "NULL");
     }
 
     #[test]
@@ -890,10 +976,10 @@ mod tests {
         let js = fieldspecs_to_json_schema(&fields);
         assert_eq!(js["type"], "object");
         let p = &js["properties"];
-        // Numeric collapses to JSON `number`; non-JSON-native types → `string`.
+        // Numeric takes numbers or decimal text; non-JSON-native types → `string`.
         assert_eq!(p["id"]["type"], json!(["integer", "null"]));
         assert_eq!(p["score"]["type"], json!(["number", "null"]));
-        assert_eq!(p["amount"]["type"], json!(["number", "null"]));
+        assert_eq!(p["amount"]["type"], json!(["number", "string", "null"]));
         assert_eq!(p["flag"]["type"], json!(["boolean", "null"]));
         assert_eq!(p["name"]["type"], json!(["string", "null"]));
         assert_eq!(p["ts"]["type"], json!(["string", "null"]));
@@ -901,6 +987,13 @@ mod tests {
         assert_eq!(p["tags"]["type"], json!(["array", "null"]));
         // A non-repeated struct is an object.
         assert_eq!(p["addr"]["type"], json!(["object", "null"]));
+        let doc = fieldspecs_to_json_schema(&[scalar("doc", BqType::Json)]);
+        assert_eq!(
+            doc["properties"]["doc"]["type"],
+            json!([
+                "string", "number", "integer", "boolean", "object", "array", "null"
+            ])
+        );
     }
 
     #[test]

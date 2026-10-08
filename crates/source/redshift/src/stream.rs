@@ -6,8 +6,6 @@
 //! down via a `${bookmark}` bind when present and always re-checked client-side.
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Mutex;
 
@@ -110,12 +108,15 @@ impl RedshiftSource {
 
 /// Derive a stable state key from the host, database, and query.
 fn default_state_key(config: &RedshiftSourceConfig) -> String {
-    let mut h = DefaultHasher::new();
-    config.connection.host.hash(&mut h);
-    config.connection.port.hash(&mut h);
-    config.connection.database.hash(&mut h);
-    config.query.hash(&mut h);
-    format!("redshift:{:016x}", h.finish())
+    // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
+    let material = format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        config.connection.host, config.connection.port, config.connection.database, config.query
+    );
+    format!(
+        "redshift:{:016x}",
+        faucet_core::shard::shard_hash(&material)
+    )
 }
 
 /// Apply the client-side incremental filter to a page (no-op for full runs).
@@ -203,7 +204,8 @@ impl Source for RedshiftSource {
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let cap = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
-            let mut running_max: Option<Value> = None;
+            // Seeded with the start bookmark so it can never move backwards.
+            let mut running_max: Option<Value> = incr.as_ref().map(|ic| ic.start.clone());
             let mut total = 0usize;
 
             while let Some(row) = rows
@@ -211,7 +213,7 @@ impl Source for RedshiftSource {
                 .await
                 .map_err(|e| FaucetError::Source(format!("redshift query failed: {e}")))?
             {
-                let obj = row_to_json(&row);
+                let obj = row_to_json(&row)?;
                 // Track the running max BEFORE the client-side filter so the
                 // persisted bookmark reflects the full scan.
                 if let Some(ic) = &incr
@@ -367,6 +369,18 @@ mod tests {
         let k2 = source(c).state_key().unwrap();
         assert_eq!(k1, k2);
         assert!(k1.starts_with("redshift:"));
+        let c = base_config();
+        let material = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            c.connection.host, c.connection.port, c.connection.database, c.query
+        );
+        assert_eq!(
+            k1,
+            format!(
+                "redshift:{:016x}",
+                faucet_core::shard::shard_hash(&material)
+            )
+        );
     }
 
     #[tokio::test]

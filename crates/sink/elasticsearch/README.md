@@ -65,13 +65,18 @@ faucet run pipeline.yaml
 | `base_url` | string | — *(required)* | Base URL of the Elasticsearch cluster (e.g. `"http://localhost:9200"`). Trailing slashes are stripped automatically. |
 | `index` | string | — *(required)* | Target index name. |
 | `auth` | `AuthSpec<ElasticsearchAuth>` | `{ type: none }` | Authentication — inline `{ type, config }` or `{ ref: <name> }`. See [Authentication](#authentication). |
-| `id_field` | string | *(unset)* | JSON field name used as the document `_id` in `append` mode. If unset, Elasticsearch auto-generates IDs. **Superseded by `key` in `upsert`/`delete` modes.** |
+| `id_field` | string | *(unset)* | JSON field name used as the document `_id` in `append` mode. If unset, Elasticsearch auto-generates IDs. **Superseded by `key` in `upsert`/`delete` modes.** See [Document ID extraction](#document-id-extraction). |
+| `op_type` | `index` \| `create` | `index` | The `_bulk` action for `append` writes. Data streams accept only `create`; with `create`, a document whose `_id` already exists is a per-row error. Refused with any other `write_mode`. |
+| `connect_timeout_secs` | int | `10` | Seconds to wait for a connection to the cluster. |
+| `request_timeout_secs` | int | `300` | Seconds one HTTP request may take end to end; a half-open connection or wedged node fails the request (retriable) instead of hanging the run. |
 
 ### Batching
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `batch_size` | int | `1000` | Maximum documents per `_bulk` request. The sink slices larger pages into `batch_size`-document chunks. **`0` = no batching**: the whole upstream page is sent in one `_bulk` call. See [Streaming & batching](#streaming--batching). |
+| `batch_size` | int | `1000` | Maximum actions per `_bulk` request, in every write mode. The sink slices larger pages into `batch_size`-action chunks. **`0` = no batching**: the whole upstream page is sent in one `_bulk` call. See [Streaming & batching](#streaming--batching). |
+
+Bulk items Elasticsearch rejects as overloaded (`429`, `503`, `es_rejected_execution_exception`) are re-sent on their own with exponential backoff (200 ms doubling, up to 5 retries) before they count as failed, so a briefly saturated write pool neither sends valid rows to the DLQ nor makes a retry re-index the items that already succeeded.
 
 ### Write mode
 
@@ -88,7 +93,10 @@ idiomatic Elasticsearch **alias swap**, so a reader never sees a half-replaced
 dataset and a failed/cancelled run leaves the previous data intact:
 
 1. `begin` creates a fresh physical index `{index}-faucet-ovw-…` (copying the
-   current target's mappings) behind a marker alias `{index}-faucet-ovw-staging`,
+   current target's mappings **and** its settings — analysis, shard/replica
+   counts, `refresh_interval`, index sorting, `mapping.*`, ingest pipelines,
+   lifecycle policy, minus identity keys such as `uuid`) behind a marker alias
+   `{index}-faucet-ovw-staging`,
    and the run's documents are indexed through that marker (`_bulk` with
    `require_alias=true`, so a write without a staging index fails instead of
    creating one);
@@ -237,21 +245,28 @@ Missing or null `key` values are per-row failures: `write_batch` aborts the page
 In `append` mode, when `id_field` is set the sink extracts the document `_id` from each record:
 
 - A string field value is used directly.
-- A number or other type is converted to its string representation.
+- A number or boolean is converted to its string representation.
 - A record missing `id_field` gets an Elasticsearch auto-generated ID.
+- A `null`, object or array value is an error for **that row** (DLQ-routable; without a DLQ the batch fails before anything is sent). Rendering it would put every such record on one `_id` such as `"null"` and silently keep only the last.
+
+In `upsert` / `delete` modes rows are deduplicated by the `_id` they address, last write wins, so keys `7` and `"7"` (both `_id "7"`) are one document.
 
 Setting `id_field` to a stable business key makes resumed/retried runs **idempotent overwrites** rather than duplicates — the recommended setting for resumable append pipelines (or configure a DLQ, whose per-row path avoids the whole-page re-send).
 
 ## Schema evolution
 
-`ElasticsearchSink` reports its live index mappings via `current_schema()` (`GET /<index>/_mapping`, every field marked nullable since ES has no NOT NULL concept; a missing index → `None`), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real index. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
+`ElasticsearchSink` reports its live index mappings via `current_schema()` (`GET /<index>/_mapping`; every field is reported as `[type, "array", "null"]` because ES has no NOT NULL concept and every field is multi-valued, so array data is not drift; a missing index → `None`), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real index. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
 
 Under `on_drift: evolve`, `ElasticsearchSink::evolve_schema()` is **add-fields only**:
 
-- **New fields** → `PUT /<index>/_mapping` adding the field mappings.
+- **New fields** → `PUT /<index>/_mapping` adding the field mappings. An array column maps to its item type (not `object`), and strings map to `keyword` with `ignore_above: 8191`, so an over-long value is stored but not indexed instead of rejecting its document.
 - **Type widenings and nullability relaxations are no-ops** — Elasticsearch cannot change an existing field's mapping type or nullability in place (a one-shot `debug` log notes this).
 
 Because ES cannot retype an existing field, any change to an existing field's type is classified as **incompatible** and routed by `on_incompatible` (`fail` or `quarantine`) rather than applied. See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+
+## Scoped cleanup
+
+With a source `complete_for` claim and `write_mode: upsert`, the sink deletes the documents in the claimed scope it did not write this run, in one `_delete_by_query` that excludes every written `_id`. Each scope field is matched with a `term` query on its exact indexed value: a field mapped as analyzed `text` (Elasticsearch's dynamic mapping for strings) is matched through its `keyword` sub-field (`account.keyword`), and a `text` field with no `keyword` sub-field is refused, because an exact match on it would delete nothing. Elasticsearch has no transactions, so concurrent searches can observe a partially cleaned scope; a partial outcome (failures, version conflicts, a timeout) fails the run, and the next run finishes the job.
 
 ## Dead-letter queue
 

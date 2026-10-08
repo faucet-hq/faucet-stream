@@ -268,8 +268,11 @@ impl TypeFamily {
     /// The JSON-Schema fragment for values of this family as the source emits them.
     pub fn json_schema(self) -> Value {
         match self {
-            TypeFamily::Integer => json!({ "type": "integer" }),
-            TypeFamily::Decimal | TypeFamily::BinaryFloat => json!({ "type": "number" }),
+            // Integers beyond 64 bits, and decimals an f64 cannot hold exactly,
+            // are emitted as their exact text.
+            TypeFamily::Integer => json!({ "type": ["integer", "string"] }),
+            TypeFamily::Decimal => json!({ "type": ["number", "string"] }),
+            TypeFamily::BinaryFloat => json!({ "type": "number" }),
             TypeFamily::Boolean => json!({ "type": "boolean" }),
             TypeFamily::Json => json!({ "type": "object" }),
             TypeFamily::Raw | TypeFamily::Blob => {
@@ -615,8 +618,10 @@ mod tests {
     #[test]
     fn family_schemas() {
         use TypeFamily::*;
-        assert_eq!(Integer.json_schema()["type"], "integer");
-        assert_eq!(Decimal.json_schema()["type"], "number");
+        // Values past i64/u64 or f64 exactness are emitted as text.
+        assert_eq!(Integer.json_schema()["type"], json!(["integer", "string"]));
+        assert_eq!(Decimal.json_schema()["type"], json!(["number", "string"]));
+        assert_eq!(BinaryFloat.json_schema()["type"], "number");
         assert_eq!(Boolean.json_schema()["type"], "boolean");
         assert_eq!(Json.json_schema()["type"], "object");
         assert_eq!(Blob.json_schema()["contentEncoding"], "base64");

@@ -207,10 +207,10 @@ the snapshot starts, and pair the source with a `cdc_unwrap` transform so the
 
 ### Postgres requires a permanent slot
 
-For `postgres-cdc`, position capture requires a **permanent** replication slot
-(`slot_type: permanent`, the default). A temporary slot is dropped when the
-short-lived capture connection closes, so it cannot retain WAL across the
-snapshot — `faucet mirror` rejects a temporary slot with a typed error.
+For `postgres-cdc`, position capture uses a **permanent** replication slot
+(`slot_type: permanent`, the default), which retains WAL across the snapshot.
+`slot_type: temporary` is refused at config load: a temporary slot is dropped
+with the session that creates it, before replication could start.
 
 ### Log retention must outlast the snapshot
 

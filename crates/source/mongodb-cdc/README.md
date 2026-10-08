@@ -55,23 +55,24 @@ Connect with `?replicaSet=rs0` in the URI. Some additional requirements dependin
 ```yaml
 # pipeline.yaml
 version: 1
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://user:pass@localhost:27017/?replicaSet=rs0
-    scope:
-      type: collection
-      database: appdb
-      collection: orders
-    full_document: update_lookup
-    idle_timeout: 30
-sink:
-  type: file
-  config:
-    path: ./changes.jsonl
-state:
-  type: file
-  config: { path: ./state }
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://user:pass@localhost:27017/?replicaSet=rs0
+      scope:
+        type: collection
+        database: appdb
+        collection: orders
+      full_document: update_lookup
+      idle_timeout: 30
+  sink:
+    type: file
+    config:
+      path: ./changes.jsonl
+  state:
+    type: file
+    config: { path: ./state }
 ```
 
 ```bash
@@ -82,21 +83,20 @@ Every change to `appdb.orders` lands as one JSON line in `changes.jsonl`; the re
 
 ## Output record schema
 
-Every change event is one JSON object — a flat CDC envelope:
+Every change event is one JSON object — a flat CDC envelope. Document values are BSON rendered as **relaxed Extended JSON**, so an `ObjectId` is `{"$oid": "…"}`, a date `{"$date": "…"}`, a `Decimal128` `{"$numberDecimal": "…"}`:
 
 ```json
 {
   "op": "c",
   "ts_ms": 1779019200000,
   "namespace": { "db": "appdb", "coll": "orders" },
-  "document_key": { "_id": "6654a1b2c3d4e5f600000001" },
+  "document_key": { "_id": { "$oid": "6654a1b2c3d4e5f600000001" } },
   "before": null,
   "after": {
-    "_id": "6654a1b2c3d4e5f600000001",
+    "_id": { "$oid": "6654a1b2c3d4e5f600000001" },
     "status": "shipped",
     "total": 49.99
   },
-  "update_description": null,
   "resume_token": { "_data": "826654A1B20000000..." }
 }
 ```
@@ -106,12 +106,12 @@ Every change event is one JSON object — a flat CDC envelope:
 | Field | Type | Description |
 |-------|------|-------------|
 | `op` | string | Operation type: `c` (insert), `u` (update), `r` (replace), `d` (delete), `ddl` (drop / rename / dropDatabase / invalidate) |
-| `ts_ms` | number | Wall-clock time of the change in Unix-epoch milliseconds (from `clusterTime`) |
+| `ts_ms` | number \| null | The change's `clusterTime` in Unix-epoch milliseconds — **second precision** (the cluster time's seconds × 1000). `null` when the event carries no cluster time. |
 | `namespace` | object \| null | `{ "db": "…", "coll": "…" }`. `null` for cluster-scope events that carry no namespace (e.g. a cluster-level invalidate) |
 | `document_key` | object \| null | Document identity key (typically `{ "_id": … }`) |
 | `before` | object \| null | Pre-image of the document. Populated only when `full_document_before_change` is enabled and the collection has `changeStreamPreAndPostImages` turned on (MongoDB 6.0+). |
 | `after` | object \| null | Post-image of the document. Always populated on inserts and replaces. On updates it is populated only with `full_document: update_lookup`, or with `when_available` / `required` on a collection that has `changeStreamPreAndPostImages` enabled (MongoDB 6.0+); with the default `off` it is `null` on every update. `null` on deletes. |
-| `update_description` | object \| null | Present on `u` events: `{ "updated_fields": {…}, "removed_fields": ["…"], "truncated_arrays": [{…}] }`. `null` for all other op types. |
+| `update_description` | object | Only on `u` events (the key is absent otherwise): `{ "updated_fields": {…}, "removed_fields": ["…"] }`, plus `truncated_arrays` when the server reports any. |
 | `resume_token` | object | Opaque server-assigned token. The pipeline persists this as the page bookmark and passes it to `resumeAfter` on the next run. |
 
 ### Operation-type mapping
@@ -170,7 +170,7 @@ scope: { type: collection, database: appdb, collection: orders }
 
 ```yaml
 start_from: { type: now }                        # only events from now on (default)
-start_from: { type: earliest }                   # from the oldest retained oplog entry
+start_from: { type: earliest }                   # from the oldest entry still in the oplog
 start_from: { type: resume_token, token: {...} } # an explicit opaque token
 start_from: { type: timestamp, timestamp_secs: 1779019200 }  # a cluster time, in epoch seconds
 ```
@@ -190,55 +190,57 @@ start_from: { type: timestamp, timestamp_secs: 1779019200 }  # a cluster time, i
 
 ```yaml
 version: 1
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://faucet:secret@mongo1:27017,mongo2:27017/?replicaSet=rs0&authSource=admin
-    scope:
-      type: collection
-      database: myapp
-      collection: events
-    operation_types: ["insert", "update", "replace", "delete"]
-    full_document: when_available
-    full_document_before_change: off
-    idle_timeout: 60
-    max_await_time_ms: 500
-    batch_size: 500
-sink:
-  type: bigquery
-  config:
-    project_id: my-gcp-project
-    dataset_id: cdc
-    table_id: events_stream
-    credentials:
-      type: service_account_file
-      config: { path: /secrets/bq-sa.json }
-state:
-  type: redis
-  config:
-    url: redis://localhost:6379
-    namespace: faucet-cdc
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://faucet:secret@mongo1:27017,mongo2:27017/?replicaSet=rs0&authSource=admin
+      scope:
+        type: collection
+        database: myapp
+        collection: events
+      operation_types: ["insert", "update", "replace", "delete"]
+      full_document: when_available
+      full_document_before_change: off
+      idle_timeout: 60
+      max_await_time_ms: 500
+      batch_size: 500
+  sink:
+    type: bigquery
+    config:
+      project_id: my-gcp-project
+      dataset_id: cdc
+      table_id: events_stream
+      credentials:
+        type: service_account_file
+        config: { path: /secrets/bq-sa.json }
+  state:
+    type: redis
+    config:
+      url: redis://localhost:6379
+      namespace: faucet-cdc
 ```
 
 ### Cluster-wide CDC with operation filtering, printed to stdout
 
 ```yaml
 version: 1
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://faucet:secret@mongos:27017/?tls=true
-    scope:
-      type: cluster
-    operation_types: ["insert", "delete"]
-    idle_timeout: 30
-sink:
-  type: stdout
-  config:
-    format: pretty
-state:
-  type: file
-  config: { path: ./state/mongodb-cdc }
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://faucet:secret@mongos:27017/?tls=true
+      scope:
+        type: cluster
+      operation_types: ["insert", "delete"]
+      idle_timeout: 30
+  sink:
+    type: stdout
+    config:
+      format: pretty
+  state:
+    type: file
+    config: { path: ./state/mongodb-cdc }
 ```
 
 ### Server-side projection via an aggregation pipeline
@@ -247,29 +249,30 @@ Strip large fields and redact a secret before events ever leave the server:
 
 ```yaml
 version: 1
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://localhost:27017/?replicaSet=rs0
-    scope:
-      type: collection
-      database: appdb
-      collection: users
-    full_document: update_lookup
-    aggregation_pipeline:
-      - { $unset: ["fullDocument.password_hash", "fullDocument.blob"] }
-state:
-  type: file
-  config: { path: ./state }
-sink:
-  type: file
-  config:
-    path: ./users-changes.jsonl
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://localhost:27017/?replicaSet=rs0
+      scope:
+        type: collection
+        database: appdb
+        collection: users
+      full_document: update_lookup
+      aggregation_pipeline:
+        - { $unset: ["fullDocument.password_hash", "fullDocument.blob"] }
+  state:
+    type: file
+    config: { path: ./state }
+  sink:
+    type: file
+    config:
+      path: ./users-changes.jsonl
 ```
 
 ## Streaming & batching
 
-The source overrides `stream_pages` to tail the change stream natively. It accumulates change events into a `StreamPage` and yields a page when **either** `batch_size` events have accumulated **or** `idle_timeout` elapses with no new event. The bookmark carried on each page is the `resume_token` of the last event in that page, so the pipeline persists durable progress every page.
+The source overrides `stream_pages` to tail the change stream natively. It accumulates change events into a `StreamPage` and yields a page when **either** `batch_size` events have accumulated **or** `idle_timeout` elapses with no new event. The bookmark carried on each page is the `resume_token` of the last event in that page, so the pipeline persists durable progress every page. When the cycle ends idle, the final page carries the stream's **post-batch resume token** instead — it covers the events the server filtered out (`operation_types`, `aggregation_pipeline`) and the quiet period, so a filtered or low-write stream's bookmark keeps moving and never falls out of the oplog window; the page is emitted (bookmark-only) even when no event arrived. A page that reaches `batch_size` in the middle of a multi-document transaction is held until that transaction's events are all buffered, so a reader never sees half of a source transaction.
 
 - The `batch_size` config field is authoritative — a pipeline-supplied hint never overrides it.
 - `batch_size: 0` is the "no batching" sentinel: drain events until idle and emit a single page. Use it for low-traffic collections where you'd rather get one consolidated page per quiet period.
@@ -279,10 +282,9 @@ The source overrides `stream_pages` to tail the change stream natively. It accum
 
 The connector is fully resumable. After each emitted page the pipeline writes the `resume_token` of the last event to the configured `StateStore`. On the next run, `apply_start_bookmark` restores the token and the change stream opens with `resumeAfter: <token>` — MongoDB delivers events from exactly that point onwards.
 
-**`start_from` precedence (only consulted when no persisted bookmark exists, except as noted):**
+**`start_from` precedence:** every variant places only a **fresh** run. Once a bookmark exists the connector always resumes from it — an explicit `resume_token` / `timestamp` no longer overrides it, because replaying from a fixed point every run rewrote committed pages under exactly-once, ignored a mirror's captured handoff position, and failed for good once the point left the oplog. To restart from an explicit position, clear the state (`faucet state reset`) first.
 
-- `resume_token` and `timestamp` variants **always** override a persisted bookmark — they force an explicit start position regardless of what the state store holds.
-- `now` and `earliest` variants **yield** to a persisted bookmark: if one exists the connector resumes from it; if none exists, the variant chooses the initial position. A fresh `now` start persists the position it opened at before any change arrives, so a quiet first cycle followed by writes between runs loses nothing: the next run resumes from that position.
+- `earliest` opens at the oldest entry still in the oplog (read from `local.oplog.rs`), so it works on a replica set whose oplog has rolled; without read access to `local` it falls back to the beginning of time with a warning. A fresh `now` start persists the position it opened at before any change arrives, so a quiet first cycle followed by writes between runs loses nothing: the next run resumes from that position.
 
 State keys (one per scope) so that two pipelines on different scopes never collide:
 
@@ -308,21 +310,22 @@ The CLI enforces a hard gate at config-load time (caught by `faucet validate` be
 ```yaml
 version: 1
 delivery: exactly_once
-source:
-  type: mongodb-cdc
-  config:
-    connection_uri: mongodb://localhost:27017/?replicaSet=rs0
-    scope: { type: collection, database: appdb, collection: orders }
-    full_document: update_lookup
-sink:
-  type: postgres
-  config:
-    connection_url: postgres://user:pass@localhost/warehouse
-    table: orders_cdc
-state:
-  type: postgres
-  config:
-    connection_url: postgres://user:pass@localhost/warehouse
+pipeline:
+  source:
+    type: mongodb-cdc
+    config:
+      connection_uri: mongodb://localhost:27017/?replicaSet=rs0
+      scope: { type: collection, database: appdb, collection: orders }
+      full_document: update_lookup
+  sink:
+    type: postgres
+    config:
+      connection_url: postgres://user:pass@localhost/warehouse
+      table: orders_cdc
+  state:
+    type: postgres
+    config:
+      connection_url: postgres://user:pass@localhost/warehouse
 ```
 
 > **Note:** a mirror built with the `cdc_unwrap` transform + `write_mode: upsert` needs an `after` image on every update, so set `full_document: update_lookup` (or `required` on a collection with `changeStreamPreAndPostImages` enabled). `faucet validate` refuses the pairing with the default `full_document: off`, and `cdc_unwrap` fails the run on an update it cannot turn into a row rather than dropping it. `update_lookup` re-reads the document at lookup time, not change time (see [Caveats](#caveats)). See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
@@ -407,7 +410,7 @@ This crate has no optional features of its own. From the umbrella / CLI it is ga
 |---------|-------------|
 | `The $changeStream stage is only supported on replica sets` or a startup `FaucetError::Source` about standalone | The URI points at a standalone `mongod`. Change Streams need a replica set or sharded cluster. Run `mongod --replSet rs0` and `rs.initiate()`, then add `?replicaSet=rs0` to the URI. |
 | Config error: `max_await_time_ms must be strictly less than idle_timeout` | `max_await_time_ms` is in **milliseconds** and must be `< idle_timeout` (which is in **seconds**). E.g. `idle_timeout: 30` (30 000 ms) with `max_await_time_ms: 1000` is valid. |
-| `start_from: earliest` errors with an oplog/`resume of change stream was not possible` message | The oldest available oplog entry has rolled past. Use `{ type: now }` for fresh deployments, and size the oplog (and your tolerated downtime) so the window outlasts any gap between runs. |
+| `start_from: earliest` errors with an oplog/`resume of change stream was not possible` message | The connector could not read `local.oplog.rs` (it logs a warning) and fell back to the beginning of time, which the server rejects once the oplog has rolled. Grant read on `local`, or use `{ type: now }` / an explicit `timestamp` inside the oplog window. |
 | Resume fails after restart with a "resume point may no longer be in the oplog" error | The persisted `resumeToken` rolled off the oplog while the pipeline was down. Increase the oplog size, or restart with `start_from: { type: now }` (accepting the gap). |
 | `before` is always `null` despite `full_document_before_change` set | Pre-images need MongoDB 6.0+ **and** `changeStreamPreAndPostImages: { enabled: true }` on the collection: `db.runCommand({ collMod: "mycoll", changeStreamPreAndPostImages: { enabled: true } })`. With `required` and pre-images off, the stream errors; with `when_available` you get `before: null`. |
 | `after` reflects a newer state than the change | You're using `full_document: update_lookup`, which re-reads the document at lookup time. If the doc was further modified or deleted in between, `after` shows the later state (or is absent). Don't rely on it for a strict point-in-time image. |
@@ -420,7 +423,7 @@ This crate has no optional features of its own. From the umbrella / CLI it is ga
 
 - **Replica set or sharded cluster required.** Standalone `mongod` instances do not support Change Streams; the connector validates this at startup and returns a typed `FaucetError::Source` immediately.
 - **`full_document: update_lookup` has at-least-once / read-skew semantics.** The document is re-read from the primary at delivery time, not at change time. If the document was further modified or deleted in between, the `after` image reflects the later state (or is absent).
-- **`start_from: earliest` may error** if the oplog has rolled past the earliest timestamp. Keep the oplog window large enough for your expected downtime.
+- **`start_from: earliest` needs read access to `local.oplog.rs`** to find the oldest retained entry; without it, it errors once the oplog has rolled.
 - **DDL events are best-effort.** Collection drops/renames arrive as `ddl` records, but the change stream does not replicate index operations or `collMod` changes that don't appear in the oplog.
 - **Per-batch durability, not per-event.** A crash mid-page replays at most `batch_size` events (unless effectively-once delivery is enabled).
 

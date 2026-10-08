@@ -220,7 +220,9 @@ impl RedshiftSinkConfig {
             ));
         }
         if self.write_strategy == RedshiftWriteStrategy::Copy {
-            let bucket_ok = self
+            // Validate what the load will use: the `copy:` block wins wholesale.
+            let spec = self.copy_spec();
+            let bucket_ok = spec
                 .staging_bucket
                 .as_ref()
                 .is_some_and(|b| !b.trim().is_empty());
@@ -230,7 +232,7 @@ impl RedshiftSinkConfig {
                         .into(),
                 ));
             }
-            let role_ok = self.iam_role.as_ref().is_some_and(|r| !r.trim().is_empty());
+            let role_ok = spec.iam_role.as_ref().is_some_and(|r| !r.trim().is_empty());
             if !role_ok {
                 return Err(FaucetError::Config(
                     "redshift sink: write_strategy: copy requires a non-empty `iam_role`".into(),
@@ -282,6 +284,36 @@ mod tests {
     #[test]
     fn valid_copy_config_passes() {
         base().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_checks_the_effective_copy_block() {
+        let mut c = base();
+        c.staging_bucket = None;
+        c.iam_role = None;
+        c.copy = Some(RedshiftCopySpec {
+            format: RedshiftCopyFormat::Jsonl,
+            staging_bucket: Some("b".into()),
+            staging_prefix: String::new(),
+            iam_role: Some("arn:role".into()),
+            region: None,
+            endpoint_url: None,
+        });
+        c.validate().expect("copy block alone is valid");
+
+        let mut c = base();
+        c.copy = Some(RedshiftCopySpec {
+            format: RedshiftCopyFormat::Jsonl,
+            staging_bucket: None,
+            staging_prefix: String::new(),
+            iam_role: None,
+            region: None,
+            endpoint_url: None,
+        });
+        assert!(
+            c.validate().is_err(),
+            "flat keys do not rescue an empty copy block"
+        );
     }
 
     #[test]

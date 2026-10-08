@@ -140,9 +140,12 @@ async fn writes_route_by_partition_key_and_round_trip() {
     let client = raw_client(&endpoint).await;
     create_stream(&client, "events", 2).await;
 
-    let sink = KinesisSink::new(sink_config(&endpoint, "events"))
-        .await
-        .expect("sink");
+    // Small requests with several in flight: each key's records must still
+    // arrive in order (#789 MSG-37).
+    let mut cfg = sink_config(&endpoint, "events");
+    cfg.batch_size = 4;
+    cfg.concurrency = 4;
+    let sink = KinesisSink::new(cfg).await.expect("sink");
     let records: Vec<Value> = (0..50)
         .map(|i| json!({"user_id": format!("user-{}", i % 5), "i": i}))
         .collect();
@@ -157,6 +160,20 @@ async fn writes_route_by_partition_key_and_round_trip() {
         .collect();
     is.sort_unstable();
     assert_eq!(is, (0..50).collect::<Vec<i64>>(), "payload round-trip");
+
+    let mut per_key: HashMap<String, Vec<i64>> = HashMap::new();
+    for (_, key, v) in &read {
+        per_key
+            .entry(key.clone())
+            .or_default()
+            .push(v["i"].as_i64().unwrap());
+    }
+    for (key, is) in &per_key {
+        assert!(
+            is.windows(2).all(|w| w[0] < w[1]),
+            "key {key} out of order: {is:?}"
+        );
+    }
 
     // Same partition key → same shard (Kinesis MD5 routing).
     let mut key_to_shard: HashMap<String, String> = HashMap::new();

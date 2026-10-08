@@ -62,6 +62,10 @@ faucet run pipeline.yaml
 
 Each result row becomes one output JSON record: column name → JSON key; `NULL` → JSON `null`; DuckDB `STRUCT` / `LIST` / `MAP` → nested JSON.
 
+**Sparse records.** Arrow needs one column per key across the page, so a key some records lack is `NULL` for them inside DuckDB. When the query keeps `batch`'s columns (`SELECT *`, `SELECT * EXCLUDE (…)`, `SELECT *, … FROM batch WHERE …`) the transform remembers which keys each record did not carry and leaves them out of the output again, so an upsert sink does not overwrite those destination columns with `NULL`; an explicit `null` in the input stays `null`. A query that names its columns gets exactly those columns, `null` where a record had no value. A key that is a number in one record and a string in another becomes a string column (`1` → `"1"`).
+
+**Sandbox.** The DuckDB connection has no host access once the reference relations are loaded: `enable_external_access` is off (no `read_text`, `read_csv`, `COPY … TO`, `ATTACH` or network reads; only the files of `reload_on_change` relations stay readable), extensions cannot be installed or autoloaded, and the configuration is locked, so a query cannot `SET` its own `memory_limit` or `threads`.
+
 ## Configuration reference
 
 Wire shape: `{ type: sql, config: { query, relations?, memory_limit?, threads? } }`.

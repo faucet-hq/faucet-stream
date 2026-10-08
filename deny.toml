@@ -38,14 +38,16 @@ ignore = [
     { id = "RUSTSEC-2026-0178", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
     { id = "RUSTSEC-2026-0179", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
     { id = "RUSTSEC-2026-0180", reason = "dev-dependency only (postgres-cdc / cli tests) (2026-10-07)" },
-    # 2026-10-07 — quick-xml: the fix (0.41) changes how entity references are
-    # reported and needs a parser rewrite in core/xml/rest; until then every
-    # call site turns the quadratic duplicate-attribute check off
-    # (`with_checks(false)`). 0.39 comes from object_store, which parses the
-    # configured storage endpoint's list responses. `NsReader` (0195) is used
-    # nowhere.
-    { id = "RUSTSEC-2026-0194", reason = "duplicate checks disabled at every call site; object_store pins 0.39 (2026-10-07)" },
-    { id = "RUSTSEC-2026-0195", reason = "NsReader is not used (2026-10-07)" },
+    # 2026-10-07 — quick-xml: faucet's own parsers and calamine are on >= 0.41
+    # (RUSTSEC-2026-0194/0195 fixed). Two older copies remain transitively and
+    # cannot move until their parents do: 0.39 from object_store 0.13 (pinned by
+    # parquet 58) and opendal 0.57 (pinned by iceberg 0.10), which parse only
+    # the configured storage endpoint's list responses and never use NsReader;
+    # 0.31 from azure_core 0.21, a dev-dependency of the azure-blob sink tests.
+    # cargo-deny cannot scope an advisory ignore to one version, so drop these
+    # two ids once object_store/opendal/azure_core move past quick-xml 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "only transitive quick-xml 0.39 (object_store/opendal) and 0.31 (azure dev-dep) remain (2026-10-07)" },
+    { id = "RUSTSEC-2026-0195", reason = "only transitive quick-xml 0.39 / 0.31 remain; NsReader unused (2026-10-07)" },
 ]
 
 [licenses]

@@ -53,7 +53,7 @@ async fn writes_10k_items_and_routes_invalid_rows_to_the_dlq() {
         .write_batch(&[json!({"pk": "ok"}), json!({"pk": 1})])
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("rejected"), "{err}");
+    assert!(err.to_string().contains("table's S key"), "{err}");
     let err = sink.write_batch(&[json!({"nope": 1})]).await.unwrap_err();
     assert!(err.to_string().contains("missing key attribute"), "{err}");
     assert_eq!(sink.write_batch(&[json!({"pk": "fine"})]).await.unwrap(), 1);
@@ -153,7 +153,7 @@ async fn upsert_delete_and_conditional_writes() {
             .as_ref()
             .unwrap_err()
             .to_string()
-            .contains("rejected")
+            .contains("table's N key")
     );
     assert_eq!(count(&client, "kvstore").await, 2);
 
@@ -170,4 +170,50 @@ async fn upsert_delete_and_conditional_writes() {
         .await
         .unwrap();
     assert_eq!(report.failed_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn key_attributes_take_the_table_declared_type() {
+    let Some((_c, endpoint, client)) = start().await else {
+        return;
+    };
+    create_table(&client, "binkeys", ScalarAttributeType::B, false, false).await;
+    let sink = DynamoDbSink::new(config(&endpoint, "binkeys"))
+        .await
+        .unwrap();
+    sink.write_batch(&[json!({"pk": "AAEC", "v": "AAEC"})])
+        .await
+        .unwrap();
+    let key = item(vec![(
+        "pk",
+        aws_sdk_dynamodb::types::AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(vec![
+            0u8, 1, 2,
+        ])),
+    )]);
+    let got = get(&client, "binkeys", key)
+        .await
+        .expect("binary-keyed item");
+    assert_eq!(
+        got["v"],
+        s("AAEC"),
+        "non-key attributes keep their JSON type"
+    );
+
+    create_table(&client, "numkeys", ScalarAttributeType::S, true, false).await;
+    let big = "123456789012345678901234567890.5";
+    DynamoDbSink::new(config(&endpoint, "numkeys"))
+        .await
+        .unwrap()
+        .write_batch(&[json!({"pk": "a", "sk": big})])
+        .await
+        .unwrap();
+    assert!(
+        get(
+            &client,
+            "numkeys",
+            item(vec![("pk", s("a")), ("sk", n(big))])
+        )
+        .await
+        .is_some()
+    );
 }

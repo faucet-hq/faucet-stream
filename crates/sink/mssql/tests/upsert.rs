@@ -364,3 +364,47 @@ async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
     assert_eq!(count(&pool, "dbo.t").await, 3);
     assert_eq!(name_of(&pool, "dbo.t", 1).await, "a2");
 }
+
+/// SQL-103 / SQL-102: with one pooled connection a keyed page still applies
+/// (columns are discovered before the write connection is held), and a delete
+/// followed by an upsert of a collation-equal key leaves the row.
+#[tokio::test(flavor = "multi_thread")]
+async fn single_connection_pool_applies_keyed_pages_in_order() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.t (id NVARCHAR(20) COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, \
+         name NVARCHAR(255))",
+    )
+    .await;
+    exec(
+        &pool,
+        "INSERT INTO dbo.t (id, name) VALUES (N'Bob', N'old')",
+    )
+    .await;
+
+    let mut scfg = upsert_sink_cfg(
+        &cfg,
+        WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".to_string()],
+            delete_marker: Some(faucet_core::DeleteMarker {
+                field: "op".into(),
+                values: vec!["d".into()],
+            }),
+            rollback: None,
+        },
+    );
+    scfg.max_connections = 1;
+    let sink = MssqlSink::new(scfg).await.expect("sink");
+    sink.write_batch(&[
+        json!({"id": "Bob", "op": "d"}),
+        json!({"id": "bob", "name": "new"}),
+    ])
+    .await
+    .expect("keyed page on a one-connection pool");
+    assert_eq!(count(&pool, "dbo.t").await, 1, "the re-insert survives");
+}

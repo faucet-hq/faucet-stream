@@ -129,6 +129,18 @@ pub struct PostgresSinkConfig {
     /// truncating the whole table. The prior out-of-scope rows are preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<faucet_core::OverwriteScope>,
+    /// Longest a page write may wait on the server, in seconds, before it
+    /// fails. Defaults to 3600; `0` waits forever.
+    ///
+    /// A peer that disappears without closing the connection (a failover, an
+    /// idle-eviction by a NAT or load balancer) otherwise leaves the write
+    /// waiting forever, and a scheduled or served run stuck in "running".
+    #[serde(default = "default_write_timeout_secs")]
+    pub write_timeout_secs: u64,
+}
+
+fn default_write_timeout_secs() -> u64 {
+    3600
 }
 
 fn default_batch_size() -> usize {
@@ -153,6 +165,7 @@ impl std::fmt::Debug for PostgresSinkConfig {
             .field("batch_size", &self.batch_size)
             .field("max_connections", &self.max_connections)
             .field("write_method", &self.write_method)
+            .field("write_timeout_secs", &self.write_timeout_secs)
             .finish()
     }
 }
@@ -171,6 +184,7 @@ impl PostgresSinkConfig {
             write: faucet_core::WriteSpec::default(),
             write_method: PostgresWriteMethod::default(),
             scope: None,
+            write_timeout_secs: default_write_timeout_secs(),
         }
     }
 

@@ -8,8 +8,8 @@
 //!
 //! - [`SnowflakeAuth`] — JWT key-pair or OAuth bearer authentication.
 //! - [`authorization_header`] — produces the `Authorization` header value the
-//!   Snowflake SQL REST API expects (JWT for `KeyPair`, `Snowflake Token=...`
-//!   for `OAuth`).
+//!   Snowflake SQL REST API expects (`Bearer <jwt>` for `KeyPair`,
+//!   `Bearer <token>` for `OAuth`).
 //! - [`snowflake_token_type`] — the matching `X-Snowflake-Authorization-Token-Type`
 //!   header value (`KEYPAIR_JWT` for `KeyPair`, `OAUTH` for `OAuth`).
 //!
@@ -62,20 +62,20 @@ impl std::fmt::Debug for SnowflakeAuth {
 /// Build the `Authorization` header value for a Snowflake SQL REST API request.
 ///
 /// For `KeyPair`, generates a fresh JWT signed with the configured RSA key
-/// (issuer/subject set to `{ACCOUNT_UPPER}.{USER_UPPER}`, 1-hour expiry) and
-/// wraps it as `Bearer {jwt}`. For `OAuth`, wraps the token as
-/// `Snowflake Token="{token}"`.
+/// (issuer/subject set to `{ACCOUNT}.{USER}`, see [`jwt_account`], 1-hour
+/// expiry) and wraps it as `Bearer {jwt}`. For `OAuth`, wraps the token as
+/// `Bearer {token}` — the SQL API pairs it with
+/// `X-Snowflake-Authorization-Token-Type: OAUTH`.
 ///
 /// `account` is the Snowflake account identifier from the source/sink config
-/// (e.g. `"xy12345.us-east-1"`); only its uppercase form is used in the JWT
-/// claims.
+/// (e.g. `"xy12345.us-east-1"`), the same value that names the host.
 pub fn authorization_header(auth: &SnowflakeAuth, account: &str) -> Result<String, FaucetError> {
     match auth {
         SnowflakeAuth::KeyPair {
             user,
             private_key_pem,
         } => {
-            let account_upper = account.to_uppercase();
+            let account_upper = jwt_account(account);
             let user_upper = user.to_uppercase();
             let qualified_user = format!("{account_upper}.{user_upper}");
 
@@ -108,7 +108,115 @@ pub fn authorization_header(auth: &SnowflakeAuth, account: &str) -> Result<Strin
 
             Ok(format!("Bearer {token}"))
         }
-        SnowflakeAuth::OAuth { token } => Ok(format!("Snowflake Token=\"{token}\"")),
+        SnowflakeAuth::OAuth { token } => Ok(format!("Bearer {token}")),
+    }
+}
+
+/// The account part of a key-pair JWT's `iss`/`sub` claims.
+///
+/// Snowflake wants the account locator without its region or cloud suffix
+/// (`xy12345.us-east-1` → `XY12345`), and for a `.global` identifier only the
+/// part before the first hyphen; the organization form (`org-acct`) passes
+/// through. The result is upper-cased.
+pub fn jwt_account(account: &str) -> String {
+    let base = if account.contains(".global") {
+        account.split('-').next().unwrap_or(account)
+    } else {
+        account.split('.').next().unwrap_or(account)
+    };
+    base.to_uppercase()
+}
+
+/// TCP connect timeout of [`http_client`].
+pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle read timeout of [`http_client`]: longer than the ~45 s the SQL API
+/// holds a submit before answering 202, so only a stalled connection trips it.
+pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The HTTP client the Snowflake source and sink share: gzip-decoding (result
+/// partitions after the first arrive gzip-encoded) with connect and idle-read
+/// timeouts, so a half-open connection fails instead of hanging the run.
+pub fn http_client() -> Result<reqwest::Client, FaucetError> {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .gzip(true)
+        .build()
+        .map_err(|e| FaucetError::Config(format!("snowflake: cannot build HTTP client: {e}")))
+}
+
+/// Best-effort `POST {statements_url}/{handle}/cancel`, so an abandoned
+/// statement stops running (and billing) on the warehouse. `statements_url`
+/// is the `…/api/v2/statements` endpoint. A failure is logged, never returned.
+pub async fn cancel_statement(
+    client: &reqwest::Client,
+    statements_url: &str,
+    handle: &str,
+    auth: &str,
+    token_type: &str,
+) {
+    let url = format!("{}/{handle}/cancel", statements_url.trim_end_matches('/'));
+    let result = client
+        .post(&url)
+        .header("Authorization", auth)
+        .header("Accept", "application/json")
+        .header("X-Snowflake-Authorization-Token-Type", token_type)
+        .send()
+        .await;
+    if let Err(e) = result {
+        tracing::warn!(statement = handle, error = %e, "Snowflake statement cancel failed");
+    }
+}
+
+/// Cancels a still-running statement when the future polling it is dropped
+/// (the run was cancelled or timed out). [`disarm`](Self::disarm) it once the
+/// statement finished or was cancelled explicitly.
+pub struct CancelOnDrop {
+    client: reqwest::Client,
+    statements_url: String,
+    handle: String,
+    auth: Option<(String, &'static str)>,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    /// Arm a guard for `handle` on the `…/api/v2/statements` endpoint.
+    pub fn new(client: reqwest::Client, statements_url: String, handle: &str) -> Self {
+        Self {
+            client,
+            statements_url,
+            handle: handle.to_owned(),
+            auth: None,
+            armed: true,
+        }
+    }
+
+    /// The latest `Authorization` header and token type, used by the cancel.
+    pub fn set_auth(&mut self, auth: String, token_type: &'static str) {
+        self.auth = Some((auth, token_type));
+    }
+
+    /// Do not cancel on drop.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (Some((auth, token_type)), Ok(rt)) =
+            (self.auth.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let client = self.client.clone();
+        let url = std::mem::take(&mut self.statements_url);
+        let handle = std::mem::take(&mut self.handle);
+        rt.spawn(async move { cancel_statement(&client, &url, &handle, &auth, token_type).await });
     }
 }
 
@@ -227,12 +335,37 @@ mod tests {
     }
 
     #[test]
-    fn oauth_authorization_header_uses_snowflake_token_scheme() {
+    fn oauth_authorization_header_uses_bearer_scheme() {
         let auth = SnowflakeAuth::OAuth {
             token: "my-token".into(),
         };
         let header = authorization_header(&auth, "acct").unwrap();
-        assert_eq!(header, "Snowflake Token=\"my-token\"");
+        assert_eq!(header, "Bearer my-token");
+    }
+
+    #[test]
+    fn jwt_account_strips_region_and_global_suffixes() {
+        assert_eq!(jwt_account("xy12345.us-east-1"), "XY12345");
+        assert_eq!(jwt_account("xy12345.us-east-2.aws"), "XY12345");
+        assert_eq!(jwt_account("myorg-myacct"), "MYORG-MYACCT");
+        assert_eq!(jwt_account("xy12345-abcdef.global"), "XY12345");
+        assert_eq!(jwt_account("acct"), "ACCT");
+    }
+
+    #[test]
+    fn key_pair_jwt_claims_use_the_locator_without_region() {
+        use base64::Engine as _;
+        let auth = SnowflakeAuth::KeyPair {
+            user: "u".into(),
+            private_key_pem: TEST_RSA_PKCS8_PEM.into(),
+        };
+        let header = authorization_header(&auth, "xy12345.us-east-1").unwrap();
+        let jwt = header.strip_prefix("Bearer ").unwrap();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(jwt.split('.').nth(1).unwrap())
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(claims["sub"], "XY12345.U");
     }
 
     #[test]
@@ -308,6 +441,24 @@ yCkue9tat7y9DS8+VR5D6cM9oQpKbrfG+PfTdlkCgYBf/pUWO94VgZvpV5Ui7MHb
     fn public_key_fingerprint_matches_openssl() {
         let fp = public_key_fingerprint(TEST_RSA_PKCS8_PEM).unwrap();
         assert_eq!(fp, "SHA256:NiQ5G+9Hr4ZBmdBscIoTOgx2SM6aWPG0/Q9Y6NuFtpI=");
+    }
+
+    #[test]
+    fn a_guard_without_auth_or_runtime_does_nothing_on_drop() {
+        let mut g = CancelOnDrop::new(http_client().unwrap(), "http://x".into(), "h");
+        drop(CancelOnDrop::new(
+            http_client().unwrap(),
+            "http://x".into(),
+            "h",
+        ));
+        g.set_auth("Bearer t".into(), "OAUTH");
+        drop(g);
+    }
+
+    #[test]
+    fn http_client_builds() {
+        assert!(http_client().is_ok());
+        assert!(HTTP_READ_TIMEOUT > std::time::Duration::from_secs(45));
     }
 
     #[test]

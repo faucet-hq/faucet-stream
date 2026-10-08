@@ -115,7 +115,7 @@ listing, never a data scan.
 The `rest` source discovers only when an `odata:` or `discovery:` block is set.
 `discovery:` is a **config-driven recipe** — no vendor code path: `list`
 enumerates dataset names from a listing endpoint (JSONPath `items`/`name`, an
-optional `keep_if` predicate, and `exclude_name_suffixes`), or `objects`
+optional `keep_if` predicate, `exclude_name_suffixes`, and `next` — a JSONPath to the next listing page's URL for a paginated listing), or `objects`
 supplies them directly (a YAML list or a comma-separated run param);
 `describe` optionally fetches each dataset's fields; `emit` templates what
 each dataset becomes, using `${name}` / `${name_snake}` / `${name_lower}` /

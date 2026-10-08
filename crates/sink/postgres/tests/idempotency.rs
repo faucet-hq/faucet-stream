@@ -210,10 +210,9 @@ async fn auto_map_into_missing_table_errors_with_no_columns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn auto_map_skips_records_with_no_matching_columns_then_noop() {
-    // A record whose keys match no table column is skipped (logged warn). When
-    // EVERY record is skipped, matched_rows is empty and write_batch returns 0
-    // without issuing an INSERT.
+async fn auto_map_refuses_records_with_no_matching_columns() {
+    // A record whose keys match no table column fails the write; nothing is
+    // inserted.
     let (_container, url) = start_postgres().await;
     let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
     sqlx::query("CREATE TABLE t (id BIGINT, name TEXT)")
@@ -227,12 +226,16 @@ async fn auto_map_skips_records_with_no_matching_columns_then_noop() {
         .with_batch_size(0);
     let sink = PostgresSink::new(config).await.expect("sink new");
 
-    // Neither key matches `id`/`name`.
-    let written = sink
+    // Neither key matches `id`/`name`: the page fails rather than being
+    // dropped while the bookmark advances (#789 SQL-50).
+    let err = sink
         .write_batch(&[json!({"nope": 1}), json!({"other": 2})])
         .await
-        .expect("write");
-    assert_eq!(written, 0, "all records skipped → zero written");
+        .expect_err("unmatched records must fail");
+    assert!(
+        err.to_string().contains("record 0 has no field matching"),
+        "{err}"
+    );
 
     let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM t")

@@ -595,3 +595,41 @@ async fn conformance_preflight_check_wellformed() {
         .unwrap();
     assert_eq!(report.failed_count(), 0);
 }
+
+/// API-27: a target that stops reading used to stall the writer forever.
+#[tokio::test]
+async fn a_target_that_stops_reading_fails_the_write_after_flush_timeout() {
+    let fx = Fixture::new();
+    let mut cfg = fx.config(json!({"mode": "echo", "delay_start": 30}));
+    cfg.flush_timeout_secs = 1;
+    let sink = SingerSink::new(cfg).unwrap();
+    let pad = "y".repeat(1024);
+    let records: Vec<Value> = (0..4000).map(|i| json!({"id": i, "pad": pad})).collect();
+    let started = Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(20), sink.write_batch(&records))
+        .await
+        .expect("must not stall")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("stopped reading its input"),
+        "{err}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(15));
+}
+
+/// API-60: the committing instance never wrote a record, so it knows no
+/// schema; it must not send an empty SCHEMA with ACTIVATE_VERSION.
+#[tokio::test]
+async fn the_overwrite_commit_sends_no_empty_schema() {
+    let fx = Fixture::new();
+    overwrite_run(&fx, 100, &[1, 2], true).await;
+    let schemas = fx.events("schema");
+    assert!(!schemas.is_empty());
+    assert!(
+        schemas
+            .iter()
+            .all(|e| e["schema"] != json!({"type": "object", "properties": {}})),
+        "{schemas:?}"
+    );
+    assert_eq!(fx.events("activate").len(), 1);
+}

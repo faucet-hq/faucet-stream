@@ -42,6 +42,10 @@ pub struct SchemaRegistryClient {
     /// not POST to the registry on every produced record (#78/#30). Keyed by
     /// subject + schema type + schema text.
     register_cache: Arc<Mutex<LruCache<String, u32>>>,
+    /// Parsed/compiled schemas keyed by codec + schema text, so a codec
+    /// parses an Avro schema, compiles a `.proto` or builds a JSON Schema
+    /// validator once per schema rather than once per message (#789 MSG-65).
+    parsed: Arc<std::sync::Mutex<LruCache<String, Arc<dyn std::any::Any + Send + Sync>>>>,
 }
 
 impl SchemaRegistryClient {
@@ -58,7 +62,32 @@ impl SchemaRegistryClient {
             auth: config.auth.clone(),
             cache: Arc::new(Mutex::new(LruCache::new(capacity))),
             register_cache: Arc::new(Mutex::new(LruCache::new(capacity))),
+            parsed: Arc::new(std::sync::Mutex::new(LruCache::new(capacity))),
         })
+    }
+
+    /// The parsed form of `text` for codec `kind`, built with `build` on the
+    /// first request and shared afterwards. A failed build is not cached.
+    pub fn parsed<T, F>(&self, kind: &str, text: &str, build: F) -> Result<Arc<T>, FaucetError>
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce(&str) -> Result<T, FaucetError>,
+    {
+        let key = format!("{kind}\u{0}{text}");
+        if let Some(hit) = self
+            .parsed
+            .lock()
+            .ok()
+            .and_then(|mut c| c.get(&key).cloned())
+            && let Ok(t) = hit.downcast::<T>()
+        {
+            return Ok(t);
+        }
+        let built = Arc::new(build(text)?);
+        if let Ok(mut c) = self.parsed.lock() {
+            c.put(key, built.clone() as Arc<dyn std::any::Any + Send + Sync>);
+        }
+        Ok(built)
     }
 
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

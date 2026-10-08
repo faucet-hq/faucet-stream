@@ -33,8 +33,9 @@ use crate::encode::{
 
 pub(crate) use crate::statements::Prepared;
 use crate::statements::{
-    cleanup_key_typing, delete_statements, insert_statements, insertable, key_load_statements,
-    merge_statements, poison_check, prepare_rows, with_timeout, writable,
+    cleanup_key_typing, delete_statements, insert_statements, key_load_statements,
+    merge_statements, overwrite_swap_sql, poison_check, prepare_rows, staging_create_sql,
+    staging_relax_sql, with_timeout, writable,
 };
 
 /// Microsoft SQL Server sink.
@@ -281,11 +282,6 @@ impl MssqlSink {
         Ok(infos)
     }
 
-    /// Writable (non-IDENTITY) column names, in table order.
-    async fn insertable_columns(&self) -> Result<Vec<String>, FaucetError> {
-        Ok(insertable(&self.column_infos().await?))
-    }
-
     /// Every column of `table` as `sys.columns` declares it, in column order;
     /// empty when the table does not exist.
     async fn fetch_column_infos(&self, table: &str) -> Result<Vec<ColumnInfo>, FaucetError> {
@@ -314,6 +310,7 @@ impl MssqlSink {
                 // `bit` columns decode as bools.
                 is_nullable: row.get::<bool, _>("is_nullable").unwrap_or(true),
                 is_identity: row.get::<bool, _>("is_identity").unwrap_or(false),
+                is_computed: row.get::<bool, _>("is_computed").unwrap_or(false),
             });
         }
         Ok(cols)
@@ -612,30 +609,41 @@ impl MssqlSink {
         Ok(deletes.len())
     }
 
-    /// Apply a planned upsert/delete batch atomically: upserts then deletes,
-    /// wrapped in a single `BEGIN TRAN` / `COMMIT TRAN` so they commit together
-    /// (last-write-wins dedup already collapsed conflicting ops in the planner).
-    async fn apply_plan(&self, plan: &faucet_core::WritePlan) -> Result<usize, FaucetError> {
+    /// Apply planned upsert/delete groups atomically, in page order, in a
+    /// single `BEGIN TRAN` / `COMMIT TRAN`. Groups come from [`ordered_plans`]
+    /// so a delete that precedes an upsert of a key equal under the column
+    /// collation (`"Bob"` / `"bob"`) cannot run after it and remove the row.
+    async fn apply_plans(&self, plans: &[faucet_core::WritePlan]) -> Result<usize, FaucetError> {
+        // Fill the column cache first: discovery takes its own pooled
+        // connection, so doing it under the write connection deadlocks a
+        // `max_connections: 1` pool.
+        self.column_infos().await?;
         let mut conn = self.checkout().await?;
         control(&mut conn, "BEGIN TRAN").await?;
 
-        let mut affected = 0usize;
-        match self.upsert_rows_no_txn(&mut conn, &plan.upserts).await {
-            Ok(n) => affected += n,
+        match self.apply_plans_no_txn(&mut conn, plans).await {
+            Ok(affected) => {
+                control(&mut conn, "COMMIT TRAN").await?;
+                Ok(affected)
+            }
             Err((e, timed_out)) => {
                 self.abort_txn(&mut conn, timed_out).await;
-                return Err(e);
+                Err(e)
             }
         }
-        match self.delete_keys_no_txn(&mut conn, &plan.deletes).await {
-            Ok(n) => affected += n,
-            Err((e, timed_out)) => {
-                self.abort_txn(&mut conn, timed_out).await;
-                return Err(e);
-            }
-        }
+    }
 
-        control(&mut conn, "COMMIT TRAN").await?;
+    /// Each group's upserts then deletes, inside the caller's transaction.
+    async fn apply_plans_no_txn(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+        plans: &[faucet_core::WritePlan],
+    ) -> Result<usize, (FaucetError, bool)> {
+        let mut affected = 0usize;
+        for plan in plans {
+            affected += self.upsert_rows_no_txn(conn, &plan.upserts).await?;
+            affected += self.delete_keys_no_txn(conn, &plan.deletes).await?;
+        }
         Ok(affected)
     }
 
@@ -970,10 +978,53 @@ pub(crate) fn classify_server_code(code: u32) -> ChunkFailure {
         1205 | 1222 => ChunkFailure::RolledBack,
         // Azure throttle/failover: connection-level, outcome unknown.
         c if AZURE_TRANSIENT.contains(&c) => ChunkFailure::Infrastructure,
-        // Everything else the server reports is about this row's data.
-        _ => ChunkFailure::RowRejected,
+        // Errors about the values being written: these blame rows.
+        c if ROW_DATA_ERRORS.contains(&c) => ChunkFailure::RowRejected,
+        // Anything else (log or filegroup full, missing object, permission,
+        // memory, …) is environmental: it would fail every row, so quarantining
+        // the stream while the bookmark advances would hide an outage.
+        _ => ChunkFailure::Infrastructure,
     }
 }
+
+/// Split a keyed page into runs of consecutive upserts or deletes and plan
+/// each run, so the runs apply in page order. One plan for the whole page
+/// would apply every upsert before every delete; when a delete and a later
+/// upsert address keys that differ in JSON but are equal under the column
+/// collation, that order deletes the row the page re-inserted. Rows with no
+/// usable key are left out (the caller reports them from its own plan).
+pub(crate) fn ordered_plans(
+    records: &[Value],
+    spec: &faucet_core::WriteSpec,
+) -> Vec<faucet_core::WritePlan> {
+    let mut plans = Vec::new();
+    let mut run: Vec<Value> = Vec::new();
+    let mut run_is_delete = None;
+    for rec in records {
+        let single = faucet_core::plan_writes(std::slice::from_ref(rec), spec);
+        if !single.failed.is_empty() {
+            continue;
+        }
+        let is_delete = !single.deletes.is_empty();
+        if run_is_delete.is_some_and(|d| d != is_delete) {
+            plans.push(faucet_core::plan_writes(&std::mem::take(&mut run), spec));
+        }
+        run_is_delete = Some(is_delete);
+        run.push(rec.clone());
+    }
+    if !run.is_empty() {
+        plans.push(faucet_core::plan_writes(&run, spec));
+    }
+    plans
+}
+
+/// SQL Server error numbers that are about the data of the rows being
+/// written: conversion and overflow (241, 242, 245, 220, 232, 517, 8114,
+/// 8115, 8169, 8134), truncation (8152, 2628), `NULL` into `NOT NULL` (515),
+/// constraint and key violations (547, 2601, 2627), invalid JSON (13609).
+const ROW_DATA_ERRORS: &[u32] = &[
+    220, 232, 241, 242, 245, 515, 517, 547, 2601, 2627, 2628, 8114, 8115, 8134, 8152, 8169, 13609,
+];
 
 /// Classify a tiberius failure while the error is still typed.
 pub(crate) fn classify_chunk_failure(e: &tiberius::error::Error) -> ChunkFailure {
@@ -1084,7 +1135,9 @@ impl Sink for MssqlSink {
                     self.config.write.write_mode.as_str()
                 )));
             }
-            let total = self.apply_plan(&plan).await?;
+            let total = self
+                .apply_plans(&ordered_plans(records, &self.config.write))
+                .await?;
             tracing::info!(
                 table = %self.config.table,
                 mode = self.config.write.write_mode.as_str(),
@@ -1161,7 +1214,8 @@ impl Sink for MssqlSink {
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
             let plan = faucet_core::plan_writes(records, &self.config.write);
-            self.apply_plan(&plan).await?;
+            self.apply_plans(&ordered_plans(records, &self.config.write))
+                .await?;
 
             let mut outcomes: Vec<RowOutcome> = records.iter().map(|_| Ok(())).collect();
             for (idx, msg) in &plan.failed {
@@ -1279,6 +1333,8 @@ impl Sink for MssqlSink {
     /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         let first_run = self.config.create_table && !self.table_exists(&self.config.table).await?;
+        // Read before checking out the DDL connection (a one-connection pool).
+        let target_infos = self.discover_column_types().await?;
         let staging = &self.staging_table_quoted;
         let target = &self.table_quoted;
         let staging_lit = self.staging_literal().replace('\'', "''");
@@ -1293,7 +1349,7 @@ impl Sink for MssqlSink {
         }
         control(
             &mut conn,
-            &format!("SELECT * INTO {staging} FROM {target} WHERE 1 = 0"),
+            &staging_create_sql(staging, target, &target_infos)?,
         )
         .await
         .map_err(|e| {
@@ -1302,6 +1358,9 @@ impl Sink for MssqlSink {
                 self.config.table
             ))
         })?;
+        if let Some(sql) = staging_relax_sql(staging, &target_infos)? {
+            control(&mut conn, &sql).await?;
+        }
         Ok(())
     }
 
@@ -1326,23 +1385,17 @@ impl Sink for MssqlSink {
             }
             return Ok(());
         }
-        // Explicit non-IDENTITY column list, discovered from the real target.
-        let cols = self.insertable_columns().await?;
-        let col_list = cols
-            .iter()
-            .map(|c| quote_ident_mssql(c))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
+        // Column lists from the real target (not the staging clone, where
+        // computed and rowversion columns turned into plain ones).
+        let target_infos = self.discover_column_types().await?;
         let staging = &self.staging_table_quoted;
         let target = &self.table_quoted;
+        let mut swap = overwrite_swap_sql(target, staging, &target_infos)?;
+        swap.push(format!("DROP TABLE {staging}"));
 
         let mut conn = self.checkout().await?;
         control(&mut conn, "BEGIN TRAN").await?;
-        for stmt in [
-            format!("DELETE FROM {target}"),
-            format!("INSERT INTO {target} ({col_list}) SELECT {col_list} FROM {staging}"),
-            format!("DROP TABLE {staging}"),
-        ] {
+        for stmt in swap {
             if let Err(e) = control(&mut conn, &stmt).await {
                 let _ = control(&mut conn, "ROLLBACK TRAN").await;
                 return Err(FaucetError::Sink(format!(
@@ -1515,6 +1568,15 @@ impl Sink for MssqlSink {
             None
         };
 
+        if plan.is_some()
+            || matches!(
+                self.config.column_mapping,
+                MssqlColumnMapping::AutoColumns { .. }
+            )
+        {
+            // Warm the column cache before holding a connection (see apply_plan).
+            self.column_infos().await?;
+        }
         let mut conn = self.checkout().await?;
         self.ensure_commit_table(&mut conn).await?;
         control(&mut conn, "BEGIN TRAN").await?;
@@ -1524,23 +1586,15 @@ impl Sink for MssqlSink {
         // planned upserts/deletes run via the same no-txn MERGE helpers used by
         // the append path's INSERTs, inside this same BEGIN TRAN.
         let written = match &plan {
-            Some(plan) => {
-                let mut affected = 0usize;
-                match self.upsert_rows_no_txn(&mut conn, &plan.upserts).await {
-                    Ok(n) => affected += n,
+            Some(_) => {
+                let plans = ordered_plans(records, &self.config.write);
+                match self.apply_plans_no_txn(&mut conn, &plans).await {
+                    Ok(n) => n,
                     Err((e, timed_out)) => {
                         self.abort_txn(&mut conn, timed_out).await;
                         return Err(e);
                     }
                 }
-                match self.delete_keys_no_txn(&mut conn, &plan.deletes).await {
-                    Ok(n) => affected += n,
-                    Err((e, timed_out)) => {
-                        self.abort_txn(&mut conn, timed_out).await;
-                        return Err(e);
-                    }
-                }
-                affected
             }
             None => match self.prepare_chunk(records).await {
                 Ok(Some(p)) => {
@@ -1905,5 +1959,40 @@ mod tests {
         // substring rule misread as transient and propagated forever.
         assert_eq!(classify_server_code(2627), ChunkFailure::RowRejected);
         assert_eq!(classify_server_code(8152), ChunkFailure::RowRejected);
+        assert_eq!(classify_server_code(515), ChunkFailure::RowRejected);
+        // Environmental faults fail the batch instead of quarantining every
+        // row: log full, filegroup full, invalid object, permission, memory.
+        for code in [9002, 1105, 208, 229, 701, 50000] {
+            assert_eq!(
+                classify_server_code(code),
+                ChunkFailure::Infrastructure,
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyed_pages_apply_in_page_order() {
+        use serde_json::json;
+        let spec: faucet_core::WriteSpec = serde_json::from_value(json!({
+            "write_mode": "upsert",
+            "key": ["name"],
+            "delete_marker": {"field": "op", "values": ["d"]}
+        }))
+        .unwrap();
+        let page = vec![
+            json!({"name": "Bob", "op": "d"}),
+            json!({"name": "bob", "v": 1}),
+            json!({"name": "carl", "v": 2}),
+            json!({"v": 3}),
+            json!({"name": "dee", "op": "d"}),
+        ];
+        let plans = super::ordered_plans(&page, &spec);
+        let shape: Vec<(usize, usize)> = plans
+            .iter()
+            .map(|p| (p.upserts.len(), p.deletes.len()))
+            .collect();
+        assert_eq!(shape, vec![(0, 1), (2, 0), (0, 1)]);
+        assert!(super::ordered_plans(&[], &spec).is_empty());
     }
 }

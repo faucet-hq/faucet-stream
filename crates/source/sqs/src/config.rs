@@ -53,6 +53,12 @@ pub struct SqsSourceConfig {
     /// and leaves the queue's own visibility timeout in charge. Default 60.
     #[serde(default = "default_visibility_extension_secs")]
     pub visibility_extension_secs: u32,
+    /// Wrap each record as `{ message_id, attributes, payload }`: the SQS
+    /// `MessageId` (for downstream deduplication of redeliveries) and the
+    /// message attributes, which are requested only when this is on. Default
+    /// `false` (the decoded body alone).
+    #[serde(default)]
+    pub include_metadata: bool,
 }
 
 fn default_wait_time_seconds() -> i32 {
@@ -78,6 +84,7 @@ impl SqsSourceConfig {
             wait_time_seconds: default_wait_time_seconds(),
             batch_size: default_batch_size(),
             visibility_extension_secs: default_visibility_extension_secs(),
+            include_metadata: false,
         }
     }
 

@@ -23,6 +23,8 @@
 //!   authentication headers.
 //! - [`parse_json_each_row`] / [`build_json_each_row`] — decode / encode the
 //!   newline-delimited `JSONEachRow` format used for both reads and writes.
+//! - [`quote_ident`] — ClickHouse identifier quoting (escapes `\` as well as
+//!   `"`).
 //! - [`sql_literal`] — inject-safe SQL literal encoding for a JSON scalar
 //!   (used to push an incremental bookmark down into the `WHERE` clause).
 //!
@@ -149,11 +151,21 @@ impl ClickHouseConnection {
     }
 }
 
+/// TCP connect timeout of [`build_client`].
+pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle read timeout of [`build_client`]: how long a response may go without
+/// a byte before the request fails (a half-open connection otherwise hangs
+/// the run forever).
+pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Build a reqwest [`Client`](reqwest::Client) for the ClickHouse HTTP
-/// interface. Kept in one place so both connectors share the client-construction
-/// path and connection pool.
+/// interface, with connect and idle-read timeouts. Kept in one place so both
+/// connectors share the client-construction path and connection pool.
 pub fn build_client(_conn: &ClickHouseConnection) -> Result<reqwest::Client, FaucetError> {
     reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
         .build()
         .map_err(FaucetError::Http)
 }
@@ -275,6 +287,17 @@ fn quote_string(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Quote a ClickHouse identifier (column, table or database name).
+///
+/// Like string literals, ClickHouse double-quoted identifiers accept C-style
+/// escapes, so [`faucet_core::util::quote_ident`] (which only doubles `"`) is
+/// unsafe here: a name containing `\"` would close the identifier. Both `\`
+/// and `"` are backslash-escaped.
+pub fn quote_ident(name: &str) -> String {
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +358,26 @@ mod tests {
             ..Default::default()
         };
         assert!(host_only.validate().is_ok());
+    }
+
+    #[test]
+    fn quote_ident_escapes_backslash_and_quote() {
+        assert_eq!(quote_ident("plain"), "\"plain\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote_ident("x\\"), "\"x\\\\\"");
+        let evil = "x\\\" Int64, y String) ENGINE=Log --";
+        let q = quote_ident(evil);
+        let inner = &q[1..q.len() - 1];
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    assert!(chars.next().is_some(), "dangling escape in {q}");
+                }
+                '"' => panic!("unescaped quote in {q}"),
+                _ => {}
+            }
+        }
     }
 
     #[test]

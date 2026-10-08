@@ -23,23 +23,42 @@ pub async fn discover(config: &SingerSourceConfig) -> Result<Value, FaucetError>
         .arg(config_file.path())
         .arg("--discover")
         .args(&config.args)
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(env) = config.inherit_env.from_process() {
         command.env_clear().envs(env);
     }
-    let output = command.output().await.map_err(|e| {
+    // The child is killed if the deadline drops the future (API-45).
+    command.kill_on_drop(true);
+    let redactor = crate::process::Redactor::from_config(&config.tap_config);
+    let spawn_err = |e: std::io::Error| {
         FaucetError::Source(format!(
             "failed to spawn tap '{}' for discovery: {e}",
-            config.executable
+            redactor.redact(&config.executable)
         ))
-    })?;
+    };
+    let child = faucet_common_singer::spawn_command(&mut command).map_err(spawn_err)?;
+    let run = child.wait_with_output();
+    let output = match config.idle_timeout_secs {
+        Some(secs) => tokio::time::timeout(std::time::Duration::from_secs(secs), run)
+            .await
+            .map_err(|_| {
+                FaucetError::Source(format!(
+                    "tap discovery did not finish within {secs}s (idle_timeout_secs)"
+                ))
+            })?,
+        None => run.await,
+    }
+    .map_err(|e| FaucetError::Source(format!("tap discovery failed: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // A tap echoing its own credentials must not put them in the error.
+        let stderr = faucet_core::redact::redact(&redactor.redact(stderr.trim()));
         return Err(FaucetError::Source(format!(
-            "tap discovery exited with status {}; stderr:\n{}",
-            output.status,
-            stderr.trim()
+            "tap discovery exited with status {}; stderr:\n{stderr}",
+            output.status
         )));
     }
 

@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 const USER: &str = "faucet";
 const PASS: &str = "secret";
 
-async fn server() -> Option<(ContainerAsync<GenericImage>, u16)> {
+async fn server_inner() -> Option<(ContainerAsync<GenericImage>, u16)> {
     let image = GenericImage::new("atmoz/sftp", "alpine")
         .with_exposed_port(22.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
@@ -183,4 +183,15 @@ async fn a_new_run_removes_stale_upload_scratch_of_its_output() {
         ["other.csv.faucet-tmp-upload-live", "x.jsonl"],
         "{names:?}"
     );
+}
+
+/// [`server_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
+/// is set — CI provides Docker, so an unavailable backend is a failure there.
+async fn server() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    let started = server_inner().await;
+    assert!(
+        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
+        "server: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
+    );
+    started
 }

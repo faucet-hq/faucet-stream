@@ -187,7 +187,9 @@ async fn fetch_all_stream_no_group_with_count_caps_read() {
             .unwrap();
     }
 
-    // An explicit `count` is the caller's own XREAD cap (no consumer group).
+    // `count` is ignored: every read path is XRANGE paged by `batch_size`
+    // (#789 MSG-18 removed the XREAD/XREADGROUP batch path), so the whole
+    // stream is read.
     let source = RedisSource::new(RedisSourceConfig::new(
         &url,
         RedisSourceType::Stream {
@@ -200,7 +202,7 @@ async fn fetch_all_stream_no_group_with_count_caps_read() {
     .unwrap();
 
     let records = source.fetch_all().await.expect("fetch_all ok");
-    assert_eq!(records.len(), 2, "XREAD COUNT caps the single read");
+    assert_eq!(records.len(), 5, "count no longer caps the read");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -221,12 +223,13 @@ async fn fetch_all_stream_no_group_empty_stream_returns_empty() {
     assert!(records.is_empty());
 }
 
-// ── Stream mode (fetch_all, consumer group → XREADGROUP) ──────────────────
+// ── Stream mode with a consumer group configured ──────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_all_stream_group_respects_max_records() {
-    // The XREADGROUP drain loop should stop once `max_records` is reached even
-    // when more entries are pending in the group.
+    // A configured group is ignored: the read is XRANGE, stops at
+    // `max_records`, and claims nothing into the group's pending list, so the
+    // group's other consumers still receive every entry (#789 MSG-18).
     let (_container, url) = start_redis().await;
     let mut conn = open_conn(&url).await;
     let _: () = redis::cmd("XGROUP")
@@ -260,11 +263,118 @@ async fn fetch_all_stream_group_respects_max_records() {
     .unwrap();
 
     let records = source.fetch_all().await.expect("fetch_all ok");
+    assert_eq!(records.len(), 120, "the read must stop at max_records");
+    let pending: redis::Value = redis::cmd("XPENDING")
+        .arg("mstream")
+        .arg("grp")
+        .query_async(&mut conn)
+        .await
+        .expect("XPENDING");
+    let redis::Value::Array(summary) = pending else {
+        panic!("XPENDING summary: {pending:?}");
+    };
     assert_eq!(
-        records.len(),
-        120,
-        "consumer-group drain must stop at max_records"
+        summary.first(),
+        Some(&redis::Value::Int(0)),
+        "a preview must leave the group's pending list empty"
     );
+}
+
+// ── Value decoding, non-string keys, reconnects ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_values_scalar_strings_and_non_string_keys() {
+    let (_container, url) = start_redis().await;
+    let mut conn = open_conn(&url).await;
+    let _: i64 = conn.rpush("bin", vec![0xff_u8, 0x00, b'a']).await.unwrap();
+    let _: i64 = conn.rpush("bin", "1.10").await.unwrap();
+    let _: () = conn.set("obj:str", "true").await.unwrap();
+    let _: () = conn.hset("obj:hash", "f", "v").await.unwrap();
+    let _: () = conn.sadd("obj:set", "m").await.unwrap();
+    let _: String = conn
+        .xadd("bstream", "*", &[("payload", vec![0xfe_u8, 0xff])])
+        .await
+        .unwrap();
+
+    let list = RedisSource::new(RedisSourceConfig::new(
+        &url,
+        RedisSourceType::List { key: "bin".into() },
+    ))
+    .unwrap();
+    assert_eq!(
+        list.fetch_all()
+            .await
+            .expect("a binary element no longer fails the read"),
+        vec![serde_json::json!("/wBh"), serde_json::json!("1.10")]
+    );
+
+    let mut strict = RedisSourceConfig::new(&url, RedisSourceType::List { key: "bin".into() });
+    strict.binary = faucet_source_redis::RedisBinary::Error;
+    let err = RedisSource::new(strict)
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("'bin'"), "{err}");
+
+    let keys = RedisSource::new(RedisSourceConfig::new(
+        &url,
+        RedisSourceType::Keys {
+            pattern: "obj:*".into(),
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        keys.fetch_all().await.unwrap(),
+        vec![serde_json::json!({"key": "obj:str", "value": "true"})],
+        "only the string key is read; the hash and set are skipped with a warning"
+    );
+
+    let stream = RedisSource::new(RedisSourceConfig::new(
+        &url,
+        RedisSourceType::Stream {
+            key: "bstream".into(),
+            group: None,
+            consumer: None,
+            count: None,
+        },
+    ))
+    .unwrap();
+    let records = stream.fetch_all().await.unwrap();
+    assert_eq!(records[0]["fields"]["payload"], "/v8=");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_source_reconnects_after_the_server_drops_its_connection() {
+    let (_container, url) = start_redis().await;
+    let mut conn = open_conn(&url).await;
+    let _: i64 = conn.rpush("rc", "a").await.unwrap();
+    let source = RedisSource::new(RedisSourceConfig::new(
+        &url,
+        RedisSourceType::List { key: "rc".into() },
+    ))
+    .unwrap();
+    assert_eq!(source.fetch_all().await.unwrap().len(), 1);
+    let _: redis::Value = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("TYPE")
+        .arg("normal")
+        .arg("SKIPME")
+        .arg("yes")
+        .query_async(&mut conn)
+        .await
+        .expect("CLIENT KILL");
+    let mut last = None;
+    for _ in 0..20 {
+        match source.fetch_all().await {
+            Ok(r) => {
+                last = Some(r);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    assert_eq!(last.expect("the connection manager reconnects").len(), 1);
 }
 
 // ── Keys mode (fetch_all → SCAN + MGET) ───────────────────────────────────

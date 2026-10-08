@@ -2,7 +2,8 @@
 
 use crate::config::{RedisSinkConfig, RedisSinkType};
 use async_trait::async_trait;
-use faucet_core::FaucetError;
+use faucet_core::{FaucetError, RowOutcome};
+use redis::aio::ConnectionManager;
 use serde_json::Value;
 
 /// A configured Redis sink that writes records to Redis data structures.
@@ -11,24 +12,89 @@ use serde_json::Value;
 /// all `write_batch()` calls.
 pub struct RedisSink {
     config: RedisSinkConfig,
-    conn: redis::aio::MultiplexedConnection,
+    /// Reconnects after the server connection drops (a failover), where a
+    /// bare multiplexed connection failed every later command (#789 MSG-78).
+    conn: std::panic::AssertUnwindSafe<ConnectionManager>,
 }
+
+/// The exactly-once write: every data command and the watermark in one Lua
+/// script, which refuses before writing anything when a target key holds
+/// another Redis type. `MULTI`/`EXEC` applied the watermark even when a data
+/// command failed at `EXEC` time (`WRONGTYPE`), so the next run skipped the
+/// page and its records were lost (#789 MSG-19).
+///
+/// `KEYS[1]` is the watermark key, `KEYS[2..]` the data keys; `ARGV[1]` the
+/// type every data key must have (`""` to skip the check), `ARGV[2]` the
+/// token, then each command as its argument count followed by its arguments.
+const IDEMPOTENT_SCRIPT: &str = r#"
+local want = ARGV[1]
+if want ~= '' then
+  for i = 2, #KEYS do
+    local t = redis.call('TYPE', KEYS[i])['ok']
+    if t ~= 'none' and t ~= want then
+      return redis.error_reply('WRONGTYPE ' .. KEYS[i] .. ' holds a ' .. t .. ', not a ' .. want)
+    end
+  end
+end
+local i = 3
+while i <= #ARGV do
+  local n = tonumber(ARGV[i])
+  redis.call(unpack(ARGV, i + 1, i + n))
+  i = i + n + 1
+end
+redis.call('SET', KEYS[1], ARGV[2])
+return 1
+"#;
 
 impl RedisSink {
     /// Create a new Redis sink from the given configuration.
     ///
-    /// This opens a multiplexed async connection to Redis immediately.
+    /// This opens the connection to Redis immediately.
     pub async fn new(config: RedisSinkConfig) -> Result<Self, FaucetError> {
-        faucet_core::validate_batch_size(config.batch_size)?;
+        config.validate()?;
         let client = redis::Client::open(config.url.as_str())
             .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
-
-        let conn = client
-            .get_multiplexed_async_connection()
+        let manager = redis::aio::ConnectionManagerConfig::new()
+            .set_number_of_retries(3)
+            .set_factor(2)
+            .set_max_delay(1000)
+            .set_connection_timeout(std::time::Duration::from_secs(10));
+        let conn = ConnectionManager::new_with_config(client, manager)
             .await
             .map_err(|e| FaucetError::Sink(format!("Redis connection failed: {e}")))?;
 
-        Ok(Self { config, conn })
+        Ok(Self {
+            config,
+            conn: std::panic::AssertUnwindSafe(conn),
+        })
+    }
+
+    fn command(&self, record: &Value) -> Result<Vec<String>, FaucetError> {
+        record_command_args_with(&self.config, record)
+    }
+
+    /// Pipeline `commands` in `batch_size` chunks.
+    async fn run_commands(&self, commands: &[Vec<String>]) -> Result<(), FaucetError> {
+        let mut conn = self.conn.0.clone();
+        let chunk = if self.config.batch_size == 0 {
+            commands.len().max(1)
+        } else {
+            self.config.batch_size
+        };
+        for group in commands.chunks(chunk) {
+            let mut pipe = redis::pipe();
+            for args in group {
+                let mut cmd = redis::Cmd::new();
+                for a in args {
+                    cmd.arg(a);
+                }
+                pipe.add_command(cmd);
+            }
+            pipe.query_async::<()>(&mut conn)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("Redis pipeline execution failed: {e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -68,8 +134,8 @@ impl faucet_core::Sink for RedisSink {
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
 
-        // MultiplexedConnection is cheaply cloneable; clone to satisfy &self.
-        let mut conn = self.conn.clone();
+        // The connection manager is cheaply cloneable; clone to satisfy &self.
+        let mut conn = self.conn.0.clone();
         let started = std::time::Instant::now();
         let hint = "check the Redis url / that the server is reachable and accepting connections";
 
@@ -90,40 +156,36 @@ impl faucet_core::Sink for RedisSink {
         if records.is_empty() {
             return Ok(0);
         }
+        // Build every command before sending any, so a bad record fails the
+        // batch without having written the rows before it.
+        let commands = records
+            .iter()
+            .map(|r| self.command(r))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.run_commands(&commands).await?;
+        tracing::debug!(records = records.len(), "Redis batch written");
+        Ok(records.len())
+    }
 
-        // MultiplexedConnection is cheaply cloneable (it shares the
-        // underlying connection), so we clone to satisfy the &self receiver.
-        let mut conn = self.conn.clone();
-        let mut written = 0usize;
-
-        // `batch_size = 0` is the "no batching" sentinel: pack the entire
-        // upstream slice into a single Redis pipeline, preserving
-        // `StreamPage` framing. Otherwise re-chunk into `batch_size`-sized
-        // slices so each Redis pipeline stays near the recommended
-        // ~1000-command working set.
-        let effective_chunk = if self.config.batch_size == 0 {
-            records.len()
-        } else {
-            self.config.batch_size
-        };
-
-        // Process in chunks of batch_size using redis pipelines.
-        for chunk in records.chunks(effective_chunk) {
-            let mut pipe = redis::pipe();
-
-            for record in chunk {
-                append_record_command(&mut pipe, &self.config.sink_type, record)?;
+    /// Rows whose command cannot be built (a `KeyValue` record with a
+    /// missing, null, object or array key) fail on their own and are DLQ'd;
+    /// the rest are written (#789 MSG-20).
+    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+        let mut outcomes: Vec<RowOutcome> = Vec::with_capacity(records.len());
+        let mut commands = Vec::with_capacity(records.len());
+        for r in records {
+            match self.command(r) {
+                Ok(c) => {
+                    commands.push(c);
+                    outcomes.push(Ok(()));
+                }
+                Err(e) => outcomes.push(Err(e)),
             }
-
-            pipe.query_async::<()>(&mut conn)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("Redis pipeline execution failed: {e}")))?;
-
-            written += chunk.len();
         }
-
-        tracing::debug!(records = written, "Redis batch written");
-        Ok(written)
+        if !commands.is_empty() {
+            self.run_commands(&commands).await?;
+        }
+        Ok(outcomes)
     }
 
     fn supports_idempotent_writes(&self) -> bool {
@@ -131,39 +193,43 @@ impl faucet_core::Sink for RedisSink {
     }
 
     /// Write `records` AND durably record `token` for `scope` in one atomic
-    /// Redis transaction (`MULTI`/`EXEC`).
+    /// Lua script.
     ///
-    /// The whole page ships as a single atomic pipeline: every record's
-    /// command for the configured [`RedisSinkType`] plus a final
-    /// `SET _faucet_commit_token:{scope} {token}`. Either all of it commits
-    /// or none of it does, so a crash between "sink wrote" and "state
-    /// persisted" is resolved on resume by `last_committed_token` — zero
-    /// duplicates on replay.
+    /// Every record's command for the configured [`RedisSinkType`] plus a
+    /// final `SET _faucet_commit_token:{scope} {token}`, after a type check
+    /// that refuses before anything is written. A crash between "sink wrote"
+    /// and "state persisted" is resolved on resume by `last_committed_token`.
     ///
     /// **`batch_size` re-chunking does NOT apply on this path.** Splitting the
-    /// page across multiple `MULTI`/`EXEC` blocks would break atomicity (a
-    /// crash between chunks would commit rows without the watermark), so the
-    /// entire page is one transaction regardless of `batch_size`.
+    /// page across several scripts would break atomicity, so the entire page
+    /// is one script regardless of `batch_size`.
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        let mut conn = self.conn.clone();
-
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-        for record in records {
-            append_record_command(&mut pipe, &self.config.sink_type, record)?;
+        let mut conn = self.conn.0.clone();
+        let commands = records
+            .iter()
+            .map(|r| self.command(r))
+            .collect::<Result<Vec<_>, _>>()?;
+        let lua = redis::Script::new(IDEMPOTENT_SCRIPT);
+        let mut script = lua.prepare_invoke();
+        script.key(commit_token_key(scope));
+        for key in data_keys(&commands) {
+            script.key(key);
         }
-        // The watermark commits in the same MULTI/EXEC as the data. Even an
-        // empty page still advances the token so resume skips it.
-        pipe.cmd("SET").arg(commit_token_key(scope)).arg(token);
-
-        pipe.query_async::<()>(&mut conn).await.map_err(|e| {
+        script.arg(expected_type(&self.config.sink_type)).arg(token);
+        for args in &commands {
+            script.arg(args.len());
+            for a in args {
+                script.arg(a);
+            }
+        }
+        script.invoke_async::<i64>(&mut conn).await.map_err(|e| {
             FaucetError::Sink(format!(
-                "Redis atomic pipeline (MULTI/EXEC) execution failed: {e}"
+                "Redis exactly-once write failed (nothing was written): {e}"
             ))
         })?;
 
@@ -176,7 +242,7 @@ impl faucet_core::Sink for RedisSink {
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.0.clone();
         // The token is opaque to the sink (it may carry an embedded resume
         // bookmark after a '#'); never parse it here — just hand it back.
         redis::cmd("GET")
@@ -197,9 +263,49 @@ fn commit_token_key(scope: &str) -> String {
     format!("{}:{scope}", faucet_core::idempotency::COMMIT_TOKEN_TABLE)
 }
 
+/// The Redis type every data key of a page must hold for the exactly-once
+/// script (`""` = no check: `SET` replaces a key of any type).
+fn expected_type(sink_type: &RedisSinkType) -> &'static str {
+    match sink_type {
+        RedisSinkType::List { .. } => "list",
+        RedisSinkType::Stream { .. } => "stream",
+        RedisSinkType::KeyValue { .. } => "",
+    }
+}
+
+/// The distinct keys a set of commands writes (argument 1 of each).
+fn data_keys(commands: &[Vec<String>]) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    commands
+        .iter()
+        .filter_map(|c| c.get(1).map(String::as_str))
+        .filter(|k| seen.insert(*k))
+        .collect()
+}
+
+/// [`record_command_args`] plus the config's write options (`SET … EX`,
+/// `XADD … MAXLEN ~`).
+fn record_command_args_with(
+    config: &RedisSinkConfig,
+    record: &Value,
+) -> Result<Vec<String>, FaucetError> {
+    let mut args = record_command_args(&config.sink_type, record)?;
+    if let (RedisSinkType::KeyValue { .. }, Some(ttl)) = (&config.sink_type, config.ttl_secs) {
+        args.push("EX".into());
+        args.push(ttl.to_string());
+    }
+    if let (RedisSinkType::Stream { .. }, Some(max)) = (&config.sink_type, config.stream_max_len) {
+        args.splice(
+            2..2,
+            ["MAXLEN".to_string(), "~".to_string(), max.to_string()],
+        );
+    }
+    Ok(args)
+}
+
 /// Render the full Redis command (name first, then arguments) that writes one
-/// record under the given sink mode. Pure — shared by [`append_record_command`]
-/// so `write_batch` and `write_batch_idempotent` build identical commands.
+/// record under the given sink mode. Pure — shared by every write path so
+/// `write_batch` and `write_batch_idempotent` build identical commands.
 fn record_command_args(
     sink_type: &RedisSinkType,
     record: &Value,
@@ -228,37 +334,32 @@ fn record_command_args(
             Ok(args)
         }
         RedisSinkType::KeyValue { key_field } => {
-            let key = record
-                .get(key_field)
-                .map(|v| match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .ok_or_else(|| {
-                    FaucetError::Sink(format!("record missing key field '{key_field}'"))
-                })?;
+            // A null, object or array key would collapse onto one rendered key
+            // (`"null"`), silently overwriting records (#789 MSG-20).
+            let key = match record.get(key_field) {
+                None => {
+                    return Err(FaucetError::Sink(format!(
+                        "record missing key field '{key_field}'"
+                    )));
+                }
+                Some(Value::String(s)) => s.clone(),
+                Some(v @ (Value::Number(_) | Value::Bool(_))) => v.to_string(),
+                Some(other) => {
+                    return Err(FaucetError::Sink(format!(
+                        "key field '{key_field}' is {}, not a string, number or boolean",
+                        match other {
+                            Value::Null => "null",
+                            Value::Array(_) => "an array",
+                            _ => "an object",
+                        }
+                    )));
+                }
+            };
             let serialized = serde_json::to_string(record)
                 .map_err(|e| FaucetError::Sink(format!("JSON serialization failed: {e}")))?;
             Ok(vec!["SET".into(), key, serialized])
         }
     }
-}
-
-/// Append the command that writes `record` to `pipe`. Thin I/O-free shim over
-/// the pure [`record_command_args`].
-fn append_record_command(
-    pipe: &mut redis::Pipeline,
-    sink_type: &RedisSinkType,
-    record: &Value,
-) -> Result<(), FaucetError> {
-    let args = record_command_args(sink_type, record)?;
-    // The command name is just the first protocol argument.
-    let mut cmd = redis::Cmd::new();
-    for arg in &args {
-        cmd.arg(arg);
-    }
-    pipe.add_command(cmd);
-    Ok(())
 }
 
 /// Flatten a JSON record's top-level fields into string key-value pairs
@@ -281,6 +382,12 @@ fn flatten_record_to_fields(record: &Value) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keeps_its_auto_traits() {
+        fn assert<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert::<super::RedisSink>();
+    }
+
     use super::*;
     use crate::config::RedisSinkConfig;
     use serde_json::json;
@@ -416,44 +523,67 @@ mod tests {
         }
     }
 
-    /// Collect a pipe's commands as flat arg vectors for assertion.
-    fn pipe_commands(pipe: &redis::Pipeline) -> Vec<Vec<String>> {
-        pipe.cmd_iter()
-            .map(|cmd| {
-                cmd.args_iter()
-                    .map(|a| match a {
-                        redis::Arg::Simple(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-                        redis::Arg::Cursor => "<cursor>".to_string(),
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
     #[test]
-    fn append_record_command_appends_exactly_the_pure_args() {
-        let sink_type = RedisSinkType::List { key: "q".into() };
-        let records = [json!({"id": 1}), json!({"id": 2})];
-        let mut pipe = redis::pipe();
-        for r in &records {
-            append_record_command(&mut pipe, &sink_type, r).unwrap();
-        }
-        let cmds = pipe_commands(&pipe);
-        assert_eq!(cmds.len(), 2);
-        for (cmd, record) in cmds.iter().zip(&records) {
-            assert_eq!(cmd, &record_command_args(&sink_type, record).unwrap());
-        }
-    }
-
-    #[test]
-    fn append_record_command_propagates_builder_errors() {
-        let sink_type = RedisSinkType::KeyValue {
+    fn null_object_and_array_keys_fail_per_row() {
+        let t = RedisSinkType::KeyValue {
             key_field: "id".into(),
         };
-        let mut pipe = redis::pipe();
-        let err = append_record_command(&mut pipe, &sink_type, &json!({"no": "id"})).unwrap_err();
-        assert!(matches!(err, FaucetError::Sink(_)));
-        assert_eq!(pipe.cmd_iter().count(), 0, "no command must be appended");
+        for bad in [
+            json!({"id": null}),
+            json!({"id": [1]}),
+            json!({"id": {"a": 1}}),
+        ] {
+            let err = record_command_args(&t, &bad).unwrap_err();
+            assert!(err.to_string().contains("not a string"), "{err}");
+        }
+        assert_eq!(
+            record_command_args(&t, &json!({"id": true})).unwrap()[1],
+            "true"
+        );
+    }
+
+    #[test]
+    fn write_options_extend_the_commands() {
+        let mut c = RedisSinkConfig::new(
+            "redis://localhost",
+            RedisSinkType::KeyValue {
+                key_field: "id".into(),
+            },
+        );
+        c.ttl_secs = Some(30);
+        let args = record_command_args_with(&c, &json!({"id": "a"})).unwrap();
+        assert_eq!(&args[args.len() - 2..], ["EX", "30"]);
+        let mut c = RedisSinkConfig::new(
+            "redis://localhost",
+            RedisSinkType::Stream { key: "s".into() },
+        );
+        c.stream_max_len = Some(100);
+        let args = record_command_args_with(&c, &json!({"f": 1})).unwrap();
+        assert_eq!(&args[..6], ["XADD", "s", "MAXLEN", "~", "100", "*"]);
+    }
+
+    #[test]
+    fn data_keys_are_distinct_and_typed_per_sink_type() {
+        let cmds = vec![
+            vec!["RPUSH".to_string(), "a".into(), "1".into()],
+            vec!["RPUSH".to_string(), "a".into(), "2".into()],
+            vec!["RPUSH".to_string(), "b".into(), "3".into()],
+        ];
+        assert_eq!(data_keys(&cmds), vec!["a", "b"]);
+        assert_eq!(
+            expected_type(&RedisSinkType::List { key: "a".into() }),
+            "list"
+        );
+        assert_eq!(
+            expected_type(&RedisSinkType::Stream { key: "a".into() }),
+            "stream"
+        );
+        assert_eq!(
+            expected_type(&RedisSinkType::KeyValue {
+                key_field: "a".into()
+            }),
+            ""
+        );
     }
 
     #[tokio::test]

@@ -434,3 +434,64 @@ async fn create_stream_ready(client: &aws_sdk_kinesis::Client, name: &str) {
     }
     panic!("stream {name} never became ACTIVE");
 }
+
+/// One undecodable record no longer blocks its shard: `skip` drops it and the
+/// bookmark moves past it, `raw` emits it base64-encoded (#789 MSG-53). A
+/// malformed stored bookmark is refused instead of restarting every shard
+/// (#789 MSG-95).
+#[tokio::test(flavor = "multi_thread")]
+async fn undecodable_records_follow_on_decode_error() {
+    use aws_sdk_kinesis::primitives::Blob;
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    create_stream(&client, "mixed", 1).await;
+    for body in [r#"{"i":1}"#, "not json", r#"{"i":2}"#] {
+        client
+            .put_record()
+            .stream_name("mixed")
+            .partition_key("k")
+            .data(Blob::new(body.as_bytes().to_vec()))
+            .send()
+            .await
+            .expect("put_record");
+    }
+    let run = |policy: faucet_source_kinesis::OnDecodeError| {
+        let mut cfg = source_config(&endpoint, "mixed");
+        cfg.on_decode_error = policy;
+        cfg
+    };
+    let skip = KinesisSource::new(run(faucet_source_kinesis::OnDecodeError::Skip))
+        .await
+        .unwrap();
+    let got = skip
+        .fetch_all()
+        .await
+        .expect("skip drains past the bad record");
+    let is: Vec<i64> = got
+        .iter()
+        .map(|r| r["data"]["i"].as_i64().unwrap())
+        .collect();
+    assert_eq!(is, vec![1, 2]);
+
+    let raw = KinesisSource::new(run(faucet_source_kinesis::OnDecodeError::Raw))
+        .await
+        .unwrap();
+    let got = raw.fetch_all().await.unwrap();
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[1]["data"]["raw_base64"], "bm90IGpzb24=");
+
+    let fail = KinesisSource::new(run(faucet_source_kinesis::OnDecodeError::Fail))
+        .await
+        .unwrap();
+    assert!(fail.fetch_all().await.is_err());
+
+    let resumed = KinesisSource::new(source_config(&endpoint, "mixed"))
+        .await
+        .unwrap();
+    assert!(
+        resumed
+            .apply_start_bookmark(serde_json::json!({"shards": "not-a-map"}))
+            .await
+            .is_err()
+    );
+}

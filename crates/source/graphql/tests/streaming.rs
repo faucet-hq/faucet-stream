@@ -462,12 +462,13 @@ async fn stuck_cursor_stops_without_extra_duplicate_page() {
         .await;
 
     let source = GraphqlStream::new(relay_config(&server, 10));
-    let records = source.fetch_all().await.unwrap();
+    let err = source.fetch_all().await.unwrap_err();
 
     // Two requests: page 1 (cursor None→"stuck"), page 2 ("stuck"→"stuck" =
-    // loop). Each returns one record → 2 records, not an infinite/extra run.
+    // loop). With hasNextPage still true the run fails rather than ending
+    // green with pages unread (API-28).
     assert_eq!(hits.load(Ordering::SeqCst), 2, "must stop after 2 requests");
-    assert_eq!(records.len(), 2);
+    assert!(err.to_string().contains("cursor just used"), "{err}");
 }
 
 /// #466 M2: a server that cycles its cursor across *two* values
@@ -500,16 +501,16 @@ async fn multi_cursor_cycle_terminates() {
     let records = tokio::time::timeout(std::time::Duration::from_secs(10), source.fetch_all())
         .await
         .expect("must terminate, not loop forever")
-        .expect("fetch_all ok");
+        .expect_err("a cycle while hasNextPage is true fails the run (API-28)");
 
-    // Pages: None→c1 (record 1), c1→c2 (record 2), c2→c1 — c1 already seen ⇒
-    // stop. Three requests, two records; never unbounded.
+    // Pages: None→c1, c1→c2, c2→c1 — c1 already seen ⇒ stop. Three requests;
+    // never unbounded.
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
         3,
         "stops when a cursor repeats"
     );
-    assert_eq!(records.len(), 3);
+    assert!(records.to_string().contains("cursor cycle"), "{records}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -101,12 +101,12 @@ impl SingerSink {
         Duration::from_secs(self.config.flush_timeout_secs)
     }
 
-    fn fixed_or_inferred_schema(&self, inner: &Inner) -> Value {
+    /// The configured schema, else the one inferred from written records.
+    fn known_schema(&self, inner: &Inner) -> Option<Value> {
         self.config
             .schema
             .clone()
             .or_else(|| inner.inferred.is_object().then(|| inner.inferred.clone()))
-            .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}))
     }
 
     async fn write_page(&self, inner: &mut Inner, records: &[Value]) -> Result<(), FaucetError> {
@@ -286,15 +286,19 @@ impl Sink for SingerSink {
             return Err(e);
         }
         let stream = self.config.stream_name();
-        let schema = self.fixed_or_inferred_schema(&inner);
         let mut process = TargetProcess::spawn(&self.config, &self.redactor)?;
         let mut buf = Vec::new();
-        write_schema(
-            &mut buf,
-            stream,
-            &schema,
-            &self.config.effective_key_properties(),
-        );
+        // The committing sink is usually not one of the writers, so it has no
+        // inferred schema; sending an empty SCHEMA could reset the target's
+        // table, so it is sent only when a schema is actually known (API-60).
+        if let Some(schema) = self.known_schema(&inner) {
+            write_schema(
+                &mut buf,
+                stream,
+                &schema,
+                &self.config.effective_key_properties(),
+            );
+        }
         write_activate_version(&mut buf, stream, self.activate_version());
         inner.flush_seq += 1;
         write_state(&mut buf, &flush_marker(stream, inner.flush_seq));
@@ -401,20 +405,16 @@ mod tests {
     }
 
     #[test]
-    fn fixed_or_inferred_schema_precedence() {
+    fn known_schema_precedence() {
+        // API-60: no fixed or inferred schema means none is known (the commit
+        // then sends no SCHEMA) rather than an empty one.
         let s = sink(json!({"target_command": "t"}));
         let mut inner = Inner::default();
-        assert_eq!(
-            s.fixed_or_inferred_schema(&inner),
-            json!({"type": "object", "properties": {}})
-        );
+        assert_eq!(s.known_schema(&inner), None);
         inner.inferred = json!({"type": "object", "properties": {"a": {}}});
-        assert_eq!(s.fixed_or_inferred_schema(&inner), inner.inferred);
+        assert_eq!(s.known_schema(&inner), Some(inner.inferred.clone()));
         let s = sink(json!({"target_command": "t", "schema": {"type": "object"}}));
-        assert_eq!(
-            s.fixed_or_inferred_schema(&inner),
-            json!({"type": "object"})
-        );
+        assert_eq!(s.known_schema(&inner), Some(json!({"type": "object"})));
     }
 
     #[test]

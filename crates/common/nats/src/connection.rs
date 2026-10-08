@@ -61,6 +61,10 @@ impl NatsConnectionConfig {
     }
 }
 
+/// Reconnect attempts after a lost connection before the client gives up
+/// (each waits with the client's growing backoff, a few minutes in total).
+pub const MAX_RECONNECTS: usize = 60;
+
 /// Connect to NATS using the shared connection config.
 ///
 /// Applies the configured authentication mode, TLS requirement and connection
@@ -97,6 +101,9 @@ pub async fn connect(cfg: &NatsConnectionConfig) -> Result<async_nats::Client, F
     if cfg.tls {
         options = options.require_tls(true);
     }
+    // async-nats reconnects forever by default, so a long outage would wedge a
+    // run with no error (#789 MSG-59).
+    options = options.max_reconnects(MAX_RECONNECTS);
     if let Some(name) = &cfg.name {
         options = options.name(name.clone());
     }

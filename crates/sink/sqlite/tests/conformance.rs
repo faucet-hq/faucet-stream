@@ -40,6 +40,7 @@ async fn fresh_sink() -> (TempDir, String, SqliteSink) {
         batch_size: 1000,
         max_connections: 1,
         create_table: true,
+        busy_timeout_secs: 60,
         write: WriteSpec {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],

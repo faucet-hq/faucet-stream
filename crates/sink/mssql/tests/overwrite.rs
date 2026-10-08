@@ -266,3 +266,55 @@ async fn aborted_first_overwrite_leaves_no_table_behind() {
         .expect("abort");
     assert!(!target_present(&pool).await);
 }
+
+/// SQL-113: overwrite of a table with an IDENTITY, a computed and a
+/// rowversion column commits, keeps supplied identities and generates the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_handles_identity_computed_and_rowversion_columns() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.t (id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(255), \
+         shout AS UPPER(name), rv ROWVERSION)",
+    )
+    .await;
+    exec(&pool, "INSERT INTO dbo.t (name) VALUES (N'old')").await;
+
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[
+        json!({"id": 40, "name": "kept"}),
+        json!({"name": "generated"}),
+    ])
+    .await
+    .expect("write");
+    sink.commit_overwrite().await.expect("commit");
+
+    let mut conn = pool.get().await.expect("checkout");
+    let rows = conn
+        .query("SELECT id, name, shout FROM dbo.t ORDER BY name", &[])
+        .await
+        .expect("query")
+        .into_first_result()
+        .await
+        .expect("result");
+    let got: Vec<(i32, String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<i32, _>("id").unwrap(),
+                r.get::<&str, _>("name").unwrap().to_string(),
+                r.get::<&str, _>("shout").unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        (got[1].0, got[1].1.as_str(), got[1].2.as_str()),
+        (40, "kept", "KEPT")
+    );
+    assert_eq!(got[0].1, "generated");
+}

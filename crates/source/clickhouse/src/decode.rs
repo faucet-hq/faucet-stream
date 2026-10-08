@@ -15,6 +15,10 @@ pub(crate) const SETTINGS: &[(&str, &str)] = &[
     ("default_format", "JSONCompactEachRowWithNamesAndTypes"),
     ("output_format_json_quote_64bit_integers", "1"),
     ("output_format_json_quote_decimals", "1"),
+    // RFC 3339 in UTC; the default `simple` format drops the zone offset.
+    ("date_time_output_format", "iso"),
+    // NaN / ±Inf as `"nan"` / `"inf"` / `"-inf"` instead of `null`.
+    ("output_format_json_quote_denormals", "1"),
 ];
 
 /// How a column's quoted cells are turned back into JSON.

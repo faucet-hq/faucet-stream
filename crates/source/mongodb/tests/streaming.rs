@@ -409,6 +409,13 @@ async fn discover_enumerates_collections_with_schemas() {
         .insert_many(vec![doc! { "id": 1, "open": true }])
         .await
         .expect("seed carts");
+    // faucet's own collections are not data (#789 MSG-92).
+    for internal in ["_faucet_commit_token", "orders__faucet_ovw"] {
+        db.collection::<Document>(internal)
+            .insert_one(doc! { "x": 1 })
+            .await
+            .expect("seed internal");
+    }
 
     let config = MongoSourceConfig::new(uri, "shop", "orders");
     let source = MongoSource::new(config).await.expect("source new");
@@ -421,6 +428,11 @@ async fn discover_enumerates_collections_with_schemas() {
     assert!(
         !names.iter().any(|n| n.starts_with("system.")),
         "system collections must be excluded: {names:?}"
+    );
+    assert_eq!(
+        names.len(),
+        2,
+        "faucet-internal collections excluded: {names:?}"
     );
 
     let orders = datasets
@@ -454,7 +466,7 @@ async fn discover_enumerates_collections_with_schemas() {
 #[tokio::test(flavor = "multi_thread")]
 async fn config_schema_and_dataset_uri_via_instance() {
     let (_container, uri) = start_mongo().await;
-    let config = MongoSourceConfig::new(uri.clone(), "shop", "carts");
+    let config = MongoSourceConfig::new(format!("{uri}/?appName=t"), "shop", "carts");
     let source = MongoSource::new(config).await.expect("source new");
 
     let schema = source.config_schema();
@@ -471,4 +483,8 @@ async fn config_schema_and_dataset_uri_via_instance() {
 
     let ds = source.dataset_uri();
     assert!(ds.ends_with("/shop/carts"), "dataset_uri: {ds}");
+    assert!(
+        !ds.contains('?'),
+        "query options are not part of the identity: {ds}"
+    );
 }
