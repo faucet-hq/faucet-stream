@@ -140,7 +140,10 @@ pub(crate) fn render_table(runs: &[RunRecord]) -> String {
             r.invocations.len(),
         ));
         if let Some(err) = &r.error {
-            out.push_str(&format!("  └─ error: {err}\n"));
+            out.push_str(&format!(
+                "  └─ error: {}\n",
+                crate::secrets::registry::redact(err)
+            ));
         }
     }
     out
@@ -149,6 +152,20 @@ pub(crate) fn render_table(runs: &[RunRecord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table output redacts error text like `--json` does (#789 CLI-162).
+    #[test]
+    fn the_table_redacts_run_errors() {
+        crate::secrets::registry::register("s3cr3t-value-for-history");
+        let mut r: RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "r1", "status": "failed", "submitted_at": "2026-01-01T00:00:00Z",
+            "labels": {}, "invocations": [], "records_written": 0
+        }))
+        .unwrap();
+        r.error = Some("auth failed with s3cr3t-value-for-history".into());
+        let out = render_table(&[r]);
+        assert!(!out.contains("s3cr3t-value-for-history"), "{out}");
+    }
     use crate::serve::history::{InvocationRecord, RunStatus};
     use chrono::{TimeZone, Utc};
 
