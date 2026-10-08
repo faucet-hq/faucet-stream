@@ -123,8 +123,7 @@ impl BudgetSpec {
             (true, false) => other.allowed_sinks.clone(),
             (false, false) => {
                 let allows = |list: &[String], entry: &String| {
-                    list.contains(entry)
-                        || kind_of(entry).is_some_and(|k| list.iter().any(|l| *l == k))
+                    list.contains(entry) || kind_of(entry).is_some_and(|k| list.contains(&k))
                 };
                 let mut both: Vec<String> = Vec::new();
                 for entry in self.allowed_sinks.iter().chain(&other.allowed_sinks) {

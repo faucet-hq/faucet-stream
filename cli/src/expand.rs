@@ -1714,7 +1714,7 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
         let Some(path) = crate::registry::sink_truncating_path(&n.sink.kind, &n.sink.config) else {
             continue;
         };
-        if !varies_per_invocation(&path, n) {
+        if !varies_per_invocation(path, n) {
             let fix = match n.sink.kind.as_str() {
                 "parquet" => "write to a directory destination or set a rollover cap",
                 _ => "set `append: true`",
