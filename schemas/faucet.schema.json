@@ -1542,7 +1542,7 @@
           ]
         },
         "value_detector": {
-          "description": "Value-based PII detector run over each *string* field value.\nConservative (fully anchored) by default to avoid over-masking.",
+          "description": "Value-based PII detector run over each *string* field value (and\ninteger values, for `credit_card`). Conservative (fully anchored) by\ndefault to avoid over-masking.",
           "anyOf": [
             {
               "$ref": "#/$defs/Detector"

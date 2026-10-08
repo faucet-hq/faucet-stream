@@ -18,7 +18,7 @@
 
 use crate::FaucetError;
 use arrow::array::RecordBatch;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -165,6 +165,53 @@ fn refine_wide_integers(schema: &Schema, records: &[Value]) -> Result<Schema, Fa
         .map(|f| refine_field(f, observed(records, f.name())).map(Arc::new))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Schema::new(fields).with_metadata(schema.metadata().clone()))
+}
+
+/// Top-level numeric, boolean or temporal columns of `schema` that a masking
+/// pass re-types into strings: a name-based rule covers them (`rewrites`), or
+/// a numeric/boolean column now holds a string in some record (temporal
+/// columns always read back as strings, so only a name rule widens them).
+pub(crate) fn masked_string_columns(
+    schema: &Schema,
+    records: &[Value],
+    rewrites: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter(|f| {
+            let t = f.data_type();
+            let scalar = t.is_numeric() || *t == DataType::Boolean;
+            (rewrites(f.name()) && (scalar || t.is_temporal()))
+                || (scalar
+                    && records
+                        .iter()
+                        .any(|r| r.get(f.name()).is_some_and(Value::is_string)))
+        })
+        .map(|f| f.name().clone())
+        .collect()
+}
+
+/// `schema` with the named top-level columns as nullable Utf8.
+pub(crate) fn widen_to_utf8(
+    schema: &SchemaRef,
+    names: &std::collections::BTreeSet<String>,
+) -> SchemaRef {
+    if !schema.fields().iter().any(|f| names.contains(f.name())) {
+        return Arc::clone(schema);
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if names.contains(f.name()) {
+                Field::new(f.name(), DataType::Utf8, true).with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Arc::new(Schema::new(fields).with_metadata(schema.metadata().clone()))
 }
 
 /// Encode a slice of JSON records into a single [`RecordBatch`] against `schema`.

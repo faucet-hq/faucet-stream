@@ -1049,6 +1049,10 @@ where
     let mut last_bookmark: Option<Value> = None;
     let mut gov_state = GovernanceState::default();
     let mut dlq_stats = crate::dlq::DlqStats::default();
+    // Top-level columns masking turned into strings; sticky for the run so
+    // every page reaches the sink with the same schema.
+    #[cfg_attr(not(feature = "masking"), allow(unused_mut))]
+    let mut widened: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     loop {
         // Cooperative cancellation: race the next batch against the token so a
@@ -1133,7 +1137,18 @@ where
             }
 
             // Re-encode against the *incoming* schema so a pass that only
-            // removes rows cannot silently re-type a column via inference.
+            // removes rows cannot silently re-type a column via inference —
+            // except the columns masking rewrote into strings, which are
+            // widened to Utf8.
+            #[cfg(feature = "masking")]
+            if let Some(m) = specs.masking {
+                widened.extend(crate::columnar::masked_string_columns(
+                    &schema,
+                    &gov.records,
+                    |name| m.rewrites_name(name),
+                ));
+            }
+            let schema = crate::columnar::widen_to_utf8(&schema, &widened);
             crate::columnar::values_to_record_batch(&gov.records, schema)?
         } else {
             page.batch

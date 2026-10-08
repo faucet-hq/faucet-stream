@@ -21,6 +21,16 @@ pub struct CompiledMasking {
     pub(crate) hasher: Hasher,
 }
 
+impl CompiledMasking {
+    /// Whether a name-based rule matches the top-level field `name`, so the
+    /// pass may rewrite (and re-type) every value of it.
+    pub(crate) fn rewrites_name(&self, name: &str) -> bool {
+        self.rules.iter().any(|r| {
+            r.fields.contains(name) || r.field_pattern.as_ref().is_some_and(|p| p.is_match(name))
+        })
+    }
+}
+
 /// One compiled rule: its matchers plus the action to apply.
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledRule {

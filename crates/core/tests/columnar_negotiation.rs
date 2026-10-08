@@ -308,6 +308,55 @@ async fn masking_runs_on_the_columnar_path_and_the_sink_sees_masked_values() {
     assert_eq!(got[0]["id"], json!(1), "untouched columns survive");
 }
 
+/// Masking a numeric column turns its values into strings; the columnar path
+/// widens that column to Utf8 instead of failing to re-encode the page.
+#[cfg(feature = "masking")]
+#[tokio::test]
+async fn masking_a_numeric_column_on_the_columnar_path_widens_it() {
+    use faucet_core::masking::{CompiledMasking, MaskAction, MaskRule, MaskingSpec, MatchSpec};
+
+    let source = ColumnarOnlySource {
+        rows: vec![
+            json!({"id": 1, "acct": 4111111111111111u64, "n": 7}),
+            json!({"id": 2, "acct": 5500000000000004u64, "n": 8}),
+        ],
+    };
+    let sink = ColumnarOnlySink::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let seen = Arc::clone(&sink.seen);
+    let rule = |matcher: MatchSpec| MaskRule {
+        name: None,
+        matcher,
+        action: MaskAction::Hash,
+        applies_to: vec![],
+    };
+    let spec = MaskingSpec {
+        description: None,
+        key: None,
+        rules: vec![
+            rule(MatchSpec {
+                fields: vec!["id".into()],
+                ..Default::default()
+            }),
+            rule(MatchSpec {
+                value_detector: Some(faucet_core::masking::Detector::CreditCard),
+                ..Default::default()
+            }),
+        ],
+    };
+    let result = Pipeline::new(&source, &sink)
+        .with_masking(Arc::new(CompiledMasking::compile(&spec).unwrap()))
+        .run()
+        .await
+        .expect("a masked numeric column must not fail the page");
+    assert_eq!(result.records_written, 2);
+    let got = seen.lock().unwrap().clone();
+    for r in &got {
+        assert!(r["id"].is_string(), "{r}");
+        assert!(r["acct"].is_string(), "{r}");
+        assert!(r["n"].is_number(), "an unmasked column keeps its type: {r}");
+    }
+}
+
 /// A non-quarantining quality policy (`abort`) must run *on* the columnar path
 /// and stop the run — proving the pass executed rather than being skipped.
 #[cfg(feature = "quality")]

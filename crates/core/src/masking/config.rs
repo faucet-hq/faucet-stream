@@ -80,8 +80,9 @@ pub struct MatchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_pattern: Option<String>,
 
-    /// Value-based PII detector run over each *string* field value.
-    /// Conservative (fully anchored) by default to avoid over-masking.
+    /// Value-based PII detector run over each *string* field value (and
+    /// integer values, for `credit_card`). Conservative (fully anchored) by
+    /// default to avoid over-masking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_detector: Option<Detector>,
 
