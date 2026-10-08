@@ -157,8 +157,10 @@ matrix:
         .assert()
         .success()
         .stdout(contains("masking — valid (2 rules)"))
-        .stdout(contains("- default [jsonl]: everywhere"))
-        .stdout(contains("- secure [jsonl]: everywhere, secure-only"));
+        .stdout(contains("- default (rows to_default) [jsonl]: everywhere"))
+        .stdout(contains(
+            "- secure (rows to_secure) [jsonl]: everywhere, secure-only",
+        ));
 }
 
 #[cfg(feature = "masking")]
