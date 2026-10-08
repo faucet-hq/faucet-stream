@@ -39,6 +39,7 @@ pub async fn run(args: StateArgs) -> CliResult<()> {
                 force: a.mutate.force,
                 dry_run: true,
                 skip_watermark_check: a.skip_watermark_check,
+                legacy_format: a.legacy_format,
             };
             guard_history(&cfg, &target, a.mutate.force).await?;
             let plan = ops::set(&target, &stores, &auth, &req, Utc::now()).await?;
@@ -61,6 +62,7 @@ pub async fn run(args: StateArgs) -> CliResult<()> {
                 dry_run: true,
                 skip_watermark_check: a.skip_watermark_check,
                 rewind_token: a.rewind_token,
+                legacy_format: a.legacy_format,
             };
             guard_history(&cfg, &target, a.mutate.force).await?;
             let plan = ops::reset(&target, &stores, &auth, &req, Utc::now()).await?;

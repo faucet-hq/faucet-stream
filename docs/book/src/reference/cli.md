@@ -893,6 +893,10 @@ namespace `{name}::…` in the `state:` store(s):
   null bookmark at the sink-safe sequence; `--rewind-token` instead deletes
   the sink's commit token too (sinks that support it: postgres / sqlite /
   mysql).
+- `set` and `reset` take `--legacy-format` to write the pre-versioning bookmark
+  shape during a rolling upgrade while an older cluster member is still
+  running; `PUT` / `DELETE /v1/state` choose it the same way the server's runs
+  do.
 - **`export`** — the versioned document `{version: 1, pipeline, exported_at,
   keys}` (run leases excluded) on stdout or `-o FILE`.
 - **`import`** — restore an export into the config's store, or another with

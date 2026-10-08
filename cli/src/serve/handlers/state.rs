@@ -426,6 +426,7 @@ pub async fn put_state(
         force: body.force,
         dry_run: body.dry_run,
         skip_watermark_check: body.skip_watermark_check,
+        legacy_format: state.cluster().legacy_state_writes(),
     };
     let result = ops::set(&target, &stores, &auth, &req, Utc::now()).await;
     let outcome = match &result {
@@ -492,6 +493,7 @@ pub async fn delete_state(
         dry_run: q.dry_run,
         skip_watermark_check: q.skip_watermark_check,
         rewind_token: q.rewind_token,
+        legacy_format: state.cluster().legacy_state_writes(),
     };
     let result = ops::reset(&target, &stores, &auth, &req, Utc::now()).await;
     let outcome = match &result {
