@@ -403,6 +403,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// An object inserted in reverse-sorted key order (#817).
+    fn login_then_id() -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("login".into(), json!("o"));
+        m.insert("id".into(), json!(2));
+        Value::Object(m)
+    }
+
+    #[test]
+    fn object_key_values_render_with_sorted_keys() {
+        assert_eq!(key_scalar_text(&login_then_id()), r#"{"id":2,"login":"o"}"#);
+        let k = KeyTuple(vec![("k".into(), login_then_id())]);
+        assert_eq!(key_to_doc_id(&k, "_"), r#"{"id":2,"login":"o"}"#);
+    }
+
     fn upsert_spec(keys: &[&str]) -> WriteSpec {
         WriteSpec {
             write_mode: WriteMode::Upsert,

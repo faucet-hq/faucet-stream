@@ -576,6 +576,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// An object inserted in reverse-sorted key order (#817).
+    fn login_then_id() -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("login".into(), json!("o"));
+        m.insert("id".into(), json!(2));
+        Value::Object(m)
+    }
+
+    #[test]
+    fn csv_encodes_nested_objects_with_sorted_keys() {
+        let csv = serialize_csv(&[json!({"o": login_then_id()})]).unwrap();
+        assert_eq!(
+            String::from_utf8(csv).unwrap(),
+            "o\n\"{\"\"id\"\":2,\"\"login\"\":\"\"o\"\"}\"\n"
+        );
+    }
+
     #[test]
     fn parse_location_variants() {
         let s3 = StagingLocation::parse("s3://bucket/faucet-stage/").unwrap();
