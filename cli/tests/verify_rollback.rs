@@ -1168,3 +1168,36 @@ pipeline:
     .unwrap_err();
     assert!(err.to_string().contains("no undoable run 'x'"), "{err}");
 }
+
+/// A text key cannot be split into integer ranges: verify compares the whole
+/// dataset instead of failing, and still finds the drift (#789 CLI-58).
+#[tokio::test]
+async fn verify_falls_back_to_a_full_comparison_for_a_text_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!("sqlite://{}?mode=rwc", dir.path().join("src.db").display());
+    let dst = format!("sqlite://{}?mode=rwc", dir.path().join("dst.db").display());
+    exec(&src, "CREATE TABLE src (id TEXT PRIMARY KEY, name TEXT)").await;
+    exec(&src, "INSERT INTO src VALUES ('a-1', 'one'), ('b-2', 'two')").await;
+    exec(&dst, "CREATE TABLE dst (id TEXT PRIMARY KEY, name TEXT)").await;
+    let cfg = load(&config_yaml(&src, &dst, &dir.path().join("state"), "upsert", ""));
+    assert!(!run(&cfg).await.had_failures());
+    exec(&dst, "UPDATE dst SET name = 'TWO' WHERE id = 'b-2'").await;
+    let out = faucet_cli::verify::verify(
+        &cfg,
+        &VerifySpec::default(),
+        VerifyInputs {
+            row: None,
+            repair: false,
+            allow_delete: false,
+            dry_run: false,
+            pipeline_name: "mirror".into(),
+            execution: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .expect("a text key verifies");
+    assert_eq!(out.strategy, "full");
+    assert_eq!(out.report.tally(), (0, 0, 1, 0), "{out:?}");
+}

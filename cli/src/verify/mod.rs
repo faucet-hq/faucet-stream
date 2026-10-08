@@ -181,14 +181,43 @@ pub async fn verify_node(
         })?,
     };
 
-    // Range mode needs one integer key and two range-readable sources.
-    let range_mode =
+    // Range mode needs one integer key and two range-readable sources. The
+    // key's type is only known to the backend: planning the ranges casts its
+    // bounds to an integer, so a text / uuid key fails there and the row is
+    // compared in full instead.
+    let mut range_mode =
         key.len() == 1 && source_reads_ranges(&node.source.kind) && source_reads_ranges(&dest_kind);
+    if range_mode
+        && let Ok(Some(schema)) = sink.current_schema().await
+        && !key_is_integer(&schema, &key[0])
+    {
+        tracing::info!(row = %node.id, key = %key[0], "verify: the key is not an integer column; comparing the whole dataset");
+        range_mode = false;
+    }
     let mut source_cfg = source_cfg;
     let mut dest_cfg = dest_cfg;
+    let mut planned = Vec::new();
     if range_mode {
-        inject_shard_key(&mut source_cfg, &key[0]);
-        inject_shard_key(&mut dest_cfg, &key[0]);
+        let mut sharded = source_cfg.clone();
+        inject_shard_key(&mut sharded, &key[0]);
+        let probe = build_source(&node.source.kind, sharded.clone(), &inputs.auth, None).await?;
+        match probe.enumerate_shards(spec.ranges).await {
+            Ok(shards) => {
+                planned = shards;
+                source_cfg = sharded;
+                inject_shard_key(&mut dest_cfg, &key[0]);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    row = %node.id,
+                    key = %key[0],
+                    error = %e,
+                    "verify: key ranges cannot be planned (not an integer key?); comparing the \
+                     whole dataset instead"
+                );
+                range_mode = false;
+            }
+        }
     }
 
     // Server-side digests need an explicit column list on both sides. Take
@@ -241,7 +270,7 @@ pub async fn verify_node(
     };
 
     let strategy = if range_mode {
-        session.verify_ranges(spec).await?;
+        session.verify_ranges(spec, planned).await?;
         "range"
     } else {
         session.verify_full().await?;
@@ -295,6 +324,23 @@ pub async fn verify_node(
         report,
         dry_run: inputs.dry_run,
     })
+}
+
+/// Whether the destination schema types `key` as an integer (a column it does
+/// not list is given the benefit of the doubt; range planning then decides).
+fn key_is_integer(schema: &Value, key: &str) -> bool {
+    let Some(prop) = schema.get("properties").and_then(|p| p.get(key)) else {
+        return true;
+    };
+    match prop.get("type") {
+        Some(Value::String(t)) => t == "integer",
+        Some(Value::Array(ts)) => ts
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|t| *t != "null")
+            .all(|t| t == "integer"),
+        _ => true,
+    }
 }
 
 /// Put `shard: { key }` on a range-readable source config (unless one is
@@ -415,13 +461,12 @@ impl Session<'_> {
     }
 
     /// Range mode: plan → digest → bisect → leaf diff.
-    async fn verify_ranges(&mut self, spec: &VerifySpec) -> CliResult<()> {
+    async fn verify_ranges(
+        &mut self,
+        spec: &VerifySpec,
+        shards: Vec<faucet_core::ShardSpec>,
+    ) -> CliResult<()> {
         let key = &self.key[0];
-        let shards = self
-            .source
-            .enumerate_shards(spec.ranges)
-            .await
-            .map_err(|e| CliError::Config(format!("verify: planning key ranges: {e}")))?;
         let mut queue: Vec<KeyRange> = shards.iter().map(range_of_shard).collect();
         if queue.is_empty() {
             queue.push(KeyRange::ALL);
