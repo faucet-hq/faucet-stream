@@ -63,9 +63,13 @@ impl Position {
     }
 
     /// Where to anchor a fresh capture: at `current_scn`, reaching back to the
-    /// oldest open transaction's start so it is captured whole.
+    /// oldest open transaction's start so it is captured whole. A start of 0
+    /// is no position at all (#843) and anchors at `current_scn` like no open
+    /// transaction does.
     pub fn resume_from(current_scn: u64, oldest_open_start: Option<u64>) -> Self {
-        let restart = oldest_open_start.map_or(current_scn + 1, |s| s.min(current_scn + 1));
+        let restart = oldest_open_start
+            .filter(|&s| s > 0)
+            .map_or(current_scn + 1, |s| s.min(current_scn + 1));
         Self::at(current_scn, restart)
     }
 
@@ -205,6 +209,11 @@ mod tests {
         assert_eq!(Position::resume_from(100, None).restart_scn, 101);
         assert_eq!(Position::resume_from(100, Some(40)).restart_scn, 40);
         assert_eq!(Position::resume_from(100, Some(400)).restart_scn, 101);
+        // #843: an open transaction reporting START_SCN 0 never anchors the
+        // capture at SCN 0.
+        let p = Position::resume_from(100, Some(0));
+        assert_eq!(p.restart_scn, 101);
+        assert_eq!(p.commit_scn, Position::resume_from(100, None).commit_scn);
         assert_eq!(Position::at(5, 9).restart_scn, 6);
     }
 
