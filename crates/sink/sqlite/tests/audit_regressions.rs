@@ -247,6 +247,20 @@ async fn auto_created_boolean_and_nested_columns_do_not_drift() {
     assert!(diff.is_empty(), "{diff:?}");
 }
 
+#[tokio::test]
+async fn an_auto_created_column_keeps_integers_above_i64_exact() {
+    let (_dir, url) = fresh_db(&[]).await;
+    let sink = SqliteSink::new(config(&url, "wide", WriteMode::Append, &[]))
+        .await
+        .unwrap();
+    sink.write_batch(&[json!({"id": 18446744073709551615u64})])
+        .await
+        .unwrap();
+    let rows = query(&url, "SELECT typeof(id), CAST(id AS TEXT) FROM wide").await;
+    assert_eq!(rows[0].get::<String, _>(0), "text");
+    assert_eq!(rows[0].get::<String, _>(1), "18446744073709551615");
+}
+
 #[test]
 fn busy_timeout_defaults_to_a_minute_and_is_configurable() {
     let c = SqliteSinkConfig::new("sqlite::memory:", "t");
