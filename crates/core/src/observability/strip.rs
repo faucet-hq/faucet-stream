@@ -7,15 +7,16 @@
 /// - `"my_crate::nested::module::MyConnector"` → `"MyConnector"`
 /// - `"Foo"` → `"Foo"`
 /// - `""` → `"unknown"`
-/// - Generics (`"Foo<Bar>"`) keep the outer name: → `"Foo<Bar>"`
+/// - Generics (`"Foo<Bar>"`) keep the outer name: → `"Foo<Bar>"`, and a
+///   path inside the generic arguments is not mistaken for the type's own:
+///   `"a::W<b::Inner>"` → `"W<b::Inner>"`
 pub fn strip_type_name(s: &'static str) -> &'static str {
     if s.is_empty() {
         return "unknown";
     }
-    match s.rsplit_once("::") {
-        Some((_, tail)) => tail,
-        None => s,
-    }
+    let head_end = s.find('<').unwrap_or(s.len());
+    let start = s[..head_end].rfind("::").map_or(0, |i| i + 2);
+    &s[start..]
 }
 
 #[cfg(test)]
@@ -53,5 +54,14 @@ mod tests {
     #[test]
     fn preserves_generics_after_path_strip() {
         assert_eq!(strip_type_name("crate::Foo<Bar>"), "Foo<Bar>");
+    }
+
+    #[test]
+    fn a_path_inside_generic_arguments_is_not_the_type_name() {
+        assert_eq!(strip_type_name("a::W<b::Inner>"), "W<b::Inner>");
+        assert_eq!(
+            strip_type_name("a::b::W<c::X, d::Y<e::Z>>"),
+            "W<c::X, d::Y<e::Z>>"
+        );
     }
 }

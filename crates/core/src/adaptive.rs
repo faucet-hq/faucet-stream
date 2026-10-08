@@ -318,6 +318,7 @@ impl AimdController {
             return None;
         }
         self.current = new;
+        self.latencies.clear();
         self.bump_log(AdjustDirection::Down, reason);
         Some(Adjustment {
             new_size: new,
@@ -337,6 +338,7 @@ impl AimdController {
             return None;
         }
         self.current = new;
+        self.latencies.clear();
         self.bump_log(AdjustDirection::Up, reason);
         Some(Adjustment {
             new_size: new,
@@ -637,5 +639,27 @@ mod controller_tests {
             latency: Duration::from_millis(900),
         });
         assert_eq!(c.p50_latency_ms(), Some(10));
+    }
+
+    #[test]
+    fn an_adjustment_starts_a_fresh_latency_window() {
+        let cfg: AdaptiveBatchConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true, "min": 1, "max": 1000, "target_latency_ms": 100,
+            "latency_window": 5, "cooldown_batches": 0
+        }))
+        .unwrap();
+        let mut c = AimdController::new(&cfg, 1000);
+        let obs = |ms| Observation {
+            batch_len: 10,
+            errors: 0,
+            latency: std::time::Duration::from_millis(ms),
+        };
+        assert!(c.observe(obs(500)).is_some());
+        assert_eq!(c.current(), 500);
+        assert!(
+            c.observe(obs(100)).is_none(),
+            "the stale slow sample is gone"
+        );
+        assert_eq!(c.current(), 500);
     }
 }

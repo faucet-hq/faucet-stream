@@ -277,6 +277,10 @@ pub const OVERWRITE_STAGING_SUFFIX: &str = "__faucet_ovw";
 /// a prefix catches this one too.
 pub const OVERWRITE_STAGING_OLD_SUFFIX: &str = "__faucet_ovw_old";
 
+/// Length of the `__h:` + 64 hex-digit SHA-256 suffix appended to a shortened
+/// scope.
+const SCOPE_DIGEST_LEN: usize = 4 + 64;
+
 /// Fit a watermark scope into a length-capped, indexable key column.
 ///
 /// The scope is the pipeline state key — `{name}::{row}` for a root, plus
@@ -291,22 +295,13 @@ pub const OVERWRITE_STAGING_OLD_SUFFIX: &str = "__faucet_ovw_old";
 /// before this existed still resolves. A longer one is replaced by a
 /// deterministic, collision-resistant digest form (`__h:<64-hex>`), which is
 /// stable across restarts — the only property the watermark needs.
-/// Length of the `__h:` + 16 hex-digit suffix appended to a shortened scope.
-const SCOPE_DIGEST_LEN: usize = 4 + 16;
-
 pub fn scope_key(scope: &str, max: usize) -> String {
     if scope.len() <= max {
         return scope.to_owned();
     }
-    // FNV-1a rather than a crypto hash: `sha2` is an optional dependency of this
-    // crate (masking / transform-hash / encryption) and this module is always
-    // compiled. The requirement is determinism, not preimage resistance — the same
-    // choice the backfill progress marker makes.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in scope.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x1000_0000_01b3);
-    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(scope.as_bytes());
+    let h: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     // Keep as much of the readable head as fits, so an operator inspecting the
     // watermark table can still tell which pipeline a row belongs to. Truncate on
     // a char boundary — a scope may hold non-ASCII.
@@ -318,7 +313,7 @@ pub fn scope_key(scope: &str, max: usize) -> String {
         }
         head = i;
     }
-    let shortened = format!("{}__h:{h:016x}", &scope[..head]);
+    let shortened = format!("{}__h:{h}", &scope[..head]);
     tracing::debug!(
         scope_len = scope.len(),
         max,
@@ -567,6 +562,19 @@ mod scope_key_tests {
         // truncation both of these would become the same 255-char prefix.
         assert_ne!(scope_key(&a, 255), scope_key(&b, 255));
         assert_eq!(&a[..255], &format!("pipe::row::{}", "a".repeat(400))[..255]);
+    }
+
+    #[test]
+    fn scope_key_digest_is_sha256() {
+        let long = format!("pipe::row::{}", "k".repeat(400));
+        let key = scope_key(&long, 255);
+        let (_, digest) = key.rsplit_once("__h:").unwrap();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(
+            &digest[..16],
+            "4c5c3b297497a0a0",
+            "pinned: a changed digest strands every shortened watermark"
+        );
     }
 
     #[test]

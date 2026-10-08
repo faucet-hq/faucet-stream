@@ -113,7 +113,8 @@ pub enum DlqReason {
 
 impl DlqReason {
     /// Returns the stable Prometheus label value for this reason.
-    /// Closed-set values: `"partial"`, `"dlq_all"`, or `"quality"`.
+    /// Closed-set values: `"partial"`, `"dlq_all"`, `"quality"`,
+    /// `"schema_drift"` or `"contract"` (see [`ALL`](Self::ALL)).
     pub fn as_str(self) -> &'static str {
         match self {
             DlqReason::Partial => "partial",
