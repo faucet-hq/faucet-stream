@@ -598,6 +598,106 @@ pub fn snake_case(key: &str) -> String {
         .join("_")
 }
 
+/// Compact JSON text for `v` with object keys sorted (byte order) at every
+/// depth; arrays keep their element order.
+///
+/// Use this wherever a JSON value becomes *record data* (an encoded column, a
+/// hash input, a CSV cell, a row identity). `serde_json`'s own `to_string`
+/// follows its map's iteration order, which flips between sorted and
+/// insertion order depending on whether Cargo feature unification enabled
+/// `serde_json/preserve_order` in the build — so the same record would
+/// serialize differently from one binary to the next (#817). Sorted order is
+/// what every build without `preserve_order` has always produced.
+pub fn canonical_json(v: &Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(v, &mut out);
+    out
+}
+
+fn write_canonical_json(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            out.push('{');
+            for (i, (k, val)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                write_canonical_json(val, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod canonical_json_tests {
+    use super::canonical_json;
+    use serde_json::{Map, Value, json};
+
+    /// Build an object whose *insertion* order is the reverse of sorted order,
+    /// so the test is meaningful whichever way `preserve_order` resolves.
+    fn reversed(pairs: Vec<(&str, Value)>) -> Value {
+        let mut m = Map::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v);
+        }
+        Value::Object(m)
+    }
+
+    #[test]
+    fn sorts_keys_at_every_depth_and_keeps_array_order() {
+        let owner = reversed(vec![("login", json!("octo-org")), ("id", json!(2))]);
+        assert_eq!(canonical_json(&owner), r#"{"id":2,"login":"octo-org"}"#);
+
+        let nested = reversed(vec![
+            ("z", json!([3, 1, 2])),
+            (
+                "m",
+                Value::Array(vec![reversed(vec![("y", json!(null)), ("x", json!(true))])]),
+            ),
+            ("a", reversed(vec![("b", json!(1.5)), ("a", json!("s"))])),
+        ]);
+        assert_eq!(
+            canonical_json(&nested),
+            r#"{"a":{"a":"s","b":1.5},"m":[{"x":true,"y":null}],"z":[3,1,2]}"#
+        );
+    }
+
+    #[test]
+    fn escapes_keys_and_strings_like_serde_json() {
+        let v = reversed(vec![
+            ("q\"k", json!("line\nbreak\u{7f}\u{8}")),
+            ("\u{e9}", json!(-1)),
+        ]);
+        let text = canonical_json(&v);
+        // Keys and strings are escaped exactly as serde_json escapes them.
+        let mut sorted = std::collections::BTreeMap::new();
+        for (k, val) in v.as_object().unwrap() {
+            sorted.insert(k.clone(), val.clone());
+        }
+        assert_eq!(text, serde_json::to_string(&sorted).unwrap());
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), v);
+        assert_eq!(canonical_json(&json!("x")), r#""x""#);
+        assert_eq!(canonical_json(&json!({})), "{}");
+        assert_eq!(canonical_json(&json!([])), "[]");
+    }
+}
+
 #[cfg(test)]
 mod snake_tests {
     use super::snake_case;

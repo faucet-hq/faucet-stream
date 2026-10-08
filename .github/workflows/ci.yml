@@ -649,7 +649,7 @@ jobs:
     # On hold with #565: Windows is not a supported platform yet.
     if: false
     env:
-      SHIPPED_FEATURES: "serve,serve-ui,schedule,lineage,templates"
+      SHIPPED_FEATURES: "serve,serve-ui,schedule,lineage,templates,mcp,notify,secrets,catalog,serve-history-sqlite,serve-history-postgres"
       # openssl-src must run Strawberry Perl; the Git Bash (MSYS) perl lacks
       # Locale::Maketext::Simple and misdetects the target.
       OPENSSL_SRC_PERL: C:/Strawberry/perl/bin/perl.exe

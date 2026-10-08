@@ -402,7 +402,7 @@ fn serialize_csv(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
                 Some(Value::String(s)) => csv_field(s),
                 Some(Value::Bool(b)) => b.to_string(),
                 Some(Value::Number(n)) => n.to_string(),
-                Some(other) => csv_field(&other.to_string()),
+                Some(other) => csv_field(&crate::util::canonical_json(other)),
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -575,6 +575,23 @@ mod upload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An object inserted in reverse-sorted key order (#817).
+    fn login_then_id() -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("login".into(), json!("o"));
+        m.insert("id".into(), json!(2));
+        Value::Object(m)
+    }
+
+    #[test]
+    fn csv_encodes_nested_objects_with_sorted_keys() {
+        let csv = serialize_csv(&[json!({"o": login_then_id()})]).unwrap();
+        assert_eq!(
+            String::from_utf8(csv).unwrap(),
+            "o\n\"{\"\"id\"\":2,\"\"login\"\":\"\"o\"\"}\"\n"
+        );
+    }
 
     #[test]
     fn parse_location_variants() {

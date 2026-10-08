@@ -162,8 +162,8 @@ pub use observability::otel::{OtelConfig, OtelProtocol, OtelSignal, shutdown_ote
 pub use observability::{
     DurationGuard, InstallError, InstallReport, InstrumentedSink, InstrumentedSource,
     InstrumentedStateStore, Labels, ObservabilityConfig, PrometheusConfig, RunStreamOptions,
-    TracingConfig, install_observability, instrumented_apply_stages, register_build_info,
-    update_bookmark_lag,
+    TracingConfig, build_version, install_observability, instrumented_apply_stages,
+    register_build_info, set_build_version, update_bookmark_lag,
 };
 pub use pipeline::{
     DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, Pipeline, PipelineResult, StreamPage, run_stream,

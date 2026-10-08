@@ -1419,7 +1419,7 @@ fn value_to_key(v: &Value) -> Option<String> {
                 Some(n.to_string())
             }
         }
-        other => Some(other.to_string()),
+        other => Some(crate::util::canonical_json(other)),
     }
 }
 
@@ -2210,7 +2210,7 @@ fn hash_fields(
                 // JSON value hashes over its canonical serialization.
                 let input = match current {
                     Value::String(s) => s.clone(),
-                    other => other.to_string(),
+                    other => crate::util::canonical_json(other),
                 };
                 let digest = hash_string(&input, algorithm, encoding, salt);
                 let target = into.unwrap_or(field.as_str());
@@ -2275,8 +2275,7 @@ fn json_encode_fields(mut value: Value, fields: &[String]) -> Value {
             if let Some(v) = map.get_mut(f)
                 && matches!(v, Value::Object(_) | Value::Array(_))
             {
-                let s = serde_json::to_string(v).unwrap_or_else(|_| "null".to_string());
-                *v = Value::String(s);
+                *v = Value::String(crate::util::canonical_json(v));
             }
         }
     }
@@ -2474,7 +2473,7 @@ fn scalar_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
-        other => other.to_string(),
+        other => crate::util::canonical_json(other),
     }
 }
 
@@ -4551,6 +4550,29 @@ mod tests {
         assert_eq!(out["n"], Value::String(expected));
     }
 
+    /// #817: an object hashes over its sorted-key form, so the digest does not
+    /// depend on the order its keys were inserted in.
+    #[cfg(feature = "transform-hash")]
+    #[test]
+    fn hash_object_ignores_key_insertion_order() {
+        let mut rec = Map::new();
+        rec.insert(
+            "o".into(),
+            reverse_inserted(&[("login", json!("octo-org")), ("id", json!(2))]),
+        );
+        let out = apply_all(
+            Value::Object(rec),
+            &compiled(&hash_spec(&["o"], HashEncoding::Hex, None)),
+        );
+        let expected = hash_string(
+            r#"{"id":2,"login":"octo-org"}"#,
+            HashAlgorithm::Sha256,
+            HashEncoding::Hex,
+            None,
+        );
+        assert_eq!(out["o"], Value::String(expected));
+    }
+
     #[cfg(feature = "transform-hash")]
     #[test]
     fn hash_blake3_differs_from_sha256() {
@@ -5132,6 +5154,49 @@ mod tests {
         assert_eq!(out["tags"], json!("[1,2]"));
         assert_eq!(out["name"], json!("a")); // scalar left untouched (idempotent)
         assert_eq!(out["id"], json!(1));
+    }
+
+    /// An object built in reverse-sorted insertion order, so the canonical
+    /// tests mean something whichever way `serde_json/preserve_order` resolves.
+    #[cfg(any(feature = "transform-json-encode", feature = "transform-hash"))]
+    fn reverse_inserted(pairs: &[(&str, Value)]) -> Value {
+        let mut m = Map::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), v.clone());
+        }
+        Value::Object(m)
+    }
+
+    /// #817: the encoded string sorts object keys at every depth, regardless
+    /// of the map's iteration order in this build.
+    #[cfg(feature = "transform-json-encode")]
+    #[test]
+    fn json_encode_sorts_keys_at_every_depth() {
+        let owner = reverse_inserted(&[("login", json!("octo-org")), ("id", json!(2))]);
+        let deep = reverse_inserted(&[
+            (
+                "z",
+                json!([reverse_inserted(&[("b", json!(1)), ("a", json!(2))])]),
+            ),
+            (
+                "a",
+                reverse_inserted(&[("y", json!(null)), ("x", json!("s"))]),
+            ),
+        ]);
+        let mut rec = Map::new();
+        rec.insert("owner".into(), owner);
+        rec.insert("deep".into(), deep);
+        let out = apply_all(
+            Value::Object(rec),
+            &compiled(&[RecordTransform::JsonEncode {
+                fields: vec!["owner".into(), "deep".into()],
+            }]),
+        );
+        assert_eq!(out["owner"], json!(r#"{"id":2,"login":"octo-org"}"#));
+        assert_eq!(
+            out["deep"],
+            json!(r#"{"a":{"x":"s","y":null},"z":[{"a":2,"b":1}]}"#)
+        );
     }
 
     #[cfg(feature = "transform-lookup")]

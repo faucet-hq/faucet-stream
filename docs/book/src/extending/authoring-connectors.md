@@ -19,8 +19,14 @@ The generated crate has the standard module layout (`config.rs`, `stream.rs` /
 `sink.rs`), a `JsonSchema`-deriving config, the `config_schema()` /
 `connector_name()` overrides, the `#![cfg_attr(docsrs, feature(doc_cfg))]`
 crate-root line, the `[package.metadata.docs.rs]` block, system-name-first
-crates.io keywords, a README, and a passing unit test — so `cargo test` is green
-immediately with a trivial passthrough. Replace the `TODO`s with your real
+crates.io keywords, a README, a passing unit test, and `tests/conformance.rs`
+wired to the [`faucet-conformance`](../reference/conformance.md) battery (a
+`faucet-conformance` dev-dependency) — so `cargo test` is green immediately with
+a trivial passthrough, and `cargo test --test conformance` runs the SDK-contract
+checks. Add checks to that file as the connector grows (bounded memory and
+bookmark round-trips for a source; truthful capabilities, write modes and
+idempotent replay for a sink). `faucet conformance` scores only connectors
+compiled into a faucet binary, so it does not apply to a standalone crate. Replace the `TODO`s with your real
 config fields and I/O, then publish. The rest of this page explains what the
 scaffold sets up.
 

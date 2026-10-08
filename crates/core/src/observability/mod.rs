@@ -34,7 +34,7 @@ pub use drift::schema_drift;
 pub use install::install_prometheus_with_otel_metrics;
 pub use install::{
     InstallError, InstallReport, ObservabilityConfig, PrometheusConfig, TracingConfig,
-    install_observability, register_build_info,
+    build_version, install_observability, register_build_info, set_build_version,
 };
 pub use labels::Labels;
 #[cfg(feature = "masking")]

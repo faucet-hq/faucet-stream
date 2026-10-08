@@ -364,7 +364,7 @@ fn key_scalar_text(v: &Value) -> String {
             _ => n.to_string(),
         },
         Value::Bool(b) => b.to_string(),
-        other => other.to_string(),
+        other => crate::util::canonical_json(other),
     }
 }
 
@@ -386,11 +386,11 @@ pub fn key_to_doc_id(k: &KeyTuple, separator: &str) -> String {
     if k.0.len() == 1 {
         return match &k.0[0].1 {
             Value::String(s) => s.clone(),
-            other => other.to_string(),
+            other => crate::util::canonical_json(other),
         };
     }
-    let values: Vec<&Value> = k.0.iter().map(|(_, v)| v).collect();
-    serde_json::to_string(&values).expect("a Vec<&serde_json::Value> always serializes")
+    let values: Vec<Value> = k.0.iter().map(|(_, v)| v.clone()).collect();
+    crate::util::canonical_json(&Value::Array(values))
 }
 
 /// Build a Mongo/ES filter document `{ col: value, … }` from a key tuple.
@@ -402,6 +402,21 @@ pub fn key_to_filter(k: &KeyTuple) -> Map<String, Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An object inserted in reverse-sorted key order (#817).
+    fn login_then_id() -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("login".into(), json!("o"));
+        m.insert("id".into(), json!(2));
+        Value::Object(m)
+    }
+
+    #[test]
+    fn object_key_values_render_with_sorted_keys() {
+        assert_eq!(key_scalar_text(&login_then_id()), r#"{"id":2,"login":"o"}"#);
+        let k = KeyTuple(vec![("k".into(), login_then_id())]);
+        assert_eq!(key_to_doc_id(&k, "_"), r#"{"id":2,"login":"o"}"#);
+    }
 
     fn upsert_spec(keys: &[&str]) -> WriteSpec {
         WriteSpec {

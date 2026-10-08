@@ -177,7 +177,7 @@ pub fn canonical_key(tuple: &crate::write_mode::KeyTuple) -> crate::write_mode::
                     serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
                     serde_json::Value::Bool(b) => serde_json::Value::String(b.to_string()),
                     serde_json::Value::Number(n) => serde_json::Value::String(n.to_string()),
-                    other => serde_json::Value::String(other.to_string()),
+                    other => serde_json::Value::String(crate::util::canonical_json(other)),
                 };
                 (k.clone(), v)
             })

@@ -11,8 +11,9 @@ and `${secret:VAR}` (alias for `${env:}`).
 
 ## Build features
 
-None of the four backends are compiled in by default. Opt in per backend or take
-all four with the aggregate feature:
+The prebuilt binaries (Homebrew, the installer, the release archives) include
+all four backends. From crates.io none are compiled into the default build; opt
+in per backend or take all four with the aggregate feature:
 
 ```bash
 # All four backends

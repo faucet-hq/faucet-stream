@@ -496,7 +496,7 @@ fn scalar_string(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        other => other.to_string(),
+        other => crate::util::canonical_json(other),
     }
 }
 
@@ -536,6 +536,19 @@ fn path_get<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An object inserted in reverse-sorted key order (#817).
+    fn login_then_id() -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("login".into(), json!("o"));
+        m.insert("id".into(), json!(2));
+        Value::Object(m)
+    }
+
+    #[test]
+    fn scalar_string_sorts_nested_object_keys() {
+        assert_eq!(scalar_string(&login_then_id()), r#"{"id":2,"login":"o"}"#);
+    }
 
     fn spec() -> TreeFlattenSpec {
         TreeFlattenSpec {

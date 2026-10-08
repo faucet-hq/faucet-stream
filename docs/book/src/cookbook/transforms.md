@@ -479,6 +479,11 @@ array is replaced **in place** with its compact JSON-string form — the
 standard step for landing nested data as a flat `STRING` column (e.g. when
 matching a warehouse table that stores nested structures as text). Scalar
 (already-flat) values and absent fields are left unchanged (idempotent).
+The string is canonical: object keys are sorted at every depth (arrays keep
+their order), so `{login: octo, id: 2}` always encodes as
+`{"id":2,"login":"octo"}` — the same bytes from every build and release, which
+keeps hashes, upsert change detection and test fixtures stable. The `hash`
+transform and `join` serialize nested values the same way.
 Needs the `transform-json-encode` feature.
 
 ## `unpivot` — wide/map → long (1→N)

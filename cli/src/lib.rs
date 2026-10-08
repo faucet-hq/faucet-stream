@@ -97,6 +97,13 @@ pub use error::{CliError, CliResult};
 use crate::cli::{Cli, Command};
 use crate::registry::PluginRegistry;
 
+/// Make `faucet_build_info{version}` report this binary's version, not
+/// `faucet-core`'s — they differ whenever only the CLI was released (#832).
+/// Called before every observability install; the first call wins.
+pub fn set_build_version() {
+    faucet_core::set_build_version(env!("CARGO_PKG_VERSION"));
+}
+
 /// Entry point for a custom `faucet` binary that bundles third-party
 /// connectors.
 ///
@@ -120,6 +127,8 @@ use crate::registry::PluginRegistry;
 pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
     use clap::Parser;
     use std::process::ExitCode;
+
+    set_build_version();
 
     if let Err(err) = registry.install() {
         commands::report(&err);

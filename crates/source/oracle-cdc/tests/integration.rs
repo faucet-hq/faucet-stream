@@ -130,6 +130,11 @@ async fn oracle_logminer_cdc_end_to_end() {
         .await
         .unwrap()
         .expect("position");
+    // #843: the anchor is a real position, never SCN 0.
+    assert!(
+        anchor["restart_scn"].as_u64().is_some_and(|s| s > 0),
+        "{anchor}"
+    );
     common::exec(
         &conn,
         &[

@@ -164,6 +164,24 @@ async fn submit_poll_get_completes_and_records_metrics() {
         "metrics missing requests_total"
     );
 
+    // #832: the build-info label is the binary's version — what `faucet
+    // --version` prints — not faucet-core's.
+    let cli_version = <faucet_cli::cli::Cli as clap::CommandFactory>::command()
+        .get_version()
+        .expect("the CLI declares a version")
+        .to_string();
+    assert_eq!(cli_version, env!("CARGO_PKG_VERSION"));
+    let build_info = format!("faucet_build_info{{version=\"{cli_version}\"}} 1");
+    assert!(
+        metrics.contains(&build_info),
+        "metrics missing {build_info}:\n{metrics}"
+    );
+    assert_eq!(
+        metrics.matches("faucet_build_info{").count(),
+        1,
+        "exactly one build-info series:\n{metrics}"
+    );
+
     // Verify GET /v1/runs lists the completed run.
     let list: serde_json::Value = client
         .get(format!("{base}/v1/runs"))

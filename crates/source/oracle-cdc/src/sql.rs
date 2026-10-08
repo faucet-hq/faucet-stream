@@ -64,9 +64,12 @@ pub(crate) const ONLINE_LOGS_SQL: &str = "SELECT MIN(f.MEMBER), l.THREAD#, l.SEQ
     WHERE l.NEXT_CHANGE# > :1 AND l.FIRST_CHANGE# <= :2 \
     GROUP BY l.THREAD#, l.SEQUENCE#, l.FIRST_CHANGE#, l.NEXT_CHANGE#";
 
-/// Current SCN plus the oldest open transaction's start.
-pub(crate) const POSITION_SQL: &str =
-    "SELECT d.CURRENT_SCN, (SELECT MIN(t.START_SCN) FROM V$TRANSACTION t) FROM V$DATABASE d";
+/// Current SCN plus the oldest open transaction's start. A transaction that
+/// reports `START_SCN` 0 (seen on a freshly restarted database) has no real
+/// start position — anchoring at it would ask LogMiner for SCN 1 onwards,
+/// which no redo log covers (#843) — so it is ignored, as NULL is by `MIN`.
+pub(crate) const POSITION_SQL: &str = "SELECT d.CURRENT_SCN, (SELECT MIN(t.START_SCN) FROM \
+    V$TRANSACTION t WHERE t.START_SCN > 0) FROM V$DATABASE d";
 
 /// The database's current SCN, for source lag.
 pub(crate) const CURRENT_SCN_SQL: &str = "SELECT CURRENT_SCN FROM V$DATABASE";
@@ -204,6 +207,11 @@ mod tests {
             "binary XMLType rows reach on_unsupported: {q}"
         );
         assert!(ARCHIVED_LOGS_SQL.contains("RESETLOGS_CHANGE# = (SELECT RESETLOGS_CHANGE#"));
+        // #843: a START_SCN of 0 is excluded from the oldest-open lookup.
+        assert!(
+            POSITION_SQL.contains("FROM V$TRANSACTION t WHERE t.START_SCN > 0"),
+            "{POSITION_SQL}"
+        );
         assert!(columns_sql(1).ends_with("IN ((:1, :2))"));
         assert!(log_groups_sql(2).contains("(:1, :2), (:3, :4)"));
         assert!(flush_table_ddl("F").contains("CREATE TABLE \"F\" (SCN NUMBER(19))"));

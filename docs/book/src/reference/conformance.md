@@ -50,8 +50,10 @@ no schema) drops to `Experimental` / `Beta`.
 - **`faucet list`** — a tier badge next to every compiled-in source and sink.
 - **`cli/connectors/registry.json`** — a per-connector `tier` field, validated in
   CI against the computed score so the published catalog stays honest.
-- **`faucet new connector`** — the scaffold's starting tier (⚪ Draft) plus the
-  checklist to reach 🟢 Stable.
+- **`faucet new connector`** — the scaffold wires `tests/conformance.rs` (the
+  `faucet-conformance` battery, run with `cargo test --test conformance`) and
+  names the checks to add as the connector grows. A third-party crate is
+  scored by that test; `faucet conformance` scores compiled-in connectors.
 
 ## A badge for your crate README
 

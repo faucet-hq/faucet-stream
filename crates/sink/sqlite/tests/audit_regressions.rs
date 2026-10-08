@@ -329,3 +329,47 @@ async fn json_column_partial_writes_and_large_unsigned_values() {
     let rows = query(&url, "SELECT n FROM nums").await;
     assert_eq!(rows[0].get::<String, _>(0), u64::MAX.to_string());
 }
+
+/// #822: a database path under directories that do not exist yet works — the
+/// sink creates them, as every other file-writing sink does.
+#[tokio::test]
+async fn database_under_a_missing_nested_directory_is_created() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = dir.path().join("out").join("nested").join("db.sqlite");
+    assert!(!db.parent().unwrap().exists());
+    let url = format!("sqlite://{}", db.display());
+    let sink = SqliteSink::new(config(&url, "t", WriteMode::Append, &[]))
+        .await
+        .expect("the sink creates the missing directories");
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    sink.flush().await.unwrap();
+    assert!(db.is_file(), "database file created at {}", db.display());
+    let rows = query(&url, "SELECT COUNT(*) AS n FROM t").await;
+    assert_eq!(rows[0].get::<i64, _>("n"), 1);
+}
+
+/// #822: a directory that cannot be created is a typed sink error naming it.
+#[tokio::test]
+async fn an_uncreatable_database_directory_is_a_sink_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let blocker = dir.path().join("file");
+    std::fs::write(&blocker, b"not a dir").unwrap();
+    let url = format!(
+        "sqlite://{}",
+        blocker.join("sub").join("db.sqlite").display()
+    );
+    let err = SqliteSink::new(config(&url, "t", WriteMode::Append, &[]))
+        .await
+        .err()
+        .expect("a file in the way of the directory fails");
+    match err {
+        faucet_core::FaucetError::Sink(msg) => {
+            assert!(
+                msg.contains("cannot create the database directory"),
+                "{msg}"
+            );
+            assert!(msg.contains("sub"), "{msg}");
+        }
+        other => panic!("expected FaucetError::Sink, got {other:?}"),
+    }
+}
