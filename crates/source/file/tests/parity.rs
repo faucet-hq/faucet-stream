@@ -124,9 +124,27 @@ async fn a_whole_file_sealed_csv_and_gzip_body_is_decrypted() {
     let mut cfg = FileSourceConfig::new(&path);
     cfg.encryption = Some(spec("k"));
     assert_eq!(
-        FileSource::new(cfg).unwrap().fetch_all().await.unwrap(),
+        FileSource::new(cfg.clone())
+            .unwrap()
+            .fetch_all()
+            .await
+            .unwrap(),
         vec![json!({"x": 1})]
     );
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, "{\"x\":1}\n".repeat(10_000).as_bytes()).unwrap();
+    let sealed = enc.encrypt(&gz.finish().unwrap());
+    std::fs::write(&path, &sealed).unwrap();
+    cfg.max_object_bytes = sealed.len() as u64;
+    let err = FileSource::new(cfg.clone())
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
+    cfg.max_object_bytes = 4;
+    let err = FileSource::new(cfg).unwrap().fetch_all().await.unwrap_err();
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
     let p = dir.path().join("s.parquet");
     put_parquet(&p, vec![7], vec![Some("q")]);
     let sealed = enc.encrypt(&std::fs::read(&p).unwrap());
@@ -137,4 +155,34 @@ async fn a_whole_file_sealed_csv_and_gzip_body_is_decrypted() {
         FileSource::new(cfg).unwrap().fetch_all().await.unwrap(),
         vec![json!({"id": 7, "name": "q", "score": 1.5})]
     );
+}
+
+/// #789 FILE-24: a per-line sealed file is verified whole — a line dropped
+/// at the end (with the trailer) fails the read instead of passing silently.
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn a_per_line_sealed_file_is_verified_whole() {
+    use faucet_common_file::sealed_lines::LineSeal;
+    let dir = tempfile::tempdir().unwrap();
+    let enc = faucet_core::CompiledEncryption::compile(&spec("k")).unwrap();
+    let mut seal = LineSeal::new();
+    let mut lines = vec![seal.header(&enc)];
+    for r in ["{\"x\":1}", "{\"x\":2}"] {
+        lines.push(seal.seal(&enc, r.as_bytes()));
+    }
+    lines.push(seal.trailer(&enc));
+    let path = write(dir.path(), "s.jsonl", &lines.concat());
+    let mut cfg = FileSourceConfig::new(&path);
+    cfg.encryption = Some(spec("k"));
+    assert_eq!(
+        FileSource::new(cfg.clone())
+            .unwrap()
+            .fetch_all()
+            .await
+            .unwrap(),
+        vec![json!({"x": 1}), json!({"x": 2})]
+    );
+    std::fs::write(&path, lines[..2].concat()).unwrap();
+    let err = FileSource::new(cfg).unwrap().fetch_all().await.unwrap_err();
+    assert!(err.to_string().contains("integrity"), "{err}");
 }

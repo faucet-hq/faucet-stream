@@ -15,7 +15,9 @@ use faucet_core::check::Probe;
 /// build (the CSV sink already does all its I/O via `spawn_blocking`).
 ///
 /// - Parent exists and a temp file can be created + removed → [`Probe::pass`].
-/// - Parent directory is missing → [`Probe::fail_hint`] naming the directory.
+/// - Parent directory is missing → the nearest existing ancestor is probed
+///   instead, since the sink creates the missing directories.
+/// - That ancestor is not a directory → [`Probe::fail_hint`] naming it.
 /// - Parent exists but the temp file cannot be created → [`Probe::fail_hint`]
 ///   surfacing the I/O error (e.g. permission denied, read-only filesystem).
 pub fn probe_parent_writable(path: &str, start: Instant) -> Probe {
@@ -26,13 +28,25 @@ pub fn probe_parent_writable(path: &str, start: Instant) -> Probe {
         _ => PathBuf::from("."),
     };
 
+    // The sink creates missing parent directories, so a missing parent passes
+    // when its nearest existing ancestor is a writable directory.
+    let mut parent = parent;
+    while !parent.exists() {
+        match parent.parent() {
+            Some(up) if !up.as_os_str().is_empty() => parent = up.to_path_buf(),
+            _ => {
+                parent = PathBuf::from(".");
+                break;
+            }
+        }
+    }
     if !parent.is_dir() {
         return Probe::fail_hint(
             "io",
             start.elapsed(),
-            format!("parent directory {} does not exist", parent.display()),
+            format!("{} is not a directory", parent.display()),
             format!(
-                "create the directory {} before running the pipeline",
+                "point the sink at a path under a directory, not under the file {}",
                 parent.display()
             ),
         );

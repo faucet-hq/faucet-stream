@@ -294,7 +294,6 @@ mod encryption {
 
     #[tokio::test]
     async fn json_lines_are_sealed_per_line_like_the_jsonl_sink() {
-        use base64::Engine as _;
         let dir = tempfile::tempdir().unwrap();
         let new = p(dir.path(), "new.jsonl");
         pages(
@@ -316,15 +315,11 @@ mod encryption {
         let enc =
             faucet_core::CompiledEncryption::compile(&serde_json::from_value(spec("k")).unwrap())
                 .unwrap();
-        let open = |path: &Path| -> Vec<Vec<u8>> {
-            std::fs::read_to_string(path)
+        // The file sink adds a header and trailer for whole-file integrity
+        // (#789 FILE-24); the records' plaintext is what must match.
+        let open = |path: &Path| -> Vec<u8> {
+            faucet_common_file::sealed_lines::plaintext(&std::fs::read(path).unwrap(), &enc)
                 .unwrap()
-                .lines()
-                .map(|l| {
-                    enc.decrypt(&base64::engine::general_purpose::STANDARD.decode(l).unwrap())
-                        .unwrap()
-                })
-                .collect()
         };
         assert_eq!(open(Path::new(&new)), open(&old));
         assert!(!std::fs::read_to_string(&new).unwrap().contains("Doe"));

@@ -13,6 +13,9 @@ pub struct Candidate {
     pub path: String,
     /// Modification time in nanoseconds since the Unix epoch, when known.
     pub mtime_ns: Option<i64>,
+    /// Inode change time (nanoseconds since the epoch) where the platform has
+    /// one. A rename or a timestamp-preserving copy moves it but not `mtime`.
+    pub ctime_ns: Option<i64>,
 }
 
 /// The incremental position: what the previous runs have read.
@@ -80,6 +83,17 @@ pub fn is_new(bookmark: Option<&Bookmark>, c: &Candidate) -> Result<bool, Faucet
     })
 }
 
+/// A skipped file whose inode changed after the watermark: it landed after
+/// the newest file read, with a preserved (older) modification time.
+pub fn arrived_after_watermark(bookmark: Option<&Bookmark>, c: &Candidate) -> bool {
+    match (bookmark, c.mtime_ns, c.ctime_ns) {
+        (Some(Bookmark::Mtime { mtime_ns, .. }), Some(m), Some(ct)) => {
+            m < *mtime_ns && ct > *mtime_ns
+        }
+        _ => false,
+    }
+}
+
 fn mtime_of(c: &Candidate) -> Result<i64, FaucetError> {
     c.mtime_ns.ok_or_else(|| {
         FaucetError::Source(format!(
@@ -144,10 +158,22 @@ pub fn select(
         files = kept;
     }
     let mut out = Vec::with_capacity(files.len());
+    let mut late = Vec::new();
     for f in files {
         if is_new(bookmark, &f)? {
             out.push(f);
+        } else if arrived_after_watermark(bookmark, &f) {
+            late.push(f.path);
         }
+    }
+    if !late.is_empty() {
+        tracing::warn!(
+            count = late.len(),
+            files = ?late.iter().take(10).collect::<Vec<_>>(),
+            "file source: files arrived after the incremental watermark but carry an older \
+             modification time (a rename, `cp -p` or `rsync -t`), so `by: mtime` skips them; \
+             touch them, or use `by: name` with sortable names"
+        );
     }
     match by {
         Some(IncrementalBy::Mtime) => {
@@ -174,6 +200,19 @@ fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
     let t = meta.modified().ok()?;
     let d = t.duration_since(std::time::UNIX_EPOCH).ok()?;
     i64::try_from(d.as_nanos()).ok()
+}
+
+#[cfg(unix)]
+fn ctime_ns(meta: &std::fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    meta.ctime()
+        .checked_mul(1_000_000_000)?
+        .checked_add(meta.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn ctime_ns(_meta: &std::fs::Metadata) -> Option<i64> {
+    None
 }
 
 fn io_err(path: &Path, e: impl std::fmt::Display) -> FaucetError {
@@ -204,6 +243,7 @@ pub fn list_local(path: &str, recursive: bool) -> Result<Vec<Candidate>, FaucetE
                 out.push(Candidate {
                     path: p.to_string_lossy().into_owned(),
                     mtime_ns: mtime_ns(&meta),
+                    ctime_ns: ctime_ns(&meta),
                 });
             }
         }
@@ -215,6 +255,7 @@ pub fn list_local(path: &str, recursive: bool) -> Result<Vec<Candidate>, FaucetE
         return Ok(vec![Candidate {
             path: path.to_string(),
             mtime_ns: mtime_ns(&meta),
+            ctime_ns: ctime_ns(&meta),
         }]);
     }
     walk(root, recursive, &mut out)?;
@@ -237,6 +278,7 @@ fn walk(dir: &Path, recursive: bool, out: &mut Vec<Candidate>) -> Result<(), Fau
             out.push(Candidate {
                 path: p.to_string_lossy().into_owned(),
                 mtime_ns: mtime_ns(&meta),
+                ctime_ns: ctime_ns(&meta),
             });
         }
     }
@@ -251,7 +293,49 @@ mod tests {
         Candidate {
             path: path.into(),
             mtime_ns: Some(m),
+            ctime_ns: Some(m),
         }
+    }
+
+    #[test]
+    fn a_file_landing_with_a_preserved_old_mtime_is_reported() {
+        let bm = Bookmark::Mtime {
+            mtime_ns: 100,
+            paths: vec!["new".into()],
+        };
+        let copied = Candidate {
+            path: "copied".into(),
+            mtime_ns: Some(50),
+            ctime_ns: Some(200),
+        };
+        assert!(arrived_after_watermark(Some(&bm), &copied));
+        assert!(!arrived_after_watermark(Some(&bm), &c("old", 50)));
+        assert!(!arrived_after_watermark(None, &copied));
+        let name = Bookmark::Name { last: "a".into() };
+        assert!(!arrived_after_watermark(Some(&name), &copied));
+        let sel = select(
+            vec![copied, c("old", 50), c("newer", 150)],
+            Some(IncrementalBy::Mtime),
+            Some(&bm),
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(sel, vec![c("newer", 150)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_listing_reports_the_inode_change_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.jsonl");
+        std::fs::write(&p, "{}\n").unwrap();
+        let f = std::fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        let listed = list_local(&p.to_string_lossy(), false).unwrap();
+        assert_eq!(listed[0].mtime_ns, Some(1_000_000_000));
+        assert!(listed[0].ctime_ns.unwrap() > 1_000_000_000);
     }
 
     #[test]
@@ -333,7 +417,8 @@ mod tests {
                 IncrementalBy::Mtime,
                 &Candidate {
                     path: "n".into(),
-                    mtime_ns: None
+                    mtime_ns: None,
+                    ctime_ns: None,
                 }
             )
             .is_err()
@@ -370,6 +455,7 @@ mod tests {
         let none = Candidate {
             path: "u".into(),
             mtime_ns: None,
+            ctime_ns: None,
         };
         assert!(select(vec![none.clone()], None, None, Some(1), now).is_err());
         assert!(select(vec![none], Some(IncrementalBy::Mtime), None, None, now).is_err());

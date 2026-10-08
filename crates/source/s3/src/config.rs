@@ -87,6 +87,10 @@ impl S3FileFormat {
     }
 }
 
+fn default_max_object_bytes() -> u64 {
+    faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
+}
+
 fn default_concurrency() -> usize {
     10
 }
@@ -99,6 +103,13 @@ pub struct S3SourceConfig {
     /// Object key prefix filter.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Glob over the whole object key selecting which listed objects to read
+    /// (e.g. `exports/*.parquet`). Without it, folder markers and objects
+    /// with a `_`- or `.`-prefixed path segment below the prefix (`_SUCCESS`,
+    /// `_temporary/`, `.crc`) are skipped; with it, exactly the matching keys
+    /// are read.
+    #[serde(default)]
+    pub include: Option<String>,
     /// AWS region. `None` uses the SDK default.
     #[serde(default)]
     pub region: Option<String>,
@@ -153,6 +164,12 @@ pub struct S3SourceConfig {
     /// debug log notes it); the length check still applies.
     #[serde(default)]
     pub verify_checksum: bool,
+    /// Largest object, once decompressed, that a format read whole (JSON
+    /// array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may
+    /// reach; a larger one fails with an error instead of exhausting memory.
+    /// Default 2 GiB.
+    #[serde(default = "default_max_object_bytes")]
+    pub max_object_bytes: u64,
     /// Compression codec applied to each downloaded object. Defaults to
     /// [`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —
     /// the codec is resolved per-object-key, so a single source can read a
@@ -197,6 +214,7 @@ impl S3SourceConfig {
         Self {
             bucket: bucket.into(),
             prefix: None,
+            include: None,
             region: None,
             endpoint_url: None,
             file_format: S3FileFormat::default(),
@@ -205,6 +223,7 @@ impl S3SourceConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             verify_length: true,
             verify_checksum: false,
+            max_object_bytes: default_max_object_bytes(),
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),
             csv: faucet_core::CsvOptions::default(),

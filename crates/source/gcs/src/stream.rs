@@ -73,6 +73,7 @@ pub struct GcsSource {
     /// `list` (one per listing page), `get` (one per object metadata read
     /// or body read, including each ranged Parquet read).
     roundtrips: faucet_core::observability::RecorderSlot,
+    filter: faucet_common_file::ObjectFilter,
 }
 
 impl GcsSource {
@@ -80,6 +81,8 @@ impl GcsSource {
     /// reused across calls.
     pub async fn new(config: GcsSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
+        let filter = faucet_common_file::ObjectFilter::new(config.include.as_deref())
+            .map_err(|e| faucet_common_file::config_context("GCS source", e))?;
         let storage = build_storage(&config.auth, config.storage_host.as_deref()).await?;
         let control = build_storage_control(&config.auth, config.storage_host.as_deref()).await?;
         Ok(Self {
@@ -88,6 +91,7 @@ impl GcsSource {
             control,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            filter,
         })
     }
 
@@ -134,6 +138,11 @@ impl GcsSource {
             })?;
             if object.name.is_empty()
                 || faucet_common_file::write::is_unfinished_output_key(&object.name)
+                || !self.filter.keep(
+                    &object.name,
+                    u64::try_from(object.size).ok(),
+                    effective_prefix.unwrap_or_default(),
+                )
             {
                 continue;
             }
@@ -184,6 +193,17 @@ impl GcsSource {
                 &self.config.format_options(),
             )?)),
             _ => Ok(None),
+        }
+    }
+
+    /// Formats the text parser cannot read, decoded only by `stream_pages`.
+    #[allow(unreachable_patterns)]
+    fn decodes_in_stream(&self) -> bool {
+        match self.config.file_format {
+            GcsFileFormat::JsonLines | GcsFileFormat::JsonArray | GcsFileFormat::RawText => false,
+            #[cfg(feature = "arrow")]
+            GcsFileFormat::Parquet => false,
+            _ => true,
         }
     }
 
@@ -283,7 +303,8 @@ impl GcsSource {
             len,
             self.roundtrips.recorder(),
         )
-        .await?;
+        .await?
+        .pinned_to(meta.generation);
         let object_len = reader.len();
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -337,15 +358,9 @@ impl GcsSource {
         // the raw bytes AND the decompressed bytes AND the String at once
         // (#78/#25). For JsonArray / RawText the whole object is still one
         // unit, but peak memory is now ~1× the decoded size rather than ~3×.
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut text = String::new();
-        reader.read_to_string(&mut text).await.map_err(|e| {
-            FaucetError::Source(format!(
-                "GCS read/decode error for key '{key}' (not valid UTF-8?): {e}"
-            ))
-        })?;
-        Ok(text)
+        let reader = self.open_object_reader(key).await?;
+        faucet_core::file_format::read_to_string_capped(reader, self.config.max_object_bytes, key)
+            .await
     }
 
     /// Open a GCS object as an `AsyncBufRead` over its body so callers can
@@ -451,14 +466,9 @@ impl GcsSource {
         feature = "file-format-orc"
     ))]
     async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
+        let reader = self.open_object_reader(key).await?;
+        faucet_core::file_format::read_to_end_capped(reader, self.config.max_object_bytes, key)
             .await
-            .map_err(|e| FaucetError::Source(format!("GCS read error for key '{key}': {e}")))?;
-        Ok(buf)
     }
 
     /// Decode a single Parquet object into its Arrow schema and batches. The
@@ -610,9 +620,9 @@ impl faucet_core::Source for GcsSource {
         &self,
         context: &std::collections::HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
-        // Avro / ORC decode in listing order against the first object's
-        // schema, which the ordered page stream already guarantees.
-        if self.is_container() {
+        // CSV, XML and Excel decode in the page stream, and Avro / ORC decode
+        // in listing order against the first object's schema.
+        if self.decodes_in_stream() {
             let mut out = Vec::new();
             let mut pages = self.stream_pages(context, 0);
             while let Some(page) = pages.next().await {

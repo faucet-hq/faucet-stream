@@ -31,8 +31,24 @@ pub struct HttpFetcher {
 }
 
 impl HttpFetcher {
-    /// Build the client once; `headers` were validated with the config.
+    /// Build the client once with the default timeouts (30 s to connect, 300 s
+    /// without a byte); `headers` were validated with the config.
     pub fn new(headers: &BTreeMap<String, String>, retries: u32) -> Result<Self, FaucetError> {
+        Self::with_timeouts(
+            headers,
+            retries,
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        )
+    }
+
+    /// Build the client with explicit connect and read (idle) timeouts.
+    pub fn with_timeouts(
+        headers: &BTreeMap<String, String>,
+        retries: u32,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Result<Self, FaucetError> {
         let mut map = HeaderMap::new();
         for (k, v) in headers {
             let name = HeaderName::from_bytes(k.as_bytes())
@@ -42,6 +58,8 @@ impl HttpFetcher {
             map.insert(name, value);
         }
         let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
             .build()
             .map_err(|e| FaucetError::Config(format!("file source: http client: {e}")))?;
         Ok(Self {

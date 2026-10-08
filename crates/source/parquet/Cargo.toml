@@ -18,7 +18,7 @@ categories.workspace = true
 arrow = ["faucet-core/arrow"]
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["arrow"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +28,6 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 futures.workspace = true
 arrow.workspace = true
-arrow-json.workspace = true
 parquet = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 glob.workspace = true
@@ -36,6 +35,7 @@ url.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+arrow-json.workspace = true
 faucet-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "fs", "io-util"] }
 serde_json.workspace = true

@@ -14,10 +14,10 @@ Reach for it when you want a database query, a CDC stream, a CSV dump, or an API
 - **Four catalog backends, one config shape** — REST (Polaris, Nessie, Tabular, …), AWS Glue, SQL-backed (Postgres/SQLite/…), and Hive Metastore, each selected by a Cargo feature and a single `catalog.type` discriminator.
 - **Local & cloud warehouses** — REST resolves FileIO server-side; the SQL/Glue/HMS catalogs pick an OpenDAL-backed storage factory from the `warehouse` URI scheme (`file://`, `s3://`/`s3a://`, `gs://`).
 - **Atomic snapshot commits** — each `flush()` writes the Parquet footer and registers the new data files in a single `fast_append` transaction. One `StreamPage` becomes exactly one snapshot.
-- **Schema inference on create** — when `create_if_missing` is set and the table is new, the Iceberg schema is inferred from the first Arrow batch (every field becomes a nullable column typed by its first non-null value).
+- **Schema inference on create** — when `create_if_missing` is set and the table is new, the Iceberg schema is inferred from the first Arrow batch (every field becomes a nullable column typed by its first non-null value; a field null in every sampled record becomes a nullable `string`).
 - **Partitioned tables** — writes to a partitioned table (new or existing) are split by the table's default partition spec, one data file per partition; on create, `identity`, `year`, `month`, `day`, `hour`, `void`, plus parameterized `bucket[N]` / `truncate[N]`.
 - **Parquet codec choice** — `snappy` (default), `zstd`, `gzip`, `lz4`, or `none`, with a soft `target_file_size_mb` rollover.
-- **Effectively-once delivery** — pairs with the CDC sources; the commit token is durably recorded as Iceberg snapshot summary properties (`faucet.commit-scope` / `faucet.commit-token`) inside the same atomic commit.
+- **Effectively-once delivery** — pairs with the CDC sources; the commit token is durably recorded as Iceberg snapshot summary properties (`faucet.commit-scope` / `faucet.commit-token`) inside the same atomic commit, and also as the table property `faucet.commit-token.<scope>`, so the watermark survives the expiry of the snapshot that recorded it. A page that fails part-way discards everything not yet committed and poisons the sink (later writes and the flush fail), so no fragment of it is ever committed without its token.
 - **`faucet doctor` preflight** — probes catalog connectivity and table existence without writing any data.
 - **Secrets-safe `Debug`** — the catalog `credential` and `uri` are redacted, never logged.
 
@@ -288,7 +288,7 @@ See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 ## Schema inference
 
-When `create_if_missing: true` and the table is new, the Iceberg schema is inferred from the first Arrow batch: every JSON field becomes a nullable column, typed by its first non-null value. Subsequent batches use the table's existing schema so the writer and table stay in sync. Iceberg assigns **field IDs** sequentially from `1`; IDs are stable once the table exists, so renaming or reordering JSON keys in later runs does not change them.
+When `create_if_missing: true` and the table is new, the Iceberg schema is inferred from the first Arrow batch: every JSON field becomes a nullable column, typed by its first non-null value. Subsequent batches use the table's existing schema so the writer and table stay in sync; a record field the table does not have is dropped with a one-time `WARN` naming it (add a `schema:` drift policy to fail or quarantine instead). A `decimal` column reports as `number` in `current_schema`. Iceberg assigns **field IDs** sequentially from `1`; IDs are stable once the table exists, so renaming or reordering JSON keys in later runs does not change them.
 
 A fractional number bound for an integer column (`10.5` into a `long`) fails the write naming the column instead of being truncated.
 

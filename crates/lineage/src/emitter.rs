@@ -24,6 +24,15 @@ impl LineageEmitter {
                  contain secrets that will be emitted in the SourceCode facet"
             );
         }
+        if let Some(p) = &cfg.parent_job
+            && p.run_id.is_none()
+        {
+            tracing::warn!(
+                parent = %p.name,
+                "lineage.parent_job has no run_id — OpenLineage's parent facet needs the \
+                 parent's run id, so no parent facet is emitted"
+            );
+        }
         let transport: Arc<dyn TransportTrait> = match &cfg.transport {
             Transport::Http {
                 url,
@@ -95,17 +104,23 @@ impl LineageEmitter {
         let terminal = matches!(ev, EventType::Complete | EventType::Abort | EventType::Fail);
 
         // Run facets.
-        let parent = ctx.parent.as_ref().map(|p| ParentRunFacet {
-            producer: PRODUCER.into(),
-            schema_url: OL_SCHEMA_URL.into(),
-            run: ParentRunRef {
-                run_id: p.run_id.clone().unwrap_or_else(|| ctx.run_id.clone()),
-            },
-            job: ParentJobRef {
-                namespace: p.namespace.clone(),
-                name: p.name.clone(),
-            },
+        let parent = ctx.parent.as_ref().and_then(|p| {
+            let run_id = p.run_id.clone()?;
+            Some(ParentRunFacet {
+                producer: PRODUCER.into(),
+                schema_url: OL_SCHEMA_URL.into(),
+                run: ParentRunRef { run_id },
+                job: ParentJobRef {
+                    namespace: p.namespace.clone(),
+                    name: p.name.clone(),
+                },
+            })
         });
+        let error_message = ctx
+            .error
+            .as_deref()
+            .filter(|_| matches!(ev, EventType::Fail | EventType::Abort))
+            .map(|e| ErrorMessageRunFacet::new(faucet_core::redact::redact(e)));
         let nominal_time = Some(NominalTimeRunFacet {
             producer: PRODUCER.into(),
             schema_url: OL_SCHEMA_URL.into(),
@@ -151,6 +166,9 @@ impl LineageEmitter {
         {
             output.facets.schema = Some(schema_facet(s));
         }
+        if terminal || matches!(ev, EventType::Running) {
+            output.output_facets.output_statistics = Some(OutputStatisticsFacet::new(ctx.records));
+        }
         // Column lineage references a single input's fields, and the derivation
         // models one transform chain — so emit it only when there is exactly one
         // input. A merge/join is opaque to it, and inventing an input to point at
@@ -176,6 +194,7 @@ impl LineageEmitter {
                 facets: RunFacets {
                     parent,
                     nominal_time,
+                    error_message,
                 },
             },
             job: Job {
@@ -188,6 +207,49 @@ impl LineageEmitter {
             producer: PRODUCER.into(),
             schema_url: OL_SCHEMA_URL.into(),
         }
+    }
+}
+
+/// A running RUNNING-heartbeat task. Dropping the guard stops the task, so a
+/// run whose future is dropped (timeout, cancellation, panic) stops emitting.
+#[derive(Debug)]
+pub struct HeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl HeartbeatGuard {
+    /// Whether the heartbeat task has stopped.
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl LineageEmitter {
+    /// Emit a RUNNING event every `interval` (skipping the first, immediate
+    /// tick) until the returned guard is dropped. `records` is read before each
+    /// beat to refresh the record count.
+    pub fn spawn_heartbeat(
+        self: &Arc<Self>,
+        interval: std::time::Duration,
+        mut ctx: RunLifecycle,
+        records: impl Fn() -> Option<u64> + Send + 'static,
+    ) -> HeartbeatGuard {
+        let em = Arc::clone(self);
+        HeartbeatGuard(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Some(n) = records() {
+                    ctx.records = n;
+                }
+                em.emit(EventType::Running, &ctx).await;
+            }
+        }))
     }
 }
 
@@ -331,6 +393,113 @@ mod tests {
         let em = LineageEmitter::new(c).unwrap();
         em.emit(EventType::Running, &lifecycle()).await; // disabled → nothing written
         assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().is_empty());
+    }
+
+    async fn emitted(
+        c: LineageConfig,
+        path: &std::path::Path,
+        ev: EventType,
+        ctx: &RunLifecycle,
+    ) -> serde_json::Value {
+        LineageEmitter::new(c).unwrap().emit(ev, ctx).await;
+        let body = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(body.lines().last().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_parent_without_run_id_emits_no_parent_facet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ol.jsonl");
+        let parent = crate::config::ParentJob {
+            namespace: "airflow".into(),
+            name: "dag".into(),
+            run_id: None,
+        };
+        let mut c = cfg(path.clone());
+        c.parent_job = Some(parent.clone());
+        let mut ctx = lifecycle();
+        ctx.parent = Some(parent.clone());
+        let v = emitted(c.clone(), &path, EventType::Start, &ctx).await;
+        assert!(v["run"]["facets"].get("parent").is_none(), "{v}");
+
+        let mut with_id = parent;
+        with_id.run_id = Some("p-1".into());
+        ctx.parent = Some(with_id);
+        let v = emitted(c, &path, EventType::Start, &ctx).await;
+        assert_eq!(v["run"]["facets"]["parent"]["run"]["runId"], "p-1");
+    }
+
+    #[tokio::test]
+    async fn failure_and_volume_reach_the_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ol.jsonl");
+        let mut ctx = lifecycle();
+        ctx.records = 42;
+        ctx.error = Some("sink refused the page".into());
+        ctx.finished_at = Some(Utc::now());
+
+        let v = emitted(cfg(path.clone()), &path, EventType::Fail, &ctx).await;
+        let facet = &v["run"]["facets"]["errorMessage"];
+        assert_eq!(facet["message"], "sink refused the page");
+        assert_eq!(facet["programmingLanguage"], "rust");
+        assert_eq!(
+            v["outputs"][0]["outputFacets"]["outputStatistics"]["rowCount"],
+            42
+        );
+
+        ctx.error = None;
+        let v = emitted(cfg(path.clone()), &path, EventType::Complete, &ctx).await;
+        assert!(v["run"]["facets"].get("errorMessage").is_none(), "{v}");
+        assert_eq!(
+            v["outputs"][0]["outputFacets"]["outputStatistics"]["rowCount"],
+            42
+        );
+
+        let mut running = cfg(path.clone());
+        running.emit_on.running = true;
+        let v = emitted(running, &path, EventType::Running, &ctx).await;
+        assert_eq!(
+            v["outputs"][0]["outputFacets"]["outputStatistics"]["rowCount"],
+            42
+        );
+        let v = emitted(cfg(path.clone()), &path, EventType::Start, &ctx).await;
+        assert!(v["outputs"][0].get("outputFacets").is_none(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_heartbeat_guard_stops_the_beats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ol.jsonl");
+        let mut c = cfg(path.clone());
+        c.emit_on.running = true;
+        let em = LineageEmitter::new(c).unwrap();
+        let guard = em.spawn_heartbeat(std::time::Duration::from_millis(10), lifecycle(), || {
+            Some(7)
+        });
+        let lines = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .map(|b| b.lines().count())
+                .unwrap_or(0)
+        };
+        for _ in 0..200 {
+            if lines(&path) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(v["eventType"], "RUNNING");
+        assert_eq!(
+            v["outputs"][0]["outputFacets"]["outputStatistics"]["rowCount"],
+            7
+        );
+
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let after_drop = lines(&path);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(lines(&path), after_drop, "beats continued after drop");
     }
 
     #[tokio::test]

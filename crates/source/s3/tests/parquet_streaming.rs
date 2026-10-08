@@ -360,3 +360,24 @@ async fn parquet_columns_project_on_both_read_paths() {
         "{err}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_object_replaced_mid_read_fails_rather_than_mixing_versions() {
+    let (_c, endpoint) = start_minio().await;
+    seed(&endpoint, "swap.parquet", parquet_bytes(5_000, 500, 10)).await;
+    let source = build_source(&endpoint, config(500)).await;
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 500);
+    let first = pages.next().await.expect("a page").expect("page ok");
+    assert_eq!(first.records[0]["id"], 0);
+    seed(&endpoint, "swap.parquet", parquet_bytes(5_000, 500, 11)).await;
+    let mut error = None;
+    while let Some(page) = pages.next().await {
+        if let Err(e) = page {
+            error = Some(e.to_string());
+            break;
+        }
+    }
+    let error = error.expect("a replaced object must fail the read");
+    assert!(error.contains("replaced"), "{error}");
+}

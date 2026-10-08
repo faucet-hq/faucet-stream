@@ -308,7 +308,7 @@ async fn parent_run_facet_built_from_parent_job() {
 }
 
 #[tokio::test]
-async fn parent_run_facet_falls_back_to_run_id_when_parent_run_id_absent() {
+async fn no_parent_run_facet_when_parent_run_id_absent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ol.jsonl");
     let em = LineageEmitter::new(file_cfg(path.clone())).unwrap();
@@ -316,11 +316,11 @@ async fn parent_run_facet_falls_back_to_run_id_when_parent_run_id_absent() {
     ctx.parent = Some(ParentJob {
         namespace: "airflow".into(),
         name: "dag.task".into(),
-        run_id: None, // → falls back to ctx.run_id ("r1")
+        run_id: None,
     });
     em.emit(EventType::Start, &ctx).await;
     let events = read_lines(&path);
-    assert_eq!(events[0]["run"]["facets"]["parent"]["run"]["runId"], "r1");
+    assert!(events[0]["run"]["facets"].get("parent").is_none());
 }
 
 #[tokio::test]

@@ -2683,22 +2683,12 @@ async fn run_one_invocation(
             // Heartbeat task — periodic RUNNING events with the live throughput
             // count read off the output sampler.
             let hb_handle = if lc.emit_on.running {
-                let em2 = std::sync::Arc::clone(em);
-                let interval = lc.heartbeat_interval;
-                let mut beat_ctx = ctx.clone();
                 let counter = out_sample.clone();
-                Some(tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(interval);
-                    tick.tick().await; // skip the immediate first tick
-                    loop {
-                        tick.tick().await;
-                        if let Some(c) = &counter {
-                            beat_ctx.records = c.count();
-                        }
-                        em2.emit(faucet_lineage::EventType::Running, &beat_ctx)
-                            .await;
-                    }
-                }))
+                Some(
+                    em.spawn_heartbeat(lc.heartbeat_interval, ctx.clone(), move || {
+                        counter.as_ref().map(|c| c.count())
+                    }),
+                )
             } else {
                 None
             };
@@ -2835,9 +2825,7 @@ async fn run_one_invocation(
 
     #[cfg(feature = "lineage")]
     if let Some((em, mut ctx, hb)) = lineage_ctx {
-        if let Some(h) = hb {
-            h.abort();
-        }
+        drop(hb);
         ctx.finished_at = Some(chrono::Utc::now());
         if let Some(state) = &out_sample {
             ctx.records = state.count();

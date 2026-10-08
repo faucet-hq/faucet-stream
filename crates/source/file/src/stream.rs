@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::io::AsyncBufReadExt;
 
 type Reader = Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>;
 
@@ -84,7 +84,12 @@ impl FileSource {
     pub fn new(config: FileSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let http = if config.is_http() {
-            Some(HttpFetcher::new(&config.headers, config.http_retries)?)
+            Some(HttpFetcher::with_timeouts(
+                &config.headers,
+                config.http_retries,
+                std::time::Duration::from_secs(config.http_connect_timeout_secs),
+                std::time::Duration::from_secs(config.http_read_timeout_secs),
+            )?)
         } else {
             None
         };
@@ -156,6 +161,7 @@ impl FileSource {
                 vec![Candidate {
                     path: root.to_string(),
                     mtime_ns,
+                    ctime_ns: None,
                 }]
             }
             None => {
@@ -240,12 +246,13 @@ impl FileSource {
             let file = std::fs::File::open(path).map_err(|e| read_err(path, e))?;
             return Ok(Opened::Local(file));
         }
-        let mut reader = self.open_reader(path).await?;
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| read_err(path, e))?;
+        let reader = self.open_reader(path).await?;
+        let bytes = faucet_core::file_format::read_to_end_capped(
+            reader,
+            self.config.max_object_bytes,
+            path,
+        )
+        .await?;
         Ok(Opened::Bytes(bytes))
     }
 
@@ -256,25 +263,24 @@ impl FileSource {
         format: FileFormat,
         enc: &faucet_core::CompiledEncryption,
     ) -> Result<Vec<u8>, FaucetError> {
-        let mut raw = Vec::new();
-        self.open_raw(path)
-            .await?
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|e| read_err(path, e))?;
+        let max = self.config.max_object_bytes;
+        let raw =
+            faucet_core::file_format::read_to_end_capped(self.open_raw(path).await?, max, path)
+                .await?;
         let codec = self.codec_of(path);
         let fail = |e: FaucetError| FaucetError::Source(format!("file source: '{path}': {e}"));
         if faucet_core::encryption::is_encrypted(&raw) {
             let sealed = enc.decrypt(&raw).map_err(fail)?;
             let mut plain = Vec::new();
             std::io::Read::read_to_end(
-                &mut faucet_core::compression::wrap_sync_reader(
-                    std::io::Cursor::new(sealed),
-                    codec,
+                &mut std::io::Read::take(
+                    faucet_core::compression::wrap_sync_reader(std::io::Cursor::new(sealed), codec),
+                    max.saturating_add(1),
                 ),
                 &mut plain,
             )
             .map_err(|e| read_err(path, e))?;
+            faucet_core::file_format::check_object_size(plain.len() as u64, max, path)?;
             return Ok(plain);
         }
         if matches!(format, FileFormat::JsonLines | FileFormat::RawText)

@@ -47,6 +47,10 @@ enum LineDecode {
     /// Sealed and successfully decrypted — classify the plaintext.
     #[cfg(feature = "encryption")]
     Decrypted(String),
+    /// The header or trailer line of a file sealed with whole-file
+    /// integrity — not a record.
+    #[cfg(feature = "encryption")]
+    Marker,
     /// Sealed but no key / wrong key / tampered — counted, never fatal.
     Undecryptable,
 }
@@ -144,11 +148,12 @@ impl DlqDecryptor {
             if !faucet_core::encryption::is_encrypted(&sealed) {
                 return LineDecode::Plain;
             }
-            return match enc.decrypt(&sealed) {
-                Ok(plain) => match String::from_utf8(plain) {
+            return match enc.open_line(&sealed) {
+                Ok(faucet_core::SealedLine::Data(plain)) => match String::from_utf8(plain) {
                     Ok(text) => LineDecode::Decrypted(text),
                     Err(_) => LineDecode::Undecryptable,
                 },
+                Ok(_) => LineDecode::Marker,
                 Err(_) => LineDecode::Undecryptable,
             };
         }
@@ -228,6 +233,8 @@ pub fn classify_line_with(line: &str, dec: &DlqDecryptor) -> LineOutcome {
         LineDecode::Plain => classify_text(line),
         #[cfg(feature = "encryption")]
         LineDecode::Decrypted(plain) => classify_text(&plain),
+        #[cfg(feature = "encryption")]
+        LineDecode::Marker => LineOutcome::Blank,
         LineDecode::Undecryptable => LineOutcome::Undecryptable,
     }
 }
@@ -649,6 +656,35 @@ mod tests {
                 classify_line_with("RkNU-not-really-sealed!!!", &dec),
                 LineOutcome::Malformed
             );
+        }
+
+        #[test]
+        fn bound_lines_classify_and_header_and_trailer_lines_are_blank() {
+            use faucet_core::encryption::{
+                SEALED_LINE_CONTEXT, SEALED_LINES_HEADER_CONTEXT, SEALED_LINES_TRAILER_CONTEXT,
+            };
+            let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+                key: "k".into(),
+                previous_keys: vec![],
+                algorithm: Default::default(),
+            })
+            .unwrap();
+            let b64 = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+            let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+            let record = envelope_line("quality", serde_json::json!({"id": 1}));
+            assert!(matches!(
+                classify_line_with(
+                    &b64(enc.encrypt_bound(record.as_bytes(), SEALED_LINE_CONTEXT)),
+                    &dec
+                ),
+                LineOutcome::Envelope(_)
+            ));
+            for ctx in [SEALED_LINES_HEADER_CONTEXT, SEALED_LINES_TRAILER_CONTEXT] {
+                assert_eq!(
+                    classify_line_with(&b64(enc.encrypt_bound(b"{}", ctx)), &dec),
+                    LineOutcome::Blank
+                );
+            }
         }
 
         #[test]

@@ -226,6 +226,8 @@ struct JsonObject {
     #[serde(default)]
     size: Option<String>,
     #[serde(default)]
+    generation: Option<String>,
+    #[serde(default)]
     content_type: Option<String>,
     #[serde(default)]
     content_encoding: Option<String>,
@@ -238,6 +240,9 @@ impl JsonObject {
             .set_bucket(format!("{BUCKET_PREFIX}{bucket}"));
         if let Some(size) = self.size.and_then(|s| s.parse::<i64>().ok()) {
             obj = obj.set_size(size);
+        }
+        if let Some(generation) = self.generation.and_then(|g| g.parse::<i64>().ok()) {
+            obj = obj.set_generation(generation);
         }
         if let Some(ct) = self.content_type {
             obj = obj.set_content_type(ct);
@@ -561,7 +566,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/storage/v1/b/bkt/o/data%2Fx.parquet"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "data/x.parquet", "size": "4096", "contentEncoding": "gzip"
+                "name": "data/x.parquet", "size": "4096", "generation": "1712", "contentEncoding": "gzip"
             })))
             .mount(&server)
             .await;
@@ -578,6 +583,7 @@ mod tests {
             .unwrap();
         assert_eq!(obj.name, "data/x.parquet");
         assert_eq!(obj.size, 4096);
+        assert_eq!(obj.generation, 1712);
         assert_eq!(obj.content_encoding, "gzip");
         assert_eq!(obj.bucket, "projects/_/buckets/bkt");
     }

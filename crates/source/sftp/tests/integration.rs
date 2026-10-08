@@ -253,3 +253,30 @@ async fn start_sftp(files: &[(String, String)]) -> Option<(ContainerAsync<Generi
     );
     started
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn symlinked_files_are_read_and_symlinked_directories_skipped() {
+    let files = vec![
+        ("a.jsonl".to_string(), "{\"id\":1}\n".to_string()),
+        ("sub/inner.jsonl".to_string(), "{\"id\":2}\n".to_string()),
+    ];
+    let Some((c, port)) = start_sftp(&files).await else {
+        return;
+    };
+    let dir = format!("/home/{USER}/data");
+    let mut exec = c
+        .exec(testcontainers::core::ExecCommand::new([
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("ln -s a.jsonl {dir}/link.jsonl && ln -s sub {dir}/dirlink"),
+        ]))
+        .await
+        .expect("symlinks");
+    let _ = exec.stdout_to_vec().await;
+    let records = drain(&source(port, SftpFormat::Jsonl, 2, 1_000), 1_000).await;
+    assert_eq!(
+        records,
+        vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 1})],
+        "the symlinked file is read; the symlinked directory is not"
+    );
+}

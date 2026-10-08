@@ -42,7 +42,7 @@ file-format-parquet = ["faucet-core/file-format-parquet", "arrow", "dep:parquet"
 # The columnar (Arrow) path for Avro, ORC and Parquet.
 arrow = ["faucet-core/arrow", "dep:arrow"]
 # Decrypt files sealed by a sink's `encryption` block.
-encryption = ["faucet-core/encryption", "dep:base64"]
+encryption = ["faucet-core/encryption", "faucet-common-file/encryption", "dep:base64"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc", "file-format-parquet"]
 
 [dev-dependencies]

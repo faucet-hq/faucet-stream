@@ -76,10 +76,21 @@ Scratch files are named `<file>.faucet-tmp` plus one of `SCRATCH_ROLES`
 (`-body`, `-old`, `-seal`, `-prev`); `is_scratch_name` and `is_swap_dir_name`
 let a reader skip them. Scratch files are not encrypted while a run is in
 progress: those holding plaintext of an encrypted output are created
-readable by their owner only.
+readable by their owner only. A remote backend's private scratch directory
+(`faucet-remote-*`) holds an `.owner` file locked for the run's life; a new
+backend removes every such directory whose lock it can take — the scratch of a
+run that crashed (SIGKILL, OOM) — so plaintext does not outlive the run.
 
 Features mirror the formats: `file-format-csv`, `-xml`, `-excel`, `-avro`,
 `-parquet` (`file-formats` is all of them), `arrow`, `encryption`.
+
+`sealed_lines` (feature `encryption`) is the per-line sealed JSON Lines layout:
+`LineSeal` writes the header, bound record lines and the trailer (record count
+plus a SHA-256 digest of the lines), and `open` / `plaintext` verify a file whole
+— a file written before the header existed is read line by line with a warning.
+`ObjectFilter` is the object-store listing filter the s3 / gcs / azure-blob
+sources share: folder markers and `_`/`.`-prefixed keys are skipped unless an
+`include` glob names exactly what to read.
 
 Connector authors normally depend on the source or sink crate, not this one.
 

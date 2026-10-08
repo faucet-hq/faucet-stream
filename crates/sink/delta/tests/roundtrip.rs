@@ -80,3 +80,54 @@ async fn a_fractional_value_in_an_integer_column_is_refused() {
     let err = sink.write_batch(&[json!({"n": 10.5})]).await.unwrap_err();
     assert!(err.to_string().contains("'n'"), "{err}");
 }
+
+fn committed_rows(dir: &std::path::Path) -> i64 {
+    use deltalake::parquet::file::reader::{FileReader, SerializedFileReader};
+    let mut rows = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "parquet") {
+            let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+            rows += reader.metadata().file_metadata().num_rows();
+        }
+    }
+    rows
+}
+
+/// #789 FILE-40: a page that fails in a later chunk leaves nothing of itself
+/// buffered, so the next flush cannot commit its earlier chunks.
+#[tokio::test]
+async fn a_page_failing_in_a_later_chunk_buffers_none_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "chunks");
+    let mut cfg = DeltaSinkConfig::new(&uri);
+    cfg.batch_size = 2;
+    let sink = DeltaSink::new(cfg).await.unwrap();
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    let page = [
+        json!({"id": 2}),
+        json!({"id": 3}),
+        json!({"id": 4}),
+        json!({"id": "not-a-number"}),
+    ];
+    assert!(sink.write_batch(&page).await.is_err());
+    sink.flush().await.unwrap();
+    assert_eq!(committed_rows(&dir.path().join("chunks")), 1);
+}
+
+/// #789 FILE-41: a column null in every sampled record creates the table as
+/// a nullable string column instead of failing the create.
+#[tokio::test]
+async fn a_column_null_in_the_sample_creates_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "sparse");
+    let sink = DeltaSink::new(DeltaSinkConfig::new(&uri)).await.unwrap();
+    sink.write_batch(&[json!({"id": 1, "deleted_at": null})])
+        .await
+        .unwrap();
+    sink.write_batch(&[json!({"id": 2, "deleted_at": "2026-10-01"})])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+    assert_eq!(committed_rows(&dir.path().join("sparse")), 2);
+}

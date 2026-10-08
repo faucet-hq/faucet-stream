@@ -72,7 +72,9 @@ faucet run pipeline.yaml
 | `object_keys` | array of string | *(unset)* | Explicit object names to read. When set, listing is skipped and `prefix` is ignored. |
 | `auth` | `GcsCredentials` | `application_default` | Authentication — see [Authentication](#authentication). |
 | `file_format` | enum | `json_lines` | `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx`, `avro`, `orc` — see [File formats](#file-formats-604). |
+| `include` | string | *(unset)* | Glob over the whole object key selecting what to read (e.g. `exports/*.parquet`). Without it, zero-byte folder markers and keys with a `_`- or `.`-prefixed segment below the prefix (`_SUCCESS`, `_temporary/…`, `.crc`) are skipped; with it, exactly the matching keys are read. |
 | `max_objects` | int | *(unset)* | Hard cap on the number of objects read (applied after listing, and to an explicit `object_keys` list). |
+| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may reach; a larger one fails the run instead of exhausting memory. |
 
 ### Performance
 
@@ -277,7 +279,7 @@ For a non-zero `batch_size`, records from multiple objects can share a page (cro
 
 > **Memory ceiling — `raw_text` / `json_array`.** Both hold one whole decoded object in memory at a time (inherent: a raw-text record *is* the whole file, and a JSON array isn't valid until its closing `]`). Because objects are fetched concurrently, peak memory is bounded by roughly **`concurrency` × (largest object's decoded size)**, not by `batch_size`. For large `raw_text` / `json_array` objects, lower `concurrency` to cap peak memory, or re-emit the data as `json_lines` upstream so it streams at `O(batch_size)`.
 
-> **Parquet streams row groups.** A `file_format: parquet` object is read over byte ranges — its footer locates every row group, so peak memory is one Arrow batch (capped at `batch_size`), not the object. Two settings fall back to reading the whole object, because each is a guarantee worth more than the memory saving: `verify_checksum: true` (the checksum covers the whole object, so verifying it means streaming all of it) and a resolved `compression` codec (a compressed member is not randomly addressable). Records are identical either way.
+> **Parquet streams row groups.** A `file_format: parquet` object is read over byte ranges — its footer locates every row group, so peak memory is one Arrow batch (capped at `batch_size`), not the object. Two settings fall back to reading the whole object, because each is a guarantee worth more than the memory saving: `verify_checksum: true` (the checksum covers the whole object, so verifying it means streaming all of it) and a resolved `compression` codec (a compressed member is not randomly addressable). Records are identical either way. Every range read is pinned to its generation as the first metadata read saw it, so an object replaced mid-read fails the run instead of mixing row groups from two versions.
 
 
 This is a one-shot scan source — it has no incremental bookmark / resume support, so each run re-lists and re-reads the matching objects. For incremental loads, advance the `prefix` between runs (e.g. a dated `events/dt=${now.date}/` prefix) so each run reads only fresh objects.

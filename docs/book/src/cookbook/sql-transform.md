@@ -169,6 +169,27 @@ relation if it changed. Useful for reference files that are updated while the
 pipeline is running (e.g. a nightly price list). Default `false`. Ignored for
 `values`.
 
+A file modified less than a second ago is stat'ed twice, 100 ms apart, and is
+reloaded only when its mtime and size match — otherwise the old table stays
+for this page and the reload is retried on the next one. Replace reference
+files atomically (write a temp file, then rename it over the old one) so a
+reload never sees a half-written file.
+
+## Output types
+
+- **Decimals are exact.** A `DECIMAL` with precision up to 15 stays a JSON
+  number; an integral `DECIMAL` or `HUGEINT` value (e.g. `SUM` of integers)
+  that fits a 64-bit integer becomes a JSON integer; any wider value is an
+  exact decimal string such as `"1234567890123456789012345678.0123456789"`,
+  never an `f64` rounding.
+- **Non-finite floats** (`NaN`, `±Infinity`) become the strings `"NaN"`,
+  `"Infinity"` and `"-Infinity"` rather than `null`.
+- **A field that is `{}` in every record of a page** is passed to DuckDB as the
+  string `'{}'` (DuckDB has no zero-field struct) and comes back as `{}`.
+- **Keys that differ only by letter case** (`a` and `A`) fail the page: SQL
+  identifiers are case-insensitive, so DuckDB would silently rename one. Rename
+  one of them upstream.
+
 ## JSON columns
 
 Use `json_extract` on string fields that contain JSON:

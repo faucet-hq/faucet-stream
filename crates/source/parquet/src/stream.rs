@@ -299,7 +299,7 @@ impl faucet_core::Source for ParquetSource {
         if outputs.len() > 1 {
             let first = &outputs[0];
             for other in &outputs[1..] {
-                if first.arrow_schema != other.arrow_schema {
+                if first.arrow_schema.fields() != other.arrow_schema.fields() {
                     return Err(FaucetError::Source(schema_mismatch_message(first, other)));
                 }
             }
@@ -377,7 +377,7 @@ impl faucet_core::Source for ParquetSource {
             for target in &all_targets {
                 let (_, arrow_schema, display) = self.open_target_stream(target).await?;
                 if let Some((first_path, first_schema)) = &reference {
-                    if first_schema != &arrow_schema {
+                    if first_schema.fields() != arrow_schema.fields() {
                         Err(FaucetError::Source(schema_mismatch_message_pair(
                             first_path,
                             first_schema,
@@ -478,7 +478,7 @@ impl faucet_core::Source for ParquetSource {
             for target in &all_targets {
                 let (_, arrow_schema, display) = self.open_target_stream(target).await?;
                 if let Some((first_path, first_schema)) = &reference {
-                    if first_schema != &arrow_schema {
+                    if first_schema.fields() != arrow_schema.fields() {
                         Err(FaucetError::Source(schema_mismatch_message_pair(
                             first_path,
                             first_schema,
@@ -635,10 +635,26 @@ async fn list_s3_prefix(
         let meta = item.map_err(|e| {
             FaucetError::Source(format!("S3 list error for prefix '{prefix}': {e}"))
         })?;
-        keys.push(meta.location);
+        if is_data_object(meta.location.as_ref(), meta.size, prefix) {
+            keys.push(meta.location);
+        }
     }
     keys.sort();
     Ok(keys.into_iter().map(FileTarget::S3).collect())
+}
+
+/// Whether a listed key is a data file: not a zero-byte folder marker and
+/// without a `_`- or `.`-prefixed segment below `prefix` (`_SUCCESS`,
+/// `_temporary/…`, `.crc`).
+fn is_data_object(key: &str, size: u64, prefix: &str) -> bool {
+    if size == 0 || key.ends_with('/') {
+        return false;
+    }
+    let dir = &prefix[..prefix.rfind('/').map_or(0, |i| i + 1)];
+    !key.strip_prefix(dir)
+        .unwrap_or(key)
+        .split('/')
+        .any(|s| s.starts_with('_') || s.starts_with('.'))
 }
 
 /// Build an `AmazonS3` `object_store` client from a `ParquetS3Config`.
@@ -754,6 +770,18 @@ fn schema_mismatch_message_pair(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn markers_and_hidden_objects_are_not_data() {
+        use super::is_data_object;
+        assert!(is_data_object("out/part-0.parquet", 10, "out/"));
+        assert!(!is_data_object("out/_SUCCESS", 0, "out/"));
+        assert!(!is_data_object("out/_common_metadata", 10, "out/"));
+        assert!(!is_data_object("out/.part-0.parquet.crc", 8, "out/"));
+        assert!(!is_data_object("out/_temporary/0/part.parquet", 8, "out/"));
+        assert!(!is_data_object("out/sub/", 0, "out/"));
+        assert!(is_data_object("_raw/a.parquet", 4, "_raw/"));
+    }
+
     use super::*;
     use crate::config::ParquetSourceConfig;
     use faucet_core::Source;

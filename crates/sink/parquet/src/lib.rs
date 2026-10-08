@@ -18,6 +18,7 @@
 pub mod config;
 pub mod schema;
 pub mod sink;
+mod upload;
 
 pub use config::{
     DEFAULT_ROW_GROUP_SIZE, DEFAULT_SAMPLE_SIZE, ParquetCompression, ParquetDestination,

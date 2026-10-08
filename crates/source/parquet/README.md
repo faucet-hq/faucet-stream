@@ -125,18 +125,18 @@ Each row becomes a `serde_json::Value::Object`. Field encoding is delegated to `
 
 | Arrow type | JSON shape |
 |---|---|
-| `Int32`/`Int64`/`Float32`/`Float64` | number |
+| `Int32`/`Int64`/`Float32`/`Float64` | number (NaN / ±Infinity as the strings `"NaN"` / `"Infinity"` / `"-Infinity"`) |
 | `Utf8`/`LargeUtf8` | string |
 | `Boolean` | `true`/`false` |
 | `Date32`/`Date64` | ISO-8601 date string |
 | `Time32`/`Time64` | ISO-8601 time string |
 | `Timestamp(unit, tz)` | ISO-8601 timestamp string |
-| `Decimal128`/`Decimal256` | string (precision/scale preserved) |
+| `Decimal128`/`Decimal256` | string, every digit kept |
 | `Binary`/`LargeBinary`/`FixedSizeBinary` | base64 string |
 | `Struct(...)` | nested object |
 | `List`/`LargeList`/`FixedSizeList` | array |
 | `Map(K, V)` | object keyed by `K` |
-| Null values | field omitted |
+| Null values | `null` (the field is always present) |
 
 ## Streaming & batching
 

@@ -277,9 +277,9 @@ The builder methods are `delimiter(u8)`, `write_headers(bool)`, `append(bool)`, 
 2. The first open obeys `config.append` (truncate when `false`). A `Mutex` guards the writer state (column order + `csv::Writer`) for thread-safe access.
 3. Each record's cells are written in column order; missing fields become empty strings, and the `csv` crate applies RFC 4180 quoting automatically.
 4. All CSV I/O runs inside `tokio::task::spawn_blocking` so the async runtime is never blocked; the writer state is moved in and out of the `Mutex` across the blocking boundary (never held across an await).
-5. `flush()` finalises the writer (and the compression encoder, with its error surfaced) and **clears the writer slot**. A subsequent `write_batch` reopens the file in **append mode regardless of `config.append`**, so the pipeline's per-bookmark flush is safe for CDC-style sources — every transaction appends rather than truncates. The header is written only on the very first open.
+5. `flush()` finalises the writer (and the compression encoder, with its error surfaced), `fsync`s the file so the bookmark the pipeline records next never outlives the rows, and **clears the writer slot**. A batch that fails (a non-object record, `on_unknown_field: error`, an I/O error) leaves the open writer in place, so earlier rows and an open compressed frame are still finished by the next `flush()`. A subsequent `write_batch` reopens the file in **append mode regardless of `config.append`**, so the pipeline's per-bookmark flush is safe for CDC-style sources — every transaction appends rather than truncates. The header is written only on the very first open.
 6. The default `Sink` impl does **not** flush on `Drop` — always call `flush()` before dropping the sink or reading the file.
-7. `check()` (for `faucet doctor`) verifies the parent directory exists and is writable by creating then removing a temp file there; it never touches your actual output file.
+7. `check()` (for `faucet doctor`) verifies the nearest existing ancestor of the output path is a writable directory (the sink creates missing directories) by creating then removing a temp file there; it never touches your actual output file.
 
 ## Lineage dataset URI
 

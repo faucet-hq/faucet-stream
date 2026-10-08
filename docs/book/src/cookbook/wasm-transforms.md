@@ -50,7 +50,7 @@ module sources live under `examples/wasm-transforms/`.
 | `memory_limit_mb` | `16` | Linear-memory cap. A record that grows memory past this fails (see `on_error`). ~8 MB is the practical floor for ~1 KB JSON records. |
 | `fuel_limit` | `10_000_000` | wasmtime fuel per record — a deterministic CPU bound. A record that exhausts fuel fails. |
 | `on_error` | `fail` | `fail` aborts the run (like every other transform); `skip` drops the failing record; `passthrough` emits it unchanged. |
-| `reload_on_change` | `false` | Re-stat the module mtime before each page; recompile + atomically swap if it changed. A failed recompile keeps the last-known-good module and warns. |
+| `reload_on_change` | `false` | Re-stat the module mtime before each page; recompile, check the ABI exports, and atomically swap if it changed. A module that fails to compile or to pass the ABI check keeps the last-known-good module and warns. |
 
 ## The ABI (v1)
 

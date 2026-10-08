@@ -1,9 +1,12 @@
 //! Encryption at rest for faucet-managed local files (#207).
 //!
 //! Seals [`FileStateStore`](crate::state::FileStateStore) bookmark files and
-//! (via the jsonl sink's `encryption` feature) per-line JSONL / DLQ output
+//! (via the file sinks' `encryption` feature) per-line JSONL / DLQ output
 //! with authenticated encryption, so resume positions and dead-lettered
 //! records — which can embed sensitive values — are not stored in plaintext.
+//! A per-line file binds its lines with the `SEALED_LINE*` contexts and
+//! carries a header and trailer, so the file is authenticated whole, not only
+//! each line (see `faucet_common_file::sealed_lines`).
 //!
 //! ## On-disk format (v1)
 //!
@@ -260,6 +263,45 @@ impl CompiledEncryption {
     }
 }
 
+/// Associated-data context of a record line in a JSON Lines file sealed per
+/// line (#789 FILE-24). A file of such lines opens with a header line, ends
+/// with a trailer line carrying the record count and a digest of every line,
+/// and each line is bound so it can not be read as an unbound one.
+pub const SEALED_LINE_CONTEXT: &[u8] = b"faucet.sealed-lines.v2.line";
+/// Associated-data context of a per-line sealed file's header line.
+pub const SEALED_LINES_HEADER_CONTEXT: &[u8] = b"faucet.sealed-lines.v2.header";
+/// Associated-data context of a per-line sealed file's trailer line.
+pub const SEALED_LINES_TRAILER_CONTEXT: &[u8] = b"faucet.sealed-lines.v2.trailer";
+
+/// One opened line of a per-line sealed file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealedLine {
+    /// A record line (bound, or a legacy unbound line) and its plaintext.
+    Data(Vec<u8>),
+    /// The file's header line.
+    Header(Vec<u8>),
+    /// The file's trailer line.
+    Trailer(Vec<u8>),
+}
+
+impl CompiledEncryption {
+    /// Open one sealed line of a per-line sealed file, telling record lines
+    /// from the header and trailer by the context each was sealed under.
+    pub fn open_line(&self, sealed: &[u8]) -> Result<SealedLine, FaucetError> {
+        let data = self.decrypt_bound(sealed, SEALED_LINE_CONTEXT);
+        if let Ok(plain) = data {
+            return Ok(SealedLine::Data(plain));
+        }
+        if let Ok(plain) = self.decrypt_bound(sealed, SEALED_LINES_HEADER_CONTEXT) {
+            return Ok(SealedLine::Header(plain));
+        }
+        if let Ok(plain) = self.decrypt_bound(sealed, SEALED_LINES_TRAILER_CONTEXT) {
+            return Ok(SealedLine::Trailer(plain));
+        }
+        data.map(SealedLine::Data)
+    }
+}
+
 fn bound_aad(context: &[u8]) -> Vec<u8> {
     let mut aad = BOUND_AAD_PREFIX.to_vec();
     aad.extend_from_slice(context);
@@ -268,6 +310,40 @@ fn bound_aad(context: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sealed_lines_open_by_their_context() {
+        let enc = CompiledEncryption::compile(&EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let line = enc.encrypt_bound(b"r", SEALED_LINE_CONTEXT);
+        let head = enc.encrypt_bound(b"h", SEALED_LINES_HEADER_CONTEXT);
+        let tail = enc.encrypt_bound(b"t", SEALED_LINES_TRAILER_CONTEXT);
+        assert_eq!(
+            enc.open_line(&line).unwrap(),
+            SealedLine::Data(b"r".to_vec())
+        );
+        assert_eq!(
+            enc.open_line(&head).unwrap(),
+            SealedLine::Header(b"h".to_vec())
+        );
+        assert_eq!(
+            enc.open_line(&tail).unwrap(),
+            SealedLine::Trailer(b"t".to_vec())
+        );
+        assert_eq!(
+            enc.open_line(&enc.encrypt(b"old")).unwrap(),
+            SealedLine::Data(b"old".to_vec())
+        );
+        assert!(
+            enc.decrypt(&line).is_err(),
+            "a bound line never reads as unbound"
+        );
+        assert!(enc.open_line(&enc.encrypt_bound(b"x", b"other")).is_err());
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -628,6 +628,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reload_keeps_last_good_when_the_new_module_breaks_the_abi() {
+        let f = write_wasm(&identity_wat());
+        let mut c = cfg(f.path());
+        c.reload_on_change = true;
+        let t = WasmTransform::compile(&c).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let no_alloc = r#"(module
+            (memory (export "memory") 1)
+            (func (export "transform") (param i32) (param i32) (result i64) (i64.const 0)))"#;
+        std::fs::write(f.path(), wat::parse_str(no_alloc).unwrap()).unwrap();
+
+        assert_eq!(
+            t.run_page(vec![json!({"keep": 1})]).unwrap(),
+            vec![json!({"keep": 1})]
+        );
+    }
+
+    #[test]
+    fn the_same_module_compiles_once_across_transforms() {
+        let wat = format!(
+            r#"(module {PREAMBLE}
+            (data (i32.const 50) "module-cache-test")
+            (func (export "transform") (param i32) (param i32) (result i64) (i64.const 0)))"#
+        );
+        let (f1, f2) = (write_wasm(&wat), write_wasm(&wat));
+        let a = WasmTransform::compile(&cfg(f1.path())).unwrap();
+        let b = WasmTransform::compile(&cfg(f2.path())).unwrap();
+        let other = write_wasm(&identity_wat());
+        let c = WasmTransform::compile(&cfg(other.path())).unwrap();
+        let engine = |t: &WasmTransform| t.engine.lock().unwrap().engine.clone();
+        assert!(wasmtime::Engine::same(&engine(&a), &engine(&b)));
+        assert!(!wasmtime::Engine::same(&engine(&a), &engine(&c)));
+        assert!(crate::engine::MODULES_COMPILED.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
+    fn compile_inside_a_multi_thread_runtime_runs_off_the_worker() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let f = write_wasm(&identity_wat());
+        let c = cfg(f.path());
+        let t = rt
+            .block_on(async move { tokio::spawn(async move { WasmTransform::compile(&c) }).await });
+        assert!(t.unwrap().is_ok());
+    }
+
     /// Traps on a short record after dirtying a global; a dirty instance drops
     /// every later record instead of echoing it.
     fn dirty_trap_wat() -> String {

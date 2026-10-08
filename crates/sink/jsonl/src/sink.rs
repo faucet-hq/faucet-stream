@@ -89,6 +89,20 @@ impl JsonlSink {
             .await
     }
 
+    /// Whether the file holds plain newline-terminated lines (no compression),
+    /// so a torn last line can be found and cut.
+    fn writes_plain_lines(&self) -> bool {
+        #[cfg(feature = "compression")]
+        {
+            self.config
+                .compression
+                .resolve(&self.config.path.to_string_lossy())
+                == faucet_core::Compression::None
+        }
+        #[cfg(not(feature = "compression"))]
+        true
+    }
+
     /// Ensure the file is open and return a mutable reference to the writer.
     async fn ensure_open(
         &self,
@@ -120,6 +134,14 @@ impl JsonlSink {
                     ))
                 })?;
             }
+            if append && self.writes_plain_lines() {
+                trim_partial_line(&self.config.path).await.map_err(|e| {
+                    FaucetError::Sink(format!(
+                        "failed to repair a partial last line in {}: {e}",
+                        self.config.path.display()
+                    ))
+                })?;
+            }
             // Provenance for the retention GC (#587): probe before the open, so
             // `create(true)` cannot make a file faucet did not create look like
             // one it did. Idempotent + first-open-wins, so the flush→reopen
@@ -139,6 +161,11 @@ impl JsonlSink {
                         self.config.path.display()
                     ))
                 })?;
+            if !opened_before {
+                sync_parent_dir(&self.config.path)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("JSONL directory fsync failed: {e}")))?;
+            }
             self.opened_once
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let buffered = tokio::io::BufWriter::new(file);
@@ -156,6 +183,60 @@ impl JsonlSink {
         }
         Ok(guard)
     }
+}
+
+/// Make a newly created file's directory entry durable.
+async fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        tokio::fs::File::open(parent).await?.sync_all().await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Cut a torn last line (bytes after the final newline) left by a write that
+/// failed part-way, so an appending run starts on a line boundary.
+async fn trim_partial_line(path: &std::path::Path) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = match OpenOptions::new().read(true).write(true).open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata().await?.len();
+    let mut end = len;
+    let mut buf = vec![0u8; 8192];
+    let keep = loop {
+        if end == 0 {
+            break 0;
+        }
+        let start = end.saturating_sub(buf.len() as u64);
+        let n = (end - start) as usize;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        file.read_exact(&mut buf[..n]).await?;
+        if let Some(i) = buf[..n].iter().rposition(|b| *b == b'\n') {
+            break start + i as u64 + 1;
+        }
+        end = start;
+    };
+    if keep < len {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = len - keep,
+            "jsonl sink: cutting a partial last line left by an interrupted write"
+        );
+        file.set_len(keep).await?;
+        file.sync_all().await?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -211,14 +292,16 @@ impl faucet_core::Sink for JsonlSink {
                 None => line,
             };
 
-            writer
-                .write_all(line.as_bytes())
-                .await
-                .map_err(|e| FaucetError::Sink(format!("write failed: {e}")))?;
-            writer
-                .write_all(b"\n")
-                .await
-                .map_err(|e| FaucetError::Sink(format!("write failed: {e}")))?;
+            let mut line = line.into_bytes();
+            line.push(b'\n');
+            if let Err(e) = writer.write_all(&line).await {
+                // Close the file: the next write reopens it and cuts any torn
+                // last line rather than continuing after it.
+                if let Some(mut w) = guard.take() {
+                    let _ = w.shutdown().await;
+                }
+                return Err(FaucetError::Sink(format!("write failed: {e}")));
+            }
         }
 
         tracing::debug!(records = records.len(), "JSONL batch written");
@@ -233,6 +316,15 @@ impl faucet_core::Sink for JsonlSink {
                 .shutdown()
                 .await
                 .map_err(|e| FaucetError::Sink(format!("flush failed: {e}")))?;
+            // Durable before the pipeline records the bookmark.
+            OpenOptions::new()
+                .append(true)
+                .open(&self.config.path)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("fsync open failed: {e}")))?
+                .sync_all()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("fsync failed: {e}")))?;
         }
         Ok(())
     }
@@ -270,6 +362,29 @@ mod tests {
     use faucet_core::Sink;
     use serde_json::json;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn an_append_run_cuts_a_torn_last_line_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        std::fs::write(&path, "{\"id\":1}\n{\"id\":2,\"na").unwrap();
+        let sink = JsonlSink::new(JsonlSinkConfig::new(&path).append(true));
+        sink.write_batch(&[json!({"id": 3})]).await.unwrap();
+        sink.flush().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"id\":1}\n{\"id\":3}\n"
+        );
+
+        let long = dir.path().join("long.jsonl");
+        let torn = "x".repeat(20_000);
+        std::fs::write(&long, &torn).unwrap();
+        trim_partial_line(&long).await.unwrap();
+        assert_eq!(std::fs::read(&long).unwrap().len(), 0);
+        trim_partial_line(&dir.path().join("missing.jsonl"))
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn dataset_uri_uses_display_on_pathbuf() {
@@ -376,10 +491,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_fails_when_parent_dir_missing() {
+    async fn check_passes_when_a_missing_parent_can_be_created() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nope").join("out.jsonl");
+        let path = dir.path().join("nope").join("deeper").join("out.jsonl");
         let sink = JsonlSink::new(JsonlSinkConfig::new(&path));
+        let report = sink
+            .check(&faucet_core::check::CheckContext::default())
+            .await
+            .unwrap();
+        assert_eq!(report.failed_count(), 0, "the sink creates the directory");
+        assert!(!dir.path().join("nope").exists(), "check() creates nothing");
+
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let sink = JsonlSink::new(JsonlSinkConfig::new(file.join("out.jsonl")));
         let report = sink
             .check(&faucet_core::check::CheckContext::default())
             .await

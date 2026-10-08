@@ -46,6 +46,18 @@ fn default_http_retries() -> u32 {
     3
 }
 
+fn default_max_object_bytes() -> u64 {
+    faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
+}
+
+fn default_http_connect_timeout_secs() -> u64 {
+    30
+}
+
+fn default_http_read_timeout_secs() -> u64 {
+    300
+}
+
 /// Configuration for the local (and `http(s)://`) file source.
 ///
 /// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
@@ -89,6 +101,12 @@ pub struct FileSourceConfig {
     /// names no format under `format: auto`.
     #[serde(default)]
     pub strict: bool,
+    /// Largest file, once decompressed, that a format read whole (JSON array,
+    /// XML, Excel, compressed or remote Avro/ORC/Parquet, encrypted files) may
+    /// reach; a larger one fails with an error instead of exhausting memory.
+    /// Default 2 GiB.
+    #[serde(default = "default_max_object_bytes")]
+    pub max_object_bytes: u64,
     /// Read at most this many files (after sorting and filtering).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_files: Option<usize>,
@@ -99,6 +117,14 @@ pub struct FileSourceConfig {
     /// exponential backoff that honours `Retry-After`.
     #[serde(default = "default_http_retries")]
     pub http_retries: u32,
+    /// Seconds to wait for an HTTP connection to open. A timeout is retried.
+    #[serde(default = "default_http_connect_timeout_secs")]
+    pub http_connect_timeout_secs: u64,
+    /// Seconds an HTTP response may go without sending a byte — waiting for
+    /// the headers or mid-body. A timeout before the body starts is retried;
+    /// one mid-body fails the file.
+    #[serde(default = "default_http_read_timeout_secs")]
+    pub http_read_timeout_secs: u64,
     /// CSV dialect, used for CSV files.
     #[serde(default)]
     pub csv: CsvOptions,
@@ -145,8 +171,11 @@ impl FileSourceConfig {
             stable_for_secs: None,
             strict: false,
             max_files: None,
+            max_object_bytes: default_max_object_bytes(),
             headers: BTreeMap::new(),
             http_retries: default_http_retries(),
+            http_connect_timeout_secs: default_http_connect_timeout_secs(),
+            http_read_timeout_secs: default_http_read_timeout_secs(),
             csv: CsvOptions::default(),
             excel: ExcelOptions::default(),
             xml: XmlOptions::default(),
@@ -227,6 +256,18 @@ impl FileSourceConfig {
         if !self.headers.is_empty() && !self.is_http() {
             return Err(FaucetError::Config(
                 "file source: `headers` apply only to an http(s):// path".into(),
+            ));
+        }
+        if self.max_object_bytes == 0 {
+            return Err(FaucetError::Config(
+                "file source: `max_object_bytes` must be at least 1".into(),
+            ));
+        }
+        if self.http_connect_timeout_secs == 0 || self.http_read_timeout_secs == 0 {
+            return Err(FaucetError::Config(
+                "file source: `http_connect_timeout_secs` and `http_read_timeout_secs` must be \
+                 at least 1"
+                    .into(),
             ));
         }
         for (k, v) in &self.headers {

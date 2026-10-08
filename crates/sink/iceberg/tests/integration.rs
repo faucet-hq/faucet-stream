@@ -602,3 +602,59 @@ async fn a_fractional_value_in_an_integer_column_is_refused() {
         .expect_err("10.5 is not an integer");
     assert!(err.to_string().contains("'id'"), "{err}");
 }
+
+/// #789 FILE-16 / FILE-51: an exactly-once page that fails in a later chunk
+/// commits nothing — not even its earlier chunks — and a committed token is
+/// also kept as a table property, so it outlives its snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_idempotent_page_commits_nothing_and_tokens_are_carried() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut cfg = sink_config(&dir, "eo");
+    cfg.batch_size = 2;
+    let sink = IcebergSink::new(cfg.clone()).await.expect("sink");
+    let token = faucet_core::idempotency::format_token(1);
+    sink.write_batch_idempotent(&[json!({"id": 1})], "p::r", &token)
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+
+    let reader = open_reader_catalog(&dir).await;
+    let tid = TableIdent::new(NamespaceIdent::from_strs(["db"]).unwrap(), "eo".into());
+    let table = reader.load_table(&tid).await.unwrap();
+    assert_eq!(
+        table
+            .metadata()
+            .properties()
+            .get("faucet.commit-token.p::r"),
+        Some(&token)
+    );
+    assert_eq!(
+        sink.last_committed_token("p::r").await.unwrap(),
+        Some(token)
+    );
+
+    let page = [
+        json!({"id": 2}),
+        json!({"id": 3}),
+        json!({"id": 4}),
+        json!({"id": "not-a-number"}),
+    ];
+    let token2 = faucet_core::idempotency::format_token(2);
+    assert!(
+        sink.write_batch_idempotent(&page, "p::r", &token2)
+            .await
+            .is_err()
+    );
+    assert!(
+        sink.flush().await.is_err(),
+        "a poisoned sink refuses to commit"
+    );
+    assert!(sink.write_batch(&[json!({"id": 9})]).await.is_err());
+    assert_eq!(read_rows(&dir, "eo").await, vec![json!({"id": 1})]);
+
+    let fresh = IcebergSink::new(cfg).await.expect("sink");
+    assert_eq!(
+        fresh.last_committed_token("p::r").await.unwrap().as_deref(),
+        Some(faucet_core::idempotency::format_token(1).as_str())
+    );
+}

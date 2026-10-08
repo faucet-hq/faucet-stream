@@ -5,8 +5,8 @@
 //! object. No datafusion: the active file set comes from the Delta log
 //! (`get_active_add_actions_by_partitions`) and each parquet file is streamed through the async
 //! Arrow reader faucet's Parquet source uses. Partition-column values (which
-//! live in the Hive-style path, not the file) are reconstructed and merged
-//! back into every row, typed against the table schema.
+//! the log's add actions carry, not the file) are merged back into every row,
+//! typed against the table schema.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -28,7 +28,7 @@ pub struct DeltaSource {
     config: DeltaSourceConfig,
 }
 
-/// One active data file plus the partition values encoded in its path.
+/// One active data file plus its partition values from the log.
 struct DataFile {
     path: ObjPath,
     /// `col -> JSON value` for every partition column, typed against the table
@@ -68,6 +68,14 @@ impl DeltaSource {
         let arrow_schema =
             faucet_common_delta::arrow_bridge::schema_from_delta(&state.snapshot().arrow_schema())?;
         let partition_cols = state.metadata().partition_columns().to_vec();
+        refuse_column_mapping(
+            state
+                .snapshot()
+                .table_properties()
+                .column_mapping_mode
+                .map(|m| format!("{m:?}")),
+        )?;
+        check_requested(&self.config.columns, &arrow_schema, &partition_cols)?;
 
         let views: Vec<_> =
             futures::TryStreamExt::try_collect(table.get_active_add_actions_by_partitions(&[]))
@@ -80,14 +88,15 @@ impl DeltaSource {
                 .iter()
                 .map(|v| (v.path(), v.deletion_vector_descriptor().is_some())),
         )?;
-        let paths: Vec<ObjPath> = views.iter().map(|v| v.object_store_path()).collect();
-
-        let files = paths
-            .into_iter()
-            .map(|path| {
-                let partitions =
-                    parse_partition_values(path.as_ref(), &partition_cols, &arrow_schema);
-                DataFile { path, partitions }
+        let files = views
+            .iter()
+            .map(|v| DataFile {
+                path: v.object_store_path(),
+                partitions: typed_partition_values(
+                    &v.partition_values_map(),
+                    &partition_cols,
+                    &arrow_schema,
+                ),
             })
             .collect();
         Ok((files, arrow_schema, partition_cols))
@@ -109,6 +118,57 @@ impl DeltaSource {
                 .collect(),
         )
     }
+}
+
+/// Refuse a column-mapped table: its data files store physical column names
+/// (`col-<uuid>`) this reader does not translate back to logical ones.
+fn refuse_column_mapping(mode: Option<String>) -> Result<(), FaucetError> {
+    match mode.as_deref() {
+        None | Some("None") => Ok(()),
+        Some(m) => Err(FaucetError::Source(format!(
+            "delta: the table uses column mapping (`delta.columnMapping.mode` = {}), which \
+             this source does not support: its data files store physical column names, so \
+             rows would carry `col-<uuid>` keys instead of the column names",
+            m.to_ascii_lowercase()
+        ))),
+    }
+}
+
+/// Refuse requested `columns` the table does not have.
+fn check_requested(
+    requested: &[String],
+    schema: &SchemaRef,
+    partition_cols: &[String],
+) -> Result<(), FaucetError> {
+    let unknown: Vec<&str> = requested
+        .iter()
+        .filter(|c| schema.field_with_name(c).is_err() && !partition_cols.contains(c))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(FaucetError::Config(format!(
+            "delta source: `columns` names {} not in the table schema",
+            unknown.join(", ")
+        )))
+    }
+}
+
+/// The parquet projection over top-level columns named in `cols` (a struct,
+/// list or map column is one root, whatever its leaves are called).
+fn root_projection(
+    pq: &parquet::schema::types::SchemaDescriptor,
+    cols: &[String],
+) -> ProjectionMask {
+    let roots = pq
+        .root_schema()
+        .get_fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| cols.iter().any(|c| c == f.name()))
+        .map(|(i, _)| i);
+    ProjectionMask::roots(pq, roots)
 }
 
 /// Refuse a table whose active files carry deletion vectors: reading such a
@@ -214,6 +274,7 @@ impl faucet_core::Source for DeltaSource {
                 "delta source resolved active files",
             );
 
+            let mut whole_file: Vec<Value> = Vec::new();
             for file in &files {
                 let reader = ParquetObjectReader::new(store.clone(), file.path.clone());
                 let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(|e| {
@@ -223,20 +284,10 @@ impl faucet_core::Source for DeltaSource {
                     ))
                 })?;
 
-                if self.config.batch_size > 0 {
-                    builder = builder.with_batch_size(self.config.batch_size);
-                }
+                let file_rows = builder.metadata().file_metadata().num_rows();
+                builder = builder.with_batch_size(read_batch_size(self.config.batch_size, file_rows));
                 if let Some(cols) = &data_projection {
-                    // Only project columns actually present in this file. A
-                    // requested column that is neither a data column here nor a
-                    // partition column is genuinely absent → surface it.
-                    let pq = builder.parquet_schema();
-                    let present: Vec<&str> = cols
-                        .iter()
-                        .filter(|c| pq.columns().iter().any(|col| col.name() == c.as_str()))
-                        .map(String::as_str)
-                        .collect();
-                    let mask = ProjectionMask::columns(pq, present.iter().copied());
+                    let mask = root_projection(builder.parquet_schema(), cols);
                     builder = builder.with_projection(mask);
                 }
 
@@ -252,12 +303,17 @@ impl faucet_core::Source for DeltaSource {
                         FaucetError::Source(format!("delta: read error in '{}': {e}", file.path))
                     })?;
                     let mut rows = record_batch_to_json(&batch)?;
-                    if !rows.is_empty() {
-                        for row in &mut rows {
-                            merge_partitions(row, &file.partitions, requested);
-                        }
+                    for row in &mut rows {
+                        merge_partitions(row, &file.partitions, requested);
+                    }
+                    if self.config.batch_size == 0 {
+                        whole_file.append(&mut rows);
+                    } else if !rows.is_empty() {
                         yield StreamPage { records: rows, bookmark: None };
                     }
+                }
+                if !whole_file.is_empty() {
+                    yield StreamPage { records: std::mem::take(&mut whole_file), bookmark: None };
                 }
             }
         })
@@ -291,22 +347,16 @@ impl faucet_core::Source for DeltaSource {
             let requested: Option<&[String]> =
                 if self.config.columns.is_empty() { None } else { Some(&self.config.columns) };
 
+            let mut file_batches: Vec<arrow::array::RecordBatch> = Vec::new();
             for file in &files {
                 let reader = ParquetObjectReader::new(store.clone(), file.path.clone());
                 let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(|e| {
                     FaucetError::Source(format!("delta: could not open data file '{}': {e}", file.path))
                 })?;
-                if self.config.batch_size > 0 {
-                    builder = builder.with_batch_size(self.config.batch_size);
-                }
+                let file_rows = builder.metadata().file_metadata().num_rows();
+                builder = builder.with_batch_size(read_batch_size(self.config.batch_size, file_rows));
                 if let Some(cols) = &data_projection {
-                    let pq = builder.parquet_schema();
-                    let present: Vec<&str> = cols
-                        .iter()
-                        .filter(|c| pq.columns().iter().any(|col| col.name() == c.as_str()))
-                        .map(String::as_str)
-                        .collect();
-                    let mask = ProjectionMask::columns(pq, present.iter().copied());
+                    let mask = root_projection(builder.parquet_schema(), cols);
                     builder = builder.with_projection(mask);
                 }
                 let mut batches = builder.build().map_err(|e| {
@@ -320,6 +370,18 @@ impl faucet_core::Source for DeltaSource {
                         continue;
                     }
                     let batch = append_partition_columns(batch, &file.partitions, &schema, requested)?;
+                    if self.config.batch_size == 0 {
+                        file_batches.push(batch);
+                    } else {
+                        yield faucet_core::ColumnarPage { batch, bookmark: None };
+                    }
+                }
+                if let Some(first) = file_batches.first() {
+                    let batch = arrow::compute::concat_batches(&first.schema(), &file_batches)
+                        .map_err(|e| {
+                            FaucetError::Source(format!("delta: joining '{}' into one page failed: {e}", file.path))
+                        })?;
+                    file_batches.clear();
                     yield faucet_core::ColumnarPage { batch, bookmark: None };
                 }
             }
@@ -380,32 +442,38 @@ fn append_partition_columns(
         .map_err(|e| FaucetError::Source(format!("delta: assembling columnar batch failed: {e}")))
 }
 
-/// Parse Hive-style `col=value` segments out of a data file path, typing each
-/// value against the table's Arrow schema. Only the declared partition columns
-/// are extracted; unknown segments are ignored.
-fn parse_partition_values(
-    path: &str,
+/// The Arrow reader's batch size: `batch_size`, or the whole file for the
+/// `0` sentinel (one page per file).
+fn read_batch_size(batch_size: usize, file_rows: i64) -> usize {
+    match batch_size {
+        0 => usize::try_from(file_rows).unwrap_or(usize::MAX).max(1),
+        n => n,
+    }
+}
+
+/// Type the log's raw partition values (the add action's `partitionValues`,
+/// authoritative whatever the file path looks like) against the table schema.
+/// A partition column the add action omits, or records as null, is `null`.
+fn typed_partition_values(
+    raw: &HashMap<String, Option<String>>,
     partition_cols: &[String],
     schema: &SchemaRef,
 ) -> HashMap<String, Value> {
-    let mut out = HashMap::new();
-    if partition_cols.is_empty() {
-        return out;
-    }
-    for segment in path.split('/') {
-        if let Some((k, v)) = segment.split_once('=')
-            && partition_cols.iter().any(|c| c == k)
-        {
-            let decoded = percent_decode(v);
+    partition_cols
+        .iter()
+        .map(|col| {
             let dt = schema
-                .field_with_name(k)
+                .field_with_name(col)
                 .ok()
                 .map(|f| f.data_type().clone())
                 .unwrap_or(DataType::Utf8);
-            out.insert(k.to_string(), coerce_partition_value(&decoded, &dt));
-        }
-    }
-    out
+            let value = match raw.get(col) {
+                Some(Some(v)) => coerce_partition_value(v, &dt),
+                _ => Value::Null,
+            };
+            (col.clone(), value)
+        })
+        .collect()
 }
 
 /// The Delta Hive-default-partition sentinel — represents a NULL partition
@@ -463,33 +531,11 @@ fn merge_partitions(
         }
         if let Some(cols) = requested {
             map.retain(|k, _| cols.iter().any(|c| c == k));
-        }
-    }
-}
-
-/// Minimal `%XX` percent-decoder for Hive-encoded partition path segments.
-/// Leaves malformed escapes untouched.
-fn percent_decode(s: &str) -> String {
-    if !s.contains('%') {
-        return s.to_string();
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
+            for c in cols {
+                map.entry(c.clone()).or_insert(Value::Null);
             }
         }
-        out.push(bytes[i]);
-        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -509,34 +555,36 @@ mod tests {
     }
 
     #[test]
-    fn parses_typed_partition_values() {
+    fn partition_values_come_from_the_log_typed_by_the_schema() {
         let s = schema();
-        let cols = vec!["dt".to_string(), "part".to_string()];
-        let m = parse_partition_values("t/dt=2026-01-01/part=7/file.parquet", &cols, &s);
+        let cols = vec!["dt".to_string(), "part".to_string(), "region".to_string()];
+        let raw = HashMap::from([
+            ("dt".to_string(), Some("2026-01-01".to_string())),
+            ("part".to_string(), Some("7".to_string())),
+            ("region".to_string(), None),
+        ]);
+        let m = typed_partition_values(&raw, &cols, &s);
         assert_eq!(m["dt"], json!("2026-01-01"));
         assert_eq!(m["part"], json!(7));
-    }
-
-    #[test]
-    fn hive_null_becomes_json_null() {
-        let s = schema();
-        let cols = vec!["region".to_string()];
-        let m = parse_partition_values("t/region=__HIVE_DEFAULT_PARTITION__/f.parquet", &cols, &s);
         assert_eq!(m["region"], Value::Null);
+        let partial = typed_partition_values(&HashMap::new(), &cols[..1], &s);
+        assert_eq!(partial["dt"], Value::Null);
+        assert!(typed_partition_values(&raw, &[], &s).is_empty());
     }
 
     #[test]
-    fn percent_decoding_of_partition_values() {
+    fn column_mapping_and_unknown_columns_are_refused() {
+        assert!(refuse_column_mapping(None).is_ok());
+        assert!(refuse_column_mapping(Some("None".into())).is_ok());
+        let err = refuse_column_mapping(Some("Name".into())).unwrap_err();
+        assert!(err.to_string().contains("column mapping"), "{err}");
         let s = schema();
-        let cols = vec!["region".to_string()];
-        let m = parse_partition_values("t/region=a%2Fb/f.parquet", &cols, &s);
-        assert_eq!(m["region"], json!("a/b"));
-    }
-
-    #[test]
-    fn no_partition_columns_is_empty() {
-        let s = schema();
-        assert!(parse_partition_values("t/f.parquet", &[], &s).is_empty());
+        assert!(check_requested(&["id".into(), "p".into()], &s, &["p".into()]).is_ok());
+        let err = check_requested(&["nope".into()], &s, &[]).unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
+        assert_eq!(read_batch_size(0, 5_000), 5_000);
+        assert_eq!(read_batch_size(0, 0), 1);
+        assert_eq!(read_batch_size(10, 5_000), 10);
     }
 
     #[test]
@@ -555,6 +603,18 @@ mod tests {
         assert_eq!(row2["id"], json!(1));
         assert_eq!(row2["dt"], json!("2026-01-01"));
         assert!(row2.get("name").is_none());
+
+        let mut row3 = json!({"id": 1});
+        merge_partitions(
+            &mut row3,
+            &HashMap::new(),
+            Some(&["id".into(), "added".into()]),
+        );
+        assert_eq!(
+            row3,
+            json!({"id": 1, "added": null}),
+            "a requested column absent from a file is null"
+        );
     }
 
     #[test]

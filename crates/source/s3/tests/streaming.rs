@@ -740,3 +740,47 @@ async fn a_sinks_unfinished_output_is_not_listed() {
         datasets.iter().map(|d| &d.name).collect::<Vec<_>>()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn markers_are_skipped_and_whole_objects_are_capped() {
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(
+        &endpoint,
+        &[
+            ("out/rows.json".to_string(), r#"[{"id":1}]"#.to_string()),
+            ("out/_SUCCESS".to_string(), String::new()),
+            ("out/.rows.json.crc".to_string(), "crc".to_string()),
+            ("out/dir/".to_string(), String::new()),
+        ],
+    )
+    .await;
+    let config = || {
+        S3SourceConfig::new(TEST_BUCKET)
+            .prefix("out/")
+            .file_format(S3FileFormat::JsonArray)
+    };
+    let source = build_source(&endpoint, config()).await;
+    assert_eq!(
+        collect_all(&source, 0).await,
+        vec![serde_json::json!({"id": 1})]
+    );
+    let mut only_success = config();
+    only_success.include = Some("out/_*".into());
+    let source = build_source(&endpoint, only_success).await;
+    assert!(
+        source.fetch_with_context(&HashMap::new()).await.is_err(),
+        "an include glob reads exactly what it names — here the empty marker"
+    );
+    let mut capped = config();
+    capped.max_object_bytes = 4;
+    let err = build_source(&endpoint, capped)
+        .await
+        .fetch_with_context(&HashMap::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
+    let mut bad = config();
+    bad.include = Some("[".into());
+    bad.endpoint_url = Some(endpoint.clone());
+    assert!(S3Source::new(bad).await.is_err());
+}

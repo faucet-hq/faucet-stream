@@ -42,6 +42,8 @@ fn conformance_connector_name_nonempty() {
             password: "x".to_string(),
         },
         known_hosts: HostKeyPolicy::Insecure,
+        connect_timeout_secs: 30,
+        keepalive_interval_secs: 15,
     };
     let source =
         SftpSource::new(SftpSourceConfig::new(conn, "/data")).expect("source builds lazily");
@@ -80,6 +82,8 @@ fn connection(port: u16) -> SftpConnectionConfig {
         // The container's host key is ephemeral, so verification is disabled
         // for the test only.
         known_hosts: HostKeyPolicy::Insecure,
+        connect_timeout_secs: 30,
+        keepalive_interval_secs: 15,
     }
 }
 
@@ -142,6 +146,8 @@ async fn conformance_errors_not_panics() {
             password: "x".to_string(),
         },
         known_hosts: HostKeyPolicy::Insecure,
+        connect_timeout_secs: 30,
+        keepalive_interval_secs: 15,
     };
     let source =
         SftpSource::new(SftpSourceConfig::new(conn, "/data")).expect("source builds lazily");

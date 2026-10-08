@@ -24,7 +24,7 @@ storage-opendal = ["faucet-common-iceberg/storage-opendal"]
 arrow = ["faucet-core/arrow"]
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["arrow"] }
 faucet-common-iceberg.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -37,7 +37,6 @@ futures.workspace = true
 chrono.workspace = true
 iceberg = "0.10.0"
 arrow = "58"
-arrow-json = "58"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

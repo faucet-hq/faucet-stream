@@ -1,8 +1,8 @@
 //! Arrow ⇆ JSON conversion shared by the Delta source and sink.
 //!
 //! * [`record_batch_to_json`] — Arrow `RecordBatch` → `Vec<serde_json::Value>`
-//!   (the read path). Delegates to `arrow_json::ArrayWriter`, which already
-//!   encodes every Arrow logical type.
+//!   (the read path). Delegates to `faucet_core::columnar::record_batch_to_values`:
+//!   null columns stay present, decimals keep every digit (as strings).
 //! * [`infer_arrow_schema`] — a nullable-everywhere Arrow schema inferred from
 //!   a sample of JSON records (the write path, when creating a table / decoding
 //!   a batch).
@@ -12,7 +12,6 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
-use arrow_json::ArrayWriter;
 use faucet_core::FaucetError;
 use serde_json::Value;
 
@@ -23,26 +22,8 @@ pub fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<Value>, FaucetErr
         return Ok(Vec::new());
     }
 
-    let mut buf: Vec<u8> = Vec::with_capacity(batch.num_rows() * 64);
-    {
-        let mut writer = ArrayWriter::new(&mut buf);
-        writer
-            .write(batch)
-            .map_err(|e| FaucetError::Source(format!("delta: arrow_json encode error: {e}")))?;
-        writer
-            .finish()
-            .map_err(|e| FaucetError::Source(format!("delta: arrow_json finish error: {e}")))?;
-    }
-
-    let parsed: Value = serde_json::from_slice(&buf)
-        .map_err(|e| FaucetError::Source(format!("delta: arrow_json output parse error: {e}")))?;
-
-    match parsed {
-        Value::Array(rows) => Ok(rows),
-        other => Err(FaucetError::Source(format!(
-            "delta: arrow_json produced non-array output: {other}"
-        ))),
-    }
+    faucet_core::columnar::record_batch_to_values(batch)
+        .map_err(|e| FaucetError::Source(format!("delta: encoding rows as JSON failed: {e}")))
 }
 
 /// Infer a fully-nullable Arrow schema from up to `sample_size` JSON records.
@@ -105,6 +86,9 @@ fn make_nullable(field: &Field) -> Field {
         }
         DataType::List(inner) => DataType::List(Arc::new(make_nullable(inner.as_ref()))),
         DataType::LargeList(inner) => DataType::LargeList(Arc::new(make_nullable(inner.as_ref()))),
+        // Null in every sampled record: a nullable string column (no format
+        // can store a Null-typed one).
+        DataType::Null => DataType::Utf8,
         other => other.clone(),
     };
     Field::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
@@ -144,7 +128,28 @@ mod tests {
         assert_eq!(rows[0]["id"], 1);
         assert_eq!(rows[0]["name"], "Alice");
         assert_eq!(rows[1]["id"], 2);
-        assert!(rows[1].get("name").is_none() || rows[1]["name"].is_null());
+        assert_eq!(
+            rows[1].get("name"),
+            Some(&Value::Null),
+            "a null stays present"
+        );
+    }
+
+    #[test]
+    fn decimals_keep_every_digit() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Decimal128(38, 2),
+            true,
+        )]));
+        let d = arrow::array::Decimal128Array::from(vec![Some(i128::MAX / 10)])
+            .with_precision_and_scale(38, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(d)]).unwrap();
+        assert_eq!(
+            record_batch_to_json(&batch).unwrap()[0]["d"],
+            "170141183460469231731687303715884105.72"
+        );
     }
 
     #[test]

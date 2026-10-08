@@ -4,7 +4,8 @@ use crate::compile::{Reloadable, build_connection, sql_escape, validate_query};
 use crate::config::SqlTransformConfig;
 use crate::shovel::{
     ABSENT_MARKER, infer_schema, json_to_record_batch, mark_absent_fields, record_batches_to_json,
-    schema_eq, strip_absent_fields,
+    refuse_case_collisions, restore_empty_structs, schema_eq, stringify_empty_structs,
+    strip_absent_fields,
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -133,6 +134,11 @@ fn execute_page(st: &mut State, mut records: Vec<Value>) -> Result<Vec<Value>, F
     // Schema cache: infer once per page, reuse the cached schema on a match,
     // otherwise adopt the freshly inferred one (first page or drift).
     let mut fresh = infer_schema(&records)?;
+    refuse_case_collisions(&fresh)?;
+    let original = fresh.clone();
+    if let Some(rewritten) = stringify_empty_structs(&fresh, &mut records) {
+        fresh = rewritten;
+    }
     if mark_absent_fields(&mut records, &fresh) {
         let mut fields: Vec<_> = fresh.fields().iter().cloned().collect();
         fields.push(Arc::new(Field::new(ABSENT_MARKER, DataType::Utf8, true)));
@@ -149,6 +155,7 @@ fn execute_page(st: &mut State, mut records: Vec<Value>) -> Result<Vec<Value>, F
     let batches = run_query_batches(st, batch)?;
     let mut rows = record_batches_to_json(&batches)?;
     strip_absent_fields(&mut rows);
+    restore_empty_structs(&original, &mut rows);
     Ok(rows)
 }
 
@@ -207,29 +214,67 @@ fn register_batch_chunked(st: &mut State, batch: RecordBatch) -> Result<(), Fauc
     Ok(())
 }
 
+/// A file whose mtime is at least this old is taken as fully written.
+const RELOAD_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Gap between the two stats taken of a recently modified file.
+const RELOAD_RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
+type FileStamp = (std::time::SystemTime, u64);
+
+fn file_stamp(path: &str) -> Option<FileStamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// Whether a changed file can be read: its mtime is old enough, or a second
+/// stat taken a moment later saw the same mtime and size.
+fn settled(
+    first: FileStamp,
+    now: std::time::SystemTime,
+    recheck: impl FnOnce() -> Option<FileStamp>,
+) -> bool {
+    let age = now.duration_since(first.0).unwrap_or_default();
+    age >= RELOAD_SETTLE || recheck() == Some(first)
+}
+
 fn reload_relations(st: &mut State) -> Result<(), FaucetError> {
     for r in st.reloadables.iter_mut() {
-        let cur = std::fs::metadata(&r.path).and_then(|m| m.modified()).ok();
-        if cur != r.last_mtime {
-            let stmt = if r.is_csv {
-                format!(
-                    "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM read_csv_auto('{}', header={});",
-                    r.name,
-                    sql_escape(&r.path),
-                    r.has_header
-                )
-            } else {
-                format!(
-                    "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM read_json_auto('{}', format='newline_delimited');",
-                    r.name,
-                    sql_escape(&r.path)
-                )
-            };
-            st.conn.execute_batch(&stmt).map_err(|e| {
-                FaucetError::Transform(format!("sql transform: reload '{}': {e}", r.name))
-            })?;
-            r.last_mtime = cur;
+        let stamp = file_stamp(&r.path);
+        let cur = stamp.map(|s| s.0);
+        if cur == r.last_mtime {
+            continue;
         }
+        if let Some(first) = stamp
+            && !settled(first, std::time::SystemTime::now(), || {
+                std::thread::sleep(RELOAD_RECHECK);
+                file_stamp(&r.path)
+            })
+        {
+            tracing::debug!(
+                target: "faucet::transform::sql",
+                relation = %r.name,
+                "reference file is still being written; reloading on a later page"
+            );
+            continue;
+        }
+        let stmt = if r.is_csv {
+            format!(
+                "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM read_csv_auto('{}', header={});",
+                r.name,
+                sql_escape(&r.path),
+                r.has_header
+            )
+        } else {
+            format!(
+                "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM read_json_auto('{}', format='newline_delimited');",
+                r.name,
+                sql_escape(&r.path)
+            )
+        };
+        st.conn.execute_batch(&stmt).map_err(|e| {
+            FaucetError::Transform(format!("sql transform: reload '{}': {e}", r.name))
+        })?;
+        r.last_mtime = cur;
     }
     Ok(())
 }
@@ -296,6 +341,80 @@ mod tests {
         for r in &out {
             assert_eq!(r["n"], json!(1_250), "5000 rows / 4 keys = 1250 each");
         }
+    }
+
+    #[test]
+    fn a_changed_file_reloads_only_once_it_is_stable() {
+        let now = std::time::SystemTime::now();
+        let fresh = (now, 10);
+        assert!(settled(fresh, now, || Some(fresh)), "unchanged on recheck");
+        assert!(!settled(fresh, now, || Some((now, 20))), "still growing");
+        assert!(!settled(fresh, now, || None), "vanished mid-check");
+        let old = (now - RELOAD_SETTLE, 10);
+        assert!(
+            settled(old, now, || panic!("no recheck for an old file")),
+            "old mtime needs no recheck"
+        );
+    }
+
+    #[test]
+    fn decimals_and_hugeints_survive_exactly() {
+        let out = run(
+            "SELECT CAST('1234567890123456789012345678.0123456789' AS DECIMAL(38,10)) AS big, \
+                    CAST(12.34 AS DECIMAL(10,2)) AS small, \
+                    CAST(170141183460469231731687303715884105727 AS HUGEINT) AS huge, \
+                    SUM(v) AS total \
+             FROM batch",
+            vec![json!({"v": 1}), json!({"v": 2})],
+        );
+        assert_eq!(
+            out[0]["big"],
+            json!("1234567890123456789012345678.0123456789")
+        );
+        assert_eq!(out[0]["small"], json!(12.34));
+        assert_eq!(
+            out[0]["huge"],
+            json!("170141183460469231731687303715884105727")
+        );
+        assert_eq!(out[0]["total"], json!(3));
+    }
+
+    #[test]
+    fn a_field_that_is_always_empty_object_round_trips() {
+        let out = run(
+            "SELECT * FROM batch ORDER BY id",
+            vec![
+                json!({"id": 1, "metadata": {}, "nested": {"inner": {}}, "list": [{}]}),
+                json!({"id": 2, "metadata": {}, "nested": {"inner": {}}, "list": []}),
+            ],
+        );
+        assert_eq!(out[0]["metadata"], json!({}));
+        assert_eq!(out[0]["nested"], json!({"inner": {}}));
+        assert_eq!(out[0]["list"], json!([{}]));
+        assert_eq!(out[1]["id"], json!(2));
+    }
+
+    #[test]
+    fn keys_differing_only_by_case_are_refused() {
+        let cfg = SqlTransformConfig {
+            query: "SELECT * FROM batch".into(),
+            relations: vec![],
+            memory_limit: None,
+            threads: Some(1),
+        };
+        let stage = compile_stage(&SqlTransform::compile(&cfg).unwrap().into_page_stage()).unwrap();
+        let err = apply_stages_to_page(vec![json!({"a": 1, "A": 2})], std::slice::from_ref(&stage))
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("differ only by letter case"),
+            "{err}"
+        );
+        let err = apply_stages_to_page(
+            vec![json!({"o": {"k": 1, "K": 2}})],
+            std::slice::from_ref(&stage),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("'o.k'"), "{err}");
     }
 
     // The <=2048 fast path (single CREATE) is unchanged.
