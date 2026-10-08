@@ -167,3 +167,85 @@ async fn paths_are_validated_and_context_values_encoded() {
     assert_eq!(resp.status(), 200);
     assert_eq!(run.await.unwrap().unwrap().len(), 1);
 }
+
+/// A wrong bearer token is 401, a non-JSON text body is kept as a string, a
+/// body that is neither JSON nor UTF-8 is 400, and a non-string context value
+/// is rendered into the path as its JSON text.
+#[tokio::test]
+async fn bearer_tokens_text_bodies_and_numeric_path_values() {
+    let addr = free_addr();
+    let source = WebhookSource::new(
+        WebhookSourceConfig::new()
+            .listen_addr(addr.clone())
+            .path("/hooks/{shard}")
+            .auth_token("s3cret")
+            .max_payloads(1)
+            .timeout_secs(10),
+    );
+    let ctx: HashMap<String, Value> = [("shard".to_string(), json!(7))].into_iter().collect();
+    let run = tokio::spawn(async move { source.fetch_with_context(&ctx).await });
+    let url = format!("http://{addr}/hooks/7");
+    let client = reqwest::Client::new();
+    let wrong = post_until_up(&client, &url, || {
+        client.post(&url).bearer_auth("nope").body("{}")
+    })
+    .await;
+    assert_eq!(wrong.status(), 401);
+    let binary = client
+        .post(&url)
+        .bearer_auth("s3cret")
+        .body(vec![0xff, 0xfe, 0x00])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(binary.status(), 400);
+    let text = client
+        .post(&url)
+        .bearer_auth("s3cret")
+        .body("plain text")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(text.status(), 200);
+    assert_eq!(run.await.unwrap().unwrap(), vec![json!("plain text")]);
+}
+
+/// A sender that stalls mid-body cannot hold the run open: once the window
+/// closes the server gets a bounded grace period, then is stopped.
+#[tokio::test]
+async fn a_stalled_sender_cannot_hold_the_run_open() {
+    use tokio::io::AsyncWriteExt;
+    let addr = free_addr();
+    let source = WebhookSource::new(
+        WebhookSourceConfig::new()
+            .listen_addr(addr.clone())
+            .max_payloads(1)
+            .timeout_secs(60),
+    );
+    let run = tokio::spawn(async move { source.fetch_all().await });
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let mut stalled = loop {
+        if let Ok(s) = tokio::net::TcpStream::connect(&addr).await {
+            break s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    stalled
+        .write_all(
+            b"POST /webhook HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"n\":",
+        )
+        .await
+        .unwrap();
+    let resp = post_until_up(&client, &url, || client.post(&url).json(&json!({"n": 1}))).await;
+    assert_eq!(resp.status(), 200);
+    let started = std::time::Instant::now();
+    let records = tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("the run ends despite the stalled sender")
+        .unwrap()
+        .unwrap();
+    assert_eq!(records, vec![json!({"n": 1})]);
+    assert!(started.elapsed() < Duration::from_secs(30));
+    drop(stalled);
+}
