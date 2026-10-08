@@ -332,6 +332,9 @@ async fn materialize_and_check(supplied: &SuppliedParams, target: &Target<'_>) -
                 })?;
             }
         }
+        // Each connector config into its typed struct, as `faucet validate`
+        // does — a param type the connector rejects fails the case (#823).
+        crate::commands::validate::check_connector_configs(&nodes)?;
     } else {
         crate::topology::validate_topology_spec(&cfg)?;
     }

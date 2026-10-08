@@ -23,6 +23,7 @@ pub mod remote;
 pub mod rows;
 pub mod spec;
 pub mod trust;
+pub mod typed;
 
 use std::path::{Path, PathBuf};
 

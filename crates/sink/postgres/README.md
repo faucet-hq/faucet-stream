@@ -447,6 +447,12 @@ the field (narrowing later is the `schema:` drift policy's job).
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out.
 
+Concurrent first writes are safe (#828): backfill windows or matrix rows that
+create the same schema, table, commit-token table or rollback journal at once
+serialize on a transaction-scoped advisory lock per schema
+(`pg_advisory_xact_lock`), so none fails with a duplicate-key error on the
+catalog. A race lost to a creator outside faucet is retried.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **atomic** for a JSONB-column append with `batch_size: 0`, or `write_mode: upsert|delete` when journaled for rollback; otherwise **best-effort** — appends are autocommit statements (one per chunk), keyed writes are transactional only when journaled for rollback. `on_batch_error: dlq_all`

@@ -100,9 +100,29 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
         ),
         _ => None,
     };
+    // A compatible pairing must also pass the typed config validation
+    // `faucet validate --source … --sink …` runs (#823).
+    let typed_error = if cell.compatible {
+        let composed;
+        let c = match &overlaid {
+            Some(c) => c,
+            None => {
+                composed = hub::compose::compose(&s, &k)?;
+                &composed
+            }
+        };
+        hub::typed::check_composition(c)
+            .err()
+            .map(|e| typed_failure(&e, &source_file, &sink_file, &s, &k))
+    } else {
+        None
+    };
     if a.json {
         let mut v = serde_json::to_value(&cell)
             .map_err(|e| CliError::Internal(format!("hub: rendering JSON: {e}")))?;
+        if let (Some(e), Some(obj)) = (&typed_error, v.as_object_mut()) {
+            obj.insert("config_error".into(), serde_json::json!(e));
+        }
         if let (Some(c), Some(obj)) = (&overlaid, v.as_object_mut()) {
             obj.insert("overlay".into(), serde_json::json!(c.overlay));
             obj.insert(
@@ -157,6 +177,9 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
             println!("\n{cmd}");
         }
     }
+    if let Some(e) = typed_error {
+        return Err(CliError::Config(e));
+    }
     if cell.compatible {
         Ok(())
     } else {
@@ -167,6 +190,36 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
             cell.sink
         )))
     }
+}
+
+/// The `hub check` message for a pairing whose composed config fails typed
+/// validation: both template files, the error, and the param responsible when
+/// one is (#823).
+fn typed_failure(
+    e: &CliError,
+    source_file: &std::path::Path,
+    sink_file: &std::path::Path,
+    s: &hub::SourceTemplate,
+    k: &hub::SinkTemplate,
+) -> String {
+    let mut msg = format!(
+        "{} × {}: the composed config does not validate (`faucet validate --source {} --sink {}` rejects it): {e}",
+        source_file.display(),
+        sink_file.display(),
+        s.id(),
+        k.id()
+    );
+    for (file, findings) in [
+        (source_file, hub::typed::source_findings(s)),
+        (sink_file, hub::typed::sink_findings(k)),
+    ] {
+        for f in findings {
+            for line in f.lines().filter(|l| l.trim_start().starts_with("param `")) {
+                msg.push_str(&format!("\n  {}: {}", file.display(), line.trim()));
+            }
+        }
+    }
+    msg
 }
 
 async fn load_catalog(hub_flag: Option<&str>) -> CliResult<Catalog> {
@@ -380,14 +433,14 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
             match hub::detect_kind_in_file(f) {
                 Some(hub::TemplateKind::SourceTemplate) => {
                     let t = hub::parse_source_file(f)?;
-                    let r = hub::catalog::lint_source(&t);
+                    let r = hub::catalog::lint_source_all(&t);
                     if !r.is_empty() {
                         findings.push((f.display().to_string(), r));
                     }
                 }
                 Some(hub::TemplateKind::SinkTemplate) => {
                     let t = hub::parse_sink_file(f)?;
-                    let r = hub::catalog::lint_sink(&t);
+                    let r = hub::catalog::lint_sink_all(&t);
                     if !r.is_empty() {
                         findings.push((f.display().to_string(), r));
                     }

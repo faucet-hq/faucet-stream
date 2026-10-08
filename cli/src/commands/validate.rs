@@ -615,18 +615,47 @@ fn row_line(node: &crate::expand::ExpandedNode) -> String {
 /// name — used to pass `faucet validate` and fail on the first real run
 /// (#609). Offline: no credentials are resolved, no pool is built, no
 /// connection is opened. Live reachability remains `faucet doctor`'s job.
-fn check_connector_configs(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
+pub(crate) fn check_connector_configs(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
+    check_source_configs(nodes, false)?;
+    check_sink_configs(nodes, false)
+}
+
+/// The source half of [`check_connector_configs`]. With `compiled_only`, a row
+/// whose source kind this binary does not include is skipped rather than
+/// reported — a hub lint run by a slim build must not flag a template for a
+/// connector it simply cannot see (#823).
+pub(crate) fn check_source_configs(
+    nodes: &[crate::expand::ExpandedNode],
+    compiled_only: bool,
+) -> CliResult<()> {
     for n in nodes {
+        if compiled_only && crate::registry::source_schema(&n.source.kind).is_err() {
+            continue;
+        }
         crate::registry::validate_source_config(&n.source.kind, &n.id, n.source.config.clone())
             .map_err(|e| CliError::Config(format!("row '{}' source: {e}", n.id)))?;
+    }
+    Ok(())
+}
+
+/// The sink half of [`check_connector_configs`]; `compiled_only` as for
+/// [`check_source_configs`].
+pub(crate) fn check_sink_configs(
+    nodes: &[crate::expand::ExpandedNode],
+    compiled_only: bool,
+) -> CliResult<()> {
+    for n in nodes {
         // A discovery row has no sink (`NodeRole::Discovery` — it runs its
         // source, projects `select`, and publishes a value set), so the sink
         // slot holds a placeholder. Validating it would reject a perfectly good
         // config for a connector the row never writes to.
-        if !matches!(n.role, crate::expand::NodeRole::Discovery { .. }) {
-            crate::registry::validate_sink_config(&n.sink.kind, &n.id, n.sink.config.clone())
-                .map_err(|e| CliError::Config(format!("row '{}' sink: {e}", n.id)))?;
+        if matches!(n.role, crate::expand::NodeRole::Discovery { .. })
+            || (compiled_only && crate::registry::sink_schema(&n.sink.kind).is_err())
+        {
+            continue;
         }
+        crate::registry::validate_sink_config(&n.sink.kind, &n.id, n.sink.config.clone())
+            .map_err(|e| CliError::Config(format!("row '{}' sink: {e}", n.id)))?;
     }
     Ok(())
 }
@@ -673,7 +702,7 @@ fn sink_writes_by_key(sink: &crate::config::ConnectorSpec) -> bool {
 /// field (`set: { fields: … }` instead of `values:`) or an invalid SQL/WASM stage
 /// used to pass validation and then fail on the first page of a real run. Pure and
 /// offline — no connector is built.
-fn check_transforms(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
+pub(crate) fn check_transforms(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
     for n in nodes {
         if n.transforms.is_empty() {
             continue;

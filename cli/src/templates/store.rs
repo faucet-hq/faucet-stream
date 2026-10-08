@@ -164,14 +164,14 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
             let t: crate::hub::SourceTemplate = serde_json::from_value(doc.clone())
                 .map_err(|e| CliError::Config(format!("source-template: {e}")))?;
             t.validate()?;
-            registry_lint(&t.id(), crate::hub::catalog::lint_source(&t))?;
+            registry_lint(&t.id(), crate::hub::catalog::lint_source_all(&t))?;
             (TemplateKind::SourceTemplate, Some(t.id()))
         }
         Some(TemplateKind::SinkTemplate) => {
             let t: crate::hub::SinkTemplate = serde_json::from_value(doc.clone())
                 .map_err(|e| CliError::Config(format!("sink-template: {e}")))?;
             t.validate()?;
-            registry_lint(&t.id(), crate::hub::catalog::lint_sink(&t))?;
+            registry_lint(&t.id(), crate::hub::catalog::lint_sink_all(&t))?;
             (TemplateKind::SinkTemplate, Some(t.id()))
         }
         Some(TemplateKind::Deployment) => {

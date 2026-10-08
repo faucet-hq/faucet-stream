@@ -1114,10 +1114,10 @@ before it is ever registered. The exit code is the failed-case count, mirroring
 
 ```bash
 faucet hub list      [--hub ./hub] [--sort name|stars|updated] [--json]
-faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--overlay ops/prod.yaml]  # per-stream write modes; exit≠0 if incompatible
+faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--overlay ops/prod.yaml]  # per-stream write modes + typed config validation; exit≠0 if incompatible or invalid
 faucet hub compose   --source faucet-hq/example-rest-api --sink faucet-hq/sqlite [--overlay ops/prod.yaml] --out my-pipeline.yaml
 faucet hub matrix    --format table|markdown|json [--out FILE]
-faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint
+faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint + typed config validation
 faucet hub rows      faucet-hq/example-csv [--sink faucet-hq/jsonl] [--select …] [--state] [--json]  # streams + metadata, or a pipeline file's rows
 faucet run           --source faucet-hq/example-csv --sink faucet-hq/jsonl                   # runs offline
 faucet validate      --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--show-composed]

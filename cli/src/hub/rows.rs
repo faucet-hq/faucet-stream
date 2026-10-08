@@ -227,7 +227,9 @@ fn placeholder_config(doc: &Value) -> CliResult<PipelineConfig> {
 }
 
 /// The config's expanded rows, placeholder-bound. `None` for a topology.
-fn placeholder_nodes(doc: &Value) -> CliResult<(PipelineConfig, Option<Vec<ExpandedNode>>)> {
+pub(crate) fn placeholder_nodes(
+    doc: &Value,
+) -> CliResult<(PipelineConfig, Option<Vec<ExpandedNode>>)> {
     let cfg = placeholder_config(doc)?;
     if crate::topology::is_topology(&cfg) {
         return Ok((cfg, None));
