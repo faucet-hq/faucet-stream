@@ -32,30 +32,6 @@ fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
 /// a server that never reports `done` would otherwise loop forever.
 pub(crate) const MAX_REWRITE_CALLS: usize = 1000;
 
-/// Open a local file for upload, with its CRC32C (read in chunks; the file
-/// is rewound to its start).
-///
-/// An upload sends the checksum in the object metadata, where the server
-/// checks it against the bytes it stored. Left to itself, the client (>= 1.19)
-/// sends a single-shot upload's checksum as a third multipart part, which a
-/// server that reads only two parts (the GCS emulator) stores as object
-/// content, so the upload then fails its own checksum validation (#803).
-pub(crate) async fn open_with_crc32c(path: &Path) -> std::io::Result<(tokio::fs::File, u32)> {
-    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut buf = vec![0_u8; 256 * 1024];
-    let mut crc = 0_u32;
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        crc = crc32c::crc32c_append(crc, &buf[..n]);
-    }
-    file.rewind().await?;
-    Ok((file, crc))
-}
-
 /// The HTTP status a client error stands for: its own, or the equivalent of
 /// a retryable gRPC code.
 fn status_of(e: &google_cloud_storage::Error) -> Option<u16> {
@@ -155,7 +131,7 @@ impl ObjectClient for GcsObjects {
     }
 
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
-        let (file, crc) = open_with_crc32c(from)
+        let (file, crc) = faucet_common_gcs::open_with_crc32c(from)
             .await
             .map_err(|e| err("open local file", key, e))?;
         self.roundtrips.record("put");
@@ -296,28 +272,6 @@ mod tests {
         assert!(faucet_core::FaucetError::is_retriable(&e));
     }
 
-    #[tokio::test]
-    async fn the_crc32c_covers_the_whole_body_across_chunks() {
-        use tokio::io::AsyncReadExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let crc = |name: &str, body: &[u8]| {
-            let path = dir.path().join(name);
-            std::fs::write(&path, body).unwrap();
-            async move {
-                let (mut file, crc) = open_with_crc32c(&path).await.unwrap();
-                let mut read = Vec::new();
-                file.read_to_end(&mut read).await.unwrap();
-                assert_eq!(read.len(), std::fs::metadata(&path).unwrap().len() as usize);
-                crc
-            }
-        };
-        // The CRC-32C check value.
-        assert_eq!(crc("small", b"123456789").await, 0xE306_9283);
-        let body: Vec<u8> = (0..700_000_u32).map(|i| (i % 251) as u8).collect();
-        assert_eq!(crc("big", &body).await, crc32c::crc32c(&body));
-        assert_eq!(crc("empty", b"").await, 0);
-    }
-
     /// #803: the upload's CRC32C travels in the object metadata, and the
     /// request carries exactly the metadata and media parts — no trailing
     /// checksum part a two-part server would store as content.
@@ -328,8 +282,8 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         let body = b"{\"a\":1}\n";
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode(crc32c::crc32c(body).to_be_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(faucet_common_gcs::crc32c_of_bytes(body).to_be_bytes());
         Mock::given(method("POST"))
             .and(path("/upload/storage/v1/b/b/o"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

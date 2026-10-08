@@ -5047,6 +5047,7 @@ dependencies = [
 name = "faucet-common-gcs"
 version = "1.1.1"
 dependencies = [
+ "crc32c",
  "faucet-core",
  "google-cloud-auth",
  "google-cloud-gax",
@@ -5476,6 +5477,7 @@ version = "1.8.0"
 dependencies = [
  "arrow 58.3.0",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "faucet-common-bigquery",
  "faucet-common-gcs",
@@ -5660,7 +5662,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
- "crc32c",
  "faucet-common-file",
  "faucet-common-gcs",
  "faucet-conformance",
