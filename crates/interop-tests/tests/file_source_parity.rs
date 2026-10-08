@@ -248,7 +248,7 @@ async fn parquet_projection_matches_the_parquet_source() {
 }
 
 #[tokio::test]
-async fn parquet_nulls_are_explicit_where_the_parquet_source_omitted_them() {
+async fn parquet_nulls_are_explicit_in_both_sources() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("n.parquet");
     put_parquet(&path, vec![1], vec![None]);
@@ -261,8 +261,8 @@ async fn parquet_nulls_are_explicit_where_the_parquet_source_omitted_them() {
         .fetch_all()
         .await
         .unwrap();
-    assert_eq!(old, vec![json!({"id": 1, "score": 1.5})]);
-    assert_eq!(new, vec![json!({"id": 1, "name": null, "score": 1.5})]);
+    assert_eq!(old, vec![json!({"id": 1, "name": null, "score": 1.5})]);
+    assert_eq!(new, old);
 }
 
 #[tokio::test]
