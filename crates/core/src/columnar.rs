@@ -171,6 +171,7 @@ fn refine_wide_integers(schema: &Schema, records: &[Value]) -> Result<Schema, Fa
 /// pass re-types into strings: a name-based rule covers them (`rewrites`), or
 /// a numeric/boolean column now holds a string in some record (temporal
 /// columns always read back as strings, so only a name rule widens them).
+#[cfg(feature = "masking")]
 pub(crate) fn masked_string_columns(
     schema: &Schema,
     records: &[Value],
