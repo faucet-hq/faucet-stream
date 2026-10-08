@@ -16,6 +16,10 @@
   var MOON =
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
 
+  var LINKEDIN_URL = "https://www.linkedin.com/company/faucet-stream";
+  var LINKEDIN =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512" aria-hidden="true"><path d="M416 32H31.9C14.3 32 0 46.5 0 64.3v383.4C0 465.5 14.3 480 31.9 480H416c17.6 0 32-14.5 32-32.3V64.3c0-17.8-14.4-32.3-32-32.3zM135.4 416H69V202.2h66.5V416zm-33.2-243c-21.3 0-38.5-17.3-38.5-38.5S80.9 96 102.2 96c21.2 0 38.5 17.3 38.5 38.5 0 21.3-17.2 38.5-38.5 38.5zm282.1 243h-66.4V312c0-24.8-.5-56.7-34.5-56.7-34.6 0-39.9 27-39.9 54.9V416h-66.4V202.2h63.7v29.2h.9c8.9-17 30.6-34.9 56.4-34.9 67.2 0 79.7 44.3 79.7 101.9V416z"/></svg>';
+
   function init() {
     var bar = document.getElementById("mdbook-menu-bar");
     if (!bar) return;
@@ -116,6 +120,20 @@
     }
     forceContrastCode();
     window.addEventListener("load", forceContrastCode);
+
+    if (right && !document.getElementById("fs-linkedin")) {
+      var li = document.createElement("a");
+      li.id = "fs-linkedin";
+      li.href = LINKEDIN_URL;
+      li.target = "_blank";
+      li.rel = "noopener";
+      li.title = "Follow faucet-stream on LinkedIn";
+      li.setAttribute("aria-label", li.title);
+      li.innerHTML = '<span class="fa-svg">' + LINKEDIN + "</span>";
+      var repo = right.querySelector('a[title="Git repository"]');
+      if (repo) repo.insertAdjacentElement("afterend", li);
+      else right.appendChild(li);
+    }
 
     // ---- Theme: one light/dark toggle ---------------------------------------
     if (right) {
