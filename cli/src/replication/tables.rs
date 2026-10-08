@@ -61,7 +61,8 @@ pub fn selected(spec: &TablesSpec, name: &str) -> bool {
 }
 
 /// A state-key-safe node id for a table name: characters a state key cannot
-/// hold become `_`.
+/// hold become `_`, and a leading `__` is prefixed so a table never takes a
+/// marker's key.
 pub fn node_id(table: &str) -> String {
     let id: String = table
         .chars()
@@ -75,6 +76,9 @@ pub fn node_id(table: &str) -> String {
         .collect();
     match id.strip_prefix('.') {
         Some(rest) => format!("_{rest}"),
+        // `__name__` segments are the mirror's own markers
+        // (`{name}::__replication__`), so a table may never take one.
+        None if id.starts_with("__") => format!("t{id}"),
         None => id,
     }
 }
@@ -446,6 +450,12 @@ mod tests {
         assert_eq!(node_id("public.orders"), "public.orders");
         assert_eq!(node_id("my table$x"), "my_table_x");
         assert_eq!(node_id(".hidden"), "_hidden");
+        // A table named like the mirror marker never shares its key (#789 CLI-89).
+        assert_eq!(node_id("__replication__"), "t__replication__");
+        assert_ne!(
+            crate::executor::build_state_key("m", &node_id("__replication__"), None),
+            crate::replication::state::marker_key("m")
+        );
         faucet_core::state::validate_state_key(&format!("m::{}", node_id("a b.\"c\""))).unwrap();
     }
 
