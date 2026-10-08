@@ -116,7 +116,7 @@ fn strip_ext(name: &str) -> &str {
 ///
 /// A template that cannot be used this pull (its file or sidecar unreadable,
 /// its sidecar invalid, two files claiming its stem) is returned with
-/// [`RemoteTemplate::unusable`] set, so the planner keeps it out of the
+/// `RemoteTemplate::unusable` set, so the planner keeps it out of the
 /// orphan set instead of deprecating a live template over a typo.
 pub fn pair_files(files: Vec<RemoteFile>) -> Paired {
     use std::collections::BTreeMap;

@@ -89,7 +89,7 @@ fn test_verdict(kind: &str, outcomes: &[DeliveryOutcome]) -> CliResult<()> {
 /// Build a synthetic event for the requested kind. DLQ uses a large count so it
 /// clears any configured `dlq_threshold`.
 ///
-/// Every kind except `scheduler_stuck` carries a synthetic [`RunContext`], so a
+/// Every kind except `scheduler_stuck` carries a synthetic [`RunContext`](crate::notify::RunContext), so a
 /// receiver being tested sees the same populated `run_id` / `invocation_id` /
 /// timing fields a real run would send (#480). `scheduler_stuck` deliberately
 /// does not — it has no owning invocation in production either, so leaving it
