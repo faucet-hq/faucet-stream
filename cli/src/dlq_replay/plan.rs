@@ -34,6 +34,14 @@ pub fn validate_reason(reason: Option<&str>) -> CliResult<Option<String>> {
     }
 }
 
+/// Whether `path` is a replay-failure DLQ [`default_failed_dlq_path`] names
+/// (`x.replay-failed.jsonl` or `replay-failed.jsonl`).
+pub fn is_replay_failure(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "replay-failed.jsonl" || n.ends_with(".replay-failed.jsonl"))
+}
+
 /// Derive the default "replay-failed" DLQ path for a set of source files:
 /// a `replay-failed.jsonl` sibling next to the first file (or, when the
 /// source is a single file `x.jsonl`, `x.replay-failed.jsonl`). Guaranteed

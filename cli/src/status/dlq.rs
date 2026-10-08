@@ -74,7 +74,10 @@ pub fn backlog(spec: Option<&DlqSpec>, pipeline: &str, row: &str) -> DlqStatus {
     let glob = location_glob(path);
     out.location = Some(glob.clone());
     let files = match expand_location(&glob) {
-        Ok(f) => f,
+        Ok(f) => f
+            .into_iter()
+            .filter(|p| !crate::dlq_replay::plan::is_replay_failure(p))
+            .collect::<Vec<_>>(),
         Err(_) => {
             // Nothing written yet is an empty backlog, not an error.
             out.readable = true;
@@ -169,6 +172,37 @@ mod tests {
         assert_eq!(st.count, 2);
         assert_eq!(st.oldest.unwrap().timestamp_millis(), 1_000);
         assert_eq!(st.unreadable_lines, 1);
+    }
+
+    /// A dated DLQ glob skips replay-failure files and discarded envelopes,
+    /// so a handled backlog reads as empty (#789 CLI-166).
+    #[test]
+    fn a_dated_backlog_skips_replay_failures_and_discards() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026-10-01.jsonl");
+        std::fs::write(&day, envelope("orders", "a", 1_000)).unwrap();
+        std::fs::write(
+            dir.path().join("2026-10-01.replay-failed.jsonl"),
+            envelope("orders", "a", 2_000),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("replay-failed.jsonl"),
+            envelope("orders", "a", 3_000),
+        )
+        .unwrap();
+        let pattern = format!("{}/${{now.date}}.jsonl", dir.path().display());
+        let s = spec("jsonl", json!({ "path": pattern }));
+        assert_eq!(backlog(Some(&s), "orders", "a").count, 1);
+        crate::dlq_replay::discard(
+            day.to_str().unwrap(),
+            None,
+            None,
+            true,
+            &crate::dlq_replay::reader::DlqDecryptor::default(),
+        )
+        .unwrap();
+        assert_eq!(backlog(Some(&s), "orders", "a").count, 0);
     }
 
     #[test]
