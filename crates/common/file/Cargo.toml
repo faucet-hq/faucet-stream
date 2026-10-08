@@ -26,6 +26,8 @@ base64 = { workspace = true, optional = true }
 # The remote backend (#777): the private scratch directory, run ids for object keys.
 tempfile.workspace = true
 uuid.workspace = true
+# Object-store listing filter (`include:` globs).
+glob.workspace = true
 
 [features]
 # Formats the shared writer encodes that need a dependency. JSON Lines, JSON

@@ -71,6 +71,7 @@ pub struct S3Source {
     /// `list` (one per `ListObjectsV2` page), `get` (one per `GetObject`,
     /// including each ranged Parquet read).
     roundtrips: faucet_core::observability::RecorderSlot,
+    filter: faucet_common_file::ObjectFilter,
 }
 
 impl S3Source {
@@ -79,12 +80,15 @@ impl S3Source {
     /// Builds the S3 client eagerly so it is reused across calls.
     pub async fn new(config: S3SourceConfig) -> Result<Self, FaucetError> {
         config.parquet.validate()?;
+        let filter = faucet_common_file::ObjectFilter::new(config.include.as_deref())
+            .map_err(|e| faucet_common_file::config_context("S3 source", e))?;
         let client = Self::build_client(&config).await?;
         Ok(Self {
             config,
             client,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            filter,
         })
     }
 
@@ -151,6 +155,13 @@ impl S3Source {
                 if key.is_empty() || faucet_common_file::write::is_unfinished_output_key(key) {
                     continue;
                 }
+                let size = object.size().and_then(|n| u64::try_from(n).ok());
+                if !self
+                    .filter
+                    .keep(key, size, effective_prefix.unwrap_or_default())
+                {
+                    continue;
+                }
                 keys.push(key.to_string());
 
                 if let Some(max) = self.config.max_objects
@@ -207,14 +218,9 @@ impl S3Source {
         feature = "file-format-orc"
     ))]
     async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
+        let reader = self.open_object_reader(key).await?;
+        faucet_core::file_format::read_to_end_capped(reader, self.config.max_object_bytes, key)
             .await
-            .map_err(|e| FaucetError::Source(format!("S3 read error for key '{key}': {e}")))?;
-        Ok(buf)
     }
 
     /// Decode a single Parquet object into its Arrow schema and the list of
@@ -404,15 +410,9 @@ impl S3Source {
     /// at once (#78/#25). The whole object is still one unit for
     /// `JsonArray` / `RawText`, but peak memory is now ~1× the decoded size.
     async fn read_object_text(&self, key: &str) -> Result<String, FaucetError> {
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut text = String::new();
-        reader.read_to_string(&mut text).await.map_err(|e| {
-            FaucetError::Source(format!(
-                "S3 read/decode error for key '{key}' (not valid UTF-8?): {e}"
-            ))
-        })?;
-        Ok(text)
+        let reader = self.open_object_reader(key).await?;
+        faucet_core::file_format::read_to_string_capped(reader, self.config.max_object_bytes, key)
+            .await
     }
 
     /// Open an S3 object as an [`AsyncBufRead`](tokio::io::AsyncBufRead) over
@@ -1262,6 +1262,7 @@ mod tests {
             client,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            filter: Default::default(),
         }
     }
 

@@ -178,9 +178,82 @@ pub fn resolution_name(path: &str) -> &str {
     }
 }
 
+/// Which listed objects an object-store source reads.
+///
+/// A folder marker (a zero-byte key ending in `/`) is never data. Without an
+/// `include` glob, a key with a path segment below the prefix that starts
+/// with `_` or `.` — `_SUCCESS`, `_temporary/…`, `.crc` files — is skipped
+/// too; with one, exactly the keys the glob matches are read.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectFilter {
+    include: Option<glob::Pattern>,
+}
+
+impl ObjectFilter {
+    /// Compile the optional `include` glob (matched against the whole key).
+    pub fn new(include: Option<&str>) -> Result<Self, FaucetError> {
+        let include = include
+            .map(|g| {
+                glob::Pattern::new(g)
+                    .map_err(|e| FaucetError::Config(format!("`include` glob {g:?}: {e}")))
+            })
+            .transpose()?;
+        Ok(Self { include })
+    }
+
+    /// Whether to read `key` (`size` in bytes, when the listing reports it)
+    /// listed under `prefix`.
+    pub fn keep(&self, key: &str, size: Option<u64>, prefix: &str) -> bool {
+        if key.ends_with('/') && size.unwrap_or(0) == 0 {
+            return false;
+        }
+        match &self.include {
+            Some(p) => p.matches_with(
+                key,
+                glob::MatchOptions {
+                    case_sensitive: true,
+                    require_literal_separator: false,
+                    require_literal_leading_dot: false,
+                },
+            ),
+            None => !is_hidden_object(key, prefix),
+        }
+    }
+}
+
+/// Whether a path segment of `key` below `prefix` starts with `_` or `.`.
+pub fn is_hidden_object(key: &str, prefix: &str) -> bool {
+    let dir = &prefix[..prefix.rfind('/').map_or(0, |i| i + 1)];
+    key.strip_prefix(dir)
+        .unwrap_or(key)
+        .split('/')
+        .any(|s| s.starts_with('_') || s.starts_with('.'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markers_and_hidden_objects_are_skipped_unless_included() {
+        let f = ObjectFilter::default();
+        assert!(f.keep("out/part-0001.parquet", Some(10), "out/"));
+        assert!(!f.keep("out/_SUCCESS", Some(0), "out/"));
+        assert!(!f.keep("out/.part-0001.parquet.crc", Some(8), "out/"));
+        assert!(!f.keep("out/_temporary/0/part-1.json", Some(8), "out/"));
+        assert!(!f.keep("out/sub/", Some(0), "out/"));
+        assert!(!f.keep("out/sub/", None, "out/"));
+        assert!(
+            f.keep("_raw/data.json", Some(4), "_raw/"),
+            "the prefix itself is not judged"
+        );
+        assert!(f.keep("_raw/part-1.json", Some(4), "_raw/part"));
+        assert!(!f.keep("data/_x.json", Some(4), ""));
+        let inc = ObjectFilter::new(Some("out/_*")).unwrap();
+        assert!(inc.keep("out/_metadata", Some(4), "out/"));
+        assert!(!inc.keep("out/part-1.parquet", Some(4), "out/"));
+        assert!(ObjectFilter::new(Some("[")).is_err());
+    }
 
     #[test]
     fn every_choice_maps_onto_the_shared_vocabulary() {

@@ -88,6 +88,7 @@ type ColumnarStream<'a> = Pin<
 pub struct AzureBlobSource {
     config: AzureBlobSourceConfig,
     store: Arc<dyn ObjectStore>,
+    filter: faucet_common_file::ObjectFilter,
 }
 
 impl AzureBlobSource {
@@ -95,8 +96,14 @@ impl AzureBlobSource {
     /// across calls.
     pub async fn new(config: AzureBlobSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
+        let filter = faucet_common_file::ObjectFilter::new(config.include.as_deref())
+            .map_err(|e| faucet_common_file::config_context("azure source", e))?;
         let store = build_store(&config.connection)?;
-        Ok(Self { config, store })
+        Ok(Self {
+            config,
+            store,
+            filter,
+        })
     }
 
     /// List object names under the configured (or override) prefix, capped at
@@ -110,12 +117,10 @@ impl AzureBlobSource {
             return Ok(cap_keys(keys.clone(), self.config.max_objects));
         }
 
-        let effective_prefix = prefix_override.or(self.config.prefix.as_deref());
-        let prefix_path = effective_prefix
-            .filter(|p| !p.is_empty())
-            .map(ObjectPath::from);
-
-        let mut listing = self.store.list(prefix_path.as_ref());
+        let effective_prefix = prefix_override
+            .or(self.config.prefix.as_deref())
+            .unwrap_or_default();
+        let mut listing = self.store.list(list_root(effective_prefix).as_ref());
         let mut names: Vec<String> = Vec::new();
         while let Some(item) = listing.next().await {
             let meta = item.map_err(|e| {
@@ -125,7 +130,11 @@ impl AzureBlobSource {
                 ))
             })?;
             let name = meta.location.to_string();
-            if name.is_empty() || faucet_common_file::write::is_unfinished_output_key(&name) {
+            if name.is_empty()
+                || !name.starts_with(effective_prefix)
+                || faucet_common_file::write::is_unfinished_output_key(&name)
+                || !self.filter.keep(&name, Some(meta.size), effective_prefix)
+            {
                 continue;
             }
             names.push(name);
@@ -171,14 +180,9 @@ impl AzureBlobSource {
         all(feature = "arrow", feature = "compression")
     ))]
     async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
+        let reader = self.open_object_reader(key).await?;
+        faucet_core::file_format::read_to_end_capped(reader, self.config.max_object_bytes, key)
             .await
-            .map_err(|e| FaucetError::Source(format!("azure read error for key '{key}': {e}")))?;
-        Ok(bytes)
     }
 
     /// Open one Parquet blob, projected by `parquet.columns`, as its Arrow
@@ -204,7 +208,7 @@ impl AzureBlobSource {
             let (schema, batches) = self.read_parquet(key, batch_size).await?;
             return Ok((schema, stream::iter(batches.into_iter().map(Ok)).boxed()));
         }
-        let path = ObjectPath::from(key);
+        let path = object_path(key);
         let meta = self.store.head(&path).await.map_err(|e| {
             FaucetError::Source(format!(
                 "azure head error for container '{}' key '{key}': {e}",
@@ -333,15 +337,9 @@ impl AzureBlobSource {
 
     /// Read the full body of a single object into a UTF-8 `String`.
     async fn read_object_text(&self, key: &str) -> Result<String, FaucetError> {
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut text = String::new();
-        reader.read_to_string(&mut text).await.map_err(|e| {
-            FaucetError::Source(format!(
-                "azure read/decode error for key '{key}' (not valid UTF-8?): {e}"
-            ))
-        })?;
-        Ok(text)
+        let reader = self.open_object_reader(key).await?;
+        faucet_core::file_format::read_to_string_capped(reader, self.config.max_object_bytes, key)
+            .await
     }
 
     /// Open an object as an `AsyncBufRead` over its (optionally decompressed)
@@ -351,7 +349,7 @@ impl AzureBlobSource {
         &self,
         key: &str,
     ) -> Result<Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>, FaucetError> {
-        let path = ObjectPath::from(key);
+        let path = object_path(key);
         let result = self.store.get(&path).await.map_err(|e| {
             FaucetError::Source(format!(
                 "azure get error for container '{}' key '{key}': {e}",
@@ -505,6 +503,22 @@ fn content_encoding(attributes: &object_store::Attributes) -> Option<&str> {
 
 /// Truncate an explicit object-key list to the `max_objects` cap. `None` leaves
 /// the list untouched.
+/// The whole-segment directory to list for `prefix`: object_store lists by
+/// path segment, so `logs/2026-05-` is listed as `logs/` and filtered.
+fn list_root(prefix: &str) -> Option<ObjectPath> {
+    prefix
+        .rfind('/')
+        .map(|i| object_path(&prefix[..i]))
+        .filter(|p| !p.as_ref().is_empty())
+}
+
+/// The object_store path for a blob name exactly as listed or configured.
+/// `Path::from` would percent-encode characters such as `%`, `[` and `#` a
+/// second time and address a different blob.
+fn object_path(key: &str) -> ObjectPath {
+    ObjectPath::parse(key).unwrap_or_else(|_| ObjectPath::from(key))
+}
+
 fn cap_keys(mut keys: Vec<String>, max: Option<usize>) -> Vec<String> {
     if let Some(n) = max {
         keys.truncate(n);
@@ -985,6 +999,17 @@ mod tests {
     fn parse_raw_text_yields_single_record() {
         let r = parse_file_content(&AzureFileFormat::RawText, "p/f.txt", "hello").unwrap();
         assert_eq!(r, vec![json!({"key": "p/f.txt", "content": "hello"})]);
+    }
+
+    #[test]
+    fn listing_roots_are_whole_segments_and_names_are_not_reencoded() {
+        assert_eq!(list_root("logs/2026-05-").unwrap().as_ref(), "logs");
+        assert_eq!(list_root("a/b/").unwrap().as_ref(), "a/b");
+        assert!(list_root("plain").is_none());
+        assert!(list_root("").is_none());
+        for name in ["data[2024].csv", "a%20b.json", "~$x.xlsx", "a#1.json"] {
+            assert_eq!(object_path(name).as_ref(), name);
+        }
     }
 
     #[test]
