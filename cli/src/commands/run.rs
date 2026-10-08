@@ -264,6 +264,12 @@ pub(crate) async fn execute(
         if crate::select::SelectionRequest::from_flags(&args.selection)?.is_some() {
             return Err(CliError::Config(crate::select::TOPOLOGY_REFUSAL.into()));
         }
+        if let Some(flag) = topology_refused_flag(&args) {
+            return Err(CliError::Config(format!(
+                "{flag} does not apply to a topology config (`pipeline.nodes`): the graph keeps \
+                 its own `state:` store and runs every node concurrently — remove the flag"
+            )));
+        }
         #[cfg(feature = "policy")]
         if let Some(spec) = cfg.policy.as_ref() {
             let report = crate::policy::evaluate_topology(spec, &cfg)?;
@@ -622,6 +628,18 @@ pub(crate) async fn execute(
     stop.finish(outcome)
 }
 
+/// A `run` flag that matrix mode honours and a topology run cannot, so it is
+/// refused instead of silently ignored (#789 CLI-64).
+fn topology_refused_flag(args: &RunArgs) -> Option<&'static str> {
+    if args.state_path.is_some() {
+        Some("--state-path")
+    } else if args.concurrency.is_some() {
+        Some("--concurrency")
+    } else {
+        None
+    }
+}
+
 /// The stop signals of a one-shot run: the first SIGTERM / Ctrl-C cancels the
 /// run cooperatively (each row finishes its page and flushes), a second one
 /// exits at once.
@@ -845,6 +863,40 @@ fn finish_topology_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--state-path` / `--concurrency` are refused for a topology config
+    /// rather than silently ignored (#789 CLI-64).
+    #[tokio::test]
+    async fn topology_refuses_state_path_and_concurrency() {
+        let cfg = crate::config::PipelineConfig::from_text(
+            "version: 1\nname: p\npipeline:\n  sources:\n    a: { type: csv, config: { path: /nonexistent/a.csv } }\n  sinks:\n    o: { type: jsonl, config: { path: /nonexistent/o.jsonl } }\n  nodes:\n    s: { kind: source, ref: a }\n    w: { kind: sink, ref: o }\n  edges:\n    - { from: s, to: w }\n",
+            std::path::Path::new("p.yaml"),
+        )
+        .unwrap();
+        for (args, flag) in [
+            (
+                RunArgs {
+                    state_path: Some("/tmp/scratch".into()),
+                    ..Default::default()
+                },
+                "--state-path",
+            ),
+            (
+                RunArgs {
+                    concurrency: Some(2),
+                    ..Default::default()
+                },
+                "--concurrency",
+            ),
+        ] {
+            let err = Box::pin(execute(cfg.clone(), args, None))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(flag), "{err}");
+        }
+        assert_eq!(topology_refused_flag(&RunArgs::default()), None);
+    }
 
     /// SIGTERM cancels the run's token instead of killing the process, and a
     /// cancelled run reports `Cancelled` (exit 130) whatever its rows did
