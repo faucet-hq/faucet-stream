@@ -298,7 +298,8 @@ pub fn discard(
         let mut file_discarded = 0usize;
         for line in text.lines() {
             let id = reader::line_id(line);
-            if already.contains(&id) || plan::discard_keep_line(line, dec, reason.as_deref(), before_ms)
+            if already.contains(&id)
+                || plan::discard_keep_line(line, dec, reason.as_deref(), before_ms)
             {
                 continue;
             }
@@ -449,7 +450,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
         let scan = reader::scan_files(&[path.clone()], &DlqDecryptor::default()).unwrap();
         assert_eq!(scan.envelopes.len(), 1);
-        assert_eq!(scan.envelopes[0].error_kind.as_deref(), Some("ContractViolation"));
+        assert_eq!(
+            scan.envelopes[0].error_kind.as_deref(),
+            Some("ContractViolation")
+        );
         assert_eq!(scan.non_envelope, 1);
         // The archive holds the discarded envelope.
         let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
@@ -463,16 +467,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = env_line("quality", "QualityFailure", 1, json!({"id": 1}));
         let path = write(dir.path(), "dlq.jsonl", &format!("{first}\n"));
-        let mut live = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        discard(path.to_str().unwrap(), None, None, false, &DlqDecryptor::default()).unwrap();
+        let mut live = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        discard(
+            path.to_str().unwrap(),
+            None,
+            None,
+            false,
+            &DlqDecryptor::default(),
+        )
+        .unwrap();
         use std::io::Write;
         let late = env_line("quality", "QualityFailure", 2, json!({"id": 2}));
         writeln!(live, "{late}").unwrap();
         drop(live);
         let scan = reader::scan_files(&[path.clone()], &DlqDecryptor::default()).unwrap();
         assert_eq!(scan.envelopes.len(), 1, "the late envelope survives");
-        let again =
-            discard(path.to_str().unwrap(), None, None, false, &DlqDecryptor::default()).unwrap();
+        let again = discard(
+            path.to_str().unwrap(),
+            None,
+            None,
+            false,
+            &DlqDecryptor::default(),
+        )
+        .unwrap();
         assert_eq!(again.discarded, 1, "only the late one is new");
         let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
         assert_eq!(archived.lines().count(), 2);

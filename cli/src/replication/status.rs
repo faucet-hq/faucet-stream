@@ -437,17 +437,31 @@ mod tests {
     #[test]
     fn a_non_replacing_resnapshot_is_flagged_in_status() {
         let mut s = state();
-        assert!(!multi_state::flag_stale_resnapshot(&mut s, "public.a", false, "spanner"));
+        assert!(!multi_state::flag_stale_resnapshot(
+            &mut s, "public.a", false, "spanner"
+        ));
         multi_state::mark_snapshot_started(&mut s, "public.a", json!(2), 1, t0());
-        assert!(multi_state::flag_stale_resnapshot(&mut s, "public.a", false, "spanner"));
-        assert!(!multi_state::flag_stale_resnapshot(&mut s, "public.zzz", false, "spanner"));
+        assert!(multi_state::flag_stale_resnapshot(
+            &mut s, "public.a", false, "spanner"
+        ));
+        assert!(!multi_state::flag_stale_resnapshot(
+            &mut s,
+            "public.zzz",
+            false,
+            "spanner"
+        ));
         let st = multi_status("shop", &s, &BTreeMap::new(), 0, t0());
         assert_eq!(st.summary.resync_required, 1);
         let text = render_human(&st);
         assert!(text.contains("resync required"), "{text}");
-        assert!(text.contains("! public.a: re-snapshotted into a spanner"), "{text}");
+        assert!(
+            text.contains("! public.a: re-snapshotted into a spanner"),
+            "{text}"
+        );
         assert!(serde_json::to_value(&st).unwrap()["tables"][0]["resync_required"].is_string());
-        assert!(!multi_state::flag_stale_resnapshot(&mut s, "public.a", true, "postgres"));
+        assert!(!multi_state::flag_stale_resnapshot(
+            &mut s, "public.a", true, "postgres"
+        ));
         assert!(s.tables["public.a"].resync_required.is_none());
     }
 

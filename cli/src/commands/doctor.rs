@@ -205,14 +205,19 @@ pub async fn probe_invocation(
 ) -> InvocationOut {
     let mut probes = Vec::new();
 
-    match build_source(&source.kind, source.config.clone(), auth, None).await {
+    match bounded(
+        ctx,
+        build_source(&source.kind, source.config.clone(), auth, None),
+    )
+    .await
+    {
         Ok(src) => {
             probes.extend(collect_probes("source", src.connector_name(), ctx, src.check(ctx)).await)
         }
         Err(e) => probes.push(construct_fail("source", &source.kind, &e)),
     }
 
-    match build_sink(&sink.kind, sink.config.clone(), auth).await {
+    match bounded(ctx, build_sink(&sink.kind, sink.config.clone(), auth)).await {
         Ok(snk) => {
             probes.extend(collect_probes("sink", snk.connector_name(), ctx, snk.check(ctx)).await)
         }
@@ -221,7 +226,7 @@ pub async fn probe_invocation(
 
     let mut store = None;
     if let Some(spec) = state {
-        match build_state_store(&spec).await {
+        match bounded(ctx, build_state_store(&spec)).await {
             Ok(st) => {
                 probes.extend(collect_probes("state", &spec.kind, ctx, st.check(ctx)).await);
                 store = Some(st);
@@ -229,12 +234,30 @@ pub async fn probe_invocation(
             Err(e) => probes.push(construct_fail("state", &spec.kind, &e)),
         }
     }
+    probes.extend(stateful_probes(ctx, store.as_ref(), sla, profiling).await);
 
+    InvocationOut {
+        id,
+        probes,
+        delivery: None,
+        source_kind: source.kind,
+        sink_kind: sink.kind,
+    }
+}
+
+/// The read-only SLA and column-profiling probes over a row's state store.
+async fn stateful_probes(
+    ctx: &CheckContext,
+    store: Option<&Arc<dyn faucet_core::StateStore>>,
+    sla: Option<(crate::sla::SlaSpec, String)>,
+    profiling: Option<(faucet_core::ProfilingSpec, String)>,
+) -> Vec<ProbeOut> {
+    let mut probes = Vec::new();
     if let Some((spec, base_key)) = sla {
         let now = chrono::Utc::now().timestamp();
         let sla_probes = tokio::time::timeout(
             ctx.timeout,
-            crate::sla::doctor_probes(&spec, store.as_ref(), &base_key, now),
+            crate::sla::doctor_probes(&spec, store, &base_key, now),
         )
         .await
         .unwrap_or_else(|_| {
@@ -250,12 +273,11 @@ pub async fn probe_invocation(
                 .map(|p| ProbeOut::from_probe("sla", "sla".to_string(), p)),
         );
     }
-
     // Column-profiling baseline (#708): read-only depth / warm-up state.
     if let Some((spec, base_key)) = profiling {
         let probes_out = tokio::time::timeout(
             ctx.timeout,
-            crate::profiling::doctor_probes(&spec, store.as_ref(), &base_key),
+            crate::profiling::doctor_probes(&spec, store, &base_key),
         )
         .await
         .unwrap_or_else(|_| {
@@ -271,14 +293,7 @@ pub async fn probe_invocation(
                 .map(|p| ProbeOut::from_probe("profiling", "profiling".to_string(), p)),
         );
     }
-
-    InvocationOut {
-        id,
-        probes,
-        delivery: None,
-        source_kind: source.kind,
-        sink_kind: sink.kind,
-    }
+    probes
 }
 
 /// Probe the pipeline-wide `lineage:` transport reachability, returning a
@@ -321,6 +336,7 @@ pub async fn probe_roots(
     pipeline_name: &str,
 ) -> Vec<InvocationOut> {
     let sem = Arc::new(Semaphore::new(8));
+    let clock = chrono::Utc::now().fixed_offset();
     let mut handles = Vec::new();
     for node in nodes.iter().filter(|n| matches!(n.role, NodeRole::Root)) {
         let id = node.id.clone();
@@ -360,32 +376,231 @@ pub async fn probe_roots(
         let policy_probes: Vec<ProbeOut> = Vec::new();
         let lag_sla = sla.as_ref().map(|(s, _)| s.clone());
         let lag_key = crate::executor::build_state_key(pipeline_name, &node.id, None);
-        handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.expect("semaphore not closed");
-            let lag = lag_probe(
-                &source,
-                state.as_ref(),
-                &lag_key,
-                lag_sla.as_ref(),
-                &auth,
-                &ctx,
-            )
-            .await;
-            let format = state_format_probe(&source, state.as_ref(), &lag_key).await;
-            let mut inv =
-                probe_invocation(id, source, sink, state, &auth, &ctx, sla, profiling).await;
-            inv.probes.extend(lag);
-            inv.probes.extend(format);
-            inv.delivery = Some(guarantee);
-            inv.probes.extend(policy_probes);
-            inv
-        }));
+        let kinds = (id.clone(), source.kind.clone(), sink.kind.clone());
+        handles.push((
+            kinds,
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                let (source, sink) = match resolve_probe_configs(source, sink, clock) {
+                    Ok(pair) => pair,
+                    Err(skipped) => {
+                        let mut inv = skipped.into_invocation(id);
+                        inv.delivery = Some(guarantee);
+                        return inv;
+                    }
+                };
+                let mut inv = probe_root(RootProbe {
+                    id,
+                    source,
+                    sink,
+                    state,
+                    auth: &auth,
+                    ctx: &ctx,
+                    sla,
+                    profiling,
+                    lag_sla,
+                    base_key: lag_key,
+                })
+                .await;
+                inv.delivery = Some(guarantee);
+                inv.probes.extend(policy_probes);
+                inv
+            }),
+        ));
     }
     let mut out = Vec::with_capacity(handles.len());
-    for h in handles {
-        out.push(h.await.expect("doctor probe task panicked"));
+    for ((id, source_kind, sink_kind), h) in handles {
+        out.push(match h.await {
+            Ok(inv) => inv,
+            Err(e) => failed_join(id, source_kind, sink_kind, &e),
+        });
     }
     out
+}
+
+/// A probe task that panicked (or was cancelled) is a failed probe, never a
+/// crash of `doctor` or of the serve request that ran it.
+fn failed_join(
+    id: String,
+    source_kind: String,
+    sink_kind: String,
+    e: &tokio::task::JoinError,
+) -> InvocationOut {
+    let reason = if e.is_panic() {
+        "a probe panicked".to_string()
+    } else {
+        format!("the probe task stopped: {e}")
+    };
+    InvocationOut {
+        id,
+        probes: vec![ProbeOut::from_probe(
+            "doctor",
+            source_kind.clone(),
+            Probe::fail("probe", Duration::ZERO, reason),
+        )],
+        delivery: None,
+        source_kind,
+        sink_kind,
+    }
+}
+
+/// Why a root's connectors cannot be probed as configured.
+enum Unprobeable {
+    /// A token only a backfill unit / partition chunk resolves.
+    RunTimeToken(&'static str, &'static str, String),
+    /// `${now.*}` failed to render.
+    Clock(String, String, String),
+}
+
+impl Unprobeable {
+    fn into_invocation(self, id: String) -> InvocationOut {
+        let (source_kind, sink_kind, probe) = match self {
+            Self::RunTimeToken(role, token, kind) => {
+                let probe = ProbeOut::from_probe(
+                    role,
+                    kind.clone(),
+                    Probe::skip(
+                        "construct",
+                        format!("the config uses `{token}`, resolved only when a run plans it"),
+                    ),
+                );
+                (kind.clone(), kind, probe)
+            }
+            Self::Clock(source_kind, sink_kind, e) => {
+                let probe = ProbeOut::from_probe(
+                    "source",
+                    source_kind.clone(),
+                    Probe::fail("construct", Duration::ZERO, e),
+                );
+                (source_kind, sink_kind, probe)
+            }
+        };
+        InvocationOut {
+            id,
+            probes: vec![probe],
+            delivery: None,
+            source_kind,
+            sink_kind,
+        }
+    }
+}
+
+/// Render `${now.*}` in a root's connector configs with the probe's clock,
+/// as a run would — or say why the configs cannot be probed yet.
+fn resolve_probe_configs(
+    mut source: ConnectorSpec,
+    mut sink: ConnectorSpec,
+    clock: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<(ConnectorSpec, ConnectorSpec), Unprobeable> {
+    for (role, spec) in [("source", &source), ("sink", &sink)] {
+        for token in ["${backfill.", "${partition."] {
+            if spec.config.to_string().contains(token) {
+                let name = if token.contains("backfill") {
+                    "${backfill.*}"
+                } else {
+                    "${partition.*}"
+                };
+                return Err(Unprobeable::RunTimeToken(role, name, spec.kind.clone()));
+            }
+        }
+    }
+    let (sk, kk) = (source.kind.clone(), sink.kind.clone());
+    crate::executor::resolve_now_inplace(&mut source.config, clock)
+        .and_then(|()| crate::executor::resolve_now_inplace(&mut sink.config, clock))
+        .map_err(|e| Unprobeable::Clock(sk, kk, e.to_string()))?;
+    Ok((source, sink))
+}
+
+/// One root's probe inputs.
+struct RootProbe<'a> {
+    id: String,
+    source: ConnectorSpec,
+    sink: ConnectorSpec,
+    state: Option<StateStoreSpec>,
+    auth: &'a AuthCatalog,
+    ctx: &'a CheckContext,
+    sla: Option<(crate::sla::SlaSpec, String)>,
+    profiling: Option<(faucet_core::ProfilingSpec, String)>,
+    lag_sla: Option<crate::sla::SlaSpec>,
+    base_key: String,
+}
+
+/// Probe one root, building its source, sink and state store once each, every
+/// build bounded by the probe timeout.
+async fn probe_root(r: RootProbe<'_>) -> InvocationOut {
+    let ctx = r.ctx;
+    let mut probes = Vec::new();
+    let source = bounded(
+        ctx,
+        build_source(&r.source.kind, r.source.config.clone(), r.auth, None),
+    )
+    .await;
+    let sink = bounded(ctx, build_sink(&r.sink.kind, r.sink.config.clone(), r.auth)).await;
+    let store = match &r.state {
+        Some(spec) => Some(bounded(ctx, build_state_store(spec)).await),
+        None => None,
+    };
+    let store_ok = store.as_ref().and_then(|s| s.as_ref().ok());
+
+    if let Ok(src) = &source
+        && let Some(lag) = lag_probe_built(
+            &r.source,
+            src.as_ref(),
+            store_ok,
+            &r.base_key,
+            r.lag_sla.as_ref(),
+            ctx,
+        )
+        .await
+    {
+        probes.push(lag);
+    }
+    match &source {
+        Ok(src) => {
+            probes.extend(collect_probes("source", src.connector_name(), ctx, src.check(ctx)).await)
+        }
+        Err(e) => probes.push(construct_fail("source", &r.source.kind, e)),
+    }
+    match &sink {
+        Ok(snk) => {
+            probes.extend(collect_probes("sink", snk.connector_name(), ctx, snk.check(ctx)).await)
+        }
+        Err(e) => probes.push(construct_fail("sink", &r.sink.kind, e)),
+    }
+    if let (Some(spec), Some(store)) = (&r.state, &store) {
+        match store {
+            Ok(st) => probes.extend(collect_probes("state", &spec.kind, ctx, st.check(ctx)).await),
+            Err(e) => probes.push(construct_fail("state", &spec.kind, e)),
+        }
+    }
+    probes.extend(stateful_probes(ctx, store_ok, r.sla, r.profiling).await);
+    if let (Some(spec), Some(st)) = (r.state.as_ref(), store_ok)
+        && let Some(p) = state_format_probe_built(&r.source, spec, st.as_ref(), &r.base_key).await
+    {
+        probes.push(p);
+    }
+    InvocationOut {
+        id: r.id,
+        probes,
+        delivery: None,
+        source_kind: r.source.kind,
+        sink_kind: r.sink.kind,
+    }
+}
+
+/// A connector build bounded by the probe timeout.
+async fn bounded<T>(
+    ctx: &CheckContext,
+    build: impl std::future::Future<Output = CliResult<T>>,
+) -> CliResult<T> {
+    tokio::time::timeout(ctx.timeout, build)
+        .await
+        .unwrap_or_else(|_| {
+            Err(CliError::Config(format!(
+                "building the connector timed out after {}s",
+                ctx.timeout.as_secs()
+            )))
+        })
 }
 
 /// How far a lag-reporting source is behind its head (#733), measured from
@@ -406,18 +621,55 @@ pub async fn lag_probe(
     let start = Instant::now();
     let measured = tokio::time::timeout(ctx.timeout, async {
         let src = build_source(&source.kind, source.config.clone(), auth, None).await?;
-        if let Some(spec) = state {
-            let store = build_state_store(spec).await?;
-            if let Some(v) = store.get(base_key).await? {
-                let (bookmark, _) = crate::pipeline_state::ops::decode_bookmark(&v);
-                if let Some(bm) = bookmark {
-                    src.apply_start_bookmark(bm).await?;
-                }
-            }
-        }
-        Ok::<_, CliError>(src.lag().await?)
+        let store = match state {
+            Some(spec) => Some(build_state_store(spec).await?),
+            None => None,
+        };
+        measure_lag(src.as_ref(), store.as_ref(), base_key).await
     })
     .await;
+    Some(lag_outcome(source, start, measured, sla))
+}
+
+/// [`lag_probe`] with the source and state store already built.
+async fn lag_probe_built(
+    source: &ConnectorSpec,
+    src: &dyn faucet_core::Source,
+    store: Option<&Arc<dyn faucet_core::StateStore>>,
+    base_key: &str,
+    sla: Option<&crate::sla::SlaSpec>,
+    ctx: &CheckContext,
+) -> Option<ProbeOut> {
+    if !crate::registry::source_reports_lag(&source.kind) {
+        return None;
+    }
+    let start = Instant::now();
+    let measured = tokio::time::timeout(ctx.timeout, measure_lag(src, store, base_key)).await;
+    Some(lag_outcome(source, start, measured, sla))
+}
+
+async fn measure_lag(
+    src: &dyn faucet_core::Source,
+    store: Option<&Arc<dyn faucet_core::StateStore>>,
+    base_key: &str,
+) -> CliResult<Option<faucet_core::SourceLag>> {
+    if let Some(store) = store
+        && let Some(v) = store.get(base_key).await?
+    {
+        let (bookmark, _) = crate::pipeline_state::ops::decode_bookmark(&v);
+        if let Some(bm) = bookmark {
+            src.apply_start_bookmark(bm).await?;
+        }
+    }
+    Ok(src.lag().await?)
+}
+
+fn lag_outcome(
+    source: &ConnectorSpec,
+    start: Instant,
+    measured: Result<CliResult<Option<faucet_core::SourceLag>>, tokio::time::error::Elapsed>,
+    sla: Option<&crate::sla::SlaSpec>,
+) -> ProbeOut {
     let probe = match measured {
         Err(_) => Probe::fail("lag", start.elapsed(), "lag query timed out"),
         Ok(Err(e)) => Probe::fail(
@@ -447,7 +699,7 @@ pub async fn lag_probe(
             p
         }
     };
-    Some(ProbeOut::from_probe("source", source.kind.clone(), probe))
+    ProbeOut::from_probe("source", source.kind.clone(), probe)
 }
 
 /// Whether the row's stored bookmark is one this release's source reads
@@ -457,17 +709,36 @@ pub async fn state_format_probe(
     state: Option<&StateStoreSpec>,
     base_key: &str,
 ) -> Option<ProbeOut> {
-    use faucet_core::state_version::{StateCompat, StoredState, check_compat};
     let spec = state.filter(|s| s.kind != "memory")?;
+    match build_state_store(spec).await {
+        Err(e) => Some(ProbeOut::from_probe(
+            "state",
+            spec.kind.clone(),
+            Probe::fail(
+                "format",
+                Duration::ZERO,
+                redact(&e.to_string()).into_owned(),
+            ),
+        )),
+        Ok(store) => state_format_probe_built(source, spec, store.as_ref(), base_key).await,
+    }
+}
+
+/// [`state_format_probe`] over an already-built store.
+async fn state_format_probe_built(
+    source: &ConnectorSpec,
+    spec: &StateStoreSpec,
+    store: &dyn faucet_core::StateStore,
+    base_key: &str,
+) -> Option<ProbeOut> {
+    use faucet_core::state_version::{StateCompat, StoredState, check_compat};
+    if spec.kind == "memory" {
+        return None;
+    }
     let start = Instant::now();
     let codec = crate::registry::state_codec_for(Some((&source.kind, &source.config)));
-    let probe = match build_state_store(spec).await {
-        Err(e) => Probe::fail(
-            "format",
-            start.elapsed(),
-            redact(&e.to_string()).into_owned(),
-        ),
-        Ok(store) => match store.get(base_key).await {
+    let probe = {
+        match store.get(base_key).await {
             Err(e) => Probe::fail(
                 "format",
                 start.elapsed(),
@@ -502,7 +773,7 @@ pub async fn state_format_probe(
                     ),
                 }
             }
-        },
+        }
     };
     Some(ProbeOut::from_probe("state", spec.kind.clone(), probe))
 }
@@ -815,6 +1086,68 @@ fn render_lints(path: &Path, findings: &[LintFinding], json: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `${now.*}` is rendered with the probe's clock, so a dated path is
+    /// probed where a run would read it; a backfill/partition token is
+    /// skipped rather than probed literally (#789 CLI-70).
+    #[tokio::test]
+    async fn probes_render_the_clock_and_skip_run_time_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        std::fs::create_dir_all(dir.path().join(&today)).unwrap();
+        std::fs::write(dir.path().join(&today).join("a.csv"), "id\n1\n").unwrap();
+        let yaml = format!(
+            "version: 1\nname: d\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}/${{now.date}}/a.csv\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}/o.jsonl\" }} }}\n",
+            dir.path().display(),
+            dir.path().display()
+        );
+        let cfg = PipelineConfig::from_text(&yaml, Path::new("d.yaml")).unwrap();
+        let nodes = expand(&cfg).unwrap();
+        let ctx = CheckContext {
+            timeout: Duration::from_secs(10),
+        };
+        let invs = probe_roots(&nodes, &AuthCatalog::new(), &ctx, None, None, "d").await;
+        assert_eq!(count_failures(&invs), 0, "{:?}", invs[0].probes);
+
+        let source: ConnectorSpec =
+            serde_json::from_value(serde_json::json!({"type": "csv", "config": {"path": "x-${backfill.start}.csv"}}))
+                .unwrap();
+        let sink: ConnectorSpec =
+            serde_json::from_value(serde_json::json!({"type": "jsonl", "config": {"path": "o.jsonl"}}))
+                .unwrap();
+        let clock = chrono::Utc::now().fixed_offset();
+        let inv = match resolve_probe_configs(source.clone(), sink.clone(), clock) {
+            Err(u) => u.into_invocation("r".into()),
+            Ok(_) => panic!("a backfill token cannot be probed"),
+        };
+        assert!(matches!(inv.probes[0].status, ProbeStatus::Skip { .. }));
+        let mut bad = source;
+        bad.config = serde_json::json!({"path": "${now.nope}"});
+        let inv = match resolve_probe_configs(bad, sink, clock) {
+            Err(u) => u.into_invocation("r".into()),
+            Ok(_) => panic!("an unknown clock token fails"),
+        };
+        assert_eq!(count_failures(&[inv]), 1);
+    }
+
+    /// A panicking probe is a failed probe, not a crash (#789 CLI-126), and a
+    /// connector build is bounded by the probe timeout (#789 CLI-127).
+    #[tokio::test]
+    async fn a_panicking_probe_fails_and_builds_are_bounded() {
+        let e = tokio::spawn(async { panic!("boom") }).await.unwrap_err();
+        let inv = failed_join("r".into(), "csv".into(), "jsonl".into(), &e);
+        assert_eq!(count_failures(&[inv]), 1);
+        let ctx = CheckContext {
+            timeout: Duration::from_millis(20),
+        };
+        let err = bounded(&ctx, async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<(), CliError>(())
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
 
     fn probe_out(role: &'static str, name: &'static str, status: ProbeStatus) -> ProbeOut {
         ProbeOut {

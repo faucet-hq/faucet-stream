@@ -1198,7 +1198,9 @@ per_stream:
         assert_eq!(shared.document["name"], json!(shared.source));
         assert!(shared.overlay_contributes.contains(&"name".to_string()));
         let kept = a
-            .apply_overlay(&overlay("kind: deployment\nname: x\nstate_scope: pairing\n"))
+            .apply_overlay(&overlay(
+                "kind: deployment\nname: x\nstate_scope: pairing\n",
+            ))
             .unwrap();
         assert_ne!(kept.name, kept.source);
     }

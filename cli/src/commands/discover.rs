@@ -767,7 +767,10 @@ mod tests {
         back.reverse();
         assert_eq!(ids, back, "order must not change any id");
         assert_eq!(ids[2], "a_b");
-        assert!(ids[0].starts_with("a_b-") && ids[1].starts_with("a_b-"), "{ids:?}");
+        assert!(
+            ids[0].starts_with("a_b-") && ids[1].starts_with("a_b-"),
+            "{ids:?}"
+        );
         assert_ne!(ids[0], ids[1]);
         assert!(ids[3].starts_with("window-"), "{ids:?}");
         assert!(ids[4].starts_with("dataset-"), "{ids:?}");

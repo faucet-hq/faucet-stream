@@ -1233,7 +1233,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/objects"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "items": [] })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "items": [] })),
+            )
             .expect(2)
             .mount(&server)
             .await;
@@ -1331,7 +1333,11 @@ mod tests {
             cancel: Default::default(),
         });
         // Should return promptly without aborting (the run already completed).
-        assert!(graceful_shutdown(running, c.shutdown_grace, "p").await.is_ok());
+        assert!(
+            graceful_shutdown(running, c.shutdown_grace, "p")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1380,6 +1386,10 @@ mod tests {
     #[tokio::test]
     async fn graceful_shutdown_noop_when_idle() {
         // No in-flight run → returns immediately.
-        assert!(graceful_shutdown(None, Duration::from_secs(1), "p").await.is_ok());
+        assert!(
+            graceful_shutdown(None, Duration::from_secs(1), "p")
+                .await
+                .is_ok()
+        );
     }
 }

@@ -588,6 +588,12 @@ misconfiguration surfaces before a real run. For each root invocation it probes
 the source, sink, and state store and prints a green/red checklist with elapsed
 times; the **exit code equals the number of failed probes** (clamped to 255).
 
+Each root's source, sink and state store are built once, and every build and
+check is bounded by `--timeout-secs`. `${now.*}` tokens are rendered with the
+current time, as a run would; a row whose config still carries a
+`${backfill.*}` / `${partition.*}` token is listed as skipped. A probe that
+panics is reported as a failed probe.
+
 - **Sources** reuse the real read path — the probe pulls a single page and stops
   (never the full dataset). Sources whose first page would block or mutate use a
   targeted probe instead: `webhook` (port bindable), `websocket` (TCP connect),

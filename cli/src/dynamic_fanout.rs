@@ -354,7 +354,10 @@ mod tests {
         let mut two = cfg_with_source(recipe(&server.uri(), "/objects"), true);
         two.pipeline.source = two.pipeline.sources.get("api").cloned();
         let err = has_fanout_source(&two).unwrap_err().to_string();
-        assert!(err.contains("several sources set `fan_out: true` (api, default)"), "{err}");
+        assert!(
+            err.contains("several sources set `fan_out: true` (api, default)"),
+            "{err}"
+        );
 
         let plain = cfg_with_source(json!({}), false);
         assert!(!has_fanout_source(&plain).unwrap());

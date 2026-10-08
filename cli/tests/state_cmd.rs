@@ -775,18 +775,27 @@ async fn migrate_state_honours_the_run_lease_and_the_profile() {
         .await
         .unwrap_err();
     assert!(matches!(err, CliError::StateBusy(_)), "{err}");
-    assert_eq!(store.get("orders::a").await.unwrap(), Some(json!({"id": 2})));
+    assert_eq!(
+        store.get("orders::a").await.unwrap(),
+        Some(json!({"id": 2}))
+    );
     run(&["migrate", "--state", &cfgs, "--check"])
         .await
         .unwrap_err();
     run(&["migrate", "--state", &cfgs, "--force", "--no-env-file"])
         .await
         .unwrap();
-    assert_ne!(store.get("orders::a").await.unwrap(), Some(json!({"id": 2})));
+    assert_ne!(
+        store.get("orders::a").await.unwrap(),
+        Some(json!({"id": 2}))
+    );
     drop(lease);
 
     let prod_store = FileStateStore::new(&prod);
-    prod_store.put("orders::b", &json!({"id": 7})).await.unwrap();
+    prod_store
+        .put("orders::b", &json!({"id": 7}))
+        .await
+        .unwrap();
     run(&["migrate", "--state", &cfgs, "--profile", "prod"])
         .await
         .unwrap();

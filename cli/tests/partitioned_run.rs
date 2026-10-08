@@ -328,7 +328,10 @@ partition:
     std::fs::write(&path, &yaml).unwrap();
     let cfg = PipelineConfig::from_text(&yaml, &path).expect("config parses");
     assert!(expand(&cfg).is_err(), "unresolved bounds cannot be planned");
-    assert_eq!(expand(&faucet_cli::partition::offline(&cfg)).unwrap().len(), 1);
+    assert_eq!(
+        expand(&faucet_cli::partition::offline(&cfg)).unwrap().len(),
+        1
+    );
     let cli = <faucet_cli::cli::Cli as clap::Parser>::try_parse_from([
         "faucet",
         "validate",
@@ -349,7 +352,10 @@ partition:
     )
     .unwrap();
     assert_eq!(
-        faucet_cli::partition::resolve_runtime(&plain).await.unwrap().name,
+        faucet_cli::partition::resolve_runtime(&plain)
+            .await
+            .unwrap()
+            .name,
         plain.name
     );
 }
