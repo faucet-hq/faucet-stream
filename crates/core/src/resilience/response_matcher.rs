@@ -771,6 +771,15 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_waits_never_panic_converting_to_a_duration() {
+        assert_eq!(relative(f64::INFINITY, 1.0), Some(Duration::MAX));
+        assert_eq!(relative(1e20, 60.0), Some(Duration::MAX));
+        assert_eq!(relative(f64::NAN, 1.0), None);
+        assert_eq!(relative(-1.0, 1.0), None);
+        assert_eq!(relative(1.5, 1.0), Some(Duration::from_millis(1500)));
+    }
+
+    #[test]
     fn a_huge_relative_wait_is_refused_not_a_panic() {
         // API-43: Duration::from_secs_f64(1e30) panicked before the cap applied.
         let rule = m(json!({
