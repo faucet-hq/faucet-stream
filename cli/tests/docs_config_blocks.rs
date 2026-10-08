@@ -162,8 +162,7 @@ async fn every_complete_config_in_the_docs_validates() {
     }
     // Docs paths (a wasm module, a reference CSV) are relative to the repo root,
     // where a reader runs them. Run from a scratch directory that links those
-    // trees, so anything validation writes (a topology's SQLite file) stays out
-    // of the checkout.
+    // trees, so the generated block files stay out of the checkout.
     let repo = root.join("../../..").canonicalize().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     for tree in ["cli", "examples"] {
