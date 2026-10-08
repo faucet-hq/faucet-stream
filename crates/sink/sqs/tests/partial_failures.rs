@@ -166,3 +166,31 @@ async fn a_standard_queue_retries_only_the_failed_message() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["Id"], "0");
 }
+
+#[tokio::test]
+async fn a_message_the_response_never_mentions_is_not_counted_delivered() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(reply(&["0"], json!([])))
+        .mount(&server)
+        .await;
+    let sink = SqsSink::new(config(&server.uri(), "orders", 10))
+        .await
+        .unwrap();
+
+    let out = sink
+        .write_batch_partial(&[json!({"n": 1}), json!({"n": 2})])
+        .await
+        .unwrap();
+    assert!(out[0].is_ok(), "{out:?}");
+    let err = out[1].as_ref().unwrap_err().to_string();
+    assert!(err.contains("neither confirmed nor rejected"), "{err}");
+
+    let whole = sink
+        .write_batch(&[json!({"n": 1}), json!({"n": 2})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(whole.contains("1 of 2 record(s) failed"), "{whole}");
+}
