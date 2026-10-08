@@ -345,6 +345,7 @@ pub(crate) async fn execute(
     #[cfg(feature = "catalog")]
     let snapshot_inputs = catalog
         .as_ref()
+        .filter(|_| records_snapshot(&args))
         .map(|handle| (handle.clone(), nodes.clone(), pipeline_name.clone()));
     // Runtime matrix-row selection (#370/#371/#376/#377): status gate → tag
     // narrowing → parent policy → skip. A plain config (no `status`/`tags`, no
@@ -628,6 +629,14 @@ pub(crate) async fn execute(
     stop.finish(outcome)
 }
 
+/// Whether this run may stand as the config's last successful run for
+/// `plan --diff` / impact analysis: a dry run or a `--limit` sample never
+/// does (#789 CLI-130).
+#[cfg(feature = "catalog")]
+fn records_snapshot(args: &RunArgs) -> bool {
+    !args.dry_run && args.limit.is_none()
+}
+
 /// A `run` flag that matrix mode honours and a topology run cannot, so it is
 /// refused instead of silently ignored (#789 CLI-64).
 fn topology_refused_flag(args: &RunArgs) -> Option<&'static str> {
@@ -863,6 +872,20 @@ fn finish_topology_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "catalog")]
+    #[test]
+    fn only_a_full_real_run_records_the_config_snapshot() {
+        assert!(records_snapshot(&RunArgs::default()));
+        assert!(!records_snapshot(&RunArgs {
+            dry_run: true,
+            ..Default::default()
+        }));
+        assert!(!records_snapshot(&RunArgs {
+            limit: Some(5),
+            ..Default::default()
+        }));
+    }
 
     /// `--state-path` / `--concurrency` are refused for a topology config
     /// rather than silently ignored (#789 CLI-64).
