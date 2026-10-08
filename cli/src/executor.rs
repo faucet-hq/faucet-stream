@@ -5011,10 +5011,12 @@ mod tests {
     #[tokio::test]
     async fn a_failing_overwrite_begin_fails_its_members_not_the_run() {
         let dir = tempfile::tempdir().unwrap();
-        // The database's directory does not exist, so the group's begin fails.
+        // The database's parent is a regular file, so its directory cannot be
+        // created and the group's begin fails.
+        std::fs::write(dir.path().join("not_a_dir"), "").unwrap();
         let db_url = format!(
             "sqlite:{}",
-            dir.path().join("missing").join("ow.db").display()
+            dir.path().join("not_a_dir").join("ow.db").display()
         );
         std::fs::write(dir.path().join("parents.csv"), "id\n1\n2\n").unwrap();
         std::fs::write(dir.path().join("child_1.csv"), "id,v\n1,A\n").unwrap();
