@@ -272,3 +272,45 @@ async fn evolve_widens_integers_to_exact_numeric() {
     let rows = text_rows(&url, "SELECT id::text FROM w ORDER BY id").await;
     assert_eq!(rows, vec!["1.5", "9007199254740993"]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keyed_and_jsonb_paths_of_every_write_entry_point() {
+    let (_c, url) = start_postgres().await;
+    exec(&url, "CREATE TABLE kv (id INT PRIMARY KEY, v TEXT)").await;
+    let upsert = PostgresSink::new(config(&url, "kv", WriteMode::Upsert, &["id"]))
+        .await
+        .unwrap();
+    let err = upsert
+        .write_batch(&[json!({"v": "no key"})])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("postgres upsert: row 0"), "{err}");
+    let err = upsert
+        .write_batch_idempotent(
+            &[json!({"id": 1, "v": "a"}), json!({"v": "b"})],
+            "s",
+            &faucet_core::format_token(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("postgres upsert: row 1"), "{err}");
+    assert!(text_rows(&url, "SELECT id::text FROM kv").await.is_empty());
+
+    exec(&url, "CREATE TABLE docs (data JSONB)").await;
+    let json_sink = PostgresSink::new(PostgresSinkConfig::new(&url, "docs").column_mapping(
+        PostgresColumnMapping::Jsonb {
+            column: "data".into(),
+        },
+    ))
+    .await
+    .unwrap();
+    let out = json_sink
+        .write_batch_partial(&[json!({"a": 1}), json!({"b": 2})])
+        .await
+        .unwrap();
+    assert!(out.len() == 2 && out.iter().all(Result::is_ok));
+    assert_eq!(
+        text_rows(&url, "SELECT count(*)::text FROM docs").await,
+        vec!["2"]
+    );
+}
