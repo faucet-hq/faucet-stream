@@ -21,20 +21,30 @@ pub fn row_to_json(row: &Row) -> Result<Value, FaucetError> {
     let mut map = Map::with_capacity(row.columns().len());
     let names: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
     for (i, (col, data)) in row.cells().enumerate() {
-        let money = matches!(
-            col.column_type(),
-            tiberius::ColumnType::Money | tiberius::ColumnType::Money4
-        );
-        let value = match (money, data) {
-            (true, ColumnData::F64(Some(f))) => Value::String(money_text(*f)),
-            _ => match scalar_to_json(data) {
-                Some(v) => v,
-                None => decode_temporal(row, i, data)?,
-            },
+        let value = match cell_to_json(is_money(&col.column_type()), data) {
+            Some(v) => v,
+            None => decode_temporal(row, i, data)?,
         };
         map.insert(names[i].clone(), value);
     }
     Ok(Value::Object(map))
+}
+
+/// Whether a column is `MONEY` / `SMALLMONEY`.
+fn is_money(ty: &tiberius::ColumnType) -> bool {
+    matches!(
+        ty,
+        tiberius::ColumnType::Money | tiberius::ColumnType::Money4
+    )
+}
+
+/// A non-temporal cell as JSON (a money column as exact decimal text), or
+/// `None` for a temporal cell.
+fn cell_to_json(money: bool, data: &ColumnData<'_>) -> Option<Value> {
+    match (money, data) {
+        (true, ColumnData::F64(Some(f))) => Some(Value::String(money_text(*f))),
+        _ => scalar_to_json(data),
+    }
 }
 
 /// A `MONEY` / `SMALLMONEY` value as an exact 4-decimal string. The driver
@@ -131,6 +141,26 @@ pub(crate) fn numeric_to_string(n: Numeric) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn money_columns_decode_as_exact_text() {
+        use tiberius::{ColumnData, ColumnType};
+        assert!(super::is_money(&ColumnType::Money));
+        assert!(super::is_money(&ColumnType::Money4));
+        assert!(!super::is_money(&ColumnType::Float8));
+        assert_eq!(
+            super::cell_to_json(true, &ColumnData::F64(Some(12.3456))),
+            Some(serde_json::json!("12.3456"))
+        );
+        assert_eq!(
+            super::cell_to_json(true, &ColumnData::F64(None)),
+            Some(serde_json::Value::Null)
+        );
+        assert_eq!(
+            super::cell_to_json(false, &ColumnData::F64(Some(1.5))),
+            Some(serde_json::json!(1.5))
+        );
+    }
+
     #[test]
     fn money_renders_exact_decimal_text() {
         assert_eq!(super::money_text(12.3456), "12.3456");

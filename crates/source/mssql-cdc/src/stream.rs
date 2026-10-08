@@ -35,7 +35,7 @@ use crate::change::{
     LSN_ALIAS, LsnBounds, OP_COLUMN, OpAction, PollPlan, SEQVAL_ALIAS, build_change_envelope,
     business_columns, op_action, plan_poll,
 };
-use crate::config::MssqlCdcSourceConfig;
+use crate::config::{MssqlCdcSourceConfig, OnGap, StartPosition};
 use crate::decode::row_to_json;
 use crate::lsn::Lsn;
 use crate::state::Bookmarks;
@@ -573,35 +573,19 @@ impl MssqlCdcSource {
                         FaucetError::Source(format!("mssql-cdc: pool checkout failed: {e}"))
                     })?;
                     for ci in &self.config.capture_instances {
-                        let (schema, table) = self
-                            .tables
-                            .get(ci)
-                            .cloned()
-                            .unwrap_or_else(|| ("".to_string(), ci.clone()));
                         let bounds = self.query_lsn_bounds(&mut conn, ci).await?;
-                        match plan_poll(marks.get(ci), bounds, start_position) {
-                            PollPlan::NoChanges { set_bookmark } => {
-                                // Fresh `current` start: anchor and persist it so
-                                // history is skipped.
-                                if let Some(anchor) = set_bookmark
-                                    && marks.get(ci).is_none()
-                                {
-                                    marks.set(ci.clone(), anchor);
-                                    if per_transaction {
-                                        yield StreamPage {
-                                            records: Vec::new(),
-                                            bookmark: Some(self.note_emitted(&marks)?),
-                                        };
-                                    } else {
-                                        agg_dirty = true;
-                                    }
+                        match plan_instance(ci, &self.tables, bounds, &mut marks, start_position, self.config.on_gap)? {
+                            InstanceStep::Idle => {}
+                            InstanceStep::Query(q) => queries.push(q),
+                            InstanceStep::Anchored => {
+                                if per_transaction {
+                                    yield StreamPage {
+                                        records: Vec::new(),
+                                        bookmark: Some(self.note_emitted(&marks)?),
+                                    };
+                                } else {
+                                    agg_dirty = true;
                                 }
-                            }
-                            PollPlan::Query { from, to, gap } => {
-                                if gap {
-                                    crate::change::check_gap(self.config.on_gap, ci, &from.to_hex())?;
-                                }
-                                queries.push(ChangeQuery { ci: ci.clone(), schema, table, from, to });
                             }
                         }
                     }
@@ -626,20 +610,12 @@ impl MssqlCdcSource {
                         heads.push(next_change(stream, &q.ci).await?);
                     }
 
-                    let mut buffer: Vec<Value> = Vec::new();
-                    let mut cur_lsn: Option<Lsn> = None;
+                    let mut tx = TxAssembler::new(max_staged);
                     while let Some(i) = next_head(&heads) {
                         let change = heads[i].take().expect("next_head picks a present head");
                         heads[i] = next_change(&mut streams[i], &queries[i].ci).await?;
-
-                        // Commit boundary: every change at or below `prev`, in
-                        // every instance, has been read, so the transaction is
-                        // complete and each instance can resume after it.
-                        if let Some(prev) = cur_lsn
-                            && prev != change.lsn
-                        {
+                        if let Some((prev, recs)) = tx.push(change, &queries[i])? {
                             advance_marks(&mut marks, &queries, prev);
-                            let recs = std::mem::take(&mut buffer);
                             if per_transaction {
                                 yield StreamPage {
                                     records: recs,
@@ -650,40 +626,13 @@ impl MssqlCdcSource {
                                 agg_dirty = true;
                             }
                         }
-                        cur_lsn = Some(change.lsn);
-
-                        if let OpAction::Emit(op) = op_action(change.op_code)? {
-                            if let Some(max) = max_staged
-                                && buffer.len() >= max
-                            {
-                                Err(FaucetError::Source(format!(
-                                    "mssql-cdc: in-progress transaction exceeded \
-                                     max_staged_records ({max}); aborting to avoid \
-                                     unbounded memory growth. Raise max_staged_records \
-                                     or reduce the source transaction size."
-                                )))?;
-                            }
-                            let q = &queries[i];
-                            let env = build_change_envelope(
-                                op,
-                                &q.schema,
-                                &q.table,
-                                &change.lsn_hex,
-                                change.seqval_hex.as_deref(),
-                                business_columns(&change.decoded),
-                            );
-                            buffer.push(env);
-                            any_rows = true;
-                        }
                     }
+                    any_rows |= tx.emitted;
                     drop(streams);
                     drop(conns);
 
-                    // Everything up to each instance's `to` is consumed.
-                    for q in &queries {
-                        marks.set(q.ci.clone(), q.to);
-                    }
-                    let recs = std::mem::take(&mut buffer);
+                    consume_all(&mut marks, &queries);
+                    let recs = tx.finish();
                     if per_transaction {
                         yield StreamPage {
                             records: recs,
@@ -751,33 +700,148 @@ async fn next_change(
         FaucetError::Source(format!("mssql-cdc: change row stream failed for {ci}: {e}"))
     })? {
         let QueryItem::Row(row) = item else { continue };
-        let decoded = row_to_json(&row)?;
-        let lsn_hex = decoded
-            .get(LSN_ALIAS)
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                FaucetError::Source("mssql-cdc: change row missing __$start_lsn".into())
-            })?
-            .to_string();
-        let seqval_hex = decoded
-            .get(SEQVAL_ALIAS)
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let op_code = decoded
-            .get(OP_COLUMN)
-            .and_then(Value::as_i64)
-            .ok_or_else(|| {
-                FaucetError::Source("mssql-cdc: change row missing __$operation".into())
-            })?;
-        return Ok(Some(Change {
-            lsn: Lsn::from_hex(&lsn_hex)?,
-            lsn_hex,
-            seqval_hex,
-            op_code,
-            decoded,
-        }));
+        return decode_change(row_to_json(&row)?).map(Some);
     }
     Ok(None)
+}
+
+/// Pull the commit LSN, sequence value and operation out of a decoded row.
+fn decode_change(decoded: Value) -> Result<Change, FaucetError> {
+    let lsn_hex = decoded
+        .get(LSN_ALIAS)
+        .and_then(Value::as_str)
+        .ok_or_else(|| FaucetError::Source("mssql-cdc: change row missing __$start_lsn".into()))?
+        .to_string();
+    let seqval_hex = decoded
+        .get(SEQVAL_ALIAS)
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let op_code = decoded
+        .get(OP_COLUMN)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| FaucetError::Source("mssql-cdc: change row missing __$operation".into()))?;
+    Ok(Change {
+        lsn: Lsn::from_hex(&lsn_hex)?,
+        lsn_hex,
+        seqval_hex,
+        op_code,
+        decoded,
+    })
+}
+
+/// What one capture instance contributes to a poll.
+enum InstanceStep {
+    /// Nothing to read.
+    Idle,
+    /// A fresh `current` start anchored the instance's bookmark; persist it.
+    Anchored,
+    /// Read this range of changes.
+    Query(ChangeQuery),
+}
+
+/// Plan one capture instance's poll from its LSN bounds, anchoring a fresh
+/// `current` start in `marks` and applying the `on_gap` policy.
+fn plan_instance(
+    ci: &str,
+    tables: &HashMap<String, (String, String)>,
+    bounds: LsnBounds,
+    marks: &mut Bookmarks,
+    start: StartPosition,
+    on_gap: OnGap,
+) -> Result<InstanceStep, FaucetError> {
+    match plan_poll(marks.get(ci), bounds, start) {
+        PollPlan::NoChanges {
+            set_bookmark: Some(anchor),
+        } if marks.get(ci).is_none() => {
+            marks.set(ci, anchor);
+            Ok(InstanceStep::Anchored)
+        }
+        PollPlan::NoChanges { .. } => Ok(InstanceStep::Idle),
+        PollPlan::Query { from, to, gap } => {
+            if gap {
+                crate::change::check_gap(on_gap, ci, &from.to_hex())?;
+            }
+            let (schema, table) = tables
+                .get(ci)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), ci.to_string()));
+            Ok(InstanceStep::Query(ChangeQuery {
+                ci: ci.to_string(),
+                schema,
+                table,
+                from,
+                to,
+            }))
+        }
+    }
+}
+
+/// Groups merged changes into whole transactions by commit LSN.
+struct TxAssembler {
+    buffer: Vec<Value>,
+    cur: Option<Lsn>,
+    max_staged: Option<usize>,
+    /// Whether any change was turned into a record.
+    emitted: bool,
+}
+
+impl TxAssembler {
+    fn new(max_staged: Option<usize>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            cur: None,
+            max_staged,
+            emitted: false,
+        }
+    }
+
+    /// Feed the next change in commit order. When it starts a new commit LSN,
+    /// the previous transaction is complete and is returned with its LSN.
+    fn push(
+        &mut self,
+        change: Change,
+        q: &ChangeQuery,
+    ) -> Result<Option<(Lsn, Vec<Value>)>, FaucetError> {
+        let closed = match self.cur {
+            Some(prev) if prev != change.lsn => Some((prev, std::mem::take(&mut self.buffer))),
+            _ => None,
+        };
+        self.cur = Some(change.lsn);
+        if let OpAction::Emit(op) = op_action(change.op_code)? {
+            if let Some(max) = self.max_staged
+                && self.buffer.len() >= max
+            {
+                return Err(FaucetError::Source(format!(
+                    "mssql-cdc: in-progress transaction exceeded \
+                     max_staged_records ({max}); aborting to avoid \
+                     unbounded memory growth. Raise max_staged_records \
+                     or reduce the source transaction size."
+                )));
+            }
+            self.buffer.push(build_change_envelope(
+                op,
+                &q.schema,
+                &q.table,
+                &change.lsn_hex,
+                change.seqval_hex.as_deref(),
+                business_columns(&change.decoded),
+            ));
+            self.emitted = true;
+        }
+        Ok(closed)
+    }
+
+    /// The records of the last, still-open transaction.
+    fn finish(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.buffer)
+    }
+}
+
+/// Everything up to each queried instance's `to` has been consumed.
+fn consume_all(marks: &mut Bookmarks, queries: &[ChangeQuery]) {
+    for q in queries {
+        marks.set(q.ci.clone(), q.to);
+    }
 }
 
 /// The stream whose head comes first in commit order: by commit LSN, then by
@@ -850,6 +914,291 @@ mod tests {
             op_code: 2,
             decoded: serde_json::json!({}),
         }
+    }
+
+    fn lsn(hex: &str) -> Lsn {
+        Lsn::from_hex(hex).unwrap()
+    }
+
+    fn query(ci: &str) -> ChangeQuery {
+        ChangeQuery {
+            ci: ci.into(),
+            schema: "dbo".into(),
+            table: ci.into(),
+            from: lsn("00000000000000000001"),
+            to: lsn("00000000000000000100"),
+        }
+    }
+
+    fn row(lsn_hex: &str, seq: &str, op: i64, id: i64) -> Change {
+        decode_change(serde_json::json!({
+            LSN_ALIAS: lsn_hex,
+            SEQVAL_ALIAS: seq,
+            OP_COLUMN: op,
+            "__$update_mask": "AQ==",
+            "id": id,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn decode_change_reads_metadata_and_keeps_the_row() {
+        let c = row("0000002a000000550003", "0000002a000000550002", 4, 7);
+        assert_eq!(c.lsn, lsn("0000002a000000550003"));
+        assert_eq!(c.lsn_hex, "0000002a000000550003");
+        assert_eq!(c.seqval_hex.as_deref(), Some("0000002a000000550002"));
+        assert_eq!(c.op_code, 4);
+        assert_eq!(c.decoded["id"], 7);
+    }
+
+    #[test]
+    fn decode_change_refuses_rows_without_lsn_or_operation() {
+        let no_lsn = decode_change(serde_json::json!({ OP_COLUMN: 2 }));
+        assert!(no_lsn.err().unwrap().to_string().contains("__$start_lsn"));
+        let no_op = decode_change(serde_json::json!({ LSN_ALIAS: "0000002a000000550003" }));
+        assert!(no_op.err().unwrap().to_string().contains("__$operation"));
+        let bad_lsn = decode_change(serde_json::json!({ LSN_ALIAS: "zz", OP_COLUMN: 2 }));
+        assert!(bad_lsn.is_err());
+        let no_seq = decode_change(serde_json::json!({
+            LSN_ALIAS: "0000002a000000550003", OP_COLUMN: 2
+        }))
+        .unwrap();
+        assert!(no_seq.seqval_hex.is_none());
+    }
+
+    #[test]
+    fn plan_instance_anchors_a_fresh_current_start_once() {
+        let tables = HashMap::new();
+        let bounds = LsnBounds {
+            min: Some(lsn("00000000000000000010")),
+            max: Some(lsn("00000000000000000020")),
+            start: None,
+        };
+        let mut marks = Bookmarks::new();
+        let step = plan_instance(
+            "dbo_t",
+            &tables,
+            bounds,
+            &mut marks,
+            StartPosition::Current,
+            OnGap::Fail,
+        )
+        .unwrap();
+        assert!(matches!(step, InstanceStep::Anchored));
+        assert_eq!(marks.get("dbo_t"), Some(lsn("00000000000000000020")));
+        let again = plan_instance(
+            "dbo_t",
+            &tables,
+            bounds,
+            &mut marks,
+            StartPosition::Current,
+            OnGap::Fail,
+        )
+        .unwrap();
+        assert!(matches!(again, InstanceStep::Idle));
+        assert_eq!(marks.get("dbo_t"), Some(lsn("00000000000000000020")));
+    }
+
+    #[test]
+    fn plan_instance_is_idle_without_change_activity() {
+        let mut marks = Bookmarks::new();
+        let step = plan_instance(
+            "dbo_t",
+            &HashMap::new(),
+            LsnBounds::default(),
+            &mut marks,
+            StartPosition::Earliest,
+            OnGap::Fail,
+        )
+        .unwrap();
+        assert!(matches!(step, InstanceStep::Idle));
+        assert_eq!(marks.get("dbo_t"), None);
+    }
+
+    #[test]
+    fn plan_instance_queries_with_the_resolved_table() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "dbo_Orders".to_string(),
+            ("sales".to_string(), "Orders".to_string()),
+        );
+        let bounds = LsnBounds {
+            min: Some(lsn("00000000000000000010")),
+            max: Some(lsn("00000000000000000020")),
+            start: None,
+        };
+        let mut marks = Bookmarks::new();
+        let InstanceStep::Query(q) = plan_instance(
+            "dbo_Orders",
+            &tables,
+            bounds,
+            &mut marks,
+            StartPosition::Earliest,
+            OnGap::Fail,
+        )
+        .unwrap() else {
+            panic!("expected a query");
+        };
+        assert_eq!((q.schema.as_str(), q.table.as_str()), ("sales", "Orders"));
+        assert_eq!(
+            (q.from, q.to),
+            (lsn("00000000000000000010"), lsn("00000000000000000020"))
+        );
+
+        let InstanceStep::Query(unknown) = plan_instance(
+            "dbo_Other",
+            &tables,
+            bounds,
+            &mut Bookmarks::new(),
+            StartPosition::Earliest,
+            OnGap::Fail,
+        )
+        .unwrap() else {
+            panic!("expected a query");
+        };
+        assert_eq!(
+            (unknown.schema.as_str(), unknown.table.as_str()),
+            ("", "dbo_Other")
+        );
+    }
+
+    #[test]
+    fn plan_instance_applies_the_gap_policy() {
+        let bounds = LsnBounds {
+            min: Some(lsn("00000000000000000050")),
+            max: Some(lsn("00000000000000000090")),
+            start: None,
+        };
+        let behind = || {
+            let mut m = Bookmarks::new();
+            m.set("dbo_t", lsn("00000000000000000010"));
+            m
+        };
+        let err = plan_instance(
+            "dbo_t",
+            &HashMap::new(),
+            bounds,
+            &mut behind(),
+            StartPosition::Current,
+            OnGap::Fail,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("purged"), "{err}");
+        let InstanceStep::Query(q) = plan_instance(
+            "dbo_t",
+            &HashMap::new(),
+            bounds,
+            &mut behind(),
+            StartPosition::Current,
+            OnGap::Skip,
+        )
+        .unwrap() else {
+            panic!("expected a query");
+        };
+        assert_eq!(q.from, lsn("00000000000000000050"));
+    }
+
+    #[test]
+    fn transactions_close_on_a_new_commit_lsn() {
+        let (a, b) = (query("dbo_a"), query("dbo_b"));
+        let mut tx = TxAssembler::new(None);
+        assert!(
+            tx.push(row("00000000000000000005", "01", 2, 1), &a)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tx.push(row("00000000000000000005", "02", 3, 2), &b)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tx.push(row("00000000000000000005", "03", 4, 2), &b)
+                .unwrap()
+                .is_none()
+        );
+        let (lsn5, recs) = tx
+            .push(row("00000000000000000009", "01", 1, 3), &a)
+            .unwrap()
+            .expect("the first transaction closes");
+        assert_eq!(lsn5, lsn("00000000000000000005"));
+        assert_eq!(recs.len(), 2, "the update pre-image row is skipped");
+        assert_eq!(recs[0]["op"], "i");
+        assert_eq!(recs[0]["table"], "dbo_a");
+        assert_eq!(recs[1]["op"], "u");
+        assert_eq!(recs[1]["table"], "dbo_b");
+        assert_eq!(recs[1]["after"]["id"], 2);
+        assert!(tx.emitted);
+        let tail = tx.finish();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0]["op"], "d");
+        assert_eq!(tail[0]["before"]["id"], 3);
+        assert!(tx.finish().is_empty());
+    }
+
+    #[test]
+    fn a_transaction_of_skipped_rows_still_closes_empty() {
+        let a = query("dbo_a");
+        let mut tx = TxAssembler::new(None);
+        assert!(
+            tx.push(row("00000000000000000005", "01", 3, 1), &a)
+                .unwrap()
+                .is_none()
+        );
+        let (lsn5, recs) = tx
+            .push(row("00000000000000000006", "01", 3, 1), &a)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lsn5, lsn("00000000000000000005"));
+        assert!(recs.is_empty());
+        assert!(!tx.emitted);
+    }
+
+    #[test]
+    fn transactions_refuse_unknown_operations_and_oversized_buffers() {
+        let a = query("dbo_a");
+        let mut tx = TxAssembler::new(None);
+        assert!(
+            tx.push(row("00000000000000000005", "01", 9, 1), &a)
+                .is_err()
+        );
+
+        let mut capped = TxAssembler::new(Some(2));
+        capped
+            .push(row("00000000000000000005", "01", 2, 1), &a)
+            .unwrap();
+        capped
+            .push(row("00000000000000000005", "02", 2, 2), &a)
+            .unwrap();
+        let err = capped
+            .push(row("00000000000000000005", "03", 2, 3), &a)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("max_staged_records (2)"), "{err}");
+    }
+
+    #[test]
+    fn consume_all_moves_every_instance_to_its_upper_bound() {
+        let mut marks = Bookmarks::new();
+        marks.set("dbo_a", lsn("00000000000000000003"));
+        consume_all(&mut marks, &[query("dbo_a"), query("dbo_b")]);
+        assert_eq!(marks.get("dbo_a"), Some(lsn("00000000000000000100")));
+        assert_eq!(marks.get("dbo_b"), Some(lsn("00000000000000000100")));
+    }
+
+    #[tokio::test]
+    async fn new_fails_when_the_server_is_unreachable() {
+        let cfg: MssqlCdcSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_url": "mssql://sa:pw@127.0.0.1:1/sales",
+            "capture_instances": ["dbo_Orders"],
+            "max_connections": 2
+        }))
+        .unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(60), MssqlCdcSource::new(cfg))
+            .await
+            .expect("an unreachable server fails promptly");
+        assert!(res.is_err());
     }
 
     #[test]
