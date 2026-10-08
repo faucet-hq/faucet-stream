@@ -936,7 +936,7 @@ faucet catalog datasets --config pipeline.yaml                 # list catalogued
 faucet catalog datasets --config pipeline.yaml --kind csv --q users --json
 faucet catalog show 3f2a9c1e0b7d4a55 --config pipeline.yaml    # detail (id prefix ok)
 faucet catalog lineage --config pipeline.yaml --root 3f2a9c1e0b7d4a55 --depth 3
-faucet catalog annotate 3f2a9c1e --config pipeline.yaml \
+faucet catalog annotate 3f2a9c1e0b7d4a55 --config pipeline.yaml \
   --owner team-bi --consumer revenue-dashboard=dashboard --contact "#bi" --columns amount,currency
 ```
 
@@ -950,7 +950,10 @@ cwd when omitted. `annotate` is the one write: it sets a dataset's owners
 (`--owner`, repeatable; replaces the list) and upserts declared consumers
 (`--consumer NAME[=KIND]`, repeatable, with `--contact` / `--columns` for the
 consumers named in that call; `--replace` drops the unlisted) — what
-[`plan --impact`](#plan) names. The others are read-only.
+[`plan --impact`](#plan) names, and takes the full dataset id (a prefix is
+refused, so a write can never land on the wrong dataset). The others are
+read-only and accept a unique id prefix, matched against every catalogued
+dataset.
 
 ## `usage`
 
