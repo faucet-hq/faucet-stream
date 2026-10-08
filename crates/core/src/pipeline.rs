@@ -1564,6 +1564,9 @@ where
                 cb.cooldown,
             )
         });
+    if breaker.is_some() {
+        crate::observability::resilience::circuit_closed(&pipeline_name, &row);
+    }
     // Poison-pill (per-row) policy, applied in the DLQ path only.
     let poison = resilience.as_ref().and_then(|r| r.poison);
 
@@ -2010,6 +2013,10 @@ where
                                 }
                             } else if page_success > 0 {
                                 b.record_success();
+                                crate::observability::resilience::circuit_closed(
+                                    &pipeline_name,
+                                    &row,
+                                );
                             }
                         }
                         if let Some(limit) = dlq_cfg.max_failures_per_page

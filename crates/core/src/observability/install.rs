@@ -151,13 +151,20 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
     }
 
     // --- Traces ---
-    if let Some(t) = cfg.tracing.as_ref() {
+    #[cfg(feature = "otel")]
+    let otel_traces = cfg
+        .otel
+        .as_ref()
+        .is_some_and(|o| o.exports(crate::observability::otel::OtelSignal::Traces));
+    #[cfg(not(feature = "otel"))]
+    let otel_traces = false;
+    if cfg.tracing.is_some() || otel_traces {
         use tracing_subscriber::EnvFilter;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
-        let make_filter =
-            || EnvFilter::try_new(&t.level).unwrap_or_else(|_| EnvFilter::new("info"));
+        let level = cfg.tracing.as_ref().map_or("info", |t| t.level.as_str());
+        let make_filter = || EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
 
         // Reassigned only in the `otel` branch below; without that feature the
         // `mut` is genuinely unused.
@@ -165,31 +172,46 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
         let mut installed = false;
 
         #[cfg(feature = "otel")]
-        {
-            let otel_traces = cfg
-                .otel
-                .as_ref()
-                .map(|o| o.exports(crate::observability::otel::OtelSignal::Traces))
-                .unwrap_or(false);
-            if let (true, Some(otel)) = (otel_traces, cfg.otel.as_ref()) {
+        if let (true, Some(otel)) = (otel_traces, cfg.otel.as_ref()) {
+            if crate::observability::otel::tracer_installed() {
+                installed = true;
+            } else {
                 match crate::observability::otel::build_trace_provider(otel) {
                     Ok(tp) => {
                         use opentelemetry::trace::TracerProvider as _;
+                        use tracing_subscriber::Layer as _;
                         let tracer = tp.tracer("faucet");
                         crate::observability::otel::install_propagator();
-                        let reg = tracing_subscriber::registry()
-                            .with(make_filter())
-                            .with(tracing_subscriber::fmt::layer())
-                            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-                            .with(crate::observability::otel::OtelErrorCountLayer);
-                        if reg.try_init().is_err() {
-                            tracing::warn!("tracing subscriber already installed; continuing");
-                            report.tracing_already_installed = true;
-                            // try_init failed: no otel layer was installed, so DON'T store the
-                            // provider — let `tp` drop here to shut its exporter down.
-                        } else {
-                            report.otel_signals.push("traces");
-                            otel_tracer = Some(tp);
+                        let layer: crate::observability::otel::TraceLayer = Box::new(
+                            tracing_opentelemetry::layer()
+                                .with_tracer(tracer)
+                                .and_then(crate::observability::otel::OtelErrorCountLayer),
+                        );
+                        // A host that installed its own subscriber first (the CLI)
+                        // registered a slot for exactly this layer.
+                        match crate::observability::otel::fill_trace_slot(layer) {
+                            Ok(()) => {
+                                report.otel_signals.push("traces");
+                                otel_tracer = Some(tp);
+                            }
+                            Err(layer) => {
+                                let reg = tracing_subscriber::registry()
+                                    .with(layer)
+                                    .with(make_filter())
+                                    .with(tracing_subscriber::fmt::layer());
+                                if reg.try_init().is_err() {
+                                    tracing::warn!(
+                                        "tracing subscriber already installed and no trace \
+                                         layer slot registered; OTLP traces are not exported"
+                                    );
+                                    report.tracing_already_installed = true;
+                                    // No otel layer was installed, so DON'T store the
+                                    // provider — let `tp` drop to shut its exporter down.
+                                } else {
+                                    report.otel_signals.push("traces");
+                                    otel_tracer = Some(tp);
+                                }
+                            }
                         }
                         installed = true;
                     }

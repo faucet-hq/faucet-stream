@@ -568,6 +568,7 @@ Defaults: `transform-flatten`, `transform-rename-keys`, `transform-keys-case`.
 | `file-format-orc` | ORC reading (`orc-rust`, Arrow-native, so it turns on `arrow`); read-only by design |
 | `file-formats` | All of the above |
 | `observability-install` | `install_observability` (Prometheus exporter + tracing subscriber) |
+| `otel` | OTLP export of traces and metrics. A host that installs its own global subscriber first registers a `tracing_subscriber::reload` slot with `observability::otel::register_trace_layer_slot`; `install_observability` puts the OTLP trace layer there |
 
 > Connector authors: enable in your **own** `Cargo.toml` every feature your crate uses — the feature-isolation CI matrix builds each connector alone, so relying on workspace feature unification compiles locally but fails CI.
 

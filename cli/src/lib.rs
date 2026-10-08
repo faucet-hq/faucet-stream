@@ -289,30 +289,66 @@ async fn dispatch(cli: Cli) -> CliResult<()> {
 fn install_tracing(level: &str, format: crate::cli::LogFormat) {
     use crate::secrets::registry::RedactingMakeWriter;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        // Redaction wraps the *serialized bytes*, so it keeps working under
-        // JSON: a resolved secret appearing in a field value is still scrubbed.
-        .with_writer(RedactingMakeWriter);
+    // The bottom of the stack is a reload slot the OTLP trace layer is placed
+    // in once a config with `observability.otel` is loaded.
+    let registry = tracing_subscriber::registry().with(trace_layer_slot());
     match format {
         crate::cli::LogFormat::Text => {
-            let _ = builder.try_init();
+            // Redaction wraps the *serialized bytes*, so it keeps working
+            // under JSON: a resolved secret in a field value is still scrubbed.
+            let _ = registry
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter))
+                .try_init();
         }
         crate::cli::LogFormat::Json => {
-            let _ = builder
-                .json()
-                // Event fields at the top level rather than nested under
-                // `fields`, which is what log pipelines index on.
-                .flatten_event(true)
-                // Span context (`pipeline`, `row`, `run_id`, …) as fields; the
-                // full ancestor list is noise once the current span's fields
-                // are present.
-                .with_current_span(true)
-                .with_span_list(false)
+            let _ = registry
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(RedactingMakeWriter)
+                        .json()
+                        // Event fields at the top level rather than nested under
+                        // `fields`, which is what log pipelines index on.
+                        .flatten_event(true)
+                        // Span context (`pipeline`, `row`, `run_id`, …) as
+                        // fields; the full ancestor list is noise once the
+                        // current span's fields are present.
+                        .with_current_span(true)
+                        .with_span_list(false),
+                )
                 .try_init();
         }
     }
+}
+
+/// An empty reload layer registered with faucet-core as the home of the OTLP
+/// trace layer (`install_observability` builds it after this subscriber is
+/// already global, so it could not install its own).
+#[cfg(feature = "otel")]
+pub(crate) fn trace_layer_slot() -> tracing_subscriber::reload::Layer<
+    Option<faucet_core::observability::otel::TraceLayer>,
+    tracing_subscriber::Registry,
+> {
+    let (layer, handle) = tracing_subscriber::reload::Layer::new(None);
+    faucet_core::observability::otel::register_trace_layer_slot(move |l| {
+        let mut slot = Some(l);
+        match handle.modify(|s| *s = slot.take()) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(slot
+                .take()
+                .expect("a failed reload leaves the layer unused")),
+        }
+    });
+    layer
+}
+
+#[cfg(all(feature = "observability", not(feature = "otel")))]
+pub(crate) fn trace_layer_slot() -> tracing_subscriber::layer::Identity {
+    tracing_subscriber::layer::Identity::new()
 }
 
 /// Stub used when the `observability` feature is disabled. Logging falls back to
