@@ -1581,10 +1581,9 @@ impl faucet_core::Sink for ElasticsearchSink {
     /// Item-level rejections never collapse into an outer `Err`: each record
     /// maps to exactly one [`faucet_core::RowOutcome`] — `Ok(())` when its
     /// action was accepted, `Err` when Elasticsearch rejected it (after the
-    /// transient `429`/`503` retries of [`bulk_items`](Self::bulk_items)),
-    /// when its response item is missing, or when the record could not be
-    /// turned into an action (a missing/`null` key, an unusable `id_field`
-    /// value). Only a transport/HTTP failure is an outer `Err`.
+    /// transient `429`/`503` per-item retries), when its response item is
+    /// missing, or when the record could not be turned into an action (a
+    /// missing/`null` key, an unusable `id_field` value). Only a transport/HTTP failure is an outer `Err`.
     async fn write_batch_partial(
         &self,
         records: &[Value],
