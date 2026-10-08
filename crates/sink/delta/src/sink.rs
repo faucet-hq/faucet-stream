@@ -249,6 +249,8 @@ impl DeltaSink {
         batch: RecordBatch,
     ) -> Result<usize, FaucetError> {
         let rows = batch.num_rows();
+        let schema = state.schema.clone().expect("schema set");
+        self.ensure_table_writer(state, &schema).await?;
         let writer = state.writer.as_mut().expect("writer set");
         writer
             .write(batch)
