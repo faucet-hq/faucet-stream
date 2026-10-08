@@ -124,7 +124,7 @@ pub use drift::{
     SchemaDriftSpec, SchemaEvolution, SqlBaseType, adds_null, base_widened, json_schema_base_type,
 };
 #[cfg(feature = "encryption")]
-pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
+pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec, SealedLine};
 pub use error::FaucetError;
 pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{

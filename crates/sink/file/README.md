@@ -116,9 +116,16 @@ the columnar path batches are cast to the schema.
 ## Encryption
 
 With `encryption: { key: ${vault:…} }`, uncompressed JSON Lines and raw text
-seal each record on its own line (base64 of an AES-256-GCM payload) — the same
-layout the `jsonl` sink writes, so the file stays appendable and every line
-decrypts on its own. Every other file, compressed JSON Lines included, is
+seal each record on its own line (base64 of an AES-256-GCM payload), so the
+file stays appendable. The file opens with a sealed header line naming a random
+file id and closes with a sealed trailer line holding the record count and a
+SHA-256 digest of every record line in order; each record line is bound so it
+can not be read as a line of an older, header-less file. A reader verifies the
+file whole, so a line dropped, duplicated, reordered or copied in from another
+file — or a file cut short at a line boundary — fails the read. Appending cuts
+the trailer, continues the digest and writes a new one; a file written before
+this layout (by the `jsonl` sink, or an older faucet) is continued line by
+line. Every other file, compressed JSON Lines included, is
 compressed and then sealed whole when it is finalised; appending to one
 decrypts it first. Appending to an existing file that is not sealed the same
 way — plaintext under `encryption`, or a sealed file without it — is refused

@@ -10,6 +10,8 @@ use faucet_core::{FaucetError, FileFormat};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "encryption")]
+pub mod sealed_lines;
 pub mod write;
 
 #[doc(hidden)]

@@ -51,27 +51,105 @@ pub(crate) struct Ctx<'a> {
 
 impl Ctx<'_> {
     /// The bytes of `records` as the line formats write them: pretty or
-    /// compact JSON, and sealed per record when encryption is on.
-    fn line_bytes(&self, records: &[Value]) -> Result<Vec<u8>, FaucetError> {
+    /// compact JSON, and sealed per record when encryption is on — bound
+    /// into the file's `seal`, or unbound when continuing a file written
+    /// before whole-file integrity.
+    fn line_bytes(
+        &self,
+        records: &[Value],
+        seal: Option<&mut Seal>,
+    ) -> Result<Vec<u8>, FaucetError> {
         #[cfg(feature = "encryption")]
         if let Some(enc) = self.encryption
             && self.seals_lines()
         {
             use base64::Engine as _;
+            let mut seal = seal;
             let mut out = Vec::new();
             for r in records {
                 let mut line = self.plain_lines(std::slice::from_ref(r))?;
                 line.pop();
-                out.extend_from_slice(
-                    base64::engine::general_purpose::STANDARD
-                        .encode(enc.encrypt(&line))
-                        .as_bytes(),
-                );
-                out.push(b'\n');
+                match seal.as_deref_mut() {
+                    Some(seal) => out.extend_from_slice(&seal.seal(enc, &line)),
+                    None => {
+                        out.extend_from_slice(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(enc.encrypt(&line))
+                                .as_bytes(),
+                        );
+                        out.push(b'\n');
+                    }
+                }
             }
             return Ok(out);
         }
+        let _ = seal;
         self.plain_lines(records)
+    }
+
+    /// A fresh seal for a new per-line sealed file, when this output is one.
+    fn new_seal(&self) -> Option<Seal> {
+        #[cfg(feature = "encryption")]
+        if self.encryption.is_some() && self.seals_lines() {
+            return Some(Seal::new());
+        }
+        None
+    }
+
+    /// The header line opening a sealed file.
+    fn seal_header(&self, seal: &Seal) -> Vec<u8> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = self.encryption {
+            return seal.header(enc);
+        }
+        let _ = seal;
+        Vec::new()
+    }
+
+    /// The trailer line closing a sealed file.
+    fn seal_trailer(&self, seal: &Seal) -> Vec<u8> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = self.encryption {
+            return seal.trailer(enc);
+        }
+        let _ = seal;
+        Vec::new()
+    }
+
+    /// Continue a stored per-line sealed file copied to `tmp`: verify it
+    /// whole, cut its trailer and return its seal. A file written before
+    /// whole-file integrity continues unbound (`None`).
+    fn resume_seal(&self, tmp: &Path, label: &str) -> Result<Option<Seal>, FaucetError> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = self.encryption
+            && self.seals_lines()
+        {
+            use crate::sealed_lines::{Opened, open};
+            let raw = std::fs::read(tmp).map_err(|e| io_err("reading", tmp, e))?;
+            return match open(&raw, enc)
+                .map_err(|e| FaucetError::Sink(format!("file sink: continuing '{label}': {e}")))?
+            {
+                Opened::Sealed { seal, body_len, .. } => {
+                    OpenOptions::new()
+                        .write(true)
+                        .open(tmp)
+                        .and_then(|f| f.set_len(body_len as u64))
+                        .map_err(|e| io_err("truncating", tmp, e))?;
+                    Ok(Some(seal))
+                }
+                Opened::Legacy { .. } => Ok(None),
+                Opened::Empty => {
+                    OpenOptions::new()
+                        .write(true)
+                        .open(tmp)
+                        .and_then(|f| f.set_len(0))
+                        .map_err(|e| io_err("truncating", tmp, e))?;
+                    Ok(Some(Seal::new()))
+                }
+            };
+        }
+        let _ = (tmp, label);
+        Ok(None)
     }
 
     fn plain_lines(&self, records: &[Value]) -> Result<Vec<u8>, FaucetError> {
@@ -336,6 +414,12 @@ impl Write for LineOut {
 
 type LineWriter = SyncCompressWriter<BufWriter<LineOut>>;
 
+/// The integrity state of a per-line sealed file being written.
+#[cfg(feature = "encryption")]
+type Seal = crate::sealed_lines::LineSeal;
+#[cfg(not(feature = "encryption"))]
+type Seal = ();
+
 /// Format-specific state.
 enum Enc {
     /// JSON Lines and raw text: encoded bytes streamed through the codec.
@@ -393,6 +477,8 @@ pub(crate) struct OpenFile {
     parts: Option<Parts>,
     /// The upload a streamed file's parts go to, once the first part is full.
     pub stream: Option<Box<dyn PartStream>>,
+    /// Whole-file integrity of a per-line sealed file while it is open.
+    seal: Option<Seal>,
 }
 
 impl OpenFile {
@@ -422,6 +508,7 @@ impl OpenFile {
             continued: existing.is_some(),
             parts: None,
             stream: None,
+            seal: None,
         };
         file.enc = match ctx.format {
             FileFormat::JsonLines | FileFormat::RawText => {
@@ -433,13 +520,9 @@ impl OpenFile {
                     }
                     _ => None,
                 };
-                Enc::Lines(Some(open_lines(
-                    ctx,
-                    &file.label,
-                    &file.tmp,
-                    existing,
-                    spool,
-                )?))
+                let (w, seal) = open_lines(ctx, &file.label, &file.tmp, existing, spool)?;
+                file.seal = seal;
+                Enc::Lines(Some(w))
             }
             #[cfg(feature = "file-format-csv")]
             FileFormat::Csv => {
@@ -495,11 +578,13 @@ impl OpenFile {
         let tmp = self.tmp.clone();
         match &mut self.enc {
             Enc::Lines(slot) => {
-                let buf = ctx.line_bytes(records).map_err(clean)?;
                 if slot.is_none() {
-                    *slot =
-                        Some(open_lines(ctx, &self.label, &tmp, existing, None).map_err(clean)?);
+                    let (w, seal) =
+                        open_lines(ctx, &self.label, &tmp, existing, None).map_err(clean)?;
+                    *slot = Some(w);
+                    self.seal = seal;
                 }
+                let buf = ctx.line_bytes(records, self.seal.as_mut()).map_err(clean)?;
                 let w = slot.as_mut().expect("opened above");
                 w.write_all(&buf)
                     .map_err(|e| dirty(io_err("writing", &tmp, e)))?;
@@ -554,9 +639,13 @@ impl OpenFile {
         let tmp = self.tmp.clone();
         match &mut self.enc {
             Enc::Lines(slot) => {
-                let Some(w) = slot.take() else {
+                let Some(mut w) = slot.take() else {
                     return Ok(Closed::Nothing);
                 };
+                if let Some(seal) = self.seal.take() {
+                    w.write_all(&ctx.seal_trailer(&seal))
+                        .map_err(|e| io_err("writing", &tmp, e))?;
+                }
                 let buffered = w.finish().map_err(|e| io_err("finishing", &tmp, e))?;
                 let out = buffered
                     .into_inner()
@@ -626,6 +715,7 @@ impl OpenFile {
         if let Enc::Lines(slot) = &mut self.enc {
             slot.take();
         }
+        self.seal = None;
         #[cfg(feature = "file-format-parquet")]
         if let Enc::Parquet(state) = &mut self.enc {
             state.abandon();
@@ -646,22 +736,29 @@ fn open_lines(
     tmp: &Path,
     existing: Option<&Path>,
     spool: Option<(usize, Parts)>,
-) -> Result<Box<LineWriter>, FaucetError> {
+) -> Result<(Box<LineWriter>, Option<Seal>), FaucetError> {
+    let start = |mut w: Box<LineWriter>, seal: Option<Seal>| {
+        if let Some(seal) = &seal {
+            w.write_all(&ctx.seal_header(seal))
+                .map_err(|e| io_err("writing", tmp, e))?;
+        }
+        Ok((w, seal))
+    };
     if let Some((size, parts)) = spool {
         let out = LineOut::Spool {
             size,
             buf: Vec::new(),
             parts,
         };
-        return Ok(Box::new(sync_compress_writer(
-            BufWriter::new(out),
-            ctx.codec,
-        )));
+        let w = Box::new(sync_compress_writer(BufWriter::new(out), ctx.codec));
+        return start(w, ctx.new_seal());
     }
+    let mut resumed = None;
     if let Some(existing) = existing {
         if ctx.seals_lines() {
             ctx.check_line_sealing(existing, label)?;
             copy_or_move(existing, tmp)?;
+            resumed = Some(ctx.resume_seal(tmp, label)?);
         } else if ctx.encrypted() {
             let stored = ctx.read_stored(existing, label);
             remove_fetched(existing);
@@ -672,10 +769,18 @@ fn open_lines(
         }
     }
     let f = open_scratch(tmp, ctx.private(), existing.is_some())?;
-    Ok(Box::new(sync_compress_writer(
+    let w = Box::new(sync_compress_writer(
         BufWriter::new(LineOut::File(f)),
         ctx.codec,
-    )))
+    ));
+    match resumed {
+        // An empty stored file starts sealed like a new one.
+        Some(Some(seal)) if std::fs::metadata(tmp).is_ok_and(|m| m.len() == 0) => {
+            start(w, Some(seal))
+        }
+        Some(seal) => Ok((w, seal)),
+        None => start(w, ctx.new_seal()),
+    }
 }
 
 /// Make `to` a copy of `from`: a rename when `from` is a fetched copy, a

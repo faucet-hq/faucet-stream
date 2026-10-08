@@ -346,7 +346,9 @@ Parquet stream, and so does CSV (with the `csv:` dialect above); the other
 formats are read whole per file. `parquet: { columns: [...] }` projects a
 Parquet read to those columns, and Parquet schemas are compared from the
 footers before the first row is read. `encryption:` decrypts files the `file`
-or `jsonl` sink encrypted. See the
+or `jsonl` sink encrypted; a JSON Lines file the `file` sink sealed line by line
+is verified whole against its trailer (record count and digest), so dropped,
+reordered or truncated lines fail the read. See the
 [crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/file)
 for sharding, discovery, HTTP retries and a field-by-field mapping from the
 `csv` and `parquet` sources, which the `file` source matches option for option.

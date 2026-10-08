@@ -676,7 +676,7 @@ mod capped_read_tests {
 
     #[tokio::test]
     async fn a_body_past_the_cap_fails_and_one_at_the_cap_reads() {
-        let body = vec![b'x'; 64];
+        let body = [b'x'; 64];
         let ok = read_to_end_capped(&body[..], 64, "f").await.unwrap();
         assert_eq!(ok.len(), 64);
         let err = read_to_end_capped(&body[..], 63, "big.json.gz")

@@ -907,3 +907,130 @@ async fn a_run_removes_its_own_stale_upload_scratch() {
         ]
     );
 }
+
+#[cfg(feature = "encryption")]
+mod sealed_line_integrity {
+    use super::*;
+    use crate::sealed_lines::{Opened, open, plaintext};
+
+    fn enc() -> faucet_core::CompiledEncryption {
+        faucet_core::CompiledEncryption::compile(
+            &serde_json::from_value(json!({"key": "k"})).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn sealed_jsonl() -> WriteSettings {
+        let mut s = jsonl();
+        s.if_exists = IfExists::Append;
+        s.encryption = Some(serde_json::from_value(json!({"key": "k"})).unwrap());
+        s
+    }
+
+    #[tokio::test]
+    async fn a_file_continued_across_flushes_and_runs_verifies_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(dir.path(), "e.jsonl", sealed_jsonl());
+        w.write_rows(&rows(2)).await.unwrap();
+        w.flush().await.unwrap();
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        let again = local(dir.path(), "e.jsonl", sealed_jsonl());
+        again.write_rows(&rows(1)).await.unwrap();
+        again.flush().await.unwrap();
+        let raw = std::fs::read(dir.path().join("e.jsonl")).unwrap();
+        assert!(matches!(open(&raw, &enc()).unwrap(), Opened::Sealed { .. }));
+        let text = String::from_utf8(plaintext(&raw, &enc()).unwrap()).unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            ["{\"i\":0}", "{\"i\":1}", "{\"i\":0}", "{\"i\":0}"]
+        );
+        let cut: Vec<&[u8]> = raw.split_inclusive(|b| *b == b'\n').collect();
+        assert!(open(&cut[..cut.len() - 1].concat(), &enc()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_streamed_remote_file_carries_header_and_trailer() {
+        let mem = Arc::new(Mem::default());
+        let mut s = sealed_jsonl();
+        s.if_exists = IfExists::Replace;
+        let w = remote(&mem, Some("e.jsonl"), s, 1);
+        w.write_rows(&rows(3)).await.unwrap();
+        w.flush().await.unwrap();
+        let raw = mem.objects.lock().unwrap()["pre/e.jsonl"].clone();
+        assert_eq!(
+            String::from_utf8(plaintext(&raw, &enc()).unwrap())
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_streamed_in_parts_carries_header_and_trailer() {
+        let mem = Arc::new(Mem::default());
+        let mut s = per_flush();
+        s.encryption = Some(serde_json::from_value(json!({"key": "k"})).unwrap());
+        let (base, t) = object_layout("pre/", None, ".jsonl", s.format, s.codec, false).unwrap();
+        let b = RemoteBackend::new(mem.clone(), base, &t, None)
+            .unwrap()
+            .with_multipart(Arc::new(MemParts {
+                mem: mem.clone(),
+                size: 64,
+            }));
+        let w = FileWriter::new(s, t, Arc::new(b)).unwrap();
+        w.write_rows(&rows(50)).await.unwrap();
+        w.flush().await.unwrap();
+        let keys = mem.keys();
+        let raw = mem.objects.lock().unwrap()[&keys[0]].clone();
+        assert!(matches!(open(&raw, &enc()).unwrap(), Opened::Sealed { .. }));
+        assert_eq!(
+            String::from_utf8(plaintext(&raw, &enc()).unwrap())
+                .unwrap()
+                .lines()
+                .count(),
+            50
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_from_before_whole_file_integrity_continues_line_by_line() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let line = |r: &str| {
+            format!(
+                "{}\n",
+                base64::engine::general_purpose::STANDARD.encode(enc().encrypt(r.as_bytes()))
+            )
+        };
+        std::fs::write(dir.path().join("old.jsonl"), line("{\"i\":9}")).unwrap();
+        let w = local(dir.path(), "old.jsonl", sealed_jsonl());
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        let raw = std::fs::read(dir.path().join("old.jsonl")).unwrap();
+        assert!(matches!(open(&raw, &enc()).unwrap(), Opened::Legacy { .. }));
+        assert_eq!(plaintext(&raw, &enc()).unwrap(), b"{\"i\":9}\n{\"i\":0}\n");
+
+        std::fs::write(dir.path().join("empty.jsonl"), "\n").unwrap();
+        let w = local(dir.path(), "empty.jsonl", sealed_jsonl());
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        let raw = std::fs::read(dir.path().join("empty.jsonl")).unwrap();
+        assert!(matches!(open(&raw, &enc()).unwrap(), Opened::Sealed { .. }));
+
+        let w = local(dir.path(), "t.jsonl", sealed_jsonl());
+        w.write_rows(&rows(2)).await.unwrap();
+        w.flush().await.unwrap();
+        let mut lines: Vec<Vec<u8>> = std::fs::read(dir.path().join("t.jsonl"))
+            .unwrap()
+            .split_inclusive(|b| *b == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        lines.swap(1, 2);
+        std::fs::write(dir.path().join("t.jsonl"), lines.concat()).unwrap();
+        let w = local(dir.path(), "t.jsonl", sealed_jsonl());
+        let e = w.write_rows(&rows(1)).await.unwrap_err().to_string();
+        assert!(e.contains("integrity"), "{e}");
+    }
+}

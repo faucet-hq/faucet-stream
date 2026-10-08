@@ -81,6 +81,14 @@ readable by their owner only.
 Features mirror the formats: `file-format-csv`, `-xml`, `-excel`, `-avro`,
 `-parquet` (`file-formats` is all of them), `arrow`, `encryption`.
 
+`sealed_lines` (feature `encryption`) is the per-line sealed JSON Lines layout:
+`LineSeal` writes the header, bound record lines and the trailer (record count
+plus a SHA-256 digest of the lines), and `open` / `plaintext` verify a file whole
+— a file written before the header existed is read line by line with a warning.
+`ObjectFilter` is the object-store listing filter the s3 / gcs / azure-blob
+sources share: folder markers and `_`/`.`-prefixed keys are skipped unless an
+`include` glob names exactly what to read.
+
 Connector authors normally depend on the source or sink crate, not this one.
 
 ```toml

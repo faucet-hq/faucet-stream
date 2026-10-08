@@ -22,6 +22,7 @@ file-format-csv = []
 file-format-xml = []
 
 [dev-dependencies]
+faucet-common-file = { workspace = true, features = ["encryption"] }
 faucet-core = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-conformance.workspace = true
 faucet-common-oracle.workspace = true
