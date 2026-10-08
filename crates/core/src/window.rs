@@ -240,11 +240,11 @@ impl WindowSpec {
     pub fn validate(&self) -> Result<(), FaucetError> {
         parse_step(&self.step)?;
         if let Some(g) = &self.granularity
-            && parse_step(g)? >= parse_step(&self.step)?
+            && parse_step(g)? > parse_step(&self.step)?
         {
             return Err(FaucetError::Config(format!(
-                "window slicing: `granularity` ({g}) must be shorter than `step` ({}), or \
-                 every window's upper bound would fall at or before its start",
+                "window slicing: `granularity` ({g}) must not be longer than `step` ({}), or \
+                 every window's upper bound would fall before its start",
                 self.step
             )));
         }
@@ -585,12 +585,15 @@ mod tests {
     }
 
     #[test]
-    fn granularity_must_be_shorter_than_step() {
+    fn granularity_must_not_exceed_step() {
         let mut spec = combined_spec();
         spec.validate().unwrap();
         spec.granularity = Some("7d".into());
+        spec.validate()
+            .expect("one granule per window: an inclusive upper bound equal to the start");
+        spec.granularity = Some("8d".into());
         let err = spec.validate().unwrap_err();
-        assert!(err.to_string().contains("shorter than `step`"), "{err}");
+        assert!(err.to_string().contains("longer than `step`"), "{err}");
     }
 
     fn combined_spec() -> WindowSpec {
