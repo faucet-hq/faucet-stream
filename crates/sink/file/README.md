@@ -70,7 +70,9 @@ that append can leave a torn last line; the next `append` run cuts it, and a
 `replace` run writes a new file anyway. The other formats are rewritten whole
 to continue a file, so a long run with frequent flushes into one file costs
 time and I/O that grow with the square of its size — the sink warns once per
-file, and a `{part}` template or `max_records_per_file` keeps each file small.
+file, `faucet validate` / `run` warn at load when a source that bookmarks every
+page (CDC, a queue, an incremental file source) feeds such a file, and a
+`{part}` template or `max_records_per_file` keeps each file small.
 CSV keeps its rows in a side file and rewrites
 the header in front of them (so a later record can still add a column),
 Parquet copies its row groups into a new file, and the whole-document formats

@@ -1584,6 +1584,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
+    for warning in out.iter().filter_map(rewritten_file_warning) {
+        tracing::warn!("{warning}");
+    }
     check_truncating_fan_out(&out)?;
     if cfg.reconcile.is_some() {
         check_reconcile_scope(&out)?;
@@ -1728,6 +1731,84 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+/// A local file sink writing one unnumbered file in a format that can only be
+/// rewritten whole to continue it, under a source that bookmarks — so the
+/// pipeline flushes — every page: each flush rewrites the file, so the run's
+/// time and I/O grow with the square of its size (#789 FILE-19). JSON Lines
+/// and raw text extend in place unless the whole file is sealed (encrypted
+/// and compressed). The sink warns again, per file, when it happens.
+fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
+    if matches!(n.role, NodeRole::Discovery { .. })
+        || !source_flushes_every_page(&n.source.kind, &n.source.config)
+    {
+        return None;
+    }
+    let cfg = &n.sink.config;
+    let text = |k: &str| cfg.get(k).and_then(Value::as_str);
+    let path: String = match n.sink.kind.as_str() {
+        "file" | "csv" => text("path")?.to_string(),
+        "parquet" => crate::registry::sink_shared_destination("parquet", cfg)?
+            .strip_prefix("file:")?
+            .to_string(),
+        _ => return None,
+    };
+    let capped = [
+        "max_records_per_file",
+        "max_bytes_per_file",
+        "max_rows_per_file",
+    ]
+    .iter()
+    .any(|k| cfg.get(*k).is_some_and(|v| !v.is_null()));
+    if capped || path.contains("{part}") || path.ends_with('/') {
+        return None;
+    }
+    let format = match n.sink.kind.as_str() {
+        "csv" => faucet_core::FileFormat::Csv,
+        "parquet" => faucet_core::FileFormat::Parquet,
+        _ => match text("format").filter(|f| *f != "auto") {
+            Some("json_lines") => faucet_core::FileFormat::JsonLines,
+            Some("raw_text") => faucet_core::FileFormat::RawText,
+            Some(_) => faucet_core::FileFormat::Csv,
+            None => faucet_core::FileFormat::from_path(&path)?,
+        },
+    };
+    let line = matches!(
+        format,
+        faucet_core::FileFormat::JsonLines | faucet_core::FileFormat::RawText
+    );
+    let compressed = match text("compression").unwrap_or("auto") {
+        "auto" => [".gz", ".gzip", ".zst", ".zstd"]
+            .iter()
+            .any(|ext| path.to_ascii_lowercase().ends_with(ext)),
+        other => other != "none",
+    };
+    let sealed_whole = cfg.get("encryption").is_some_and(|v| !v.is_null()) && compressed;
+    if line && !sealed_whole {
+        return None;
+    }
+    Some(format!(
+        "row '{}': the {} source bookmarks every page, so the {} sink flushes '{path}' once per \
+         page and must rewrite it whole each time (its format can not be appended to) — the \
+         run's time and I/O grow with the square of the file's size; add `{{part}}` to the path \
+         or set max_records_per_file / max_bytes_per_file",
+        n.id, n.source.kind, n.sink.kind
+    ))
+}
+
+/// Whether a source bookmarks every page it emits, which makes the pipeline
+/// flush the sink once per page.
+fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
+    let mode = || cfg.get("mode").and_then(Value::as_str);
+    match kind {
+        "postgres-cdc" | "mysql-cdc" | "mongodb-cdc" | "mssql-cdc" | "oracle-cdc" | "kafka"
+        | "kinesis" | "rabbitmq" | "nats" | "pubsub" | "sqs" => true,
+        "dynamodb" => mode() == Some("streams"),
+        "iceberg" => mode() == Some("incremental"),
+        "file" => cfg.get("incremental").is_some_and(|v| !v.is_null()),
+        _ => false,
+    }
 }
 
 /// File-writing sinks must not share a destination (#743, #789 FILE-05): two
@@ -4144,6 +4225,98 @@ pipeline:
                 faucet_core::EffectivelyOnceMechanism::KeyedUpsert
             )
         );
+    }
+
+    /// #789 FILE-19: a per-page-bookmarking source writing one unnumbered
+    /// file in a format that is rewritten whole on every flush is warned
+    /// about at load time; line formats, numbered templates, rollover caps
+    /// and sources that bookmark once are not.
+    #[test]
+    fn rewritten_file_sinks_are_warned_about_at_load() {
+        let warn = |source: &str, sink: &str| {
+            let yaml = format!("version: 1\npipeline:\n  source: {source}\n  sink: {sink}\n");
+            let nodes = expand(&parse_with_extension(&yaml, "yaml").unwrap()).unwrap();
+            rewritten_file_warning(&nodes[0])
+        };
+        let kafka = r#"{ type: kafka, config: { brokers: "b:9092", topics: [t], group_id: g, max_messages: 10 } }"#;
+        let csv_out = r#"{ type: file, config: { path: /tmp/f19/out.csv } }"#;
+        let w = warn(kafka, csv_out).expect("csv under kafka is rewritten per page");
+        assert!(
+            w.contains("{part}") && w.contains("max_records_per_file"),
+            "{w}"
+        );
+        assert!(w.contains("kafka"), "{w}");
+
+        for quiet in [
+            r#"{ type: file, config: { path: /tmp/f19/out.jsonl } }"#,
+            r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz } }"#,
+            r#"{ type: file, config: { path: "/tmp/f19/out-{part}.csv" } }"#,
+            r#"{ type: file, config: { path: /tmp/f19/out.csv, max_records_per_file: 1000 } }"#,
+            r#"{ type: file, config: { path: /tmp/f19/dir/, format: csv } }"#,
+            r#"{ type: stdout, config: {} }"#,
+        ] {
+            assert_eq!(warn(kafka, quiet), None, "{quiet}");
+        }
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.txt, format: json_array } }"#
+            )
+            .is_some()
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: csv, config: { path: /tmp/f19/legacy.csv } }"#
+            )
+            .is_some()
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz, encryption: { key: k } } }"#
+            )
+            .is_some(),
+            "a compressed line file sealed whole is rewritten"
+        );
+        assert_eq!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.jsonl, encryption: { key: k } } }"#
+            ),
+            None,
+            "per-line sealing stays appendable"
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: parquet, config: { destination: { type: local_path, path: /tmp/f19/out.parquet } } }"#
+            )
+            .is_some()
+        );
+        let incremental =
+            r#"{ type: file, config: { path: /tmp/f19/in/, incremental: { by: mtime } } }"#;
+        assert!(warn(incremental, csv_out).is_some());
+        assert_eq!(
+            warn(
+                r#"{ type: file, config: { path: /tmp/f19/in.csv } }"#,
+                csv_out
+            ),
+            None,
+            "a source that bookmarks once flushes once"
+        );
+        assert!(source_flushes_every_page(
+            "dynamodb",
+            &serde_json::json!({"mode": "streams"})
+        ));
+        assert!(!source_flushes_every_page(
+            "dynamodb",
+            &serde_json::json!({"mode": "scan"})
+        ));
+        assert!(source_flushes_every_page(
+            "iceberg",
+            &serde_json::json!({"mode": "incremental"})
+        ));
     }
 
     #[test]
