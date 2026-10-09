@@ -83,8 +83,8 @@ scripts/build-image.sh -t ghcr.io/you/faucet-stream:analytics \
 # Complete image — every connector and every feature (the CLI's `full`)
 scripts/build-image.sh -t ghcr.io/you/faucet-stream:full
 
-# …or use the published ones: `:full`, or `:full-oracle` when you move Oracle
-# data (it adds Oracle Instant Client, ~40 MiB compressed).
+# …or use the published `:full`, which also ships the Oracle Instant Client
+# the Oracle connectors load.
 ```
 
 The recommended workflow is **B: named per-profile images** — publish a few

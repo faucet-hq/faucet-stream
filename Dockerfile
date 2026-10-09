@@ -11,13 +11,10 @@
 # ------------
 #   # Complete image — the CLI's `full` feature: every connector and every
 #   # feature (serve, tenants, templates + sync, triggers, SQL/WASM transforms,
-#   # OTLP, secret managers, …).
+#   # OTLP, secret managers, …), plus the Oracle Instant Client the Oracle
+#   # connectors load at run time.
 #   # Heavy: bundled DuckDB (C++), wasmtime, librdkafka, Delta (~30-60 min).
 #   docker build -t faucet:full .
-#
-#   # …plus the Oracle Instant Client libraries the Oracle connectors load at
-#   # run time (adds ~40 MiB compressed, so it is opt-in).
-#   docker build --build-arg ORACLE_CLIENT=true -t faucet:full-oracle .
 #
 #   # Lean image — only the connectors you name (skips DuckDB/Kafka/… natives).
 #   docker build \
@@ -32,9 +29,13 @@
 #   1. FEATURES set            -> used verbatim (with --no-default-features).
 #   2. SOURCES/SINKS both empty -> DEFAULT_FEATURES (`full`: every feature).
 #   3. otherwise               -> EXTRAS + source-<each SOURCES> + sink-<each SINKS>.
+#
+# ORACLE_CLIENT=auto (default) installs Oracle Instant Client exactly when the
+# binary has an Oracle connector compiled in; `true` / `false` force it.
 
 ARG RUST_VERSION=1.96.0
 ARG DEBIAN_RELEASE=bookworm
+ARG ORACLE_CLIENT=auto
 
 ########################  builder  ########################
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
@@ -93,26 +94,29 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     # Strip debug symbols — on a full build (DuckDB + Kafka + every connector
     # statically linked) this removes 50-150MB from the shipped binary.
     strip --strip-all /usr/local/bin/faucet; \
-    /usr/local/bin/faucet --version
+    /usr/local/bin/faucet --version; \
+    mkdir -p /usr/local/share/faucet; \
+    if /usr/local/bin/faucet list | grep -qw oracle; then \
+        touch /usr/local/share/faucet/has-oracle-connector; \
+    fi
 
 ####################  oracle-client  ####################
 # Oracle Instant Client (Basic Light), which the Oracle connectors load at run
 # time through ODPI-C. Downloaded once per architecture, checksum-pinned, and
-# pruned to the four libraries ODPI-C loads. Opt-in (ORACLE_CLIENT=true): the
-# client is ~40 MiB compressed, so the default image leaves it out and an
-# Oracle connector in it fails with a message naming the `-oracle` tag.
-# Instant Client is redistributable under the Oracle Free Use Terms and
-# Conditions license.
+# pruned to the four libraries ODPI-C loads (~40 MiB compressed). Skipped
+# only with ORACLE_CLIENT=false; under `auto` the runtime stage installs it when
+# the binary has an Oracle connector. Instant Client is redistributable under
+# the Oracle Free Use Terms and Conditions license.
 FROM debian:${DEBIAN_RELEASE}-slim AS oracle-client
 ARG TARGETARCH
-ARG ORACLE_CLIENT=false
+ARG ORACLE_CLIENT
 ARG ORACLE_CLIENT_VERSION=23.26.2.0.0
 ARG ORACLE_CLIENT_DIR=2326200
 ARG ORACLE_CLIENT_SHA256_AMD64=c5e97765e633ad02597b8274c35efe5c10bd249a3285e34ee58fa7b318243225
 ARG ORACLE_CLIENT_SHA256_ARM64=1de02a6d7a56cbbd5f6a4f6ddfc5b66340dc0cbf42b1e2ea80975f35c4c2ccd0
 RUN set -eu; \
     mkdir -p /opt/oracle/instantclient; \
-    if [ "${ORACLE_CLIENT}" != "true" ]; then exit 0; fi; \
+    if [ "${ORACLE_CLIENT}" = "false" ]; then exit 0; fi; \
     case "${TARGETARCH}" in \
         amd64) arch=x64;   sum="${ORACLE_CLIENT_SHA256_AMD64}" ;; \
         arm64) arch=arm64; sum="${ORACLE_CLIENT_SHA256_ARM64}" ;; \
@@ -141,15 +145,21 @@ LABEL org.opencontainers.image.title="faucet-stream" \
 
 # Runtime shared libs the connectors dlopen/link against (TLS, SASL for Kafka).
 # librdkafka/DuckDB are statically linked by their -sys crates, so no extra pkg.
-# The Oracle client (plus the libaio it needs) is copied in only when the
-# oracle-client stage downloaded it (ORACLE_CLIENT=true).
+# The Oracle client (plus the libaio it needs) goes in when the binary has an
+# Oracle connector (ORACLE_CLIENT=auto) or when ORACLE_CLIENT=true.
+ARG ORACLE_CLIENT
 RUN --mount=type=bind,from=oracle-client,source=/opt/oracle/instantclient,target=/mnt/instantclient \
+    --mount=type=bind,from=builder,source=/usr/local/share/faucet,target=/mnt/faucet-meta \
     set -eu; \
     pkgs="ca-certificates libssl3 libsasl2-2 zlib1g"; \
     oracle=false; \
-    if [ -n "$(ls -A /mnt/instantclient)" ]; then \
-        oracle=true; pkgs="${pkgs} libaio1"; \
-    fi; \
+    case "${ORACLE_CLIENT}" in \
+        true) oracle=true ;; \
+        false) ;; \
+        auto|"") [ -f /mnt/faucet-meta/has-oracle-connector ] && oracle=true ;; \
+        *) echo "ORACLE_CLIENT must be auto, true or false, got '${ORACLE_CLIENT}'" >&2; exit 1 ;; \
+    esac; \
+    if [ "${oracle}" = true ]; then pkgs="${pkgs} libaio1"; fi; \
     apt-get update && apt-get install -y --no-install-recommends ${pkgs} \
     && rm -rf /var/lib/apt/lists/*; \
     if [ "${oracle}" = true ]; then \

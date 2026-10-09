@@ -17,8 +17,8 @@ name: Docker images
 #     refuses unless this commit's faucet-cli version is X.Y.Z, so a tag never
 #     names a binary of another version.
 #
-# Every image is built and smoke-tested locally first (it starts, the full
-# profiles carry their features, the Oracle client loads in `full-oracle`);
+# Every image is built and smoke-tested locally first (it starts; `full`
+# carries its features and loads the Oracle client);
 # only an image that passes is pushed, signed and attested. Sizes land in the
 # run summary.
 
@@ -63,17 +63,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The CLI's `full` feature: every connector and every feature. Heavy.
+          # The CLI's `full` feature: every connector and every feature, plus
+          # the Oracle Instant Client its Oracle connectors load. Heavy.
           - profile: full
             sources: ""
             sinks: ""
-            oracle: "false"
-          # `full` plus the Oracle Instant Client the Oracle connectors load at
-          # run time. ~40 MiB more compressed, so it is its own tag.
-          - profile: full-oracle
-            sources: ""
-            sinks: ""
-            oracle: "true"
+            oracle: "auto"
           # Lean, common analytics/ELT set.
           - profile: core
             sources: "rest,postgres,s3,csv"
@@ -149,9 +144,8 @@ jobs:
             SINKS=${{ matrix.sinks }}
             ORACLE_CLIENT=${{ matrix.oracle }}
           tags: faucet-smoke:${{ matrix.profile }}
-          # Both full profiles compile the same binary, so they share a cache.
-          cache-from: type=gha,scope=faucet-${{ startsWith(matrix.profile, 'full') && 'full' || matrix.profile }}
-          cache-to: type=gha,mode=max,scope=faucet-${{ startsWith(matrix.profile, 'full') && 'full' || matrix.profile }}
+          cache-from: type=gha,scope=faucet-${{ matrix.profile }}
+          cache-to: type=gha,mode=max,scope=faucet-${{ matrix.profile }}
           provenance: false
 
       - name: Smoke-test the image
@@ -162,7 +156,7 @@ jobs:
           img="faucet-smoke:${PROFILE}"
           docker run --rm "$img" --version
           docker run --rm "$img" list > list.txt
-          if [ "$PROFILE" = full ] || [ "$PROFILE" = full-oracle ]; then
+          if [ "$PROFILE" = full ]; then
             # A sample of what #845 found missing from the old :full image.
             docker run --rm "$img" schema transform sql > /dev/null
             docker run --rm "$img" schema transform wasm > /dev/null
@@ -179,16 +173,11 @@ jobs:
               '  sink: { type: stdout, config: {} }' > smoke/oracle.yaml
             out="$(docker run --rm -v "$PWD/smoke:/smoke:ro" "$img" run --no-env-file /smoke/oracle.yaml 2>&1 || true)"
             echo "$out" | tail -5
-            if [ "$PROFILE" = full-oracle ]; then
-              if echo "$out" | grep -qE 'DPI-1047|DPI-1072'; then
-                echo "::error::the Oracle client did not load in full-oracle"; exit 1
-              fi
-              echo "$out" | grep -qE 'ORA-|DPI-' \
-                || { echo "::error::no Oracle error came back, so the client was never exercised"; exit 1; }
-            else
-              echo "$out" | grep -q 'full-oracle' \
-                || { echo "::error::a missing Oracle client must point at the -oracle tag"; exit 1; }
+            if echo "$out" | grep -qE 'DPI-1047|DPI-1072'; then
+              echo "::error::the Oracle client did not load in full"; exit 1
             fi
+            echo "$out" | grep -qE 'ORA-|DPI-' \
+              || { echo "::error::no Oracle error came back, so the client was never exercised"; exit 1; }
           fi
           raw=$(docker image inspect -f '{{.Size}}' "$img")
           echo "RAW_MIB=$((raw / 1048576))" >> "$GITHUB_ENV"
@@ -208,7 +197,7 @@ jobs:
             SINKS=${{ matrix.sinks }}
             ORACLE_CLIENT=${{ matrix.oracle }}
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=faucet-${{ startsWith(matrix.profile, 'full') && 'full' || matrix.profile }}
+          cache-from: type=gha,scope=faucet-${{ matrix.profile }}
           # SLSA provenance and an SBOM travel with the image (#789 SUPPLY-05).
           provenance: mode=max
           sbom: true
