@@ -301,9 +301,14 @@ its own sink, write mode, drift policy, DLQ and **its own state key**
 routes each record by the table it belongs to. A table commits a stream
 position only after its own sink has flushed. The stream resumes from the
 **earliest** position any table has committed (so a slot never releases WAL a
-table still needs), and each table skips the changes it already applied. Under
+table still needs), and each table skips the changes it already applied. The
+skip is decided per change, by the change's own stream position: a replay can
+cut the stream into pages at different points than the run that committed
+them, so a page may straddle a table's position. Under
 `delivery: exactly_once` each table's watermark is scoped to its own state key,
-so exactly-once composes per table.
+so exactly-once composes per table. A one-shot run (`continuous: false`) exits
+with an error naming every table whose snapshot or last stream cycle failed,
+even under `on_table_error: pause`.
 
 **Per-table handoff.** Each table's snapshot starts from a stream position
 captured just before it and recorded as that table's join point; the stream

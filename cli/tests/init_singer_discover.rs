@@ -35,6 +35,7 @@ fn init_args_stream(
         discover,
         executable,
         stream,
+        no_pin: true,
     }
 }
 

@@ -425,6 +425,17 @@ pub enum CliError {
     #[error("{0}")]
     LeaseHeld(String),
 
+    /// The config's `requires_faucet` constraint excludes this binary.
+    #[error("this {what} requires faucet {required}; this binary is {version}")]
+    IncompatibleFaucet {
+        /// What declared the constraint (`pipeline`, `source template`, …).
+        what: String,
+        /// The declared requirement, as written.
+        required: String,
+        /// This binary's version.
+        version: String,
+    },
+
     /// Pass-through for failures bubbling up from `faucet-core` or a connector.
     #[error(transparent)]
     Faucet(#[from] faucet_core::FaucetError),

@@ -74,6 +74,7 @@ spec:
                   mountPath: {{ .Values.pipelineConfig.mountPath }}
                   readOnly: true
                 {{- with include "faucet-stream.logSpoolMount" . | trim }}{{ . | nindent 16 }}{{- end }}
+                {{- with include "faucet-stream.extraVolumeMounts" . | trim }}{{ . | nindent 16 }}{{- end }}
           volumes:
             - name: tmp
               emptyDir: {}
@@ -83,6 +84,7 @@ spec:
             - name: pipeline-config
               configMap:
                 name: {{ include "faucet-stream.configMapName" . }}
+            {{- with include "faucet-stream.extraVolumes" . | trim }}{{ . | nindent 12 }}{{- end }}
           {{- with .Values.cronjob.nodeSelector }}
           nodeSelector:
             {{- toYaml . | nindent 12 }}

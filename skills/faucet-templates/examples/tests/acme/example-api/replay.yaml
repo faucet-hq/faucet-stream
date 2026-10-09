@@ -1,0 +1,46 @@
+# Recorded exchanges for acme/example-api (synthetic values). Run twice: the
+# second run must resume invoices from the bookmark the first run saved.
+runs: 2
+overlay: ../../state-overlay.yaml
+params:
+  api_base_url: "{replay}"
+  api_token: tok_replay
+exchanges:
+  - match:
+      path: /customers
+      query: { limit: "100" }
+      absent: [cursor]
+      headers: { authorization: Bearer tok_replay }
+    response:
+      body:
+        data: [{ id: 1, displayName: Ada, address: { city: Paris } }]
+        next_cursor: c2
+  - match:
+      path: /customers
+      query: { cursor: c2 }
+    response:
+      body:
+        data: [{ id: 2, displayName: Bo, address: null }]
+        next_cursor: null
+  - match:
+      path: /invoices
+      query: { updated_since: "2020-01-01T00:00:00Z" }
+    response:
+      body:
+        data:
+          - { id: 10, updated_at: "2026-01-02T00:00:00Z", amount: 100 }
+          - { id: 11, updated_at: "2026-02-02T00:00:00Z", amount: 250 }
+        next_cursor: null
+  - match:
+      path: /invoices
+      query: { updated_since: "2026-02-02T00:00:00Z" }
+    response:
+      body:
+        data: [{ id: 11, updated_at: "2026-03-01T00:00:00Z", amount: 300 }]
+        next_cursor: null
+  - match:
+      path: /events
+    response:
+      body:
+        data: [{ id: e1, type: invoice.created }]
+        next_cursor: null

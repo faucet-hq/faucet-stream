@@ -53,6 +53,11 @@ pub struct PipelineConfig {
     /// and are composed with `faucet run --source X --sink Y` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ConfigKind>,
+    /// The faucet versions this config is written for, as a semver
+    /// requirement such as `">=1.15"`. A binary outside the range refuses the
+    /// config before reading anything else in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_faucet: Option<String>,
 
     /// Config-format version. Currently always `1`.
     #[serde(default = "default_version")]
@@ -1385,6 +1390,7 @@ fn resolve_document(text: &str, path: &Path, inputs: &RunInputs) -> CliResult<St
                     path: path.to_path_buf(),
                     message: friendly_parse_error(&e.to_string()),
                 })?;
+            crate::requires::check_document(&value, "pipeline")?;
             resolve(&mut value)?;
             serde_yaml::to_string(&value).map_err(|e| CliError::ParseConfig {
                 path: path.to_path_buf(),
@@ -1397,6 +1403,7 @@ fn resolve_document(text: &str, path: &Path, inputs: &RunInputs) -> CliResult<St
                     path: path.to_path_buf(),
                     message: friendly_parse_error(&e.to_string()),
                 })?;
+            crate::requires::check_document(&value, "pipeline")?;
             resolve(&mut value)?;
             serde_json::to_string(&value).map_err(|e| CliError::ParseConfig {
                 path: path.to_path_buf(),
@@ -1525,6 +1532,7 @@ impl PipelineConfig {
             _ => None,
         };
         if let Some(raw) = &raw {
+            crate::requires::check_document(raw, "pipeline")?;
             crate::vocabulary::warn_deprecated(raw);
         }
         // Typed parse first: its errors carry the document's line numbers.
@@ -1567,6 +1575,7 @@ impl PipelineConfig {
     /// `interpolate` on the source text) before building the `Value`.
     pub fn from_value(mut value: serde_json::Value) -> CliResult<Self> {
         let synthetic = Path::new("<submitted>");
+        crate::requires::check_document(&value, "pipeline")?;
         crate::vocabulary::warn_deprecated(&value);
         crate::interpolate::unescape_document(&mut value);
         let cfg: PipelineConfig =

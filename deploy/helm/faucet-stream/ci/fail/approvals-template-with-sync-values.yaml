@@ -1,0 +1,9 @@
+# expect-error: serve.approvals.require=template_launch cannot be combined with serve.templatesSync.enabled
+serve:
+  history:
+    backend: sqlite
+  approvals:
+    require: [template_launch]
+  templatesSync:
+    enabled: true
+    existingConfigMap: my-sync

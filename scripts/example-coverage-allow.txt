@@ -1,0 +1,13 @@
+# Things scripts/example-coverage.py does not require an example for.
+# One `<category>:<name>` per line, each with the reason it cannot or should
+# not have one. An entry that gains an example fails the check until removed.
+
+# Deprecated connector kinds (#779). The CLI builds `type: csv` / `type: jsonl`
+# and local `type: parquet` as the `file` connector, and S3 Parquet is read and
+# written by the `s3` connector's `format: parquet`. An example would teach a
+# deprecated spelling; the `file` and `s3` examples cover the behaviour.
+source:csv
+sink:csv
+sink:jsonl
+source:parquet
+sink:parquet

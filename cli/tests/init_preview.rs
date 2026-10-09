@@ -21,6 +21,7 @@ fn init_args(output: PathBuf, source: Option<&str>, sink: Option<&str>) -> InitA
         discover: false,
         executable: None,
         stream: None,
+        no_pin: true,
     }
 }
 
@@ -84,6 +85,7 @@ async fn init_defaults_to_rest_to_file() {
         discover: false,
         executable: None,
         stream: None,
+        no_pin: true,
     };
     init::run(args).await.expect("init defaults should write");
 

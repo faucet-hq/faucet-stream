@@ -47,6 +47,45 @@ starts.) A postgres-cdc row also needs a `state:` block — without one the slot
 never advances and every run replays from its start. See the
 [CDC tutorial](../tutorials/postgres-cdc.md).
 
+## Error kinds
+
+Every runtime failure carries a typed **kind**. It is the `kind` field in the
+logs, the `last error: <Kind>: …` line of [`faucet status`](../cookbook/state-and-status.md),
+the `kind` label on `faucet_pipeline_runs_total{status="err"}`, and
+`error.kind` in a [DLQ envelope](../cookbook/dlq.md#the-envelope). The kind
+says where to look first:
+
+| Kind | Meaning | First move |
+|---|---|---|
+| `Http` | Transport failure: DNS, connect, TLS, timeout | [`faucet doctor`](../cookbook/troubleshooting.md) |
+| `HttpStatus` | A non-success HTTP status, with the URL and a truncated body | Read the body; 401/403 means credentials or grants |
+| `RateLimited` | A rate-limit signal outlasted the retries | [Source-side throttling](../cookbook/resilience.md#source-side-throttling) |
+| `Auth` | A credential or token flow failed | `faucet doctor`; check the secret references |
+| `Config` | Invalid configuration | `faucet validate` |
+| `Url` | A URL could not be built | Check base URL and path templating |
+| `Json`, `JsonPath` | A response did not parse, or a JSONPath failed | `faucet preview` a few records |
+| `Transform` | A transform could not compile or apply | `faucet plan --live` |
+| `Source`, `Sink` | A source- or sink-side operation failed (query, file, write) | The message names the operation |
+| `QualityFailure` | A quality check with an `abort` policy failed | [Quality checks](../cookbook/quality.md) |
+| `ContractViolation` | A record breached the contract under `on_breach: fail` | [Data contracts](../cookbook/contracts.md) |
+| `SchemaDrift` | The page's shape diverged from the destination under a `fail` drift policy | [Schema drift](../cookbook/schema-drift.md) |
+| `ProfileDrift` | Column profiles drifted under `on_drift: fail` — after the data was written | [Column profiling](../cookbook/profiling.md) |
+| `PolicyViolation` | A labelled column would reach a sink the policy forbids | [Data-flow policies](../cookbook/policies.md) |
+| `BudgetExceeded` | A run budget was crossed; the crossing page was refused before it was written | [Usage and budgets](../cookbook/usage.md) |
+| `State` | A state-store read or write failed | `faucet doctor` (the state probe) |
+| `StateIncompatible` | The stored bookmark was written by a newer faucet or another source; refused before the source is read | [Upgrading faucet safely](./upgrading.md) |
+| `CircuitOpen` | The circuit breaker saw too many consecutive fully-failed pages | [Resilience](../cookbook/resilience.md) |
+| `Custom` | An error from a third-party connector | Read the message |
+
+A connector panic is isolated and counted under the metric kind `Panic`.
+
+Only transient failures are retried automatically: `Http` transport errors
+(connect, timeout), `HttpStatus` 429 and 5xx, and `RateLimited`. HTTP sources
+retry their own requests; sink writes, flushes and state writes are retried
+only under a [`resilience:`](../cookbook/resilience.md) block, and a plain sink
+write only when replaying it is safe (a keyed `write_mode: upsert` / `delete`),
+because retrying an append whose response was lost would duplicate rows.
+
 ## Some records failed but I don't want the run to abort
 
 Attach a [dead-letter queue](../cookbook/dlq.md) so failing rows are captured and

@@ -184,6 +184,13 @@ async fn oracle_logminer_cdc_end_to_end() {
     let end = bookmark.clone().expect("bookmark");
     assert_eq!(source.position_le(&end, &end), Some(true));
     assert_eq!(source.position_le(&end, &json!("not a position")), None);
+    assert!(
+        records
+            .iter()
+            .all(|r| source.record_covered(r, &end) == Some(true)),
+        "every emitted change is covered by the position after it"
+    );
+    assert_eq!(source.record_covered(&records[0], &anchor), Some(false));
     let after = source.lag().await.unwrap().expect("lag after capture");
     assert!(after.seconds.unwrap() < 600.0, "{after:?}");
     let ancient = OracleCdcSource::new(cfg(&conn)).await.expect("source");

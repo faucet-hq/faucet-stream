@@ -68,6 +68,7 @@ pub mod reconcile;
 pub mod registry;
 pub mod registry_index;
 pub mod replication;
+pub mod requires;
 pub mod rollback;
 pub mod scaffold;
 #[cfg(feature = "schedule")]

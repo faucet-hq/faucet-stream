@@ -1,0 +1,18 @@
+# Inline content as a mapping → chart-managed ConfigMap + --triggers.
+# expect: - --triggers=/etc/faucet-triggers/triggers.yaml
+# expect: name: t-faucet-stream-serve-triggers
+# expect: mountPath: /etc/faucet-triggers
+# expect: triggers.yaml: |
+# expect: name: sync-hook
+# expect: checksum/serve-files:
+# expect-not: --templates-sync
+serve:
+  triggers:
+    enabled: true
+    content:
+      version: 1
+      triggers:
+        - name: sync-hook
+          type: webhook
+          config: /etc/faucet/pipeline.yaml
+          methods: [POST]

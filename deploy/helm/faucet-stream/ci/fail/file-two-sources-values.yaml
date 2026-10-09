@@ -1,0 +1,6 @@
+# expect-error: serve.policy.enabled=true needs exactly one of serve.policy.content, serve.policy.existingConfigMap or serve.policy.existingSecret (got 2)
+serve:
+  policy:
+    enabled: true
+    content: "version: 1"
+    existingConfigMap: my-policy

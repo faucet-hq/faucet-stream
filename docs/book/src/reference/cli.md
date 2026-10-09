@@ -447,6 +447,12 @@ Required fields are surfaced with a typed placeholder and a `# REQUIRED` marker;
 optional fields are commented out so connector defaults apply. The interactive
 mode (`--interactive`) is gated behind the `cli-interactive` feature.
 
+The scaffold sets `requires_faucet: ">=<major>.<minor>"` for the binary that
+wrote it, and `faucet init` pins that exact version in the `mise.toml` next to
+the output file: it creates the file, or adds the faucet entry to an existing
+one, and leaves an existing faucet pin alone. `--no-pin` skips the pin. See
+[Pinning the faucet version](../operations/pinning.md).
+
 **Singer discovery.** For the [Singer bridge](connectors.md) source, add
 `--discover --executable <tap>` to run the tap's `--discover`, write the returned
 catalog to `catalog.json`, and scaffold a config that inlines the catalog and
@@ -1361,7 +1367,7 @@ Selected flags (`faucet serve --help` for the full list):
 | `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`) and cannot be combined with `--templates-sync`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
 | `--vault-key <key>` | Key that seals tenant connection credentials at rest (AES-256-GCM; env `FAUCET_VAULT_KEY`). At least 32 bytes of random key material (`openssl rand -hex 32`); a shorter key is refused at startup. Each sealed value is bound to its owner (tenant + connection), so a row copied onto another record does not open. Without it the server refuses to store or open [tenant connections](../cookbook/embedded-integrations.md). Requires the `tenants` feature. |
-| `--vault-previous-key <key>` | A previous vault key, tried when opening credentials sealed before a rotation; never used to seal. Repeatable. |
+| `--vault-previous-key <key>` | A previous vault key, tried when opening credentials sealed before a rotation; never used to seal. Repeatable. Env: `FAUCET_VAULT_PREVIOUS_KEYS`, a comma-separated list, which keeps the keys out of the process arguments. |
 | `--connect-providers <path>` | Hosted OAuth connect providers (a YAML/JSON file), validated at startup; needs `--vault-key`. |
 | `--callback-allow-host <host>` | Restrict per-run completion callbacks to these hosts. Repeatable. Unset = any host except link-local / cloud-metadata addresses, which are always refused unless named here. See [Completion callbacks](./http-api.md#completion-callbacks). |
 
@@ -1777,8 +1783,14 @@ faucet run pipeline.yaml --output json      # one JSON document: per-row + total
 faucet run pipeline.yaml --output ndjson     # one JSON object per matrix row
 ```
 
-Each row reports `rows_in` / `rows_out` / `duration_ms` / `dlq_count` / `status`
-/ `bookmark`; the exit code is unchanged (non-zero on failure). Secret material
+Each row reports `status`, `error` (the failure message, redacted),
+`rows_in` / `rows_out`, `duration_ms`, `dlq_count`, `bookmark` (after the run),
+`batches` (how its sink writes ended — see
+[batch outcomes](../cookbook/dlq.md#seeing-what-happened-to-each-batch)),
+`source_lag` (how far the source was behind its head at the end) and `run_id`
+(what [`faucet rollback --run`](../cookbook/rollback.md) takes). `rows_in` is
+`null` unless a `lineage:` or `catalog:` block turns input sampling on. The
+exit code is unchanged (non-zero on failure). Secret material
 is scrubbed from the output. With log shipping on (`export: [logs]`), the JSON
 document also carries `log_export` — whether the run's log lines reached the
 collector (`status`, `pending_lines`, `dropped_lines`, `last_error`) — and the

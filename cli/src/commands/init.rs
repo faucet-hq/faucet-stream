@@ -51,6 +51,34 @@ pub async fn run(args: InitArgs) -> CliResult<()> {
     );
     std::fs::write(&args.output, body)?;
     println!("wrote {}", args.output.display());
+    pin_project(&args)
+}
+
+/// Pin this faucet version in the `mise.toml` beside the output file.
+fn pin_project(args: &InitArgs) -> CliResult<()> {
+    if args.no_pin {
+        return Ok(());
+    }
+    let path = match args.output.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("mise.toml"),
+        _ => std::path::PathBuf::from("mise.toml"),
+    };
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    match crate::requires::pin_mise(existing.as_deref(), &crate::requires::current())? {
+        Some(text) => {
+            std::fs::write(&path, text)?;
+            println!(
+                "pinned faucet {} in {}",
+                crate::requires::current(),
+                path.display()
+            );
+        }
+        None => println!("{} already pins faucet; left it as is", path.display()),
+    }
     Ok(())
 }
 
@@ -136,7 +164,7 @@ async fn run_singer_discover(args: &InitArgs) -> CliResult<()> {
         catalog_path.display(),
         args.output.display()
     );
-    Ok(())
+    pin_project(args)
 }
 
 #[cfg(not(feature = "source-singer"))]
@@ -163,8 +191,10 @@ fn render_singer_config(
     } else {
         streams.join(", ")
     };
+    let requires = crate::requires::default_requirement();
     format!(
         "version: 1\n\
+         requires_faucet: \"{requires}\"\n\
          name: {name}\n\
          pipeline:\n\
          \x20 source:\n\
@@ -340,6 +370,10 @@ fn render_pipeline(
 
     let mut body = String::new();
     body.push_str("version: 1\n");
+    body.push_str(&format!(
+        "requires_faucet: \"{}\"\n",
+        crate::requires::default_requirement()
+    ));
     body.push_str(&format!("name: {name}\n\n"));
     body.push_str("# Optional shared constants. Reference these anywhere via ${vars.KEY}.\n");
     body.push_str("# vars:\n");
@@ -409,6 +443,7 @@ mod tests {
             discover: false,
             executable: None,
             stream: None,
+            no_pin: true,
         }
     }
 
@@ -429,6 +464,43 @@ mod tests {
         .unwrap();
         let nodes = crate::expand::expand(&cfg).expect("a fresh scaffold expands");
         assert_eq!(nodes[0].id, "warehouse");
+    }
+
+    #[tokio::test]
+    async fn a_scaffold_pins_this_version_and_requires_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = args(Some("csv"), Some("jsonl"));
+        a.output = dir.path().join("p.yaml");
+        a.no_pin = false;
+        super::run(a).await.unwrap();
+        let cfg = crate::config::PipelineConfig::from_path_tolerating_secrets(
+            dir.path().join("p.yaml"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.requires_faucet.as_deref(),
+            Some(crate::requires::default_requirement().as_str())
+        );
+        let mise = std::fs::read_to_string(dir.path().join("mise.toml")).unwrap();
+        assert!(mise.contains(crate::requires::MISE_TOOL), "{mise}");
+        assert!(mise.contains(env!("CARGO_PKG_VERSION")), "{mise}");
+
+        let mut again = args(Some("csv"), Some("jsonl"));
+        again.output = dir.path().join("q.yaml");
+        again.no_pin = false;
+        super::run(again).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("mise.toml")).unwrap(),
+            mise,
+            "an existing pin is kept"
+        );
+
+        std::fs::write(dir.path().join("mise.toml"), "[tools").unwrap();
+        let mut broken = args(Some("csv"), Some("jsonl"));
+        broken.output = dir.path().join("r.yaml");
+        broken.no_pin = false;
+        assert!(super::run(broken).await.is_err());
     }
 
     /// `--discover` never overwrites an existing catalog without --force

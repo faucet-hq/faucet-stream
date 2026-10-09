@@ -28,6 +28,10 @@ cli/                          — faucet-cli: `faucet` binary, YAML/JSON pipelin
   examples/                   — ready-to-run pipeline YAMLs
   tests/                      — assert_cmd + wiremock + testcontainers integration tests
 hub/                          — Template Hub: sink templates + example source templates
+skills/                       — agent skills (Claude Code / Codex plugin), versioned with faucet-cli
+  .claude-plugin/ .codex-plugin/ — plugin manifests (version = faucet-cli)
+  faucet-connector/examples/  — example connector crates (not workspace members, never published)
+.claude-plugin/ .agents/      — marketplace manifests pointing at skills/
 schemas/                      — committed JSON Schema for pipeline configs (editor validation)
 examples/                     — repo-level examples: docker-compose infra stack + run index
   orchestration/              — ELT recipe: faucet (EL) + dbt (T) + Airflow/Dagster
@@ -36,6 +40,9 @@ observability/                — Prometheus alert rules and Grafana dashboards
 Dockerfile                    — multi-stage image build (name-based connector selection)
 deploy/                       — container + Kubernetes assets
   helm/faucet-stream/         — Helm chart (serve Deployment and/or run Job/CronJob)
+  helm/faucet-stream/ci/      — chart test values (`# expect:` lines; ci/fail/ = must be refused)
+  helm/faucet-stream/examples/ — example values (everything.yaml: every serve feature on)
+  helm/test-chart.sh          — renders the chart test values and checks their expectations
   otel/                       — log-shipping recipes (Alloy → Loki, OTel Collector → S3/GCS/Azure)
 scripts/                      — helper and CI-check scripts (try-local.sh, build-image.sh, …)
 docs/book/                    — mdBook documentation site (source under docs/book/src)

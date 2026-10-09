@@ -1,0 +1,4 @@
+# expect-error: serve.triggers.enabled=true needs exactly one of serve.triggers.content
+serve:
+  triggers:
+    enabled: true

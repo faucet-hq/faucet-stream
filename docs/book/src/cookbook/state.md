@@ -284,7 +284,10 @@ last confirmed point.
 
 Each invocation has a state key so concurrent matrix rows don't collide:
 `{name}::{row_id}` for roots and `{name}::{row_id}::{parent_record_key}` for DAG
-children. The CDC source uses `postgres-cdc:<slot>`.
+children. The CDC source uses `postgres-cdc:<slot>`. Because the key is built
+from the pipeline `name` and the row `id`, renaming either starts the row from
+an empty bookmark; read the old one with `faucet state show` and set it on the
+new row with `faucet state set`.
 
 To inspect, move, reset, back up or migrate these keys — and to see each row's
 health at a glance — use `faucet state` and `faucet status`; see

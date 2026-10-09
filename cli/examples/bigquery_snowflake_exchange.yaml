@@ -1,0 +1,78 @@
+# Move query results between two warehouses, in both directions. Row
+# `bq_to_snowflake` runs a BigQuery query and loads the rows into Snowflake;
+# row `snowflake_to_bq` runs a Snowflake query and streams the rows into
+# BigQuery. Each row picks a named source and sink template.
+#
+#   faucet validate cli/examples/bigquery_snowflake_exchange.yaml
+#   faucet run      cli/examples/bigquery_snowflake_exchange.yaml --only bq_to_snowflake
+#
+# Prereqs (for a real run): Application Default Credentials for BigQuery
+# (`gcloud auth application-default login` or a workload identity), and a
+# Snowflake key pair whose private key is at ./snowflake_key.pem.
+version: 1
+name: bigquery_snowflake_exchange
+
+pipeline:
+  sources:
+    bigquery_daily:
+      type: bigquery
+      config:
+        project_id: my-gcp-project
+        auth: { type: application_default }
+        location: US
+        # Standard SQL; `?` markers bind `params` in order.
+        query: |
+          SELECT user_id, event_name, occurred_at
+          FROM `my-gcp-project.analytics.events`
+          WHERE DATE(occurred_at) = ?
+        params: ["2026-01-01"]
+        max_results_per_page: 10000
+
+    snowflake_accounts:
+      type: snowflake
+      config:
+        account: xy12345.us-east-1
+        warehouse: COMPUTE_WH
+        database: ANALYTICS
+        schema: PUBLIC
+        role: REPORTER
+        auth:
+          type: key_pair
+          config:
+            user: SVC_EXPORT
+            private_key_pem: ${file:./snowflake_key.pem}
+        query: SELECT id, name, plan, updated_at FROM accounts WHERE updated_at >= ?
+        params: ["2026-01-01"]
+        poll_timeout: 600
+
+  sinks:
+    snowflake_raw:
+      type: snowflake
+      config:
+        account: xy12345.us-east-1
+        warehouse: INGEST_WH
+        database: ANALYTICS
+        schema: RAW
+        table: EVENTS
+        auth:
+          type: key_pair
+          config:
+            user: SVC_LOAD
+            private_key_pem: ${file:./snowflake_key.pem}
+        batch_size: 500
+
+    bigquery_raw:
+      type: bigquery
+      config:
+        project_id: my-gcp-project
+        dataset_id: raw
+        table_id: accounts
+        auth: { type: application_default }
+
+matrix:
+  - id: bq_to_snowflake
+    source: { ref: bigquery_daily }
+    sink: { ref: snowflake_raw }
+  - id: snowflake_to_bq
+    source: { ref: snowflake_accounts }
+    sink: { ref: bigquery_raw }

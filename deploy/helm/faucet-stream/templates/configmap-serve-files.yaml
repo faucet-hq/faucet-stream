@@ -1,0 +1,19 @@
+{{- if .Values.serve.enabled -}}
+{{- $features := include "faucet-stream.serveFileFeatures" . | fromYaml -}}
+{{- range $key, $f := $features -}}
+{{- $block := index $.Values.serve $key -}}
+{{- if and $block.enabled $block.content (not $block.existingConfigMap) (not $block.existingSecret) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "faucet-stream.serveFileConfigMapName" (dict "root" $ "volume" $f.volume) }}
+  labels:
+    {{- include "faucet-stream.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: serve
+data:
+  {{ $block.fileName }}: |
+    {{- include "faucet-stream.serveFileContent" $block.content | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

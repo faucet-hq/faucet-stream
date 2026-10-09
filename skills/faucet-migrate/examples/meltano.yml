@@ -1,0 +1,90 @@
+# Sample input for the faucet-migrate skill: a Meltano project before
+# migration. An application database and an internal REST API are loaded into
+# a Postgres warehouse by two jobs on two schedules, with a hashing mapper.
+# Use it to practise the skill's inventory step; it is not a faucet config.
+#
+# Credentials are not in this file. Meltano reads them from .env as
+# TAP_POSTGRES_SQLALCHEMY_URL, TAP_REST_API_MSDK_BEARER_TOKEN and
+# TARGET_POSTGRES_SQLALCHEMY_URL (<PLUGIN_NAME>_<SETTING_NAME>, upper-cased).
+version: 1
+default_environment: dev
+project_id: analytics-el
+
+environments:
+  - name: dev
+  - name: prod
+    config:
+      plugins:
+        loaders:
+          - name: target-postgres
+            config:
+              default_target_schema: raw
+
+plugins:
+  extractors:
+    - name: tap-postgres
+      variant: meltanolabs
+      pip_url: meltanolabs-tap-postgres
+      config:
+        filter_schemas: [public]
+      select:
+        - public-customers.*
+        - "!public-customers.password_hash"
+        - public-orders.*
+      metadata:
+        public-customers:
+          replication-method: INCREMENTAL
+          replication-key: updated_at
+        public-orders:
+          replication-method: INCREMENTAL
+          replication-key: updated_at
+
+    - name: tap-rest-api-msdk
+      pip_url: tap-rest-api-msdk
+      config:
+        api_url: https://api.internal.example.com/v2
+        auth_method: bearer_token
+        next_page_token_path: $.meta.next_cursor
+        streams:
+          - name: tickets
+            path: /tickets
+            primary_keys: [id]
+            records_path: $.data[*]
+            replication_key: updated_at
+            start_date: "2024-01-01T00:00:00Z"
+
+  mappers:
+    - name: meltano-map-transformer
+      variant: meltano
+      pip_url: meltano-map-transformer
+      mappings:
+        - name: hash-emails
+          config:
+            stream_maps:
+              public-customers:
+                email_hash: md5(email)
+                email: __NULL__
+
+  loaders:
+    - name: target-postgres
+      variant: meltanolabs
+      pip_url: meltanolabs-target-postgres
+      config:
+        default_target_schema: raw_dev
+        add_record_metadata: true
+
+jobs:
+  - name: app-db-el
+    tasks:
+      - tap-postgres hash-emails target-postgres
+  - name: tickets-el
+    tasks:
+      - tap-rest-api-msdk target-postgres
+
+schedules:
+  - name: app-db-daily
+    interval: "15 1 * * *"
+    job: app-db-el
+  - name: tickets-hourly
+    interval: "@hourly"
+    job: tickets-el

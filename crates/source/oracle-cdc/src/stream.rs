@@ -633,6 +633,10 @@ impl Source for OracleCdcSource {
         crate::state::position_le(a, b)
     }
 
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        crate::state::record_covered(record, position)
+    }
+
     fn connector_name(&self) -> &'static str {
         "oracle-cdc"
     }

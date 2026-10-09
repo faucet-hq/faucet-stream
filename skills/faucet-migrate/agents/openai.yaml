@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Migrate"
+  short_description: "Move Meltano, Singer or Airbyte pipelines to faucet"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-migrate to convert my meltano.yml into faucet pipelines, carry over the incremental state, and plan a verified cutover."

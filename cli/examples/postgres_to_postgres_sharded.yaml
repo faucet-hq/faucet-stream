@@ -1,0 +1,37 @@
+# Copy one large table across a `faucet serve --cluster` fleet. The top-level
+# `shard:` block asks for ~8 shards; the postgres source splits its query into
+# primary-key ranges on `id`, and every instance claims and runs shards up to
+# its free capacity. A reclaimed shard can run twice, so the sink upserts by
+# key and a replay overwrites rather than duplicates.
+#
+#   faucet validate cli/examples/postgres_to_postgres_sharded.yaml
+#   # submit to a cluster (every instance: --cluster + a shared SQL --history):
+#   jq -Rs '{config: .}' cli/examples/postgres_to_postgres_sharded.yaml |
+#     curl -X POST localhost:8080/v1/runs -H 'content-type: application/json' \
+#       -H "Authorization: Bearer $TOKEN" -d @-
+#
+# `faucet run` ignores `shard:` and copies the table in one pass.
+version: 1
+name: postgres_to_postgres_sharded
+
+shard:
+  count: 8
+
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://faucet@localhost:5432/app
+      query: SELECT id, account_id, kind, payload, created_at FROM events
+      # Integer column the shards are range-partitioned on; it must be in the
+      # query's output.
+      shard: { key: id }
+
+  sink:
+    type: postgres
+    config:
+      connection_url: postgres://faucet@localhost:5432/warehouse
+      table_name: events
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [id]

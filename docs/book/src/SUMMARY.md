@@ -5,6 +5,7 @@
 # Getting Started
 
 - [Installation](./getting-started/installation.md)
+- [Agent skills (Claude Code, Codex)](./getting-started/agent-skills.md)
 - [Your first pipeline](./getting-started/first-pipeline.md)
 - [Try it locally (interactive demo)](./getting-started/try-it-locally.md)
 - [Core concepts](./getting-started/concepts.md)
@@ -104,7 +105,9 @@
 - [Running a cluster](./cookbook/cluster.md)
 - [Observability](./operations/observability.md)
 - [Reliability testing](./operations/reliability-testing.md)
+- [Pinning the faucet version](./operations/pinning.md)
 - [Upgrading faucet safely](./operations/upgrading.md)
+- [Migrating from Meltano, Singer or Airbyte](./operations/migrating.md)
 - [Backing up the server database](./operations/backup.md)
 - [Performance tuning](./operations/tuning.md)
 - [Troubleshooting with `faucet doctor`](./cookbook/troubleshooting.md)

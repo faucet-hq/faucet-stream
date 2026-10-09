@@ -2212,8 +2212,15 @@ pub struct ServeArgs {
     #[arg(long, env = "FAUCET_VAULT_KEY", hide_env_values = true)]
     pub vault_key: Option<String>,
     /// A previous vault key, tried when opening credentials sealed before a
-    /// rotation (never used to seal). Repeatable.
-    #[arg(long = "vault-previous-key", value_name = "KEY")]
+    /// rotation (never used to seal). Repeatable; the env var takes a
+    /// comma-separated list and keeps the keys out of the process arguments.
+    #[arg(
+        long = "vault-previous-key",
+        value_name = "KEY",
+        env = "FAUCET_VAULT_PREVIOUS_KEYS",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
     pub vault_previous_key: Vec<String>,
     /// Hosted OAuth connect providers (#709): a YAML/JSON file of
     /// authorization-code providers tenants can connect through.
@@ -2898,6 +2905,11 @@ pub struct InitArgs {
     /// nothing unless a stream is selected in the catalog.
     #[arg(long)]
     pub stream: Option<String>,
+    /// Do not pin this faucet version in the project's `mise.toml`. By
+    /// default `faucet init` adds the pin next to the output file unless one
+    /// is already there.
+    #[arg(long)]
+    pub no_pin: bool,
 }
 
 /// `faucet plan` arguments.

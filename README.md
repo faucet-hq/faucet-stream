@@ -385,6 +385,20 @@ Prebuilt archives with SHA-256 checksums are on the
 Rust version is 1.96. See the [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html)
 for container images and slim builds. Prebuilt binaries cover macOS and Linux.
 
+Pin the version a project uses in its `mise.toml` (`faucet init` writes it) and
+declare the oldest faucet a config needs with `requires_faucet`; see
+[pinning](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+
+**Agent skills.** Teach Claude Code, Codex or any Agent Skills reader to write,
+debug and deploy faucet pipelines with the skills that ship with each release:
+
+```text
+/plugin marketplace add faucet-hq/faucet-stream
+/plugin install faucet@faucet
+```
+
+Codex and other agents: [agent skills](https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills.html).
+
 ## Star history
 
 <a href="https://www.star-history.com/?repos=faucet-hq%2Ffaucet-stream&type=date&legend=top-left">

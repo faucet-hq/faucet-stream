@@ -1,0 +1,4 @@
+# expect-error: serve.approvals.require: unknown change kind "deploy"
+serve:
+  approvals:
+    require: [run, deploy]

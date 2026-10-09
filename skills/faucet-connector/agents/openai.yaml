@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Connector"
+  short_description: "Build and test faucet source and sink crates in Rust"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-connector to build a faucet-source or faucet-sink crate in Rust that passes the conformance battery."

@@ -139,6 +139,7 @@ impl ConfigFormat {
 const KEY_ORDER: &[&str] = &[
     // ── top level ────────────────────────────────────────────────────────────
     "kind",
+    "requires_faucet",
     "version",
     "name",
     "vars",

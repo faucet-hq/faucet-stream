@@ -1,0 +1,4 @@
+# expect-error: serve.cluster.enabled=true requires a persistent history backend
+serve:
+  cluster:
+    enabled: true

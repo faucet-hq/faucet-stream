@@ -237,9 +237,7 @@ fn run_query(
     match schema {
         Ok(schema) => {
             check_unique(schema.fields().iter().map(|f| f.name().as_str()))?;
-            let stream = stmt
-                .stream_arrow(bound(), schema)
-                .map_err(source_err("query"))?;
+            let stream = stmt.stream_arrow(bound()).map_err(source_err("query"))?;
             for batch in guarded(stream) {
                 if !sink(convert::batch_to_values(&batch?, &plan.duck_types)?)? {
                     break;

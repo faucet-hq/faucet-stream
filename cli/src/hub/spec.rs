@@ -288,6 +288,10 @@ impl Stream {
 pub struct SourceTemplate {
     /// Must be `source-template`.
     pub kind: TemplateKind,
+    /// The faucet versions this template is written for (a semver
+    /// requirement such as `">=1.15"`); an older or newer binary refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_faucet: Option<String>,
     /// Document version; must be `1`.
     #[serde(default = "default_version")]
     pub version: u32,
@@ -443,6 +447,10 @@ impl SourceTemplate {
 pub struct SinkTemplate {
     /// Must be `sink-template`.
     pub kind: TemplateKind,
+    /// The faucet versions this template is written for (a semver
+    /// requirement such as `">=1.15"`); an older or newer binary refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_faucet: Option<String>,
     #[serde(default = "default_version")]
     pub version: u32,
     /// Hub id.
@@ -655,6 +663,10 @@ impl StreamOverlay {
 pub struct DeploymentTemplate {
     /// Must be `deployment`.
     pub kind: TemplateKind,
+    /// The faucet versions this template is written for (a semver
+    /// requirement such as `">=1.15"`); an older or newer binary refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_faucet: Option<String>,
     #[serde(default = "default_version")]
     pub version: u32,
     pub name: String,
@@ -741,9 +753,11 @@ impl DeploymentTemplate {
     /// Parse an untyped document, explaining a refused key in terms of what an
     /// overlay may set rather than serde's bare "unknown field".
     pub fn from_value(value: Value) -> CliResult<Self> {
+        crate::requires::check_document(&value, "deployment overlay")?;
         if let Some(obj) = value.as_object() {
             const META: &[&str] = &[
                 "kind",
+                "requires_faucet",
                 "version",
                 "name",
                 "owner",

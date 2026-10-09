@@ -506,6 +506,7 @@ pub fn parse_source_file(path: &Path) -> CliResult<SourceTemplate> {
             )));
         }
     }
+    crate::requires::check_document(&value, "source template")?;
     let t: SourceTemplate = serde_json::from_value(value)
         .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))?;
     t.validate()
@@ -532,6 +533,7 @@ pub fn parse_sink_file(path: &Path) -> CliResult<SinkTemplate> {
             )));
         }
     }
+    crate::requires::check_document(&value, "sink template")?;
     let t: SinkTemplate = serde_json::from_value(value)
         .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))?;
     t.validate()

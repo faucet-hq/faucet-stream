@@ -100,7 +100,10 @@ exits non-zero fails the run with its last stderr lines. See the
 [`faucet-sink-singer` README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/sink/singer)
 and the example `cli/examples/csv_to_singer_target.yaml`.
 
-For a full step-by-step walkthrough with before/after configs, see the
+For the whole procedure (inventory, carrying bookmarks over, a verified
+parallel run and cutover), see
+[Migrating from Meltano, Singer or Airbyte](../operations/migrating.md); for a
+step-by-step walkthrough with before/after configs, the
 [**Migrating from Meltano/Singer** guide](https://github.com/faucet-hq/faucet-stream/blob/main/docs/blog/migrating-from-meltano.md).
 Then start from [your first pipeline](../getting-started/first-pipeline.md) and the [connector catalog](../reference/connectors.md).
 

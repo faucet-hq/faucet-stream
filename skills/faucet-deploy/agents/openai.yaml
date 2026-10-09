@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Deploy"
+  short_description: "Run faucet pipelines reliably in production"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-deploy to deploy this faucet pipeline to production with durable state, auth and alerts."

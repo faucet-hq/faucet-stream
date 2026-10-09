@@ -1,0 +1,33 @@
+{
+  "name": "faucet",
+  "version": "1.13.3",
+  "description": "Skills for writing, running, debugging and deploying faucet-stream data pipelines, Template Hub templates and connector crates. The version equals the faucet-cli release it ships with.",
+  "author": {
+    "name": "faucet-hq",
+    "url": "https://faucet-hq.github.io"
+  },
+  "homepage": "https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills.html",
+  "repository": "https://github.com/faucet-hq/faucet-stream",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "faucet",
+    "faucet-stream",
+    "data-pipelines",
+    "etl",
+    "cdc",
+    "rust"
+  ],
+  "skills": "./",
+  "interface": {
+    "displayName": "faucet",
+    "shortDescription": "Move data with faucet-stream.",
+    "longDescription": "Skills for faucet-stream: author pipeline YAML that passes validation, diagnose failed, slow or lagging runs, deploy and migrate, compose and publish Template Hub templates, and implement faucet-source-* / faucet-sink-* crates.",
+    "developerName": "faucet-hq",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://faucet-hq.github.io"
+  }
+}

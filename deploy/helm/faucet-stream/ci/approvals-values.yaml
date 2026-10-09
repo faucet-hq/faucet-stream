@@ -1,0 +1,6 @@
+# expect: - --require-approval=run,template_register,template_launch
+# expect: - --approval-expiry-secs=3600
+serve:
+  approvals:
+    require: [run, template_register, template_launch]
+    expirySecs: 3600

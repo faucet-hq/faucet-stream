@@ -243,6 +243,10 @@ impl Source for MssqlCdcSource {
         crate::state::bookmarks_min(positions)
     }
 
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        record_covered(&self.tables, record, position)
+    }
+
     fn connector_name(&self) -> &'static str {
         "mssql-cdc"
     }
@@ -888,6 +892,27 @@ fn changes_sql(capture_instance: &str) -> String {
 
 /// `schema.table` of a change envelope, the name the `mssql` source's
 /// discovery reports for the same table.
+/// Whether every capture instance of the record's table that `position`
+/// tracks is consumed through the record's commit LSN.
+fn record_covered(
+    tables: &HashMap<String, (String, String)>,
+    record: &Value,
+    position: &Value,
+) -> Option<bool> {
+    let lsn = Lsn::from_hex(record.get("lsn")?.as_str()?).ok()?;
+    let (schema, table) = (
+        record.get("schema")?.as_str()?,
+        record.get("table")?.as_str()?,
+    );
+    let marks = Bookmarks::from_value(position.clone()).ok()?;
+    let tracked: Vec<Lsn> = tables
+        .iter()
+        .filter(|(_, (s, t))| s == schema && t == table)
+        .filter_map(|(ci, _)| marks.get(ci))
+        .collect();
+    (!tracked.is_empty()).then(|| tracked.iter().all(|have| lsn <= *have))
+}
+
 fn schema_table(record: &Value) -> Option<String> {
     let schema = record.get("schema")?.as_str()?;
     let table = record.get("table")?.as_str()?;
@@ -904,6 +929,53 @@ mod tests {
             Some("dbo.Orders".into())
         );
         assert_eq!(schema_table(&serde_json::json!({"schema": "dbo"})), None);
+    }
+
+    #[test]
+    fn a_record_is_covered_through_every_tracked_instance_of_its_table() {
+        let tables = HashMap::from([
+            (
+                "dbo_Orders".to_string(),
+                ("dbo".to_string(), "Orders".to_string()),
+            ),
+            (
+                "dbo_Orders_v2".to_string(),
+                ("dbo".to_string(), "Orders".to_string()),
+            ),
+            (
+                "dbo_Items".to_string(),
+                ("dbo".to_string(), "Items".to_string()),
+            ),
+        ]);
+        let rec = |lsn: &str| serde_json::json!({"schema": "dbo", "table": "Orders", "lsn": lsn});
+        let one = serde_json::json!({"dbo_Orders": "00000000000000000005"});
+        assert_eq!(
+            record_covered(&tables, &rec("00000000000000000005"), &one),
+            Some(true)
+        );
+        assert_eq!(
+            record_covered(&tables, &rec("00000000000000000006"), &one),
+            Some(false)
+        );
+        let both = serde_json::json!({
+            "dbo_Orders": "00000000000000000009",
+            "dbo_Orders_v2": "00000000000000000004"
+        });
+        assert_eq!(
+            record_covered(&tables, &rec("00000000000000000005"), &both),
+            Some(false),
+            "an instance still behind the record keeps it"
+        );
+        let other = serde_json::json!({"dbo_Items": "00000000000000000009"});
+        assert_eq!(
+            record_covered(&tables, &rec("00000000000000000001"), &other),
+            None
+        );
+        assert_eq!(record_covered(&tables, &rec("zz"), &one), None);
+        assert_eq!(
+            record_covered(&tables, &rec("00000000000000000001"), &serde_json::json!(1)),
+            None
+        );
     }
 
     fn change(lsn: &str, seq: &str) -> Change {

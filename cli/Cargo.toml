@@ -658,6 +658,8 @@ serde.workspace = true
 # order whatever else the build enables, so slim and full binaries agree.
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = "0.9"
+semver = "1"
+toml_edit = "0.25"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time"] }
 tracing.workspace = true

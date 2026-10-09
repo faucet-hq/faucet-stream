@@ -7,7 +7,7 @@ metadata:
   name: {{ $fullName }}
   labels:
     {{- include "faucet-stream.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
+  {{- with merge (deepCopy (default dict .Values.ingress.annotations)) (default dict .Values.ingress.streamingAnnotations) }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}

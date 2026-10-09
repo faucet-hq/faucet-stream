@@ -83,6 +83,28 @@ streams:
 full refresh, `upsert` (needs `primary_keys`, which become the sink's `key`),
 `append`, `delete`. Default `append`.
 
+Writing one well comes down to a few choices:
+
+| The stream is… | `write` |
+|---|---|
+| a full refresh of a dimension or list, re-read every run | `[overwrite, upsert]` |
+| an incremental feed of mutable records | `[upsert, append]` |
+| an immutable event log | `append` |
+
+Order matters: `[overwrite, upsert]` gets an atomic replace on a warehouse and
+still composes with a sink that cannot overwrite. `primary_keys` name columns as
+they look **after** the template's transforms, while an incremental stream's
+`replication_key` is read from the raw API record
+([Nested replication keys](./state.md#nested-replication-keys)) — when
+`keys_case` renames `updatedAt` to `updated_at`, the key is `updatedAt`. A wrong
+key only warns and the bookmark never advances, so run twice with
+a state store and check that the second run asks for newer records. Make every
+host a param that defaults to the public URL (`api_base_url`), so a test or a
+recorded replay can point it at a local server and a self-hosted variant needs
+no fork; every credential is a `secret: true` param with no default. Shaping
+that every destination needs (`keys_case`, `json_encode` for nested objects)
+goes in the top-level `transforms`.
+
 ## A sink template
 
 ```yaml

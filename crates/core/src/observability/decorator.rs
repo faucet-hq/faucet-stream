@@ -190,6 +190,10 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         self.inner.position_le(a, b)
     }
 
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        self.inner.record_covered(record, position)
+    }
+
     fn position_min(&self, positions: &[Value]) -> Option<Value> {
         self.inner.position_min(positions)
     }
@@ -946,6 +950,14 @@ pub(crate) mod source_tests {
         fn position_min(&self, _positions: &[serde_json::Value]) -> Option<serde_json::Value> {
             Some(serde_json::json!("inner-min"))
         }
+
+        fn record_covered(
+            &self,
+            record: &serde_json::Value,
+            position: &serde_json::Value,
+        ) -> Option<bool> {
+            Some(record.get("p")?.as_u64()? < position.as_u64()?)
+        }
     }
 
     fn assert_forwards_multi_table_hooks(s: &dyn crate::Source) {
@@ -960,6 +972,14 @@ pub(crate) mod source_tests {
         );
         assert_eq!(
             s.position_le(&serde_json::json!(3), &serde_json::json!(2)),
+            Some(false)
+        );
+        assert_eq!(
+            s.record_covered(&serde_json::json!({"p": 1}), &serde_json::json!(2)),
+            Some(true)
+        );
+        assert_eq!(
+            s.record_covered(&serde_json::json!({"p": 2}), &serde_json::json!(2)),
             Some(false)
         );
         assert_eq!(

@@ -326,6 +326,10 @@ impl Source for MongoCdcSource {
         token_le(a, b)
     }
 
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        token_le(record, position)
+    }
+
     fn connector_name(&self) -> &'static str {
         "mongodb-cdc"
     }
@@ -870,6 +874,9 @@ mod tests {
         assert_eq!(token_le(&t("8264A1"), &t("8264b2")), Some(true));
         assert_eq!(token_le(&t("8264B2"), &t("8264A1")), Some(false));
         assert_eq!(token_le(&t("8264A1"), &json!({})), None);
+        let event = |d: &str| json!({"op": "c", "resume_token": {"_data": d}});
+        assert_eq!(token_le(&event("8264A1"), &t("8264A1")), Some(true));
+        assert_eq!(token_le(&event("8264B2"), &t("8264A1")), Some(false));
     }
 
     #[test]
