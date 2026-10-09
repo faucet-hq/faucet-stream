@@ -1,7 +1,7 @@
 import { authHeaders } from "./api.js";
 
 // Stream a run's logs. Calls handlers.onLog(line) / onTruncated(msg) / onEnd()
-// / onError(err). Returns an AbortController — call .abort() to stop.
+// / onLink(url) (the local copy aged out; the log service has it) / onError(err). Returns an AbortController — call .abort() to stop.
 export function streamLogs(runId, handlers) {
   const ctrl = new AbortController();
   (async () => {
@@ -57,4 +57,5 @@ function dispatch(frame, handlers) {
   if (event === "log") handlers.onLog?.(payload);
   else if (event === "truncated") handlers.onTruncated?.(payload);
   else if (event === "end") handlers.onEnd?.();
+  else if (event === "link") handlers.onLink?.(payload);
 }
