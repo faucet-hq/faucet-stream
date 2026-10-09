@@ -11,6 +11,8 @@
 #   PG_URL           — postgres://user:pass@host/db (destination, DLQ and state)
 #   SOURCE_API_TOKEN — bearer token for the source API
 version: 1
+# An older faucet refuses this file instead of misreading it.
+requires_faucet: ">=1.13"
 name: orders_sync
 
 schedule:
