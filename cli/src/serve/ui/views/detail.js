@@ -28,6 +28,27 @@ function fmtMs(ms) {
 
 const TERMINAL = ["completed", "failed", "cancelled"];
 
+const LOG_EXPORT_PILL = {
+  exported: "pill-completed",
+  pending: "pill-queued",
+  failed: "pill-failed",
+  partially_dropped: "pill-cancelled",
+};
+
+/** The "Log export" segment (#806): did the run's logs reach the log service? */
+function logExportSegment(le) {
+  if (!le || (le.status === "not_configured" && !le.link)) return "";
+  const pill = `<span class="pill ${LOG_EXPORT_PILL[le.status] || ""}">${escapeHtml(le.status.replace("_", " "))}</span>`;
+  const rows = [`<dt>Status</dt><dd class="le-status">${pill}</dd>`];
+  if (le.status !== "not_configured") {
+    rows.push(`<dt>Pending</dt><dd>${fmtInt(le.pending_lines ?? 0)}<small>lines buffered locally</small></dd>`);
+    if (le.dropped_lines) rows.push(`<dt>Dropped</dt><dd class="le-bad">${fmtInt(le.dropped_lines)}<small>before delivery</small></dd>`);
+    if (le.last_error) rows.push(`<dt>Last error</dt><dd class="le-error" title="${escapeHtml(le.last_error)}">${escapeHtml(le.last_error)}</dd>`);
+  }
+  if (le.link) rows.push(`<dt>Log service</dt><dd><a class="le-link" href="${escapeHtml(le.link)}" target="_blank" rel="noopener noreferrer">View logs ↗</a></dd>`);
+  return `<div class="rs-seg rs-seg-logs"><h3>Log export</h3><dl>${rows.join("")}</dl></div>`;
+}
+
 /** Link to the template a run was triggered from, with the numeric version it
  *  resolved to (both carried in the run's labels). Empty for other runs. */
 function templateLink(rec) {
@@ -170,7 +191,7 @@ export async function renderDetail(container, { id }) {
       </section>
       <h2>Invocations</h2>
       <div id="invocations"></div>
-      <h2>Logs</h2>
+      <div class="logs-head"><h2>Logs</h2><a id="logs-link" class="le-link" target="_blank" rel="noopener noreferrer" hidden>View in the log service ↗</a></div>
       <pre id="logs" class="logs"></pre>
       <h2>Dead-letter queue</h2>
       <div class="dlq-panel">
@@ -256,6 +277,11 @@ export async function renderDetail(container, { id }) {
 
   function renderHead(rec) {
     const errors = rec.error ? `<div class="error-box">${escapeHtml(rec.error)}</div>` : "";
+    const logsLink = container.querySelector("#logs-link");
+    if (rec.log_export?.link) {
+      logsLink.href = rec.log_export.link;
+      logsLink.hidden = false;
+    }
     const invCount = (rec.invocations || []).length;
     const stamp = (iso) => {
       const t = formatTsSplit(iso);
@@ -292,6 +318,7 @@ export async function renderDetail(container, { id }) {
             </dl>
           </div>
           ${provenance ? `<div class="rs-seg"><h3>Provenance</h3><dl>${provenance}</dl></div>` : ""}
+          ${logExportSegment(rec.log_export)}
         </div>
       </section>${errors}`;
     const inv = container.querySelector("#invocations");
@@ -364,6 +391,12 @@ export async function renderDetail(container, { id }) {
     onTruncated: (m) => appendLog(`— ${m} —`, "log-truncated"),
     onEnd: () => appendLog("— end of logs —", "log-end"),
     onExpired: () => appendLog("— logs expired —", "log-end"),
+    onLink: (url) => {
+      appendLog("— the local copy of these logs has aged out; open them in the log service ↗ —", "log-end");
+      const a = container.querySelector("#logs-link");
+      a.href = url;
+      a.hidden = false;
+    },
     onError: (e) => appendLog(`— log stream error: ${e.message} —`, "log-truncated"),
   });
 

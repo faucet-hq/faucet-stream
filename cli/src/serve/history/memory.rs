@@ -81,6 +81,8 @@ pub struct MemoryHistory {
         Mutex<std::collections::HashMap<String, BTreeMap<u32, templates::DeprecationRecord>>>,
     /// Persistent run logs (#529): run_id → lines (append order == seq order).
     run_logs: Mutex<std::collections::HashMap<String, Vec<RunLogLine>>>,
+    /// Log delivery rows (#806): run_id → watermark + export status.
+    log_ship: Mutex<std::collections::HashMap<String, super::LogShipRow>>,
     /// Local sink output ledger (#587): output id → row. The provenance the
     /// retention GC deletes from; ephemeral like everything else here, so a
     /// restart simply forgets (and therefore never collects) earlier files.
@@ -99,7 +101,21 @@ pub struct MemoryHistory {
     idem_retention: Duration,
 }
 
+/// The delivery-lease owner of the single-process memory backend.
+const MEMORY_OWNER: &str = "memory";
+
 impl MemoryHistory {
+    fn log_ship_guard(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, std::collections::HashMap<String, super::LogShipRow>>,
+        HistoryError,
+    > {
+        self.log_ship
+            .lock()
+            .map_err(|_| HistoryError::Backend("log_ship lock poisoned".into()))
+    }
+
     fn tenant_state(&self) -> Result<std::sync::MutexGuard<'_, TenantState>, HistoryError> {
         self.tenants
             .lock()
@@ -118,6 +134,7 @@ impl MemoryHistory {
             template_deprecations: Mutex::new(std::collections::HashMap::new()),
             template_version_deprecations: Mutex::new(std::collections::HashMap::new()),
             run_logs: Mutex::new(std::collections::HashMap::new()),
+            log_ship: Mutex::new(std::collections::HashMap::new()),
             local_outputs: Mutex::new(BTreeMap::new()),
             usage: Mutex::new(VecDeque::new()),
             changes: Mutex::new(BTreeMap::new()),
@@ -322,10 +339,170 @@ impl RunHistory for MemoryHistory {
             .run_logs
             .lock()
             .map_err(|_| HistoryError::Backend("run_logs lock poisoned".into()))?;
-        map.entry(run_id.to_string())
-            .or_default()
-            .extend(lines.iter().cloned());
+        let entry = map.entry(run_id.to_string()).or_default();
+        let mut max_seq = None;
+        for l in lines {
+            if l.seq != RUN_LOG_TRUNCATED_SEQ {
+                max_seq = Some(max_seq.map_or(l.seq, |m: u64| m.max(l.seq)));
+            }
+            entry.push(l.clone());
+        }
+        drop(map);
+        if let Some(max) = max_seq {
+            let mut ship = self.log_ship_guard()?;
+            let row = ship
+                .entry(run_id.to_string())
+                .or_insert_with(|| super::LogShipRow {
+                    run_id: run_id.to_string(),
+                    ..Default::default()
+                });
+            row.total_seq = row.total_seq.max(max);
+        }
         Ok(())
+    }
+
+    async fn log_ship_rows(
+        &self,
+        pending_only: bool,
+    ) -> Result<Vec<super::LogShipRow>, HistoryError> {
+        let ship = self.log_ship_guard()?;
+        let mut rows: Vec<super::LogShipRow> = ship
+            .values()
+            .filter(|r| !pending_only || r.has_pending())
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        Ok(rows)
+    }
+
+    async fn log_ship_row(&self, run_id: &str) -> Result<Option<super::LogShipRow>, HistoryError> {
+        Ok(self.log_ship_guard()?.get(run_id).cloned())
+    }
+
+    async fn log_ship_claim(&self, run_id: &str, ttl: Duration) -> Result<bool, HistoryError> {
+        let now = Utc::now();
+        let mut ship = self.log_ship_guard()?;
+        let Some(row) = ship.get_mut(run_id) else {
+            return Ok(false);
+        };
+        let free = row.owner.as_deref().is_none_or(|o| o == MEMORY_OWNER)
+            || row.lease_expires_at.is_none_or(|t| t < now);
+        if free {
+            row.owner = Some(MEMORY_OWNER.to_string());
+            row.lease_expires_at = Some(now + chrono::Duration::from_std(ttl).unwrap_or_default());
+        }
+        Ok(free)
+    }
+
+    async fn log_ship_ack(&self, run_id: &str, delivered_seq: u64) -> Result<bool, HistoryError> {
+        let now = Utc::now();
+        let mut ship = self.log_ship_guard()?;
+        match ship.get_mut(run_id) {
+            Some(row) if row.owner.as_deref() == Some(MEMORY_OWNER) => {
+                row.delivered_seq = Some(delivered_seq);
+                row.delivered_at = Some(now);
+                row.last_attempt_at = Some(now);
+                row.last_error = None;
+                row.failing_since = None;
+                row.notified_failure = false;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn log_ship_fail(&self, run_id: &str, error: &str) -> Result<bool, HistoryError> {
+        let now = Utc::now();
+        let mut ship = self.log_ship_guard()?;
+        match ship.get_mut(run_id) {
+            Some(row) if row.owner.as_deref() == Some(MEMORY_OWNER) => {
+                row.last_error = Some(error.to_string());
+                row.last_attempt_at = Some(now);
+                row.failing_since.get_or_insert(now);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn log_ship_release(&self, run_id: &str) -> Result<(), HistoryError> {
+        if let Some(row) = self.log_ship_guard()?.get_mut(run_id)
+            && row.owner.as_deref() == Some(MEMORY_OWNER)
+        {
+            row.owner = None;
+            row.lease_expires_at = None;
+        }
+        Ok(())
+    }
+
+    async fn log_ship_add_dropped(&self, run_id: &str, n: u64) -> Result<(), HistoryError> {
+        if let Some(row) = self.log_ship_guard()?.get_mut(run_id) {
+            row.dropped = row.dropped.saturating_add(n);
+        }
+        Ok(())
+    }
+
+    async fn log_ship_mark_notified(
+        &self,
+        run_id: &str,
+        failure: bool,
+        drop: bool,
+    ) -> Result<(), HistoryError> {
+        if let Some(row) = self.log_ship_guard()?.get_mut(run_id) {
+            row.notified_failure = failure;
+            row.notified_drop = drop;
+        }
+        Ok(())
+    }
+
+    async fn log_ship_forget(&self, run_id: &str) -> Result<(), HistoryError> {
+        self.log_ship_guard()?.remove(run_id);
+        Ok(())
+    }
+
+    async fn run_log_stats(
+        &self,
+        run_id: &str,
+        after: Option<u64>,
+        through: Option<u64>,
+    ) -> Result<super::RunLogStats, HistoryError> {
+        let map = self
+            .run_logs
+            .lock()
+            .map_err(|_| HistoryError::Backend("run_logs lock poisoned".into()))?;
+        let mut st = super::RunLogStats::default();
+        for l in map.get(run_id).into_iter().flatten().filter(|l| {
+            l.seq != RUN_LOG_TRUNCATED_SEQ
+                && after.is_none_or(|a| l.seq > a)
+                && through.is_none_or(|t| l.seq <= t)
+        }) {
+            st.lines += 1;
+            st.bytes += l.line.len() as u64;
+            st.min_seq = Some(st.min_seq.map_or(l.seq, |m| m.min(l.seq)));
+            st.max_seq = Some(st.max_seq.map_or(l.seq, |m| m.max(l.seq)));
+        }
+        Ok(st)
+    }
+
+    async fn delete_run_logs_through(
+        &self,
+        run_id: &str,
+        through: u64,
+    ) -> Result<usize, HistoryError> {
+        let mut map = self
+            .run_logs
+            .lock()
+            .map_err(|_| HistoryError::Backend("run_logs lock poisoned".into()))?;
+        let Some(lines) = map.get_mut(run_id) else {
+            return Ok(0);
+        };
+        let before = lines.len();
+        lines.retain(|l| l.seq == RUN_LOG_TRUNCATED_SEQ || l.seq > through);
+        let removed = before - lines.len();
+        if lines.is_empty() {
+            map.remove(run_id);
+        }
+        Ok(removed)
     }
 
     async fn list_run_logs(

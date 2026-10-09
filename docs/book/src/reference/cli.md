@@ -1165,12 +1165,32 @@ the real delivery path (no pipeline runs) — the fast way to confirm a Slack /
 PagerDuty / webhook channel is wired correctly. `--event` accepts any event
 kind (`run_failure`, `run_success`, `sla_breach`, `circuit_open`,
 `contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`,
-`change_requested`, `budget_exceeded`, `connection_needs_reauth`). The event
+`change_requested`, `budget_exceeded`, `connection_needs_reauth`,
+`log_export_failed`). The event
 carries the row `faucet-notify-test`, so it never shares a real run's PagerDuty
 dedup key; a failure-class test incident is resolved right after the trigger
 unless `--keep-open`. Exits non-zero when no rule delivered the event or any
 delivery failed. `--profile` / `FAUCET_PROFILE` selects an overlay. See the
 [Notifications](../cookbook/notifications.md) cookbook page.
+
+## `logs`
+
+*(requires the `otel` build feature)*
+
+```bash
+faucet logs ship                                   # auto-discover faucet.yaml
+faucet logs ship pipeline.yaml --spool /var/lib/faucet/logs
+faucet logs ship --spool ./spool --endpoint http://collector:4318 --protocol http --json
+```
+
+Delivers every undelivered run-log line `faucet run` / `faucet schedule` left
+in a spool directory ([Shipping logs](../operations/observability.md#shipping-logs)),
+using the config's `observability.otel` collector and `observability.logs`
+settings; `--endpoint` / `--protocol` / `--spool` override them (with no config,
+`--endpoint` is required). Runs another process is shipping (its `.lock` is
+held) are left alone. Stops after `--timeout-secs` (default 60). The exit code
+is the number of runs still undelivered (0 = everything shipped) — suitable for
+a cron job or a sidecar.
 
 ## `mirror`
 
@@ -1332,7 +1352,11 @@ Selected flags (`faucet serve --help` for the full list):
 | `--preview-local-outputs` | Serve **dataset previews** of the local files this server's sinks wrote — read their first N rows back into the console (env `FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS`). **Off by default**: it returns file *contents* over HTTP, so it is a local-testing convenience. See [Dataset preview](#dataset-preview-of-local-outputs). |
 | `--preview-default-rows <n>` | Rows a preview loads when the request omits `row_count_to_load` — the soft cap (default `500`; env `FAUCET_SERVE_PREVIEW_DEFAULT_ROWS`). `0` = the whole dataset by default. |
 | `--preview-max-rows <n>` | Ceiling on one preview's rows — the hard cap (default `5000`; env `FAUCET_SERVE_PREVIEW_MAX_ROWS`). A larger `row_count_to_load` is clamped to it, never honoured. **`0` lifts the ceiling**, which is what makes `row_count_to_load=all` load an entire dataset. |
-| `--otel-config <path>` | OTLP export for the server: a YAML/JSON file in the shape of a pipeline config's [`observability.otel`](../operations/observability.md) block (env `FAUCET_SERVE_OTEL_CONFIG`). Traces of every run, and with `export: [metrics]` the metrics `/metrics` serves. Requires the `otel` Cargo feature. |
+| `--otel-config <path>` | OTLP export for the server: a YAML/JSON file in the shape of a pipeline config's [`observability.otel`](../operations/observability.md) block (env `FAUCET_SERVE_OTEL_CONFIG`). Traces of every run, with `export: [metrics]` the metrics `/metrics` serves, and with `export: [logs]` every run's log lines ([Shipping logs](../operations/observability.md#shipping-logs)). Requires the `otel` Cargo feature. |
+| `--log-buffer-max-age-secs <n>` | With log shipping on: undelivered run-log lines older than this are dropped and counted (default `604800`, env `FAUCET_SERVE_LOG_BUFFER_MAX_AGE_SECS`). |
+| `--log-buffer-max-bytes <n>` | With log shipping on: bound on undelivered run-log bytes; past it the oldest go first (default `1073741824`, env `FAUCET_SERVE_LOG_BUFFER_MAX_BYTES`). |
+| `--log-link-template <url>` | Link to a run's logs in the log service, shown in the console and returned by the log endpoint once the local copy aged out. Placeholders `{run_id} {pipeline} {row} {tenant} {started_at} {ended_at}` (env `FAUCET_SERVE_LOG_LINK_TEMPLATE`). |
+| `--log-export-notify-after-secs <n>` | Emit `log_export_failed` once a run's log export has been failing this long (default `300`). |
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](./triggers.md). |
 | `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`) and cannot be combined with `--templates-sync`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
@@ -1755,4 +1779,8 @@ faucet run pipeline.yaml --output ndjson     # one JSON object per matrix row
 
 Each row reports `rows_in` / `rows_out` / `duration_ms` / `dlq_count` / `status`
 / `bookmark`; the exit code is unchanged (non-zero on failure). Secret material
-is scrubbed from the output.
+is scrubbed from the output. With log shipping on (`export: [logs]`), the JSON
+document also carries `log_export` — whether the run's log lines reached the
+collector (`status`, `pending_lines`, `dropped_lines`, `last_error`) — and the
+text output ends with `logs: exported` or `logs: N lines pending — run "faucet
+logs ship"`.

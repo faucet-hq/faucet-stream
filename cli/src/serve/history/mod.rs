@@ -534,6 +534,49 @@ pub struct RunLogLine {
     pub level: String,
     /// The redacted, formatted log line.
     pub line: String,
+    /// Line attributes shipped with it (#806): `target`, `row`,
+    /// `connector`, `shard`, `trace_id`, … Values are redacted.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attrs: std::collections::BTreeMap<String, String>,
+}
+
+/// A run's log-delivery bookkeeping (#806): the highest captured sequence,
+/// the acknowledged watermark, the export status, and the delivery lease that
+/// keeps two cluster instances from shipping one run at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogShipRow {
+    pub run_id: String,
+    /// Highest captured sequence.
+    pub total_seq: u64,
+    /// Highest acknowledged sequence.
+    pub delivered_seq: Option<u64>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    /// Lines dropped by a buffer bound or the per-run cap.
+    pub dropped: u64,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub failing_since: Option<DateTime<Utc>>,
+    /// The instance shipping the run, while its lease lasts.
+    pub owner: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub notified_failure: bool,
+    pub notified_drop: bool,
+}
+
+impl LogShipRow {
+    /// Whether lines past the watermark exist.
+    pub fn has_pending(&self) -> bool {
+        self.delivered_seq.is_none_or(|d| self.total_seq > d)
+    }
+}
+
+/// Count, size and sequence range of a slice of a run's persisted lines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunLogStats {
+    pub lines: u64,
+    pub bytes: u64,
+    pub min_seq: Option<u64>,
+    pub max_seq: Option<u64>,
 }
 
 /// A page of persisted run logs (#529), oldest-first. `truncated` is `true` when
@@ -871,6 +914,96 @@ pub trait RunHistory: Send + Sync {
     /// removed. Independent of run-record retention. Default: nothing purged.
     async fn purge_run_logs(&self, older_than: Duration) -> Result<usize, HistoryError> {
         let _ = older_than;
+        Ok(0)
+    }
+
+    // ── Log delivery (#806) ──────────────────────────────────────────────────
+    //
+    // The per-run delivery watermark the log shipper keeps. `record_run_logs`
+    // creates/extends a run's row; the shipper claims a run (a lease, so one
+    // cluster instance ships it), acknowledges batches and records failures.
+    // Defaulted to inert; implemented by the memory + SQL backends and
+    // forwarded by the fallback wrapper.
+
+    /// Every run's delivery row; with `pending_only`, only runs with lines
+    /// past their watermark.
+    async fn log_ship_rows(&self, pending_only: bool) -> Result<Vec<LogShipRow>, HistoryError> {
+        let _ = pending_only;
+        Ok(Vec::new())
+    }
+
+    /// One run's delivery row.
+    async fn log_ship_row(&self, run_id: &str) -> Result<Option<LogShipRow>, HistoryError> {
+        let _ = run_id;
+        Ok(None)
+    }
+
+    /// Take (or renew) the delivery lease on a run for this instance, unless
+    /// another instance holds a live one.
+    async fn log_ship_claim(&self, run_id: &str, ttl: Duration) -> Result<bool, HistoryError> {
+        let _ = (run_id, ttl);
+        Ok(false)
+    }
+
+    /// Advance the watermark after an acknowledged batch (lease-fenced).
+    async fn log_ship_ack(&self, run_id: &str, delivered_seq: u64) -> Result<bool, HistoryError> {
+        let _ = (run_id, delivered_seq);
+        Ok(false)
+    }
+
+    /// Record a failed export attempt (lease-fenced).
+    async fn log_ship_fail(&self, run_id: &str, error: &str) -> Result<bool, HistoryError> {
+        let _ = (run_id, error);
+        Ok(false)
+    }
+
+    /// Give up this instance's lease on a run.
+    async fn log_ship_release(&self, run_id: &str) -> Result<(), HistoryError> {
+        let _ = run_id;
+        Ok(())
+    }
+
+    /// Count `n` lines of a run as dropped before delivery.
+    async fn log_ship_add_dropped(&self, run_id: &str, n: u64) -> Result<(), HistoryError> {
+        let _ = (run_id, n);
+        Ok(())
+    }
+
+    /// Remember that a run's failure / drop was notified.
+    async fn log_ship_mark_notified(
+        &self,
+        run_id: &str,
+        failure: bool,
+        drop: bool,
+    ) -> Result<(), HistoryError> {
+        let _ = (run_id, failure, drop);
+        Ok(())
+    }
+
+    /// Delete a run's delivery row.
+    async fn log_ship_forget(&self, run_id: &str) -> Result<(), HistoryError> {
+        let _ = run_id;
+        Ok(())
+    }
+
+    /// Count and size of a run's persisted lines with `after < seq <= through`.
+    async fn run_log_stats(
+        &self,
+        run_id: &str,
+        after: Option<u64>,
+        through: Option<u64>,
+    ) -> Result<RunLogStats, HistoryError> {
+        let _ = (run_id, after, through);
+        Ok(RunLogStats::default())
+    }
+
+    /// Delete a run's persisted lines with `seq <= through`.
+    async fn delete_run_logs_through(
+        &self,
+        run_id: &str,
+        through: u64,
+    ) -> Result<usize, HistoryError> {
+        let _ = (run_id, through);
         Ok(0)
     }
 
@@ -1704,6 +1837,32 @@ mod tests {
         fn degraded(&self) -> bool {
             false
         }
+    }
+
+    #[tokio::test]
+    async fn log_delivery_defaults_are_inert() {
+        let h = Bare;
+        let ttl = Duration::from_secs(1);
+        assert!(h.log_ship_rows(true).await.unwrap().is_empty());
+        assert!(h.log_ship_row("r").await.unwrap().is_none());
+        assert!(!h.log_ship_claim("r", ttl).await.unwrap());
+        assert!(!h.log_ship_ack("r", 1).await.unwrap());
+        assert!(!h.log_ship_fail("r", "e").await.unwrap());
+        h.log_ship_release("r").await.unwrap();
+        h.log_ship_add_dropped("r", 1).await.unwrap();
+        h.log_ship_mark_notified("r", true, true).await.unwrap();
+        h.log_ship_forget("r").await.unwrap();
+        assert_eq!(
+            h.run_log_stats("r", None, None).await.unwrap(),
+            RunLogStats::default()
+        );
+        assert_eq!(h.delete_run_logs_through("r", 1).await.unwrap(), 0);
+        let row = LogShipRow {
+            total_seq: 5,
+            delivered_seq: Some(5),
+            ..Default::default()
+        };
+        assert!(!row.has_pending());
     }
 
     #[tokio::test]

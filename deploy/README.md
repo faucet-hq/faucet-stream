@@ -7,6 +7,7 @@ Container image + Kubernetes/Helm assets for running faucet-stream anywhere.
 | [`../Dockerfile`](../Dockerfile) | Multi-stage image build with **name-based connector selection** (build args). |
 | [`../scripts/build-image.sh`](../scripts/build-image.sh) | Helper to build lean or full images by connector name. |
 | [`helm/faucet-stream/`](./helm/faucet-stream/) | Helm chart — `serve` Deployment and/or `run` Job/CronJob. |
+| [`otel/`](./otel/) | Log-shipping recipes: Alloy → Loki, OTel Collector → S3 / GCS / Azure, a Docker Compose example. |
 | [`../.github/workflows/docker-images.yml`](../.github/workflows/docker-images.yml) | CI matrix that publishes named per-profile images to GHCR. |
 
 ## The one thing to understand
@@ -20,10 +21,9 @@ running image is missing a connector you declared).
 ## Quick start (Docker)
 
 ```bash
-# Complete image — the CLI's `full` feature: every connector and every feature
+# Complete image — the CLI's `full` feature: every connector and every
+# feature, plus the Oracle Instant Client the Oracle connectors load
 docker build -t faucet:full .
-# …plus Oracle Instant Client for the Oracle connectors (~40 MiB more)
-docker build --build-arg ORACLE_CLIENT=true -t faucet:full-oracle .
 # The image's default command is `serve`, which refuses to start without auth.
 docker run --rm -p 8080:8080 -e FAUCET_SERVE_AUTH_TOKEN="$(openssl rand -hex 32)" faucet:full
 curl -s localhost:8080/healthz && echo OK

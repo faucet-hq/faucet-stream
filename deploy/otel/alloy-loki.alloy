@@ -1,0 +1,32 @@
+// Grafana Alloy: receive faucet run logs over OTLP and push them to Loki (#806).
+// The run identifiers (`serve_run_id` / `run_id`, `pipeline`, `tenant`) become
+// Loki structured metadata, so a Grafana Explore query on `serve_run_id` finds
+// one run's lines — the shape `--log-link-template` should point at.
+
+otelcol.receiver.otlp "faucet" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  output {
+    logs = [otelcol.processor.batch.faucet.input]
+  }
+}
+
+otelcol.processor.batch "faucet" {
+  output {
+    logs = [otelcol.exporter.loki.faucet.input]
+  }
+}
+
+otelcol.exporter.loki "faucet" {
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

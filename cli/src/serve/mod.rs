@@ -14,6 +14,7 @@ pub mod handlers;
 pub mod history;
 pub mod idempotency;
 pub mod load;
+pub mod log_export;
 pub mod logs;
 #[cfg(feature = "mcp")]
 pub mod mcp_route;

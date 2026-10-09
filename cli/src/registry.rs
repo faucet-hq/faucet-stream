@@ -1304,7 +1304,8 @@ pub fn source_kind_consumes_destructively(kind: &str, config: &Value) -> bool {
 
 /// Whether a source configured this way resumes from a stored bookmark, so a
 /// run with `state:` reads only what changed since the last one: an
-/// incremental `replication_method`, the file source's `incremental:` block,
+/// incremental `replication_method`, a SQL source's `replication: { type:
+/// incremental }`, the file source's `incremental:` block,
 /// an incremental Iceberg / DynamoDB-streams read, or a change-stream / log
 /// source. A full refresh (`write_mode: overwrite`) from such a source would
 /// replace the destination with only the delta (#789 CLI-20).
@@ -1319,11 +1320,21 @@ pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
     };
     let mode = config.get("mode").and_then(Value::as_str);
     incremental_method
+        || sql_incremental(config)
         || (kind == "file" && config.get("incremental").is_some_and(|v| !v.is_null()))
         || (kind == "iceberg" && mode == Some("incremental"))
         || (kind == "dynamodb" && mode == Some("streams"))
         || kind.ends_with("-cdc")
         || matches!(kind, "kafka" | "kinesis")
+}
+
+/// Whether a SQL query source reads with `replication: { type: incremental }`.
+pub fn sql_incremental(config: &Value) -> bool {
+    config
+        .get("replication")
+        .and_then(|r| r.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case("incremental"))
 }
 
 /// See [`EXACTLY_ONCE_SOURCE_KINDS`].
@@ -1693,9 +1704,12 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
         #[cfg(feature = "source-grpc")]
         "grpc" => check::<faucet_source_grpc::GrpcStreamConfig>("grpc", name, config),
         #[cfg(feature = "source-postgres")]
-        "postgres" => {
-            check::<faucet_source_postgres::PostgresSourceConfig>("postgres", name, config)
-        }
+        "postgres" => check_with::<faucet_source_postgres::PostgresSourceConfig, _, _>(
+            "postgres",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "source-postgres-cdc")]
         "postgres-cdc" => check_with::<faucet_source_postgres_cdc::PostgresCdcSourceConfig, _, _>(
             "postgres-cdc",
@@ -1704,7 +1718,11 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
             |c| c.validate(),
         ),
         #[cfg(feature = "source-mysql")]
-        "mysql" => check::<faucet_source_mysql::MysqlSourceConfig>("mysql", name, config),
+        "mysql" => {
+            check_with::<faucet_source_mysql::MysqlSourceConfig, _, _>("mysql", name, config, |c| {
+                c.validate()
+            })
+        }
         #[cfg(feature = "source-mssql")]
         "mssql" => {
             check_with::<faucet_source_mssql::MssqlSourceConfig, _, _>("mssql", name, config, |c| {

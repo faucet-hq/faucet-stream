@@ -1806,6 +1806,7 @@ fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
         | "kinesis" | "rabbitmq" | "nats" | "pubsub" | "sqs" => true,
         "dynamodb" => mode() == Some("streams"),
         "iceberg" => mode() == Some("incremental"),
+        "postgres" | "mysql" => crate::registry::sql_incremental(cfg),
         "file" => cfg.get("incremental").is_some_and(|v| !v.is_null()),
         _ => false,
     }
@@ -4316,6 +4317,21 @@ pipeline:
         assert!(source_flushes_every_page(
             "iceberg",
             &serde_json::json!({"mode": "incremental"})
+        ));
+        let incremental = serde_json::json!({"replication": {"type": "incremental"}});
+        assert!(source_flushes_every_page("postgres", &incremental));
+        assert!(source_flushes_every_page("mysql", &incremental));
+        assert!(!source_flushes_every_page(
+            "postgres",
+            &serde_json::json!({"replication": {"type": "full"}})
+        ));
+        assert!(crate::registry::source_resumes_from_bookmark(
+            "mssql",
+            &incremental
+        ));
+        assert!(!crate::registry::source_resumes_from_bookmark(
+            "postgres",
+            &serde_json::json!({})
         ));
     }
 

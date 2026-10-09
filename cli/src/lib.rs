@@ -46,6 +46,7 @@ pub mod lineage_glue;
 pub mod livemetrics;
 #[cfg(feature = "serve")]
 pub mod local_outputs;
+pub mod logship;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memstat;
@@ -208,6 +209,7 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
             Err(CliError::PolicyViolations { violations }) => {
                 ExitCode::from(violations.clamp(1, 255) as u8)
             }
+            Err(CliError::LogsUndelivered { runs }) => ExitCode::from(runs.clamp(1, 255) as u8),
             Err(CliError::VerifyFailed { differences }) => {
                 ExitCode::from(differences.clamp(1, 255) as u8)
             }
@@ -281,6 +283,8 @@ async fn dispatch(cli: Cli) -> CliResult<()> {
         Command::Mcp(args) => commands::mcp::run(args).await,
         #[cfg(feature = "notify")]
         Command::Notify(args) => commands::notify::run(args).await,
+        #[cfg(feature = "otel")]
+        Command::Logs(args) => commands::logs::run(args).await,
         #[cfg(feature = "catalog")]
         Command::Catalog(args) => commands::catalog::run(args).await,
         #[cfg(feature = "catalog")]
@@ -315,6 +319,7 @@ fn install_tracing(level: &str, format: crate::cli::LogFormat) {
             let _ = registry
                 .with(filter)
                 .with(tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter))
+                .with(spool_layer())
                 .try_init();
         }
         crate::cli::LogFormat::Json => {
@@ -333,9 +338,22 @@ fn install_tracing(level: &str, format: crate::cli::LogFormat) {
                         .with_current_span(true)
                         .with_span_list(false),
                 )
+                .with(spool_layer())
                 .try_init();
         }
     }
+}
+
+/// The run-log capture layer feeding the log-shipping spool (#806); inert
+/// until a `faucet run` / `faucet schedule` session starts shipping.
+#[cfg(feature = "otel")]
+pub(crate) fn spool_layer() -> crate::logship::session::SpoolLayer {
+    crate::logship::session::SpoolLayer
+}
+
+#[cfg(all(feature = "observability", not(feature = "otel")))]
+pub(crate) fn spool_layer() -> tracing_subscriber::layer::Identity {
+    tracing_subscriber::layer::Identity::new()
 }
 
 /// An empty reload layer registered with faucet-core as the home of the OTLP

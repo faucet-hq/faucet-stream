@@ -96,6 +96,8 @@ pub struct ServeConfig {
     /// Per-run cap on persisted log lines (#529). Past it, a truncation marker is
     /// recorded and further lines are dropped.
     pub log_max_lines_per_run: usize,
+    /// Log-shipping buffer bounds + console link (#806).
+    pub log_buffer: LogBufferSettings,
     /// Default retention window, in days, for the local files a run's sinks
     /// wrote (#587). `0` disables the automatic sweep; on-demand cleanup from the
     /// Datasets page / `faucet cleanup` still works. Overridable per pipeline via
@@ -149,6 +151,32 @@ pub struct ServeConfig {
     /// Whether a caller-supplied config may use connectors that run a program
     /// on the server (`--allow-subprocess-connectors`).
     pub allow_subprocess_connectors: bool,
+}
+
+/// Log-shipping buffer bounds and the console's log link (#806).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogBufferSettings {
+    pub max_age: Duration,
+    pub max_bytes: u64,
+    pub link_template: Option<String>,
+    pub notify_after: Duration,
+}
+
+impl Default for LogBufferSettings {
+    fn default() -> Self {
+        Self::from(&crate::cli::LogBufferArgs::default())
+    }
+}
+
+impl From<&crate::cli::LogBufferArgs> for LogBufferSettings {
+    fn from(a: &crate::cli::LogBufferArgs) -> Self {
+        Self {
+            max_age: Duration::from_secs(a.log_buffer_max_age_secs),
+            max_bytes: a.log_buffer_max_bytes,
+            link_template: a.log_link_template.clone().filter(|t| !t.trim().is_empty()),
+            notify_after: Duration::from_secs(a.log_export_notify_after_secs),
+        }
+    }
 }
 
 /// The vault key (`--vault-key`) and previous keys (`--vault-previous-key`).
@@ -351,6 +379,13 @@ impl ServeConfig {
             );
         }
 
+        if args.log_buffer.log_buffer_max_age_secs == 0 || args.log_buffer.log_buffer_max_bytes == 0
+        {
+            return Err(CliError::Serve(
+                "--log-buffer-max-age-secs and --log-buffer-max-bytes must be > 0".into(),
+            ));
+        }
+
         let max_concurrent_runs = args
             .max_concurrent_runs
             .unwrap_or_else(default_max_concurrent)
@@ -374,6 +409,7 @@ impl ServeConfig {
             idempotency_retention: Duration::from_secs(args.idempotency_retention_secs),
             log_retention: Duration::from_secs(args.log_retention_secs),
             log_max_lines_per_run: args.log_max_lines_per_run,
+            log_buffer: LogBufferSettings::from(&args.log_buffer),
             local_output_retention_days: args.local_output_retention_days,
             local_output_in_flight_grace: Duration::from_secs(
                 args.local_output_in_flight_grace_secs,
@@ -534,6 +570,7 @@ mod tests {
             idempotency_retention_secs: 86_400,
             log_retention_secs: 604_800,
             log_max_lines_per_run: 100_000,
+            log_buffer: Default::default(),
             local_output_retention_days: 7,
             local_output_in_flight_grace_secs: 60,
             preview_local_outputs: false,

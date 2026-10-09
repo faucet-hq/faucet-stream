@@ -59,6 +59,7 @@ fn serve_args_with_retention(
         idempotency_retention_secs: 86_400,
         log_retention_secs: 604_800,
         log_max_lines_per_run: 100_000,
+        log_buffer: Default::default(),
         // Long window: these tests drive cleanup explicitly, so the background
         // sweeper must not race them by collecting a fresh file first.
         local_output_retention_days: retention_days,

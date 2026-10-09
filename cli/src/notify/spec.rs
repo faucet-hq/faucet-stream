@@ -78,6 +78,9 @@ pub enum EventKind {
     /// A tenant connection's grant was revoked and it needs re-authorization
     /// (#709). Emitted through the tenant's own `notifications:`.
     ConnectionNeedsReauth,
+    /// A run's log export has been failing past `notify_after_secs`, or its
+    /// buffered log lines were dropped before delivery (#806).
+    LogExportFailed,
 }
 
 impl EventKind {
@@ -95,6 +98,7 @@ impl EventKind {
             EventKind::ChangeRequested => "change_requested",
             EventKind::BudgetExceeded => "budget_exceeded",
             EventKind::ConnectionNeedsReauth => "connection_needs_reauth",
+            EventKind::LogExportFailed => "log_export_failed",
         }
     }
 }

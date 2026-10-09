@@ -128,6 +128,47 @@ source:
 Combine it with a `replication_bind` of `into: body, path: /variables/since`
 for incremental reads.
 
+### Incremental SQL queries (postgres, mysql)
+
+The `postgres` and `mysql` query sources take a `replication:` block instead
+of `replication_method` / `replication_key`, with the same shape as `mssql`:
+
+```yaml
+source:
+  type: postgres
+  config:
+    connection_url: "postgres://faucet:faucet@localhost:5432/app"
+    query: "SELECT id, status, total, updated_at FROM public.orders"
+    replication:
+      type: incremental
+      column: updated_at                    # an output column of the query
+      initial_value: "1970-01-01T00:00:00Z" # inclusive, first run only
+state:
+  type: file
+  config: { path: ./.faucet-state }
+```
+
+The source runs `SELECT * FROM (<query>) AS q WHERE q.updated_at >= <bookmark>
+ORDER BY q.updated_at`, so the server filters and orders by the cursor. Write
+the token — `${bookmark}` for postgres, `@bookmark` for mysql — inside the
+query with `>=` to apply the cursor in a CTE or join as well; a strict `>` is
+refused when the config loads.
+
+**Ties are never skipped.** The stored bookmark is the last cursor value read
+plus a fingerprint of every row already written at that value
+(`{"value": "...", "boundary": ["..."]}`). The next run re-reads that value and
+drops only those rows, so a row that committed late with the same `updated_at`
+is written, and so is a boundary row updated in place. Above 10,000 rows at one
+value the fingerprints are dropped and the next run re-reads the value whole
+(duplicates, not loss).
+
+**Every page is checkpointed.** Each page carries the bookmark after its last
+row, persisted only after the sink has written the page, so a crash replays at
+most one page. Rows with a `NULL` cursor are never read, and a row committed
+with a cursor below the stored bookmark is not seen — use the CDC source when
+that matters. `faucet state show|set|reset` work on these bookmarks like any
+other. Example: `cli/examples/postgres_incremental_to_jsonl.yaml`.
+
 ### Records without the key
 
 A record whose key is missing or `null` is **kept** by default — dropping it

@@ -16,6 +16,7 @@ Built on [`sqlx`](https://crates.io/crates/sqlx) with a reusable connection pool
 - **Type-aware row decoding** — integers, floats, booleans, `text`, `json`/`jsonb`, `timestamp(tz)`, `date`/`time`, `uuid`, `numeric`/`decimal`, and `bytea` are each converted to the right JSON shape (full numeric precision preserved as strings; binary base64-encoded); every other type arrives as its text output, never as a silent `null`.
 - **Positional bind parameters** — `params` from config are bound as native scalar types (`$1`, `$2`, …), so a numeric or boolean bind compares correctly against a typed column instead of being coerced to `jsonb`.
 - **Matrix-context binding** — `${parent.path}` tokens in the query are rewritten to additional positional bind markers and filled per parent record, so the same query template runs once per row produced by a parent in a [matrix](https://faucet-hq.github.io/faucet-stream/reference/config.html) pipeline.
+- **Incremental replication** — `replication: { type: incremental, column, initial_value }` reads only rows changed since the stored bookmark, in cursor order, without skipping rows that share a cursor value; a crash replays at most one page (see [Incremental replication](#incremental-replication)).
 - **Credential redaction** — the connection URL is masked in `Debug` output and stripped from the emitted lineage dataset URI.
 
 ## Installation
@@ -72,6 +73,8 @@ All fields live under `pipeline.source.config`.
 | `read_timeout_secs` | int | `3600` | Longest the source waits on the server for the next row before the read fails (`0` = forever), so a peer that vanished without closing the connection (a failover, a NAT/LB idle eviction) cannot hang a run. |
 | `json_big_numbers` | `fail` \| `string` | `fail` | A number inside a JSON column that a 64-bit float cannot represent exactly (more than about 17 significant digits, or beyond the 64-bit integer range): `fail` fails the read with an error naming the column and the number's leading digits; `string` emits it as a JSON string holding its exact digits (one warning per column). Checked on the column's text, never after conversion. |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
+| `replication` | object | `{ type: full }` | `{ type: incremental, column, initial_value }` reads only rows changed since the stored bookmark — see [Incremental replication](#incremental-replication). |
+| `state_key` | string | *(derived)* | State-store key for the incremental bookmark. |
 
 ## Examples
 
@@ -165,7 +168,47 @@ pipeline:
 
 The trait-level `batch_size` argument to `stream_pages` is informational; the source always uses its own config field as the authoritative knob, so a pipeline-supplied hint cannot silently override an explicit config value.
 
-This is a **query source with no incremental-replication mode** — it runs the configured query once and streams the result. Every emitted page therefore carries `bookmark: None`; there is no resume/state bookmark, no effectively-once delivery, and no upsert/write modes (those are sink concerns). For change data capture, see [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc), which captures logical-replication changes and is resumable via a state store.
+With `replication: { type: full }` (the default) every page carries `bookmark: None`. With `replication: { type: incremental }` every page carries the bookmark after its last row — see [Incremental replication](#incremental-replication). The source does not provide effectively-once delivery on its own (pair it with a keyed upsert sink for that). For change data capture, see [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc).
+
+## Incremental replication
+
+`replication: { type: incremental }` reads only the rows that changed since the last run. The bookmark lives in the pipeline's [state store](https://faucet-hq.github.io/faucet-stream/cookbook/state.html), so pair it with a durable `state:` block (`file`, `redis` or `postgres`).
+
+```yaml
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: "postgres://faucet:faucet@localhost:5432/app"
+      query: "SELECT id, status, updated_at FROM orders"
+      replication:
+        type: incremental
+        column: updated_at          # an output column of the query
+        initial_value: "1970-01-01T00:00:00Z"
+  sink: { type: file, config: { path: ./out/orders.jsonl, if_exists: append } }
+  state: { type: file, config: { path: ./.faucet-state } }
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `replication.type` | `full` | `full` reads the whole result every run; `incremental` reads from the stored bookmark. |
+| `replication.column` | — *(required)* | Output column holding the cursor (`updated_at`, an increasing id). |
+| `replication.initial_value` | — *(required)* | Inclusive lower bound for the first run, before a bookmark is stored. Not `null`. |
+| `state_key` | derived | Explicit state-store key. Default `postgres:<host>:<fingerprint of the database URL and query>`; the CLI overrides it with the row's own key. |
+
+**How it reads.** The source wraps the query as `SELECT * FROM (<query>) AS q WHERE q.<column> >= <bookmark> ORDER BY q.<column>`, so the server filters and orders by the cursor (index it). The bookmark is bound as `CAST($n AS <type of column>)`, so a timestamp, numeric or date cursor compares natively. To apply the cursor further inside the query — a CTE, a join, an aggregate the planner cannot push into — write `${bookmark}` there with `>=` (`WHERE o.updated_at >= ${bookmark}`); a `> ${bookmark}` is refused at load time because it would skip rows that share the bookmark value.
+
+**Rows that share a cursor value are never skipped.** A strict `> bookmark` loses a row that commits after a run with the same `updated_at` as the last row read. Instead the bookmark stores the last cursor value **and** a 128-bit fingerprint of every row already emitted at that value — `{"value": "...", "boundary": ["<fingerprint>", ...]}`. The next read re-reads that value with `>=` and drops only the fingerprints it holds, so:
+
+- a row committed late at the boundary value is emitted;
+- a boundary row updated in place without its cursor moving is emitted again (its fingerprint changed);
+- nothing already written is emitted twice.
+
+The fingerprint covers the whole row, so no key column is needed. When more than 10,000 rows share one cursor value the set is dropped (`"boundary": null`) and the next read re-emits every row at that value — duplicates, never loss (a warning names the column). A bare value written with `faucet state set` reads as that value with an empty boundary.
+
+**A crash replays at most one page.** Every page carries the bookmark after its last row, and the pipeline persists it only after the sink has written and flushed the page. The final page carries a bookmark even when it is empty.
+
+**Limits.** Rows whose cursor is `NULL` are never read — use a `NOT NULL` column or `COALESCE` it in the query. A row that commits with a cursor value *below* the stored bookmark (a long transaction that stamped `updated_at` before it committed) is not seen; use a cursor the database sets at commit, or the CDC source, when that matters. The cursor column must be orderable by the server; client-side, rows provably before the bookmark (numbers, decimal strings, timestamps, dates) are dropped as a backstop, while other strings are left to the server's collation. Incremental replication works with [sharding](#sharded-execution-cluster-mode-b) (each shard keeps its own bookmark), and [range digests](#range-digests-faucet-verify-701) cover every row from `initial_value` on.
 
 > **Note** — Postgres' wire protocol sends rows from a simple `SELECT` in a single response (no server-side cursor by default). The streaming implementation bounds *client-side* memory at `O(batch_size)` and lets the sink begin writing as soon as the first batch is parsed off the wire.
 

@@ -83,8 +83,8 @@ scripts/build-image.sh -t ghcr.io/you/faucet-stream:analytics \
 # Complete image — every connector and every feature (the CLI's `full`)
 scripts/build-image.sh -t ghcr.io/you/faucet-stream:full
 
-# …or use the published ones: `:full`, or `:full-oracle` when you move Oracle
-# data (it adds Oracle Instant Client, ~40 MiB compressed).
+# …or use the published `:full`, which also ships the Oracle Instant Client
+# the Oracle connectors load.
 ```
 
 The recommended workflow is **B: named per-profile images** — publish a few
@@ -204,6 +204,16 @@ Override via `podSecurityContext` / `securityContext`.
   with `serviceMonitor.enabled=true` (Prometheus Operator) or annotate the
   Service yourself.
 - `/healthz` (liveness) and `/readyz` (readiness) back the probes.
+- **Log shipping (#806):** `otel.logs.enabled=true` + `otel.logs.endpoint`
+  ships every run's log lines over OTLP. For `serve` the chart renders the
+  `--otel-config` file and the buffer bounds / link template as env; the
+  run-history backend is the buffer, so pair it with `serve.history.backend:
+  sqlite` + `serve.persistence.enabled` (or postgres) to survive restarts.
+  `job` / `cronjob` pods get a spool volume at `otel.logs.spoolDir`
+  (`otel.logs.buffer.persistence.enabled` for a PVC); their pipeline config
+  must set `observability.otel.export: [logs]` and
+  `observability.logs.spool_dir` to that path. Collector recipes:
+  [`deploy/otel/`](../../otel/).
 
 ---
 
@@ -235,6 +245,11 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `cronjob.schedule` | `0 * * * *` | cron expression |
 | `pipelineConfig.create` | `false` | render pipeline config into a ConfigMap |
 | `serviceMonitor.enabled` | `false` | Prometheus Operator scrape |
+| `otel.logs.enabled` | `false` | ship run logs over OTLP (needs an `otel` image) |
+| `otel.logs.endpoint` / `.protocol` | `""` / `grpc` | the OTLP collector |
+| `otel.logs.retentionSeconds` / `.maxAgeSeconds` / `.maxBytes` | `86400` / `604800` / `1073741824` | buffer retention after delivery and bounds before it |
+| `otel.logs.linkTemplate` | `""` | console **View logs** link (`{run_id}` …) |
+| `otel.logs.buffer.persistence.enabled` | `false` | PVC for the job / cronjob spool (`emptyDir` otherwise) |
 | `ingress.enabled` | `false` | expose serve via Ingress |
 
 ---

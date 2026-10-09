@@ -263,8 +263,20 @@ FAUCET_SERVE_AUTH_TOKEN=s3cret faucet serve --listen 0.0.0.0:8080      # bearer 
 faucet serve --no-auth                                                 # explicit no-auth opt-in (required if no token)
 faucet serve --history sqlite:/var/lib/faucet/runs.db                  # durable run history
 faucet serve --default-config defaults.yaml                            # merge workspace defaults under every run
-faucet serve --otel-config otel.yaml                                   # OTLP traces + metrics (an `observability.otel` block; `otel` feature)
+faucet serve --otel-config otel.yaml                                   # OTLP traces + metrics (+ run logs with `export: [logs]`; `otel` feature)
 ```
+
+**Log shipping (#806, `otel` feature).** `export: [logs]` (in a pipeline's
+`observability.otel` block, or in `faucet serve --otel-config`) ships every
+run's log lines to the OTLP collector from a durable local buffer — the
+history log store under `serve`, a spool directory (`observability.logs`) under
+`run` / `schedule` — advancing a per-run watermark only on acknowledgement.
+`GET /v1/runs/{id}` and the console report `log_export`; `faucet run` prints a
+`logs:` line and adds `log_export` to `--output json`; `faucet logs ship
+[--spool DIR]` drains a spool (exit code = runs still undelivered). Serve
+flags: `--log-retention-secs` (default 24 h, kept *after* delivery),
+`--log-buffer-max-age-secs`, `--log-buffer-max-bytes`, `--log-link-template`,
+`--log-export-notify-after-secs`. See the observability guide's *Shipping logs*.
 
 Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** without `--no-auth`, startup fails (an unauthenticated server is never accidental). The default bind is loopback.
 

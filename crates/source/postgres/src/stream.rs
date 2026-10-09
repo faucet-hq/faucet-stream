@@ -1,7 +1,8 @@
 //! PostgreSQL source implementation.
 
-use crate::config::PostgresSourceConfig;
+use crate::config::{BOOKMARK_TOKEN, PostgresReplication, PostgresSourceConfig};
 use async_trait::async_trait;
+use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::shard::{
     PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
 };
@@ -24,12 +25,14 @@ pub struct PostgresSource {
     applied_shard: Mutex<Option<PkShardBounds>>,
     /// Columns already warned about under `json_big_numbers: string`.
     json_warned: Mutex<std::collections::HashSet<String>>,
+    /// Bookmark loaded via [`Source::apply_start_bookmark`](faucet_core::Source::apply_start_bookmark).
+    start_bookmark: Mutex<Option<Value>>,
 }
 
 impl PostgresSource {
     /// Create a new PostgreSQL source. Establishes a connection pool.
     pub async fn new(config: PostgresSourceConfig) -> Result<Self, FaucetError> {
-        faucet_core::validate_batch_size(config.batch_size)?;
+        config.validate()?;
 
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
@@ -49,7 +52,112 @@ impl PostgresSource {
             pool,
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
+            start_bookmark: Mutex::new(None),
         })
+    }
+
+    /// The cursor column and starting position of an incremental read.
+    fn incremental_start(&self) -> Result<Option<(String, CursorBookmark)>, FaucetError> {
+        let PostgresReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.config.replication
+        else {
+            return Ok(None);
+        };
+        let stored = self
+            .start_bookmark
+            .lock()
+            .expect("start_bookmark mutex poisoned")
+            .clone();
+        let start = match stored {
+            Some(v) => CursorBookmark::from_state(v)?,
+            None => CursorBookmark::initial(initial_value.clone()),
+        };
+        Ok(Some((column.clone(), start)))
+    }
+
+    /// The incremental query before ordering: the configured query with its
+    /// context and `${bookmark}` bound, sharded, then filtered to
+    /// `column >= start`. Returns the SQL and the bind values that follow the
+    /// configured params.
+    async fn incremental_base(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+        column: &str,
+        start: &Value,
+        sharded: bool,
+    ) -> Result<(String, Vec<Value>), FaucetError> {
+        use sqlx::Executor;
+        let probe = resolve_query_text(
+            &self.config.query.replace(BOOKMARK_TOKEN, "NULL"),
+            self.config.params.len(),
+            context,
+        )
+        .0;
+        let described = (&self.pool).describe(&probe).await.map_err(|e| {
+            FaucetError::Source(format!(
+                "postgres: could not describe the incremental query: {e}"
+            ))
+        })?;
+        let type_name = described
+            .columns()
+            .iter()
+            .find(|c| c.name() == column)
+            .map(|c| c.type_info().name().to_string())
+            .ok_or_else(|| {
+                FaucetError::Config(format!(
+                    "postgres: incremental replication `column` {column:?} is not a column of \
+                     the query's output"
+                ))
+            })?;
+        let cast = cast_type(&type_name)?;
+        let (query, mut binds) = bind_bookmark(&self.config, context, start, &cast);
+        let index = self.config.params.len() + binds.len() + 1;
+        binds.push(start.clone());
+        Ok((
+            cursor_filter(&self.shard_wrap_if(query, sharded), column, index, &cast),
+            binds,
+        ))
+    }
+
+    /// The final SQL and bind values for a fetch, and the cursor tracker of
+    /// an incremental read.
+    async fn plan_fetch(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<(String, Vec<Value>, Option<CursorTracker>), FaucetError> {
+        match self.incremental_start()? {
+            None => {
+                let (query, binds) = resolve_query(&self.config, context);
+                Ok((self.typed_query(self.shard_wrap(query)).await, binds, None))
+            }
+            Some((column, start)) => {
+                let (base, binds) = self
+                    .incremental_base(context, &column, &start.value, true)
+                    .await?;
+                let query = cursor_order(&self.typed_query(base).await, &column);
+                Ok((query, binds, Some(CursorTracker::new(column, start))))
+            }
+        }
+    }
+
+    /// Every page of an incremental read, and its last bookmark.
+    async fn collect_incremental(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
+        use faucet_core::Source as _;
+        use futures::StreamExt as _;
+        let mut pages = self.stream_pages(context, 0);
+        let mut records = Vec::new();
+        let mut bookmark = None;
+        while let Some(page) = pages.next().await {
+            let page = page?;
+            records.extend(page.records);
+            bookmark = page.bookmark.or(bookmark);
+        }
+        Ok((records, bookmark))
     }
 
     /// `query` wrapped by [`text_cast_query`] for the columns the decoder
@@ -74,6 +182,14 @@ impl PostgresSource {
         JsonContext {
             mode: self.config.json_big_numbers,
             warned: &self.json_warned,
+        }
+    }
+
+    fn shard_wrap_if(&self, query: String, sharded: bool) -> String {
+        if sharded {
+            self.shard_wrap(query)
+        } else {
+            query
         }
     }
 
@@ -380,16 +496,98 @@ fn resolve_query(
     config: &PostgresSourceConfig,
     context: &std::collections::HashMap<String, Value>,
 ) -> (String, Vec<Value>) {
+    resolve_query_text(&config.query, config.params.len(), context)
+}
+
+fn resolve_query_text(
+    query: &str,
+    params: usize,
+    context: &std::collections::HashMap<String, Value>,
+) -> (String, Vec<Value>) {
     if context.is_empty() {
-        (config.query.clone(), Vec::new())
+        (query.to_string(), Vec::new())
     } else {
-        faucet_core::util::substitute_context_bind_params(
-            &config.query,
-            context,
-            config.params.len() + 1,
-            |i| format!("${i}"),
-        )
+        faucet_core::util::substitute_context_bind_params(query, context, params + 1, |i| {
+            format!("${i}")
+        })
     }
+}
+
+/// Context key the bookmark binds through, so its markers number in order
+/// with the context's.
+const BOOKMARK_KEY: &str = "__faucet_bookmark";
+
+/// The configured query with its context and `${bookmark}` tokens bound
+/// (each token as `CAST($n AS cast)`), and the bind values in marker order.
+fn bind_bookmark(
+    config: &PostgresSourceConfig,
+    context: &std::collections::HashMap<String, Value>,
+    start: &Value,
+    cast: &str,
+) -> (String, Vec<Value>) {
+    let mut context = context.clone();
+    context.insert(BOOKMARK_KEY.into(), start.clone());
+    let query = config.query.replace(
+        BOOKMARK_TOKEN,
+        &format!("CAST({{{BOOKMARK_KEY}}} AS {cast})"),
+    );
+    resolve_query_text(&query, config.params.len(), &context)
+}
+
+/// `inner` filtered to `column >= $index`; the outer relation is `q`, so the
+/// text-cast wrapper and [`cursor_order`] address the same native column.
+fn cursor_filter(inner: &str, column: &str, index: usize, cast: &str) -> String {
+    format!(
+        "SELECT * FROM ({inner}) AS q WHERE q.{c} >= CAST(${index} AS {cast})",
+        c = quote_ident(column)
+    )
+}
+
+fn cursor_order(query: &str, column: &str) -> String {
+    format!("{query} ORDER BY q.{}", quote_ident(column))
+}
+
+/// A server-reported type name usable in `CAST(… AS <name>)`.
+fn cast_type(name: &str) -> Result<String, FaucetError> {
+    let ok = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '"' | '[' | ']'));
+    if ok {
+        Ok(name.to_string())
+    } else {
+        Err(FaucetError::Config(format!(
+            "postgres: the incremental cursor column has type {name:?}, which cannot be \
+             compared to a bookmark; cast it in the query"
+        )))
+    }
+}
+
+/// The derived state key: `postgres:<host>:<fingerprint of URL and query>`.
+fn default_state_key(config: &PostgresSourceConfig) -> String {
+    let redacted = faucet_core::redact_uri_credentials(&config.connection_url);
+    let host: String = url_host(&config.connection_url)
+        .unwrap_or("postgres")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let fingerprint = faucet_core::shard::shard_hash(&format!("{redacted}\n{}", config.query));
+    format!("postgres:{host}:{fingerprint:016x}")
+}
+
+/// The host of a `scheme://[user[:pass]@]host[:port]/…` URL.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then_some(host)
 }
 
 /// How a numeric bind value should be bound onto a sqlx query.
@@ -549,6 +747,9 @@ impl faucet_core::Source for PostgresSource {
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Value>, FaucetError> {
+        if !matches!(self.config.replication, PostgresReplication::Full) {
+            return Ok(self.collect_incremental(context).await?.0);
+        }
         let (query_str, bind_values) = resolve_query(&self.config, context);
         let query_str = self.typed_query(self.shard_wrap(query_str)).await;
         let query = bind_params(sqlx::query(&query_str), &self.config.params, &bind_values)?;
@@ -572,9 +773,10 @@ impl faucet_core::Source for PostgresSource {
     /// documents, and routing the pipeline-supplied hint through it would
     /// silently override an explicit config value.
     ///
-    /// `batch_size = 0` drains the entire cursor into a single page. The
-    /// postgres query source has no incremental-replication mode today, so
-    /// every emitted page carries `bookmark: None`.
+    /// `batch_size = 0` drains the entire cursor into a single page. In
+    /// `replication: incremental` mode rows arrive in cursor order and every
+    /// page carries the bookmark after its last row (the final page carries
+    /// one even when empty); in `full` mode no page carries a bookmark.
     fn stream_pages<'a>(
         &'a self,
         context: &'a std::collections::HashMap<String, Value>,
@@ -583,8 +785,7 @@ impl faucet_core::Source for PostgresSource {
         let batch_size = self.config.batch_size;
 
         Box::pin(async_stream::try_stream! {
-            let (query_str, bind_values) = resolve_query(&self.config, context);
-            let query_str = self.typed_query(self.shard_wrap(query_str)).await;
+            let (query_str, bind_values, mut tracker) = self.plan_fetch(context).await?;
             let query = bind_params(
                 sqlx::query(&query_str),
                 &self.config.params,
@@ -598,16 +799,28 @@ impl faucet_core::Source for PostgresSource {
             let mut total = 0usize;
 
             while let Some(row) = bounded_read(self.config.read_timeout_secs, rows.try_next()).await? {
-                buffer.push(row_to_json(&row, &self.json_context())?);
+                let record = row_to_json(&row, &self.json_context())?;
+                if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
+                    buffer.push(record);
+                }
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
-                    yield StreamPage { records: page, bookmark: None };
+                    let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                    yield StreamPage { records: page, bookmark };
                 }
             }
-            if !buffer.is_empty() {
+            if !buffer.is_empty() || tracker.is_some() {
                 total += buffer.len();
-                yield StreamPage { records: buffer, bookmark: None };
+                let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                yield StreamPage { records: buffer, bookmark };
+            }
+            if let Some(missing) = tracker.as_ref().map(CursorTracker::missing).filter(|n| *n > 0) {
+                tracing::warn!(
+                    missing,
+                    "PostgreSQL incremental read: rows without a cursor value were emitted \
+                     without moving the bookmark"
+                );
             }
 
             tracing::info!(
@@ -617,6 +830,37 @@ impl faucet_core::Source for PostgresSource {
                 "PostgreSQL source stream complete",
             );
         })
+    }
+
+    async fn fetch_with_context_incremental(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
+        if matches!(self.config.replication, PostgresReplication::Full) {
+            return Ok((self.fetch_with_context(context).await?, None));
+        }
+        self.collect_incremental(context).await
+    }
+
+    fn state_key(&self) -> Option<String> {
+        match &self.config.replication {
+            PostgresReplication::Full => None,
+            PostgresReplication::Incremental { .. } => Some(
+                self.config
+                    .state_key
+                    .clone()
+                    .unwrap_or_else(|| default_state_key(&self.config)),
+            ),
+        }
+    }
+
+    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        CursorBookmark::from_state(bookmark.clone())?;
+        *self
+            .start_bookmark
+            .lock()
+            .expect("start_bookmark mutex poisoned") = Some(bookmark);
+        Ok(())
     }
 
     fn connector_name(&self) -> &'static str {
@@ -711,9 +955,15 @@ impl faucet_core::Source for PostgresSource {
             return Ok(vec![ShardSpec::whole()]);
         };
 
-        let bounds_sql =
-            pk_bounds_query(&self.config.query, &quote_ident(&shard_cfg.key), "BIGINT");
-        let row = bind_params(sqlx::query(&bounds_sql), &self.config.params, &[])?
+        let (base, binds) = match self.incremental_start()? {
+            None => (self.config.query.clone(), Vec::new()),
+            Some((column, start)) => {
+                self.incremental_base(&Default::default(), &column, &start.value, false)
+                    .await?
+            }
+        };
+        let bounds_sql = pk_bounds_query(&base, &quote_ident(&shard_cfg.key), "BIGINT");
+        let row = bind_params(sqlx::query(&bounds_sql), &self.config.params, &binds)?
             .fetch_one(&self.pool)
             .await
             .map_err(|e| {
@@ -753,9 +1003,19 @@ impl faucet_core::Source for PostgresSource {
     ) -> Result<Option<faucet_core::diff::ServerDigest>, FaucetError> {
         let bounds = PkShardBounds::from_spec(&range.to_shard(key))
             .ok_or_else(|| FaucetError::Source("postgres: invalid digest range".into()))?;
-        let inner = bounds.wrap(&self.config.query, quote_ident);
+        let (base, binds) = match &self.config.replication {
+            PostgresReplication::Full => (self.config.query.clone(), Vec::new()),
+            PostgresReplication::Incremental {
+                column,
+                initial_value,
+            } => {
+                self.incremental_base(&Default::default(), column, initial_value, false)
+                    .await?
+            }
+        };
+        let inner = bounds.wrap(&base, quote_ident);
         let sql = digest_query(&inner, key, columns);
-        let row = bind_params(sqlx::query(&sql), &self.config.params, &[])?
+        let row = bind_params(sqlx::query(&sql), &self.config.params, &binds)?
             .fetch_one(&self.pool)
             .await
             .map_err(|e| FaucetError::Source(format!("postgres: range digest failed: {e}")))?;
@@ -1332,7 +1592,7 @@ mod tests {
     /// Build a source over a lazy pool (no server needed) so the shard glue —
     /// `apply_shard`, `shard_wrap`, and `enumerate_shards`' error path — is
     /// testable without Docker.
-    fn lazy_source(config: PostgresSourceConfig) -> PostgresSource {
+    pub(super) fn lazy_source(config: PostgresSourceConfig) -> PostgresSource {
         let pool = PgPoolOptions::new()
             // Fail fast at first checkout — these tests never reach a server.
             .acquire_timeout(std::time::Duration::from_millis(200))
@@ -1343,6 +1603,7 @@ mod tests {
             pool,
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
+            start_bookmark: Mutex::new(None),
         }
     }
 
@@ -1382,6 +1643,7 @@ mod tests {
 
 #[cfg(test)]
 mod bind_overflow_tests {
+    use super::tests::lazy_source;
     use super::*;
     use serde_json::json;
 
@@ -1419,5 +1681,110 @@ mod bind_overflow_tests {
                 .contains("postgres: primary-key discovery failed"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn bookmark_tokens_bind_in_marker_order_after_the_context() {
+        let mut cfg = PostgresSourceConfig::new(
+            "postgres://h/db",
+            "SELECT * FROM t WHERE a = {p} AND ts >= ${bookmark} AND b = $1",
+        )
+        .params(vec![serde_json::json!(7)]);
+        cfg.replication = PostgresReplication::Incremental {
+            column: "ts".into(),
+            initial_value: serde_json::json!(0),
+        };
+        let ctx = std::collections::HashMap::from([("p".to_string(), serde_json::json!("x"))]);
+        let (q, binds) = bind_bookmark(&cfg, &ctx, &serde_json::json!(5), "INT8");
+        assert_eq!(
+            q,
+            "SELECT * FROM t WHERE a = $2 AND ts >= CAST($3 AS INT8) AND b = $1"
+        );
+        assert_eq!(binds, vec![serde_json::json!("x"), serde_json::json!(5)]);
+        assert_eq!(
+            cursor_order(&cursor_filter("SELECT 1", "ts", 4, "INT8"), "ts"),
+            "SELECT * FROM (SELECT 1) AS q WHERE q.\"ts\" >= CAST($4 AS INT8) ORDER BY q.\"ts\""
+        );
+    }
+
+    #[test]
+    fn cast_types_are_limited_to_type_names() {
+        assert_eq!(cast_type("TIMESTAMPTZ").unwrap(), "TIMESTAMPTZ");
+        assert_eq!(cast_type("\"CHAR\"").unwrap(), "\"CHAR\"");
+        assert_eq!(cast_type("TEXT[]").unwrap(), "TEXT[]");
+        assert!(cast_type("int); DROP TABLE t; --").is_err());
+        assert!(cast_type("").is_err());
+    }
+
+    #[test]
+    fn default_state_key_names_the_host_and_is_valid() {
+        let cfg = PostgresSourceConfig::new("postgres://u:secret@db.example:5432/app", "SELECT 1");
+        let key = default_state_key(&cfg);
+        assert!(key.starts_with("postgres:db.example:"), "{key}");
+        assert!(!key.contains("secret"));
+        assert_eq!(key, default_state_key(&cfg));
+        faucet_core::state::validate_state_key(&key).unwrap();
+        let other =
+            PostgresSourceConfig::new("postgres://u:secret@db.example:5432/other", "SELECT 1");
+        assert_ne!(
+            key,
+            default_state_key(&other),
+            "the database is part of the key"
+        );
+        assert_eq!(url_host("not a url"), None);
+        assert_eq!(url_host("postgres:///db"), None);
+        assert_eq!(url_host("postgres://h?x=1"), Some("h"));
+        let odd = PostgresSourceConfig::new("postgres://", "SELECT 1");
+        assert!(default_state_key(&odd).starts_with("postgres:postgres:"));
+    }
+
+    #[tokio::test]
+    async fn incremental_state_key_and_start_bookmark() {
+        use faucet_core::Source as _;
+        let full = lazy_source(PostgresSourceConfig::new(
+            "postgres://u@127.0.0.1:1/db",
+            "SELECT 1",
+        ));
+        assert_eq!(full.state_key(), None);
+        assert!(full.incremental_start().unwrap().is_none());
+
+        let cfg = PostgresSourceConfig::new("postgres://u@127.0.0.1:1/db", "SELECT 1")
+            .incremental("ts", serde_json::json!(3));
+        let src = lazy_source(cfg.clone());
+        assert!(src.state_key().unwrap().starts_with("postgres:127.0.0.1:"));
+        let (_, start) = src.incremental_start().unwrap().unwrap();
+        assert_eq!(start, CursorBookmark::initial(serde_json::json!(3)));
+        src.apply_start_bookmark(serde_json::json!({"value": 9, "boundary": ["a"]}))
+            .await
+            .unwrap();
+        let (_, start) = src.incremental_start().unwrap().unwrap();
+        assert_eq!(start.value, serde_json::json!(9));
+        assert!(
+            src.apply_start_bookmark(serde_json::json!({"value": 9, "boundary": 1}))
+                .await
+                .is_err()
+        );
+
+        let mut named = cfg;
+        named.state_key = Some("orders".into());
+        assert_eq!(lazy_source(named).state_key().as_deref(), Some("orders"));
+    }
+
+    #[tokio::test]
+    async fn incremental_reads_fail_cleanly_without_a_server() {
+        use faucet_core::Source as _;
+        let mut cfg = PostgresSourceConfig::new("postgres://u@127.0.0.1:1/db", "SELECT 1 AS ts")
+            .incremental("ts", serde_json::json!(0));
+        cfg.shard = Some(crate::config::ShardConfig { key: "ts".into() });
+        let src = lazy_source(cfg);
+        let err = src.fetch_all().await.unwrap_err();
+        assert!(err.to_string().contains("could not describe"), "{err}");
+        assert!(src.fetch_all_incremental().await.is_err());
+        assert!(src.enumerate_shards(2).await.is_err());
+        let range = faucet_core::diff::KeyRange {
+            lo: Some(0),
+            hi: Some(10),
+        };
+        assert!(src.range_digest(&range, "ts", &[]).await.is_err());
     }
 }

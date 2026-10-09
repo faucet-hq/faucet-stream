@@ -1,7 +1,8 @@
 //! MySQL source implementation.
 
-use crate::config::MysqlSourceConfig;
+use crate::config::{BOOKMARK_TOKEN, MysqlReplication, MysqlSourceConfig};
 use async_trait::async_trait;
+use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::shard::{
     PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
 };
@@ -23,6 +24,8 @@ pub struct MysqlSource {
     applied_shard: Mutex<Option<PkShardBounds>>,
     /// Columns already warned about under `json_big_numbers: string`.
     json_warned: Mutex<std::collections::HashSet<String>>,
+    /// Bookmark loaded via [`Source::apply_start_bookmark`](faucet_core::Source::apply_start_bookmark).
+    start_bookmark: Mutex<Option<Value>>,
 }
 
 /// Quote a MySQL identifier with backticks (MySQL's default identifier
@@ -43,7 +46,7 @@ fn session_setup_sql(net_write_timeout_secs: u64) -> Option<String> {
 impl MysqlSource {
     /// Create a new MySQL source. Establishes a connection pool.
     pub async fn new(config: MysqlSourceConfig) -> Result<Self, FaucetError> {
-        faucet_core::validate_batch_size(config.batch_size)?;
+        config.validate()?;
 
         let net_write_timeout = config.net_write_timeout_secs;
         let pool = MySqlPoolOptions::new()
@@ -72,7 +75,87 @@ impl MysqlSource {
             pool,
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
+            start_bookmark: Mutex::new(None),
         })
+    }
+
+    /// The cursor column and starting position of an incremental read.
+    fn incremental_start(&self) -> Result<Option<(String, CursorBookmark)>, FaucetError> {
+        let MysqlReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.config.replication
+        else {
+            return Ok(None);
+        };
+        let stored = self
+            .start_bookmark
+            .lock()
+            .expect("start_bookmark mutex poisoned")
+            .clone();
+        let start = match stored {
+            Some(v) => CursorBookmark::from_state(v)?,
+            None => CursorBookmark::initial(initial_value.clone()),
+        };
+        Ok(Some((column.clone(), start)))
+    }
+
+    /// The incremental query before ordering: the configured query with its
+    /// context and `@bookmark` bound, sharded, then filtered to
+    /// `column >= start`, with its bind values in marker order.
+    fn incremental_base(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+        column: &str,
+        start: &Value,
+        sharded: bool,
+    ) -> (String, Vec<Value>) {
+        let (query, mut binds) = bind_bookmark(&self.config.query, context, start);
+        binds.push(start.clone());
+        (
+            cursor_filter(&self.shard_wrap_if(query, sharded), column),
+            binds,
+        )
+    }
+
+    /// The final SQL and bind values for a fetch, and the cursor tracker of
+    /// an incremental read.
+    fn plan_fetch(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<(String, Vec<Value>, Option<CursorTracker>), FaucetError> {
+        Ok(match self.incremental_start()? {
+            None => {
+                let (query, binds) = resolve_query(&self.config, context);
+                (self.shard_wrap(query), binds, None)
+            }
+            Some((column, start)) => {
+                let (base, binds) = self.incremental_base(context, &column, &start.value, true);
+                (
+                    cursor_order(&base, &column),
+                    binds,
+                    Some(CursorTracker::new(column, start)),
+                )
+            }
+        })
+    }
+
+    /// Every page of an incremental read, and its last bookmark.
+    async fn collect_incremental(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
+        use faucet_core::Source as _;
+        use futures::StreamExt as _;
+        let mut pages = self.stream_pages(context, 0);
+        let mut records = Vec::new();
+        let mut bookmark = None;
+        while let Some(page) = pages.next().await {
+            let page = page?;
+            records.extend(page.records);
+            bookmark = page.bookmark.or(bookmark);
+        }
+        Ok((records, bookmark))
     }
 
     /// Apply the currently-set shard (if any) to a resolved query string.
@@ -135,6 +218,14 @@ impl MysqlSource {
         JsonContext {
             mode: self.config.json_big_numbers,
             warned: &self.json_warned,
+        }
+    }
+
+    fn shard_wrap_if(&self, query: String, sharded: bool) -> String {
+        if sharded {
+            self.shard_wrap(query)
+        } else {
+            query
         }
     }
 
@@ -382,6 +473,62 @@ fn resolve_query(
     }
 }
 
+/// Context key the bookmark binds through, so its `?` markers order with the
+/// context's.
+const BOOKMARK_KEY: &str = "__faucet_bookmark";
+
+/// `query` with its context and `@bookmark` tokens bound as `?` markers, and
+/// the bind values in marker order.
+fn bind_bookmark(
+    query: &str,
+    context: &std::collections::HashMap<String, Value>,
+    start: &Value,
+) -> (String, Vec<Value>) {
+    let mut context = context.clone();
+    context.insert(BOOKMARK_KEY.into(), start.clone());
+    let query = query.replace(BOOKMARK_TOKEN, &format!("{{{BOOKMARK_KEY}}}"));
+    faucet_core::util::substitute_context_bind_params(&query, &context, 1, |_| "?".to_string())
+}
+
+/// `inner` filtered to `column >= ?`.
+fn cursor_filter(inner: &str, column: &str) -> String {
+    format!(
+        "SELECT * FROM ({inner}) AS q WHERE q.{c} >= ?",
+        c = quote_ident_mysql(column)
+    )
+}
+
+fn cursor_order(query: &str, column: &str) -> String {
+    format!("{query} ORDER BY q.{}", quote_ident_mysql(column))
+}
+
+/// The derived state key: `mysql:<host>:<fingerprint of URL and query>`.
+fn default_state_key(config: &MysqlSourceConfig) -> String {
+    let redacted = faucet_core::redact_uri_credentials(&config.connection_url);
+    let host: String = url_host(&config.connection_url)
+        .unwrap_or("mysql")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let fingerprint = faucet_core::shard::shard_hash(&format!("{redacted}\n{}", config.query));
+    format!("mysql:{host}:{fingerprint:016x}")
+}
+
+/// The host of a `scheme://[user[:pass]@]host[:port]/…` URL.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then_some(host)
+}
+
 /// How a numeric bind value should be bound onto a sqlx query.
 ///
 /// Classifying *before* binding keeps the integer/float decision in one pure,
@@ -547,6 +694,9 @@ impl faucet_core::Source for MysqlSource {
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Value>, FaucetError> {
+        if !matches!(self.config.replication, MysqlReplication::Full) {
+            return Ok(self.collect_incremental(context).await?.0);
+        }
         let (query_str, bind_values) = resolve_query(&self.config, context);
         let query_str = self.shard_wrap(query_str);
         let text_columns = self.text_columns(&query_str, &bind_values).await;
@@ -571,9 +721,10 @@ impl faucet_core::Source for MysqlSource {
     /// documents, and routing the pipeline-supplied hint through it would
     /// silently override an explicit config value.
     ///
-    /// `batch_size = 0` drains the entire cursor into a single page. The
-    /// mysql query source has no incremental-replication mode today, so
-    /// every emitted page carries `bookmark: None`.
+    /// `batch_size = 0` drains the entire cursor into a single page. In
+    /// `replication: incremental` mode rows arrive in cursor order and every
+    /// page carries the bookmark after its last row (the final page carries
+    /// one even when empty); in `full` mode no page carries a bookmark.
     fn stream_pages<'a>(
         &'a self,
         context: &'a std::collections::HashMap<String, Value>,
@@ -582,8 +733,7 @@ impl faucet_core::Source for MysqlSource {
         let batch_size = self.config.batch_size;
 
         Box::pin(async_stream::try_stream! {
-            let (query_str, bind_values) = resolve_query(&self.config, context);
-            let query_str = self.shard_wrap(query_str);
+            let (query_str, bind_values, mut tracker) = self.plan_fetch(context)?;
             let text_columns = self.text_columns(&query_str, &bind_values).await;
             let query = bind_params(sqlx::query(&query_str), &bind_values);
 
@@ -594,16 +744,28 @@ impl faucet_core::Source for MysqlSource {
             let mut total = 0usize;
 
             while let Some(row) = bounded_read(self.config.read_timeout_secs, rows.try_next()).await? {
-                buffer.push(row_to_json(&row, &text_columns, &self.json_context())?);
+                let record = row_to_json(&row, &text_columns, &self.json_context())?;
+                if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
+                    buffer.push(record);
+                }
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
-                    yield StreamPage { records: page, bookmark: None };
+                    let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                    yield StreamPage { records: page, bookmark };
                 }
             }
-            if !buffer.is_empty() {
+            if !buffer.is_empty() || tracker.is_some() {
                 total += buffer.len();
-                yield StreamPage { records: buffer, bookmark: None };
+                let bookmark = tracker.as_ref().map(|t| t.bookmark().to_value());
+                yield StreamPage { records: buffer, bookmark };
+            }
+            if let Some(missing) = tracker.as_ref().map(CursorTracker::missing).filter(|n| *n > 0) {
+                tracing::warn!(
+                    missing,
+                    "MySQL incremental read: rows without a cursor value were emitted \
+                     without moving the bookmark"
+                );
             }
 
             tracing::info!(
@@ -613,6 +775,37 @@ impl faucet_core::Source for MysqlSource {
                 "MySQL source stream complete",
             );
         })
+    }
+
+    async fn fetch_with_context_incremental(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
+        if matches!(self.config.replication, MysqlReplication::Full) {
+            return Ok((self.fetch_with_context(context).await?, None));
+        }
+        self.collect_incremental(context).await
+    }
+
+    fn state_key(&self) -> Option<String> {
+        match &self.config.replication {
+            MysqlReplication::Full => None,
+            MysqlReplication::Incremental { .. } => Some(
+                self.config
+                    .state_key
+                    .clone()
+                    .unwrap_or_else(|| default_state_key(&self.config)),
+            ),
+        }
+    }
+
+    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        CursorBookmark::from_state(bookmark.clone())?;
+        *self
+            .start_bookmark
+            .lock()
+            .expect("start_bookmark mutex poisoned") = Some(bookmark);
+        Ok(())
     }
 
     fn connector_name(&self) -> &'static str {
@@ -703,12 +896,14 @@ impl faucet_core::Source for MysqlSource {
             return Ok(vec![ShardSpec::whole()]);
         };
 
-        let bounds_sql = pk_bounds_query(
-            &self.config.query,
-            &quote_ident_mysql(&shard_cfg.key),
-            "SIGNED",
-        );
-        let row = sqlx::query(&bounds_sql)
+        let (base, binds) = match self.incremental_start()? {
+            None => (self.config.query.clone(), Vec::new()),
+            Some((column, start)) => {
+                self.incremental_base(&Default::default(), &column, &start.value, false)
+            }
+        };
+        let bounds_sql = pk_bounds_query(&base, &quote_ident_mysql(&shard_cfg.key), "SIGNED");
+        let row = bind_params(sqlx::query(&bounds_sql), &binds)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| {
@@ -747,9 +942,16 @@ impl faucet_core::Source for MysqlSource {
     ) -> Result<Option<faucet_core::diff::ServerDigest>, FaucetError> {
         let bounds = PkShardBounds::from_spec(&range.to_shard(key))
             .ok_or_else(|| FaucetError::Source("mysql: invalid digest range".into()))?;
-        let inner = bounds.wrap(&self.config.query, quote_ident_mysql);
+        let (base, binds) = match &self.config.replication {
+            MysqlReplication::Full => (self.config.query.clone(), Vec::new()),
+            MysqlReplication::Incremental {
+                column,
+                initial_value,
+            } => self.incremental_base(&Default::default(), column, initial_value, false),
+        };
+        let inner = bounds.wrap(&base, quote_ident_mysql);
         let sql = digest_query(&inner, key, columns);
-        let row = sqlx::query(&sql)
+        let row = bind_params(sqlx::query(&sql), &binds)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| FaucetError::Source(format!("mysql: range digest failed: {e}")))?;
@@ -1037,6 +1239,7 @@ mod tests {
             pool,
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
+            start_bookmark: Mutex::new(None),
         }
     }
 
@@ -1190,5 +1393,84 @@ mod tests {
                 .contains("mysql: primary-key discovery failed"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn bookmark_tokens_bind_in_marker_order() {
+        let ctx = std::collections::HashMap::from([("p".to_string(), serde_json::json!("x"))]);
+        let (q, binds) = bind_bookmark(
+            "SELECT * FROM t WHERE ts >= @bookmark AND a = {p}",
+            &ctx,
+            &serde_json::json!(5),
+        );
+        assert_eq!(q, "SELECT * FROM t WHERE ts >= ? AND a = ?");
+        assert_eq!(binds, vec![serde_json::json!(5), serde_json::json!("x")]);
+        assert_eq!(
+            cursor_order(&cursor_filter("SELECT 1", "ts"), "ts"),
+            "SELECT * FROM (SELECT 1) AS q WHERE q.`ts` >= ? ORDER BY q.`ts`"
+        );
+    }
+
+    #[test]
+    fn default_state_key_names_the_host_and_is_valid() {
+        let cfg = MysqlSourceConfig::new("mysql://u:secret@db.example:3306/app", "SELECT 1");
+        let key = default_state_key(&cfg);
+        assert!(key.starts_with("mysql:db.example:"), "{key}");
+        assert!(!key.contains("secret"));
+        faucet_core::state::validate_state_key(&key).unwrap();
+        assert_eq!(url_host("nope"), None);
+        let odd = MysqlSourceConfig::new("mysql://", "SELECT 1");
+        assert!(default_state_key(&odd).starts_with("mysql:mysql:"));
+    }
+
+    #[tokio::test]
+    async fn incremental_state_key_and_start_bookmark() {
+        use faucet_core::Source as _;
+        let full = lazy_source(MysqlSourceConfig::new(
+            "mysql://root@127.0.0.1:1/db",
+            "SELECT 1",
+        ));
+        assert_eq!(full.state_key(), None);
+        assert!(full.plan_fetch(&Default::default()).unwrap().2.is_none());
+
+        let cfg = MysqlSourceConfig::new("mysql://root@127.0.0.1:1/db", "SELECT 1")
+            .incremental("ts", serde_json::json!(3));
+        let src = lazy_source(cfg.clone());
+        assert!(src.state_key().unwrap().starts_with("mysql:127.0.0.1:"));
+        let (q, binds, tracker) = src.plan_fetch(&Default::default()).unwrap();
+        assert!(q.ends_with("ORDER BY q.`ts`"), "{q}");
+        assert_eq!(binds, vec![serde_json::json!(3)]);
+        assert!(tracker.is_some());
+        src.apply_start_bookmark(serde_json::json!({"value": 9, "boundary": []}))
+            .await
+            .unwrap();
+        let (_, binds, _) = src.plan_fetch(&Default::default()).unwrap();
+        assert_eq!(binds, vec![serde_json::json!(9)]);
+        assert!(
+            src.apply_start_bookmark(serde_json::json!({"value": null}))
+                .await
+                .is_err()
+        );
+
+        let mut named = cfg;
+        named.state_key = Some("orders".into());
+        assert_eq!(lazy_source(named).state_key().as_deref(), Some("orders"));
+    }
+
+    #[tokio::test]
+    async fn incremental_reads_fail_cleanly_without_a_server() {
+        use faucet_core::Source as _;
+        let mut cfg = MysqlSourceConfig::new("mysql://root@127.0.0.1:1/db", "SELECT 1 AS ts")
+            .incremental("ts", serde_json::json!(0));
+        cfg.shard = Some(crate::config::ShardConfig { key: "ts".into() });
+        let src = lazy_source(cfg);
+        assert!(src.fetch_all().await.is_err());
+        assert!(src.fetch_all_incremental().await.is_err());
+        assert!(src.enumerate_shards(2).await.is_err());
+        let range = faucet_core::diff::KeyRange {
+            lo: Some(0),
+            hi: Some(10),
+        };
+        assert!(src.range_digest(&range, "ts", &[]).await.is_err());
     }
 }

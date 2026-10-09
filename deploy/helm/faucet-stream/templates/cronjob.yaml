@@ -73,11 +73,13 @@ spec:
                 - name: pipeline-config
                   mountPath: {{ .Values.pipelineConfig.mountPath }}
                   readOnly: true
+                {{- with include "faucet-stream.logSpoolMount" . | trim }}{{ . | nindent 16 }}{{- end }}
           volumes:
             - name: tmp
               emptyDir: {}
             - name: scratch
               emptyDir: {}
+            {{- with include "faucet-stream.logSpoolVolume" . | trim }}{{ . | nindent 12 }}{{- end }}
             - name: pipeline-config
               configMap:
                 name: {{ include "faucet-stream.configMapName" . }}

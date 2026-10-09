@@ -197,4 +197,106 @@ you can run with `otelcol --config examples/infra/otel-collector.yaml`.
 
 | Metric | Labels | Description |
 |--------|--------|-------------|
-| `faucet_otel_export_failures_total` | `signal` (`traces`/`metrics`/`export`) | OTLP export attempts that failed. Failures are non-fatal; the pipeline continues. |
+| `faucet_otel_export_failures_total` | `signal` (`traces`/`metrics`/`logs`/`export`) | OTLP export attempts that failed. Failures are non-fatal; the pipeline continues. |
+
+## Shipping logs
+
+Add `logs` to `export` and faucet ships every run's log lines to the OTLP
+collector — and never loses one because the collector, the network or the faucet
+process went down. Every line is **written locally first**; a background
+shipper delivers it and advances a per-run delivery watermark only after the
+collector acknowledges the batch. Local copies are kept until delivered
+(bounded), then for a short window.
+
+```yaml
+observability:
+  otel:
+    endpoint: http://collector:4317
+    export: [traces, metrics, logs]     # `logs` turns shipping on
+  logs:                                 # optional — the defaults are shown
+    spool_dir: ~/.local/state/faucet/logs   # faucet run / schedule only
+    retention_secs: 86400               # keep delivered lines 24 h
+    buffer_max_age_secs: 604800         # drop undelivered lines after 7 days
+    buffer_max_bytes: 1073741824        # …or once the buffer passes 1 GiB
+    max_lines_per_run: 100000
+    flush_timeout_secs: 10              # `faucet run` waits this long at exit
+    notify_after_secs: 300              # `log_export_failed` after 5 min failing
+    link_template: "https://grafana.example/explore?...{run_id}..."
+```
+
+### Where the buffer lives
+
+| Runtime | Buffer | Shipper |
+|---|---|---|
+| `faucet serve` | The run-history log store (`--history sqlite:…` / `postgres://…`). With `--history memory` it is an in-memory, non-durable buffer — the server warns at startup. | A background task. In `--cluster`, each run's delivery is leased (`faucet_serve_log_ship`), so one instance ships it; a peer resumes it once the lease lapses. |
+| `faucet run` | A spool directory: `<run_id>.jsonl` (append-only, fsync'd every 1024 lines and at run end), `<run_id>.cursor.json` (the watermark, written temp + rename), `<run_id>.meta.json`, and an advisory `<run_id>.lock`. | Ships in the background while the run goes, then for at most `flush_timeout_secs` at exit. Anything left is shipped by the next faucet process using the spool, or by `faucet logs ship`. |
+| `faucet schedule` | The same spool; every tick is a run. | A background task for the process lifetime, draining between ticks. |
+
+`faucet serve` reads its settings from flags (each also an env var):
+`--log-retention-secs` (default 86400), `--log-buffer-max-age-secs`,
+`--log-buffer-max-bytes`, `--log-link-template`,
+`--log-export-notify-after-secs`, with `export: [logs]` in `--otel-config`.
+
+### Delivery guarantees
+
+- **At least once per batch.** A batch whose acknowledgement is lost (or whose
+  watermark write fails) is sent again; every record carries `faucet.seq` and
+  the batch scope carries `faucet.batch.first_seq` / `faucet.batch.last_seq`, so
+  a backend can drop the duplicate. An acknowledged line is never re-sent.
+- **The pipeline is never slowed.** Capture hands each line to a bounded queue;
+  a full queue drops the line (counted as `queue_full`) instead of blocking, and
+  a local-write failure is reported on stderr and counted — never a run failure.
+- **Redacted at capture.** Every resolved secret is scrubbed before the line is
+  written locally, so neither the buffer nor the export ever holds one. Lines
+  longer than 16 KiB are cut and marked.
+- **Two processes, one spool.** A run's `.lock` makes sure only one process
+  ships it; a run whose writer died is picked up by the next shipper.
+- **Bounds drop the oldest, visibly.** Past `buffer_max_age_secs` /
+  `buffer_max_bytes` (or the per-run line cap) the oldest undelivered lines are
+  dropped, counted in `faucet_logs_dropped_lines_total{reason}`, and the run is
+  reported `partially_dropped`.
+
+### Was a run's log shipped?
+
+`GET /v1/runs/{id}` carries `log_export`:
+
+```json
+{ "status": "failed", "delivered_seq": 7338097199674630147, "pending_lines": 4,
+  "dropped_lines": 0, "last_error": "OTLP HTTP export … failed",
+  "last_attempt_at": "2026-10-09T06:34:13Z",
+  "link": "https://grafana.example/explore?q=01a11f5e-…" }
+```
+
+`status` is one of `not_configured`, `pending`, `exported`, `failed`,
+`partially_dropped`. The console's run page shows it as a **Log export** panel,
+with **View logs ↗** built from the link template; once a run's local copy has
+aged out, the log endpoint returns that link (and the SSE stream opens with a
+`link` event) instead of nothing. `faucet run` prints `logs: exported` or
+`logs: 1,204 lines pending — run "faucet logs ship"` and adds `log_export` to
+`--output json`.
+
+`faucet logs ship [CONFIG] [--spool DIR] [--endpoint URL] [--protocol grpc|http]`
+drains a spool once (a cron job or sidecar); its exit code is the number of runs
+still undelivered.
+
+A `log_export_failed` notification goes through the run's `notifications:`
+when its export has been failing for `notify_after_secs`, and when lines were
+dropped.
+
+### Log-shipping metrics
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `faucet_logs_buffered_lines` | — | Lines buffered and not yet acknowledged. |
+| `faucet_logs_buffered_bytes` | — | Bytes of those lines. |
+| `faucet_logs_oldest_undelivered_seconds` | — | Age of the oldest undelivered line. |
+| `faucet_logs_shipped_lines_total` | — | Lines the collector acknowledged. |
+| `faucet_logs_dropped_lines_total` | `reason` (`max_age`/`max_bytes`/`max_lines`/`queue_full`) | Lines dropped before delivery. |
+| `faucet_logs_export_errors_total` | — | Failed export attempts (also `faucet_otel_export_failures_total{signal="logs"}`). |
+| `faucet_logs_local_write_failures_total` | — | Lines that could not be written to the local buffer. |
+
+`observability/prometheus/alerts.yml` has `FaucetLogsUndelivered` (oldest
+undelivered line > 15 min) and `FaucetLogsDropped`. Receiving-end recipes —
+Alloy → Loki, the OpenTelemetry Collector → S3 / GCS / Azure, a Docker Compose
+example — are in [`deploy/otel/`](https://github.com/faucet-hq/faucet-stream/tree/main/deploy/otel).
+`--log-format json` stays the option for shippers that read stdout.

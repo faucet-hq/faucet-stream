@@ -70,15 +70,16 @@ Every `faucet-cli` release publishes these images to
 
 | Tag | What is compiled in |
 |---|---|
-| `full` | The CLI's `full` feature: **every** connector and **every** feature — serve with the web console, tenants, templates and template sync, triggers (all watchers), the SQL and WASM transforms, OTLP export, secret-manager references, encryption, every file format, lineage, the catalog, MCP. |
-| `full-oracle` | `full` plus Oracle Instant Client, which the Oracle connectors load at run time. About 40 MiB larger compressed, so only pull it if you move Oracle data. In `full`, an Oracle connector fails at connect time with an error naming this tag. |
+| `full` | The CLI's `full` feature: **every** connector and **every** feature — serve with the web console, tenants, templates and template sync, triggers (all watchers), the SQL and WASM transforms, OTLP export, secret-manager references, encryption, every file format, lineage, the catalog, MCP — plus the Oracle Instant Client the Oracle connectors load at run time. |
 | `core` | `rest`, `postgres`, `s3`, `csv` → `postgres`, `s3`, `jsonl`, `stdout`. |
 | `analytics` | `rest`, `postgres`, `s3`, `bigquery`, `snowflake` → `bigquery`, `snowflake`, `s3`, `jsonl`. |
 | `cdc` | `postgres-cdc`, `mysql-cdc`, `mongodb-cdc` → `postgres`, `kafka`, `s3`. |
 
 The lean profiles also carry serve, the console, templates, triggers (webhook),
 the catalog and the run-history backends. Each image's size is recorded in the
-summary of the release's *Docker images* workflow run. To build your own
+summary of the release's *Docker images* workflow run. (1.13.3 alone also has
+a `full-oracle` tag, from when the Oracle client was a separate image; from the
+next release `full` carries it.) To build your own
 connector set, see [`deploy/README.md`](https://github.com/faucet-hq/faucet-stream/blob/main/deploy/README.md).
 
 ### Windows
@@ -204,7 +205,7 @@ unzip instantclient-basiclite-linuxx64.zip -d /opt/oracle
 export LD_LIBRARY_PATH=/opt/oracle/instantclient_23_7:$LD_LIBRARY_PATH   # your version's directory
 ```
 
-In a container, use the `full-oracle` image, which ships the client.
+In a container, the `full` image ships the client.
 
 On macOS put the directory on `DYLD_LIBRARY_PATH` (or symlink
 `libclntsh.dylib` into `~/lib`); on Windows add it to `PATH`. Without the

@@ -209,6 +209,10 @@ pub enum Command {
     /// to validate channel setup end-to-end (no pipeline runs).
     #[cfg(feature = "notify")]
     Notify(NotifyArgs),
+    /// Ship the run logs `faucet run` / `faucet schedule` left in the local
+    /// spool to the OTLP collector (#806).
+    #[cfg(feature = "otel")]
+    Logs(LogsArgs),
     /// Browse the Data Movement Catalog accumulated by a config's `catalog:`
     /// store — datasets, schema timelines, volume/freshness, lineage.
     #[cfg(feature = "catalog")]
@@ -966,6 +970,55 @@ pub struct TemplateRowsArgs {
     pub common: TemplateStoreArgs,
 }
 
+/// `faucet logs` arguments.
+#[cfg(feature = "otel")]
+#[derive(Debug, Parser)]
+pub struct LogsArgs {
+    #[command(subcommand)]
+    pub command: LogsCommand,
+}
+
+/// `faucet logs` subcommands.
+#[cfg(feature = "otel")]
+#[derive(Debug, Subcommand)]
+pub enum LogsCommand {
+    /// Deliver every undelivered run-log line in a spool directory. The exit
+    /// code is the number of runs still undelivered (0 = all shipped).
+    Ship(LogsShipArgs),
+}
+
+/// `faucet logs ship` arguments.
+#[cfg(feature = "otel")]
+#[derive(Debug, Parser)]
+pub struct LogsShipArgs {
+    /// Pipeline config whose `observability.otel` (collector) and
+    /// `observability.logs` (spool, bounds) blocks to use. If omitted,
+    /// auto-discovered in cwd; with none found, `--endpoint` is required.
+    pub config: Option<PathBuf>,
+    /// The spool directory (default: the config's `observability.logs.spool_dir`,
+    /// else `$XDG_STATE_HOME/faucet/logs`).
+    #[arg(long, value_name = "DIR")]
+    pub spool: Option<PathBuf>,
+    /// OTLP collector endpoint, overriding the config's.
+    #[arg(long, value_name = "URL")]
+    pub endpoint: Option<String>,
+    /// OTLP protocol (`grpc` or `http`), overriding the config's.
+    #[arg(long, value_parser = ["grpc", "http"])]
+    pub protocol: Option<String>,
+    /// Stop after this many seconds even if lines remain.
+    #[arg(long, default_value_t = 60)]
+    pub timeout_secs: u64,
+    /// Print the per-run report as JSON.
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub env_file: Option<PathBuf>,
+    #[arg(long, conflicts_with = "env_file")]
+    pub no_env_file: bool,
+    #[arg(long)]
+    pub profile: Option<String>,
+}
+
 /// `faucet notify test` arguments.
 #[cfg(feature = "notify")]
 #[derive(Debug, Parser)]
@@ -992,7 +1045,8 @@ pub struct NotifyTestArgs {
     /// Which event to synthesize (defaults to `run_failure`). One of
     /// `run_failure`, `run_success`, `sla_breach`, `circuit_open`,
     /// `contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`,
-    /// `change_requested`, `budget_exceeded`, `connection_needs_reauth`.
+    /// `change_requested`, `budget_exceeded`, `connection_needs_reauth`,
+    /// `log_export_failed`.
     #[arg(long, default_value = "run_failure")]
     pub event: String,
     /// Leave the PagerDuty incident a failure-class test event opens. By
@@ -1868,6 +1922,54 @@ pub struct ScheduleArgs {
     pub profile: Option<String>,
 }
 
+/// `faucet serve` log-shipping buffer bounds (#806).
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, clap::Args)]
+pub struct LogBufferArgs {
+    /// Undelivered run-log lines older than this are dropped (counted, and the
+    /// run marked `partially_dropped`). Only with log shipping on. Default: 7 days.
+    #[arg(
+        long,
+        default_value_t = 604_800,
+        env = "FAUCET_SERVE_LOG_BUFFER_MAX_AGE_SECS"
+    )]
+    pub log_buffer_max_age_secs: u64,
+    /// Upper bound on undelivered run-log bytes in the history backend; past
+    /// it the oldest undelivered lines are dropped. Only with log shipping on.
+    /// Default: 1 GiB.
+    #[arg(
+        long,
+        default_value_t = 1_073_741_824,
+        env = "FAUCET_SERVE_LOG_BUFFER_MAX_BYTES"
+    )]
+    pub log_buffer_max_bytes: u64,
+    /// A link to a run's logs in the log service, shown in the console and
+    /// returned by the log endpoint once the local copy aged out. Placeholders:
+    /// `{run_id} {pipeline} {row} {tenant} {started_at} {ended_at}`.
+    #[arg(long, value_name = "URL", env = "FAUCET_SERVE_LOG_LINK_TEMPLATE")]
+    pub log_link_template: Option<String>,
+    /// Emit `log_export_failed` once a run's log export has been failing this
+    /// many seconds. Default: 300.
+    #[arg(
+        long,
+        default_value_t = 300,
+        env = "FAUCET_SERVE_LOG_EXPORT_NOTIFY_AFTER_SECS"
+    )]
+    pub log_export_notify_after_secs: u64,
+}
+
+#[cfg(feature = "serve")]
+impl Default for LogBufferArgs {
+    fn default() -> Self {
+        Self {
+            log_buffer_max_age_secs: 604_800,
+            log_buffer_max_bytes: 1_073_741_824,
+            log_link_template: None,
+            log_export_notify_after_secs: 300,
+        }
+    }
+}
+
 /// `faucet serve` arguments.
 #[cfg(feature = "serve")]
 #[derive(Debug, Clone, Parser)]
@@ -1956,14 +2058,24 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 86_400)]
     pub idempotency_retention_secs: u64,
     /// How long persisted run logs are kept (seconds, #529), independent of run
-    /// records. Requires a persistent `--history` backend; `0` disables durable
-    /// log persistence (ephemeral SSE only). Default: 7 days.
-    #[arg(long, default_value_t = 604_800)]
+    /// records. With log shipping on (`export: [logs]` in `--otel-config`,
+    /// #806) this is how long lines are kept *after delivery*; undelivered
+    /// lines are kept until delivered, bounded by `--log-buffer-max-age-secs`
+    /// and `--log-buffer-max-bytes`. Requires a persistent `--history` backend
+    /// unless shipping is on; `0` disables durable log persistence (ephemeral
+    /// SSE only). Default: 24 hours.
+    #[arg(
+        long,
+        default_value_t = 86_400,
+        env = "FAUCET_SERVE_LOG_RETENTION_SECS"
+    )]
     pub log_retention_secs: u64,
     /// Per-run cap on persisted log lines (#529). Past it a truncation marker is
     /// recorded and further lines are dropped.
     #[arg(long, default_value_t = 100_000)]
     pub log_max_lines_per_run: usize,
+    #[command(flatten)]
+    pub log_buffer: LogBufferArgs,
     /// How long the **local files** a run's sinks wrote (jsonl / csv / parquet)
     /// are kept before the retention GC reclaims them, in days (#587). `0`
     /// disables the automatic sweep — outputs are still tracked and can be

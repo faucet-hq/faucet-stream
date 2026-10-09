@@ -24,7 +24,7 @@ use std::time::Duration;
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Columns added to a table after it first shipped, with the schema version
 /// that added them. `CREATE TABLE IF NOT EXISTS` never alters an existing
@@ -34,7 +34,57 @@ pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (2, "faucet_usage", "tenant"),
     (2, "faucet_serve_changes", "tenant"),
     (3, "faucet_serve_audit", "target"),
+    (4, "faucet_serve_run_logs", "attrs"),
 ];
+
+/// The columns of a `faucet_serve_log_ship` row, in [`decode_log_ship`] order.
+pub const LOG_SHIP_SELECT: &str = "SELECT run_id, total_seq, delivered_seq, delivered_at, \
+    dropped, last_error, last_attempt_at, failing_since, owner, lease_expires_at, notified \
+    FROM faucet_serve_log_ship";
+
+/// The raw TEXT columns of a `faucet_serve_log_ship` row.
+pub struct LogShipColumns {
+    pub run_id: String,
+    pub total_seq: String,
+    pub delivered_seq: Option<String>,
+    pub delivered_at: Option<String>,
+    pub dropped: Option<String>,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub failing_since: Option<String>,
+    pub owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub notified: Option<String>,
+}
+
+/// Decode a `faucet_serve_log_ship` row.
+pub fn decode_log_ship(c: LogShipColumns) -> crate::serve::history::LogShipRow {
+    let ts = |v: Option<String>| v.as_deref().map(parse_ts);
+    let notified = c.notified.unwrap_or_default();
+    crate::serve::history::LogShipRow {
+        run_id: c.run_id,
+        total_seq: unpad_seq(&c.total_seq),
+        delivered_seq: c.delivered_seq.as_deref().map(unpad_seq),
+        delivered_at: ts(c.delivered_at),
+        dropped: c.dropped.and_then(|d| d.parse().ok()).unwrap_or(0),
+        last_error: c.last_error,
+        last_attempt_at: ts(c.last_attempt_at),
+        failing_since: ts(c.failing_since),
+        owner: c.owner,
+        lease_expires_at: ts(c.lease_expires_at),
+        notified_failure: notified.contains('f'),
+        notified_drop: notified.contains('d'),
+    }
+}
+
+/// Encode the notified flags (`f` failure, `d` drop).
+pub fn notified_flags(failure: bool, drop: bool) -> String {
+    format!(
+        "{}{}",
+        if failure { "f" } else { "" },
+        if drop { "d" } else { "" }
+    )
+}
 
 /// DDL that needs the [`ADDED_COLUMNS`] in place (indexes on them).
 pub const POST_MIGRATION_DDL: &[&str] = &[
@@ -310,6 +360,22 @@ pub const DDL: &[&str] = &[
         PRIMARY KEY (run_id, seq))",
     "CREATE INDEX IF NOT EXISTS faucet_serve_run_logs_ts_idx \
         ON faucet_serve_run_logs (ts)",
+    // Log delivery (#806): one row per run with persisted lines — the highest
+    // captured sequence, the acknowledged watermark, export status and the
+    // delivery lease (`owner` / `lease_expires_at`). Sequences are padded like
+    // `faucet_serve_run_logs.seq`, `dropped` is an integer as TEXT.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_log_ship (\
+        run_id TEXT PRIMARY KEY,\
+        total_seq TEXT NOT NULL,\
+        delivered_seq TEXT,\
+        delivered_at TEXT,\
+        dropped TEXT,\
+        last_error TEXT,\
+        last_attempt_at TEXT,\
+        failing_since TEXT,\
+        owner TEXT,\
+        lease_expires_at TEXT,\
+        notified TEXT)",
     // Data Movement Catalog (#279). Accumulating cross-run state, deliberately
     // NOT covered by `purge_expired` (the history is the value). Same
     // TEXT-columns + JSON `body` convention as the run tables: the dedicated
@@ -656,6 +722,32 @@ pub struct Stmts {
     pub run_log_truncated: String,
     /// Purge run-log lines older than a threshold (retention).
     pub purge_run_logs: String,
+    // ── Log delivery (#806) ──────────────────────────────────────────────────
+    /// Create a run's delivery row or raise its `total_seq`. Params: run_id,
+    /// total_seq.
+    pub log_ship_touch: String,
+    pub log_ship_select_all: String,
+    pub log_ship_select_pending: String,
+    /// Param: run_id.
+    pub log_ship_select_one: String,
+    /// Params: owner, lease_expires_at, run_id, owner, now.
+    pub log_ship_claim: String,
+    /// Params: delivered_seq, delivered_at, last_attempt_at, run_id, owner.
+    pub log_ship_ack: String,
+    /// Params: last_error, last_attempt_at, failing_since, run_id, owner.
+    pub log_ship_fail: String,
+    /// Params: run_id, owner.
+    pub log_ship_release: String,
+    /// Params: n (bigint), run_id.
+    pub log_ship_add_dropped: String,
+    /// Params: notified flags, run_id.
+    pub log_ship_notified: String,
+    /// Param: run_id.
+    pub log_ship_delete: String,
+    /// Params: run_id, sentinel, after, after, through, through.
+    pub run_log_stats: String,
+    /// Params: run_id, through, sentinel.
+    pub delete_run_logs_through: String,
     // ── Data Movement Catalog (#279) ─────────────────────────────────────────
     /// One dataset body by id (the merge read + the detail head).
     pub catalog_select_dataset: String,
@@ -1213,10 +1305,10 @@ impl Stmts {
                 WHERE id NOT IN (SELECT id FROM faucet_serve_audit)"
                 .into(),
             insert_run_log: "INSERT INTO faucet_serve_run_logs \
-                (run_id, seq, ts, level, line) VALUES ($1,$2,$3,$4,$5) \
+                (run_id, seq, ts, level, line, attrs) VALUES ($1,$2,$3,$4,$5,$6) \
                 ON CONFLICT (run_id, seq) DO NOTHING"
                 .into(),
-            list_run_logs: "SELECT seq, ts, level, line FROM faucet_serve_run_logs \
+            list_run_logs: "SELECT seq, ts, level, line, attrs FROM faucet_serve_run_logs \
                 WHERE run_id = $1 AND seq <> $2 AND ($3::text IS NULL OR seq > $4::text) \
                 ORDER BY seq ASC LIMIT $5"
                 .into(),
@@ -1224,6 +1316,47 @@ impl Stmts {
                 WHERE run_id = $1 AND seq = $2 LIMIT 1"
                 .into(),
             purge_run_logs: "DELETE FROM faucet_serve_run_logs WHERE ts < $1".into(),
+            log_ship_touch: "INSERT INTO faucet_serve_log_ship (run_id, total_seq) \
+                VALUES ($1,$2) ON CONFLICT (run_id) DO UPDATE SET total_seq = \
+                CASE WHEN excluded.total_seq > faucet_serve_log_ship.total_seq \
+                THEN excluded.total_seq ELSE faucet_serve_log_ship.total_seq END"
+                .into(),
+            log_ship_select_all: LOG_SHIP_SELECT.into(),
+            log_ship_select_pending: format!(
+                "{LOG_SHIP_SELECT} WHERE delivered_seq IS NULL OR total_seq > delivered_seq"
+            ),
+            log_ship_select_one: format!("{LOG_SHIP_SELECT} WHERE run_id = $1"),
+            log_ship_claim: "UPDATE faucet_serve_log_ship SET owner = $1, lease_expires_at = $2 \
+                WHERE run_id = $3 AND (owner IS NULL OR owner = $4 \
+                OR lease_expires_at IS NULL OR lease_expires_at < $5)"
+                .into(),
+            log_ship_ack: "UPDATE faucet_serve_log_ship SET delivered_seq = $1, \
+                delivered_at = $2, last_attempt_at = $3, last_error = NULL, \
+                failing_since = NULL, notified = REPLACE(COALESCE(notified, ''), 'f', '') \
+                WHERE run_id = $4 AND owner = $5"
+                .into(),
+            log_ship_fail: "UPDATE faucet_serve_log_ship SET last_error = $1, \
+                last_attempt_at = $2, failing_since = COALESCE(failing_since, $3) \
+                WHERE run_id = $4 AND owner = $5"
+                .into(),
+            log_ship_release: "UPDATE faucet_serve_log_ship SET owner = NULL, \
+                lease_expires_at = NULL WHERE run_id = $1 AND owner = $2"
+                .into(),
+            log_ship_add_dropped: "UPDATE faucet_serve_log_ship SET dropped = \
+                CAST(CAST(COALESCE(dropped, '0') AS BIGINT) + $1 AS TEXT) WHERE run_id = $2"
+                .into(),
+            log_ship_notified: "UPDATE faucet_serve_log_ship SET notified = $1 WHERE run_id = $2"
+                .into(),
+            log_ship_delete: "DELETE FROM faucet_serve_log_ship WHERE run_id = $1".into(),
+            run_log_stats: "SELECT COUNT(*) AS n, \
+                CAST(COALESCE(SUM(OCTET_LENGTH(line)), 0) AS BIGINT) AS b, \
+                MIN(seq) AS lo, MAX(seq) AS hi FROM faucet_serve_run_logs \
+                WHERE run_id = $1 AND seq <> $2 AND ($3::text IS NULL OR seq > $4::text) \
+                AND ($5::text IS NULL OR seq <= $6::text)"
+                .into(),
+            delete_run_logs_through: "DELETE FROM faucet_serve_run_logs \
+                WHERE run_id = $1 AND seq <= $2 AND seq <> $3"
+                .into(),
             catalog_select_dataset: "SELECT body FROM faucet_catalog_datasets WHERE id=$1".into(),
             local_output_select: "SELECT body FROM faucet_local_outputs WHERE id=$1".into(),
             local_output_upsert: "INSERT INTO faucet_local_outputs \
@@ -1655,10 +1788,10 @@ impl Stmts {
                 WHERE id NOT IN (SELECT id FROM faucet_serve_audit)"
                 .into(),
             insert_run_log: "INSERT INTO faucet_serve_run_logs \
-                (run_id, seq, ts, level, line) VALUES (?,?,?,?,?) \
+                (run_id, seq, ts, level, line, attrs) VALUES (?,?,?,?,?,?) \
                 ON CONFLICT (run_id, seq) DO NOTHING"
                 .into(),
-            list_run_logs: "SELECT seq, ts, level, line FROM faucet_serve_run_logs \
+            list_run_logs: "SELECT seq, ts, level, line, attrs FROM faucet_serve_run_logs \
                 WHERE run_id = ? AND seq <> ? AND (? IS NULL OR seq > ?) \
                 ORDER BY seq ASC LIMIT ?"
                 .into(),
@@ -1666,6 +1799,47 @@ impl Stmts {
                 WHERE run_id = ? AND seq = ? LIMIT 1"
                 .into(),
             purge_run_logs: "DELETE FROM faucet_serve_run_logs WHERE ts < ?".into(),
+            log_ship_touch: "INSERT INTO faucet_serve_log_ship (run_id, total_seq) \
+                VALUES (?,?) ON CONFLICT (run_id) DO UPDATE SET total_seq = \
+                CASE WHEN excluded.total_seq > faucet_serve_log_ship.total_seq \
+                THEN excluded.total_seq ELSE faucet_serve_log_ship.total_seq END"
+                .into(),
+            log_ship_select_all: LOG_SHIP_SELECT.into(),
+            log_ship_select_pending: format!(
+                "{LOG_SHIP_SELECT} WHERE delivered_seq IS NULL OR total_seq > delivered_seq"
+            ),
+            log_ship_select_one: format!("{LOG_SHIP_SELECT} WHERE run_id = ?"),
+            log_ship_claim: "UPDATE faucet_serve_log_ship SET owner = ?, lease_expires_at = ? \
+                WHERE run_id = ? AND (owner IS NULL OR owner = ? \
+                OR lease_expires_at IS NULL OR lease_expires_at < ?)"
+                .into(),
+            log_ship_ack: "UPDATE faucet_serve_log_ship SET delivered_seq = ?, \
+                delivered_at = ?, last_attempt_at = ?, last_error = NULL, \
+                failing_since = NULL, notified = REPLACE(COALESCE(notified, ''), 'f', '') \
+                WHERE run_id = ? AND owner = ?"
+                .into(),
+            log_ship_fail: "UPDATE faucet_serve_log_ship SET last_error = ?, \
+                last_attempt_at = ?, failing_since = COALESCE(failing_since, ?) \
+                WHERE run_id = ? AND owner = ?"
+                .into(),
+            log_ship_release: "UPDATE faucet_serve_log_ship SET owner = NULL, \
+                lease_expires_at = NULL WHERE run_id = ? AND owner = ?"
+                .into(),
+            log_ship_add_dropped: "UPDATE faucet_serve_log_ship SET dropped = \
+                CAST(CAST(COALESCE(dropped, '0') AS INTEGER) + ? AS TEXT) WHERE run_id = ?"
+                .into(),
+            log_ship_notified: "UPDATE faucet_serve_log_ship SET notified = ? WHERE run_id = ?"
+                .into(),
+            log_ship_delete: "DELETE FROM faucet_serve_log_ship WHERE run_id = ?".into(),
+            run_log_stats: "SELECT COUNT(*) AS n, \
+                CAST(COALESCE(SUM(LENGTH(CAST(line AS BLOB))), 0) AS INTEGER) AS b, \
+                MIN(seq) AS lo, MAX(seq) AS hi FROM faucet_serve_run_logs \
+                WHERE run_id = ? AND seq <> ? AND (? IS NULL OR seq > ?) \
+                AND (? IS NULL OR seq <= ?)"
+                .into(),
+            delete_run_logs_through: "DELETE FROM faucet_serve_run_logs \
+                WHERE run_id = ? AND seq <= ? AND seq <> ?"
+                .into(),
             catalog_select_dataset: "SELECT body FROM faucet_catalog_datasets WHERE id=?".into(),
             local_output_select: "SELECT body FROM faucet_local_outputs WHERE id=?".into(),
             local_output_upsert: "INSERT INTO faucet_local_outputs \
@@ -2166,6 +2340,36 @@ macro_rules! impl_sql_history {
                     lease_ttl,
                     stmts,
                 }
+            }
+
+            /// Decode one `faucet_serve_log_ship` row (#806).
+            fn decode_log_ship_row<R>(
+                r: &R,
+            ) -> Result<
+                $crate::serve::history::LogShipRow,
+                $crate::serve::history::HistoryError,
+            >
+            where
+                R: sqlx::Row,
+                for<'c> &'c str: sqlx::ColumnIndex<R>,
+                for<'v> String: sqlx::Decode<'v, R::Database> + sqlx::Type<R::Database>,
+            {
+                use $crate::serve::history::sql::{LogShipColumns, classify_backend_error, decode_log_ship};
+                let s = |c: &str| r.try_get::<String, _>(c).map_err(classify_backend_error);
+                let o = |c: &str| r.try_get::<Option<String>, _>(c).map_err(classify_backend_error);
+                Ok(decode_log_ship(LogShipColumns {
+                    run_id: s("run_id")?,
+                    total_seq: s("total_seq")?,
+                    delivered_seq: o("delivered_seq")?,
+                    delivered_at: o("delivered_at")?,
+                    dropped: o("dropped")?,
+                    last_error: o("last_error")?,
+                    last_attempt_at: o("last_attempt_at")?,
+                    failing_since: o("failing_since")?,
+                    owner: o("owner")?,
+                    lease_expires_at: o("lease_expires_at")?,
+                    notified: o("notified")?,
+                }))
             }
 
             /// Run a statement returning at most one `body` row and decode it.
@@ -3439,30 +3643,46 @@ macro_rules! impl_sql_history {
                 }
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin().await.map_err(backend)?;
+                let mut max_seq: Option<u64> = None;
                 for l in lines {
                     // A key another instance already wrote for this run moves
                     // to the next free one instead of dropping the line. The
                     // truncation sentinel is written once, as is.
-                    let attempts = if l.seq == $crate::serve::history::RUN_LOG_TRUNCATED_SEQ {
-                        1
+                    let sentinel = l.seq == $crate::serve::history::RUN_LOG_TRUNCATED_SEQ;
+                    let attempts = if sentinel { 1 } else { sql::SEQ_PROBES };
+                    let attrs = if l.attrs.is_empty() {
+                        None
                     } else {
-                        sql::SEQ_PROBES
+                        serde_json::to_string(&l.attrs).ok()
                     };
                     for bump in 0..attempts {
+                        let seq = l.seq.saturating_add(bump);
                         let written = sqlx::query(&self.stmts.insert_run_log)
                             .bind(run_id)
-                            .bind(sql::pad_seq(l.seq.saturating_add(bump)))
+                            .bind(sql::pad_seq(seq))
                             .bind(&l.ts)
                             .bind(&l.level)
                             .bind(&l.line)
+                            .bind(attrs.as_deref())
                             .execute(&mut *tx)
                             .await
                             .map_err(backend)?
                             .rows_affected();
                         if written == 1 {
+                            if !sentinel {
+                                max_seq = Some(max_seq.map_or(seq, |m| m.max(seq)));
+                            }
                             break;
                         }
                     }
+                }
+                if let Some(max) = max_seq {
+                    sqlx::query(&self.stmts.log_ship_touch)
+                        .bind(run_id)
+                        .bind(sql::pad_seq(max))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
                 }
                 tx.commit().await.map_err(backend)?;
                 Ok(())
@@ -3496,11 +3716,15 @@ macro_rules! impl_sql_history {
                 let mut out = Vec::with_capacity(rows.len());
                 for r in &rows {
                     let seq: String = r.try_get("seq").map_err(backend)?;
+                    let attrs: Option<String> = r.try_get("attrs").map_err(backend)?;
                     out.push(RunLogLine {
                         seq: sql::unpad_seq(&seq),
                         ts: r.try_get("ts").map_err(backend)?,
                         level: r.try_get("level").map_err(backend)?,
                         line: r.try_get("line").map_err(backend)?,
+                        attrs: attrs
+                            .and_then(|a| serde_json::from_str(&a).ok())
+                            .unwrap_or_default(),
                     });
                 }
                 let truncated = sqlx::query(&self.stmts.run_log_truncated)
@@ -3525,6 +3749,206 @@ macro_rules! impl_sql_history {
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
+                Ok(res.rows_affected() as usize)
+            }
+
+            // ── Log delivery (#806) ──────────────────────────────────────────
+
+            async fn log_ship_rows(
+                &self,
+                pending_only: bool,
+            ) -> Result<
+                Vec<$crate::serve::history::LogShipRow>,
+                $crate::serve::history::HistoryError,
+            > {
+                let stmt = if pending_only {
+                    &self.stmts.log_ship_select_pending
+                } else {
+                    &self.stmts.log_ship_select_all
+                };
+                let rows = sqlx::query(stmt)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                rows.iter().map(Self::decode_log_ship_row).collect()
+            }
+
+            async fn log_ship_row(
+                &self,
+                run_id: &str,
+            ) -> Result<
+                Option<$crate::serve::history::LogShipRow>,
+                $crate::serve::history::HistoryError,
+            > {
+                let row = sqlx::query(&self.stmts.log_ship_select_one)
+                    .bind(run_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                row.as_ref().map(Self::decode_log_ship_row).transpose()
+            }
+
+            async fn log_ship_claim(
+                &self,
+                run_id: &str,
+                ttl: std::time::Duration,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let now = chrono::Utc::now();
+                let until = now + chrono::Duration::from_std(ttl).unwrap_or_default();
+                let res = sqlx::query(&self.stmts.log_ship_claim)
+                    .bind(&self.instance_id)
+                    .bind(sql::fmt_ts(until))
+                    .bind(run_id)
+                    .bind(&self.instance_id)
+                    .bind(sql::fmt_ts(now))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(sql::classify_backend_error)?;
+                Ok(res.rows_affected() == 1)
+            }
+
+            async fn log_ship_ack(
+                &self,
+                run_id: &str,
+                delivered_seq: u64,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let now = sql::fmt_ts(chrono::Utc::now());
+                let res = sqlx::query(&self.stmts.log_ship_ack)
+                    .bind(sql::pad_seq(delivered_seq))
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(run_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(sql::classify_backend_error)?;
+                Ok(res.rows_affected() == 1)
+            }
+
+            async fn log_ship_fail(
+                &self,
+                run_id: &str,
+                error: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let now = sql::fmt_ts(chrono::Utc::now());
+                let res = sqlx::query(&self.stmts.log_ship_fail)
+                    .bind(error)
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(run_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(sql::classify_backend_error)?;
+                Ok(res.rows_affected() == 1)
+            }
+
+            async fn log_ship_release(
+                &self,
+                run_id: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                sqlx::query(&self.stmts.log_ship_release)
+                    .bind(run_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                Ok(())
+            }
+
+            async fn log_ship_add_dropped(
+                &self,
+                run_id: &str,
+                n: u64,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                sqlx::query(&self.stmts.log_ship_add_dropped)
+                    .bind(i64::try_from(n).unwrap_or(i64::MAX))
+                    .bind(run_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                Ok(())
+            }
+
+            async fn log_ship_mark_notified(
+                &self,
+                run_id: &str,
+                failure: bool,
+                drop: bool,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                sqlx::query(&self.stmts.log_ship_notified)
+                    .bind($crate::serve::history::sql::notified_flags(failure, drop))
+                    .bind(run_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                Ok(())
+            }
+
+            async fn log_ship_forget(
+                &self,
+                run_id: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                sqlx::query(&self.stmts.log_ship_delete)
+                    .bind(run_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                Ok(())
+            }
+
+            async fn run_log_stats(
+                &self,
+                run_id: &str,
+                after: Option<u64>,
+                through: Option<u64>,
+            ) -> Result<
+                $crate::serve::history::RunLogStats,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let backend = sql::classify_backend_error;
+                let after = after.map(sql::pad_seq);
+                let through = through.map(sql::pad_seq);
+                let r = sqlx::query(&self.stmts.run_log_stats)
+                    .bind(run_id)
+                    .bind(sql::pad_seq($crate::serve::history::RUN_LOG_TRUNCATED_SEQ))
+                    .bind(after.as_deref())
+                    .bind(after.as_deref())
+                    .bind(through.as_deref())
+                    .bind(through.as_deref())
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let n: i64 = r.try_get("n").map_err(backend)?;
+                let b: i64 = r.try_get("b").map_err(backend)?;
+                let lo: Option<String> = r.try_get("lo").map_err(backend)?;
+                let hi: Option<String> = r.try_get("hi").map_err(backend)?;
+                Ok($crate::serve::history::RunLogStats {
+                    lines: n.max(0) as u64,
+                    bytes: b.max(0) as u64,
+                    min_seq: lo.as_deref().map(sql::unpad_seq),
+                    max_seq: hi.as_deref().map(sql::unpad_seq),
+                })
+            }
+
+            async fn delete_run_logs_through(
+                &self,
+                run_id: &str,
+                through: u64,
+            ) -> Result<usize, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let res = sqlx::query(&self.stmts.delete_run_logs_through)
+                    .bind(run_id)
+                    .bind(sql::pad_seq(through))
+                    .bind(sql::pad_seq($crate::serve::history::RUN_LOG_TRUNCATED_SEQ))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(sql::classify_backend_error)?;
                 Ok(res.rows_affected() as usize)
             }
 

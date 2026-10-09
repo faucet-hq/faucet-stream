@@ -1,0 +1,42 @@
+# PostgreSQL -> JSONL, reading only the rows changed since the last run.
+#
+# `replication: incremental` orders the query by `updated_at`, filters it to
+# `updated_at >= <bookmark>` and drops the rows it already wrote at the
+# bookmark value, so a row committed late with the same `updated_at` is never
+# skipped. Every page carries a bookmark and the file state store persists it
+# only after the sink has written the page, so a crash replays at most one
+# page. The mysql source takes the same block (its in-query token is
+# `@bookmark`).
+#
+# Run:
+#   faucet run cli/examples/postgres_incremental_to_jsonl.yaml
+#
+# Prereqs:
+#   - PostgreSQL reachable on localhost:5432 with an `app` database and a
+#     `public.orders (id, status, total, updated_at)` table. Index
+#     `updated_at` so the cursor filter and ordering use it.
+
+version: 1
+name: postgres_incremental_to_jsonl
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: "postgres://faucet:faucet@localhost:5432/app"
+      query: "SELECT id, status, total, updated_at FROM public.orders"
+      batch_size: 1000
+      replication:
+        type: incremental
+        column: updated_at
+        initial_value: "1970-01-01T00:00:00Z"
+
+  sink:
+    type: file
+    config:
+      path: ./out/orders.jsonl
+      if_exists: append
+
+  state:
+    type: file
+    config:
+      path: ./.faucet-state

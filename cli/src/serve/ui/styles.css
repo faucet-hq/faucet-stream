@@ -1861,3 +1861,12 @@ select {
 .tn-row-actions { display: flex; gap: 6px; justify-content: flex-end; white-space: nowrap; }
 .tn-spacer { flex: 1 1 auto; }
 .chg-actions #td-confirm { flex: 0 1 220px; }
+
+/* Run detail: log export (#806). */
+.rs-seg-logs dd.le-status { font-family: inherit; }
+.rs-seg-logs dd.le-bad { color: var(--fail); }
+.rs-seg-logs dd.le-error { color: var(--fail); font-size: 0.76rem; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.le-link { color: var(--brand-strong); font-weight: 600; text-decoration: none; font-family: var(--font-sans, inherit); font-size: 0.84rem; }
+.le-link:hover { text-decoration: underline; }
+.logs-head { display: flex; align-items: baseline; gap: 14px; }
+.logs-head h2 { margin-right: auto; }

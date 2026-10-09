@@ -22,9 +22,14 @@ pub enum OtelProtocol {
 /// A telemetry signal that can be exported over OTLP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum OtelSignal {
     Traces,
     Metrics,
+    /// Run logs, shipped from a durable local buffer by the CLI runtimes
+    /// (`faucet run` / `schedule` / `serve`, #806). The SDK installer in this
+    /// crate does not export them.
+    Logs,
 }
 
 fn default_protocol() -> OtelProtocol {
@@ -156,6 +161,8 @@ pub(crate) fn http_signal_endpoint(base: &str, signal_path: &str) -> String {
 pub(crate) fn otel_signal_label(target: &str) -> &'static str {
     if target.contains("metric") {
         "metrics"
+    } else if target.contains("logs") {
+        "logs"
     } else if target.contains("trace") || target.contains("span") {
         "traces"
     } else {
@@ -504,6 +511,7 @@ mod tests {
             "traces"
         );
         assert_eq!(otel_signal_label("opentelemetry_otlp::exporter"), "export");
+        assert_eq!(otel_signal_label("opentelemetry_sdk::logs::batch"), "logs");
         assert_eq!(otel_signal_label("opentelemetry"), "export");
     }
 
@@ -518,6 +526,9 @@ mod tests {
         assert_eq!(cfg.metric_interval_secs, 60);
         assert!(cfg.exports(OtelSignal::Traces));
         assert!(cfg.exports(OtelSignal::Metrics));
+        assert!(!cfg.exports(OtelSignal::Logs));
+        let logs: OtelConfig = serde_json::from_str(r#"{"export":["traces","logs"]}"#).unwrap();
+        assert!(logs.exports(OtelSignal::Logs));
     }
 
     #[test]

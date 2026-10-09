@@ -385,10 +385,24 @@ Prebuilt archives with SHA-256 checksums are on the
 Rust version is 1.96. See the [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html)
 for container images and slim builds. Prebuilt binaries cover macOS and Linux.
 
+## Star history
+
+<a href="https://www.star-history.com/?repos=faucet-hq%2Ffaucet-stream&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=faucet-hq/faucet-stream&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=faucet-hq/faucet-stream&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=faucet-hq/faucet-stream&type=date&legend=top-left" />
+ </picture>
+</a>
+
+**Using faucet-stream in production?** Open a PR to add your team here — real adopters are the
+best signal for the next person deciding whether to bet a pipeline on it.
+
 ## Project
 
 - [Roadmap](https://github.com/orgs/faucet-hq/projects/2): what's being built now and what's next.
-- [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Security policy](SECURITY.md)
+- [Project structure](PROJECT_STRUCTURE.md): where everything lives in the repository.
+- [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Security policy](SECURITY.md) · [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## License
 

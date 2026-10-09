@@ -258,6 +258,10 @@ pub(crate) async fn execute(
 
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
 
+    // Run-log shipping (#806): every line this process logs is spooled
+    // locally first and shipped over OTLP; flushed (bounded) before exit.
+    let run_logs = crate::logship::process::RunLogs::start(&cfg, &pipeline_name);
+
     // Topology mode (#71/#72): an explicit `pipeline.nodes` graph replaces the
     // matrix entirely. Run it directly and report through the same summary
     // surfaces (`--output text|json|ndjson`), then return.
@@ -308,12 +312,14 @@ pub(crate) async fn execute(
         )
         .await?;
         let finished_at = Utc::now();
+        let log_export = run_logs.finish().await;
         let outcome = finish_topology_run(
             &pipeline_name,
             started_at,
             finished_at,
             &summary,
             args.output,
+            log_export,
         );
         return stop.finish(outcome);
     }
@@ -499,6 +505,7 @@ pub(crate) async fn execute(
         );
         metrics::gauge!("faucet_process_peak_rss_bytes").set(bytes as f64);
     }
+    let log_export = run_logs.finish().await;
     // End-of-run summary. `text` is the human line (default); `json` / `ndjson`
     // emit a machine-readable summary and keep stdout otherwise clean so
     // `faucet run` is scriptable in CI / cron / Slack (#390). Logs are on stderr.
@@ -521,6 +528,15 @@ pub(crate) async fn execute(
                     "row completed"
                 );
             }
+            if let Some(v) = &log_export {
+                tracing::info!(
+                    pipeline = %pipeline_name,
+                    status = v.status.as_str(),
+                    pending_lines = v.pending_lines,
+                    dropped_lines = v.dropped_lines,
+                    "log export"
+                );
+            }
         }
         RunOutput::Text => {
             eprintln!(
@@ -537,6 +553,9 @@ pub(crate) async fn execute(
                 total_written,
                 if total_written == 1 { "" } else { "s" }
             );
+            if let Some(v) = &log_export {
+                eprintln!("  {}", v.summary_line());
+            }
             // Cost & usage (#704): one line per invocation, estimates
             // labelled as such.
             for i in &summary.invocations {
@@ -584,7 +603,8 @@ pub(crate) async fn execute(
             }
         }
         RunOutput::Json => {
-            let doc = summary_document(&pipeline_name, started_at, finished_at, &summary);
+            let mut doc = summary_document(&pipeline_name, started_at, finished_at, &summary);
+            doc.log_export = log_export.clone();
             let rendered = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
             // Belt-and-suspenders: scrub any resolved secret that reached an
             // error string before it hits stdout (#390 secret-redaction AC).
@@ -753,6 +773,10 @@ pub(crate) struct RunSummaryDocument {
     pub status: &'static str,
     pub totals: RunTotals,
     pub rows: Vec<RunRowSummary>,
+    /// Whether the run's logs reached the log service (#806); absent when log
+    /// shipping is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_export: Option<crate::logship::LogExportView>,
 }
 
 /// Project one invocation outcome into its summary row.
@@ -806,6 +830,7 @@ pub(crate) fn summary_document(
         status: if failed > 0 { "failed" } else { "ok" },
         totals,
         rows,
+        log_export: None,
     }
 }
 
@@ -817,6 +842,7 @@ fn finish_topology_run(
     finished_at: DateTime<Utc>,
     summary: &RunSummary,
     output: RunOutput,
+    log_export: Option<crate::logship::LogExportView>,
 ) -> CliResult<()> {
     let total_written: usize = summary.invocations.iter().map(|i| i.records_written).sum();
     let failed = summary.failure_count();
@@ -852,7 +878,8 @@ fn finish_topology_run(
             if total_written == 1 { "" } else { "s" }
         ),
         RunOutput::Json => {
-            let doc = summary_document(pipeline_name, started_at, finished_at, summary);
+            let mut doc = summary_document(pipeline_name, started_at, finished_at, summary);
+            doc.log_export = log_export.clone();
             let rendered = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
             println!("{}", crate::secrets::registry::redact(&rendered));
         }
@@ -862,6 +889,13 @@ fn finish_topology_run(
                 println!("{}", crate::secrets::registry::redact(&line));
             }
         }
+    }
+
+    if matches!(output, RunOutput::Text)
+        && crate::cli::log_format() == crate::cli::LogFormat::Text
+        && let Some(v) = &log_export
+    {
+        eprintln!("  {}", v.summary_line());
     }
 
     faucet_core::shutdown_otel();

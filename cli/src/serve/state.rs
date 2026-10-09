@@ -28,6 +28,7 @@ struct Inner {
     semaphore: Arc<Semaphore>,
     history: Arc<dyn RunHistory>,
     log_hub: LogHub,
+    log_export: Arc<crate::serve::log_export::LogExport>,
     /// The `--default-config` merge base, hot-reloadable via `POST /v1/reload`
     /// (#198). An `RwLock` so a reload can swap it while runs read it.
     default_base: RwLock<Option<Value>>,
@@ -91,6 +92,7 @@ impl ServerState {
                 semaphore: Arc::new(Semaphore::new(config.max_concurrent_runs)),
                 history,
                 log_hub,
+                log_export: Arc::new(crate::serve::log_export::LogExport::from_config(config)),
                 default_base: RwLock::new(default_base),
                 default_config_path: config.default_config_path.clone(),
                 idempotency_retention: config.idempotency_retention,
@@ -286,6 +288,11 @@ impl ServerState {
         &self.inner.log_hub
     }
 
+    /// Log shipping (#806): settings, status views, the shipper.
+    pub fn log_export(&self) -> &Arc<crate::serve::log_export::LogExport> {
+        &self.inner.log_export
+    }
+
     /// A snapshot of the `--default-config` merge base (cloned under the read
     /// lock, so a concurrent hot reload can't tear it).
     pub fn default_base(&self) -> Option<Value> {
@@ -349,6 +356,7 @@ mod tests {
             idempotency_retention: Duration::from_secs(60),
             log_retention: Duration::from_secs(0),
             log_max_lines_per_run: 100_000,
+            log_buffer: Default::default(),
             local_output_retention_days: 7,
             local_output_in_flight_grace: Duration::from_secs(60),
             preview: crate::serve::preview::PreviewConfig::default(),

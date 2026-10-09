@@ -2856,6 +2856,83 @@
             }
           ],
           "default": null
+        },
+        "logs": {
+          "description": "Durable log-shipping settings (#806): the local buffer, its bounds and\nretention. Shipping is on when `otel.export` lists `logs`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LogsSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "LogsSpec": {
+      "description": "Durable log-shipping settings. Shipping itself is switched on by adding\n`logs` to `observability.otel.export`; this block tunes the local buffer.",
+      "type": "object",
+      "properties": {
+        "spool_dir": {
+          "description": "Directory holding the local spool `faucet run` / `faucet schedule`\nwrite every line to before it is shipped. Default:\n`$XDG_STATE_HOME/faucet/logs` (`~/.local/state/faucet/logs`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "retention_secs": {
+          "description": "Seconds a run's lines stay in the local buffer after they were\ndelivered. Default: 86400 (24 h).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 86400
+        },
+        "buffer_max_age_secs": {
+          "description": "Undelivered lines older than this many seconds are dropped (counted,\nand the run is marked `partially_dropped`). Default: 604800 (7 days).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 604800
+        },
+        "buffer_max_bytes": {
+          "description": "Upper bound on the spool size in bytes; past it the oldest undelivered\nlines are dropped. Default: 1073741824 (1 GiB).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 1073741824
+        },
+        "flush_timeout_secs": {
+          "description": "How long `faucet run` waits at exit for the run's lines to ship.\nAnything still undelivered stays in the spool for the next faucet\nprocess or `faucet logs ship`. Default: 10.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 10
+        },
+        "max_lines_per_run": {
+          "description": "Per-run line cap; lines past it are dropped and counted. Default: 100000.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 100000
+        },
+        "notify_after_secs": {
+          "description": "Emit a `log_export_failed` notification once a run's export has been\nfailing for this many seconds. Default: 300.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300
+        },
+        "link_template": {
+          "description": "A link to the run's logs in the log service, shown once the local copy\nhas aged out. Placeholders: `{run_id} {pipeline} {row} {tenant}\n{started_at} {ended_at}` (URL-encoded).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -2979,10 +3056,19 @@
     },
     "OtelSignal": {
       "description": "A telemetry signal that can be exported over OTLP.",
-      "type": "string",
-      "enum": [
-        "traces",
-        "metrics"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "traces",
+            "metrics"
+          ]
+        },
+        {
+          "description": "Run logs, shipped from a durable local buffer by the CLI runtimes\n(`faucet run` / `schedule` / `serve`, #806). The SDK installer in this\ncrate does not export them.",
+          "type": "string",
+          "const": "logs"
+        }
       ]
     },
     "ResilienceSpec": {
@@ -3973,59 +4059,64 @@
       "description": "The lifecycle / health events a rule can subscribe to.",
       "oneOf": [
         {
-          "const": "run_failure",
           "description": "A pipeline run (or its final flush) failed.",
-          "type": "string"
+          "type": "string",
+          "const": "run_failure"
         },
         {
-          "const": "run_success",
           "description": "A pipeline run completed successfully.",
-          "type": "string"
+          "type": "string",
+          "const": "run_success"
         },
         {
-          "const": "sla_breach",
           "description": "A post-run SLA check was violated (staleness / min_rows / volume).",
-          "type": "string"
+          "type": "string",
+          "const": "sla_breach"
         },
         {
-          "const": "circuit_open",
           "description": "The resilience circuit breaker tripped open.",
-          "type": "string"
+          "type": "string",
+          "const": "circuit_open"
         },
         {
-          "const": "contract_abort",
           "description": "A data contract breach aborted the run (`on_breach: fail`).",
-          "type": "string"
+          "type": "string",
+          "const": "contract_abort"
         },
         {
-          "const": "dlq_threshold",
           "description": "A run routed rows to the dead-letter queue at/over the configured\nthreshold.",
-          "type": "string"
+          "type": "string",
+          "const": "dlq_threshold"
         },
         {
-          "const": "scheduler_stuck",
           "description": "The cron scheduler appears stuck (no heartbeat / consecutive-failure\nexit). Emitted by `faucet schedule`.",
-          "type": "string"
+          "type": "string",
+          "const": "scheduler_stuck"
         },
         {
-          "const": "profile_drift",
           "description": "A column's learned profile drifted from its baseline (#708), under\n`profiling.on_drift: notify` or `fail`. One event per finding.",
-          "type": "string"
+          "type": "string",
+          "const": "profile_drift"
         },
         {
-          "const": "change_requested",
           "description": "A change request was proposed and awaits approval (#703). Emitted\nthrough the proposed config's own `notifications:` block, so the\nchannels it names are the approvers'.",
-          "type": "string"
+          "type": "string",
+          "const": "change_requested"
         },
         {
-          "const": "budget_exceeded",
           "description": "A run crossed a `budget:` ceiling (#703) and was stopped.",
-          "type": "string"
+          "type": "string",
+          "const": "budget_exceeded"
         },
         {
-          "const": "connection_needs_reauth",
           "description": "A tenant connection's grant was revoked and it needs re-authorization\n(#709). Emitted through the tenant's own `notifications:`.",
-          "type": "string"
+          "type": "string",
+          "const": "connection_needs_reauth"
+        },
+        {
+          "description": "A run's log export has been failing past `notify_after_secs`, or its\nbuffered log lines were dropped before delivery (#806).",
+          "type": "string",
+          "const": "log_export_failed"
         }
       ]
     },
@@ -15736,6 +15827,20 @@
                       "description": "What to do with a number inside a JSON column that a 64-bit float\ncannot represent exactly (more than about 17 significant digits, or\nbeyond the `u64` / `i64` range): `fail` (default) fails the read with\nan error naming the column, `string` emits the number as a JSON string\nholding its exact digits (with one warning per column).",
                       "$ref": "#/$defs/source_postgres__JsonBigNumbers",
                       "default": "fail"
+                    },
+                    "replication": {
+                      "description": "Replication mode. Defaults to [`PostgresReplication::Full`].",
+                      "$ref": "#/$defs/source_postgres__PostgresReplication",
+                      "default": {
+                        "type": "full"
+                      }
+                    },
+                    "state_key": {
+                      "description": "Explicit state-store key for the incremental bookmark. When unset, a\nkey is derived from the connection host and a fingerprint of the\ndatabase URL and query.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 },
@@ -16098,6 +16203,20 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 3600
+                    },
+                    "replication": {
+                      "description": "Replication mode. Defaults to [`MysqlReplication::Full`].",
+                      "$ref": "#/$defs/source_mysql__MysqlReplication",
+                      "default": {
+                        "type": "full"
+                      }
+                    },
+                    "state_key": {
+                      "description": "Explicit state-store key for the incremental bookmark. When unset, a\nkey is derived from the connection host and a fingerprint of the\ndatabase URL and query.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 },
@@ -35074,6 +35193,74 @@
           "description": "As `verify_ca`, plus the certificate must name the host.",
           "type": "string",
           "const": "verify_full"
+        }
+      ]
+    },
+    "source_postgres__PostgresReplication": {
+      "description": "How the source replicates rows across runs.\n\nSerializes as `{ type: full }` or\n`{ type: incremental, column: \"...\", initial_value: ... }`.",
+      "oneOf": [
+        {
+          "description": "Every run fetches the full result set (default).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "full"
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) WHERE column >= <bookmark> ORDER BY column`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value are never skipped. Every page carries a\nbookmark, so a crash replays at most one page. Write `${bookmark}` in\nthe query (with `>=`) to apply the cursor further inside it, e.g. in a\nCTE. Rows whose `column` is NULL are never read.",
+          "type": "object",
+          "properties": {
+            "column": {
+              "description": "Output column holding the replication cursor (e.g. `updated_at`).",
+              "type": "string"
+            },
+            "initial_value": {
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
+            },
+            "type": {
+              "type": "string",
+              "const": "incremental"
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "source_mysql__MysqlReplication": {
+      "description": "How the source replicates rows across runs.\n\nSerializes as `{ type: full }` or\n`{ type: incremental, column: \"...\", initial_value: ... }`.",
+      "oneOf": [
+        {
+          "description": "Every run fetches the full result set (default).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "full"
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) WHERE column >= <bookmark> ORDER BY column`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value are never skipped. Every page carries a\nbookmark, so a crash replays at most one page. Write `@bookmark` in the\nquery (with `>=`) to apply the cursor further inside it, e.g. in a CTE.\nRows whose `column` is NULL are never read.",
+          "type": "object",
+          "properties": {
+            "column": {
+              "description": "Output column holding the replication cursor (e.g. `updated_at`).",
+              "type": "string"
+            },
+            "initial_value": {
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
+            },
+            "type": {
+              "type": "string",
+              "const": "incremental"
+            }
+          },
+          "additionalProperties": true
         }
       ]
     }

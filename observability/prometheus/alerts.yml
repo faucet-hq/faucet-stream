@@ -122,6 +122,32 @@ groups:
             consecutive fully-failed pages exceeded the configured threshold
             and writes are suspended.
 
+  - name: faucet-logs
+    rules:
+      - alert: FaucetLogsUndelivered
+        expr: faucet_logs_oldest_undelivered_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Run logs not reaching the log service ({{ $labels.instance }})"
+          description: >
+            The oldest buffered run-log line has waited more than 15 minutes
+            for the OTLP collector. Lines stay in the local buffer until
+            delivered (bounded by the buffer max age / bytes); check the
+            collector and `faucet_logs_export_errors_total`.
+
+      - alert: FaucetLogsDropped
+        expr: increase(faucet_logs_dropped_lines_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Run-log lines dropped before delivery ({{ $labels.reason }})"
+          description: >
+            The local log buffer dropped lines it could not deliver
+            ({{ $labels.reason }}). Affected runs report `log_export.status:
+            partially_dropped`.
+
   - name: faucet-schedule
     rules:
       - alert: FaucetStuckScheduler

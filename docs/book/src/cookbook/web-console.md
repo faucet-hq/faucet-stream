@@ -84,6 +84,14 @@ invocation in the matrix. For in-flight runs it streams structured log events
 live via SSE (the same `GET /v1/runs/{id}/logs` endpoint). You can cancel or
 delete a run from this view.
 
+With [log shipping](../operations/observability.md#shipping-logs) on, a **Log
+export** panel shows whether the run's lines reached the log service —
+`exported`, `pending`, `failed` (with the last error), or `partially_dropped`
+(with the dropped count) — and how many lines are still buffered locally. With
+`--log-link-template` set, **View logs ↗** (and the link beside the *Logs*
+heading) opens the run in the log service; once the local copy has aged out, the
+log pane says so and points there.
+
 It also embeds a **dead-letter-queue panel** — enter a server-local DLQ location
 (a `.jsonl` file, a directory, or a glob), then **Inspect** it (grouped by
 reason), **Discard** envelopes (optionally archiving first), or **Replay

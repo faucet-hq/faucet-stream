@@ -18,6 +18,7 @@ Built on `sqlx` with a pooled, async connection and a true row cursor (`Query::f
 - **Rich type decoding** — JSON, integers, floats, booleans, `DATETIME`/`TIMESTAMP`/`DATE`/`TIME`, `DECIMAL` (exact precision), and `BLOB`/`BINARY` (base64) all map to sensible JSON; text with a binary collation (`utf8mb4_bin`, the `BINARY` attribute) stays text.
 - **Parameterised per-record queries** — in a parent/child matrix run, `${parent.field}` tokens in the query are substituted as **safe bind parameters** (`?` placeholders), never string-interpolated. A token that is a whole quoted literal (`'${parent.name}'`) binds too; one embedded in a longer literal, a quoted identifier or a comment is refused when the config loads.
 - **TLS by default** — built with `tls-rustls`; encrypted connections need no extra dependency.
+- **Incremental replication** — `replication: { type: incremental, column, initial_value }` reads only rows changed since the stored bookmark, in cursor order, without skipping rows that share a cursor value; a crash replays at most one page (see [Incremental replication](#incremental-replication)).
 - **Credential-safe** — the connection URL is masked in `Debug` output and stripped from the lineage dataset URI.
 - **`batch_size: 0` sentinel** — drain the whole result set into a single page for small lookup tables or load-job-style sinks.
 
@@ -73,6 +74,8 @@ faucet run pipeline.yaml
 | `net_write_timeout_secs` | int | `3600` | Sets the session's `net_write_timeout`: how long the server waits for the source to read more of a result. The pipeline stops reading while the sink writes a page, so the server default (60 s) aborts large extracts behind a slow sink with "Lost connection … during query". `0` keeps the server setting. |
 | `json_big_numbers` | `fail` \| `string` | `fail` | A number inside a JSON column that a 64-bit float cannot represent exactly (more than about 17 significant digits, or beyond the 64-bit integer range): `fail` fails the read with an error naming the column and the number's leading digits; `string` emits it as a JSON string holding its exact digits (one warning per column). Checked on the column's text, never after conversion. |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
+| `replication` | object | `{ type: full }` | `{ type: incremental, column, initial_value }` reads only rows changed since the stored bookmark — see [Incremental replication](#incremental-replication). |
+| `state_key` | string | *(derived)* | State-store key for the incremental bookmark. |
 
 There is no separate `auth` block — credentials live in `connection_url` (and can be sourced from env or a secrets manager; see [Config loading](#config-loading)).
 
@@ -183,7 +186,47 @@ The trait-level `batch_size` argument to `stream_pages` is ignored in favour of 
 
 > **Note** — MySQL's wire protocol sends rows from a simple `SELECT` in a single response (no server-side cursor), so the streaming here bounds memory on the client side rather than asking the server to page. True server-side cursor streaming is tracked separately as a follow-up.
 
-The MySQL query source has **no incremental-replication mode**, so every emitted page carries `bookmark: None` (there is no resume or effectively-once support — see [Capabilities](#capabilities)). For change-data-capture against MySQL binlogs, use [`faucet-source-mysql-cdc`](https://crates.io/crates/faucet-source-mysql-cdc) instead.
+With `replication: { type: full }` (the default) every page carries `bookmark: None`. With `replication: { type: incremental }` every page carries the bookmark after its last row — see [Incremental replication](#incremental-replication). For change-data-capture against MySQL binlogs, use [`faucet-source-mysql-cdc`](https://crates.io/crates/faucet-source-mysql-cdc).
+
+## Incremental replication
+
+`replication: { type: incremental }` reads only the rows that changed since the last run. The bookmark lives in the pipeline's [state store](https://faucet-hq.github.io/faucet-stream/cookbook/state.html), so pair it with a durable `state:` block (`file`, `redis` or `postgres`).
+
+```yaml
+pipeline:
+  source:
+    type: mysql
+    config:
+      connection_url: "mysql://faucet:faucet@localhost:3306/app"
+      query: "SELECT id, status, updated_at FROM orders"
+      replication:
+        type: incremental
+        column: updated_at          # an output column of the query
+        initial_value: "1970-01-01 00:00:00"
+  sink: { type: file, config: { path: ./out/orders.jsonl, if_exists: append } }
+  state: { type: file, config: { path: ./.faucet-state } }
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `replication.type` | `full` | `full` reads the whole result every run; `incremental` reads from the stored bookmark. |
+| `replication.column` | — *(required)* | Output column holding the cursor (`updated_at`, an increasing id). |
+| `replication.initial_value` | — *(required)* | Inclusive lower bound for the first run, before a bookmark is stored. Not `null`. |
+| `state_key` | derived | Explicit state-store key. Default `mysql:<host>:<fingerprint of the database URL and query>`; the CLI overrides it with the row's own key. |
+
+**How it reads.** The source wraps the query as `SELECT * FROM (<query>) AS q WHERE q.<column> >= <bookmark> ORDER BY q.<column>`, so the server filters and orders by the cursor (index it). To apply the cursor further inside the query — a CTE, a join, an aggregate — write `@bookmark` there with `>=` (`WHERE o.updated_at >= @bookmark`); it is bound as a `?` parameter, and a `> @bookmark` is refused at load time because it would skip rows that share the bookmark value. `DATETIME` and `TIMESTAMP` cursors are read as RFC 3339 strings and bound back as such.
+
+**Rows that share a cursor value are never skipped.** A strict `> bookmark` loses a row that commits after a run with the same `updated_at` as the last row read. Instead the bookmark stores the last cursor value **and** a 128-bit fingerprint of every row already emitted at that value — `{"value": "...", "boundary": ["<fingerprint>", ...]}`. The next read re-reads that value with `>=` and drops only the fingerprints it holds, so:
+
+- a row committed late at the boundary value is emitted;
+- a boundary row updated in place without its cursor moving is emitted again (its fingerprint changed);
+- nothing already written is emitted twice.
+
+The fingerprint covers the whole row, so no key column is needed. When more than 10,000 rows share one cursor value the set is dropped (`"boundary": null`) and the next read re-emits every row at that value — duplicates, never loss (a warning names the column). A bare value written with `faucet state set` reads as that value with an empty boundary.
+
+**A crash replays at most one page.** Every page carries the bookmark after its last row, and the pipeline persists it only after the sink has written and flushed the page. The final page carries a bookmark even when it is empty.
+
+**Limits.** Rows whose cursor is `NULL` are never read — use a `NOT NULL` column or `COALESCE` it in the query. A row that commits with a cursor value *below* the stored bookmark (a long transaction that stamped `updated_at` before it committed) is not seen; use a cursor the database sets at commit, or the CDC source, when that matters. The cursor column must be orderable by the server; client-side, rows provably before the bookmark (numbers, decimal strings, timestamps, dates) are dropped as a backstop, while other strings are left to the server's collation. Incremental replication works with [sharding](#sharded-execution-cluster-mode-b) (each shard keeps its own bookmark), and [range digests](#range-digests-faucet-verify-701) cover every row from `initial_value` on.
 
 ## Column types
 
@@ -220,7 +263,7 @@ alias the columns.
 |------------|-----------|-------|
 | Native streaming | ✅ | sqlx row cursor; one page per `batch_size` rows. |
 | Connection pooling | ✅ | `max_connections`, reused across fetches. |
-| Resume / bookmark state | ❌ | Stateless query source; every page is `bookmark: None`. |
+| Resume / bookmark state | ✅ | With `replication: { type: incremental }`; every page carries a bookmark. |
 | Effectively-once delivery | ❌ | Source does not implement `supports_exactly_once`. |
 | Write modes / upsert | — | Not applicable (this is a source). |
 | Compression | ❌ | No `compression` feature. |

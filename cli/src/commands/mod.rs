@@ -23,6 +23,8 @@ pub mod hub;
 pub mod init;
 pub mod install;
 pub mod list;
+#[cfg(feature = "otel")]
+pub mod logs;
 #[cfg(feature = "masking")]
 pub mod masking;
 #[cfg(feature = "mcp")]

@@ -374,6 +374,66 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.purge_run_logs(older_than), f => f.purge_run_logs(older_than))
     }
 
+    // ── Log delivery (#806) ───────────────────────────────────────────────────
+
+    async fn log_ship_rows(
+        &self,
+        pending_only: bool,
+    ) -> Result<Vec<crate::serve::history::LogShipRow>, HistoryError> {
+        via!(self, p => p.log_ship_rows(pending_only), f => f.log_ship_rows(pending_only))
+    }
+    async fn log_ship_row(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::serve::history::LogShipRow>, HistoryError> {
+        via!(self, p => p.log_ship_row(run_id), f => f.log_ship_row(run_id))
+    }
+    async fn log_ship_claim(
+        &self,
+        run_id: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, HistoryError> {
+        via!(self, p => p.log_ship_claim(run_id, ttl), f => f.log_ship_claim(run_id, ttl))
+    }
+    async fn log_ship_ack(&self, run_id: &str, delivered_seq: u64) -> Result<bool, HistoryError> {
+        via!(self, p => p.log_ship_ack(run_id, delivered_seq), f => f.log_ship_ack(run_id, delivered_seq))
+    }
+    async fn log_ship_fail(&self, run_id: &str, error: &str) -> Result<bool, HistoryError> {
+        via!(self, p => p.log_ship_fail(run_id, error), f => f.log_ship_fail(run_id, error))
+    }
+    async fn log_ship_release(&self, run_id: &str) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_release(run_id), f => f.log_ship_release(run_id))
+    }
+    async fn log_ship_add_dropped(&self, run_id: &str, n: u64) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_add_dropped(run_id, n), f => f.log_ship_add_dropped(run_id, n))
+    }
+    async fn log_ship_mark_notified(
+        &self,
+        run_id: &str,
+        failure: bool,
+        drop: bool,
+    ) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_mark_notified(run_id, failure, drop), f => f.log_ship_mark_notified(run_id, failure, drop))
+    }
+    async fn log_ship_forget(&self, run_id: &str) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_forget(run_id), f => f.log_ship_forget(run_id))
+    }
+    async fn run_log_stats(
+        &self,
+        run_id: &str,
+        after: Option<u64>,
+        through: Option<u64>,
+    ) -> Result<crate::serve::history::RunLogStats, HistoryError> {
+        via!(self, p => p.run_log_stats(run_id, after, through), f => f.run_log_stats(run_id, after, through))
+    }
+    async fn delete_run_logs_through(
+        &self,
+        run_id: &str,
+        through: u64,
+    ) -> Result<usize, HistoryError> {
+        via!(self, p => p.delete_run_logs_through(run_id, through), f => f.delete_run_logs_through(run_id, through))
+    }
+
     // ── Data Movement Catalog (#279) ─────────────────────────────────────────
 
     async fn catalog_record(
@@ -901,6 +961,36 @@ mod tests {
                 .await,
             Err(HistoryError::Degraded(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn log_delivery_is_forwarded() {
+        let fb = FallbackHistory::degraded_at_startup(Duration::from_secs(60), "test");
+        let line = crate::serve::history::RunLogLine {
+            seq: 10,
+            ts: Utc::now().to_rfc3339(),
+            level: "INFO".into(),
+            line: "x".into(),
+            attrs: Default::default(),
+        };
+        fb.record_run_logs("r", &[line]).await.unwrap();
+        assert_eq!(fb.log_ship_rows(true).await.unwrap().len(), 1);
+        assert!(
+            fb.log_ship_claim("r", Duration::from_secs(5))
+                .await
+                .unwrap()
+        );
+        assert!(fb.log_ship_fail("r", "down").await.unwrap());
+        assert!(fb.log_ship_ack("r", 10).await.unwrap());
+        fb.log_ship_add_dropped("r", 2).await.unwrap();
+        fb.log_ship_mark_notified("r", false, true).await.unwrap();
+        fb.log_ship_release("r").await.unwrap();
+        let row = fb.log_ship_row("r").await.unwrap().unwrap();
+        assert_eq!((row.dropped, row.notified_drop), (2, true));
+        assert_eq!(fb.run_log_stats("r", None, None).await.unwrap().lines, 1);
+        assert_eq!(fb.delete_run_logs_through("r", 10).await.unwrap(), 1);
+        fb.log_ship_forget("r").await.unwrap();
+        assert!(fb.log_ship_row("r").await.unwrap().is_none());
     }
 
     #[tokio::test]

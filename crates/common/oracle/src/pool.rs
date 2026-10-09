@@ -62,8 +62,8 @@ pub fn ora_code(e: &oracle::Error) -> Option<i32> {
 pub const CLIENT_HINT: &str = "the Oracle connectors load Oracle Instant Client at runtime: \
      install it (https://www.oracle.com/database/technologies/instant-client.html) and put \
      its directory on the library path (LD_LIBRARY_PATH on Linux, DYLD_LIBRARY_PATH or \
-     ~/lib on macOS). In the faucet container image, use a tag ending in `-oracle` \
-     (e.g. ghcr.io/faucet-hq/faucet-stream:full-oracle), which ships the client";
+     ~/lib on macOS). The faucet `full` container image \
+     (ghcr.io/faucet-hq/faucet-stream:full) ships the client";
 
 /// True when `message` is ODPI-C reporting that the client library is missing.
 pub fn is_client_missing(message: &str) -> bool {
@@ -166,7 +166,7 @@ mod tests {
             "DPI-1047: Cannot locate a 64-bit Oracle Client library"
         ));
         assert!(!is_client_missing("ORA-01017: invalid username/password"));
-        assert!(CLIENT_HINT.contains("full-oracle"));
+        assert!(CLIENT_HINT.contains("faucet-stream:full)"));
         assert_eq!(call_timeout(0), None);
         assert_eq!(call_timeout(5), Some(Duration::from_secs(5)));
     }

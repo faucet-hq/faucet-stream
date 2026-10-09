@@ -301,7 +301,7 @@ impl DeliveryOutcome {
 }
 
 /// Every kind a PagerDuty trigger can carry, i.e. all but `run_success`.
-const TRIGGER_KINDS: [EventKind; 10] = [
+const TRIGGER_KINDS: [EventKind; 11] = [
     EventKind::RunFailure,
     EventKind::SlaBreach,
     EventKind::CircuitOpen,
@@ -312,6 +312,7 @@ const TRIGGER_KINDS: [EventKind; 10] = [
     EventKind::ChangeRequested,
     EventKind::BudgetExceeded,
     EventKind::ConnectionNeedsReauth,
+    EventKind::LogExportFailed,
 ];
 
 /// The PagerDuty dedup key of every incident `rule` could have opened for
@@ -616,7 +617,7 @@ mod tests {
     fn an_unrestricted_rule_resolves_every_kind_key_once() {
         let r = rule("pd", vec![], slack());
         let keys = stateless_resolve_keys(&r, &NotifyEvent::run_success("p", "r", 1));
-        assert_eq!(keys.len(), 7, "{keys:?}");
+        assert_eq!(keys.len(), 8, "{keys:?}");
         assert!(keys.contains(&"p:r".to_string()));
         assert!(keys.contains(&"profile_drift:p:r".to_string()));
         assert!(!keys.iter().any(|k| k.starts_with("run_success")));

@@ -964,6 +964,11 @@ pub struct ObservabilitySpec {
     /// OTLP (OpenTelemetry) export configuration (#201).
     #[serde(default)]
     pub otel: Option<OtelSpec>,
+
+    /// Durable log-shipping settings (#806): the local buffer, its bounds and
+    /// retention. Shipping is on when `otel.export` lists `logs`.
+    #[serde(default)]
+    pub logs: Option<crate::logship::LogsSpec>,
 }
 
 /// Configuration for the Prometheus metrics HTTP endpoint.
@@ -1596,6 +1601,9 @@ impl PipelineConfig {
             && let Some(otel) = obs.otel.as_ref()
         {
             otel.to_core().map_err(CliError::Config)?;
+        }
+        if let Some(logs) = cfg.observability.as_ref().and_then(|o| o.logs.as_ref()) {
+            logs.validate().map_err(CliError::Config)?;
         }
         Ok(cfg)
     }

@@ -335,6 +335,31 @@ impl NotifyEvent {
         .with("connection", Value::String(connection.to_string()))
     }
 
+    /// A run's logs are not reaching the log service (#806): its export has
+    /// been failing, or buffered lines were dropped by a bound.
+    pub fn log_export_failed(
+        pipeline: &str,
+        row: &str,
+        run_id: &str,
+        pending_lines: u64,
+        dropped_lines: u64,
+        reason: &str,
+    ) -> Self {
+        Self::base(
+            EventKind::LogExportFailed,
+            Severity::Warning,
+            pipeline.to_string(),
+            row.to_string(),
+            format!("Logs of `{pipeline}` run {run_id} are not reaching the log service"),
+            format!(
+                "{reason}; {pending_lines} line(s) still buffered locally, {dropped_lines} dropped"
+            ),
+        )
+        .with("run_id", Value::String(run_id.to_string()))
+        .with("pending_lines", Value::from(pending_lines))
+        .with("dropped_lines", Value::from(dropped_lines))
+    }
+
     pub fn circuit_open(
         pipeline: impl Into<String>,
         row: impl Into<String>,

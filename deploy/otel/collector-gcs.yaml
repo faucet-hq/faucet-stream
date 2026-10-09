@@ -1,0 +1,33 @@
+# OpenTelemetry Collector (contrib 0.130): faucet run logs over OTLP → Google
+# Cloud Storage, date-partitioned and gzip-compressed (#806). GCS speaks the S3
+# XML API, so this uses the `awss3` exporter against storage.googleapis.com with
+# a GCS HMAC key (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY = the HMAC pair).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  awss3:
+    s3uploader:
+      region: auto
+      endpoint: https://storage.googleapis.com
+      s3_force_path_style: true
+      s3_bucket: faucet-run-logs
+      s3_prefix: logs
+      s3_partition_format: "year=%Y/month=%m/day=%d/hour=%H/minute=%M"
+      compression: gzip
+    marshaler: otlp_json
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awss3]

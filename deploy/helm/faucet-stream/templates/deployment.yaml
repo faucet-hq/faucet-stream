@@ -121,6 +121,21 @@ spec:
               value: {{ printf "sqlite://%s/history.db" $mountPath | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.otel.logs.enabled }}
+            # Log shipping over OTLP (#806).
+            - name: FAUCET_SERVE_OTEL_CONFIG
+              value: /etc/faucet-otel/otel.yaml
+            - name: FAUCET_SERVE_LOG_RETENTION_SECS
+              value: {{ .Values.otel.logs.retentionSeconds | quote }}
+            - name: FAUCET_SERVE_LOG_BUFFER_MAX_AGE_SECS
+              value: {{ .Values.otel.logs.maxAgeSeconds | quote }}
+            - name: FAUCET_SERVE_LOG_BUFFER_MAX_BYTES
+              value: {{ .Values.otel.logs.maxBytes | quote }}
+            {{- with .Values.otel.logs.linkTemplate }}
+            - name: FAUCET_SERVE_LOG_LINK_TEMPLATE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- if eq .Values.serve.auth.mode "token" }}
             - name: FAUCET_SERVE_AUTH_TOKEN
               valueFrom:
@@ -157,6 +172,11 @@ spec:
               mountPath: /etc/faucet-auth
               readOnly: true
             {{- end }}
+            {{- if .Values.otel.logs.enabled }}
+            - name: otel-config
+              mountPath: /etc/faucet-otel
+              readOnly: true
+            {{- end }}
             {{- if .Values.secretFiles.enabled }}
             - name: secret-files
               mountPath: {{ .Values.secretFiles.mountPath }}
@@ -177,6 +197,11 @@ spec:
         - name: pipeline-config
           configMap:
             name: {{ include "faucet-stream.configMapName" . }}
+        {{- end }}
+        {{- if .Values.otel.logs.enabled }}
+        - name: otel-config
+          configMap:
+            name: {{ include "faucet-stream.fullname" . }}-otel
         {{- end }}
         {{- if eq .Values.serve.auth.mode "rbac" }}
         - name: rbac-auth

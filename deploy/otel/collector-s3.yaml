@@ -1,0 +1,37 @@
+# OpenTelemetry Collector (contrib 0.130): receive faucet run logs over OTLP and
+# archive them to S3, date-partitioned and gzip-compressed (#806).
+#
+#   docker run --rm -p 4317:4317 -p 4318:4318 \
+#     -e AWS_REGION -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+#     -v "$PWD/collector-s3.yaml:/etc/otelcol-contrib/config.yaml" \
+#     otel/opentelemetry-collector-contrib:0.130.0
+#
+# faucet side: `observability.otel: { endpoint: http://collector:4317, export: [logs] }`.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  awss3:
+    s3uploader:
+      region: ${env:AWS_REGION}
+      s3_bucket: faucet-run-logs
+      s3_prefix: logs
+      # One object per minute under year=/month=/day=/hour=/minute=.
+      s3_partition_format: "year=%Y/month=%m/day=%d/hour=%H/minute=%M"
+      compression: gzip
+    marshaler: otlp_json
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awss3]

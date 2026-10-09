@@ -6,8 +6,9 @@ For the full feature grid see the [connector catalog](./connectors.md).
 ## PostgreSQL: query source vs. CDC
 
 - **`source-postgres`** runs a SQL query and returns the rows. Use it for
-  one-shot extracts, snapshots, or when you control an `updated_at` column and
-  parameterize the query yourself. Simple, no special Postgres config.
+  one-shot extracts, snapshots, or incremental pulls on an `updated_at` column
+  with `replication: { type: incremental }` (a stored bookmark; misses hard
+  deletes). Simple, no special Postgres config.
 - **`source-postgres-cdc`** streams every `INSERT`/`UPDATE`/`DELETE` from the
   write-ahead log via logical replication. Use it when you need **every change**
   (including deletes), low-latency capture, or resumability without a cursor
@@ -19,7 +20,8 @@ For the full feature grid see the [connector catalog](./connectors.md).
 ## MySQL: query source vs. CDC
 
 - **`source-mysql`** runs a SQL query and returns the rows — one-shot extracts,
-  snapshots, or `updated_at`-driven incremental pulls you parameterize yourself.
+  snapshots, or `updated_at`-driven incremental pulls with
+  `replication: { type: incremental }` (a stored bookmark; misses hard deletes).
   Simple, no special MySQL config.
 - **`source-mysql-cdc`** streams every `INSERT`/`UPDATE`/`DELETE` from the binary
   log via row-based replication. Use it when you need **every change** (including
