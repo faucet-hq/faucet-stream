@@ -126,7 +126,11 @@ impl LogExport {
     }
 
     #[cfg(feature = "notify")]
-    fn notifier_for(&self, rec: Option<&RunRecord>, run_id: &str) -> Option<Arc<crate::notify::Notifier>> {
+    fn notifier_for(
+        &self,
+        rec: Option<&RunRecord>,
+        run_id: &str,
+    ) -> Option<Arc<crate::notify::Notifier>> {
         if let Some(n) = self.notifiers.get(run_id) {
             return Some(n.clone());
         }
@@ -228,7 +232,9 @@ impl LogExport {
                     summary.skipped += 1;
                     continue;
                 }
-                let res = self.ship_run(history, exporter, &row, settle, &mut summary).await;
+                let res = self
+                    .ship_run(history, exporter, &row, settle, &mut summary)
+                    .await;
                 if let Err(e) = history.log_ship_release(&row.run_id).await {
                     tracing::warn!(run_id = %row.run_id, error = %e, "releasing the log-delivery lease failed");
                 }
@@ -252,7 +258,9 @@ impl LogExport {
         let cap = seq_at(Utc::now() - chrono::Duration::from_std(settle).unwrap_or_default());
         let mut after = row.delivered_seq;
         for _ in 0..MAX_BATCHES_PER_RUN {
-            let page = history.list_run_logs(&row.run_id, after, SHIP_BATCH).await?;
+            let page = history
+                .list_run_logs(&row.run_id, after, SHIP_BATCH)
+                .await?;
             let full = page.lines.len() == SHIP_BATCH;
             let lines: Vec<ShipLine> = page
                 .lines
@@ -301,7 +309,8 @@ impl LogExport {
             return Ok(());
         };
         if !row.notified_failure && failing_past(&st, self.notify_after, Utc::now()) {
-            self.notify(rec, run_id, &st, "OTLP log export keeps failing").await;
+            self.notify(rec, run_id, &st, "OTLP log export keeps failing")
+                .await;
             history
                 .log_ship_mark_notified(run_id, true, row.notified_drop)
                 .await?;
@@ -313,7 +322,13 @@ impl LogExport {
         Ok(())
     }
 
-    async fn notify(&self, rec: Option<&RunRecord>, run_id: &str, st: &DeliveryState, reason: &str) {
+    async fn notify(
+        &self,
+        rec: Option<&RunRecord>,
+        run_id: &str,
+        st: &DeliveryState,
+        reason: &str,
+    ) {
         #[cfg(feature = "notify")]
         if let Some(n) = self.notifier_for(rec, run_id) {
             let pipeline = rec.and_then(|r| r.name.clone()).unwrap_or_default();
@@ -334,7 +349,10 @@ impl LogExport {
     /// `retention` after delivery and undelivered ones until delivered,
     /// bounded by `max_age` / `max_bytes` (oldest dropped first, counted on
     /// the run). Without it, plain time-based retention.
-    pub async fn maintain(&self, history: &dyn RunHistory) -> Result<MaintainSummary, HistoryError> {
+    pub async fn maintain(
+        &self,
+        history: &dyn RunHistory,
+    ) -> Result<MaintainSummary, HistoryError> {
         let mut s = MaintainSummary::default();
         let now = Utc::now();
         if !self.configured {
@@ -361,13 +379,17 @@ impl LogExport {
                 .run_log_stats(&row.run_id, row.delivered_seq, Some(age_cut))
                 .await?;
             if old.lines > 0 {
-                s.purged += history.delete_run_logs_through(&row.run_id, age_cut).await?;
+                s.purged += history
+                    .delete_run_logs_through(&row.run_id, age_cut)
+                    .await?;
                 history.log_ship_add_dropped(&row.run_id, old.lines).await?;
                 metrics::dropped(DropReason::MaxAge, old.lines);
                 s.dropped_max_age += old.lines;
                 dropped_runs.push(row.run_id.clone());
             }
-            let left = history.run_log_stats(&row.run_id, row.delivered_seq, None).await?;
+            let left = history
+                .run_log_stats(&row.run_id, row.delivered_seq, None)
+                .await?;
             if left.lines > 0 {
                 pending.push((row, left.bytes, left.min_seq.unwrap_or(u64::MAX)));
             } else if history.get(&row.run_id).await?.is_none()
@@ -388,7 +410,9 @@ impl LogExport {
                 if n == 0 {
                     continue;
                 }
-                s.purged += history.delete_run_logs_through(&row.run_id, through).await?;
+                s.purged += history
+                    .delete_run_logs_through(&row.run_id, through)
+                    .await?;
                 history.log_ship_add_dropped(&row.run_id, n).await?;
                 metrics::dropped(DropReason::MaxBytes, n);
                 s.dropped_max_bytes += n;
@@ -398,11 +422,16 @@ impl LogExport {
             }
         }
         for (row, bytes, min_seq) in &pending {
-            let left = history.run_log_stats(&row.run_id, row.delivered_seq, None).await?;
+            let left = history
+                .run_log_stats(&row.run_id, row.delivered_seq, None)
+                .await?;
             s.gauges.lines += left.lines;
             s.gauges.bytes += (*bytes).min(left.bytes);
             if let Some(t) = left.min_seq.or(Some(*min_seq)).and_then(seq_time) {
-                s.gauges.oldest_secs = s.gauges.oldest_secs.max((now - t).num_seconds().max(0) as u64);
+                s.gauges.oldest_secs = s
+                    .gauges
+                    .oldest_secs
+                    .max((now - t).num_seconds().max(0) as u64);
             }
         }
         metrics::set_buffer(s.gauges);
@@ -412,8 +441,13 @@ impl LogExport {
             let (row, st) = Self::delivery(history, &run_id).await?;
             if row.is_some_and(|r| !r.notified_drop) {
                 let rec = history.get(&run_id).await?;
-                self.notify(rec.as_ref(), &run_id, &st, "buffered log lines were dropped before delivery")
-                    .await;
+                self.notify(
+                    rec.as_ref(),
+                    &run_id,
+                    &st,
+                    "buffered log lines were dropped before delivery",
+                )
+                .await;
                 history
                     .log_ship_mark_notified(&run_id, st.failing_since.is_some(), true)
                     .await?;
@@ -517,7 +551,8 @@ pub async fn run_loop(
 
 fn backoff(prev: Duration) -> Duration {
     let next = (prev * 2).min(Duration::from_secs(60));
-    let jitter = u64::from(Utc::now().timestamp_subsec_millis()) % (next.as_millis() as u64 / 5 + 1);
+    let jitter =
+        u64::from(Utc::now().timestamp_subsec_millis()) % (next.as_millis() as u64 / 5 + 1);
     next + Duration::from_millis(jitter)
 }
 

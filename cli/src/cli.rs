@@ -2064,7 +2064,11 @@ pub struct ServeArgs {
     /// and `--log-buffer-max-bytes`. Requires a persistent `--history` backend
     /// unless shipping is on; `0` disables durable log persistence (ephemeral
     /// SSE only). Default: 24 hours.
-    #[arg(long, default_value_t = 86_400, env = "FAUCET_SERVE_LOG_RETENTION_SECS")]
+    #[arg(
+        long,
+        default_value_t = 86_400,
+        env = "FAUCET_SERVE_LOG_RETENTION_SECS"
+    )]
     pub log_retention_secs: u64,
     /// Per-run cap on persisted log lines (#529). Past it a truncation marker is
     /// recorded and further lines are dropped.

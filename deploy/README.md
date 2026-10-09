@@ -7,6 +7,7 @@ Container image + Kubernetes/Helm assets for running faucet-stream anywhere.
 | [`../Dockerfile`](../Dockerfile) | Multi-stage image build with **name-based connector selection** (build args). |
 | [`../scripts/build-image.sh`](../scripts/build-image.sh) | Helper to build lean or full images by connector name. |
 | [`helm/faucet-stream/`](./helm/faucet-stream/) | Helm chart — `serve` Deployment and/or `run` Job/CronJob. |
+| [`otel/`](./otel/) | Log-shipping recipes: Alloy → Loki, OTel Collector → S3 / GCS / Azure, a Docker Compose example. |
 | [`../.github/workflows/docker-images.yml`](../.github/workflows/docker-images.yml) | CI matrix that publishes named per-profile images to GHCR. |
 
 ## The one thing to understand

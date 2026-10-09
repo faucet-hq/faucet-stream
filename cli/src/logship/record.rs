@@ -280,7 +280,10 @@ mod tests {
         let long = "é".repeat(MAX_LINE_BYTES);
         let t = truncate_line(long.clone());
         assert!(t.len() < long.len());
-        assert!(t.ends_with(&format!("[truncated {} bytes]", long.len() - MAX_LINE_BYTES)));
+        assert!(t.ends_with(&format!(
+            "[truncated {} bytes]",
+            long.len() - MAX_LINE_BYTES
+        )));
     }
 
     #[test]
@@ -305,7 +308,10 @@ mod tests {
     #[test]
     fn status_precedence() {
         let mut st = DeliveryState::default();
-        assert_eq!(derive_view(false, &st).status, LogExportStatus::NotConfigured);
+        assert_eq!(
+            derive_view(false, &st).status,
+            LogExportStatus::NotConfigured
+        );
         assert_eq!(derive_view(true, &st).status, LogExportStatus::Exported);
         st.pending_lines = 3;
         assert_eq!(derive_view(true, &st).status, LogExportStatus::Pending);
@@ -334,7 +340,11 @@ mod tests {
     fn summary_lines() {
         let mut st = DeliveryState::default();
         assert_eq!(derive_view(true, &st).summary_line(), "logs: exported");
-        assert!(derive_view(false, &st).summary_line().contains("not configured"));
+        assert!(
+            derive_view(false, &st)
+                .summary_line()
+                .contains("not configured")
+        );
         st.pending_lines = 1204;
         assert_eq!(
             derive_view(true, &st).summary_line(),
@@ -342,12 +352,24 @@ mod tests {
         );
         st.pending_lines = 1;
         st.last_error = Some("refused".into());
-        assert!(derive_view(true, &st).summary_line().contains("1 line pending"));
+        assert!(
+            derive_view(true, &st)
+                .summary_line()
+                .contains("1 line pending")
+        );
         assert!(derive_view(true, &st).summary_line().contains("refused"));
         st.dropped_lines = 1;
-        assert!(derive_view(true, &st).summary_line().contains("1 line dropped"));
+        assert!(
+            derive_view(true, &st)
+                .summary_line()
+                .contains("1 line dropped")
+        );
         st.dropped_lines = 2;
-        assert!(derive_view(true, &st).summary_line().contains("2 lines dropped"));
+        assert!(
+            derive_view(true, &st)
+                .summary_line()
+                .contains("2 lines dropped")
+        );
         assert_eq!(group(0), "0");
         assert_eq!(group(999), "999");
         assert_eq!(group(1_000_000), "1,000,000");

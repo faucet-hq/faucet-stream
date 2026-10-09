@@ -195,10 +195,7 @@ mod tests {
             default_spool_dir(Some("rel".into()), Some("/h".into())),
             PathBuf::from("/h/.local/state/faucet/logs")
         );
-        assert_eq!(
-            default_spool_dir(None, None),
-            PathBuf::from(".faucet/logs")
-        );
+        assert_eq!(default_spool_dir(None, None), PathBuf::from(".faucet/logs"));
         let _ = LogsSpec::default().resolved_spool_dir();
     }
 }

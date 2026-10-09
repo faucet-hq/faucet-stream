@@ -136,7 +136,12 @@ pub fn render_human(dir: &std::path::Path, report: &PassReport) -> String {
         if report.undelivered() == 1 { "" } else { "s" },
     );
     for r in report.runs.iter().filter(|r| !r.removed) {
-        let pipeline = r.meta.attrs.get("pipeline").map(String::as_str).unwrap_or("-");
+        let pipeline = r
+            .meta
+            .attrs
+            .get("pipeline")
+            .map(String::as_str)
+            .unwrap_or("-");
         let mut line = format!("  {} {:<20} {}", r.run_id, pipeline, r.view.status.as_str());
         if r.view.pending_lines > 0 {
             line.push_str(&format!(" ({} pending)", r.view.pending_lines));
@@ -169,7 +174,10 @@ mod tests {
         .unwrap();
         assert_eq!(o.endpoint, "http://c:4318");
         assert_eq!(o.protocol, faucet_core::OtelProtocol::Http);
-        assert_eq!(s.spool_dir.as_deref(), Some(std::path::Path::new("/tmp/spool")));
+        assert_eq!(
+            s.spool_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/spool"))
+        );
         let (o, _) = resolve(None, Some("http://c:4317"), Some("grpc"), None).unwrap();
         assert_eq!(o.protocol, faucet_core::OtelProtocol::Grpc);
         assert!(resolve(None, Some("not a url"), None, None).is_err());
@@ -177,7 +185,10 @@ mod tests {
         let cfg = crate::config::parse_with_extension(yaml, "yaml").unwrap();
         let (o, s) = resolve(Some(&cfg), None, None, None).unwrap();
         assert_eq!(o.endpoint, "http://col:4317");
-        assert_eq!(s.spool_dir.as_deref(), Some(std::path::Path::new("/var/spool")));
+        assert_eq!(
+            s.spool_dir.as_deref(),
+            Some(std::path::Path::new("/var/spool"))
+        );
     }
 
     #[test]

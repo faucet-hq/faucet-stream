@@ -109,7 +109,10 @@ fn writer_loop(rx: Receiver<Msg>) {
     }
 }
 
-fn apply_queue_drops(writers: &mut HashMap<PathBuf, SpoolWriter>, run_dir: &HashMap<String, PathBuf>) {
+fn apply_queue_drops(
+    writers: &mut HashMap<PathBuf, SpoolWriter>,
+    run_dir: &HashMap<String, PathBuf>,
+) {
     let Some(c) = CAPTURE.get() else {
         return;
     };

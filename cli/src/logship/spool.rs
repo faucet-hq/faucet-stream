@@ -453,10 +453,7 @@ impl SpoolWriter {
         let Some(mut run) = self.runs.remove(run_id) else {
             return;
         };
-        let res = run
-            .file
-            .flush()
-            .and_then(|_| run.file.get_ref().sync_all());
+        let res = run.file.flush().and_then(|_| run.file.get_ref().sync_all());
         if let Err(e) = res {
             self.failed(0, "closing the segment", &e);
         }
@@ -571,7 +568,8 @@ pub async fn ship_pass(
     let ids = spool.run_ids();
     let bytes_drop = plan_bytes_drops(spool, &ids, opts.max_bytes);
     for id in ids {
-        if let Some(r) = process_run(spool, &id, exporter, opts, now, &bytes_drop, &mut report).await
+        if let Some(r) =
+            process_run(spool, &id, exporter, opts, now, &bytes_drop, &mut report).await
         {
             report.runs.push(r);
         }
@@ -733,15 +731,15 @@ async fn process_run(
         c.settled_at = None;
     }
     let st = delivery_state(&meta, &c, pending);
-    let notify_failure = !c.notified_failure
-        && crate::logship::record::failing_past(&st, opts.notify_after, now);
+    let notify_failure =
+        !c.notified_failure && crate::logship::record::failing_past(&st, opts.notify_after, now);
     let notify_drop = !c.notified_drop && st.dropped_lines > 0;
     c.notified_failure |= notify_failure;
     c.notified_drop |= notify_drop;
 
-    let removed = c.settled_at.is_some_and(|t| {
-        now - t >= chrono::Duration::from_std(opts.retention).unwrap_or_default()
-    });
+    let removed = c
+        .settled_at
+        .is_some_and(|t| now - t >= chrono::Duration::from_std(opts.retention).unwrap_or_default());
     if removed {
         spool.remove_run(id);
     } else if let Err(e) = spool.write_cursor(id, &c) {

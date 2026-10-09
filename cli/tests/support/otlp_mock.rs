@@ -141,7 +141,9 @@ impl LogsService for GrpcSvc {
             return Err(tonic_otlp::Status::unavailable("collector down"));
         }
         self.0.accept(request.into_inner());
-        Ok(tonic_otlp::Response::new(ExportLogsServiceResponse::default()))
+        Ok(tonic_otlp::Response::new(
+            ExportLogsServiceResponse::default(),
+        ))
     }
 }
 
@@ -175,9 +177,8 @@ impl wiremock::Respond for HttpResponder {
         match ExportLogsServiceRequest::decode(req.body.as_slice()) {
             Ok(r) => {
                 self.0.accept(r);
-                wiremock::ResponseTemplate::new(200).set_body_bytes(
-                    ExportLogsServiceResponse::default().encode_to_vec(),
-                )
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(ExportLogsServiceResponse::default().encode_to_vec())
             }
             Err(_) => wiremock::ResponseTemplate::new(400),
         }

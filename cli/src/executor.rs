@@ -998,25 +998,28 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             let unit_cancel = level_cancel.child_token();
             let dlq_sinks = Arc::clone(&dlq_sinks);
             let state_stores = Arc::clone(&state_stores);
-            let handle = joinset.spawn(STATE_STORES.scope(
-                state_stores,
-                DLQ_SINKS.scope(dlq_sinks, async move {
-                    let _permit = sem.acquire().await.expect("semaphore not closed");
-                    run_unit(
-                        &unit,
-                        capture,
-                        &captured,
-                        &discovered,
-                        &collected,
-                        &opts2,
-                        unit_cancel,
-                        suppress_overwrite,
-                        overwrite_grouped,
+            let handle = joinset.spawn(
+                STATE_STORES
+                    .scope(
+                        state_stores,
+                        DLQ_SINKS.scope(dlq_sinks, async move {
+                            let _permit = sem.acquire().await.expect("semaphore not closed");
+                            run_unit(
+                                &unit,
+                                capture,
+                                &captured,
+                                &discovered,
+                                &collected,
+                                &opts2,
+                                unit_cancel,
+                                suppress_overwrite,
+                                overwrite_grouped,
+                            )
+                            .await
+                        }),
                     )
-                    .await
-                }),
-            )
-            .in_current_span());
+                    .in_current_span(),
+            );
             task_meta.insert(handle.id(), meta);
         }
 

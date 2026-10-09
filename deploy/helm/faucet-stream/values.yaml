@@ -111,6 +111,43 @@ pipelineConfig:
   #     source: { type: rest, config: { ... } }
   #     sink:   { type: jsonl, config: { path: /var/lib/faucet/out.jsonl } }
 
+# -----------------------------------------------------------------------------
+# Log shipping over OTLP (#806). Requires an image built with the `otel`
+# feature (the `full` image). Every run-log line is buffered locally first and
+# shipped to the collector; delivered lines are kept `retentionSeconds`,
+# undelivered ones until delivered (bounded by maxAge / maxBytes).
+#
+# - serve: the run-history backend is the buffer. Use history.backend sqlite +
+#   serve.persistence (or postgres) for a buffer that survives a restart; with
+#   `memory` the buffer is lost on restart.
+# - job / cronjob: `faucet run` spools to `spoolDir` (mounted below). The
+#   pipeline config must turn shipping on itself:
+#     observability:
+#       otel: { endpoint: ..., export: [logs] }
+#       logs: { spool_dir: /var/lib/faucet-logs }
+# -----------------------------------------------------------------------------
+otel:
+  logs:
+    enabled: false
+    endpoint: ""            # e.g. http://otel-collector:4317 (grpc) / :4318 (http)
+    protocol: grpc          # grpc | http
+    serviceName: faucet
+    headers: {}             # e.g. { authorization: "Bearer ..." }
+    retentionSeconds: 86400
+    maxAgeSeconds: 604800
+    maxBytes: 1073741824
+    # "View logs" link in the console once a run's local copy aged out.
+    linkTemplate: ""        # e.g. https://grafana.example/explore?...{run_id}...
+    # job / cronjob spool directory and its volume.
+    spoolDir: /var/lib/faucet-logs
+    buffer:
+      persistence:
+        enabled: false      # emptyDir otherwise: undelivered lines die with the pod
+        size: 1Gi
+        storageClass: ""
+        accessModes: [ReadWriteOnce]
+        existingClaim: ""
+
 # =============================================================================
 # serve — long-running HTTP control plane (Deployment)
 # =============================================================================

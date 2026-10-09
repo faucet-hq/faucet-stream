@@ -9,9 +9,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsSe
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
-use opentelemetry_proto::tonic::common::v1::{
-    AnyValue, InstrumentationScope, KeyValue, any_value,
-};
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost_otlp::Message as _;
@@ -238,7 +236,9 @@ impl OtlpLogExporter {
                 client
                     .export(request)
                     .await
-                    .map_err(|s| format!("OTLP gRPC export failed: {} ({})", s.message(), s.code()))?
+                    .map_err(|s| {
+                        format!("OTLP gRPC export failed: {} ({})", s.message(), s.code())
+                    })?
                     .into_inner()
             }
             Transport::Http { client, url } => {
@@ -354,19 +354,23 @@ mod tests {
         let rows: Vec<_> = r0.attributes.iter().filter(|a| a.key == "row").collect();
         assert_eq!(rows.len(), 1, "line attrs win over run attrs");
         assert!(sl.log_records[1].trace_id.is_empty());
-        assert!(build_request("svc", &run, &[]).resource_logs[0].scope_logs[0]
-            .scope
-            .as_ref()
-            .unwrap()
-            .attributes
-            .is_empty());
+        assert!(
+            build_request("svc", &run, &[]).resource_logs[0].scope_logs[0]
+                .scope
+                .as_ref()
+                .unwrap()
+                .attributes
+                .is_empty()
+        );
         assert_eq!(unix_nanos("garbage"), 0);
         assert!(hex_bytes("zz", 1).is_empty());
     }
 
     #[test]
     fn batching_splits_by_count_and_size() {
-        let lines: Vec<ShipLine> = (0..(BATCH_LINES as u64 * 2 + 1)).map(|i| line(i, &[])).collect();
+        let lines: Vec<ShipLine> = (0..(BATCH_LINES as u64 * 2 + 1))
+            .map(|i| line(i, &[]))
+            .collect();
         let b = batches(lines);
         assert_eq!(b.len(), 3);
         assert_eq!(b[0].len(), BATCH_LINES);
@@ -380,7 +384,10 @@ mod tests {
     #[test]
     fn endpoints_and_header_validation() {
         assert_eq!(http_logs_endpoint("http://c:4318"), "http://c:4318/v1/logs");
-        assert_eq!(http_logs_endpoint("http://c:4318/v1/logs/"), "http://c:4318/v1/logs");
+        assert_eq!(
+            http_logs_endpoint("http://c:4318/v1/logs/"),
+            "http://c:4318/v1/logs"
+        );
         let mut cfg = OtelConfig {
             protocol: OtelProtocol::Http,
             ..Default::default()
@@ -414,6 +421,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(grpc.export(&BTreeMap::new(), &[line(1, &[])]).await.is_err());
+        assert!(
+            grpc.export(&BTreeMap::new(), &[line(1, &[])])
+                .await
+                .is_err()
+        );
     }
 }

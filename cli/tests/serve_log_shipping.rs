@@ -113,7 +113,9 @@ fn line(seq: u64, text: &str) -> RunLogLine {
 /// `n` lines captured `age` ago.
 fn lines_at(age: Duration, n: u64, text: &str) -> Vec<RunLogLine> {
     let base = seq_at(chrono::Utc::now() - chrono::Duration::from_std(age).unwrap()) & !0xFFF;
-    (0..n).map(|i| line(base + i, &format!("{text} {i}"))).collect()
+    (0..n)
+        .map(|i| line(base + i, &format!("{text} {i}")))
+        .collect()
 }
 
 async fn record_run(h: &dyn RunHistory, id: &str, name: &str, tenant: Option<&str>) {
@@ -131,11 +133,18 @@ async fn record_run(h: &dyn RunHistory, id: &str, name: &str, tenant: Option<&st
 /// The delivery bookkeeping contract, shared by both backends.
 async fn delivery_contract(h: &dyn RunHistory) {
     assert!(h.log_ship_row("none").await.unwrap().is_none());
-    assert!(!h.log_ship_claim("none", Duration::from_secs(5)).await.unwrap());
+    assert!(
+        !h.log_ship_claim("none", Duration::from_secs(5))
+            .await
+            .unwrap()
+    );
     let lines = lines_at(Duration::from_secs(10), 4, "l");
     h.record_run_logs("r", &lines).await.unwrap();
     let page = h.list_run_logs("r", None, 10).await.unwrap();
-    assert_eq!(page.lines[0].attrs.get("row").map(String::as_str), Some("r1"));
+    assert_eq!(
+        page.lines[0].attrs.get("row").map(String::as_str),
+        Some("r1")
+    );
     let row = h.log_ship_row("r").await.unwrap().unwrap();
     assert_eq!(row.total_seq, lines[3].seq);
     assert!(row.has_pending());
@@ -165,14 +174,20 @@ async fn delivery_contract(h: &dyn RunHistory) {
     let row = h.log_ship_row("r").await.unwrap().unwrap();
     assert_eq!(row.delivered_seq, Some(lines[1].seq));
     assert!(row.last_error.is_none() && row.failing_since.is_none());
-    assert!(!row.notified_failure, "a success re-arms the failure notification");
+    assert!(
+        !row.notified_failure,
+        "a success re-arms the failure notification"
+    );
     h.log_ship_release("r").await.unwrap();
     assert!(h.log_ship_row("r").await.unwrap().unwrap().owner.is_none());
 
     h.log_ship_add_dropped("r", 3).await.unwrap();
     h.log_ship_add_dropped("r", 2).await.unwrap();
     assert_eq!(h.log_ship_row("r").await.unwrap().unwrap().dropped, 5);
-    assert_eq!(h.delete_run_logs_through("r", lines[1].seq).await.unwrap(), 2);
+    assert_eq!(
+        h.delete_run_logs_through("r", lines[1].seq).await.unwrap(),
+        2
+    );
     assert_eq!(h.run_log_stats("r", None, None).await.unwrap().lines, 2);
     assert_eq!(h.log_ship_rows(false).await.unwrap().len(), 1);
     h.log_ship_forget("r").await.unwrap();
@@ -199,21 +214,34 @@ async fn cluster_one_instance_ships_a_run_and_a_peer_takes_over_after_its_lease(
     a.record_run_logs("run", &lines_at(Duration::from_secs(10), 3, "x"))
         .await
         .unwrap();
-    assert!(a.log_ship_claim("run", Duration::from_secs(1)).await.unwrap());
     assert!(
-        !b.log_ship_claim("run", Duration::from_secs(1)).await.unwrap(),
+        a.log_ship_claim("run", Duration::from_secs(1))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !b.log_ship_claim("run", Duration::from_secs(1))
+            .await
+            .unwrap(),
         "no second shipper while the lease is live"
     );
     assert!(
-        a.log_ship_claim("run", Duration::from_secs(1)).await.unwrap(),
+        a.log_ship_claim("run", Duration::from_secs(1))
+            .await
+            .unwrap(),
         "the holder renews"
     );
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert!(
-        b.log_ship_claim("run", Duration::from_secs(1)).await.unwrap(),
+        b.log_ship_claim("run", Duration::from_secs(1))
+            .await
+            .unwrap(),
         "a peer takes over once the lease lapses"
     );
-    assert!(!a.log_ship_ack("run", 1).await.unwrap(), "the old holder is fenced");
+    assert!(
+        !a.log_ship_ack("run", 1).await.unwrap(),
+        "the old holder is fenced"
+    );
 
     // The shipper of a live-leased run skips it; once B ships, A has nothing.
     let (col, ep) = start_grpc().await;
@@ -269,7 +297,11 @@ async fn outage_then_restart_delivers_every_line_exactly_once() {
     assert_eq!(r.attr("pipeline"), Some("orders"));
     assert_eq!(r.attr("tenant"), Some("acme"));
     assert_eq!(r.attr("row"), Some("r1"));
-    assert!(r.body.starts_with("line "), "body without the rendered prefix: {}", r.body);
+    assert!(
+        r.body.starts_with("line "),
+        "body without the rendered prefix: {}",
+        r.body
+    );
     let rec = h.get("run-1").await.unwrap().unwrap();
     let v = ex.view(&h, &rec).await;
     assert_eq!(v.status, LogExportStatus::Exported);
@@ -322,13 +354,18 @@ async fn retention_follows_delivery_and_bounds_drop_the_oldest() {
     let ex2 = LogExport::from_config(&tight);
     let m = ex2.maintain(&h).await.unwrap();
     assert!(m.dropped_max_bytes >= 1);
-    assert_eq!(h.run_log_stats("old", None, None).await.unwrap().lines, 2 - m.dropped_max_bytes);
+    assert_eq!(
+        h.run_log_stats("old", None, None).await.unwrap().lines,
+        2 - m.dropped_max_bytes
+    );
 
     // A run whose record and lines are gone loses its delivery row.
     h.record_run_logs("ghost", &lines_at(Duration::from_secs(10), 1, "g"))
         .await
         .unwrap();
-    h.delete_run_logs_through("ghost", u64::MAX - 1).await.unwrap();
+    h.delete_run_logs_through("ghost", u64::MAX - 1)
+        .await
+        .unwrap();
     ex.maintain(&h).await.unwrap();
     assert!(h.log_ship_row("ghost").await.unwrap().is_none());
 }
@@ -350,7 +387,10 @@ async fn without_an_exporter_retention_is_time_based() {
     assert_eq!(ex.ship_once(&h).await.unwrap(), Default::default());
     record_run(&h, "x", "p", None).await;
     let rec = h.get("x").await.unwrap().unwrap();
-    assert_eq!(ex.view(&h, &rec).await.status, LogExportStatus::NotConfigured);
+    assert_eq!(
+        ex.view(&h, &rec).await.status,
+        LogExportStatus::NotConfigured
+    );
     faucet_cli::serve::log_export::final_flush(&ex, &h, Duration::from_secs(1)).await;
 }
 
@@ -368,7 +408,8 @@ async fn failing_exports_and_drops_notify_the_runs_channels() {
     let mut cfg = export_config(Some(otel(&ep, faucet_core::OtelProtocol::Grpc)));
     cfg.log_buffer.notify_after = Duration::ZERO;
     cfg.log_buffer.max_age = Duration::from_secs(60);
-    cfg.log_buffer.link_template = Some("https://logs.example/explore?run={run_id}&t={tenant}".into());
+    cfg.log_buffer.link_template =
+        Some("https://logs.example/explore?run={run_id}&t={tenant}".into());
     let ex = LogExport::from_config(&cfg);
     let mut rec = RunRecord::queued(
         "n-1".into(),
@@ -399,7 +440,10 @@ async fn failing_exports_and_drops_notify_the_runs_channels() {
     ex.maintain(&h).await.unwrap();
     assert!(h.log_ship_row("n-1").await.unwrap().unwrap().notified_drop);
     let v = ex.view(&h, &rec).await;
-    assert_eq!(v.link.as_deref(), Some("https://logs.example/explore?run=n-1&t="));
+    assert_eq!(
+        v.link.as_deref(),
+        Some("https://logs.example/explore?run=n-1&t=")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -432,7 +476,13 @@ async fn serve_ships_a_runs_logs_and_reports_it_on_the_run() {
         wait_for_async(30, || {
             let c = client.clone();
             let u = format!("{base}/healthz");
-            async move { c.get(u).send().await.map(|r| r.status().is_success()).unwrap_or(false) }
+            async move {
+                c.get(u)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }
         })
         .await
     );
@@ -469,14 +519,19 @@ async fn serve_ships_a_runs_logs_and_reports_it_on_the_run() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(last["log_export"]["status"], "exported", "{last}");
-    assert_eq!(last["log_export"]["link"], format!("https://g/explore?q={id}"));
+    assert_eq!(
+        last["log_export"]["link"],
+        format!("https://g/explore?q={id}")
+    );
     let recs = col.records_where("serve_run_id", &id);
     assert!(!recs.is_empty());
     assert!(recs.iter().all(|r| r.service == "faucet-serve-test"));
     assert!(
         recs.iter().all(|r| r.attr("pipeline") == Some("served")),
         "{:?}",
-        recs.iter().map(|r| (r.attr("pipeline"), &r.body)).collect::<Vec<_>>()
+        recs.iter()
+            .map(|r| (r.attr("pipeline"), &r.body))
+            .collect::<Vec<_>>()
     );
 
     // A known run with no local lines left answers with the link.

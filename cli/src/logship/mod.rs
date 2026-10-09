@@ -25,8 +25,8 @@ pub mod session;
 pub mod spool;
 
 pub use record::{
-    DeliveryState, LinkVars, LogExportStatus, LogExportView, MAX_LINE_BYTES, ShipLine,
-    derive_view, render_link, truncate_line,
+    DeliveryState, LinkVars, LogExportStatus, LogExportView, MAX_LINE_BYTES, ShipLine, derive_view,
+    render_link, truncate_line,
 };
 pub use spec::LogsSpec;
 

@@ -96,6 +96,26 @@ Shared env block for every faucet pod. Renders user env, the chart Secret (if
 created), and (for serve token auth) the auth token from its Secret.
 Usage: {{- include "faucet-stream.env" . | nindent 12 }}
 */}}
+{{/* The run-log spool volume for job / cronjob pods (#806). */}}
+{{- define "faucet-stream.logSpoolVolume" -}}
+{{- if .Values.otel.logs.enabled }}
+- name: log-spool
+  {{- if or .Values.otel.logs.buffer.persistence.enabled .Values.otel.logs.buffer.persistence.existingClaim }}
+  persistentVolumeClaim:
+    claimName: {{ .Values.otel.logs.buffer.persistence.existingClaim | default (printf "%s-logs" (include "faucet-stream.fullname" .)) }}
+  {{- else }}
+  emptyDir: {}
+  {{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "faucet-stream.logSpoolMount" -}}
+{{- if .Values.otel.logs.enabled }}
+- name: log-spool
+  mountPath: {{ .Values.otel.logs.spoolDir }}
+{{- end }}
+{{- end -}}
+
 {{- define "faucet-stream.env" -}}
 {{- with .Values.env }}
 {{ toYaml . }}

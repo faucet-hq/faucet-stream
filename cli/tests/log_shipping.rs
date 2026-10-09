@@ -88,7 +88,11 @@ async fn run_ships_every_line_with_its_attributes_over_grpc() {
         .expect("the pipeline's completion line was shipped");
     assert!(in_pipeline.attr("row").is_some());
     assert!(in_pipeline.attr("invocation_id").is_some());
-    assert!(in_pipeline.scope_attrs.contains_key("faucet.batch.first_seq"));
+    assert!(
+        in_pipeline
+            .scope_attrs
+            .contains_key("faucet.batch.first_seq")
+    );
 
     // Every captured line went out exactly once, in order.
     let s = seqs(&recs);
@@ -159,16 +163,29 @@ async fn collector_down_then_logs_ship_delivers_each_line_once_over_http() {
     let recs = col.records();
     let s = seqs(&recs);
     let meta = sp.read_meta(&ids[0]).unwrap();
-    assert_eq!(s.len() as u64, meta.last_seq, "every buffered line delivered");
+    assert_eq!(
+        s.len() as u64,
+        meta.last_seq,
+        "every buffered line delivered"
+    );
     assert_eq!(
         s.iter().copied().collect::<BTreeSet<_>>().len(),
         s.len(),
         "exactly once"
     );
     // A second ship sends nothing more.
-    faucet(&["logs", "ship", "--spool", spool.to_str().unwrap(), "--endpoint", &ep, "--protocol", "http"])
-        .await
-        .unwrap();
+    faucet(&[
+        "logs",
+        "ship",
+        "--spool",
+        spool.to_str().unwrap(),
+        "--endpoint",
+        &ep,
+        "--protocol",
+        "http",
+    ])
+    .await
+    .unwrap();
     assert_eq!(seqs(&col.records()).len(), s.len());
 }
 
@@ -196,9 +213,15 @@ async fn schedule_ticks_are_runs_and_recover_after_an_outage() {
     assert_eq!(col.request_count(), 0);
 
     col.set_down(false);
-    faucet(&["logs", "ship", cfg.to_str().unwrap(), "--spool", spool.to_str().unwrap()])
-        .await
-        .unwrap();
+    faucet(&[
+        "logs",
+        "ship",
+        cfg.to_str().unwrap(),
+        "--spool",
+        spool.to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
     let recs = col.records_where("run_id", &ids[0]);
     assert!(
         recs.iter()
@@ -206,7 +229,10 @@ async fn schedule_ticks_are_runs_and_recover_after_an_outage() {
         "the tick's pipeline lines are tagged with its run id: {:?} meta {:?} all {:?}",
         recs.iter().map(|r| &r.body).collect::<Vec<_>>(),
         sp.read_meta(&ids[0]),
-        col.records().iter().map(|r| (&r.body, r.attr("run_id"))).collect::<Vec<_>>()
+        col.records()
+            .iter()
+            .map(|r| (&r.body, r.attr("run_id")))
+            .collect::<Vec<_>>()
     );
     let meta = sp.read_meta(&ids[0]).unwrap();
     assert_eq!(seqs(&recs).len() as u64, meta.last_seq);
@@ -232,7 +258,9 @@ async fn the_background_shipper_drains_once_the_collector_returns() {
     }
     session.set_default_run(None);
     session.end_run("bg-run");
-    session.flush_writer(std::time::Duration::from_secs(2)).await;
+    session
+        .flush_writer(std::time::Duration::from_secs(2))
+        .await;
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
     assert_eq!(col.request_count(), 0, "nothing acknowledged while down");
     col.set_down(false);

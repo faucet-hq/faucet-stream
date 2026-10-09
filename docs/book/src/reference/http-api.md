@@ -425,11 +425,28 @@ curl -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/v1/runs/0192…/logs?format=jsonl&after=500"
 ```
 
-Retention is governed by **`--log-retention-secs`** (default `604800` = 7 days),
+Retention is governed by **`--log-retention-secs`** (default `86400` = 24 h),
 independent of run-record retention; `0` disables durable log persistence
 (ephemeral SSE only). **`--log-max-lines-per-run`** (default `100000`) caps how
 many lines are stored per run. The in-memory `--history` backend stays ephemeral
-(no durable persistence).
+(no durable persistence) unless log shipping is on.
+
+Each `jsonl` object also carries `attrs` (`target`, `row`, `connector`,
+`invocation_id`, `trace_id`, …) when the line had them.
+
+#### Log shipping (#806)
+
+With `export: [logs]` in `--otel-config`, this store is the buffer the server
+ships to the OTLP collector from: delivered lines are kept
+`--log-retention-secs` *after delivery*, undelivered ones until delivered,
+bounded by `--log-buffer-max-age-secs` (7 days) and `--log-buffer-max-bytes`
+(1 GiB). `GET /v1/runs/{id}` then reports `log_export` (`status`:
+`not_configured` / `pending` / `exported` / `failed` / `partially_dropped`,
+`delivered_seq`, `total_seq`, `pending_lines`, `dropped_lines`, `last_error`,
+`last_attempt_at`, `delivered_at`, `link`). Once a run's local copy has aged out
+and `--log-link-template` is set, `?format=jsonl` ends with
+`{"aged_out":true,"link":"…"}`, `?format=text` with the link, and the SSE stream
+opens with an `event: link`. See [Shipping logs](../operations/observability.md#shipping-logs).
 
 ### `GET /v1/catalog/*` (Data Movement Catalog)
 

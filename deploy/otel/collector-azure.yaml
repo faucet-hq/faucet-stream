@@ -1,0 +1,31 @@
+# OpenTelemetry Collector (contrib 0.130): faucet run logs over OTLP → Azure Blob
+# Storage (#806). The container's blob names are date-partitioned by the
+# exporter's default `logs/YYYY/MM/DD/HH/` layout.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  azureblob:
+    url: ${env:AZURE_STORAGE_URL}
+    container:
+      logs: faucet-run-logs
+    auth:
+      type: connection_string
+      connection_string: ${env:AZURE_STORAGE_CONNECTION_STRING}
+    encodings:
+      logs: otlp_json
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [azureblob]

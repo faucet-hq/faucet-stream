@@ -66,8 +66,11 @@ where
 
 /// Remember attribute-bearing fields recorded on a span after it was created
 /// (`span.record("log_run_id", …)`).
-pub fn on_record<S>(id: &tracing::span::Id, values: &tracing::span::Record<'_>, ctx: &Context<'_, S>)
-where
+pub fn on_record<S>(
+    id: &tracing::span::Id,
+    values: &tracing::span::Record<'_>,
+    ctx: &Context<'_, S>,
+) where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     let mut v = FieldVisitor::default();
@@ -167,7 +170,10 @@ where
 }
 
 #[cfg(feature = "otel")]
-fn trace_context(ext: &tracing_subscriber::registry::Extensions<'_>, attrs: &mut BTreeMap<String, String>) {
+fn trace_context(
+    ext: &tracing_subscriber::registry::Extensions<'_>,
+    attrs: &mut BTreeMap<String, String>,
+) {
     let valid = |s: &str| s.bytes().any(|b| b != b'0');
     if let Some(d) = ext.get::<tracing_opentelemetry::OtelData>() {
         if let Some(t) = d.trace_id().map(|t| t.to_string())

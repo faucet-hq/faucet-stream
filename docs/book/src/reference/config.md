@@ -1705,7 +1705,7 @@ observability:
 | `protocol` | `grpc` \| `http` | `grpc` | Transport protocol. `grpc` uses tonic; `http` uses HTTP/Protobuf. The `faucet` CLI always runs inside a tokio runtime, so both work without extra setup. |
 | `headers` | map&lt;string, string&gt; | `{}` | Extra headers sent on every export request — auth tokens, team keys, etc. Values are secret-interpolated the same as any config value (e.g. `"${env:HONEYCOMB_KEY}"`). |
 | `sample_ratio` | float | `1.0` | Head-based trace sampling probability, `0.0`–`1.0`. `1.0` exports every trace; `0.1` keeps ~10%. Does not affect metric export. |
-| `export` | list | `[traces, metrics]` | Which signals to push. Each element is `traces` or `metrics`. Omit a signal to disable it entirely. |
+| `export` | list | `[traces, metrics]` | Which signals to push. Each element is `traces`, `metrics` or `logs`. `logs` ships every run-log line from a durable local buffer (see `logs:` below). Omit a signal to disable it entirely. |
 | `service_name` | string | `faucet` | Value of the OpenTelemetry resource attribute `service.name` attached to every span and metric point. |
 | `timeout_secs` | integer | `10` | Per-export timeout in seconds. Timed-out exports are counted in `faucet_otel_export_failures_total` but do not fail the run. |
 | `metric_interval_secs` | integer | `60` | How often (in seconds) accumulated metric points are pushed to the collector. |
@@ -1714,6 +1714,32 @@ observability:
 fully independent; both can be active at the same time and metrics fan out to
 both exporters. Export failures are never propagated to the pipeline — they
 increment `faucet_otel_export_failures_total{signal}` and are logged.
+
+### `logs:`
+
+Durable log shipping (#806), on when `otel.export` lists `logs`. Every run-log
+line is written to a local spool first and shipped over OTLP; the per-run
+watermark advances only when the collector acknowledges a batch. See
+[Shipping logs](../operations/observability.md#shipping-logs).
+
+```yaml
+observability:
+  otel: { endpoint: http://collector:4317, export: [traces, logs] }
+  logs:
+    spool_dir: /var/lib/faucet/logs
+    retention_secs: 86400
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `spool_dir` | path | `$XDG_STATE_HOME/faucet/logs` (`~/.local/state/faucet/logs`) | Where `faucet run` / `faucet schedule` spool lines before shipping (one `<run_id>.jsonl` + cursor + meta + lock per run). |
+| `retention_secs` | integer | `86400` | How long delivered lines stay in the spool. |
+| `buffer_max_age_secs` | integer | `604800` | Undelivered lines older than this are dropped (counted; the run reports `partially_dropped`). Must be > 0. |
+| `buffer_max_bytes` | integer | `1073741824` | Spool size bound; past it the oldest lines go first. Must be > 0. |
+| `flush_timeout_secs` | integer | `10` | How long `faucet run` waits at exit for its lines to ship. The rest stays for the next process or `faucet logs ship`. |
+| `max_lines_per_run` | integer | `100000` | Per-run line cap; lines past it are dropped and counted (`max_lines`). |
+| `notify_after_secs` | integer | `300` | Emit `log_export_failed` once a run's export has been failing this long. |
+| `link_template` | string | — | A link to the run's logs in the log service. Placeholders `{run_id} {pipeline} {row} {tenant} {started_at} {ended_at}`, URL-encoded. |
 
 ## Discovery & env files
 

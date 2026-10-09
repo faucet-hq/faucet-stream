@@ -1,0 +1,39 @@
+{{- if .Values.otel.logs.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "faucet-stream.fullname" . }}-otel
+  labels:
+    {{- include "faucet-stream.labels" . | nindent 4 }}
+data:
+  otel.yaml: |
+    endpoint: {{ .Values.otel.logs.endpoint | quote }}
+    protocol: {{ .Values.otel.logs.protocol }}
+    service_name: {{ .Values.otel.logs.serviceName | quote }}
+    export: [logs]
+    {{- with .Values.otel.logs.headers }}
+    headers:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- if and (or .Values.job.enabled .Values.cronjob.enabled) .Values.otel.logs.buffer.persistence.enabled (not .Values.otel.logs.buffer.persistence.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "faucet-stream.fullname" . }}-logs
+  labels:
+    {{- include "faucet-stream.labels" . | nindent 4 }}
+  annotations:
+    # Undelivered run logs survive a helm uninstall.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.otel.logs.buffer.persistence.accessModes | nindent 4 }}
+  {{- if .Values.otel.logs.buffer.persistence.storageClass }}
+  storageClassName: {{ .Values.otel.logs.buffer.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.otel.logs.buffer.persistence.size }}
+{{- end }}
+{{- end }}

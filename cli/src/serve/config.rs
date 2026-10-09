@@ -173,10 +173,7 @@ impl From<&crate::cli::LogBufferArgs> for LogBufferSettings {
         Self {
             max_age: Duration::from_secs(a.log_buffer_max_age_secs),
             max_bytes: a.log_buffer_max_bytes,
-            link_template: a
-                .log_link_template
-                .clone()
-                .filter(|t| !t.trim().is_empty()),
+            link_template: a.log_link_template.clone().filter(|t| !t.trim().is_empty()),
             notify_after: Duration::from_secs(a.log_export_notify_after_secs),
         }
     }

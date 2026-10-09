@@ -137,10 +137,7 @@ async fn persisted_logs(
 }
 
 /// The live SSE stream (unchanged behavior).
-async fn stream_logs_sse(
-    state: ServerState,
-    id: String,
-) -> Result<Response, ServeError> {
+async fn stream_logs_sse(state: ServerState, id: String) -> Result<Response, ServeError> {
     let (snapshot, rx, ended) = match state.log_hub().reader(&id) {
         Some(reader) => reader,
         None => {
@@ -175,9 +172,7 @@ async fn stream_logs_sse(
                         Ok(to_sse_event(LogEvent::End)),
                     ]);
                     return Ok(Sse::new(ev)
-                        .keep_alive(
-                            KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS)),
-                        )
+                        .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS)))
                         .into_response());
                 }
             }
@@ -188,11 +183,9 @@ async fn stream_logs_sse(
 
     let stream = log_events(snapshot, rx, ended)
         .map(|ev| Ok::<Event, std::convert::Infallible>(to_sse_event(ev)));
-    Ok(
-        Sse::new(stream)
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS)))
-            .into_response(),
-    )
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS)))
+        .into_response())
 }
 
 /// Map an internal [`LogEvent`] to an SSE wire event.

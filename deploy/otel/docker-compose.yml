@@ -1,0 +1,45 @@
+# faucet serve shipping run logs over OTLP to Grafana Alloy → Loki (#806).
+#
+#   docker compose -f deploy/otel/docker-compose.yml up
+#
+# Then submit a run to http://localhost:8080 and open Grafana
+# (http://localhost:3000, Explore → Loki, `{service_name="faucet"}`).
+services:
+  loki:
+    image: grafana/loki:3.2.1
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports: ["3100:3100"]
+
+  alloy:
+    image: grafana/alloy:v1.4.3
+    command: ["run", "/etc/alloy/config.alloy", "--server.http.listen-addr=0.0.0.0:12345"]
+    volumes:
+      - ./alloy-loki.alloy:/etc/alloy/config.alloy:ro
+    ports: ["4317:4317", "4318:4318"]
+    depends_on: [loki]
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports: ["3000:3000"]
+    depends_on: [loki]
+
+  faucet:
+    image: ghcr.io/faucet-hq/faucet-stream:full
+    command:
+      - serve
+      - --listen=0.0.0.0:8080
+      - --no-auth
+      - --history=sqlite:/var/lib/faucet/history.db
+      - --otel-config=/etc/faucet/otel.yaml
+      - --log-link-template=http://localhost:3000/explore?left=%7B%22queries%22:%5B%7B%22expr%22:%22%7Bservice_name%3D%5C%22faucet%5C%22%7D%20%7C%20serve_run_id%3D%5C%22{run_id}%5C%22%22%7D%5D%7D
+    volumes:
+      - ./faucet-otel.yaml:/etc/faucet/otel.yaml:ro
+      - faucet-data:/var/lib/faucet
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on: [alloy]
+
+volumes:
+  faucet-data: {}

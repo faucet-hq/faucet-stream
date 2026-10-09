@@ -1,0 +1,5 @@
+# `faucet serve --otel-config` file: ship run logs (and traces) to Alloy.
+endpoint: http://alloy:4317
+protocol: grpc
+export: [traces, logs]
+service_name: faucet
