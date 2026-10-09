@@ -177,8 +177,37 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
             println!("\n{cmd}");
         }
     }
+    let fallback = sides
+        .source
+        .first()
+        .map(|h| h.dir.clone())
+        .unwrap_or_default();
+    let mut red = Vec::new();
+    for (role, file) in [("source", &source_file), ("sink", &sink_file)] {
+        let root = hub::bundles::hub_root_for(file, &fallback);
+        if let Some(out) = hub::bundles::run_file(file, &root).await? {
+            if !a.json {
+                print!(
+                    "\n{}",
+                    crate::template_tests::result::render_human(
+                        &format!("tests ({role} {})", file.display()),
+                        &out
+                    )
+                );
+            }
+            if !out.passed() {
+                red.push(format!("{role} template {}", file.display()));
+            }
+        }
+    }
     if let Some(e) = typed_error {
         return Err(CliError::Config(e));
+    }
+    if !red.is_empty() {
+        return Err(CliError::Config(format!(
+            "test bundle failed: {}",
+            red.join(", ")
+        )));
     }
     if cell.compatible {
         Ok(())
@@ -421,6 +450,21 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
     if a.files.is_empty() {
         let cat = load_catalog(a.hub.as_deref()).await?;
         findings = hub::catalog::lint_catalog(&cat);
+        let suites = hub::catalog::load_test_suites(&cat.root)?;
+        let mut files: Vec<std::path::PathBuf> = cat
+            .sources
+            .iter()
+            .map(|(p, _)| p.clone())
+            .chain(cat.sinks.iter().map(|(p, _)| p.clone()))
+            .collect();
+        files.extend(hub::catalog::deployment_files(&cat.root)?);
+        let ran = bundle_findings(&files, &cat.root, &mut findings).await?;
+        if !a.json {
+            println!(
+                "ran {ran} test bundle(s); {} shared suite(s) parsed",
+                suites.len()
+            );
+        }
         if !a.json {
             println!(
                 "linted {} source + {} sink template(s)",
@@ -452,13 +496,30 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
                         findings.push((f.display().to_string(), r));
                     }
                 }
+                Some(hub::TemplateKind::TestSuite) => {
+                    let text = std::fs::read_to_string(f)
+                        .map_err(|e| CliError::Config(format!("reading {}: {e}", f.display())))?;
+                    let value: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| {
+                        CliError::Config(format!("{}: invalid YAML: {e}", f.display()))
+                    })?;
+                    crate::template_tests::bundle::parse_test_suite(value)
+                        .map_err(|e| CliError::Config(format!("{}: {e}", f.display())))?;
+                }
                 Some(hub::TemplateKind::Pipeline) | None => {
                     return Err(CliError::Config(format!(
-                        "{}: not a hub template (no `kind: source-template` / `sink-template` / `deployment`)",
+                        "{}: not a hub template (no `kind: source-template` / `sink-template` / `deployment` / `test-suite`)",
                         f.display()
                     )));
                 }
             }
+        }
+        let fallback = hub::resolve_hub(a.hub.as_deref()).await?;
+        let mut by_root: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        for f in &a.files {
+            by_root.push((f.clone(), hub::bundles::hub_root_for(f, &fallback)));
+        }
+        for (f, root) in by_root {
+            bundle_findings(std::slice::from_ref(&f), &root, &mut findings).await?;
         }
     }
     if a.json {
@@ -488,6 +549,32 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
             findings.len()
         )))
     }
+}
+
+/// Run the test bundle of every file in `files` against `hub`, adding a
+/// `tests:` finding per failing case. Returns how many bundles ran.
+async fn bundle_findings(
+    files: &[std::path::PathBuf],
+    hub: &std::path::Path,
+    findings: &mut Vec<(String, Vec<String>)>,
+) -> CliResult<usize> {
+    let mut ran = 0;
+    for f in files {
+        let Some(out) = hub::bundles::run_file(f, hub).await? else {
+            continue;
+        };
+        ran += 1;
+        if out.passed() {
+            continue;
+        }
+        let lines: Vec<String> = out.failing().into_iter().map(|l| format!("tests: {l}")).collect();
+        let key = f.display().to_string();
+        match findings.iter_mut().find(|(t, _)| *t == key) {
+            Some((_, existing)) => existing.extend(lines),
+            None => findings.push((key, lines)),
+        }
+    }
+    Ok(ran)
 }
 
 /// `faucet hub rows <source> [--sink Y]` — a catalog source template's

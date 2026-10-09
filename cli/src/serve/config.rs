@@ -144,6 +144,9 @@ pub struct ServeConfig {
     pub require_approval: Vec<crate::serve::changes::ChangeKind>,
     /// Fallback expiry of a pending change request.
     pub approval_expiry: Duration,
+    /// Refuse a template launch without a passing test-bundle result recorded
+    /// under this faucet major version (#856). Off by default.
+    pub require_template_tests: bool,
     /// The tenant connection vault key and its rotation predecessors (#709).
     pub vault: Option<VaultKeys>,
     /// Path to a `--connect-providers` file (#709).
@@ -438,6 +441,7 @@ impl ServeConfig {
             callback_allow_hosts: args.callback_allow_host,
             require_approval,
             approval_expiry: Duration::from_secs(args.approval_expiry_secs),
+            require_template_tests: args.require_template_tests,
             vault: args.vault_key.filter(|k| !k.is_empty()).map(|key| {
                 crate::secrets::registry::register(&key);
                 for k in &args.vault_previous_key {
@@ -593,6 +597,7 @@ mod tests {
             mcp_allow_mutations: false,
             require_approval: Vec::new(),
             approval_expiry_secs: 86_400,
+            require_template_tests: false,
             vault_key: None,
             vault_previous_key: Vec::new(),
             connect_providers: None,

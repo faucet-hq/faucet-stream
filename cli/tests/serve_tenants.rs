@@ -81,6 +81,7 @@ fn serve_args(
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        require_template_tests: false,
         vault_key: Some("test-vault-key-0123456789abcdef0123".into()),
         vault_previous_key: Vec::new(),
         connect_providers: Some(providers),

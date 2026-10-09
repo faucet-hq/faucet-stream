@@ -630,6 +630,8 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::POST, "/v1/templates/{id}/rollback") => Some(TemplateAdmin),
         (&Method::POST, "/v1/templates/{id}/deprecate") => Some(TemplateAdmin),
         (&Method::POST, "/v1/templates/{id}/versions/{version}/deprecate") => Some(TemplateAdmin),
+        (&Method::POST, "/v1/templates/{id}/versions/{version}/test") => Some(TemplateAdmin),
+        (&Method::GET, "/v1/templates/{id}/versions/{version}/tests") => Some(TemplateRead),
         (&Method::POST, "/v1/templates/sync") => Some(TemplateAdmin),
         (&Method::POST, "/v1/templates/{id}/publish") => Some(TemplateAdmin),
         (&Method::POST, "/v1/reload") => Some(Reload),
@@ -716,6 +718,7 @@ pub fn tenant_scope_decision(
         | (&Method::GET, "/v1/templates")
         | (&Method::GET, "/v1/templates/{id}")
         | (&Method::GET, "/v1/templates/{id}/rows")
+        | (&Method::GET, "/v1/templates/{id}/versions/{version}/tests")
         | (_, "/v1/changes")
         | (_, "/v1/changes/{id}")
         | (_, "/v1/changes/{id}/approve")
@@ -780,6 +783,8 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/templates/{id}/versions/{version}/deprecate") => {
             "template.version_deprecate"
         }
+        (&Method::POST, "/v1/templates/{id}/versions/{version}/test") => "template.test",
+        (&Method::GET, "/v1/templates/{id}/versions/{version}/tests") => "template.tests",
         (&Method::POST, "/v1/templates/sync") => "template.sync",
         (&Method::POST, "/v1/templates/{id}/publish") => "template.publish",
         (&Method::POST, "/v1/reload") => "config.reload",

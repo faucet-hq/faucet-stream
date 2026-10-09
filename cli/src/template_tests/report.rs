@@ -79,7 +79,7 @@ impl SuiteReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::templates::suite::runner::CaseOutcome;
+    use crate::template_tests::runner::CaseOutcome;
     use std::collections::BTreeMap;
 
     fn outcome() -> SuiteOutcome {
@@ -91,6 +91,8 @@ mod tests {
                     params: BTreeMap::new(),
                     passed: true,
                     failure: None,
+                    attempts: 1,
+                    duration_ms: 0,
                 },
                 CaseOutcome {
                     name: "auto:missing-tenant".into(),
@@ -98,6 +100,8 @@ mod tests {
                     params: BTreeMap::new(),
                     passed: false,
                     failure: Some("expected this combination to fail".into()),
+                    attempts: 1,
+                    duration_ms: 0,
                 },
             ],
         }

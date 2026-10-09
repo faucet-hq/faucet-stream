@@ -85,6 +85,7 @@ pub mod state;
 pub mod status;
 #[cfg(feature = "templates")]
 pub mod templates;
+pub mod template_tests;
 pub mod tenant_tokens;
 pub mod topology;
 pub mod transforms;

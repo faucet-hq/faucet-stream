@@ -79,6 +79,8 @@ pub struct MemoryHistory {
     /// Per-version deprecation markers (#697): `{id: {version: record}}`.
     template_version_deprecations:
         Mutex<std::collections::HashMap<String, BTreeMap<u32, templates::DeprecationRecord>>>,
+    /// Test-bundle runs per template (#856), newest first.
+    template_tests: Mutex<std::collections::HashMap<String, Vec<templates::TemplateTestResult>>>,
     /// Persistent run logs (#529): run_id → lines (append order == seq order).
     run_logs: Mutex<std::collections::HashMap<String, Vec<RunLogLine>>>,
     /// Log delivery rows (#806): run_id → watermark + export status.
@@ -133,6 +135,7 @@ impl MemoryHistory {
             template_launches: Mutex::new(std::collections::HashMap::new()),
             template_deprecations: Mutex::new(std::collections::HashMap::new()),
             template_version_deprecations: Mutex::new(std::collections::HashMap::new()),
+            template_tests: Mutex::new(std::collections::HashMap::new()),
             run_logs: Mutex::new(std::collections::HashMap::new()),
             log_ship: Mutex::new(std::collections::HashMap::new()),
             local_outputs: Mutex::new(BTreeMap::new()),
@@ -1306,6 +1309,20 @@ impl RunHistory for MemoryHistory {
         let mut retired = self.template_version_deprecations.lock().map_err(|_| {
             HistoryError::Backend("template version deprecation lock poisoned".into())
         })?;
+        let mut tests = self
+            .template_tests
+            .lock()
+            .map_err(|_| HistoryError::Backend("template test lock poisoned".into()))?;
+        match version {
+            Some(v) => {
+                if let Some(r) = tests.get_mut(id) {
+                    r.retain(|t| t.version != v);
+                }
+            }
+            None => {
+                tests.remove(id);
+            }
+        }
         match version {
             None => {
                 tags.remove(id);
@@ -1401,6 +1418,17 @@ impl RunHistory for MemoryHistory {
         version: u32,
         launched_by: Option<&str>,
     ) -> Result<Option<u32>, HistoryError> {
+        self.template_launch_noted(id, version, launched_by, None)
+            .await
+    }
+
+    async fn template_launch_noted(
+        &self,
+        id: &str,
+        version: u32,
+        launched_by: Option<&str>,
+        tests_skipped: Option<&str>,
+    ) -> Result<Option<u32>, HistoryError> {
         let mut launches = self
             .template_launches
             .lock()
@@ -1419,9 +1447,53 @@ impl RunHistory for MemoryHistory {
                 version,
                 launched_at: Utc::now(),
                 launched_by: launched_by.map(str::to_string),
+                tests_skipped: tests_skipped.map(str::to_string),
             },
         );
         Ok(Some(seq))
+    }
+
+    async fn template_record_test(
+        &self,
+        result: &templates::TemplateTestResult,
+    ) -> Result<(), HistoryError> {
+        let mut tests = self
+            .template_tests
+            .lock()
+            .map_err(|_| HistoryError::Backend("template test lock poisoned".into()))?;
+        let runs = tests.entry(result.id.clone()).or_default();
+        runs.insert(0, result.clone());
+        let mut kept = 0usize;
+        runs.retain(|r| {
+            if r.version != result.version {
+                return true;
+            }
+            kept += 1;
+            kept <= templates::RESULTS_RETAIN
+        });
+        Ok(())
+    }
+
+    async fn template_test_results(
+        &self,
+        id: &str,
+        version: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<templates::TemplateTestResult>, HistoryError> {
+        let tests = self
+            .template_tests
+            .lock()
+            .map_err(|_| HistoryError::Backend("template test lock poisoned".into()))?;
+        Ok(tests
+            .get(id)
+            .map(|runs| {
+                runs.iter()
+                    .filter(|r| version.is_none_or(|v| r.version == v))
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn template_launches(
@@ -1756,6 +1828,7 @@ mod tests {
                 source_ip: None,
                 tenant: None,
                 target: None,
+                detail: None,
                 result: result.into(),
             };
         h.record_audit(&entry(

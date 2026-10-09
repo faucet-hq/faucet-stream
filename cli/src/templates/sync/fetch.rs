@@ -274,6 +274,7 @@ pub fn dir_for_kind<'a>(dirs: &[&'a str], kind: crate::hub::spec::TemplateKind) 
         TemplateKind::SourceTemplate => Some("source-templates"),
         TemplateKind::SinkTemplate => Some("sink-templates"),
         TemplateKind::Deployment => Some("deployments"),
+        TemplateKind::TestSuite => Some("test-suites"),
         TemplateKind::Pipeline => None,
     };
     if let Some(n) = named

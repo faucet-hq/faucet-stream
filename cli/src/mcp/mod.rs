@@ -73,6 +73,10 @@ pub struct McpContext {
     /// gate, server policy, default config, run queue, run record) instead of
     /// running in the request task. `None` on the stdio transport.
     pub server: Option<ChangeProposer>,
+    /// Whether template launches through this context need a passing
+    /// test-bundle result (#856): the server's `--require-template-tests`, or
+    /// `faucet mcp --require-template-tests`.
+    pub require_template_tests: bool,
 }
 
 /// What the MCP `propose_*` tools need to file a change request (#703).
@@ -106,7 +110,14 @@ impl McpContext {
             submitted: None,
             approval_required: Vec::new(),
             server: None,
+            require_template_tests: false,
         }
+    }
+
+    /// Whether launches need a passing test-bundle result (#856).
+    pub fn with_require_template_tests(mut self, require: bool) -> Self {
+        self.require_template_tests = require;
+        self
     }
 
     /// Submit runs through this server as this caller (the HTTP transport).

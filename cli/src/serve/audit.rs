@@ -33,6 +33,18 @@ pub async fn write_target(
     record(state, ctx, action, None, None, Some(target), result).await;
 }
 
+/// [`write_target()`] with a detail line (an override reason, #856).
+pub async fn write_target_detail(
+    state: &ServerState,
+    ctx: &AuthContext,
+    action: &str,
+    target: String,
+    detail: Option<String>,
+    result: &str,
+) {
+    persist(state, ctx, action, None, None, Some(target), detail, result).await;
+}
+
 /// [`write()`] with every field (run id, fingerprint and target).
 pub async fn record(
     state: &ServerState,
@@ -41,6 +53,20 @@ pub async fn record(
     run_id: Option<String>,
     config_fingerprint: Option<String>,
     target: Option<String>,
+    result: &str,
+) {
+    persist(state, ctx, action, run_id, config_fingerprint, target, None, result).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist(
+    state: &ServerState,
+    ctx: &AuthContext,
+    action: &str,
+    run_id: Option<String>,
+    config_fingerprint: Option<String>,
+    target: Option<String>,
+    detail: Option<String>,
     result: &str,
 ) {
     let entry = AuditEntry {
@@ -54,6 +80,7 @@ pub async fn record(
         source_ip: ctx.source_ip.clone(),
         tenant: ctx.tenant.clone(),
         target,
+        detail,
         result: result.to_string(),
     };
     if let Err(e) = state.history().record_audit(&entry).await {

@@ -336,6 +336,25 @@ pub struct LaunchPayload {
     #[cfg(feature = "templates")]
     #[serde(default)]
     pub version: Option<crate::serve::history::templates::VersionSelector>,
+    /// Launch past the test gate (#856). Only an admin may request it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_tests_reason: Option<String>,
+}
+
+/// A change that would launch past the test gate must be requested by an
+/// admin — the override is admin-only however the launch arrives (#856).
+fn check_skip_tests(actor: &AuthContext, kind: ChangeKind, payload: &Value) -> Result<(), ServeError> {
+    let skips = matches!(kind, ChangeKind::TemplateLaunch | ChangeKind::TemplateRegister)
+        && payload
+            .get("skip_tests_reason")
+            .and_then(Value::as_str)
+            .is_some();
+    if skips && actor.role != crate::serve::rbac::Role::Admin {
+        return Err(ServeError::Forbidden(
+            "`skip_tests_reason` overrides the template test gate and is admin-only".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn store_err(e: HistoryError) -> ServeError {
@@ -520,6 +539,8 @@ async fn plan_template_register(
             tags: body.tags.clone(),
             launch: body.launch,
             created_by: None,
+            test: false,
+            gate: Default::default(),
         },
     )
     .await
@@ -568,6 +589,13 @@ async fn plan_template_launch(
     let st = crate::templates::template_state(&store, &payload.id)
         .await
         .map_err(template_err)?;
+    let gate = state
+        .template_gate()
+        .with_skip(payload.skip_tests_reason.clone())
+        .map_err(template_err)?;
+    let tests = crate::templates::bundle::version_tests(&store, &payload.id, version, &gate, 1)
+        .await
+        .map_err(template_err)?;
     Ok(ChangePlan {
         material: sha_hex(&format!("{}\n{}\n{:?}", payload.id, version, st.stable)),
         summary: json!({
@@ -576,6 +604,7 @@ async fn plan_template_launch(
             "selector": target,
             "stable_before": st.stable,
             "status_before": st.status,
+            "tests": tests.gate,
         }),
         rows: Vec::new(),
     })
@@ -587,6 +616,9 @@ fn template_err(e: crate::error::CliError) -> ServeError {
     match e {
         CliError::UnknownPipelineTemplate { .. } => ServeError::NotFound,
         CliError::Internal(m) => ServeError::Internal(m),
+        gated @ CliError::LaunchGated { .. } => {
+            crate::serve::handlers::templates::gate_refusal(gated)
+        }
         other => ServeError::Unprocessable {
             message: other.to_string(),
             details: None,
@@ -717,6 +749,7 @@ pub async fn create(
             obj.remove("reason");
         }
     }
+    check_skip_tests(actor, new.kind, &payload)?;
     let plan = plan_for(state, actor, new.kind, &payload, new.trusted_config).await?;
     let policy = state.approvals();
     let rule = policy.effective(new.kind);
@@ -1051,7 +1084,11 @@ async fn execute(
                     Ok(b) => b,
                     Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
                 };
-            crate::templates::register(
+            let gate = match state.template_gate().with_skip(body.skip_tests_reason.clone()) {
+                Ok(g) => g,
+                Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+            };
+            crate::templates::register_tested(
                 &state.history(),
                 crate::templates::RegisterRequest {
                     id: body.id,
@@ -1061,15 +1098,17 @@ async fn execute(
                     tags: body.tags,
                     launch: body.launch,
                     created_by: Some(change.requester.clone()),
+                    test: body.test,
+                    gate,
                 },
             )
             .await
-            .map(|rec| {
+            .map(|r| {
                 (
                     None,
                     Some(TemplateOutcome {
-                        id: rec.id,
-                        version: rec.version,
+                        id: r.record.id,
+                        version: r.record.version,
                     }),
                 )
             })
@@ -1084,8 +1123,18 @@ async fn execute(
             let target = body
                 .version
                 .unwrap_or_else(crate::serve::history::templates::VersionSelector::newest);
-            crate::templates::launch(&state.history(), &body.id, target, Some(&change.requester))
-                .await
+            let gate = match state.template_gate().with_skip(body.skip_tests_reason.clone()) {
+                Ok(g) => g,
+                Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+            };
+            crate::templates::launch_gated(
+                &state.history(),
+                &body.id,
+                target,
+                Some(&change.requester),
+                &gate,
+            )
+            .await
                 .map(|o| {
                     (
                         None,

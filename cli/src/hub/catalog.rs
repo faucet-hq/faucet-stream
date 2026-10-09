@@ -15,6 +15,8 @@ use crate::error::{CliError, CliResult};
 
 pub const SOURCE_DIR: &str = "source-templates";
 pub const SINK_DIR: &str = "sink-templates";
+/// Shared test suites (`kind: test-suite`, #856).
+pub const TEST_SUITE_DIR: &str = "test-suites";
 
 /// A loaded catalog.
 #[derive(Debug, Default, Clone)]
@@ -143,6 +145,36 @@ impl Catalog {
         }
         cells
     }
+}
+
+/// Every deployment overlay file under `root/deployments` (unscoped and
+/// owner directories).
+pub fn deployment_files(root: &Path) -> CliResult<Vec<PathBuf>> {
+    Ok(list_dir(&root.join(super::DEPLOYMENT_DIR))?
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect())
+}
+
+/// Every shared test suite under `root/test-suites` (#856), parsed and
+/// validated; owner directories follow the same rules as templates.
+pub fn load_test_suites(
+    root: &Path,
+) -> CliResult<Vec<(PathBuf, crate::template_tests::TestSuiteTemplate)>> {
+    let mut out = Vec::new();
+    let mut seen = BTreeMap::new();
+    for (p, owner) in list_dir(&root.join(TEST_SUITE_DIR))? {
+        let text = std::fs::read_to_string(&p)
+            .map_err(|e| CliError::Config(format!("reading {}: {e}", p.display())))?;
+        let value: serde_json::Value = serde_yaml::from_str(&text)
+            .map_err(|e| CliError::Config(format!("{}: invalid YAML: {e}", p.display())))?;
+        let t = crate::template_tests::bundle::parse_test_suite(value)
+            .map_err(|e| CliError::Config(format!("{}: {e}", p.display())))?;
+        check_owner(&p, t.owner.as_deref(), owner.as_deref())?;
+        check_stem(&p, &t.name, &t.id(), &mut seen)?;
+        out.push((p, t));
+    }
+    Ok(out)
 }
 
 fn check_stem(
