@@ -5,6 +5,7 @@ A faucet config is a YAML or JSON document with this top-level shape:
 <!-- faucet:no-validate -->
 ```yaml
 version: 1                 # required, must be 1
+requires_faucet: ">=1.13"  # optional; oldest faucet this config needs
 name: my_pipeline          # optional; used in state keys and metrics
 vars: {}                   # optional; reusable values referenced as ${vars.X}
 auth: {}                   # optional; named shared auth providers (see below)
@@ -30,6 +31,17 @@ selection:                 # optional; row-selection policy (see Row selection)
 > object is checked against the keys that connector declares (`faucet schema
 > source <type>` / `faucet schema sink <type>` lists them), so a misspelled
 > connector key is refused too.
+
+## `requires_faucet`
+
+An optional semver requirement (Cargo syntax: `">=1.13"`, `"^1.13.2"`,
+`">=1.13, <2"`) naming the faucet versions that can run this config.
+`validate`, `run`, `schedule`, a `serve` submit and `template register` refuse
+a config whose requirement the running binary does not meet, with
+`this pipeline requires faucet >=1.13; this binary is 1.12.0`. Hub source and
+sink templates take the same key. `faucet init` writes it for the scaffolding
+binary's minor version. A binary that predates the key rejects it as an
+unknown field. See [Pinning the faucet version](../operations/pinning.md).
 
 ## `pipeline`
 

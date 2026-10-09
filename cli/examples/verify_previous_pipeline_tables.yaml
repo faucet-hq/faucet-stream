@@ -1,0 +1,63 @@
+# Migration parallel run: compare the tables a previous pipeline loaded
+# (schema `raw`) with the tables faucet loaded (schema `raw_faucet`), by
+# content, with `faucet verify`.
+#
+# This file is for `faucet verify` only. Never `faucet run` it, and never pass
+# `--repair`: its "source" is the old pipeline's output and its "sink" is
+# faucet's table, so a write would copy the old rows into faucet's table and
+# hide every difference.
+#
+# - Full-table queries, not a `${now.*}` window: a windowed source would
+#   report every row outside the window as extra.
+# - Metadata columns of both tools (`_sdc_*`, `_faucet_*`) and a column the two
+#   pipelines hash differently are excluded; every other column is compared.
+# - Compare a quiet window (or pause both schedules): rows that change during
+#   the scan show up as differences.
+#
+#   faucet verify verify_previous_pipeline_tables.yaml --row customers
+#   faucet verify verify_previous_pipeline_tables.yaml --row orders --json
+version: 1
+name: verify_previous_pipeline_tables
+
+pipeline:
+  sources:
+    previous:
+      type: postgres
+      config:
+        connection_url: "${env:PG_URL}"
+        query: "SELECT 1"
+  sinks:
+    faucet_tables:
+      type: postgres
+      config:
+        connection_url: "${env:PG_URL}"
+        schema: raw_faucet
+        table_name: placeholder
+        column_mapping: auto_map
+        write_mode: upsert
+        key: [id]
+        create_table: false
+
+verify:
+  after_run: false
+  exclude: ["_sdc_*", "_faucet_*", "email_hash"]
+  max_differences: 200
+
+matrix:
+  - id: customers
+    source:
+      ref: previous
+      config:
+        query: "SELECT id, name, country, created_at, updated_at FROM raw.customers"
+    sink:
+      ref: faucet_tables
+      config: { table_name: customers }
+
+  - id: orders
+    source:
+      ref: previous
+      config:
+        query: "SELECT id, customer_id, status, total_cents, created_at, updated_at FROM raw.orders"
+    sink:
+      ref: faucet_tables
+      config: { table_name: orders }

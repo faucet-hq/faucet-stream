@@ -1,0 +1,45 @@
+# Nightly full refresh with a completeness check and live metrics. Each run
+# replaces the SQLite `orders` table with the current Postgres rows
+# (`write_mode: overwrite`), then `reconcile:` asks Postgres for its own row
+# count and fails the run when fewer rows were written — so a truncated read
+# never quietly passes as a good refresh. `observability:` serves Prometheus
+# metrics on 127.0.0.1:9464 while the run is in flight.
+#
+#   faucet validate cli/examples/postgres_to_sqlite_reconciled.yaml
+#   faucet run      cli/examples/postgres_to_sqlite_reconciled.yaml
+#   curl -s 127.0.0.1:9464/metrics | grep faucet_sink_records_total   # during the run
+#
+# Prereqs (for a real run): Postgres on localhost:5432 with an `orders` table.
+version: 1
+name: postgres_to_sqlite_reconciled
+
+observability:
+  prometheus:
+    listen: 127.0.0.1:9464
+  tracing:
+    level: info
+
+reconcile:
+  count:
+    type: postgres
+    config:
+      connection_url: postgres://faucet@localhost:5432/app
+      query: SELECT count(*) AS n FROM orders
+    count_field: n
+  # Fail when more than 0.5% of the source rows are missing.
+  tolerance_pct: 0.5
+
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://faucet@localhost:5432/app
+      query: SELECT id, customer_id, status, total, updated_at FROM orders
+
+  sink:
+    type: sqlite
+    config:
+      database_url: "sqlite://./out/warehouse.db"
+      table_name: orders
+      column_mapping: auto_map
+      write_mode: overwrite

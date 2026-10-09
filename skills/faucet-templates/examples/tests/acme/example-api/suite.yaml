@@ -1,0 +1,30 @@
+# `faucet template test` suite for acme/example-api. Run from the hub root:
+#   faucet template test tests/acme/example-api/suite.yaml
+version: 1
+template: source-templates/acme/example-api.yaml
+sink: sink-templates/faucet-hq/sqlite.yaml
+suite:
+  auto:
+    required_omitted: true
+    enum_coverage: true
+    defaults_baseline: true
+  cases:
+    - name: defaults
+      params: { api_token: suite_token }
+    - name: custom-host-and-start
+      params:
+        api_token: suite_token
+        api_base_url: https://eu.api.example.com/v1
+        api_start_date: "2025-01-01T00:00:00Z"
+        page_size: "250"
+    - name: rejects-undeclared-page-size
+      params: { api_token: suite_token, page_size: "1000" }
+      expect: { error: page_size }
+  behavioral:
+    - name: customer-record-shape
+      params: { api_token: suite_token }
+      input:
+        - { id: 1, displayName: Ada, address: { city: Paris, zip: "75001" } }
+      expect:
+        records:
+          - { id: 1, display_name: Ada, address: '{"city":"Paris","zip":"75001"}' }

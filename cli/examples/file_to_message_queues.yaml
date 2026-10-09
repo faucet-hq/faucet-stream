@@ -1,0 +1,81 @@
+# Fan one CSV out to five message brokers. Each matrix row picks a named sink
+# template, so the same orders land on NATS JetStream, a RabbitMQ queue, a
+# Google Cloud Pub/Sub topic, an AWS SQS queue and an AWS Kinesis data stream.
+#
+#   faucet validate cli/examples/file_to_message_queues.yaml
+#   faucet run      cli/examples/file_to_message_queues.yaml --only nats
+#
+# Prereqs (for a real run — validate needs none of them):
+#   - NATS with JetStream on 127.0.0.1:4222 and a stream covering `orders.>`.
+#   - RabbitMQ on 127.0.0.1:5672 with a durable `orders` queue.
+#   - The Pub/Sub emulator on 127.0.0.1:8085 with topic `orders`.
+#   - AWS credentials from the default chain (env / profile / instance role)
+#     for the SQS queue and the Kinesis stream.
+version: 1
+name: file_to_message_queues
+
+pipeline:
+  source:
+    type: file
+    config:
+      path: ./data/orders.csv
+
+  sinks:
+    nats:
+      type: nats
+      config:
+        servers: ["nats://127.0.0.1:4222"]
+        subject: orders.created
+        jetstream: true
+        publish_timeout_secs: 10
+
+    rabbitmq:
+      type: rabbitmq
+      config:
+        host: 127.0.0.1
+        port: 5672
+        vhost: /
+        auth: { type: plain, config: { username: guest, password: guest } }
+        # The default exchange ("") routes by queue name.
+        routing_key: orders
+        value_format: json
+        persistent: true
+        confirm: true
+
+    pubsub:
+      type: pubsub
+      config:
+        topic: orders
+        project_id: local-project
+        emulator_host: 127.0.0.1:8085
+        ordering_key: { type: field, name: country_code }
+        batch_size: 100
+
+    sqs:
+      type: sqs
+      config:
+        queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/orders
+        region: us-east-1
+        batch_size: 10
+        concurrency: 4
+
+    kinesis:
+      type: kinesis
+      config:
+        stream_name: orders
+        region: us-east-1
+        # Records with the same order_id land on the same shard, in order.
+        partition_key: { type: field, name: order_id }
+        batch_size: 500
+
+matrix:
+  - id: nats
+    sink: { ref: nats }
+  - id: rabbitmq
+    sink: { ref: rabbitmq }
+  - id: pubsub
+    sink: { ref: pubsub }
+  - id: sqs
+    sink: { ref: sqs }
+  - id: kinesis
+    sink: { ref: kinesis }

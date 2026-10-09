@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Pipelines"
+  short_description: "Write and validate faucet pipeline configs"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-pipelines to write a faucet pipeline config that moves my data incrementally and passes faucet validate."

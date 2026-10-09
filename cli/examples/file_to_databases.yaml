@@ -1,0 +1,89 @@
+# Load one CSV into four databases. Each matrix row picks a named sink
+# template: an embedded DuckDB file, an Oracle table (keyed upsert), an Amazon
+# Redshift table (bulk COPY through S3 staging) and a Cloud Spanner table
+# (keyed upsert, against the local emulator).
+#
+#   faucet validate cli/examples/file_to_databases.yaml
+#   faucet run      cli/examples/file_to_databases.yaml --only duckdb
+#
+# Prereqs (for a real run — validate needs none of them):
+#   - duckdb: nothing; the database file is created.
+#   - oracle: Oracle Database on localhost:1521 and Oracle Instant Client on
+#     the library path. ORDERS gets a primary key on ORDER_ID.
+#   - redshift: a cluster, an S3 staging bucket and an IAM role Redshift can
+#     assume to read it.
+#   - spanner: the emulator on localhost:9010 with instance `test-instance`
+#     and database `local-database`; table `orders` keyed by `order_id`.
+version: 1
+name: file_to_databases
+
+pipeline:
+  source:
+    type: file
+    config:
+      path: ./data/orders.csv
+
+  sinks:
+    duckdb:
+      type: duckdb
+      config:
+        database: ./out/warehouse.duckdb
+        table_name: orders
+        column_mapping: auto_map
+
+    oracle:
+      type: oracle
+      config:
+        host: localhost
+        port: 1521
+        service_name: FREEPDB1
+        username: app
+        password: app
+        table: ORDERS
+        identifier_case: upper
+        column_mapping: { type: auto_columns }
+        write_mode: upsert
+        key: [order_id]
+
+    redshift:
+      type: redshift
+      config:
+        host: my-cluster.abc123.us-east-1.redshift.amazonaws.com
+        database: dev
+        user: loader
+        credentials:
+          type: password
+          config:
+            # Prefer ${env:...} / ${vault:...} in real configs; literal here so
+            # the shipped example validates offline.
+            password: changeme
+        table_name: orders
+        write_strategy: copy
+        copy:
+          format: jsonl
+          staging_bucket: acme-redshift-staging
+          staging_prefix: faucet/orders/
+          iam_role: arn:aws:iam::123456789012:role/redshift-copy
+          region: us-east-1
+
+    spanner:
+      type: spanner
+      config:
+        project_id: local-project
+        instance: test-instance
+        database: local-database
+        emulator_host: localhost:9010   # remove for real Spanner
+        table_name: orders
+        # Spanner mutations address the primary key, so `key` must equal it.
+        write_mode: upsert
+        key: [order_id]
+
+matrix:
+  - id: duckdb
+    sink: { ref: duckdb }
+  - id: oracle
+    sink: { ref: oracle }
+  - id: redshift
+    sink: { ref: redshift }
+  - id: spanner
+    sink: { ref: spanner }

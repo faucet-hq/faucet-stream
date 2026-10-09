@@ -1,0 +1,39 @@
+# Purge rows by key: every record in the CSV names an order to remove, and the
+# DynamoDB sink deletes the item with that key (`write_mode: delete`). Only the
+# `key` fields are read from each record; a key that is already gone is a
+# no-op, so a re-run is safe.
+#
+#   faucet validate cli/examples/file_to_dynamodb_delete.yaml
+#   faucet run      cli/examples/file_to_dynamodb_delete.yaml
+#
+# Prereqs (for a real run): a DynamoDB table `orders` whose partition key is
+# the number attribute `order_id`, AWS credentials from the default chain, and
+# ./data/cancelled_orders.csv with an `order_id` column.
+version: 1
+name: file_to_dynamodb_delete
+
+pipeline:
+  source:
+    type: file
+    config:
+      path: ./data/cancelled_orders.csv
+
+  transforms:
+    # CSV values are strings; the table key is a number attribute.
+    - type: cast
+      config:
+        fields: { order_id: int }
+    - type: select
+      config:
+        fields: [order_id]
+
+  sink:
+    type: dynamodb
+    config:
+      table_name: orders
+      region: us-east-1
+      # `key` must be the table's key schema (partition key, plus the sort key
+      # if the table has one).
+      write_mode: delete
+      key: [order_id]
+      concurrency: 4

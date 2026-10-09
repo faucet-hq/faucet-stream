@@ -1777,8 +1777,14 @@ faucet run pipeline.yaml --output json      # one JSON document: per-row + total
 faucet run pipeline.yaml --output ndjson     # one JSON object per matrix row
 ```
 
-Each row reports `rows_in` / `rows_out` / `duration_ms` / `dlq_count` / `status`
-/ `bookmark`; the exit code is unchanged (non-zero on failure). Secret material
+Each row reports `status`, `error` (the failure message, redacted),
+`rows_in` / `rows_out`, `duration_ms`, `dlq_count`, `bookmark` (after the run),
+`batches` (how its sink writes ended — see
+[batch outcomes](../cookbook/dlq.md#seeing-what-happened-to-each-batch)),
+`source_lag` (how far the source was behind its head at the end) and `run_id`
+(what [`faucet rollback --run`](../cookbook/rollback.md) takes). `rows_in` is
+`null` unless a `lineage:` or `catalog:` block turns input sampling on. The
+exit code is unchanged (non-zero on failure). Secret material
 is scrubbed from the output. With log shipping on (`export: [logs]`), the JSON
 document also carries `log_export` — whether the run's log lines reached the
 collector (`status`, `pending_lines`, `dropped_lines`, `last_error`) — and the

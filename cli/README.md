@@ -22,6 +22,33 @@ cargo install faucet-cli --no-default-features \
     --features source-rest,sink-file,sink-stdout,transforms
 ```
 
+### Pinning a version
+
+A config can name the oldest faucet it needs with a top-level
+`requires_faucet: ">=1.13"` (a Cargo-style semver requirement). `validate`,
+`run`, `schedule`, a `serve` submit and `template register` refuse it on a
+binary that does not satisfy it (`this pipeline requires faucet >=1.13; this
+binary is 1.12.0`); hub source and sink templates take the same key. A project
+pins the exact version in its `mise.toml`, which mise installs from the GitHub
+release archives:
+
+```toml
+[tools]
+"github:faucet-hq/faucet-stream" = { version = "1.13.3", version_prefix = "faucet-cli-v" }
+```
+
+`faucet init` writes both. Container deployments pin the image tag
+(`ghcr.io/faucet-hq/faucet-stream:<version>`). See
+[Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+
+### Agent skills
+
+The faucet agent skills (pipelines, debug, deploy, migrate, templates,
+connector) ship in this repository and are versioned with this crate. In
+Claude Code: `/plugin marketplace add faucet-hq/faucet-stream`, then
+`/plugin install faucet@faucet`; other agents:
+[Agent skills](https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills.html).
+
 ## Commands
 
 | Command | What it does |
@@ -39,7 +66,7 @@ cargo install faucet-cli --no-default-features \
 | `faucet preview <config> --limit N` | Run only the source side and emit the first N records to stdout as JSONL. |
 | `faucet plan <config> [--sample F\|--live] [--diff] [--impact [--depth N]] [--policy F] [--json]` | Read-only "what would this do" preview (resolved pipeline, output schema, sink delta — never writes). `--diff` shows a `terraform plan`-style per-row config diff against the last recorded run (needs a `catalog:` block + `catalog` feature; secrets stored only as stable `<secret:hmac:…>` tokens). `--impact` (#707) walks the catalog's lineage graph downstream of the row's sink and reports the datasets, contracts, owners and declared consumers the planned schema affects, with a severity each (`breaking` / `additive` / `unknown`). A `policy:` block / `--policy` adds the row's data-flow-policy verdict. |
 | `faucet policy <config> [--policy F] [--row R] [--json]` | Evaluate a data-flow policy (#702) — classifications that label columns + rules about which sinks a label may reach — against a config: per row, the labelled columns heading into each sink (by name, through a rename, or conservatively past an opaque transform; whether masking provably masks them) and every violated rule. Exit code = violations. The same verdict is reported by `validate` / `plan` / `doctor` (`--policy`), refuses `run`, and is enforced by `faucet serve --policy`. `faucet schema policy` prints the schema. |
-| `faucet init [name] [--source X] [--sink Y]` | Scaffold a pipeline.yaml from each connector's JSON Schema. |
+| `faucet init [name] [--source X] [--sink Y]` | Scaffold a pipeline.yaml from each connector's JSON Schema, with `requires_faucet` set to this binary's minor version and the exact version pinned in the project's `mise.toml`. |
 | `faucet doctor <config> [--timeout-secs N] [--json]` | Probe every connector (auth/network/permissions/reachability) and print a checklist. Exits with the failed-probe count. |
 | `faucet test <specs…> [--filter S] [--json] [--clock C]` | Run fixture-based **offline** pipeline tests: stream sample records through a config's transforms/quality/contract with in-memory source/sink/DLQ and assert the output. Exits with the failed-case count. `faucet schema test` prints the spec-file JSON Schema. |
 | `faucet contract <config> [--export contract\|json-schema\|openlineage]` | Validate the `pipeline.contract:` block and print a summary, or export the data contract as canonical JSON / JSON Schema / an OpenLineage schema facet. `faucet schema contract` prints the block's own JSON Schema. |

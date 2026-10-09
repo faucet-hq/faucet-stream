@@ -135,6 +135,64 @@ jobs:
           python3 scripts/test_helm_app_version.py
           python3 scripts/helm-app-version.py
 
+  # The agent skills ship with the engine (#853): they link to docs pages and
+  # cli/examples files that must exist, carry no version facts, and their
+  # plugin version is the faucet-cli version. Every connector, mode and
+  # top-level block must have a validated example in cli/examples/.
+  skills:
+    name: Skills and examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install PyYAML
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pyyaml
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Test the skill and example scripts
+        run: |
+          python3 scripts/test_check_skills.py
+          python3 scripts/test_example_coverage.py
+          python3 scripts/test_plugin_version.py
+      - name: Skills link to real docs pages and examples, and carry no version facts
+        run: python3 scripts/check_skills.py --emit-yaml "$RUNNER_TEMP/skill-yaml"
+      - name: The plugin version equals the faucet-cli version
+        run: python3 scripts/plugin-version.py
+      - name: Every connector, write mode, mirror mode and config block has an example
+        run: python3 scripts/example-coverage.py
+
+  skill-connector-examples:
+    name: Skill connector examples
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [faucet-source-acme, faucet-sink-acme]
+    env:
+      MANIFEST: skills/faucet-connector/examples/${{ matrix.crate }}/Cargo.toml
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.96.0"
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: skills/faucet-connector/examples/${{ matrix.crate }}
+      # The crates depend on crates.io `faucet-core = "1"` as a third-party
+      # connector would; patch them onto this commit's faucet-core and
+      # faucet-conformance so the skill's example tracks the engine.
+      - name: Build, lint and run the conformance tests against the workspace faucet-core
+        run: |
+          patch=(--config "patch.crates-io.faucet-core.path='$GITHUB_WORKSPACE/crates/core'"
+                 --config "patch.crates-io.faucet-conformance.path='$GITHUB_WORKSPACE/crates/conformance'")
+          cargo fmt --manifest-path "$MANIFEST" --check
+          cargo clippy --manifest-path "$MANIFEST" "${patch[@]}" --all-targets -- -D warnings
+          cargo test --manifest-path "$MANIFEST" "${patch[@]}"
+          cargo tree --manifest-path "$MANIFEST" "${patch[@]}" -i faucet-core --depth 0 | grep -q "$GITHUB_WORKSPACE/crates/core"
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

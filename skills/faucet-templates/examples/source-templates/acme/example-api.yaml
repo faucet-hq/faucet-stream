@@ -1,0 +1,50 @@
+# Minimal source template for a JSON REST API: bearer auth, cursor pagination,
+# one full-refresh stream, one incremental stream, one append-only log.
+kind: source-template
+name: example-api
+owner: acme
+description: Example API — customers, invoices (incremental on updated_at) and an append-only events log
+tags: [example, rest]
+docs: https://api.example.com/docs
+params:
+  api_token:      { type: string, required: true, secret: true, description: "API token sent as a bearer token" }
+  api_base_url:   { type: string, default: "https://api.example.com/v1", description: "API root; tests and replays point it at a local server" }
+  api_start_date: { type: string, default: "2020-01-01T00:00:00Z", description: "ISO 8601 timestamp the incremental stream starts from on its first run" }
+  page_size:      { type: string, default: "100", values: ["50", "100", "250"], description: "Records per page (query params are strings)" }
+source:
+  type: rest
+  config:
+    base_url: "${param.api_base_url}"
+    auth: { type: bearer, config: { token: "${param.api_token}" } }
+    headers: { Accept: application/json }
+    query_params: { limit: "${param.page_size}" }
+    records_path: $.data[*]
+    pagination: { type: Cursor, next_token_path: $.next_cursor, param_name: cursor }
+    timeout: 60
+    max_retries: 5
+    retry_on_response:
+      - { status: [429], header: retry-after }
+transforms:
+  - { type: keys_case, config: { mode: snake } }
+streams:
+  - name: customers
+    source: { config: { path: /customers } }
+    transforms:
+      - { type: json_encode, config: { fields: [address] } }
+    primary_keys: [id]
+    write: [overwrite, upsert]
+
+  - name: invoices
+    source:
+      config:
+        path: /invoices
+        replication_method: { type: Incremental }
+        replication_key: updated_at
+        start_replication_value: "${param.api_start_date}"
+        replication_bind: { into: query, name: updated_since, format: iso8601 }
+    primary_keys: [id]
+    write: [upsert, append]
+
+  - name: events
+    source: { config: { path: /events } }
+    write: append

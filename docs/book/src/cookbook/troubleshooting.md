@@ -49,6 +49,7 @@ faucet doctor pipeline.yaml || { echo "preflight failed"; exit 1; }
 | File sinks (`jsonl`/`csv`/`parquet`/`stdout`) | Target directory is writable (`stdout` always passes). |
 | State stores (`redis`/`postgres`/`file`/`memory`) | A sentinel `put`/`get`/`delete` that leaves no residue. |
 | SLA (`sla:` block) | Read-only staleness / volume-baseline probes against the persisted run history — see [SLA monitoring](sla.md). |
+| Sources with a head (CDC, streams) | A `lag` probe measured from the stored bookmark; fails past a `max_lag_*` threshold — see [Source lag](sla.md#source-lag). |
 
 ## Reading the result
 
@@ -66,6 +67,9 @@ faucet doctor pipeline.yaml || { echo "preflight failed"; exit 1; }
 | `--timeout-secs <N>` | Per-probe timeout in seconds (default 10). Lower it to fail fast against dead hosts. |
 | `--json` | Emit a `{ config, invocations, summary }` JSON document for tooling. |
 | `--env-file <path>` / `--no-env-file` | Same `.env` handling as `run`. |
+| `--offline` | Run only the static config lints — no connectors built, no network, no credentials, secret-manager references left unresolved. Exits non-zero only on lint errors (an `auth: { ref }` naming no provider); warnings (an unused `auth:` provider or `vars:` entry, a no-op `batch_size`) are printed but do not fail it. |
+| `--profile <name>` | Probe the config with a `profiles:` overlay applied, as `run --profile` would. |
+| `--param NAME=VALUE` / `--param-env NAME[=VALUE]` | Bind run parameters, as `run` does. |
 
 The `--json` shape:
 

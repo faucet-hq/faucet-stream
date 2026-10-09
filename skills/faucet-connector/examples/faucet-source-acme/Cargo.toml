@@ -1,0 +1,31 @@
+[package]
+name = "faucet-source-acme"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-org/faucet-source-acme"
+description = "acme source connector for the faucet-stream ecosystem"
+readme = "README.md"
+keywords = ["acme", "etl", "pipeline", "connector", "data"]
+categories = ["database", "asynchronous"]
+
+[dependencies]
+faucet-core = "1"
+serde = { version = "1", features = ["derive"] }
+schemars = "1"
+reqwest = { version = "0.13", features = ["query"] }
+
+[dev-dependencies]
+faucet-conformance = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

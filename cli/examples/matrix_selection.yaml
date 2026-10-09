@@ -1,0 +1,48 @@
+# Row selection: register every row once, run a subset. `report` depends on
+# both staging rows; with `selection.include_parents: eligible`, selecting only
+# `report` pulls in the staging rows it needs instead of failing. The
+# `archive` row is parked (`status: available`) and only runs when asked for.
+#
+#   faucet validate cli/examples/matrix_selection.yaml
+#   faucet run cli/examples/matrix_selection.yaml                  # stage_*, report
+#   faucet run cli/examples/matrix_selection.yaml --only report    # + its two parents
+#   faucet run cli/examples/matrix_selection.yaml --tag staging    # stage_* only
+#   faucet run cli/examples/matrix_selection.yaml --select archive # the parked row
+#   faucet run cli/examples/matrix_selection.yaml --only report --dry-run
+version: 1
+name: matrix_selection
+
+selection:
+  include_parents: eligible   # off (default) | eligible | all
+
+pipeline:
+  source:
+    type: file
+    config:
+      path: cli/examples/data/orders.csv
+
+  sink:
+    type: file
+    config:
+      path: staged.csv
+
+matrix:
+  - id: stage_countries
+    tags: [staging]
+    source: { config: { path: cli/examples/data/countries.csv } }
+    sink: { config: { path: staged_countries.csv } }
+
+  - id: stage_orders
+    tags: [staging]
+    sink: { config: { path: staged_orders.csv } }
+
+  - id: report
+    tags: [reporting]
+    depends_on: [stage_countries, stage_orders]
+    source: { config: { path: staged_orders.csv } }
+    sink: { config: { path: report.jsonl } }
+
+  - id: archive
+    tags: [reporting]
+    source: { status: available, config: { path: cli/examples/data/orders.csv } }
+    sink: { config: { path: archive.jsonl } }

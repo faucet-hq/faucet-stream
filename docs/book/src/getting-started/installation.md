@@ -82,6 +82,13 @@ a `full-oracle` tag, from when the Oracle client was a separate image; from the
 next release `full` carries it.) To build your own
 connector set, see [`deploy/README.md`](https://github.com/faucet-hq/faucet-stream/blob/main/deploy/README.md).
 
+### Pinning a version
+
+To make a project use one faucet version everywhere (laptops, CI, production),
+pin it in the project's `mise.toml` and use the same image tag in deployments;
+`faucet init` writes the pin. See [Pinning the faucet version](../operations/pinning.md).
+Coding agents get faucet's [agent skills](agent-skills.md), which follow that pin.
+
 ### Windows
 
 Windows is not a supported platform yet: there is no prebuilt Windows binary,

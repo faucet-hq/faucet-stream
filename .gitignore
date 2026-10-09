@@ -1,5 +1,7 @@
 # Rust
 /target/
+/skills/**/target/
+/skills/**/Cargo.lock
 # Cargo.lock is committed (not ignored): this workspace ships a binary (faucet-cli),
 # and CI re-resolving fresh can pull broken upstream releases (e.g. the aws-smithy /
 # aws-runtime 1.7.4 break, #234) that red main and every PR. Committing the lock gives
@@ -56,6 +58,13 @@ docs/superpowers/
 !/scripts/test_helm_app_version.py
 !/scripts/full-feature-coverage.py
 !/scripts/test_full_feature_coverage.py
+!/scripts/check_skills.py
+!/scripts/test_check_skills.py
+!/scripts/example-coverage.py
+!/scripts/example-coverage-allow.txt
+!/scripts/test_example_coverage.py
+!/scripts/plugin-version.py
+!/scripts/test_plugin_version.py
 
 # Benchmark generated artifacts (harness + configs are tracked; outputs are not)
 /.bench-venv/

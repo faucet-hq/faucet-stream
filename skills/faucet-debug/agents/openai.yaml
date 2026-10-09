@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Debug"
+  short_description: "Diagnose failed, slow or wrong faucet pipelines"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-debug to find out why my faucet pipeline run failed and what to do next."

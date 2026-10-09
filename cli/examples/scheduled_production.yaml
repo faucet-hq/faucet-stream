@@ -1,0 +1,75 @@
+# A production-shaped scheduled pipeline: an incremental REST API sync into
+# PostgreSQL every 15 minutes, with durable state, a dead-letter queue and a
+# Prometheus endpoint.
+#
+#   faucet schedule cli/examples/scheduled_production.yaml   # faucet owns the timer
+#   faucet run cli/examples/scheduled_production.yaml        # cron / an orchestrator / a CronJob owns it
+#
+# `faucet run` ignores the `schedule:` block, so one file serves both.
+#
+# Required env vars:
+#   PG_URL           — postgres://user:pass@host/db (destination, DLQ and state)
+#   SOURCE_API_TOKEN — bearer token for the source API
+version: 1
+name: orders_sync
+
+schedule:
+  cron: "*/15 * * * *"
+  timezone: UTC
+  overlap_policy: skip
+  on_failure: continue
+  max_consecutive_failures: 5
+  run_timeout_secs: 840
+  shutdown_grace_secs: 60
+
+observability:
+  prometheus:
+    # No authentication: keep it on loopback, or bind 0.0.0.0 only inside a
+    # pod whose network policy admits just Prometheus.
+    listen: "127.0.0.1:9464"
+
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: https://api.example.com/v1
+      path: /orders
+      auth:
+        type: bearer
+        config:
+          token: ${env:SOURCE_API_TOKEN}
+      pagination:
+        type: Cursor
+        next_token_path: $.next_page
+        param_name: starting_after
+      replication_method:
+        type: Incremental
+      replication_key: updated_at
+      primary_keys: ["id"]
+
+  sink:
+    type: postgres
+    config:
+      connection_url: ${env:PG_URL}
+      table_name: orders_raw
+      column_mapping:
+        jsonb:
+          column: data
+
+  dlq:
+    sink:
+      type: postgres
+      config:
+        connection_url: ${env:PG_URL}
+        table_name: orders_dlq
+        column_mapping:
+          jsonb:
+            column: data
+    max_failures_total: 1000
+
+  state:
+    type: postgres
+    config:
+      url: ${env:PG_URL}
+      table: faucet_state
+      ensure_table: true
