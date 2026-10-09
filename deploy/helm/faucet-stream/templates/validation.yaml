@@ -39,3 +39,61 @@
 {{- if and .Values.serve.enabled (eq .Values.serve.history.backend "postgres") (not .Values.serve.history.url) (not .Values.serve.history.existingSecret) -}}
 {{- fail "serve.history.backend=postgres requires serve.history.url or serve.history.existingSecret." -}}
 {{- end -}}
+{{- if .Values.serve.enabled -}}
+{{- $features := include "faucet-stream.serveFileFeatures" . | fromYaml -}}
+{{- range $key, $f := $features -}}
+{{- $block := index $.Values.serve $key -}}
+{{- if $block.enabled -}}
+{{- $sources := 0 -}}
+{{- range list $block.content $block.existingConfigMap $block.existingSecret -}}{{- if . -}}{{- $sources = add1 $sources -}}{{- end -}}{{- end -}}
+{{- if ne (int $sources) 1 -}}
+{{- fail (printf "serve.%s.enabled=true needs exactly one of serve.%s.content, serve.%s.existingConfigMap or serve.%s.existingSecret (got %d)." $key $key $key $key (int $sources)) -}}
+{{- end -}}
+{{- if not $block.fileName -}}
+{{- fail (printf "serve.%s.fileName must not be empty." $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.serve.tenants.enabled -}}
+{{- if eq .Values.serve.history.backend "memory" -}}
+{{- fail "serve.tenants.enabled=true requires a persistent history backend: tenants, their sealed connections and state ledgers live in the run history, so with memory every restart deletes them. Set serve.history.backend to sqlite (with serve.persistence) or postgres." -}}
+{{- end -}}
+{{- if not (and .Values.serve.tenants.vaultKey.existingSecret .Values.serve.tenants.vaultKey.existingSecretKey) -}}
+{{- fail "serve.tenants.enabled=true requires serve.tenants.vaultKey.existingSecret (and existingSecretKey): the server refuses to store or open tenant connections without a vault key. Create one with: kubectl create secret generic faucet-vault --from-literal=FAUCET_VAULT_KEY=$(openssl rand -base64 48)" -}}
+{{- end -}}
+{{- range $i, $k := .Values.serve.tenants.previousKeys -}}
+{{- if not (and (kindIs "map" $k) $k.existingSecret) -}}
+{{- fail (printf "serve.tenants.previousKeys[%d] needs existingSecret (and optionally existingSecretKey, default FAUCET_VAULT_KEY)." $i) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.serve.connectProviders.enabled (not .Values.serve.tenants.enabled) -}}
+{{- fail "serve.connectProviders.enabled=true requires serve.tenants.enabled=true: a hosted OAuth connect stores the grant as a tenant connection sealed with the vault key." -}}
+{{- end -}}
+{{- range .Values.serve.approvals.require -}}
+{{- if not (has . (list "run" "template_register" "template-register" "template_launch" "template-launch")) -}}
+{{- fail (printf "serve.approvals.require: unknown change kind %q (expected run, template_register or template_launch)." .) -}}
+{{- end -}}
+{{- if and $.Values.serve.templatesSync.enabled (ne . "run") -}}
+{{- fail (printf "serve.approvals.require=%s cannot be combined with serve.templatesSync.enabled: template sync registers and launches templates on its own schedule, which would bypass the approval (faucet serve refuses to start). Drop one of the two." .) -}}
+{{- end -}}
+{{- end -}}
+{{- with .Values.serve.approvals.expirySecs -}}
+{{- if le (int64 .) 0 -}}
+{{- fail (printf "serve.approvals.expirySecs must be a positive number of seconds (got %v)." .) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (not (kindIs "invalid" .Values.serve.approvals.expirySecs)) (eq (toString .Values.serve.approvals.expirySecs) "0") -}}
+{{- fail "serve.approvals.expirySecs must be a positive number of seconds (got 0); leave it null for the server default." -}}
+{{- end -}}
+{{- if and .Values.serve.mcp.allowMutations (not .Values.serve.mcp.enabled) -}}
+{{- fail "serve.mcp.allowMutations=true has no effect without serve.mcp.enabled=true." -}}
+{{- end -}}
+{{- if and .Values.otel.logs.enabled .Values.serve.otel.enabled .Values.serve.otel.content -}}
+{{- $otel := .Values.serve.otel.content -}}
+{{- if kindIs "string" $otel -}}{{- $otel = fromYaml $otel -}}{{- end -}}
+{{- if not (has "logs" (default list $otel.export)) -}}
+{{- fail "serve.otel replaces the server OTLP file otel.logs renders, and its `export` does not list `logs`: run-log shipping would silently stop. Add `logs` to serve.otel export (with the collector endpoint), or disable one of the two." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

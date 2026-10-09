@@ -1,0 +1,20 @@
+# serve.otel replaces the otel.logs server file; log shipping stays on because
+# its export lists `logs`. The buffer bounds still come from otel.logs.
+# expect: - --otel-config=/etc/faucet-serve-otel/otel.yaml
+# expect: name: t-faucet-stream-serve-otel
+# expect: export:
+# expect: name: FAUCET_SERVE_LOG_BUFFER_MAX_BYTES
+# expect: value: "1073741824"
+# expect-not: name: FAUCET_SERVE_OTEL_CONFIG
+# expect-not: mountPath: /etc/faucet-otel
+otel:
+  logs:
+    enabled: true
+    endpoint: http://otel-collector:4317
+serve:
+  otel:
+    enabled: true
+    content:
+      endpoint: http://otel-collector:4317
+      protocol: grpc
+      export: [traces, metrics, logs]

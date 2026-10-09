@@ -1,0 +1,25 @@
+# Tenants (vault key + a rotated-out key from Secrets) and connect providers
+# from an existing ConfigMap.
+# expect: name: FAUCET_VAULT_KEY
+# expect: name: faucet-vault
+# expect: name: FAUCET_VAULT_PREVIOUS_KEY_0
+# expect: name: faucet-vault-old
+# expect: key: OLD_KEY
+# expect: - --vault-previous-key=$(FAUCET_VAULT_PREVIOUS_KEY_0)
+# expect: - --connect-providers=/etc/faucet-connect-providers/providers.yaml
+# expect: name: my-providers
+# expect: /v1/connect/callback is public
+serve:
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  tenants:
+    enabled: true
+    vaultKey:
+      existingSecret: faucet-vault
+    previousKeys:
+      - existingSecret: faucet-vault-old
+        existingSecretKey: OLD_KEY
+  connectProviders:
+    enabled: true
+    existingConfigMap: my-providers

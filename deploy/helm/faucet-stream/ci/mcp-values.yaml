@@ -1,0 +1,7 @@
+# expect: - --mcp
+# expect: - --mcp-allow-mutations
+# expect: MCP endpoint: /mcp (read + mutating tools
+serve:
+  mcp:
+    enabled: true
+    allowMutations: true

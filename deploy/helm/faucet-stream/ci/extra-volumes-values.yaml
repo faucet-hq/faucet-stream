@@ -1,0 +1,22 @@
+# extraVolumes / extraVolumeMounts reach the serve, Job and CronJob pods.
+# expect-count: 6 name: ca-bundle
+# expect-count: 3 mountPath: /etc/ssl/corp
+# expect-count: 3 name: corp-ca
+job:
+  enabled: true
+cronjob:
+  enabled: true
+pipelineConfig:
+  create: true
+  content: |
+    version: 1
+    pipeline:
+      source: { type: csv, config: { path: /data/in.csv } }
+      sink: { type: stdout, config: {} }
+extraVolumes:
+  - name: ca-bundle
+    configMap: { name: corp-ca }
+extraVolumeMounts:
+  - name: ca-bundle
+    mountPath: /etc/ssl/corp
+    readOnly: true

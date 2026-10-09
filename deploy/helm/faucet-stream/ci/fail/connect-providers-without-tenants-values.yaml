@@ -1,0 +1,5 @@
+# expect-error: serve.connectProviders.enabled=true requires serve.tenants.enabled=true
+serve:
+  connectProviders:
+    enabled: true
+    existingConfigMap: my-providers

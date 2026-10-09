@@ -1,0 +1,6 @@
+# expect-error: serve.tenants.enabled=true requires a persistent history backend
+serve:
+  tenants:
+    enabled: true
+    vaultKey:
+      existingSecret: faucet-vault

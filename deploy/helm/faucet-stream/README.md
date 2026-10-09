@@ -130,8 +130,8 @@ serve:
   twice.
 - **Reusable pipeline definition**: set `pipelineConfig` and it's passed as the
   serve `--default-config` — a workspace default merged under every submitted
-  run, so clients only POST overrides. (faucet has no HTTP "register template"
-  endpoint; this is the closest equivalent.)
+  run, so clients only POST overrides. For named, versioned pipelines use the
+  template registry (`/v1/templates`, or `serve.templatesSync` below).
 
 ### 2. One-shot pipeline (`job`)
 
@@ -164,6 +164,155 @@ pipelineConfig:
 
 `job`/`cronjob` require a `pipelineConfig` (inline `content` or
 `existingConfigMap`); the chart fails the render otherwise.
+
+---
+
+## Serve features
+
+Every file- or flag-backed `faucet serve` feature has its own values block, so
+none of them needs `serve.extraArgs`. Each needs an image built with that
+feature; the default image (the chart's `appVersion` tag, the published full
+image) has all of them.
+
+### File-backed: triggers, template sync, policy, connect providers, OTLP
+
+`serve.triggers`, `serve.templatesSync`, `serve.policy`,
+`serve.connectProviders` and `serve.otel` share one shape. Give the file in
+exactly one way:
+
+| Key | Result |
+|---|---|
+| `content` | inline YAML (a string, or a mapping rendered as YAML) → a chart-managed ConfigMap; a change rolls the pods |
+| `existingConfigMap` | your ConfigMap, which must hold `fileName` |
+| `existingSecret` | your Secret, which must hold `fileName` (for a file with credentials in it) |
+
+The file is mounted read-only at `/etc/faucet-<feature>/<fileName>` and the
+flag points at it:
+
+| Block | Flag | Mount | Default `fileName` |
+|---|---|---|---|
+| `serve.triggers` | `--triggers` | `/etc/faucet-triggers/` | `triggers.yaml` |
+| `serve.templatesSync` | `--templates-sync` | `/etc/faucet-templates-sync/` | `sync.yaml` |
+| `serve.policy` | `--policy` | `/etc/faucet-policy/` | `policy.yaml` |
+| `serve.connectProviders` | `--connect-providers` | `/etc/faucet-connect-providers/` | `providers.yaml` |
+| `serve.otel` | `--otel-config` | `/etc/faucet-serve-otel/` | `otel.yaml` |
+
+```yaml
+serve:
+  triggers:
+    enabled: true
+    content:
+      version: 1
+      triggers:
+        - name: sync-hook
+          type: webhook
+          template: { id: platform-nightly }
+          methods: [POST]
+  policy:
+    enabled: true
+    existingSecret: faucet-policy     # key: policy.yaml
+```
+
+Template-sync, connect-provider and OTLP files resolve `${env:VAR}` when the
+server loads them, so keep tokens and client secrets in a Secret exposed through
+`envFrom` (or `secret.data`) and write `token: "${env:GITHUB_TOKEN}"` in the
+file. A trigger's relative `config:` path resolves against
+`/etc/faucet-triggers/`; use an absolute path (the `pipelineConfig` mount), an
+inline config, or a registered `template:`.
+
+`serve.otel` replaces the server file `otel.logs` renders. With
+`otel.logs.enabled`, list `logs` in its `export`; the chart refuses inline
+content that would silently stop log shipping. The `otel.logs` buffer bounds
+and link template still apply.
+
+### Tenants
+
+```yaml
+serve:
+  history: { backend: postgres, existingSecret: faucet-history }
+  tenants:
+    enabled: true
+    vaultKey:
+      existingSecret: faucet-vault        # kubectl create secret generic faucet-vault \
+      existingSecretKey: FAUCET_VAULT_KEY #   --from-literal=FAUCET_VAULT_KEY="$(openssl rand -base64 48)"
+    previousKeys:                         # after a rotation: keys to open older credentials
+      - existingSecret: faucet-vault-2025
+```
+
+The vault key reaches the pod as `FAUCET_VAULT_KEY` from your Secret and never
+sits in Helm values. Each previous key is read from its Secret into
+`FAUCET_VAULT_PREVIOUS_KEY_<n>` and passed as
+`--vault-previous-key=$(FAUCET_VAULT_PREVIOUS_KEY_<n>)`, so it stays out of the
+pod spec (it is still in the process arguments inside the pod). The render
+fails when tenants are enabled without a vault key or with `memory` history
+(tenants and their sealed connections live in the run history).
+`serve.connectProviders` requires `serve.tenants`.
+
+### Approvals and MCP
+
+```yaml
+serve:
+  approvals:
+    require: [run, template_launch]   # → --require-approval=run,template_launch
+    expirySecs: 43200                 # → --approval-expiry-secs (default 86400)
+  mcp:
+    enabled: true                     # → --mcp (/mcp, same auth + RBAC as /v1)
+    allowMutations: true              # → --mcp-allow-mutations
+```
+
+Who may approve is the `approvals:` block of the RBAC config
+(`serve.auth.rbacConfig`). `template_register` / `template_launch` cannot be
+combined with `serve.templatesSync`: the server refuses to start, so the chart
+refuses to render.
+
+### Extra volumes
+
+`extraVolumes` / `extraVolumeMounts` (verbatim k8s specs) are added to the
+serve, Job and CronJob pods: a CSI secrets-store volume, a CA bundle, a shared
+volume an `extraInitContainers` fetcher fills.
+
+### Ingress
+
+- `GET /v1/runs/{id}/logs` is a Server-Sent Events stream and `/mcp` is
+  long-lived. `ingress.streamingAnnotations` (merged under
+  `ingress.annotations`, where a key you set wins) turns proxy buffering off
+  and raises the read/send timeouts to an hour for ingress-nginx. Set the
+  equivalent for another controller (on an AWS ALB, raise the idle timeout),
+  or `streamingAnnotations: {}` to drop them.
+- `GET /v1/connect/callback` is **public** by design: the OAuth provider
+  redirects the user's browser there and the single-use `state` is the
+  credential. It must be reachable from browsers at each provider's
+  `redirect_base`.
+- `POST|PUT /v1/triggers/{name}` (webhook triggers) is bearer-authenticated
+  like every `/v1` route, so the calling system sends a token.
+
+### Render-time checks
+
+The render fails on: a feature block enabled with zero or several file sources;
+`tenants` without a vault key or with `memory` history; `connectProviders`
+without `tenants`; an unknown approval kind, a zero expiry, or template
+approvals with template sync; `mcp.allowMutations` without `mcp.enabled`;
+`serve.otel` content that drops `logs` while `otel.logs` is on. Template sync
+or triggers with `memory` history render, with a warning in the install notes.
+
+---
+
+## Deploy everything
+
+[`examples/everything.yaml`](./examples/everything.yaml) turns every serve
+feature on: RBAC with approval rules, Postgres history + cluster mode with two
+replicas, triggers, template sync, a policy, tenants with hosted OAuth connect,
+OTLP traces/metrics/logs, approvals, MCP, extra volumes, Ingress with TLS and a
+ServiceMonitor. Its header lists the Secrets to create first.
+
+```bash
+helm install faucet ./deploy/helm/faucet-stream -f deploy/helm/faucet-stream/examples/everything.yaml
+```
+
+Chart tests: `deploy/helm/test-chart.sh` (Helm 4) renders every
+`ci/*-values.yaml` and checks the `# expect:` lines in it, checks that every
+`ci/fail/*-values.yaml` is refused with its `# expect-error:` message, and
+renders the examples. CI runs it on every chart change.
 
 ---
 
@@ -238,6 +387,12 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.preview.enabled` | `false` | serve dataset previews of local sink outputs — the console reads a tracked jsonl/csv/parquet file's first rows back over HTTP. Off by default: it exposes file *contents* to anyone with the `LocalOutputRead` scope (viewer and up) |
 | `serve.preview.rows` | `500` | rows a preview loads when the request omits `row_count_to_load` (soft cap); `0` = the whole dataset |
 | `serve.preview.maxRows` | `5000` | ceiling on one preview's rows (hard cap); a larger request — including `row_count_to_load=all` — is clamped to it. `0` lifts the ceiling, letting one request read an entire output file (still bounded by a 64 MiB response budget and a 30s deadline) |
+| `serve.triggers` / `.templatesSync` / `.policy` / `.connectProviders` / `.otel` | disabled | file-backed serve features: `enabled` + one of `content` / `existingConfigMap` / `existingSecret`, and `fileName` (see [Serve features](#serve-features)) |
+| `serve.tenants.enabled` | `false` | tenants; needs `vaultKey.existingSecret` (+ `existingSecretKey`, default `FAUCET_VAULT_KEY`) and persistent history |
+| `serve.tenants.previousKeys` | `[]` | `{existingSecret, existingSecretKey}` entries → `--vault-previous-key` |
+| `serve.approvals.require` | `[]` | change kinds needing approval: `run`, `template_register`, `template_launch` |
+| `serve.approvals.expirySecs` | `null` | `--approval-expiry-secs` (server default 86400) |
+| `serve.mcp.enabled` / `.allowMutations` | `false` / `false` | `/mcp` endpoint / its mutating tools |
 | `serve.autoscaling.enabled` | `false` | HPA on the Deployment |
 | `serve.persistence.enabled` | `false` | PVC for sqlite history / bookmarks |
 | `job.enabled` | `false` | one-shot `faucet run` |
@@ -251,6 +406,8 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `otel.logs.linkTemplate` | `""` | console **View logs** link (`{run_id}` …) |
 | `otel.logs.buffer.persistence.enabled` | `false` | PVC for the job / cronjob spool (`emptyDir` otherwise) |
 | `ingress.enabled` | `false` | expose serve via Ingress |
+| `ingress.streamingAnnotations` | ingress-nginx buffering off + 3600s timeouts | merged under `ingress.annotations` for the SSE log stream and `/mcp` |
+| `extraVolumes` / `extraVolumeMounts` | `[]` | added to the serve, Job and CronJob pods |
 
 ---
 

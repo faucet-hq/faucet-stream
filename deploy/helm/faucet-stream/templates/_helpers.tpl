@@ -180,3 +180,42 @@ Usage: {{- include "faucet-stream.verifyInitContainer" . | nindent 8 }}
     limits: { cpu: 250m, memory: 128Mi }
 {{- end }}
 {{- end -}}
+
+{{/*
+File-backed `faucet serve` features: values key → CLI flag, volume name and
+mount directory. Each block is { enabled, content | existingConfigMap |
+existingSecret, fileName }.
+*/}}
+{{- define "faucet-stream.serveFileFeatures" -}}
+triggers: { flag: triggers, volume: serve-triggers, dir: /etc/faucet-triggers }
+templatesSync: { flag: templates-sync, volume: serve-templates-sync, dir: /etc/faucet-templates-sync }
+policy: { flag: policy, volume: serve-policy, dir: /etc/faucet-policy }
+connectProviders: { flag: connect-providers, volume: serve-connect-providers, dir: /etc/faucet-connect-providers }
+otel: { flag: otel-config, volume: serve-otel, dir: /etc/faucet-serve-otel }
+{{- end -}}
+
+{{- define "faucet-stream.serveFileConfigMapName" -}}
+{{- printf "%s-%s" (include "faucet-stream.fullname" .root) .volume | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* A file block's content: a string verbatim, or a mapping rendered as YAML. */}}
+{{- define "faucet-stream.serveFileContent" -}}
+{{- if kindIs "string" . -}}
+{{- . -}}
+{{- else -}}
+{{- toYaml . -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Extra volumes / mounts shared by the serve, job and cronjob pods. */}}
+{{- define "faucet-stream.extraVolumes" -}}
+{{- with .Values.extraVolumes }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "faucet-stream.extraVolumeMounts" -}}
+{{- with .Values.extraVolumeMounts }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}

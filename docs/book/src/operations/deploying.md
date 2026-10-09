@@ -41,6 +41,43 @@ Wrap the container above in a `CronJob`. Use the `postgres` or `redis` state
 backend so bookmarks survive pod restarts, and scrape the metrics endpoint (see
 [Observability](./observability.md)).
 
+### Kubernetes (Helm)
+
+The Helm chart deploys the `faucet serve` control plane (Deployment), one-shot
+pipelines (Job) and scheduled pipelines (CronJob):
+
+```bash
+helm install faucet oci://ghcr.io/faucet-hq/charts/faucet-stream -f values.yaml
+```
+
+Every `faucet serve` feature has a values block, so nothing needs raw
+`serve.extraArgs`:
+
+| Values block | What it turns on |
+|---|---|
+| `serve.triggers` | event-driven triggers (`--triggers`) |
+| `serve.templatesSync` | template hosting + sync (`--templates-sync`) |
+| `serve.policy` | data-flow policy on every submission (`--policy`) |
+| `serve.connectProviders` | hosted OAuth connect for tenants (`--connect-providers`) |
+| `serve.otel` | OTLP traces / metrics / logs for the server (`--otel-config`) |
+| `serve.tenants` | tenants; the vault key comes from a Secret as `FAUCET_VAULT_KEY` |
+| `serve.approvals` | change requests (`--require-approval`, `--approval-expiry-secs`) |
+| `serve.mcp` | the `/mcp` endpoint (`--mcp`, `--mcp-allow-mutations`) |
+| `extraVolumes` / `extraVolumeMounts` | extra volumes on the serve, Job and CronJob pods |
+
+The file-backed blocks take the file inline (`content`, rendered to a
+ConfigMap), from `existingConfigMap`, or from `existingSecret`. The render
+fails on combinations the server would refuse at start (tenants without a vault
+key or with in-memory history, template approvals together with template
+sync, and similar). Behind an Ingress, the run-log stream
+(`/v1/runs/{id}/logs`, Server-Sent Events) needs proxy buffering off and a long
+read timeout (the chart sets both for ingress-nginx), and
+`/v1/connect/callback` must be publicly reachable for hosted OAuth connect.
+
+The chart's `examples/everything.yaml` turns every feature on; its
+[README](https://github.com/faucet-hq/faucet-stream/tree/main/deploy/helm/faucet-stream)
+is the full values reference.
+
 ## Secrets
 
 Never commit secrets. Use `${env:VAR}` / `${file:PATH}` in the config and inject

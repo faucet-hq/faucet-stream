@@ -1,0 +1,155 @@
+# Deploy everything: the `faucet serve` control plane with every feature the
+# chart exposes switched on, from values alone (no serve.extraArgs).
+#
+#   helm install faucet ./deploy/helm/faucet-stream -f examples/everything.yaml
+#
+# Prerequisites (create them before installing; nothing secret lives here):
+#   kubectl create secret generic faucet-history \
+#     --from-literal=FAUCET_SERVE_HISTORY='postgres://faucet:…@postgres:5432/faucet'
+#   kubectl create secret generic faucet-vault \
+#     --from-literal=FAUCET_VAULT_KEY="$(openssl rand -base64 48)"
+#   kubectl create secret generic faucet-credentials \
+#     --from-literal=FAUCET_ADMIN_TOKEN=… --from-literal=FAUCET_OPERATOR_TOKEN=… \
+#     --from-literal=FAUCET_VIEWER_TOKEN=… --from-literal=GITHUB_TOKEN=… \
+#     --from-literal=CRM_CLIENT_ID=… --from-literal=CRM_CLIENT_SECRET=…
+#   kubectl create secret generic faucet-policy --from-file=policy.yaml
+#
+# The image must carry every feature. The default tag (the chart's
+# appVersion) is the published full image, which does.
+
+envFrom:
+  - secretRef:
+      name: faucet-credentials
+
+serve:
+  replicaCount: 2
+  cluster:
+    enabled: true
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+
+  # RBAC principals; tokens resolve from the env Secret above. `approvals:`
+  # says who may approve change requests (serve.approvals below).
+  auth:
+    mode: rbac
+    rbacConfig:
+      principals:
+        - { name: admin, token: "${env:FAUCET_ADMIN_TOKEN}", role: admin }
+        - { name: ci, token: "${env:FAUCET_OPERATOR_TOKEN}", role: operator }
+        - { name: dashboards, token: "${env:FAUCET_VIEWER_TOKEN}", role: viewer }
+      approvals:
+        rules:
+          - kinds: [run]
+            roles: [operator, admin]
+            min_approvers: 1
+
+  triggers:
+    enabled: true
+    content:
+      version: 1
+      triggers:
+        - name: sync-hook
+          type: webhook
+          template: { id: platform-nightly }
+          methods: [POST]
+          dedupe_header: Idempotency-Key
+        - name: nightly
+          type: schedule
+          cron: "0 2 * * *"
+          timezone: Etc/UTC
+          template: { id: platform-nightly }
+
+  templatesSync:
+    enabled: true
+    content:
+      version: 1
+      origins:
+        - name: platform
+          source:
+            type: github
+            config:
+              repo: acme/data-templates
+              ref: main
+              path: templates/
+              token: "${env:GITHUB_TOKEN}"
+          prefix: platform-
+          launch: follow
+          prune: deprecate
+          interval_secs: 300
+
+  policy:
+    enabled: true
+    existingSecret: faucet-policy
+
+  tenants:
+    enabled: true
+    vaultKey:
+      existingSecret: faucet-vault
+
+  connectProviders:
+    enabled: true
+    content:
+      version: 1
+      providers:
+        - name: crm
+          authorize_url: https://idp.example.com/oauth/authorize
+          token_url: https://idp.example.com/oauth/token
+          client_id: "${env:CRM_CLIENT_ID}"
+          client_secret: "${env:CRM_CLIENT_SECRET}"
+          scopes: [read, offline_access]
+          redirect_base: https://faucet.example.com
+          allowed_redirects: [https://app.example.com/integrations]
+
+  otel:
+    enabled: true
+    content:
+      endpoint: http://otel-collector.observability:4317
+      protocol: grpc
+      service_name: faucet
+      export: [traces, metrics, logs]
+
+  # template_register / template_launch cannot be gated while templatesSync
+  # registers and launches on its own schedule.
+  approvals:
+    require: [run]
+    expirySecs: 43200
+
+  mcp:
+    enabled: true
+    allowMutations: true
+
+  podDisruptionBudget:
+    enabled: true
+
+otel:
+  logs:
+    enabled: true
+    endpoint: http://otel-collector.observability:4317
+    linkTemplate: https://grafana.example.com/explore?run={run_id}
+
+extraVolumes:
+  - name: ca-bundle
+    configMap:
+      name: corp-ca
+extraVolumeMounts:
+  - name: ca-bundle
+    mountPath: /etc/ssl/corp
+    readOnly: true
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+  hosts:
+    - host: faucet.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: faucet-tls
+      hosts: [faucet.example.com]
+
+serviceMonitor:
+  enabled: true

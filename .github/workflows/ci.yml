@@ -361,6 +361,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          # Helm 4: the chart tests render NOTES with `install --dry-run=client`,
+          # which Helm 3 cannot do without a cluster.
+          version: v4.2.4
       - name: helm lint
         run: helm lint deploy/helm/faucet-stream
       - name: helm template (default values)
@@ -386,6 +390,8 @@ jobs:
               echo "::error::$bad rendered; it must be refused"; exit 1
             fi
           done
+      - name: chart tests (ci/ values, ci/fail/ refusals, examples)
+        run: bash deploy/helm/test-chart.sh deploy/helm/faucet-stream
 
   # Verify each feature compiles in isolation (catches accidental cross-feature deps)
   feature-check:

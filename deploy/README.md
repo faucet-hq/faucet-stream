@@ -58,7 +58,10 @@ helm install faucet ./deploy/helm/faucet-stream \
 
 See the [chart README](./helm/faucet-stream/README.md) for serve/job/cronjob
 config, auth modes, history backends, credentials, and the full values
-reference.
+reference. Every `faucet serve` feature (triggers, template sync, policy,
+tenants and hosted OAuth connect, OTLP export, approvals, MCP) has its own
+values block; [`examples/everything.yaml`](./helm/faucet-stream/examples/everything.yaml)
+turns them all on.
 
 ## Image size / build-time note
 

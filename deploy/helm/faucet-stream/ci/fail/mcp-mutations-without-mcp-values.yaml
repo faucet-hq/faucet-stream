@@ -1,0 +1,4 @@
+# expect-error: serve.mcp.allowMutations=true has no effect without serve.mcp.enabled=true
+serve:
+  mcp:
+    allowMutations: true

@@ -1,0 +1,11 @@
+# expect-error: its `export` does not list `logs`
+otel:
+  logs:
+    enabled: true
+    endpoint: http://otel-collector:4317
+serve:
+  otel:
+    enabled: true
+    content: |
+      endpoint: http://otel-collector:4317
+      export: [traces]

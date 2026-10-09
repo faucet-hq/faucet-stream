@@ -1,0 +1,24 @@
+# Inline content as a string, sqlite history (no memory-history warning).
+# expect: - --templates-sync=/etc/faucet-templates-sync/sync.yaml
+# expect: name: t-faucet-stream-serve-templates-sync
+# expect: token: "${env:GITHUB_TOKEN}"
+# expect-not: WARNING: serve.templatesSync
+serve:
+  history:
+    backend: sqlite
+  persistence:
+    enabled: true
+  templatesSync:
+    enabled: true
+    content: |
+      version: 1
+      origins:
+        - name: platform
+          source:
+            type: github
+            config:
+              repo: acme/data-templates
+              ref: main
+              token: "${env:GITHUB_TOKEN}"
+          prefix: platform-
+          launch: follow
