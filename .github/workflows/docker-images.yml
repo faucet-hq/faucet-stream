@@ -11,13 +11,16 @@ name: Docker images
 #     :<version>-<profile>). release-plz publishes a GitHub release per crate
 #     tag, so both jobs gate on the faucet-cli tag to build ONCE per app
 #     release rather than once per crate.
-#   - manual with `release: X.Y.Z`: rebuilds that released version's source
-#     with THIS commit's Dockerfile and pushes the release's tags, so a
-#     version that already shipped can be re-imaged after an image fix (#845).
+#   - manual with `release: X.Y.Z`: publishes THIS commit's build under that
+#     release's tags (`:<X.Y.Z>-<profile>`, and `:latest` / `:<X.Y.Z>` for
+#     full), so a release can be re-imaged after an image-only fix (#845). It
+#     refuses unless this commit's faucet-cli version is X.Y.Z, so a tag never
+#     names a binary of another version.
 #
-# Every image is smoke-tested (it starts, the full profiles carry their
-# features, the Oracle client loads in `full-oracle`), and its size lands in
-# the run summary.
+# Every image is built and smoke-tested locally first (it starts, the full
+# profiles carry their features, the Oracle client loads in `full-oracle`);
+# only an image that passes is pushed, signed and attested. Sizes land in the
+# run summary.
 
 on:
   workflow_dispatch:
@@ -27,7 +30,7 @@ on:
         type: boolean
         default: false
       release:
-        description: "Rebuild this released version (X.Y.Z) with this commit's Dockerfile; empty builds this commit"
+        description: "Publish this commit under release X.Y.Z's tags (its faucet-cli version must be X.Y.Z); empty = no version tags"
         type: string
         default: ""
   release:
@@ -89,15 +92,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check out the released source, keeping this commit's Dockerfile
+      - name: Check the release matches this commit's faucet-cli version
         if: env.RELEASE != ''
         run: |
           case "$RELEASE" in
             ""|*[!0-9.]*) echo "::error::release must look like X.Y.Z, got '$RELEASE'"; exit 1 ;;
           esac
-          cp Dockerfile "$RUNNER_TEMP/Dockerfile"
-          git checkout --quiet "faucet-cli-v${RELEASE}"
-          cp "$RUNNER_TEMP/Dockerfile" Dockerfile
+          v="$(sed -n 's/^version = "\(.*\)"$/\1/p' cli/Cargo.toml | head -1)"
+          if [ "$v" != "$RELEASE" ]; then
+            echo "::error::this commit's faucet-cli is $v, not $RELEASE; run the workflow on a commit of that version"
+            exit 1
+          fi
 
       - name: Lowercase image name
         id: img
@@ -132,44 +137,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (${{ matrix.profile }})
-        id: build
+      - name: Build (${{ matrix.profile }})
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          push: ${{ env.PUSH == 'true' }}
-          # A build-only run loads the image so the smoke test can run it.
-          load: ${{ env.PUSH != 'true' }}
+          load: true
           build-args: |
             SOURCES=${{ matrix.sources }}
             SINKS=${{ matrix.sinks }}
             ORACLE_CLIENT=${{ matrix.oracle }}
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: faucet-smoke:${{ matrix.profile }}
           # Both full profiles compile the same binary, so they share a cache.
           cache-from: type=gha,scope=faucet-${{ startsWith(matrix.profile, 'full') && 'full' || matrix.profile }}
           cache-to: type=gha,mode=max,scope=faucet-${{ startsWith(matrix.profile, 'full') && 'full' || matrix.profile }}
-          # SLSA provenance and an SBOM travel with a pushed image (#789
-          # SUPPLY-05); the local image store a build-only run loads into
-          # cannot hold attestations.
-          provenance: ${{ env.PUSH == 'true' && 'mode=max' || 'false' }}
-          sbom: ${{ env.PUSH == 'true' }}
+          provenance: false
 
-      - name: Smoke-test the image and record its size
+      - name: Smoke-test the image
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
           PROFILE: ${{ matrix.profile }}
-          TAGS: ${{ steps.tags.outputs.tags }}
-          IMAGE: ${{ steps.img.outputs.name }}
         run: |
           set -euo pipefail
-          if [ "$PUSH" = "true" ]; then
-            img="${IMAGE}@${DIGEST}"
-            docker pull --quiet "$img"
-          else
-            img="${TAGS%%,*}"
-          fi
+          img="faucet-smoke:${PROFILE}"
           docker run --rm "$img" --version
           docker run --rm "$img" list > list.txt
           if [ "$PROFILE" = full ] || [ "$PROFILE" = full-oracle ]; then
@@ -201,9 +191,38 @@ jobs:
             fi
           fi
           raw=$(docker image inspect -f '{{.Size}}' "$img")
-          packed="build-only run"
+          echo "RAW_MIB=$((raw / 1048576))" >> "$GITHUB_ENV"
+
+      # Same inputs and a warm cache, so this reuses the tested build's layers.
+      - name: Push (${{ matrix.profile }})
+        id: build
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            SOURCES=${{ matrix.sources }}
+            SINKS=${{ matrix.sinks }}
+            ORACLE_CLIENT=${{ matrix.oracle }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=faucet-${{ startsWith(matrix.profile, 'full') && 'full' || matrix.profile }}
+          # SLSA provenance and an SBOM travel with the image (#789 SUPPLY-05).
+          provenance: mode=max
+          sbom: true
+
+      - name: Record the image size
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PROFILE: ${{ matrix.profile }}
+          IMAGE: ${{ steps.img.outputs.name }}
+        run: |
+          set -euo pipefail
+          packed="not pushed"
           if [ "$PUSH" = "true" ]; then
-            index=$(docker buildx imagetools inspect --raw "$img")
+            index=$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}")
             amd64=$(echo "$index" | jq -r '[.manifests[]? | select(.platform.architecture == "amd64")][0].digest // empty')
             if [ -n "$amd64" ]; then
               index=$(docker buildx imagetools inspect --raw "${IMAGE}@${amd64}")
@@ -214,7 +233,7 @@ jobs:
           {
             echo "| Profile | Uncompressed | Compressed (pull) |"
             echo "|---|---|---|"
-            echo "| ${PROFILE} | $((raw / 1048576)) MiB | ${packed} |"
+            echo "| ${PROFILE} | ${RAW_MIB} MiB | ${packed} |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Install cosign
