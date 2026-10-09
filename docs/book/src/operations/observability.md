@@ -8,8 +8,22 @@ friendly label.
 ## Enabling the Prometheus endpoint
 
 The CLI's `observability` feature (on by default in the full build) installs a
-Prometheus exporter. Configure it from the pipeline config or environment; once
-running, scrape the listen address with Prometheus.
+Prometheus exporter. Turn it on in the pipeline config; the process logs
+`Prometheus /metrics listening on …` at startup:
+
+```yaml
+observability:
+  prometheus:
+    listen: "127.0.0.1:9464"
+```
+
+The endpoint has no authentication. Bind it to loopback and scrape through a
+local agent, or bind `0.0.0.0` only inside a pod whose network policy admits
+just Prometheus. A port already in use is a startup error. `faucet serve`
+serves its own `/metrics` on the API port, also unauthenticated.
+
+A counter appears only after its first increment (overlaps, DLQ records), so
+write alerts that tolerate a missing series.
 
 ## Common labels
 
@@ -58,7 +72,11 @@ cardinality and never a Prometheus label.
 - **Pipeline:** `faucet_pipeline_runs_total{status=ok|err,kind}`,
   `faucet_pipeline_run_duration_seconds`, `faucet_pipeline_in_flight`,
   `faucet_pipeline_seconds_since_last_bookmark`,
-  `faucet_pipeline_last_bookmark_unix_seconds`.
+  `faucet_pipeline_last_bookmark_unix_seconds`, and
+  `faucet_pipeline_invocation_duration_seconds{pipeline,row,source,sink,status}`
+  — the wall-clock of one matrix-row invocation, measured after it gets its
+  concurrency slot (queue wait excluded). `kind` on a failed run is the
+  [error kind](./troubleshooting.md#error-kinds).
 - **Local outputs** (`catalog` feature): the retention GC for local sink output
   files — `faucet_local_outputs_recorded_total{kind}`,
   `faucet_local_outputs_sweeps_total{scope}`,
@@ -76,6 +94,35 @@ cardinality and never a Prometheus label.
   the binary's own version (what `faucet --version` prints); a library
   application sets its own with `faucet_core::set_build_version`, else the
   label is `faucet-core`'s version.
+
+## Finding the problem from metrics
+
+Compare series **by `row`**; each question has a home:
+
+- **Which row is slow, and which side?** Rank rows by
+  `faucet_pipeline_invocation_duration_seconds{status="ok"}`, then compare that
+  row's `faucet_source_page_duration_seconds` with
+  `faucet_sink_write_duration_seconds` / `faucet_sink_flush_duration_seconds`:
+  whichever dominates is the bottleneck ([tuning](./tuning.md)).
+- **Is it waiting on a quota?** `faucet_source_throttle_wait_seconds` — time
+  slept on rate limits is not a speed problem
+  ([source-side throttling](../cookbook/resilience.md#source-side-throttling)).
+- **Is it behind?** The `faucet_source_lag_*` gauges and
+  `faucet_pipeline_seconds_since_last_bookmark`
+  ([source lag](../cookbook/sla.md#source-lag)).
+- **Why did it fail?** `kind` on `faucet_pipeline_runs_total{status="err"}`,
+  `faucet_{source,sink,state}_errors_total`, and the `faucet_resilience_*`
+  retry / circuit-breaker series ([metrics](../cookbook/resilience.md#metrics)).
+- **Where did rows go?** `faucet_source_records_total` vs
+  `faucet_sink_records_total`, the transform out/in ratio,
+  `faucet_source_replication_key_missing_total` and
+  `faucet_batch_outcomes_total`.
+- **Is the scheduler keeping up?** The `faucet_schedule_*` series
+  ([health metrics](../cookbook/scheduling.md#health-metrics-to-scrape)).
+
+A one-shot `faucet run` exits when it finishes, so a Prometheus scrape can miss
+it entirely; use `faucet run --output json` and the logs for one-shot runs, and
+metrics for `faucet schedule` and `faucet serve`.
 
 ## Reliability properties
 
@@ -123,7 +170,10 @@ resolved `${vault:…}` value appearing in a field is still scrubbed.
 
 Spans carry `run_id`, `pipeline`, `row`, and per-operation timing. Point a
 `tracing` subscriber at your logging/trace backend; control verbosity with
-`--log-level` or `FAUCET_LOG`.
+`--log-level` or `FAUCET_LOG`. The level is taken from the first that is set:
+`--log-level`, `FAUCET_LOG`, `RUST_LOG`, then the config's
+`observability.tracing.level`. Any of them accepts a filter directive
+(`faucet_core=debug,info`) as well as a plain level.
 
 > Full design: `docs/superpowers/specs/2026-05-23-observability-otel-prometheus-design.md`.
 

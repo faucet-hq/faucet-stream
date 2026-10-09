@@ -71,6 +71,27 @@ impl Sink for MySink {
 Your connector now works with the `Pipeline` and every other connector:
 `Pipeline::new(&MySource { .. }, &MySink { .. }).run().await?`.
 
+The trait signatures, every defaulted method and every re-export are on
+[docs.rs/faucet-core](https://docs.rs/faucet-core) — open the version your
+crate's `Cargo.lock` resolves (`cargo tree -p faucet-core --depth 0`). The
+sections below are the contract those methods carry.
+
+### Object safety
+
+The pipeline and the CLI hold connectors as `Box<dyn Source>` /
+`Box<dyn Sink>`. Implement only the trait's own methods with their exact
+signatures: no generic trait methods, associated types or driver types in a
+signature. Generics belong on private helpers; pools and SDK clients live
+inside your struct. Keep a constructor that returns `Result<Self, FaucetError>`
+and does **no network I/O** — a custom binary registers connectors through a
+synchronous factory, and `faucet validate` builds them without contacting
+anything. Connect lazily and probe connectivity in `check()`.
+
+Always override `config_schema`, `connector_name` (a short, stable, non-empty
+name — it is the `connector` metric label) and `dataset_uri` (the lineage
+identity; credential-free — `faucet_core::redact_uri_credentials` strips
+userinfo from a URL).
+
 ## Crate layout
 
 Follow the same module layout as the built-in connectors:
@@ -83,14 +104,120 @@ Follow the same module layout as the built-in connectors:
   I/O. Create reusable clients/pools in `new()` and store them; never reconnect
   per call.
 
+## Streaming pages and bookmarks
+
+`Pipeline::run` drives `Source::stream_pages` and writes each `StreamPage`
+(`records` + optional `bookmark`) to the sink as it arrives, one page at a time,
+in order. The default `stream_pages` loads the whole result and chunks it —
+correct but unbounded — so a source with a paging primitive (cursor, keyset,
+scroll, offset, a consumer) overrides it and yields as it reads, keeping memory
+at O(page size). Then have `fetch_with_context` drain that stream, so every
+entry point returns the same records.
+
+- The `batch_size` argument is a hint; a page-size field in your config wins
+  when set. `batch_size == 0` means "one page with everything" — handle it
+  explicitly. Clamp to the backend's request limit; pages smaller than the hint
+  are fine, larger are not.
+- Decide end-of-data from the backend's own signal (short page, null
+  next-cursor), and let an empty first page end cleanly.
+- Never emit page N+1 before page N; bookmarks are persisted in emit order.
+- Don't hold a `std::sync::MutexGuard` across an `.await` inside the stream (it
+  makes the stream `!Send`).
+- A record missing its cursor field is an error, never a silent skip — skipping
+  would move the bookmark past data.
+
+**Resumable sources** return a valid key from `state_key()` (the CLI may
+substitute its own `{pipeline}::{row}` key, so never read it back), receive the
+last persisted bookmark in `apply_start_bookmark` before streaming starts, and
+attach bookmarks to pages: the final page only for a query whose high-water mark
+is known at the end, or every page when replay from a bookmark is deterministic
+(keyset on a unique increasing key, CDC) — each page then becomes a checkpoint.
+Keep the bookmark a small JSON object, never a record. A stored bookmark of the
+wrong shape is `FaucetError::State`, never a silent restart from zero. When the
+shape changes in a later release, bump `state_schema()` and teach
+`migrate_state()` the step.
+
+## Write, flush, checkpoint
+
+For every page the pipeline writes (`write_batch`, `write_batch_partial` or
+`write_batch_idempotent`), then calls `flush()`, then persists the page's
+bookmark. The bookmark never moves ahead of durable data, which asks of you:
+
+- **Sources** never persist, ack, commit offsets or delete source data
+  themselves. Emit the position on a page and let the pipeline persist it after
+  the flush. A backend that needs an ack acks when the next page is polled (the
+  pipeline polls only after the previous page is durable) and reports
+  `consumes_destructively() -> true`, so previews and dry runs refuse it.
+- **Sinks** make everything passed to `write_batch` so far durable and readable
+  when `flush()` returns `Ok`. A write-through sink keeps the no-op default; a
+  buffering sink (file writer, multipart upload, client-side batch) commits in
+  `flush`. The pipeline also flushes on cancellation, so `flush` must be safe to
+  call at any time, including with nothing buffered.
+- The crash window between flush and checkpoint is deliberate: the page is
+  re-read on the next run. Default delivery is at-least-once, so every sink must
+  tolerate seeing a page twice. An empty slice is a cheap `Ok(0)`.
+
+**Per-row outcomes.** Override `write_batch_partial` when the backend reports
+per-row results or a row is invalid before sending (a missing key): one outcome
+per input row, in order; an outer `Err` means the whole call failed. Declare
+`batch_atomicity()` truthfully — `Atomic` only if a failed write commits
+nothing — and if `write_batch` splits a page into several requests to respect
+a backend limit, it is partially committed on failure, so it stays best-effort.
+
+### Effectively-once
+
+Two mechanisms remove duplicates across retries and resumes
+([Exactly-once delivery](../cookbook/state.md#effectively-once-delivery) is the user's view):
+
+| Mechanism | Sink | Source |
+|---|---|---|
+| Keyed upsert | flatten `faucet_core::WriteSpec` into the config, list `Upsert`/`Delete` in `supported_write_modes()`, return `self.config.write.dedups_by_key()` from `dedups_by_key()`, route rows through `faucet_core::plan_writes`, and genuinely converge on the key | nothing |
+| Atomic watermark | `supports_idempotent_writes() -> true`; `write_batch_idempotent` commits the rows **and** the token under `scope` in one atomic unit (one transaction, one object commit, one producer transaction); `last_committed_token` reads it back | deterministic replay (`supports_exactly_once() -> true`) |
+
+Store the token verbatim and never parse it — it may carry a bookmark only the
+pipeline decodes. Two separate writes do not qualify. If you can't do all of
+this, leave the capability `false`: an honest `false` makes the CLI refuse
+`delivery: exactly_once` at load time, a false `true` corrupts data. The same
+goes for every `supports_*` probe and for `supported_write_modes()` — the CLI
+gates configs on them. A sink that lists `Upsert` but can't apply a
+`delete_marker` rejects it as a `Config` error rather than ignoring it.
+
+## Retries
+
+- **Reads and other idempotent calls** inside your connector retry transient
+  failures with `faucet_core::execute_with_retry`, which retries only errors
+  whose `is_retriable()` is true, with capped exponential backoff and jitter.
+  Expose the retry count in config.
+- **Sink writes** are retried by the pipeline (under a `resilience:` policy),
+  and a plain `write_batch` only when `write_batch_is_replay_safe()` is true —
+  by default that follows `dedups_by_key()`. `supports_idempotent_writes()` does
+  not make a plain `write_batch` retryable. Override `write_batch_is_replay_safe`
+  only when a replayed write converges by construction (every write a keyed
+  `PUT`).
+- Never retry a non-idempotent write inside your own `write_batch`: if the
+  server committed and the response was lost, the retry duplicates every row.
+  Let the error propagate; the page is replayed from the last checkpoint.
+
 ## Make it fast
 
-Performance is the project's first principle. Reuse clients and connections,
-pool database connections, use multi-row inserts and bulk APIs, and prefer
-parallel I/O. Where it makes sense, override `stream_pages` to stream natively
-from your source's paging primitive so memory stays bounded.
+Performance is the project's first principle, and none of this may trade away
+the ordering rules above:
 
-## Config schema introspection
+- Build HTTP clients, pools and producers once in `new()` and store them; never
+  per call, page or record. Bound database pools with a `max_connections`
+  field.
+- Use bulk APIs: multi-row `INSERT … VALUES (…), (…)` or `COPY` per batch inside
+  a transaction, a bulk HTTP endpoint per chunk, pipelining for key-value
+  stores. One statement per record is a defect. Make the per-request limit a
+  config field with a safe default.
+- Bound parallel I/O (`buffer_unordered(concurrency)` or a semaphore) and expose
+  `concurrency`; concurrency must never reorder emitted pages.
+- Put blocking or CPU-heavy work (synchronous drivers, encoding, compression)
+  on `tokio::task::spawn_blocking`; buffer file and socket writers.
+- Don't log or meter per record. The pipeline already records metrics and spans
+  for every call; never use record ids, URLs or cursors as labels.
+
+## Config and schema
 
 Implement `config_schema()` so `faucet schema` and `faucet init` work:
 
@@ -100,14 +227,66 @@ fn config_schema(&self) -> Value {
 }
 ```
 
-Derive `JsonSchema` on the config struct and all sub-types, and add
-`#[schemars(with = "String")]` for any custom-serde fields.
+- Derive `Serialize + Deserialize + JsonSchema` on the config and every nested
+  type; doc comments become the schema's descriptions, so write them for users.
+- Give optional fields `#[serde(default)]` with safe, bounded defaults, and add
+  `#[schemars(with = "String")]` (or the matching type) to custom-serde fields.
+- `#[serde(deny_unknown_fields)]` catches typos at `faucet validate`; serde
+  can't combine it with `#[serde(flatten)]`, so drop it on a sink that flattens
+  `WriteSpec`.
+- Auth uses the adjacently tagged shape every built-in uses
+  (`auth: { type: bearer, config: { … } }`).
+- Validate in the constructor (empty names, zero sizes, bad URLs, unsupported
+  modes, `WriteSpec::validate`) and return `FaucetError::Config`, so
+  `faucet validate` fails before data moves.
+- Depend on `faucet-core` at the major only (`faucet-core = "1"`); a minor floor
+  forces a release of your crate whenever core releases. Use its re-exports
+  (`async_trait`, `serde_json`, `schemars`, `async_stream`, `Stream`) rather
+  than adding them yourself; `serde` and `schemars` are direct dependencies only
+  because their derive macros need them in scope.
+
+**Secrets.** Never hardcode a credential, host or URL. Users write `${env:…}`
+or a secrets-manager reference and the CLI resolves it before your constructor
+runs. Don't derive `Debug` on a struct holding a secret (print `<redacted>`),
+and never log a config, auth header or connection string.
 
 ## Errors
 
 Map every failure to a `FaucetError` variant. Third-party error types wrap into
 `FaucetError::Custom(Box<dyn Error + Send + Sync>)` without losing the chain.
 Never `.unwrap()` on anything that can fail at runtime.
+
+The variant decides whether the pipeline retries: `is_retriable()` is true for
+transport errors, 5xx and 429 statuses, and rate limits, and false for
+everything else. So type a transient failure as one of those (a 503 wrapped in
+a plain sink-error string is never retried) and a permanent one as a config,
+auth, JSON, state or source/sink error. `FaucetError::sink_status` picks the
+right one from an HTTP status. Truncate server error bodies — they can echo
+request data — and keep secrets out of every message. `FaucetError` is
+`#[non_exhaustive]`; match it with a `_` arm.
+
+## Tests
+
+Unit tests live in a `#[cfg(test)]` module at the bottom of each file and cover
+the pure logic: config validation branches, request building, cursor and
+bookmark handling (including a missing cursor and a malformed bookmark), error
+mapping, capability probes per config, and a `Debug` that hides secrets.
+Integration tests in `tests/` use `wiremock` for HTTP backends (a `Respond` impl
+can model pagination or a keyed store) and `testcontainers` for databases and
+queues: a multi-page read, a resume, a retried 5xx, a non-retried 4xx, a
+malformed response, per-row sink failures and every write mode you advertise.
+Assert exact outcomes — records, bookmark values, error variants.
+
+## Versioning
+
+Start at `1.0.0`. Adding an optional config field, a defaulted method or a
+variant of a `#[non_exhaustive]` enum is a minor release; construct config
+types through serde, `new()`, `Default` or builders so struct-literal
+construction is not part of your API. Renaming or removing a field, changing a
+default's meaning, or changing the bookmark shape without
+`state_schema`/`migrate_state` is breaking — keep compatibility
+(`#[serde(alias = "…")]`, a bookmark migration) or release a new major. The
+scaffold's `[package.metadata.cargo-semver-checks.lints]` block encodes this.
 
 ## Self-certify with the conformance battery
 
@@ -118,12 +297,13 @@ there is no separate scheme. Anything not yet wired into it is Tier-2 (still
 useful, usually with its own integration tests — Tier-2 does not mean low
 quality).
 
-Add the battery as a dev-dependency (it is a path-only workspace crate, so it
-does not need to be published first):
+Add the battery as a dev-dependency. A third-party crate takes it from
+crates.io at the same major as `faucet-core`; a connector inside this workspace
+uses the workspace entry instead (`faucet-conformance.workspace = true`):
 
 ```toml
 [dev-dependencies]
-faucet-conformance.workspace = true
+faucet-conformance = "1"
 ```
 
 For a **source**, drive the checks against a live connector:
@@ -184,6 +364,27 @@ check — an append-only sink has no idempotency mechanism, for instance — don
 skip it: assert the honest behaviour instead. The capability method returns
 `false` and the pipeline refuses `delivery: exactly_once`. A passing conformance
 run that documents what a connector *cannot* do is exactly the point.
+
+Which checks apply (the [crate docs](https://docs.rs/faucet-conformance) list
+each one's exact signature for your version):
+
+| Applies to | Checks |
+|---|---|
+| every source | config schema valid, connector name non-empty, errors not panics (pass one configured to fail), well-formed `check()` probe |
+| a pageable source | bounded memory (`total > batch`), `batch_size = 0` gives a single page |
+| a resumable source | bookmark round-trip |
+| a discoverable source | discover round-trips (integration-level) |
+| every sink | config schema valid, connector name non-empty, capabilities truthful, well-formed `check()` probe |
+| a keyed or idempotent sink | idempotent replay, write modes truthful |
+| a sink with schema evolution / a declared batch atomicity | schema evolution effective / batch atomicity declared |
+| a buffering sink | cancellation flushes (integration-level) |
+
+The sink checks write rows keyed on `"id"` with a `"v"` column, so configure
+the sink under test `write_mode: upsert`, `key: ["id"]` for the keyed checks.
+They measure row-count deltas through your `distinct_count` closure, so give
+each check its own fresh destination (a new mock server, table or container).
+`faucet_conformance::doubles` has a counting source and a test sink for testing
+your own wrappers.
 
 The full contract is the
 [Faucet Connector Protocol (FCP v0)](../spec/faucet-connector-spec-v0.md).

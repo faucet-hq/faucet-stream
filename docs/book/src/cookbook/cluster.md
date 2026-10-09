@@ -282,7 +282,8 @@ pipeline:
     type: postgres
     config:
       connection_url: ${env:WAREHOUSE_URL}
-      table: events
+      table_name: events
+      column_mapping: auto_map
       write_mode: upsert
       key: [id]
   state: { type: postgres, config: { connection_url: ${env:PG_URL} } }
