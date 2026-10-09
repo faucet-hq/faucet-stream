@@ -34,7 +34,7 @@ pipeline:
     type: {kind}
     config:
       connection_url: "{url}"
-      query: "SELECT id, updated_at, v FROM items"
+      query: "SELECT id, updated_at, v FROM items WHERE updated_at >= {token}"
       batch_size: 2
       replication:
         type: incremental
@@ -49,6 +49,11 @@ pipeline:
     config:
       path: "{state}"
 "#,
+            token = if kind == "postgres" {
+                "${bookmark}"
+            } else {
+                "@bookmark"
+            },
             out = out.display(),
             state = dir.join("state").display(),
         ),
@@ -153,15 +158,7 @@ async fn validate_accepts_the_replication_block_and_refuses_a_strict_token() {
         let parsed = faucet_cli::config::PipelineConfig::from_text(&text, &cfg).unwrap();
         faucet_cli::registry::validate_source_config(kind, "default", parsed_source(&parsed))
             .unwrap();
-        let token = if kind == "postgres" {
-            "${bookmark}"
-        } else {
-            "@bookmark"
-        };
-        let strict = text.replace(
-            "FROM items\"",
-            &format!("FROM items WHERE updated_at > {token}\""),
-        );
+        let strict = text.replace("updated_at >= ", "updated_at > ");
         let parsed = faucet_cli::config::PipelineConfig::from_text(&strict, &cfg).unwrap();
         let err =
             faucet_cli::registry::validate_source_config(kind, "default", parsed_source(&parsed))

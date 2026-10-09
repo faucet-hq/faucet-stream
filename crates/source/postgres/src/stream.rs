@@ -185,7 +185,6 @@ impl PostgresSource {
         }
     }
 
-    /// Apply the currently-set shard (if any) to a resolved query string.
     fn shard_wrap_if(&self, query: String, sharded: bool) -> String {
         if sharded {
             self.shard_wrap(query)
@@ -194,6 +193,7 @@ impl PostgresSource {
         }
     }
 
+    /// Apply the currently-set shard (if any) to a resolved query string.
     fn shard_wrap(&self, query: String) -> String {
         match &*self.applied_shard.lock().expect("shard mutex poisoned") {
             Some(bounds) => bounds.wrap(&query, quote_ident),
