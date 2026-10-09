@@ -298,6 +298,65 @@ async fn the_background_shipper_drains_once_the_collector_returns() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
+async fn topology_runs_and_json_log_format_report_log_export() {
+    install_subscriber();
+    let (col, ep) = start_grpc().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let spool = dir.path().join("spool");
+    let topo = format!(
+        "version: 1\nname: topo\npipeline:\n  sources:\n    src: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sinks:\n    out: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n  nodes:\n    read: {{ kind: source, ref: src }}\n    write: {{ kind: sink, ref: out }}\n  edges:\n    - {{ from: read, to: write }}\nobservability:\n  otel: {{ endpoint: \"{ep}\", export: [logs] }}\n  logs: {{ spool_dir: \"{}\", flush_timeout_secs: 3 }}\n",
+        input.display(),
+        dir.path().join("t.jsonl").display(),
+        spool.display()
+    );
+    let path = dir.path().join("topo.yaml");
+    std::fs::write(&path, topo).unwrap();
+    faucet(&["run", path.to_str().unwrap()]).await.unwrap();
+    faucet(&["run", path.to_str().unwrap(), "--output", "json"])
+        .await
+        .unwrap();
+    let cfg = write_config(dir.path(), &ep, "grpc", &spool, "");
+    faucet_cli::cli::set_log_format(faucet_cli::cli::LogFormat::Json);
+    let r = faucet(&["run", cfg.to_str().unwrap()]).await;
+    faucet_cli::cli::set_log_format(faucet_cli::cli::LogFormat::Text);
+    r.unwrap();
+    assert!(
+        col.records()
+            .iter()
+            .any(|r| r.attr("pipeline") == Some("topo"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn logs_ship_notifies_through_the_configs_channels() {
+    install_subscriber();
+    let hook = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .mount(&hook)
+        .await;
+    let (col, ep) = start_grpc().await;
+    col.set_down(true);
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("spool");
+    let extra = format!(
+        "    notify_after_secs: 0\nnotifications:\n  - name: hook\n    on: [log_export_failed]\n    channel: {{ type: webhook, config: {{ url: \"{}/h\" }} }}\n",
+        hook.uri()
+    );
+    let cfg = write_config(dir.path(), &ep, "grpc", &spool, &extra);
+    faucet(&["run", cfg.to_str().unwrap()]).await.unwrap();
+    let _ = faucet(&["logs", "ship", cfg.to_str().unwrap(), "--timeout-secs", "1"]).await;
+    assert!(
+        !hook.received_requests().await.unwrap().is_empty(),
+        "a failing export notified"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn run_output_json_reports_log_export() {
     install_subscriber();
     let (col, ep) = start_grpc().await;

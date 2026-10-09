@@ -277,6 +277,8 @@ mod tests {
     #[test]
     fn truncate_cuts_at_a_char_boundary() {
         assert_eq!(truncate_line("short".into()), "short");
+        let odd = format!("a{}", "é".repeat(MAX_LINE_BYTES));
+        assert!(truncate_line(odd).is_char_boundary(0));
         let long = "é".repeat(MAX_LINE_BYTES);
         let t = truncate_line(long.clone());
         assert!(t.len() < long.len());

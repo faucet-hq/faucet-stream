@@ -964,6 +964,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_delivery_is_forwarded() {
+        let fb = FallbackHistory::degraded_at_startup(Duration::from_secs(60), "test");
+        let line = crate::serve::history::RunLogLine {
+            seq: 10,
+            ts: Utc::now().to_rfc3339(),
+            level: "INFO".into(),
+            line: "x".into(),
+            attrs: Default::default(),
+        };
+        fb.record_run_logs("r", &[line]).await.unwrap();
+        assert_eq!(fb.log_ship_rows(true).await.unwrap().len(), 1);
+        assert!(
+            fb.log_ship_claim("r", Duration::from_secs(5))
+                .await
+                .unwrap()
+        );
+        assert!(fb.log_ship_fail("r", "down").await.unwrap());
+        assert!(fb.log_ship_ack("r", 10).await.unwrap());
+        fb.log_ship_add_dropped("r", 2).await.unwrap();
+        fb.log_ship_mark_notified("r", false, true).await.unwrap();
+        fb.log_ship_release("r").await.unwrap();
+        let row = fb.log_ship_row("r").await.unwrap().unwrap();
+        assert_eq!((row.dropped, row.notified_drop), (2, true));
+        assert_eq!(fb.run_log_stats("r", None, None).await.unwrap().lines, 1);
+        assert_eq!(fb.delete_run_logs_through("r", 10).await.unwrap(), 1);
+        fb.log_ship_forget("r").await.unwrap();
+        assert!(fb.log_ship_row("r").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn claim_uses_memory_when_started_degraded() {
         // No primary ever existed → the in-memory store is authoritative, so
         // idempotency works normally (no split is possible).

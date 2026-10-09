@@ -1840,6 +1840,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_delivery_defaults_are_inert() {
+        let h = Bare;
+        let ttl = Duration::from_secs(1);
+        assert!(h.log_ship_rows(true).await.unwrap().is_empty());
+        assert!(h.log_ship_row("r").await.unwrap().is_none());
+        assert!(!h.log_ship_claim("r", ttl).await.unwrap());
+        assert!(!h.log_ship_ack("r", 1).await.unwrap());
+        assert!(!h.log_ship_fail("r", "e").await.unwrap());
+        h.log_ship_release("r").await.unwrap();
+        h.log_ship_add_dropped("r", 1).await.unwrap();
+        h.log_ship_mark_notified("r", true, true).await.unwrap();
+        h.log_ship_forget("r").await.unwrap();
+        assert_eq!(
+            h.run_log_stats("r", None, None).await.unwrap(),
+            RunLogStats::default()
+        );
+        assert_eq!(h.delete_run_logs_through("r", 1).await.unwrap(), 0);
+        let row = LogShipRow {
+            total_seq: 5,
+            delivered_seq: Some(5),
+            ..Default::default()
+        };
+        assert!(!row.has_pending());
+    }
+
+    #[tokio::test]
     async fn trigger_edges_and_recovery_default_to_unsupported() {
         let h = Bare;
         for err in [

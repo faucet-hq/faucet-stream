@@ -534,6 +534,21 @@ async fn serve_ships_a_runs_logs_and_reports_it_on_the_run() {
             .collect::<Vec<_>>()
     );
 
+    // While lines are local, the persisted read serves them (no link).
+    let body = client
+        .get(format!("{base}/v1/runs/{id}/logs?format=jsonl"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!body.contains("aged_out"), "{body}");
+    assert!(
+        body.contains("\"attrs\""),
+        "lines carry their attributes: {body}"
+    );
+
     // A known run with no local lines left answers with the link.
     let h = sqlite(&dir.path().join("h.db"), "probe", Duration::from_secs(30)).await;
     h.delete_run_logs_through(&id, u64::MAX - 1).await.unwrap();
@@ -555,6 +570,207 @@ async fn serve_ships_a_runs_logs_and_reports_it_on_the_run() {
         .await
         .unwrap();
     assert!(text.contains("https://g/explore"), "{text}");
+
+    // A run with neither a live buffer nor local lines opens its SSE stream
+    // with the log-service link.
+    record_run(&h, "aged-1", "old", None).await;
+    let sse = client
+        .get(format!("{base}/v1/runs/aged-1/logs"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(sse.contains("event: link"), "{sse}");
+    assert!(sse.contains("https://g/explore?q=aged-1"), "{sse}");
+    assert!(sse.contains("event: end"), "{sse}");
+}
+
+#[tokio::test]
+async fn the_shipper_loop_backs_off_and_keeps_retention_running() {
+    let (col, ep) = start_grpc().await;
+    col.set_down(true);
+    let h: std::sync::Arc<dyn RunHistory> =
+        std::sync::Arc::new(MemoryHistory::new(Duration::from_secs(60)));
+    let mut cfg = export_config(Some(otel(&ep, faucet_core::OtelProtocol::Grpc)));
+    cfg.log_retention = Duration::ZERO;
+    let ex = std::sync::Arc::new(LogExport::from_config(&cfg));
+    assert!(!LogExport::unsupported(&cfg));
+    record_run(h.as_ref(), "loop", "p", None).await;
+    h.record_run_logs("loop", &lines_at(Duration::from_secs(10), 2, "l"))
+        .await
+        .unwrap();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(faucet_cli::serve::log_export::run_loop(
+        ex.clone(),
+        h.clone(),
+        stop.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    col.set_down(false);
+    for _ in 0..100 {
+        if col.records().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    stop.cancel();
+    task.await.unwrap();
+    assert_eq!(
+        col.records().len(),
+        2,
+        "delivered once the collector returned"
+    );
+
+    // The tail ships at shutdown without the settle window.
+    h.record_run_logs("loop", &lines_at(Duration::ZERO, 1, "tail"))
+        .await
+        .unwrap();
+    faucet_cli::serve::log_export::final_flush(&ex, h.as_ref(), Duration::from_secs(5)).await;
+    assert_eq!(col.records().len(), 3);
+
+    // An exporter that cannot be built leaves the buffer alone.
+    let mut bad = otel(&ep, faucet_core::OtelProtocol::Grpc);
+    bad.headers.insert("bad header".into(), "v".into());
+    let broken = LogExport::from_config(&export_config(Some(bad)));
+    h.record_run_logs("loop", &lines_at(Duration::from_secs(10), 1, "x"))
+        .await
+        .unwrap();
+    assert_eq!(broken.ship_once(h.as_ref()).await.unwrap().shipped, 0);
+}
+
+#[cfg(feature = "notify")]
+#[tokio::test]
+async fn a_registered_notifier_wins_over_the_stored_config() {
+    let hook = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .mount(&hook)
+        .await;
+    let (col, ep) = start_grpc().await;
+    col.set_down(true);
+    let h = MemoryHistory::new(Duration::from_secs(60));
+    let mut cfg = export_config(Some(otel(&ep, faucet_core::OtelProtocol::Grpc)));
+    cfg.log_buffer.notify_after = Duration::ZERO;
+    let ex = LogExport::from_config(&cfg);
+    let specs: Vec<faucet_cli::notify::NotificationSpec> =
+        serde_json::from_value(serde_json::json!([{
+            "name": "hook",
+            "on": ["log_export_failed"],
+            "channel": { "type": "webhook", "config": { "url": format!("{}/r", hook.uri()) } }
+        }]))
+        .unwrap();
+    let n = faucet_cli::notify::Notifier::from_specs(&specs)
+        .unwrap()
+        .unwrap();
+    ex.register_notifier("reg", n);
+    record_run(&h, "reg", "p", None).await;
+    h.record_run_logs("reg", &lines_at(Duration::from_secs(10), 1, "a"))
+        .await
+        .unwrap();
+    ex.ship_once(&h).await.unwrap();
+    assert_eq!(hook.received_requests().await.unwrap().len(), 1);
+    // Many runs over the byte bound: the oldest go first, across pages.
+    let mut tight = cfg.clone();
+    tight.log_buffer.max_bytes = 1;
+    for i in 0..3 {
+        let id = format!("bulk-{i}");
+        record_run(&h, &id, "p", None).await;
+        h.record_run_logs(&id, &lines_at(Duration::from_secs(100 - i), 1200, "b"))
+            .await
+            .unwrap();
+    }
+    let m = LogExport::from_config(&tight).maintain(&h).await.unwrap();
+    assert!(m.dropped_max_bytes >= 3599, "{m:?}");
+}
+
+#[tokio::test]
+async fn headers_ride_along_and_partial_success_counts_as_acknowledged() {
+    let (grpc, gep) = start_grpc().await;
+    let (http, hep, _srv) = start_http().await;
+    for (col, ep, proto) in [
+        (&grpc, gep.as_str(), faucet_core::OtelProtocol::Grpc),
+        (&http, hep.as_str(), faucet_core::OtelProtocol::Http),
+    ] {
+        col.reject.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut cfg = otel(ep, proto);
+        cfg.headers.insert("X-Tenant".into(), "acme".into());
+        let ex = faucet_cli::logship::otlp::OtlpLogExporter::new(&cfg).unwrap();
+        let line = faucet_cli::logship::ShipLine {
+            seq: 1,
+            ts: chrono::Utc::now().to_rfc3339(),
+            level: "INFO".into(),
+            body: "b".into(),
+            attrs: BTreeMap::new(),
+        };
+        assert_eq!(ex.export(&BTreeMap::new(), &[line]).await.unwrap(), 1);
+        assert_eq!(col.request_count(), 1);
+    }
+    let sent = _srv.received_requests().await.unwrap();
+    assert_eq!(
+        sent[0].headers.get("x-tenant").map(|v| v.to_str().unwrap()),
+        Some("acme")
+    );
+}
+
+#[test]
+fn zero_buffer_bounds_are_refused() {
+    let mut a = args(0);
+    a.log_buffer.log_buffer_max_age_secs = 0;
+    assert!(ServeConfig::from_args(a).is_err());
+    let mut a = args(0);
+    a.log_buffer.log_buffer_max_bytes = 0;
+    assert!(ServeConfig::from_args(a).is_err());
+    let mut a = args(0);
+    a.log_buffer.log_link_template = Some("  ".into());
+    assert!(
+        ServeConfig::from_args(a)
+            .unwrap()
+            .log_buffer
+            .link_template
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn persisted_lines_reach_the_store_while_the_run_is_live() {
+    let h: std::sync::Arc<dyn RunHistory> =
+        std::sync::Arc::new(MemoryHistory::new(Duration::from_secs(60)));
+    let hub = faucet_cli::serve::logs::LogHub::new();
+    hub.enable_persistence(h.clone(), 2);
+    let ts = chrono::Utc::now().to_rfc3339();
+    let mut attrs = BTreeMap::new();
+    attrs.insert("row".to_string(), "r9".to_string());
+    hub.capture_with_attrs("live", "INFO", ts.clone(), "one".into(), attrs);
+    hub.capture("live", "INFO", ts.clone(), "two".into());
+    hub.capture("live", "INFO", ts, "three (over the cap)".into());
+    let mut got = 0;
+    for _ in 0..40 {
+        got = h.list_run_logs("live", None, 10).await.unwrap().lines.len();
+        if got == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(got, 2, "the periodic flush persists before the run ends");
+    hub.finish("live");
+    for _ in 0..40 {
+        if h.log_ship_row("live")
+            .await
+            .unwrap()
+            .is_some_and(|r| r.dropped == 1)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(h.log_ship_row("live").await.unwrap().unwrap().dropped, 1);
+    let page = h.list_run_logs("live", None, 10).await.unwrap();
+    assert_eq!(
+        page.lines[0].attrs.get("row").map(String::as_str),
+        Some("r9")
+    );
 }
 
 async fn wait_for_async<F, Fut>(secs: u64, mut cond: F) -> bool

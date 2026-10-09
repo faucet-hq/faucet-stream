@@ -267,16 +267,19 @@ mod tests {
             tracing::warn!(nnn = 31337, "hello-capture");
         });
         let e = got.lock().unwrap().pop().unwrap();
+        // Other tests register secrets process-wide; compare against the
+        // redacted form so a short registered value cannot flake this.
+        let r = |v: &str| crate::secrets::registry::redact(v).into_owned();
         assert_eq!(e.level, "WARN");
-        assert_eq!(e.body, "hello-capture nnn=31337");
-        assert_eq!(e.attr("pipeline"), Some("pipe-capture-a"));
-        assert_eq!(e.attr("row"), Some("row-capture-2"));
-        assert_eq!(e.attr("connector"), Some("conn-capture"));
-        assert_eq!(e.attr("invocation_id"), Some("inv-capture-1"));
+        assert_eq!(e.body, r("hello-capture nnn=31337"));
+        assert_eq!(e.attr("pipeline"), Some(r("pipe-capture-a").as_str()));
+        assert_eq!(e.attr("row"), Some(r("row-capture-2").as_str()));
+        assert_eq!(e.attr("connector"), Some(r("conn-capture").as_str()));
+        assert_eq!(e.attr("invocation_id"), Some(r("inv-capture-1").as_str()));
         assert!(e.attr("other").is_none());
         assert_eq!(e.attr("target"), Some(e.target.as_str()));
         assert!(e.rendered().contains(" WARN "));
-        assert!(e.rendered().ends_with(": hello-capture nnn=31337"));
+        assert!(e.rendered().ends_with(&r("hello-capture nnn=31337")));
     }
 
     #[cfg(feature = "otel")]
@@ -297,6 +300,68 @@ mod tests {
         let e = got.lock().unwrap().pop().unwrap();
         assert_eq!(e.attr("trace_id").map(str::len), Some(32), "{:?}", e.attrs);
         assert_eq!(e.attr("span_id").map(str::len), Some(16));
+    }
+
+    #[test]
+    fn fields_recorded_later_are_kept() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::registry().with(Grab(got.clone()));
+        tracing::subscriber::with_default(sub, || {
+            let s = tracing::info_span!(
+                "tick",
+                log_run_id = tracing::field::Empty,
+                shard = tracing::field::Empty
+            );
+            s.record("log_run_id", "tick-capture-1");
+            s.record("shard", "shard-capture-2");
+            let plain = tracing::info_span!("plain", other = tracing::field::Empty);
+            plain.record("other", 1);
+            let _p = plain.enter();
+            let _g = s.enter();
+            tracing::info!("in the tick");
+        });
+        let e = got.lock().unwrap().pop().unwrap();
+        let r = |v: &str| crate::secrets::registry::redact(v).into_owned();
+        assert_eq!(e.attr("log_run_id"), Some(r("tick-capture-1").as_str()));
+        assert_eq!(e.attr("shard"), Some(r("shard-capture-2").as_str()));
+    }
+
+    #[test]
+    fn recording_extends_and_ignores_unrelated_fields() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::registry().with(Grab(got.clone()));
+        tracing::subscriber::with_default(sub, || {
+            let s = tracing::info_span!(
+                "s",
+                pipeline = "pipe-rec-x",
+                row = tracing::field::Empty,
+                other = tracing::field::Empty
+            );
+            s.record("other", 3);
+            s.record("row", "row-rec-x");
+            let _g = s.enter();
+            tracing::info!("x");
+        });
+        let e = got.lock().unwrap().pop().unwrap();
+        let r = |v: &str| crate::secrets::registry::redact(v).into_owned();
+        assert_eq!(e.attr("pipeline"), Some(r("pipe-rec-x").as_str()));
+        assert_eq!(e.attr("row"), Some(r("row-rec-x").as_str()));
+        assert!(e.attr("other").is_none());
+    }
+
+    #[test]
+    fn registered_secrets_never_reach_a_captured_line() {
+        crate::secrets::registry::register("s3cr3t-capture-value");
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::registry().with(Grab(got.clone()));
+        tracing::subscriber::with_default(sub, || {
+            let s = tracing::info_span!("o", pipeline = "s3cr3t-capture-value");
+            let _g = s.enter();
+            tracing::info!(token = "s3cr3t-capture-value", "using s3cr3t-capture-value");
+        });
+        let e = got.lock().unwrap().pop().unwrap();
+        assert!(!e.body.contains("s3cr3t-capture-value"), "{}", e.body);
+        assert!(!e.attr("pipeline").unwrap().contains("s3cr3t-capture-value"));
     }
 
     #[test]

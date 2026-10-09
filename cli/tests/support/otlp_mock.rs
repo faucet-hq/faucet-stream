@@ -39,6 +39,8 @@ impl Record {
 pub struct Collector {
     pub requests: Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
     pub down: Arc<AtomicBool>,
+    /// Acknowledge, but report one rejected record (OTLP partial success).
+    pub reject: Arc<AtomicBool>,
 }
 
 fn value(v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>) -> String {
@@ -53,6 +55,19 @@ fn value(v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>) -> String
 impl Collector {
     pub fn set_down(&self, down: bool) {
         self.down.store(down, Ordering::SeqCst);
+    }
+
+    pub fn response(&self) -> ExportLogsServiceResponse {
+        let mut r = ExportLogsServiceResponse::default();
+        if self.reject.load(Ordering::SeqCst) {
+            r.partial_success = Some(
+                opentelemetry_proto::tonic::collector::logs::v1::ExportLogsPartialSuccess {
+                    rejected_log_records: 1,
+                    error_message: "rejected".into(),
+                },
+            );
+        }
+        r
     }
 
     pub fn is_down(&self) -> bool {
@@ -141,9 +156,7 @@ impl LogsService for GrpcSvc {
             return Err(tonic_otlp::Status::unavailable("collector down"));
         }
         self.0.accept(request.into_inner());
-        Ok(tonic_otlp::Response::new(
-            ExportLogsServiceResponse::default(),
-        ))
+        Ok(tonic_otlp::Response::new(self.0.response()))
     }
 }
 
@@ -178,7 +191,7 @@ impl wiremock::Respond for HttpResponder {
             Ok(r) => {
                 self.0.accept(r);
                 wiremock::ResponseTemplate::new(200)
-                    .set_body_bytes(ExportLogsServiceResponse::default().encode_to_vec())
+                    .set_body_bytes(self.0.response().encode_to_vec())
             }
             Err(_) => wiremock::ResponseTemplate::new(400),
         }

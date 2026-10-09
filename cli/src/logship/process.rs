@@ -100,18 +100,6 @@ impl RunLogs {
         }
     }
 
-    /// The run's id in the spool, when shipping.
-    pub fn run_id(&self) -> Option<&str> {
-        #[cfg(feature = "otel")]
-        {
-            self.session.as_ref().map(|(_, id)| id.as_str())
-        }
-        #[cfg(not(feature = "otel"))]
-        {
-            None
-        }
-    }
-
     /// Close the run, ship what is pending within `flush_timeout_secs`, stop
     /// the shipper, and report the run's export status. `None` when shipping
     /// is off.

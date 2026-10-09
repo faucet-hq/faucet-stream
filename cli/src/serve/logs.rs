@@ -571,6 +571,27 @@ mod tests {
     use futures::StreamExt;
 
     #[test]
+    fn later_recorded_fields_and_noise_targets() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let hub = LogHub::new();
+        let subscriber = tracing_subscriber::registry().with(RunLogLayer::new(hub.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "faucet.serve.run",
+                serve_run_id = "run-rec",
+                shard = tracing::field::Empty
+            );
+            span.record("shard", "s-7");
+            let _g = span.enter();
+            tracing::info!("kept");
+            tracing::info!(target: "hyper::proto", "transport noise");
+        });
+        let (lines, _rx, _ended) = hub.reader("run-rec").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].line.ends_with(": kept"));
+    }
+
+    #[test]
     fn ring_caps_and_orders_by_seq() {
         let hub = LogHub::new();
         for i in 0..(RING_CAPACITY + 5) {

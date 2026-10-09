@@ -390,10 +390,7 @@ impl SpoolWriter {
             return;
         }
         line.seq = run.meta.last_seq + 1;
-        let mut bytes = match serde_json::to_vec(&line) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
+        let mut bytes = serde_json::to_vec(&line).expect("a ShipLine is plain strings");
         bytes.push(b'\n');
         let res = run.file.write_all(&bytes).and_then(|_| {
             run.since_sync += 1;
@@ -973,6 +970,102 @@ mod tests {
         assert!(!spool.segment("b").exists());
         assert_eq!(r.run("c").unwrap().view.dropped_lines, 0);
         assert_eq!(r.run("c").unwrap().view.pending_lines, 10);
+    }
+
+    #[test]
+    fn writer_failures_are_counted_never_raised() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spool");
+        let spool = Spool::open(&root).unwrap();
+        let mut w = SpoolWriter::new(spool.clone());
+        w.begin(
+            RunMeta {
+                run_id: "ok".into(),
+                ..Default::default()
+            },
+            10,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        w.append("ok", line("after the dir vanished", &now_ts()));
+        w.flush(true);
+        w.end("ok");
+        w.begin(
+            RunMeta {
+                run_id: "nodir".into(),
+                ..Default::default()
+            },
+            10,
+        );
+        assert!(!w.is_open("nodir"));
+        assert!(
+            w.write_failures() == 0,
+            "metadata/segment failures carry no line count"
+        );
+    }
+
+    #[test]
+    fn segments_fsync_every_sync_every_lines_and_retry_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        let other = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(spool.lock_path("big"))
+            .unwrap();
+        other.try_lock().unwrap();
+        let mut w = SpoolWriter::new(spool.clone());
+        w.begin(
+            RunMeta {
+                run_id: "big".into(),
+                ..Default::default()
+            },
+            u64::MAX,
+        );
+        drop(other);
+        for i in 0..(SYNC_EVERY + 2) {
+            w.append("big", line(&format!("l{i}"), &now_ts()));
+        }
+        w.flush(false);
+        w.end("big");
+        assert_eq!(spool.read_meta("big").unwrap().last_seq, SYNC_EVERY + 2);
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_run_is_settled_by_the_next_shipper() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        spool
+            .write_meta(&RunMeta {
+                run_id: "orphan".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::write(spool.segment("orphan"), b"").unwrap();
+        let r = ship_pass(&spool, None, opts(), Utc::now()).await;
+        assert!(r.run("orphan").unwrap().meta.ended_at.is_some());
+        assert!(spool.read_cursor("orphan").settled_at.is_some());
+    }
+
+    #[test]
+    fn unreadable_segments_and_run_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        std::fs::create_dir(spool.segment("adir")).unwrap();
+        assert!(spool.read_lines("adir", 0, 10).is_err());
+        std::fs::write(spool.segment("two"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        spool
+            .write_meta(&RunMeta {
+                run_id: "two".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::write(spool.meta_path("first"), b"{}").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(spool.segment("first"), b"").unwrap();
+        let ids = spool.run_ids();
+        assert!(ids.contains(&"two".to_string()) && ids.contains(&"first".to_string()));
     }
 
     #[tokio::test]
