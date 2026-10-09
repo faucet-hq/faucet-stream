@@ -20,8 +20,10 @@ running image is missing a connector you declared).
 ## Quick start (Docker)
 
 ```bash
-# Complete image — all connectors + the serve control plane
+# Complete image — the CLI's `full` feature: every connector and every feature
 docker build -t faucet:full .
+# …plus Oracle Instant Client for the Oracle connectors (~40 MiB more)
+docker build --build-arg ORACLE_CLIENT=true -t faucet:full-oracle .
 # The image's default command is `serve`, which refuses to start without auth.
 docker run --rm -p 8080:8080 -e FAUCET_SERVE_AUTH_TOKEN="$(openssl rand -hex 32)" faucet:full
 curl -s localhost:8080/healthz && echo OK

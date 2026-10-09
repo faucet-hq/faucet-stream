@@ -80,8 +80,11 @@ Dockerfile takes name-based build args:
 scripts/build-image.sh -t ghcr.io/you/faucet-stream:analytics \
   -s rest,postgres,s3 -k bigquery,snowflake,jsonl
 
-# Complete image — every first-party connector + serve
+# Complete image — every connector and every feature (the CLI's `full`)
 scripts/build-image.sh -t ghcr.io/you/faucet-stream:full
+
+# …or use the published ones: `:full`, or `:full-oracle` when you move Oracle
+# data (it adds Oracle Instant Client, ~40 MiB compressed).
 ```
 
 The recommended workflow is **B: named per-profile images** — publish a few

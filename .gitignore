@@ -54,6 +54,8 @@ docs/superpowers/
 !/scripts/packaged-keys.py
 !/scripts/helm-app-version.py
 !/scripts/test_helm_app_version.py
+!/scripts/full-feature-coverage.py
+!/scripts/test_full_feature_coverage.py
 
 # Benchmark generated artifacts (harness + configs are tracked; outputs are not)
 /.bench-venv/

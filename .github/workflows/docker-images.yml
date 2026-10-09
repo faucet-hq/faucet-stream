@@ -11,6 +11,13 @@ name: Docker images
 #     :<version>-<profile>). release-plz publishes a GitHub release per crate
 #     tag, so both jobs gate on the faucet-cli tag to build ONCE per app
 #     release rather than once per crate.
+#   - manual with `release: X.Y.Z`: rebuilds that released version's source
+#     with THIS commit's Dockerfile and pushes the release's tags, so a
+#     version that already shipped can be re-imaged after an image fix (#845).
+#
+# Every image is smoke-tested (it starts, the full profiles carry their
+# features, the Oracle client loads in `full-oracle`), and its size lands in
+# the run summary.
 
 on:
   workflow_dispatch:
@@ -19,6 +26,10 @@ on:
         description: "Push to GHCR (otherwise build-only)"
         type: boolean
         default: false
+      release:
+        description: "Rebuild this released version (X.Y.Z) with this commit's Dockerfile; empty builds this commit"
+        type: string
+        default: ""
   release:
     types: [published]
 
@@ -42,26 +53,51 @@ jobs:
     # not trigger a full image build. Mirrors the `helm` job's guard below.
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'faucet-cli-v')
     runs-on: ubuntu-latest
+    env:
+      PUSH: ${{ github.event_name == 'release' || inputs.push }}
+      RELEASE: ${{ inputs.release }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Complete image — every first-party connector + serve. Heavy.
+          # The CLI's `full` feature: every connector and every feature. Heavy.
           - profile: full
             sources: ""
             sinks: ""
+            oracle: "false"
+          # `full` plus the Oracle Instant Client the Oracle connectors load at
+          # run time. ~40 MiB more compressed, so it is its own tag.
+          - profile: full-oracle
+            sources: ""
+            sinks: ""
+            oracle: "true"
           # Lean, common analytics/ELT set.
           - profile: core
             sources: "rest,postgres,s3,csv"
             sinks: "postgres,s3,jsonl,stdout"
+            oracle: "false"
           - profile: analytics
             sources: "rest,postgres,s3,bigquery,snowflake"
             sinks: "bigquery,snowflake,s3,jsonl"
+            oracle: "false"
           - profile: cdc
             sources: "postgres-cdc,mysql-cdc,mongodb-cdc"
             sinks: "postgres,kafka,s3"
+            oracle: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Check out the released source, keeping this commit's Dockerfile
+        if: env.RELEASE != ''
+        run: |
+          case "$RELEASE" in
+            ""|*[!0-9.]*) echo "::error::release must look like X.Y.Z, got '$RELEASE'"; exit 1 ;;
+          esac
+          cp Dockerfile "$RUNNER_TEMP/Dockerfile"
+          git checkout --quiet "faucet-cli-v${RELEASE}"
+          cp "$RUNNER_TEMP/Dockerfile" Dockerfile
 
       - name: Lowercase image name
         id: img
@@ -72,8 +108,13 @@ jobs:
         run: |
           base="${{ steps.img.outputs.name }}"
           tags="${base}:${{ matrix.profile }}"
+          v=""
           if [ "${{ github.event_name }}" = "release" ]; then
             v="${GITHUB_REF_NAME#faucet-cli-v}"; v="${v#v}"
+          elif [ -n "$RELEASE" ]; then
+            v="$RELEASE"
+          fi
+          if [ -n "$v" ]; then
             tags="${tags},${base}:${v}-${{ matrix.profile }}"
             if [ "${{ matrix.profile }}" = "full" ]; then
               tags="${tags},${base}:latest,${base}:${v}"
@@ -84,7 +125,7 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        if: github.event_name == 'release' || inputs.push
+        if: env.PUSH == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -98,29 +139,96 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          push: ${{ github.event_name == 'release' || inputs.push }}
+          push: ${{ env.PUSH == 'true' }}
+          # A build-only run loads the image so the smoke test can run it.
+          load: ${{ env.PUSH != 'true' }}
           build-args: |
             SOURCES=${{ matrix.sources }}
             SINKS=${{ matrix.sinks }}
+            ORACLE_CLIENT=${{ matrix.oracle }}
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=faucet-${{ matrix.profile }}
-          cache-to: type=gha,mode=max,scope=faucet-${{ matrix.profile }}
-          # SLSA provenance and an SBOM travel with the image (#789 SUPPLY-05).
-          provenance: mode=max
-          sbom: true
+          # Both full profiles compile the same binary, so they share a cache.
+          cache-from: type=gha,scope=faucet-${{ startsWith(matrix.profile, 'full') && 'full' || matrix.profile }}
+          cache-to: type=gha,mode=max,scope=faucet-${{ startsWith(matrix.profile, 'full') && 'full' || matrix.profile }}
+          # SLSA provenance and an SBOM travel with a pushed image (#789
+          # SUPPLY-05); the local image store a build-only run loads into
+          # cannot hold attestations.
+          provenance: ${{ env.PUSH == 'true' && 'mode=max' || 'false' }}
+          sbom: ${{ env.PUSH == 'true' }}
+
+      - name: Smoke-test the image and record its size
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PROFILE: ${{ matrix.profile }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+          IMAGE: ${{ steps.img.outputs.name }}
+        run: |
+          set -euo pipefail
+          if [ "$PUSH" = "true" ]; then
+            img="${IMAGE}@${DIGEST}"
+            docker pull --quiet "$img"
+          else
+            img="${TAGS%%,*}"
+          fi
+          docker run --rm "$img" --version
+          docker run --rm "$img" list > list.txt
+          if [ "$PROFILE" = full ] || [ "$PROFILE" = full-oracle ]; then
+            # A sample of what #845 found missing from the old :full image.
+            docker run --rm "$img" schema transform sql > /dev/null
+            docker run --rm "$img" schema transform wasm > /dev/null
+            docker run --rm "$img" schema templates-sync > /dev/null
+            grep -qw oracle list.txt
+            mkdir -p smoke
+            printf '%s\n' \
+              'version: 1' \
+              'name: oracle-client-smoke' \
+              'pipeline:' \
+              '  source:' \
+              '    type: oracle' \
+              '    config: { host: 127.0.0.1, port: 1, service_name: X, username: u, password: p, query: "SELECT 1 FROM DUAL" }' \
+              '  sink: { type: stdout, config: {} }' > smoke/oracle.yaml
+            out="$(docker run --rm -v "$PWD/smoke:/smoke:ro" "$img" run --no-env-file /smoke/oracle.yaml 2>&1 || true)"
+            echo "$out" | tail -5
+            if [ "$PROFILE" = full-oracle ]; then
+              if echo "$out" | grep -qE 'DPI-1047|DPI-1072'; then
+                echo "::error::the Oracle client did not load in full-oracle"; exit 1
+              fi
+              echo "$out" | grep -qE 'ORA-|DPI-' \
+                || { echo "::error::no Oracle error came back, so the client was never exercised"; exit 1; }
+            else
+              echo "$out" | grep -q 'full-oracle' \
+                || { echo "::error::a missing Oracle client must point at the -oracle tag"; exit 1; }
+            fi
+          fi
+          raw=$(docker image inspect -f '{{.Size}}' "$img")
+          packed="build-only run"
+          if [ "$PUSH" = "true" ]; then
+            index=$(docker buildx imagetools inspect --raw "$img")
+            amd64=$(echo "$index" | jq -r '[.manifests[]? | select(.platform.architecture == "amd64")][0].digest // empty')
+            if [ -n "$amd64" ]; then
+              index=$(docker buildx imagetools inspect --raw "${IMAGE}@${amd64}")
+            fi
+            bytes=$(echo "$index" | jq '[.layers[]?.size] | add // 0')
+            packed="$((bytes / 1048576)) MiB"
+          fi
+          {
+            echo "| Profile | Uncompressed | Compressed (pull) |"
+            echo "|---|---|---|"
+            echo "| ${PROFILE} | $((raw / 1048576)) MiB | ${packed} |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Install cosign
-        if: github.event_name == 'release' || inputs.push
+        if: env.PUSH == 'true'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign the image (keyless)
-        if: github.event_name == 'release' || inputs.push
+        if: env.PUSH == 'true'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${{ steps.img.outputs.name }}@${DIGEST}"
 
       - name: Attest build provenance
-        if: github.event_name == 'release' || inputs.push
+        if: env.PUSH == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.img.outputs.name }}

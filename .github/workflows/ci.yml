@@ -126,6 +126,10 @@ jobs:
         run: python3 scripts/connector-deps.py
       - name: Check no published crate packages a private key (#789 SUPPLY-20)
         run: python3 scripts/packaged-keys.py
+      - name: Check `full` enables every feature and the image builds `full` (#845)
+        run: |
+          python3 scripts/test_full_feature_coverage.py
+          python3 scripts/full-feature-coverage.py
       - name: Check the Helm chart appVersion equals the faucet-cli version (#830)
         run: |
           python3 scripts/test_helm_app_version.py
