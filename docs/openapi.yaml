@@ -88,6 +88,10 @@ paths:
   /v1/runs/{id}:
     get:
       summary: Get a run record
+      description: >
+        The run record plus `log_export` (#806): whether the run's logs reached
+        the OTLP log service — `not_configured` unless `--otel-config` exports
+        `logs`.
       operationId: getRun
       parameters: [ { $ref: "#/components/parameters/RunId" } ]
       responses:
@@ -95,7 +99,7 @@ paths:
           description: The run record.
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/RunRecord" }
+              schema: { $ref: "#/components/schemas/RunDetail" }
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
     delete:
@@ -175,7 +179,15 @@ paths:
         `{seq,ts,level,line}` object per line (oldest-first), plus a trailing
         `{"truncated":true}` when earlier lines were dropped by the per-run cap.
         `text` returns `text/plain`. Requires a persistent `--history` backend
-        with `--log-retention-secs > 0`; otherwise the persisted read is empty.
+        with `--log-retention-secs > 0` (or log shipping on, #806); otherwise
+        the persisted read is empty. Each `jsonl` object also carries `attrs`
+        (`target`, `row`, `connector`, `trace_id`, …) when the line had them.
+
+
+        Once a run's local copy has aged out and `--log-link-template` is set
+        (#806), the persisted read returns the log-service link instead of
+        nothing — a trailing `{"aged_out":true,"link":"…"}` record (`jsonl`) or
+        a closing line (`text`) — and the SSE stream opens with a `link` event.
       operationId: streamRunLogs
       parameters:
         - { $ref: "#/components/parameters/RunId" }
@@ -2745,6 +2757,41 @@ components:
         records_written: 1
         duration_ms: 1483
         error: example
+    LogExport:
+      type: object
+      description: >
+        Whether a run's logs reached the OTLP log service (#806). `delivered_seq`
+        / `total_seq` are the acknowledged and the highest captured line
+        sequence; `pending_lines` are buffered locally, `dropped_lines` were
+        dropped by a buffer bound or the per-run cap.
+      required: [status, pending_lines, dropped_lines]
+      properties:
+        status: { type: string, enum: [not_configured, pending, exported, failed, partially_dropped] }
+        delivered_seq: { type: integer, format: int64 }
+        total_seq: { type: integer, format: int64 }
+        pending_lines: { type: integer }
+        dropped_lines: { type: integer }
+        last_error: { type: string }
+        last_attempt_at: { type: string, format: date-time }
+        delivered_at: { type: string, format: date-time }
+        link: { type: string, description: "The run's logs in the log service (`--log-link-template`)." }
+      example:
+        status: exported
+        delivered_seq: 7261354828361732095
+        total_seq: 7261354828361732095
+        pending_lines: 0
+        dropped_lines: 0
+        last_attempt_at: '2026-01-01T00:00:00Z'
+        delivered_at: '2026-01-01T00:00:00Z'
+        link: https://grafana.example/explore?q=run_01HZY8K3QK7
+    RunDetail:
+      description: A run record plus its log-export status (`GET /v1/runs/{id}`).
+      allOf:
+        - { $ref: "#/components/schemas/RunRecord" }
+        - type: object
+          required: [log_export]
+          properties:
+            log_export: { $ref: "#/components/schemas/LogExport" }
     RunRecord:
       type: object
       required: [run_id, status, submitted_at, records_written, invocations, labels]

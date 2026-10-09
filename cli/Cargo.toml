@@ -753,6 +753,8 @@ tokio-postgres = "0.7"
 tonic-otlp = { workspace = true, features = ["server", "router"] }
 opentelemetry-proto = { workspace = true }
 prost-otlp = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

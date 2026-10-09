@@ -55,6 +55,7 @@ type DiscoveredDims = Arc<Mutex<HashMap<String, crate::discovery_matrix::Dim>>>;
 /// each tuple ctx via [`discovery_matrix::inject_collected`].
 type CollectedDims = Arc<Mutex<HashMap<String, crate::discovery_matrix::CollectedDim>>>;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 /// Called with the store spec and key of every state key an invocation uses.
 pub type StateKeyHook = Arc<dyn Fn(&crate::config::StateStoreSpec, &str) + Send + Sync>;
@@ -1014,7 +1015,8 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                     )
                     .await
                 }),
-            ));
+            )
+            .in_current_span());
             task_meta.insert(handle.id(), meta);
         }
 

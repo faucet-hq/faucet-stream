@@ -154,6 +154,12 @@ where
         }
     }
 
+    fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+        if CAPTURE.get().is_some() {
+            capture::on_record(id, values, &ctx);
+        }
+    }
+
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let Some(c) = CAPTURE.get() else {
             return;

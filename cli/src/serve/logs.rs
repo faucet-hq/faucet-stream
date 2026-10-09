@@ -525,6 +525,10 @@ impl<S> Layer<S> for RunLogLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
+    fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+        crate::logship::capture::on_record(id, values, &ctx);
+    }
+
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         crate::logship::capture::on_new_span(attrs, id, &ctx);
         let mut visitor = RunIdVisitor::default();

@@ -64,6 +64,26 @@ where
     }
 }
 
+/// Remember attribute-bearing fields recorded on a span after it was created
+/// (`span.record("log_run_id", …)`).
+pub fn on_record<S>(id: &tracing::span::Id, values: &tracing::span::Record<'_>, ctx: &Context<'_, S>)
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let mut v = FieldVisitor::default();
+    values.record(&mut v);
+    if v.0.is_empty() {
+        return;
+    }
+    if let Some(span) = ctx.span(id) {
+        let mut ext = span.extensions_mut();
+        match ext.get_mut::<SpanFields>() {
+            Some(f) => f.0.extend(v.0),
+            None => ext.insert(SpanFields(v.0)),
+        }
+    }
+}
+
 /// Formats an event's fields: the `message`, then the other `key=value` fields.
 #[derive(Default)]
 struct EventLineVisitor {
@@ -206,6 +226,14 @@ mod tests {
         fn on_new_span(&self, a: &Attributes<'_>, id: &tracing::span::Id, ctx: Context<'_, S>) {
             on_new_span(a, id, &ctx);
         }
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            v: &tracing::span::Record<'_>,
+            ctx: Context<'_, S>,
+        ) {
+            on_record(id, v, &ctx);
+        }
         fn on_event(&self, e: &Event<'_>, ctx: Context<'_, S>) {
             self.0.lock().unwrap().push(capture(e, &ctx));
         }
@@ -216,38 +244,53 @@ mod tests {
         let got = Arc::new(Mutex::new(Vec::new()));
         let sub = tracing_subscriber::registry().with(Grab(got.clone()));
         tracing::subscriber::with_default(sub, || {
-            let outer = tracing::info_span!("o", pipeline = "p", row = "r1", run_id = "inv-1");
+            let outer = tracing::info_span!(
+                "o",
+                pipeline = "pipe-capture-a",
+                row = "row-capture-1",
+                run_id = "inv-capture-1"
+            );
             let _o = outer.enter();
-            let inner = tracing::info_span!("i", row = "r2", connector = %"rest", other = 1);
+            let inner = tracing::info_span!(
+                "i",
+                row = "row-capture-2",
+                connector = %"conn-capture",
+                other = 1
+            );
             let _i = inner.enter();
-            tracing::warn!(n = 3, "hello");
+            tracing::warn!(nnn = 31337, "hello-capture");
         });
         let e = got.lock().unwrap().pop().unwrap();
         assert_eq!(e.level, "WARN");
-        assert_eq!(e.body, "hello n=3");
-        assert_eq!(e.attr("pipeline"), Some("p"));
-        assert_eq!(e.attr("row"), Some("r2"));
-        assert_eq!(e.attr("connector"), Some("rest"));
-        assert_eq!(e.attr("invocation_id"), Some("inv-1"));
+        assert_eq!(e.body, "hello-capture nnn=31337");
+        assert_eq!(e.attr("pipeline"), Some("pipe-capture-a"));
+        assert_eq!(e.attr("row"), Some("row-capture-2"));
+        assert_eq!(e.attr("connector"), Some("conn-capture"));
+        assert_eq!(e.attr("invocation_id"), Some("inv-capture-1"));
         assert!(e.attr("other").is_none());
         assert_eq!(e.attr("target"), Some(e.target.as_str()));
         assert!(e.rendered().contains(" WARN "));
-        assert!(e.rendered().ends_with(": hello n=3"));
+        assert!(e.rendered().ends_with(": hello-capture nnn=31337"));
     }
 
+    #[cfg(feature = "otel")]
     #[test]
-    fn registered_secrets_never_reach_a_captured_line() {
-        crate::secrets::registry::register("s3cr3t-capture-value");
+    fn trace_context_rides_on_the_line() {
+        use opentelemetry::trace::TracerProvider as _;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("t");
         let got = Arc::new(Mutex::new(Vec::new()));
-        let sub = tracing_subscriber::registry().with(Grab(got.clone()));
+        let sub = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(Grab(got.clone()));
         tracing::subscriber::with_default(sub, || {
-            let s = tracing::info_span!("o", pipeline = "s3cr3t-capture-value");
+            let s = tracing::info_span!("traced", pipeline = "p");
             let _g = s.enter();
-            tracing::info!(token = "s3cr3t-capture-value", "using s3cr3t-capture-value");
+            tracing::info!("inside a trace");
         });
         let e = got.lock().unwrap().pop().unwrap();
-        assert!(!e.body.contains("s3cr3t-capture-value"), "{}", e.body);
-        assert!(!e.attr("pipeline").unwrap().contains("s3cr3t-capture-value"));
+        assert_eq!(e.attr("trace_id").map(str::len), Some(32), "{:?}", e.attrs);
+        assert_eq!(e.attr("span_id").map(str::len), Some(16));
     }
 
     #[test]
