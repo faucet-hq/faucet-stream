@@ -111,11 +111,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
 
       # release-plz bumps Cargo manifests only. The Helm chart's image tag
-      # defaults to its appVersion, so the release PR must carry the new
-      # faucet-cli version there too (#830); CI's Doc counts job fails when the
-      # two differ. The subject deliberately is not `chore: release`, which the
-      # release gate above treats as a release commit.
-      - name: Sync the Helm chart appVersion on the release PR
+      # defaults to its appVersion, and the agent-skills plugin version names
+      # the faucet-cli release whose skills it carries, so the release PR must
+      # carry the new faucet-cli version in both (#830, #853); CI fails when
+      # they differ. The subject deliberately is not `chore: release`, which
+      # the release gate above treats as a release commit.
+      - name: Sync the Helm chart appVersion and the skills plugin version on the release PR
         env:
           PR: ${{ steps.release-plz.outputs.pr }}
           PUSH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
@@ -128,12 +129,13 @@ jobs:
           git fetch --quiet origin "$branch"
           git switch --quiet -C "$branch" FETCH_HEAD
           python3 scripts/helm-app-version.py --write
+          python3 scripts/plugin-version.py --write
           if git diff --quiet; then
             exit 0
           fi
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit --quiet -am "chore: sync the Helm chart appVersion with faucet-cli"
+              commit --quiet -am "chore: sync the Helm chart and skills plugin versions with faucet-cli"
           git push --quiet "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${branch}"
 
   release-plz-release:
