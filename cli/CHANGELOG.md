@@ -8,6 +8,26 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 independently).
 ## [1.13.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.13.2...faucet-cli-v1.13.3) - 2026-10-08
 
+### Upgrade notes
+
+This release closes the 730 findings of the production-readiness audit (#789) and 15 bug issues. Most changes are fixes; these change behaviour you may notice:
+
+- **Composed Template Hub pipelines get new state keys** (`{source}.{sink}::{stream}`), so each existing composed pipeline starts once from an empty bookmark. Set `state_scope: source` in the deployment overlay to keep the old keys.
+- **Concurrent runs of the same row are refused** while another run holds its lease (also across `faucet serve` runs); pass `faucet run --force` to take over. A crashed run's lease on the same host is taken over automatically.
+- **An interrupted `faucet run` / `faucet schedule` flushes at the next page boundary and exits 130.**
+- **Postgres / MySQL JSON columns:** a number a float can't hold exactly fails the run; set `json_big_numbers: string` to keep the exact digits as a string.
+- **BigQuery sink:** a record field the table has no column for fails the write (it was dropped silently); `bulk_load.write_disposition` other than `WRITE_APPEND` is refused; job waits default to 1 h and cancel on timeout.
+- **REST source:** credentials go only to `base_url`'s origin or the new `trusted_hosts`; https → http links fail.
+- **Validation is stricter:** unknown transform config keys, unknown shared `auth:` provider keys, unresolved secret directives, community hub templates that read env/secrets without `--trust`, and `hub lint` / `template register` on templates `faucet validate` would reject are all refused. `faucet validate` checks topology configs offline.
+- **Parquet / Iceberg / Delta sources:** decimals are exact strings, NaN/Infinity are strings, nulls are `null`. Object-store sources skip `_SUCCESS`, `.crc`, `_temporary/` and folder markers (new `include` glob) and refuse objects over 2 GiB.
+- **`json_encode`** writes sorted keys again (as before 1.13.2).
+- **Encrypted state and encrypted JSON Lines files** use a new format older faucet versions can't read (older files are still read).
+- **`faucet serve`:** the vault key must be at least 32 bytes; a history database written by a newer binary refuses to start; shutdown returns a draining 503 and a clustered shutdown requeues unfinished runs; callbacks no longer follow redirects.
+- **Prebuilt binaries** now include `mcp`, notifications, the secrets managers, the catalog and both persistent history backends.
+
+Full lists per area: the "Behaviour changes" sections of [#827](https://github.com/faucet-hq/faucet-stream/pull/827), [#839](https://github.com/faucet-hq/faucet-stream/pull/839) and [#840](https://github.com/faucet-hq/faucet-stream/pull/840).
+
+
 ### Bug Fixes
 
 - #789 engine findings (core, files, transforms, CLI) + open bug issues ([#840](https://github.com/faucet-hq/faucet-stream/pull/840))
