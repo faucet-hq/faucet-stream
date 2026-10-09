@@ -1,6 +1,6 @@
 [package]
 name = "faucet-stream"
-version = "1.9.2"
+version = "1.9.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

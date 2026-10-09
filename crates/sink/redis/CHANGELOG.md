@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-redis-v1.4.0...faucet-sink-redis-v1.4.1) - 2026-10-08
+
+### Bug Fixes
+
+- MEDIUM/LOW connector findings from the #789 audit (SQL/CDC, messaging, API) ([#839](https://github.com/faucet-hq/faucet-stream/pull/839))
+
 ## [1.4.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-redis-v1.3.1...faucet-sink-redis-v1.4.0) - 2026-09-29
 
 ### Features

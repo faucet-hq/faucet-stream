@@ -7,6 +7,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.0.8](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-sftp-v1.0.7...faucet-common-sftp-v1.0.8) - 2026-10-08
+
+### Bug Fixes
+
+- #789 engine findings (core, files, transforms, CLI) + open bug issues ([#840](https://github.com/faucet-hq/faucet-stream/pull/840))
+- Close the core engine and CLI runtime findings of the production-readiness audit (#789 group B)
+- Close the security and trust-boundary findings of the production-readiness audit (#789 group A)
+
 ## [1.0.7](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-sftp-v1.0.6...faucet-common-sftp-v1.0.7) - 2026-09-30
 
 ### Bug Fixes

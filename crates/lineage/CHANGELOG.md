@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [2.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-lineage-v2.2.0...faucet-lineage-v2.2.1) - 2026-10-08
+
+### Bug Fixes
+
+- #789 engine findings (core, files, transforms, CLI) + open bug issues ([#840](https://github.com/faucet-hq/faucet-stream/pull/840))
+- MEDIUM/LOW connector findings from the #789 audit (SQL/CDC, messaging, API) ([#839](https://github.com/faucet-hq/faucet-stream/pull/839))
+- MEDIUM/LOW security findings from the #789 audit (serve, supply chain, auth, secrets) ([#827](https://github.com/faucet-hq/faucet-stream/pull/827))
+- Close the API source, file and messaging findings of the production-readiness audit (#789 group D)
+
 ## [2.2.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-lineage-v2.1.0...faucet-lineage-v2.2.0) - 2026-09-29
 
 ### Features
