@@ -44,7 +44,10 @@ pub fn build_router(
     )]
     let mut api = Router::new()
         .route("/v1/runs", post(runs::submit_run).get(runs::list_runs))
-        .route("/v1/runs/{id}", get(runs::get_run).delete(runs::delete_run))
+        .route(
+            "/v1/runs/{id}",
+            get(runs::get_run_detail).delete(runs::delete_run),
+        )
         .route("/v1/runs/{id}/cancel", post(runs::cancel_run))
         .route("/v1/runs/{id}/rollback", post(runs::rollback_run))
         .route("/v1/runs/{id}/logs", get(logs::stream_logs))

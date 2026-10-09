@@ -88,8 +88,20 @@ pub(crate) async fn ensure_visible(
     }
 }
 
-/// `GET /v1/runs/{id}` → 200 RunRecord. Fills live `elapsed_secs` for running runs.
+/// The run record alone, as [`get_run_detail`] (which serves `GET /v1/runs/{id}`)
+/// returns it without `log_export`. Fills live `elapsed_secs` for running runs.
 pub async fn get_run(
+    state: State<ServerState>,
+    actor: Extension<AuthContext>,
+    id: Path<String>,
+) -> Result<Json<RunRecord>, ServeError> {
+    get_run_detail(state, actor, id)
+        .await
+        .map(|Json(detail)| Json(detail.record))
+}
+
+/// `GET /v1/runs/{id}`: the run record plus its `log_export` status (#806).
+pub async fn get_run_detail(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
@@ -621,6 +633,39 @@ mod tests {
             q.into_filter(&global()).unwrap().status,
             vec![RunStatus::Failed]
         );
+    }
+
+    #[tokio::test]
+    async fn get_run_returns_the_record_without_log_export() {
+        use crate::serve::history::RunRecord;
+        use crate::serve::test_support::test_state;
+
+        let state = test_state();
+        let rec = RunRecord::queued("r1".into(), None, Default::default(), None, Utc::now());
+        state.history().upsert(&rec).await.unwrap();
+
+        let Json(got) = get_run(
+            axum::extract::State(state.clone()),
+            axum::extract::Extension(global()),
+            axum::extract::Path("r1".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.run_id, "r1");
+        assert!(
+            serde_json::to_value(&got)
+                .unwrap()
+                .get("log_export")
+                .is_none()
+        );
+
+        let missing = get_run(
+            axum::extract::State(state),
+            axum::extract::Extension(global()),
+            axum::extract::Path("nope".into()),
+        )
+        .await;
+        assert!(matches!(missing, Err(ServeError::NotFound)));
     }
 
     #[tokio::test]
