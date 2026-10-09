@@ -197,7 +197,7 @@ use faucet_core::{RecordTransform, KeyCaseMode};
 // Flatten nested objects: {"user": {"id": 1}} -> {"user__id": 1}
 RecordTransform::Flatten { separator: "__".into() };
 
-// Convert keys to snake_case (or camel / pascal / kebab / screaming_snake)
+// Convert keys to snake_case (or camel / pascal / kebab / screaming_snake / dot)
 RecordTransform::KeysCase { mode: KeyCaseMode::Snake };
 
 // Regex key renaming

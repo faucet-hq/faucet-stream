@@ -378,7 +378,7 @@ fn registry() -> Vec<TransformDef> {
             },
             TransformDef {
                 kind: "keys_case",
-                description: "Re-case every key (snake / camel / pascal / kebab / screaming_snake).",
+                description: "Re-case every key (snake / camel / pascal / kebab / screaming_snake / dot).",
                 schema_fn: || schema::<KeysCaseConfig>(),
                 compile_fn: |kind, config| {
                     let cfg = decode::<KeysCaseConfig>(kind, config)?;

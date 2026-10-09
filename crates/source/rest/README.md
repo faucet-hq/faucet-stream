@@ -1063,7 +1063,7 @@ Attach transforms by wrapping the source with [`faucet_core::TransformingSource`
 |---------|---------|-------------|
 | `transform-flatten` | yes | `Flatten` record transform. |
 | `transform-rename-keys` | yes | `RenameKeys` regex-based transform. |
-| `transform-keys-case` | yes | `KeysCase` transform (snake / camel / pascal / kebab / screaming_snake). |
+| `transform-keys-case` | yes | `KeysCase` transform (snake / camel / pascal / kebab / screaming_snake / dot). |
 | `transform-select` | no | `Select` transform (keep listed top-level fields). |
 | `transform-drop` | no | `Drop` transform (remove listed top-level fields). |
 | `transform-set` | no | `Set` transform (insert/overwrite constants). |
