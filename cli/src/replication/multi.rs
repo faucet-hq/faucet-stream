@@ -731,6 +731,8 @@ struct Driver {
     running: BTreeSet<String>,
     retry_at: HashMap<String, Instant>,
     warned_lag: BTreeSet<String>,
+    /// Tables whose latest snapshot or stream cycle this run failed.
+    failed: BTreeMap<String, String>,
 }
 
 impl Driver {
@@ -778,12 +780,14 @@ impl Driver {
         match result {
             Ok(true) => {
                 self.retry_at.remove(&table);
+                self.failed.remove(&table);
                 self.joined.notify_one();
             }
             Ok(false) => {}
             Err(e @ CliError::LeaseHeld(_)) => return Err(e),
             Err(e) => {
                 let msg = e.to_string();
+                self.failed.insert(table.clone(), msg.clone());
                 tracing::error!(pipeline = %self.shared.opts.pipeline_name, table = %table, error = %msg, "mirror: table snapshot failed");
                 let action = {
                     let mut state = self.shared.state.lock().await;
@@ -879,9 +883,11 @@ impl Driver {
                 match r {
                     Ok(()) => {
                         ok += 1;
+                        self.failed.remove(table);
                         multi_state::record_success(&mut state, table, now);
                     }
                     Err(msg) => {
+                        self.failed.insert(table.clone(), msg.clone());
                         let action = multi_state::record_failure(
                             &mut state,
                             table,
@@ -944,6 +950,7 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
         running: BTreeSet::new(),
         retry_at: HashMap::new(),
         warned_lag: BTreeSet::new(),
+        failed: BTreeMap::new(),
     };
     let interval = d.shared.tables.spec.discover_interval_secs;
     let continuous = d.shared.continuous;
@@ -1126,7 +1133,25 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
     d.cancel.cancel();
     let drained = d.wait_snapshots().await;
     d.shared.persist().await?;
-    result.and(drained)
+    result.and(drained)?;
+    if continuous {
+        return Ok(());
+    }
+    one_shot_outcome(&d.failed)
+}
+
+/// A one-shot mirror that ends with a table whose latest snapshot or stream
+/// cycle failed has not mirrored it, so it fails rather than exiting clean.
+fn one_shot_outcome(failed: &BTreeMap<String, String>) -> CliResult<()> {
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let detail: Vec<String> = failed.iter().map(|(t, e)| format!("{t}: {e}")).collect();
+    Err(CliError::Internal(format!(
+        "mirror: {} table(s) did not complete this run — {}",
+        failed.len(),
+        detail.join("; ")
+    )))
 }
 
 #[cfg(test)]
@@ -1161,6 +1186,22 @@ pipeline:
 
     /// A driver error stops the running cycle through its token, giving it
     /// time to flush, before the task is dropped (#789 CLI-87).
+    #[test]
+    fn a_one_shot_run_fails_while_a_table_did_not_complete() {
+        assert!(one_shot_outcome(&BTreeMap::new()).is_ok());
+        let failed = BTreeMap::from([
+            ("shop.a".to_string(), "boom".to_string()),
+            ("shop.b".to_string(), "bang".to_string()),
+        ]);
+        let err = one_shot_outcome(&failed).unwrap_err().to_string();
+        assert!(
+            err.contains("2 table(s)")
+                && err.contains("shop.a: boom")
+                && err.contains("shop.b: bang"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn a_driver_error_cancels_the_cycle_before_dropping_it() {
         let cancel = CancellationToken::new();

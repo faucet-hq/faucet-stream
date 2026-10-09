@@ -4909,6 +4909,7 @@ dependencies = [
  "reqwest 0.13.3",
  "rust-embed",
  "schemars 1.2.1",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4923,6 +4924,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-util",
+ "toml_edit",
  "tonic 0.14.6",
  "tower",
  "tower-http",
@@ -15840,6 +15842,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -15851,6 +15854,12 @@ checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tonic"

@@ -163,6 +163,17 @@ pub fn position_le(a: &Value, b: &Value) -> Option<bool> {
     )
 }
 
+/// Whether a change record's transaction is already emitted at `position`:
+/// committed below its SCN, or one of the transactions emitted at exactly it.
+pub fn record_covered(record: &Value, position: &Value) -> Option<bool> {
+    let at = Position::from_value(position).ok()?;
+    let scn = record.get("commit_scn")?.as_u64()?;
+    let xid = record.get("xid")?.as_str()?;
+    Some(
+        scn < at.commit_scn || (scn == at.commit_scn && at.committed_xids.iter().any(|x| x == xid)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -190,6 +201,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_record_is_covered_by_a_lower_scn_or_an_emitted_transaction_at_it() {
+        let at = json!({"commit_scn": 10, "restart_scn": 8, "committed_xids": ["A"]});
+        let rec = |scn: u64, xid: &str| json!({"commit_scn": scn, "xid": xid});
+        assert_eq!(record_covered(&rec(9, "Z"), &at), Some(true));
+        assert_eq!(record_covered(&rec(10, "A"), &at), Some(true));
+        assert_eq!(record_covered(&rec(10, "B"), &at), Some(false));
+        assert_eq!(record_covered(&rec(11, "A"), &at), Some(false));
+        assert_eq!(record_covered(&json!({"xid": "A"}), &at), None);
+        assert_eq!(record_covered(&rec(1, "A"), &json!({"nope": 1})), None);
+    }
 
     #[test]
     fn positions_order_by_scn_then_emitted_transactions() {

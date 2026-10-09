@@ -248,6 +248,13 @@ impl Source for PostgresCdcSource {
         Some(lsn(a)? <= lsn(b)?)
     }
 
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        // A position is a commit's end_lsn: every later commit record sits at or past it.
+        let commit = parse_lsn(record.get("lsn")?.as_str()?).ok()?;
+        let position = Bookmark::from_value(position.clone()).ok()?.as_u64().ok()?;
+        Some(commit < position)
+    }
+
     fn dataset_uri(&self) -> String {
         format!(
             "{}?publication={}",
@@ -1024,6 +1031,35 @@ mod tests {
         assert_eq!(src.position_le(&a, &a), Some(true));
         assert_eq!(src.position_le(&a, &json!({"last_lsn": "bad"})), None);
         assert_eq!(src.position_min(&[b.clone(), a.clone()]), Some(a));
+    }
+
+    #[tokio::test]
+    async fn a_record_is_covered_once_its_commit_lies_below_the_position() {
+        let src = PostgresCdcSource::new(
+            serde_json::from_value(json!({
+                "connection_url": "postgres://u:p@localhost/db",
+                "slot_name": "s",
+                "publication_name": "p"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let at = json!({"last_lsn": "0/16A4FB0"});
+        let rec = |lsn: &str| json!({"op": "insert", "lsn": lsn});
+        assert_eq!(src.record_covered(&rec("0/16A4FA0"), &at), Some(true));
+        assert_eq!(
+            src.record_covered(&rec("0/16A4FB0"), &at),
+            Some(false),
+            "a commit starting at the position is the next transaction"
+        );
+        assert_eq!(src.record_covered(&rec("0/16A5000"), &at), Some(false));
+        assert_eq!(src.record_covered(&json!({"op": "insert"}), &at), None);
+        assert_eq!(src.record_covered(&rec("bad"), &at), None);
+        assert_eq!(
+            src.record_covered(&rec("0/1"), &json!({"last_lsn": "bad"})),
+            None
+        );
     }
 
     #[test]

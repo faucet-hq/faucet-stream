@@ -425,6 +425,19 @@ pub trait Source: Send + Sync {
     /// cannot order). Sources whose positions are only partially ordered (one
     /// cursor per capture instance, say) override it with a component-wise
     /// minimum.
+    /// Whether the stream had already delivered `record`'s change at stream
+    /// position `position` (#854): `Some(true)` when a run resumed from
+    /// `position` would not deliver it again, `Some(false)` when it would, and
+    /// `None` when the source cannot tell (the default). A multi-table mirror
+    /// resumes one shared stream from the earliest table, so a replayed page
+    /// can straddle another table's committed position; this per-record test
+    /// drops the records that table already applied, which a per-page
+    /// [`position_le`](Self::position_le) check cannot when the replay cuts its
+    /// pages at different points than the run that committed them.
+    fn record_covered(&self, _record: &Value, _position: &Value) -> Option<bool> {
+        None
+    }
+
     fn position_min(&self, positions: &[Value]) -> Option<Value> {
         let first = positions.first()?;
         if positions.iter().all(|p| p == first) {

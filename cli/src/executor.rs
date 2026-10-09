@@ -3765,6 +3765,10 @@ impl Source for StateKeyOverride {
         self.inner.position_le(a, b)
     }
 
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        self.inner.record_covered(record, position)
+    }
+
     fn position_min(&self, positions: &[Value]) -> Option<Value> {
         self.inner.position_min(positions)
     }
@@ -4337,6 +4341,14 @@ mod tests {
         fn position_min(&self, _positions: &[serde_json::Value]) -> Option<serde_json::Value> {
             Some(serde_json::json!("inner-min"))
         }
+
+        fn record_covered(
+            &self,
+            record: &serde_json::Value,
+            position: &serde_json::Value,
+        ) -> Option<bool> {
+            Some(record.get("p")?.as_u64()? < position.as_u64()?)
+        }
     }
 
     fn assert_forwards_multi_table_hooks(s: &dyn faucet_core::Source) {
@@ -4351,6 +4363,14 @@ mod tests {
         );
         assert_eq!(
             s.position_le(&serde_json::json!(3), &serde_json::json!(2)),
+            Some(false)
+        );
+        assert_eq!(
+            s.record_covered(&serde_json::json!({"p": 1}), &serde_json::json!(2)),
+            Some(true)
+        );
+        assert_eq!(
+            s.record_covered(&serde_json::json!({"p": 2}), &serde_json::json!(2)),
             Some(false)
         );
         assert_eq!(
@@ -4655,6 +4675,7 @@ mod tests {
     fn cfg_csv_to_jsonl(input: &Path, output: &Path) -> PipelineConfig {
         PipelineConfig {
             kind: None,
+            requires_faucet: None,
             version: 1,
             name: Some("test".into()),
             vars: None,

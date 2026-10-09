@@ -198,6 +198,10 @@ impl Source for MysqlCdcSource {
         bookmark_le(a, b)
     }
 
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        record_covered(record, position)
+    }
+
     fn dataset_uri(&self) -> String {
         let base = faucet_core::redact_uri_credentials(&self.config.connection_url);
         if self.config.include_tables.is_empty() {
@@ -1129,6 +1133,12 @@ fn bookmark_le(a: &Value, b: &Value) -> Option<bool> {
     }
 }
 
+/// A row event's binlog position precedes its transaction's commit, so it is
+/// covered by every position at or past that commit.
+fn record_covered(record: &Value, position: &Value) -> Option<bool> {
+    bookmark_le(record.get("lsn")?, position)
+}
+
 fn binlog_seq(file: &str) -> Option<(&str, u64)> {
     let (base, seq) = file.rsplit_once('.')?;
     Some((base, seq.parse().ok()?))
@@ -1184,6 +1194,16 @@ mod tests {
             Some("shop.orders".into())
         );
         assert_eq!(schema_table(&json!({"op": "ddl"})), None);
+    }
+
+    #[test]
+    fn a_row_event_is_covered_once_its_commit_is() {
+        let at = json!({"file": "binlog.000010", "pos": 500});
+        let rec = |p: u64| json!({"op": "c", "lsn": {"file": "binlog.000010", "pos": p}});
+        assert_eq!(record_covered(&rec(420), &at), Some(true));
+        assert_eq!(record_covered(&rec(620), &at), Some(false));
+        assert_eq!(record_covered(&json!({"op": "c"}), &at), None);
+        assert_eq!(record_covered(&rec(1), &json!({"gtid_set": "x:1"})), None);
     }
 
     #[test]

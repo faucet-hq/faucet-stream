@@ -134,6 +134,10 @@ impl Source for ChannelSource {
         self.inner.position_le(a, b)
     }
 
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        self.inner.record_covered(record, position)
+    }
+
     fn position_min(&self, positions: &[Value]) -> Option<Value> {
         self.inner.position_min(positions)
     }
@@ -291,13 +295,16 @@ pub async fn run_demux(
             last_bookmark = page.bookmark.clone();
         }
         for st in states.iter_mut() {
-            let records = buckets.remove(&st.table).unwrap_or_default();
+            let mut records = buckets.remove(&st.table).unwrap_or_default();
             let covered = match (&page.bookmark, &st.position) {
                 (Some(b), Some(p)) => source.position_le(b, p) == Some(true),
                 _ => false,
             };
             if covered {
                 continue;
+            }
+            if let Some(p) = &st.position {
+                records.retain(|r| source.record_covered(r, p) != Some(true));
             }
             let due = page.bookmark.is_some() && st.last_sent_at.elapsed() >= IDLE_FLUSH;
             if records.is_empty() && !due {
@@ -449,6 +456,10 @@ mod tests {
             Some(a.as_u64()? <= b.as_u64()?)
         }
 
+        fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+            Some(record.get("at")?.as_u64()? <= position.as_u64()?)
+        }
+
         fn connector_name(&self) -> &'static str {
             "script"
         }
@@ -547,6 +558,45 @@ mod tests {
         assert_eq!(live["a"].changes, 2);
         assert_eq!(live["b"].changes, 1);
         assert!(live["a"].last_applied_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_replayed_page_straddling_a_tables_position_drops_what_it_applied() {
+        // The replay coalesced changes 1, 2 and 4 into one page that ends past
+        // b's committed position 3: b already applied the change at 2.
+        let src = script(vec![StreamPage {
+            records: vec![
+                json!({"table": "a", "at": 1, "v": 1}),
+                json!({"table": "b", "at": 2, "v": 2}),
+                json!({"table": "b", "at": 4, "v": 4}),
+            ],
+            bookmark: Some(json!(4)),
+        }]);
+        let (fa, ca) = channel("a", src.clone());
+        let (fb, cb) = channel("b", src.clone());
+        let a = tokio::spawn(consume(ca, Some(0)));
+        let b = tokio::spawn(consume(cb, Some(3)));
+        run_demux(
+            src.clone(),
+            vec![fa, fb],
+            router(&["a", "b"], false),
+            vec![],
+            CancellationToken::new(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let values = |ps: Vec<StreamPage>| {
+            ps.iter()
+                .flat_map(|p| p.records.iter().map(|r| r["v"].as_u64().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(a.await.unwrap()), vec![1]);
+        assert_eq!(
+            values(b.await.unwrap()),
+            vec![4],
+            "no duplicate of change 2"
+        );
     }
 
     #[tokio::test]
@@ -769,6 +819,8 @@ mod tests {
         assert_eq!(c.record_table(&json!({"table": "a"})).as_deref(), Some("a"));
         assert_eq!(c.position_le(&json!(1), &json!(2)), Some(true));
         assert_eq!(c.position_min(&[json!(4), json!(2)]), Some(json!(2)));
+        assert_eq!(c.record_covered(&json!({"at": 1}), &json!(1)), Some(true));
+        assert_eq!(c.record_covered(&json!({"at": 2}), &json!(1)), Some(false));
         assert_eq!(
             c.state_key().as_deref(),
             Some("mirror"),

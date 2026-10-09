@@ -38,8 +38,9 @@ so rotating away from an old (even short) key works.
 
 The vault key seals every stored credential; without it the server refuses to
 store or open connections (`503`). To rotate, start with the new key and pass
-the old one as `--vault-previous-key` until every connection has been
-re-stored. Keep the history database and the key apart: the database alone
+the old one as `--vault-previous-key` (or in `FAUCET_VAULT_PREVIOUS_KEYS`,
+comma-separated, which keeps it out of the process arguments) until every
+connection has been re-stored. Keep the history database and the key apart: the database alone
 holds only ciphertext.
 
 ## Tenants

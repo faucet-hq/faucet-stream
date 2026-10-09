@@ -159,6 +159,15 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
     // are the model (RFC 0008).
     let mut pipeline_cfg: Option<crate::config::PipelineConfig> = None;
     let detected = crate::hub::detect_kind(&doc);
+    crate::requires::check_document(
+        &doc,
+        detected.map_or("pipeline", |k| match k {
+            TemplateKind::SourceTemplate => "source template",
+            TemplateKind::SinkTemplate => "sink template",
+            TemplateKind::Deployment => "deployment overlay",
+            _ => "pipeline",
+        }),
+    )?;
     let (kind, name) = match detected {
         Some(TemplateKind::SourceTemplate) => {
             let t: crate::hub::SourceTemplate = serde_json::from_value(doc.clone())
@@ -1060,18 +1069,20 @@ async fn materialize_pair_selected(
             sink_rec.kind
         )));
     }
-    let source: crate::hub::SourceTemplate =
-        serde_json::from_value(parse_body(&src_rec.body, src_rec.format)?).map_err(|e| {
-            CliError::Internal(format!(
-                "stored source-template '{source_id}' v{source_version}: {e}"
-            ))
-        })?;
-    let sink: crate::hub::SinkTemplate =
-        serde_json::from_value(parse_body(&sink_rec.body, sink_rec.format)?).map_err(|e| {
-            CliError::Internal(format!(
-                "stored sink-template '{sink_id}' v{sink_version}: {e}"
-            ))
-        })?;
+    let source_doc = parse_body(&src_rec.body, src_rec.format)?;
+    crate::requires::check_document(&source_doc, "source template")?;
+    let sink_doc = parse_body(&sink_rec.body, sink_rec.format)?;
+    crate::requires::check_document(&sink_doc, "sink template")?;
+    let source: crate::hub::SourceTemplate = serde_json::from_value(source_doc).map_err(|e| {
+        CliError::Internal(format!(
+            "stored source-template '{source_id}' v{source_version}: {e}"
+        ))
+    })?;
+    let sink: crate::hub::SinkTemplate = serde_json::from_value(sink_doc).map_err(|e| {
+        CliError::Internal(format!(
+            "stored sink-template '{sink_id}' v{sink_version}: {e}"
+        ))
+    })?;
     let all_streams: Vec<String> = source.streams.iter().map(|s| s.name.clone()).collect();
     let (source, effective) = match selection {
         Some(sel) => {
@@ -2200,6 +2211,55 @@ write_mode_aliases:
 ",
             dir.display()
         )
+    }
+
+    #[tokio::test]
+    async fn a_template_for_another_faucet_is_refused_at_register_and_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store();
+        let too_new = |body: String| format!("requires_faucet: \">=999\"\n{body}");
+        for body in [
+            too_new(source_template(dir.path())),
+            too_new(sink_template(dir.path())),
+            too_new(PARAMETERIZED.to_string()),
+        ] {
+            let err = register(&s, req(&body)).await.unwrap_err();
+            assert!(matches!(err, CliError::IncompatibleFaucet { .. }), "{err}");
+        }
+        let ok = format!("requires_faucet: \">=1\"\n{}", source_template(dir.path()));
+        register(&s, req_launched(&ok)).await.unwrap();
+        register(&s, req_launched(&sink_template(dir.path())))
+            .await
+            .unwrap();
+        // A newer instance registered it; this one cannot run it.
+        let stored = s
+            .template_register(&crate::serve::history::templates::TemplateDraft {
+                id: crate::serve::history::templates::TemplateId::parse("local-jsonl").unwrap(),
+                kind: TemplateKind::SinkTemplate,
+                name: Some("local-jsonl".into()),
+                description: None,
+                body: too_new(sink_template(dir.path())),
+                format: ConfigFormat::Yaml,
+                params: Default::default(),
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        let err = materialize_pair(
+            &s,
+            ("acme-exports", 1),
+            ("local-jsonl", stored.version),
+            &SuppliedParams::new(),
+            &BTreeMap::new(),
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("this sink template requires faucet >=999"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

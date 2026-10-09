@@ -325,6 +325,7 @@ pub fn build_pipeline_config(env: &HashMap<String, String>) -> CliResult<Pipelin
     }
     Ok(PipelineConfig {
         kind: None,
+        requires_faucet: None,
         version: 1,
         name,
         vars,
