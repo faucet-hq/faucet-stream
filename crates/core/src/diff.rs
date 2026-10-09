@@ -306,7 +306,7 @@ pub fn parse_timestamp_micros(s: &str) -> Option<i64> {
 
 /// FNV-1a over `bytes` with a caller-chosen offset basis, so two independent
 /// 64-bit hashes of the same text can be folded into one 128-bit fingerprint.
-fn fnv1a_64(bytes: &[u8], basis: u64) -> u64 {
+pub(crate) fn fnv1a_64(bytes: &[u8], basis: u64) -> u64 {
     let mut h = basis;
     for b in bytes {
         h ^= u64::from(*b);
@@ -315,8 +315,8 @@ fn fnv1a_64(bytes: &[u8], basis: u64) -> u64 {
     h
 }
 
-const FNV_BASIS_A: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_BASIS_B: u64 = 0x84222325_cbf29ce4;
+pub(crate) const FNV_BASIS_A: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_BASIS_B: u64 = 0x84222325_cbf29ce4;
 
 /// A 128-bit fingerprint of `record`'s compared columns: the key columns plus
 /// `columns` (every non-excluded field when `columns` is `None`), each

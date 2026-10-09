@@ -1,8 +1,9 @@
 //! MySQL source configuration.
 
-use faucet_core::DEFAULT_BATCH_SIZE;
+use faucet_core::{DEFAULT_BATCH_SIZE, FaucetError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Configuration for the MySQL query source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
@@ -58,6 +59,47 @@ pub struct MysqlSourceConfig {
     /// Defaults to 3600; `0` keeps the server's setting.
     #[serde(default = "default_read_timeout_secs")]
     pub net_write_timeout_secs: u64,
+    /// Replication mode. Defaults to [`MysqlReplication::Full`].
+    #[serde(default)]
+    pub replication: MysqlReplication,
+    /// Explicit state-store key for the incremental bookmark. When unset, a
+    /// key is derived from the connection host and a fingerprint of the
+    /// database URL and query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_key: Option<String>,
+}
+
+/// The token a query uses to read the incremental bookmark
+/// (`WHERE updated_at >= @bookmark`).
+pub const BOOKMARK_TOKEN: &str = "@bookmark";
+
+/// How the source replicates rows across runs.
+///
+/// Serializes as `{ type: full }` or
+/// `{ type: incremental, column: "...", initial_value: ... }`.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MysqlReplication {
+    /// Every run fetches the full result set (default).
+    #[default]
+    Full,
+    /// Only rows not yet read, in `column` order, resuming from the stored
+    /// bookmark (or `initial_value` on the first run).
+    ///
+    /// The source wraps the query as
+    /// `SELECT * FROM (<query>) WHERE column >= <bookmark> ORDER BY column`
+    /// and drops the rows it already emitted at the bookmark value, so rows
+    /// that share a cursor value are never skipped. Every page carries a
+    /// bookmark, so a crash replays at most one page. Write `@bookmark` in the
+    /// query (with `>=`) to apply the cursor further inside it, e.g. in a CTE.
+    /// Rows whose `column` is NULL are never read.
+    Incremental {
+        /// Output column holding the replication cursor (e.g. `updated_at`).
+        column: String,
+        /// Lower bound (inclusive) used on the first run, before any bookmark
+        /// is stored.
+        initial_value: Value,
+    },
 }
 
 /// Primary-key range sharding settings for the MySQL source.
@@ -99,6 +141,8 @@ impl std::fmt::Debug for MysqlSourceConfig {
             .field("query", &self.query)
             .field("max_connections", &self.max_connections)
             .field("batch_size", &self.batch_size)
+            .field("replication", &self.replication)
+            .field("state_key", &self.state_key)
             .finish()
     }
 }
@@ -115,7 +159,48 @@ impl MysqlSourceConfig {
             read_timeout_secs: default_read_timeout_secs(),
             json_big_numbers: faucet_core::JsonBigNumbers::Fail,
             net_write_timeout_secs: default_read_timeout_secs(),
+            replication: MysqlReplication::Full,
+            state_key: None,
         }
+    }
+
+    /// Read incrementally on `column`, starting at `initial_value`.
+    pub fn incremental(mut self, column: impl Into<String>, initial_value: Value) -> Self {
+        self.replication = MysqlReplication::Incremental {
+            column: column.into(),
+            initial_value,
+        };
+        self
+    }
+
+    /// Validate the batch size and the replication settings.
+    pub fn validate(&self) -> Result<(), FaucetError> {
+        faucet_core::validate_batch_size(self.batch_size)?;
+        let MysqlReplication::Incremental {
+            column,
+            initial_value,
+        } = &self.replication
+        else {
+            return Ok(());
+        };
+        if column.trim().is_empty() {
+            return Err(FaucetError::Config(
+                "mysql: incremental replication requires a non-empty `column`".into(),
+            ));
+        }
+        if initial_value.is_null() {
+            return Err(FaucetError::Config(
+                "mysql: incremental replication requires a non-null `initial_value`".into(),
+            ));
+        }
+        if faucet_core::replication::cursor::strict_comparison(&self.query, BOOKMARK_TOKEN) {
+            return Err(FaucetError::Config(format!(
+                "mysql: compare `{BOOKMARK_TOKEN}` with `>=`, not `>`: the source re-reads the \
+                 bookmark value and drops the rows it already emitted, and a strict comparison \
+                 skips rows that share it"
+            )));
+        }
+        Ok(())
     }
 
     /// Set the maximum number of connections in the pool.
@@ -137,6 +222,68 @@ impl MysqlSourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn replication_defaults_to_full_and_parses_incremental() {
+        let cfg: MysqlSourceConfig = serde_json::from_value(json!({
+            "connection_url": "mysql://h/db",
+            "query": "SELECT * FROM t",
+        }))
+        .unwrap();
+        assert_eq!(cfg.replication, MysqlReplication::Full);
+        assert!(cfg.validate().is_ok());
+
+        let cfg: MysqlSourceConfig = serde_json::from_value(json!({
+            "connection_url": "mysql://h/db",
+            "query": "SELECT * FROM t",
+            "replication": {"type": "incremental", "column": "updated_at", "initial_value": "2024-01-01 00:00:00"},
+            "state_key": "orders",
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.replication,
+            MysqlReplication::Incremental {
+                column: "updated_at".into(),
+                initial_value: json!("2024-01-01 00:00:00"),
+            }
+        );
+        assert_eq!(cfg.state_key.as_deref(), Some("orders"));
+        assert!(cfg.validate().is_ok());
+        assert!(format!("{cfg:?}").contains("updated_at"));
+    }
+
+    #[test]
+    fn replication_rejects_unknown_fields() {
+        let err = serde_json::from_value::<MysqlReplication>(
+            json!({"type": "incremental", "column": "c", "initial_value": 0, "key": ["id"]}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("key"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_bad_incremental_settings() {
+        let base = MysqlSourceConfig::new("mysql://h/db", "SELECT * FROM t");
+        for (query, column, initial, needle) in [
+            ("SELECT * FROM t", " ", json!(0), "column"),
+            ("SELECT * FROM t", "c", json!(null), "initial_value"),
+            ("SELECT * FROM t WHERE c > @bookmark", "c", json!(0), ">="),
+        ] {
+            let mut cfg = base.clone().incremental(column, initial);
+            cfg.query = query.into();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+        let ok = MysqlSourceConfig::new("mysql://h/db", "SELECT * FROM t WHERE c >= @bookmark")
+            .incremental("c", json!(0));
+        assert!(ok.validate().is_ok());
+        assert!(
+            base.with_batch_size(faucet_core::MAX_BATCH_SIZE + 1)
+                .validate()
+                .is_err()
+        );
+    }
 
     #[test]
     fn default_config() {

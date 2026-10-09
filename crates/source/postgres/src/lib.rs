@@ -12,5 +12,5 @@ pub mod stream;
 
 pub use faucet_core::{FaucetError, Source};
 
-pub use config::{PostgresSourceConfig, ShardConfig};
+pub use config::{BOOKMARK_TOKEN, PostgresReplication, PostgresSourceConfig, ShardConfig};
 pub use stream::PostgresSource;

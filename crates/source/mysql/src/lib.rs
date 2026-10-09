@@ -12,5 +12,5 @@ pub mod stream;
 
 pub use faucet_core::{FaucetError, Source};
 
-pub use config::{MysqlSourceConfig, ShardConfig};
+pub use config::{BOOKMARK_TOKEN, MysqlReplication, MysqlSourceConfig, ShardConfig};
 pub use stream::MysqlSource;

@@ -32,9 +32,9 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | GraphQL | T1 ✅ᵐ | `source-graphql` | ✓ | ✓ | ✗ | ✗ | ✗ | cursor / offset pagination, variable injection; `replication_method: incremental` + `replication_bind` binds the bookmark into a GraphQL variable |
 | XML / SOAP | T1 ✅ᵐ | `source-xml` | ✓ | ✗ | ✗ | ✗ | ✗ | streaming XML→JSON, dot-path extraction, first-class `soap:` block (envelope + headers + fault handling) |
 | gRPC | T1 ✅ | `source-grpc` | ✓⁴ | ✗ | ✗ | ✗ | ✗ | dynamic protobuf; unary + server-streaming |
-| PostgreSQL | T1 ✅ | `source-postgres` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL query, rows as JSON |
+| PostgreSQL | T1 ✅ | `source-postgres` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query, rows as JSON; incremental `${bookmark}` replication in cursor order |
 | PostgreSQL CDC | T1 ✅ | `source-postgres-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | logical replication (pgoutput), LSN bookmarks |
-| MySQL | T1 ✅ | `source-mysql` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL query, rows as JSON |
+| MySQL | T1 ✅ | `source-mysql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query, rows as JSON; incremental `@bookmark` replication in cursor order |
 | MySQL CDC | T1 ✅ | `source-mysql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | binlog row events, file/pos or GTID bookmarks |
 | Microsoft SQL Server | T1 ✅ | `source-mssql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query (tiberius), rows as JSON |
 | Microsoft SQL Server CDC | T1 ✅ | `source-mssql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | CDC change tables (`fn_cdc_get_all_changes`), LSN bookmarks, `__op`-normalized |
@@ -92,8 +92,11 @@ partition offsets); required for the atomic-watermark mechanism behind
 ⁴ gRPC streams natively in *server-streaming* mode; unary buffers the
 single response. ⁵ S3/GCS stream in JSONL and raw-text modes; JSON-array mode
 buffers one object. ⁶ Webhook is buffer-shaped by nature (it collects POSTs over
-a window). ⁸ MSSQL is resumable only in `replication: incremental` mode (it
-persists a tracking-column bookmark); in `full` mode it is not.
+a window). ⁸ MSSQL, PostgreSQL and MySQL are resumable only in
+`replication: incremental` mode (they persist a tracking-column bookmark); in
+`full` mode they are not. PostgreSQL and MySQL read in cursor order, bookmark
+every page and never skip rows that share a cursor value — see
+[Incremental SQL queries](../cookbook/state.md#incremental-sql-queries-postgres-mysql).
 ⁹ The Singer bridge is resumable via the tap's `STATE` messages, but the
 *granularity* of resume (and whether re-emitted rows overlap) depends on the
 individual tap — pair it with a keyed/upsert sink for clean, effectively-once
