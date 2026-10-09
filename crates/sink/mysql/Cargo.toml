@@ -24,7 +24,7 @@ base64.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json.workspace = true
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 schemars.workspace = true
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["mysql"] }

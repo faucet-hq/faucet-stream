@@ -26,7 +26,7 @@ futures.workspace = true
 jsonpath-rust.workspace = true
 
 [dev-dependencies]
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 serde_json.workspace = true
 schemars.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

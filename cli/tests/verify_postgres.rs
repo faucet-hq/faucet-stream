@@ -8,13 +8,12 @@ use faucet_cli::executor::{ExecuteOptions, run_expanded};
 use faucet_cli::expand::expand;
 use faucet_cli::verify::{VerifyInputs, VerifySpec};
 use std::path::Path;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
 async fn start_postgres() -> (ContainerAsync<Postgres>, String) {
-    let image = Postgres::default().with_tag("16-alpine");
     let container: ContainerAsync<Postgres> =
-        image.start().await.expect("postgres container start");
+        faucet_conformance::containers::start(|| Postgres::default().with_tag("16-alpine")).await;
     let port = container
         .get_host_port_ipv4(5432)
         .await

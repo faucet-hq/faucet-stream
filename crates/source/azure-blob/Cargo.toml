@@ -43,7 +43,7 @@ arrow = ["faucet-core/arrow", "faucet-core/file-format-parquet", "dep:arrow"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc"]
 
 [dev-dependencies]
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "io-util", "sync"] }
 serde_json.workspace = true
 schemars.workspace = true

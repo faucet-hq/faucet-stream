@@ -19,7 +19,6 @@ use faucet_core::{DeleteMarker, Sink, WriteMode, WriteSpec};
 use faucet_sink_mssql::{MssqlColumnMapping, MssqlSink, MssqlSinkConfig, OnUnknownField};
 use testcontainers_modules::mssql_server::MssqlServer;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const ENCODED_PW: &str = "yourStrong%28%21%29Password";
 
@@ -52,11 +51,8 @@ async fn exec(pool: &MssqlPool, sql: &str) {
 /// A fresh container with a keyed table `dbo.t(id PK, v)`, plus an upsert-mode
 /// MSSQL sink and the connection pool used to count rows.
 async fn fresh_sink() -> (ContainerAsync<MssqlServer>, MssqlPool, MssqlSink) {
-    let container = MssqlServer::default()
-        .with_accept_eula()
-        .start()
-        .await
-        .expect("start mssql container");
+    let container =
+        faucet_conformance::containers::start(|| MssqlServer::default().with_accept_eula()).await;
     let port = container
         .get_host_port_ipv4(1433)
         .await

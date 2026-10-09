@@ -44,7 +44,7 @@ file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file
 
 [dev-dependencies]
 parquet = { workspace = true }
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 faucet-common-sftp.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
 serde_json.workspace = true

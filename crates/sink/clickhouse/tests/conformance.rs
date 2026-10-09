@@ -20,25 +20,12 @@ use serde_json::Value;
 use testcontainers_modules::clickhouse::ClickHouse;
 use testcontainers_modules::testcontainers::ContainerAsync;
 
-/// Start a ClickHouse container, or `None` when Docker is unavailable.
-/// A missing test backend: a skip locally, a failure when CI requires the
-/// backends (`FAUCET_REQUIRE_BACKENDS`).
-fn backend_missing(why: &str) {
-    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
-        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
-    }
-    eprintln!("skipping: {why}");
-}
-
+/// Start a ClickHouse container, or `None` (skip) when Docker is unavailable.
 async fn start_clickhouse() -> Option<(ContainerAsync<ClickHouse>, String)> {
-    match common::start_clickhouse().await {
-        Ok(started) => Some(started),
-        // CI sets FAUCET_REQUIRE_BACKENDS so a missing backend fails, not skips.
-        Err(e) if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() => {
-            panic!("ClickHouse container did not start and FAUCET_REQUIRE_BACKENDS is set: {e}")
-        }
-        Err(_) => None,
-    }
+    common::start_clickhouse()
+        .await
+        .map_err(|e| faucet_conformance::containers::backend_missing(&e.to_string()))
+        .ok()
 }
 
 async fn http_exec(base: &str, sql: &str) {
@@ -100,7 +87,6 @@ fn conformance_connector_name_nonempty() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_capabilities_truthful() {
     let Some((_c, base)) = start_clickhouse().await else {
-        backend_missing("clickhouse conformance_capabilities_truthful: Docker unavailable");
         return;
     };
 

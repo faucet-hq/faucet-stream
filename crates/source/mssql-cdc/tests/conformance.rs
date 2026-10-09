@@ -28,6 +28,7 @@
 use std::time::Duration;
 
 use faucet_common_mssql::{MssqlConnectionConfig, MssqlPool, MssqlTls, MssqlTlsMode, build_pool};
+use faucet_conformance::containers::{self, Endpoint, ReadyProbe, StartOptions};
 use faucet_conformance::{
     assert_bookmark_roundtrip, assert_bounded_memory, assert_config_schema_valid_value,
     assert_connector_name_nonempty, assert_preflight_check_wellformed,
@@ -37,7 +38,6 @@ use serde_json::json;
 use testcontainers::ImageExt;
 use testcontainers_modules::mssql_server::MssqlServer;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const ENCODED_PW: &str = "yourStrong%28%21%29Password";
 const RAW_PW: &str = "yourStrong(!)Password";
@@ -58,65 +58,37 @@ fn conformance_config_schema_valid() {
 
 // ── Docker helpers ───────────────────────────────────────────────────────────
 
-/// Start a SQL Server container with CDC (Agent) enabled and wait until it
-/// actually accepts TDS connections. Returns `None` — so the caller skips the
-/// test rather than failing — when Docker is unavailable or the image can't come
-/// up. SQL Server boots far more slowly than Postgres/MySQL: the container is
-/// reported "started" well before the engine accepts connections, so a plain
-/// checkout right after start races the boot and fails. Poll until ready.
-/// A missing test backend: a skip locally, a failure when CI requires the
-/// backends (`FAUCET_REQUIRE_BACKENDS`).
-fn backend_missing(why: &str) {
-    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
-        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
-    }
-    eprintln!("skipping: {why}");
-}
-
+/// Start a SQL Server container with CDC (Agent) enabled once it accepts TDS
+/// connections: the container is reported started well before the engine
+/// does. `None` (skip) when Docker is unavailable.
 async fn start_mssql_cdc() -> Option<(ContainerAsync<MssqlServer>, u16)> {
-    let container = match MssqlServer::default()
-        .with_accept_eula()
-        // SQL Server Agent runs the CDC capture job that moves changes from the
-        // log into the change tables.
-        .with_env_var("MSSQL_AGENT_ENABLED", "true")
-        .start()
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            backend_missing(&format!(
-                "mssql-cdc test: could not start SQL Server container: {e}"
-            ));
-            return None;
-        }
-    };
+    let opts = StartOptions::default()
+        .ready(ReadyProbe::custom(1433, |ep: Endpoint| async move {
+            let pool = build_pool(&conn_cfg(ep.port, "master"), 1)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+            conn.execute("SELECT 1", &[])
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }))
+        .ready_timeout(Duration::from_secs(180));
+    let container = containers::start_or_skip(
+        || {
+            MssqlServer::default()
+                .with_accept_eula()
+                // SQL Server Agent runs the CDC capture job.
+                .with_env_var("MSSQL_AGENT_ENABLED", "true")
+        },
+        &opts,
+    )
+    .await?;
     let port = container
         .get_host_port_ipv4(1433)
         .await
         .expect("mssql host port");
-    if !wait_until_ready(port).await {
-        backend_missing("mssql-cdc test: SQL Server never accepted connections in time");
-        return None;
-    }
     Some((container, port))
-}
-
-/// Poll a `master` checkout until SQL Server accepts connections, or give up
-/// after a generous deadline (returns `false`).
-async fn wait_until_ready(port: u16) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(180);
-    loop {
-        if let Ok(pool) = build_pool(&conn_cfg(port, "master"), 1).await
-            && let Ok(mut conn) = pool.get().await
-            && conn.execute("SELECT 1", &[]).await.is_ok()
-        {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
 }
 
 fn conn_cfg(port: u16, database: &str) -> MssqlConnectionConfig {

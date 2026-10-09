@@ -7,7 +7,6 @@
 //! Import notes for testcontainers-modules 0.15:
 //! - `Kafka` lives at `testcontainers_modules::kafka::apache::Kafka`
 //! - The port constant is `testcontainers_modules::kafka::apache::KAFKA_PORT`
-//! - `AsyncRunner` is at `testcontainers::runners::AsyncRunner` (not via modules re-export)
 
 use faucet_common_kafka::{CompressionType, KafkaAuth, KafkaValueFormat, OnKeyError};
 use faucet_core::{DEFAULT_BATCH_SIZE, Sink};
@@ -18,14 +17,10 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::Duration;
-use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{KAFKA_PORT, Kafka};
 
 async fn start_kafka() -> (testcontainers::ContainerAsync<Kafka>, String) {
-    let container = Kafka::default()
-        .start()
-        .await
-        .expect("kafka container start");
+    let container = faucet_conformance::containers::start(Kafka::default).await;
     let port = container
         .get_host_port_ipv4(KAFKA_PORT)
         .await

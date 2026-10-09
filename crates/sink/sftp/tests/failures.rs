@@ -9,7 +9,6 @@ use faucet_core::Sink;
 use faucet_sink_sftp::{SftpSink, SftpSinkConfig};
 use serde_json::{Value, json};
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::io::AsyncWriteExt;
 
@@ -17,20 +16,18 @@ const USER: &str = "faucet";
 const PASS: &str = "secret";
 
 async fn server_inner() -> Option<(ContainerAsync<GenericImage>, u16)> {
-    let image = GenericImage::new("atmoz/sftp", "alpine")
-        .with_exposed_port(22.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-        .with_cmd(vec![format!("{USER}:{PASS}:::data")]);
-    match image.start().await {
-        Ok(c) => {
-            let port = c.get_host_port_ipv4(22).await.expect("port");
-            Some((c, port))
-        }
-        Err(e) => {
-            eprintln!("Skipping: Docker not available ({e})");
-            None
-        }
-    }
+    let c = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new("atmoz/sftp", "alpine")
+                .with_exposed_port(22.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+                .with_cmd(vec![format!("{USER}:{PASS}:::data")])
+        },
+        &Default::default(),
+    )
+    .await?;
+    let port = c.get_host_port_ipv4(22).await.expect("port");
+    Some((c, port))
 }
 
 fn connection(port: u16) -> SftpConnectionConfig {
@@ -189,9 +186,8 @@ async fn a_new_run_removes_stale_upload_scratch_of_its_output() {
 /// is set — CI provides Docker, so an unavailable backend is a failure there.
 async fn server() -> Option<(ContainerAsync<GenericImage>, u16)> {
     let started = server_inner().await;
-    assert!(
-        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-        "server: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
-    );
+    if started.is_none() {
+        faucet_conformance::containers::backend_missing("server: the test backend is unavailable");
+    }
     started
 }

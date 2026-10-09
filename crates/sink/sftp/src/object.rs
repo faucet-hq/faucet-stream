@@ -321,21 +321,18 @@ mod tests {
     )> {
         use testcontainers::ImageExt;
         use testcontainers::core::{IntoContainerPort, WaitFor};
-        use testcontainers::runners::AsyncRunner;
-        let image = testcontainers::GenericImage::new("atmoz/sftp", "alpine")
-            .with_exposed_port(22.tcp())
-            .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-            .with_cmd(vec!["faucet:secret:::data".to_string()]);
-        match image.start().await {
-            Ok(c) => {
-                let port = c.get_host_port_ipv4(22).await.expect("port");
-                Some((c, port))
-            }
-            Err(e) => {
-                eprintln!("Skipping: Docker not available ({e})");
-                None
-            }
-        }
+        let c = faucet_conformance::containers::start_or_skip(
+            || {
+                testcontainers::GenericImage::new("atmoz/sftp", "alpine")
+                    .with_exposed_port(22.tcp())
+                    .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+                    .with_cmd(vec!["faucet:secret:::data".to_string()])
+            },
+            &Default::default(),
+        )
+        .await?;
+        let port = c.get_host_port_ipv4(22).await.expect("port");
+        Some((c, port))
     }
 
     /// C3 (#783): a stat the server refuses (here: a directory the user cannot

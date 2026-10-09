@@ -7,7 +7,6 @@ use faucet_common_rabbitmq::{RabbitMqAuth, RabbitMqConnectionConfig, RabbitMqTls
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const RABBIT_CONF: &str = "\
@@ -99,19 +98,19 @@ fn make_certs() -> PathBuf {
 async fn connects_over_verified_tls() {
     let certs = make_certs();
     let read = |f: &str| std::fs::read(certs.join(f)).unwrap();
-    let container = GenericImage::new("rabbitmq", "3-management")
-        .with_exposed_port(5671.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
-        .with_copy_to(
-            "/etc/rabbitmq/rabbitmq.conf",
-            RABBIT_CONF.as_bytes().to_vec(),
-        )
-        .with_copy_to("/certs/ca.pem", read("ca.pem"))
-        .with_copy_to("/certs/server.pem", read("server.pem"))
-        .with_copy_to("/certs/server.key", read("server.key"))
-        .start()
-        .await
-        .expect("rabbitmq container start");
+    let container = faucet_conformance::containers::start(|| {
+        GenericImage::new("rabbitmq", "3-management")
+            .with_exposed_port(5671.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
+            .with_copy_to(
+                "/etc/rabbitmq/rabbitmq.conf",
+                RABBIT_CONF.as_bytes().to_vec(),
+            )
+            .with_copy_to("/certs/ca.pem", read("ca.pem"))
+            .with_copy_to("/certs/server.pem", read("server.pem"))
+            .with_copy_to("/certs/server.key", read("server.key"))
+    })
+    .await;
     let port = container.get_host_port_ipv4(5671).await.unwrap();
 
     let trusted = RabbitMqConnectionConfig {

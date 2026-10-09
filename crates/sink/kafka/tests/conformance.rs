@@ -31,19 +31,18 @@ mod idempotent {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
     use testcontainers::ImageExt;
-    use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::kafka::apache::{KAFKA_PORT, Kafka};
 
     /// Boot a transaction-enabled single-broker Kafka — mirrors
     /// `exactly_once.rs::start_kafka`.
     async fn start_kafka() -> (testcontainers::ContainerAsync<Kafka>, String) {
-        let container = Kafka::default()
-            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
-            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
-            .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
-            .start()
-            .await
-            .expect("kafka container start");
+        let container = faucet_conformance::containers::start(|| {
+            Kafka::default()
+                .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+                .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+                .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        })
+        .await;
         let port = container
             .get_host_port_ipv4(KAFKA_PORT)
             .await

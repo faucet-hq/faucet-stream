@@ -21,7 +21,6 @@ use remote_matrix::{BoxFut, Remote, run_matrix};
 use serde_json::{Value, json};
 use testcontainers_modules::azurite::{Azurite, BLOB_PORT};
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const ACCOUNT: &str = "devstoreaccount1";
 const KEY: &str =
@@ -80,7 +79,23 @@ impl Remote for AzureRemote {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn every_writable_format_takes_every_option_on_azure_blob() {
-    let container = Azurite::default().start().await.expect("start azurite");
+    let container = faucet_conformance::containers::start(|| {
+        // In-memory storage: a nearly full runner disk must not fail the emulator.
+        testcontainers::ImageExt::with_cmd(
+            Azurite::default(),
+            [
+                "azurite",
+                "--blobHost",
+                "0.0.0.0",
+                "--queueHost",
+                "0.0.0.0",
+                "--tableHost",
+                "0.0.0.0",
+                "--inMemoryPersistence",
+            ],
+        )
+    })
+    .await;
     let port = container.get_host_port_ipv4(BLOB_PORT).await.expect("port");
     {
         use azure_storage::{CloudLocation, prelude::*};

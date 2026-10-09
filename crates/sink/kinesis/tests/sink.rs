@@ -4,13 +4,15 @@ use faucet_core::Sink;
 use faucet_sink_kinesis::{KinesisCredentials, KinesisSink, KinesisSinkConfig, PartitionKey};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::localstack::LocalStack;
 
 async fn start_localstack() -> (ContainerAsync<LocalStack>, String) {
     use testcontainers::ImageExt;
-    let image = LocalStack::default().with_env_var("SERVICES", "kinesis");
-    let container = image.start().await.expect("localstack start");
+    let container = faucet_conformance::containers::start(|| {
+        LocalStack::default().with_env_var("SERVICES", "kinesis")
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(4566)
         .await

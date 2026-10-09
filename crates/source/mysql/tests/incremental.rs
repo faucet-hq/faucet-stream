@@ -8,11 +8,11 @@ use faucet_source_mysql::{MysqlSource, MysqlSourceConfig};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::mysql::Mysql;
 
 async fn start_mysql() -> (ContainerAsync<Mysql>, String) {
-    let container = Mysql::default().start().await.expect("mysql start");
+    let container = faucet_conformance::containers::start(Mysql::default).await;
     let port = container.get_host_port_ipv4(3306).await.expect("port");
     (container, format!("mysql://root@127.0.0.1:{port}/test"))
 }

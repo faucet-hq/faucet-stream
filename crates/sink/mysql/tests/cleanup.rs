@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::mysql::Mysql;
 use tokio::sync::Semaphore;
 
@@ -32,10 +32,8 @@ async fn start_mysql() -> (ContainerAsync<Mysql>, String) {
         .acquire()
         .await
         .expect("startup semaphore closed");
-    let container: ContainerAsync<Mysql> = Mysql::default()
-        .start()
-        .await
-        .expect("mysql container start");
+    let container: ContainerAsync<Mysql> =
+        faucet_conformance::containers::start(Mysql::default).await;
     let port = container
         .get_host_port_ipv4(3306)
         .await

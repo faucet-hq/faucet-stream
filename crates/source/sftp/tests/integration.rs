@@ -20,7 +20,6 @@ use faucet_source_sftp::{SftpFormat, SftpSource, SftpSourceConfig};
 use futures::StreamExt;
 use serde_json::Value;
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const USER: &str = "faucet";
@@ -35,23 +34,23 @@ const PASS: &str = "secret";
 async fn start_sftp_inner(
     files: &[(String, String)],
 ) -> Option<(ContainerAsync<GenericImage>, u16)> {
-    let mut image = GenericImage::new("atmoz/sftp", "alpine")
-        .with_exposed_port(22.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-        .with_cmd(vec![format!("{USER}:{PASS}:::data")]);
-    for (name, body) in files {
-        image = image.with_copy_to(
-            format!("/home/{USER}/data/{name}"),
-            body.clone().into_bytes(),
-        );
-    }
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Skipping: Docker not available ({e})");
-            return None;
-        }
-    };
+    let container = faucet_conformance::containers::start_or_skip(
+        || {
+            let mut image = GenericImage::new("atmoz/sftp", "alpine")
+                .with_exposed_port(22.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+                .with_cmd(vec![format!("{USER}:{PASS}:::data")]);
+            for (name, body) in files {
+                image = image.with_copy_to(
+                    format!("/home/{USER}/data/{name}"),
+                    body.clone().into_bytes(),
+                );
+            }
+            image
+        },
+        &Default::default(),
+    )
+    .await?;
     let port = container.get_host_port_ipv4(22).await.ok()?;
     Some((container, port))
 }
@@ -247,10 +246,11 @@ async fn a_sinks_upload_scratch_is_not_read() {
 /// is set — CI provides Docker, so an unavailable backend is a failure there.
 async fn start_sftp(files: &[(String, String)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
     let started = start_sftp_inner(files).await;
-    assert!(
-        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-        "start_sftp: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
-    );
+    if started.is_none() {
+        faucet_conformance::containers::backend_missing(
+            "start_sftp: the test backend is unavailable",
+        );
+    }
     started
 }
 

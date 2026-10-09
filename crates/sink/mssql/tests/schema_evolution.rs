@@ -8,7 +8,6 @@ use faucet_core::{ColumnChange, SchemaEvolution, Sink};
 use serde_json::json;
 use testcontainers_modules::mssql_server::MssqlServer;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const ENCODED_PW: &str = "yourStrong%28%21%29Password";
 
@@ -17,11 +16,8 @@ const ENCODED_PW: &str = "yourStrong%28%21%29Password";
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn start_mssql() -> (ContainerAsync<MssqlServer>, u16) {
-    let container = MssqlServer::default()
-        .with_accept_eula()
-        .start()
-        .await
-        .expect("start mssql container");
+    let container =
+        faucet_conformance::containers::start(|| MssqlServer::default().with_accept_eula()).await;
     let port = container
         .get_host_port_ipv4(1433)
         .await

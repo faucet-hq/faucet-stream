@@ -17,7 +17,6 @@ use faucet_source_sftp::{SftpFormat, SftpSource, SftpSourceConfig};
 use futures::StreamExt;
 use serde_json::Value;
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use tokio::io::AsyncWriteExt;
 
@@ -101,20 +100,18 @@ async fn a_parquet_file_streams_in_bounded_memory() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(400_000);
-    let image = GenericImage::new("atmoz/sftp", "alpine")
-        .with_exposed_port(22.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-        .with_cmd(vec!["faucet:secret:::data".to_string()]);
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            assert!(
-                std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-                "Docker unavailable and FAUCET_REQUIRE_BACKENDS is set: {e}"
-            );
-            eprintln!("Skipping: Docker not available ({e})");
-            return;
-        }
+    let Some(container) = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new("atmoz/sftp", "alpine")
+                .with_exposed_port(22.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+                .with_cmd(vec!["faucet:secret:::data".to_string()])
+        },
+        &Default::default(),
+    )
+    .await
+    else {
+        return;
     };
     let port = container.get_host_port_ipv4(22).await.unwrap();
     let conn = SftpConnectionConfig::with_password("127.0.0.1", "faucet", "secret").port(port);

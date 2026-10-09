@@ -11,7 +11,7 @@ use gcloud_googleapis::spanner::admin::database::v1::CreateDatabaseRequest;
 use gcloud_googleapis::spanner::admin::instance::v1::{CreateInstanceRequest, Instance};
 use gcloud_spanner::client::Client;
 use gcloud_spanner::statement::Statement;
-use testcontainers::{ContainerAsync, GenericImage, core::IntoContainerPort, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, GenericImage, core::IntoContainerPort};
 
 pub const PROJECT: &str = "test-project";
 pub const INSTANCE: &str = "test-instance";
@@ -22,27 +22,17 @@ pub struct Emulator {
     pub host: String,
 }
 
-/// A missing test backend: a skip locally, a failure when CI requires the
-/// backends (`FAUCET_REQUIRE_BACKENDS`).
-fn backend_missing(why: &str) {
-    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
-        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
-    }
-    eprintln!("skipping: {why}");
-}
-
 /// Start the Spanner emulator. Returns `None` when Docker is unavailable so
 /// tests skip cleanly on machines without a daemon.
 pub async fn start_emulator() -> Option<Emulator> {
-    let image = GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "latest")
-        .with_exposed_port(9010.tcp());
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            backend_missing(&format!("Spanner emulator: Docker not available ({e})"));
-            return None;
-        }
-    };
+    let container = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "latest")
+                .with_exposed_port(9010.tcp())
+        },
+        &Default::default(),
+    )
+    .await?;
     let port = container
         .get_host_port_ipv4(9010)
         .await

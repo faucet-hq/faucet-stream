@@ -25,7 +25,7 @@ use gcloud_pubsub::client::{Client, ClientConfig};
 use tokio::sync::{Mutex, MutexGuard};
 
 use testcontainers_modules::google_cloud_sdk_emulators::{CloudSdk, PUBSUB_PORT};
-use testcontainers_modules::testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers_modules::testcontainers::ContainerAsync;
 
 /// Every topic/subscription is created under this project id; the emulator
 /// accepts any project name. The connector and the setup client must agree, or
@@ -49,10 +49,7 @@ struct Emulator {
 /// the next test start.
 async fn emulator() -> Emulator {
     let guard = EMULATOR_LOCK.lock().await;
-    let container = CloudSdk::pubsub()
-        .start()
-        .await
-        .expect("start pubsub emulator container");
+    let container = faucet_conformance::containers::start(CloudSdk::pubsub).await;
     let port = container
         .get_host_port_ipv4(PUBSUB_PORT)
         .await

@@ -50,7 +50,7 @@ wiremock = "0.6"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "io-util", "sync"] }
 serde_json.workspace = true
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 schemars.workspace = true
 futures.workspace = true
 testcontainers = "0.27"

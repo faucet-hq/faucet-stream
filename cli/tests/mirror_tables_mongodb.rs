@@ -16,12 +16,12 @@ use faucet_cli::verify::{VerifyInputs, VerifySpec};
 use faucet_core::StateStore as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use testcontainers::ContainerAsync;
 use testcontainers::core::ExecCommand;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
 use testcontainers_modules::mongo::Mongo;
 
 async fn start() -> (ContainerAsync<Mongo>, String) {
-    let container = Mongo::repl_set().start().await.expect("mongo start");
+    let container = faucet_conformance::containers::start(Mongo::repl_set).await;
     let port = container.get_host_port_ipv4(27017).await.expect("port");
     (
         container,
