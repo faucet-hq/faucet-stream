@@ -1110,6 +1110,7 @@ mod tests {
         let src = MockSource { records: vec![] };
         assert_eq!(src.record_table(&json!({"table": "t"})), None);
         assert_eq!(src.position_le(&json!(1), &json!(2)), None);
+        assert_eq!(src.record_covered(&json!({}), &json!(1)), None);
         assert_eq!(src.position_min(&[]), None);
         assert_eq!(src.position_min(&[json!(3), json!(3)]), Some(json!(3)));
         assert_eq!(src.position_min(&[json!(1), json!(2)]), None);
