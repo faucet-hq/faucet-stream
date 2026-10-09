@@ -385,43 +385,6 @@ Prebuilt archives with SHA-256 checksums are on the
 Rust version is 1.96. See the [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html)
 for container images and slim builds. Prebuilt binaries cover macOS and Linux.
 
-## Project structure
-
-```
-Cargo.toml                    — workspace manifest (<!--COUNT:crates-->111<!--/COUNT--> crates)
-crates/
-  core/                       — faucet-core: shared types, traits, pipeline, transforms, config
-  auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
-  source/                     — <!--COUNT:sources-->43<!--/COUNT--> source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, file, …)
-  sink/                       — <!--COUNT:sinks-->35<!--/COUNT--> sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, singer, …)
-  common/                     — <!--COUNT:common-->23<!--/COUNT--> shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, file)
-  state/                      — Redis- and Postgres-backed StateStore backends
-  lineage/                    — faucet-lineage: OpenLineage event emission
-  transform-sql/              — faucet-transform-sql: embedded DuckDB SQL transform
-  transform-wasm/             — faucet-transform-wasm: WebAssembly (wasmtime) per-record transform
-  conformance/                — faucet-conformance: connector conformance harness + engine reliability suites
-  interop-tests/              — unpublished: tests that need two connectors (round trips, fidelity)
-faucet-stream/                — umbrella crate with feature-gated re-exports
-cli/                          — faucet-cli: `faucet` binary, YAML/JSON pipeline runner
-  examples/                   — ready-to-run pipeline YAMLs
-  tests/                      — assert_cmd + wiremock + testcontainers integration tests
-hub/                          — Template Hub: sink templates + example source templates
-schemas/                      — committed JSON Schema for pipeline configs (editor validation)
-examples/                     — repo-level examples: docker-compose infra stack + run index
-  orchestration/              — ELT recipe: faucet (EL) + dbt (T) + Airflow/Dagster
-benchmarks/                   — benchmark harness and configs
-observability/                — Prometheus alert rules and Grafana dashboards
-Dockerfile                    — multi-stage image build (name-based connector selection)
-deploy/                       — container + Kubernetes assets
-  helm/faucet-stream/         — Helm chart (serve Deployment and/or run Job/CronJob)
-  otel/                       — log-shipping recipes (Alloy → Loki, OTel Collector → S3/GCS/Azure)
-scripts/                      — helper and CI-check scripts (try-local.sh, build-image.sh, …)
-docs/book/                    — mdBook documentation site (source under docs/book/src)
-rfcs/                         — design RFCs
-.github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, …
-.github/assets/               — brand assets: logo, wordmark, social-preview banner, favicon
-```
-
 ## Star history
 
 <a href="https://www.star-history.com/?repos=faucet-hq%2Ffaucet-stream&type=date&legend=top-left">
@@ -438,6 +401,7 @@ best signal for the next person deciding whether to bet a pipeline on it.
 ## Project
 
 - [Roadmap](https://github.com/orgs/faucet-hq/projects/2): what's being built now and what's next.
+- [Project structure](PROJECT_STRUCTURE.md): where everything lives in the repository.
 - [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Security policy](SECURITY.md) · [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## License

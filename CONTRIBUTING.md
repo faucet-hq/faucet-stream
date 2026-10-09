@@ -6,6 +6,9 @@ core changes and third-party connectors are welcome.
 
 By participating you agree to abide by our [Code of Conduct](./CODE_OF_CONDUCT.md).
 
+New to the codebase? [PROJECT_STRUCTURE.md](./PROJECT_STRUCTURE.md) maps where
+every crate, example, deploy asset and doc lives.
+
 ## Getting set up
 
 ```bash
