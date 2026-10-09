@@ -1340,6 +1340,7 @@ Selected flags (`faucet serve --help` for the full list):
 |------|---------|
 | `--listen <addr>` | Bind address (default `127.0.0.1:8080`; env `FAUCET_SERVE_LISTEN`). |
 | `--auth-token <t>` / `--no-auth` | Bearer token (prefer the env var) or explicit no-auth opt-in. |
+| `--allow-unauthenticated-network` | With `--no-auth`, allow a non-loopback `--listen` (`0.0.0.0`, `::`, a LAN address). Without it that combination refuses to start; with it the server logs a warning. Env: `FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK`. |
 | `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — enables role enforcement + the `GET /v1/audit` log. Tokens resolve `${env:}` / `${file:}` / secret-manager references at startup; an unresolvable one refuses the start. Mutually exclusive with `--auth-token`/`--no-auth`. |
 | `--allow-subprocess-connectors` | Let a config submitted over HTTP or MCP use connectors that run a program on the host (`singer`). Off by default (`422`); configs for a tenant are refused regardless, registered templates are always allowed. See [Subprocess connectors](http-api.md#subprocess-connectors). |
 | `--read-token <t>` / `--write-token <t>` / `--admin-token <t>` | The three-token shorthand for the same RBAC (`viewer` / `operator` / `admin`) with no file to author — prefer the env vars `FAUCET_SERVE_{READ,WRITE,ADMIN}_TOKEN`. Any subset may be set; mutually exclusive with `--auth-token` / `--auth-config` / `--no-auth`. See the [role × route matrix](http-api.md#role--route-matrix). |

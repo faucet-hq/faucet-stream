@@ -32,6 +32,7 @@ services:
       - serve
       - --listen=0.0.0.0:8080
       - --no-auth
+      - --allow-unauthenticated-network
       - --history=sqlite:/var/lib/faucet/history.db
       - --otel-config=/etc/faucet/otel.yaml
       - --log-link-template=http://localhost:3000/explore?left=%7B%22queries%22:%5B%7B%22expr%22:%22%7Bservice_name%3D%5C%22faucet%5C%22%7D%20%7C%20serve_run_id%3D%5C%22{run_id}%5C%22%22%7D%5D%7D

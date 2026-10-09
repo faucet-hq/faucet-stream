@@ -305,12 +305,13 @@ flags: `--log-retention-secs` (default 24 h, kept *after* delivery),
 `--log-buffer-max-age-secs`, `--log-buffer-max-bytes`, `--log-link-template`,
 `--log-export-notify-after-secs`. See the observability guide's *Shipping logs*.
 
-Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** without `--no-auth`, startup fails (an unauthenticated server is never accidental). The default bind is loopback.
+Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** without `--no-auth`, startup fails (an unauthenticated server is never accidental). The default bind is loopback, and `--no-auth` on any other address also needs `--allow-unauthenticated-network`.
 
 | Flag | Purpose |
 |------|---------|
 | `--listen <addr>` | Bind address (default `127.0.0.1:8080`; env `FAUCET_SERVE_LISTEN`). |
 | `--auth-token <t>` / `--no-auth` | Bearer token (prefer the env var) or explicit no-auth opt-in. |
+| `--allow-unauthenticated-network` | With `--no-auth`, allow a non-loopback `--listen` (`0.0.0.0`, `::`, a LAN address). Without it that combination refuses to start; with it the server logs a warning. Env: `FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK`. |
 | `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — role enforcement + admin-only `GET /v1/audit`. Tokens resolve `${env:}` / `${file:}` / secret-manager references at startup. Mutually exclusive with `--auth-token`/`--no-auth`. |
 | `--allow-subprocess-connectors` | Let a config submitted over HTTP / MCP use `singer` (it runs a program on the host). Off by default; tenant configs are refused regardless; registered templates are always allowed. |
 | `--max-concurrent-runs` / `--max-queued-runs` | Concurrency + queue caps (submit past the queue → 429 + `Retry-After`). |

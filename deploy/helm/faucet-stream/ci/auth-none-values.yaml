@@ -1,0 +1,9 @@
+# Unauthenticated serve: the pod listens on 0.0.0.0, so the chart accepts the
+# exposure explicitly.
+# expect: - --no-auth
+# expect: - --allow-unauthenticated-network
+# expect: Auth: DISABLED
+serve:
+  enabled: true
+  auth:
+    mode: none

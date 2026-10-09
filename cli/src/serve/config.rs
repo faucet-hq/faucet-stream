@@ -298,6 +298,21 @@ impl ServeConfig {
             .listen
             .parse()
             .map_err(|e| CliError::Serve(format!("invalid --listen '{}': {e}", args.listen)))?;
+        if matches!(auth, AuthMode::None) && !listen.ip().is_loopback() {
+            if !args.allow_unauthenticated_network {
+                return Err(CliError::Serve(format!(
+                    "refusing to serve without authentication on {listen}: anyone who can reach \
+                     it can submit and run pipelines. Bind loopback (--listen 127.0.0.1:PORT), \
+                     set --auth-token / --auth-config, or pass \
+                     --allow-unauthenticated-network to accept the exposure"
+                )));
+            }
+            tracing::warn!(
+                %listen,
+                "AUTHENTICATION IS DISABLED on a network address: anyone who can reach this port \
+                 can submit and run pipelines with this server's credentials"
+            );
+        }
 
         let history = match args.history {
             None => HistoryBackendSpec::Memory,
@@ -559,6 +574,7 @@ mod tests {
             write_token: None,
             admin_token: None,
             no_auth: false,
+            allow_unauthenticated_network: false,
             max_concurrent_runs: None,
             max_queued_runs: None,
             default_config: None,
@@ -717,10 +733,45 @@ mod tests {
     #[test]
     fn listen_parses_to_socket_addr() {
         let mut a = base_args();
-        a.no_auth = true;
+        a.auth_token = Some("t".into());
         a.listen = "0.0.0.0:9999".into();
         let cfg = ServeConfig::from_args(a).unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:9999".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn no_auth_on_a_network_address_is_refused_unless_allowed() {
+        for listen in ["0.0.0.0:8080", "10.1.2.3:8080", "[::]:8080", "[2001:db8::1]:8080"] {
+            let mut a = base_args();
+            a.no_auth = true;
+            a.listen = listen.into();
+            let err = ServeConfig::from_args(a).unwrap_err().to_string();
+            assert!(
+                err.contains("refusing to serve without authentication")
+                    && err.contains("--allow-unauthenticated-network"),
+                "{listen}: {err}"
+            );
+
+            let mut a = base_args();
+            a.no_auth = true;
+            a.allow_unauthenticated_network = true;
+            a.listen = listen.into();
+            assert!(ServeConfig::from_args(a).is_ok(), "{listen}");
+        }
+    }
+
+    #[test]
+    fn no_auth_on_loopback_or_an_authenticated_network_server_needs_no_opt_in() {
+        for listen in ["127.0.0.1:8080", "127.9.9.9:8080", "[::1]:8080"] {
+            let mut a = base_args();
+            a.no_auth = true;
+            a.listen = listen.into();
+            assert!(ServeConfig::from_args(a).is_ok(), "{listen}");
+        }
+        let mut a = base_args();
+        a.auth_token = Some("t".into());
+        a.listen = "0.0.0.0:8080".into();
+        assert!(ServeConfig::from_args(a).is_ok());
     }
 
     #[test]

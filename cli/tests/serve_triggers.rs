@@ -687,6 +687,7 @@ async fn spawn_serve_with_triggers(
         write_token: None,
         admin_token: None,
         no_auth: token.is_none(),
+        allow_unauthenticated_network: false,
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,

@@ -36,6 +36,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf) -> faucet_cli::cli::Se
         write_token: None,
         admin_token: None,
         no_auth: false,
+        allow_unauthenticated_network: false,
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,

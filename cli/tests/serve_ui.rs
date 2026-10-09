@@ -22,6 +22,7 @@ fn args(port: u16) -> ServeArgs {
         write_token: None,
         admin_token: None,
         no_auth: true,
+        allow_unauthenticated_network: false,
         max_concurrent_runs: Some(2),
         max_queued_runs: Some(8),
         default_config: None,

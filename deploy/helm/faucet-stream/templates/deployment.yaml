@@ -66,6 +66,7 @@ spec:
             - --listen=0.0.0.0:8080
             {{- if eq .Values.serve.auth.mode "none" }}
             - --no-auth
+            - --allow-unauthenticated-network
             {{- else if eq .Values.serve.auth.mode "rbac" }}
             {{- if .Values.serve.auth.existingSecret }}
             - --auth-config=/etc/faucet-auth/{{ .Values.serve.auth.existingSecretKey }}
