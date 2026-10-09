@@ -56,9 +56,7 @@ pub async fn stream_logs(
 ) -> Result<Response, ServeError> {
     crate::serve::handlers::runs::ensure_visible(&state, &actor, &id).await?;
     match q.format.as_deref() {
-        None => stream_logs_sse(state, id)
-            .await
-            .map(IntoResponse::into_response),
+        None => stream_logs_sse(state, id).await,
         Some("jsonl") | Some("text") => persisted_logs(state, id, q).await,
         Some(other) => Err(ServeError::BadConfig(format!(
             "unknown log format '{other}'; use 'jsonl' or 'text' (or omit for the SSE stream)"
@@ -73,21 +71,25 @@ async fn persisted_logs(
     q: LogQuery,
 ) -> Result<Response, ServeError> {
     // A completely unknown run is a 404 (mirrors the SSE path).
-    let known = state
+    let rec = state
         .history()
         .get(&id)
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?
-        .is_some();
-    if !known {
-        return Err(ServeError::NotFound);
-    }
+        .ok_or(ServeError::NotFound)?;
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, MAX_LOG_LIMIT);
     let page = state
         .history()
         .list_run_logs(&id, q.after, limit)
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
+    // The local copy aged out (#806): point at the log service instead of
+    // answering with nothing.
+    let aged_out_link = if page.lines.is_empty() && q.after.is_none() {
+        state.log_export().link(&rec)
+    } else {
+        None
+    };
 
     if q.format.as_deref() == Some("text") {
         let mut body = String::new();
@@ -97,6 +99,11 @@ async fn persisted_logs(
         }
         if page.truncated {
             body.push_str("… (earlier lines truncated: per-run cap reached)\n");
+        }
+        if let Some(link) = &aged_out_link {
+            body.push_str(&format!(
+                "The local copy of this run's logs has aged out; view them in the log service: {link}\n"
+            ));
         }
         return Ok((
             [(
@@ -118,6 +125,10 @@ async fn persisted_logs(
         body.push_str(r#"{"truncated":true}"#);
         body.push('\n');
     }
+    if let Some(link) = aged_out_link {
+        body.push_str(&serde_json::json!({"aged_out": true, "link": link}).to_string());
+        body.push('\n');
+    }
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
         body,
@@ -129,7 +140,7 @@ async fn persisted_logs(
 async fn stream_logs_sse(
     state: ServerState,
     id: String,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ServeError> {
+) -> Result<Response, ServeError> {
     let (snapshot, rx, ended) = match state.log_hub().reader(&id) {
         Some(reader) => reader,
         None => {
@@ -144,6 +155,32 @@ async fn stream_logs_sse(
             if !known {
                 return Err(ServeError::NotFound);
             }
+            // The local copy aged out (#806): lead with the log-service link.
+            let link = match state.history().get(&id).await {
+                Ok(Some(rec)) => state.log_export().link(&rec),
+                _ => None,
+            };
+            if let Some(link) = link {
+                let persisted = state
+                    .history()
+                    .list_run_logs(&id, None, 1)
+                    .await
+                    .map(|p| p.lines.is_empty())
+                    .unwrap_or(false);
+                if persisted {
+                    let ev = futures::stream::iter(vec![
+                        Ok::<Event, std::convert::Infallible>(
+                            Event::default().event("link").data(link),
+                        ),
+                        Ok(to_sse_event(LogEvent::End)),
+                    ]);
+                    return Ok(Sse::new(ev)
+                        .keep_alive(
+                            KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS)),
+                        )
+                        .into_response());
+                }
+            }
             // A dropped sender's receiver is never polled (ended == true).
             (Vec::new(), broadcast::channel(1).1, true)
         }
@@ -153,7 +190,8 @@ async fn stream_logs_sse(
         .map(|ev| Ok::<Event, std::convert::Infallible>(to_sse_event(ev)));
     Ok(
         Sse::new(stream)
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS))),
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS)))
+            .into_response(),
     )
 }
 

@@ -54,6 +54,7 @@ enum PersistMsg {
         ts: String,
         level: String,
         line: String,
+        attrs: std::collections::BTreeMap<String, String>,
     },
     End {
         run_id: String,
@@ -201,6 +202,19 @@ impl LogHub {
     /// persistence is enabled, enqueue it for durable storage (#529). Called by
     /// [`RunLogLayer::on_event`] with the pre-redacted line.
     pub fn capture(&self, run_id: &str, level: &str, ts: String, line: String) {
+        self.capture_with_attrs(run_id, level, ts, line, Default::default());
+    }
+
+    /// [`capture`](Self::capture) with the line's attributes (#806), which
+    /// are persisted and shipped with it.
+    pub fn capture_with_attrs(
+        &self,
+        run_id: &str,
+        level: &str,
+        ts: String,
+        line: String,
+        attrs: std::collections::BTreeMap<String, String>,
+    ) {
         let seq = self.buffer(run_id).push(line.clone());
         if let Some(tx) = self.persist.get()
             && tx
@@ -210,6 +224,7 @@ impl LogHub {
                     ts,
                     level: level.to_string(),
                     line,
+                    attrs,
                 })
                 .is_err()
         {
@@ -281,7 +296,13 @@ struct RunPersistState {
     persisted: u64,
     /// Whether the per-run cap has been hit (→ a truncation marker at End).
     truncated: bool,
+    /// Lines dropped by the per-run cap, not yet counted on the run's delivery row.
+    capped: u64,
 }
+
+/// How often the writer flushes every run's pending lines, so a long run's
+/// lines reach the durable store (and the log shipper) while it runs.
+const PERSIST_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Background task draining the persistence channel (#529): batches captured
 /// lines per run into `history`, enforces the per-run cap, and flushes at run
@@ -310,7 +331,21 @@ async fn persist_writer(
         }
     }
 
-    while let Some(msg) = rx.recv().await {
+    let mut tick = tokio::time::interval(PERSIST_FLUSH_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let msg = tokio::select! {
+            m = rx.recv() => match m {
+                Some(m) => m,
+                None => break,
+            },
+            _ = tick.tick() => {
+                for (run_id, st) in runs.iter_mut() {
+                    flush(&history, run_id, st).await;
+                }
+                continue;
+            }
+        };
         match msg {
             PersistMsg::Line {
                 run_id,
@@ -318,6 +353,7 @@ async fn persist_writer(
                 ts,
                 level,
                 line,
+                attrs,
             } => {
                 let st = runs.entry(run_id.clone()).or_default();
                 if st.persisted >= cap {
@@ -328,6 +364,11 @@ async fn persist_writer(
                         )
                         .increment(1);
                     }
+                    st.capped += 1;
+                    crate::logship::metrics::dropped(
+                        crate::logship::metrics::DropReason::MaxLines,
+                        1,
+                    );
                     continue;
                 }
                 st.persisted += 1;
@@ -336,6 +377,7 @@ async fn persist_writer(
                     ts,
                     level,
                     line,
+                    attrs,
                 });
                 if st.pending.len() >= PERSIST_BATCH {
                     flush(&history, &run_id, st).await;
@@ -364,10 +406,17 @@ async fn persist_writer(
                 ts: String::new(),
                 level: "WARN".to_string(),
                 line: "log truncated: per-run cap reached".to_string(),
+                attrs: Default::default(),
             }];
             if let Err(e) = history.record_run_logs(run_id, &marker).await {
                 tracing::warn!(run_id, error = %e, "persisting run-log truncation marker failed");
             }
+        }
+        if st.capped > 0 {
+            if let Err(e) = history.log_ship_add_dropped(run_id, st.capped).await {
+                tracing::warn!(run_id, error = %e, "recording capped run-log lines failed");
+            }
+            st.capped = 0;
         }
     }
 }
@@ -459,35 +508,6 @@ impl Visit for RunIdVisitor {
     }
 }
 
-/// Formats an event's fields into a single log line: the `message` field, then
-/// any remaining `key=value` fields.
-#[derive(Default)]
-struct EventLineVisitor {
-    message: String,
-    fields: String,
-}
-
-impl Visit for EventLineVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        use std::fmt::Write;
-        if field.name() == "message" {
-            let _ = write!(self.message, "{value:?}");
-        } else {
-            let _ = write!(self.fields, " {}={:?}", field.name(), value);
-        }
-    }
-}
-
-impl EventLineVisitor {
-    fn finish(self) -> String {
-        if self.fields.is_empty() {
-            self.message
-        } else {
-            format!("{}{}", self.message, self.fields)
-        }
-    }
-}
-
 /// Tracing layer that captures events tagged with a `serve_run_id` into the
 /// [`LogHub`] for SSE streaming. Added to serve's global subscriber alongside the
 /// redacting fmt layer (`observability.rs`).
@@ -506,6 +526,7 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        crate::logship::capture::on_new_span(attrs, id, &ctx);
         let mut visitor = RunIdVisitor::default();
         attrs.record(&mut visitor);
         if let Some(run_id) = visitor.0
@@ -523,22 +544,20 @@ where
         }) else {
             return;
         };
-        let mut visitor = EventLineVisitor::default();
-        event.record(&mut visitor);
-        let meta = event.metadata();
+        if crate::logship::capture::is_shipping_noise(event.metadata().target()) {
+            return;
+        }
         // Render the line self-describing: `<ts> <LEVEL> <target>: <msg>`, mirroring
         // the stderr fmt layer's format. The ephemeral ring / SSE / console only ever
         // see `line`, so the timestamp must live in the line text itself; the separate
-        // `ts` field is still carried for the structured jsonl persisted-log API.
-        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let line = format!(
-            "{ts} {} {}: {}",
-            meta.level(),
-            meta.target(),
-            visitor.finish()
-        );
-        let line = crate::secrets::registry::redact(&line).into_owned();
-        self.hub.capture(&run_id, meta.level().as_str(), ts, line);
+        // `ts` field and the span attributes travel with it to the durable store and
+        // the log shipper (#806). Body and attributes are redacted at capture.
+        let ev = crate::logship::capture::capture(event, &ctx);
+        let line = ev.rendered();
+        let mut attrs = ev.attrs;
+        attrs.remove("serve_run_id");
+        self.hub
+            .capture_with_attrs(&run_id, ev.level, ev.ts, line, attrs);
     }
 }
 

@@ -30,6 +30,7 @@ pub fn test_config() -> ServeConfig {
         idempotency_retention: Duration::from_secs(60),
         log_retention: std::time::Duration::from_secs(0),
         log_max_lines_per_run: 100_000,
+        log_buffer: Default::default(),
         local_output_retention_days: 7,
         local_output_in_flight_grace: Duration::from_secs(60),
         preview: crate::serve::preview::PreviewConfig::default(),

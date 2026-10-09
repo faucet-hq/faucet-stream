@@ -906,6 +906,11 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
         ) {
             report.runs += 1;
         }
+        history
+            .delete_run_logs_through(id, u64::MAX - 1)
+            .await
+            .map_err(store_err)?;
+        history.log_ship_forget(id).await.map_err(store_err)?;
     }
 
     let purged = history

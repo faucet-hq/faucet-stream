@@ -11,6 +11,7 @@ fn line(seq: u64, ts: &str, l: &str) -> RunLogLine {
         ts: ts.into(),
         level: "INFO".into(),
         line: l.into(),
+        attrs: Default::default(),
     }
 }
 

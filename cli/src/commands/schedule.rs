@@ -262,8 +262,12 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
     let usage = crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), path.parent())
         .map_err(CliError::Config)?;
 
+    // Run-log shipping (#806): each tick is a run in the spool, shipped in
+    // the background for the life of the scheduler.
+    let logs = crate::logship::process::ScheduleLogs::start(&cfg, &pipeline_name);
+
     if args.once {
-        return run_once(
+        let r = run_once(
             &nodes,
             &auth,
             &execution,
@@ -286,9 +290,11 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
             &catalog,
         )
         .await;
+        logs.shutdown().await;
+        return r;
     }
 
-    run_loop(
+    let r = run_loop(
         compiled,
         nodes,
         auth,
@@ -314,7 +320,9 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
         #[cfg(feature = "catalog")]
         catalog,
     )
-    .await
+    .await;
+    logs.shutdown().await;
+    r
 }
 
 /// Build a fresh `ExecuteOptions` for one tick (connectors are rebuilt per run;
@@ -379,6 +387,7 @@ fn run_span(run_ordinal: u64, scheduled_for: DateTime<Utc>, tick: DateTime<Utc>)
         run_ordinal,
         scheduled_for_unix_seconds = scheduled_for.timestamp(),
         tick_unix_seconds = tick.timestamp(),
+        log_run_id = tracing::field::Empty,
     )
 }
 
@@ -395,29 +404,15 @@ fn spawn_run(
     let cancel = faucet_core::CancellationToken::new();
     opts.cancel = Some(cancel.clone());
     let token = cancel.clone();
+    // Each tick is one run in the log-shipping spool (#806).
+    let log_run = crate::logship::process::begin_tick(&span);
     let handle = tokio::spawn(
         async move {
-            let fut = run_rows(nodes, opts);
-            tokio::pin!(fut);
-            let Some(d) = timeout else {
-                return fut.await;
-            };
-            match tokio::time::timeout(d, &mut fut).await {
-                Ok(r) => r,
-                Err(_) => {
-                    token.cancel();
-                    let flushed = tokio::time::timeout(flush_grace, &mut fut).await.is_ok();
-                    Err(CliError::Internal(format!(
-                        "scheduled run exceeded run_timeout_secs ({}s) and was cancelled{}",
-                        d.as_secs(),
-                        if flushed {
-                            " (its rows stopped at a page boundary and flushed)"
-                        } else {
-                            "; it did not stop within the shutdown grace and was dropped"
-                        }
-                    )))
-                }
+            let result = run_with_timeout(nodes, opts, timeout, flush_grace, token).await;
+            if let Some(id) = &log_run {
+                crate::logship::process::end_tick(id);
             }
+            result
         }
         .instrument(span),
     );
@@ -425,6 +420,37 @@ fn spawn_run(
         handle,
         started: Instant::now(),
         cancel,
+    }
+}
+
+/// Run one tick's rows under the optional run timeout.
+async fn run_with_timeout(
+    nodes: Rows,
+    opts: ExecuteOptions,
+    timeout: Option<Duration>,
+    flush_grace: Duration,
+    token: faucet_core::CancellationToken,
+) -> CliResult<RunSummary> {
+    let fut = run_rows(nodes, opts);
+    tokio::pin!(fut);
+    let Some(d) = timeout else {
+        return fut.await;
+    };
+    match tokio::time::timeout(d, &mut fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            token.cancel();
+            let flushed = tokio::time::timeout(flush_grace, &mut fut).await.is_ok();
+            Err(CliError::Internal(format!(
+                "scheduled run exceeded run_timeout_secs ({}s) and was cancelled{}",
+                d.as_secs(),
+                if flushed {
+                    " (its rows stopped at a page boundary and flushed)"
+                } else {
+                    "; it did not stop within the shutdown grace and was dropped"
+                }
+            )))
+        }
     }
 }
 

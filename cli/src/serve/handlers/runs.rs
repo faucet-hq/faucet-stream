@@ -93,7 +93,7 @@ pub async fn get_run(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
-) -> Result<Json<RunRecord>, ServeError> {
+) -> Result<Json<RunDetail>, ServeError> {
     let mut rec = state
         .history()
         .get(&id)
@@ -112,7 +112,23 @@ pub async fn get_run(
             .map(|d| d.as_secs_f64());
     }
     redact_record(&mut rec, &actor);
-    Ok(Json(rec))
+    let log_export = state
+        .log_export()
+        .view(state.history().as_ref(), &rec)
+        .await;
+    Ok(Json(RunDetail {
+        record: rec,
+        log_export,
+    }))
+}
+
+/// `GET /v1/runs/{id}`: the run record plus whether its logs reached the log
+/// service (#806).
+#[derive(Debug, serde::Serialize)]
+pub struct RunDetail {
+    #[serde(flatten)]
+    pub record: RunRecord,
+    pub log_export: crate::logship::LogExportView,
 }
 
 /// `POST /v1/runs/{id}/cancel` → 202 (cancel requested) / 200 (terminal no-op) / 404.

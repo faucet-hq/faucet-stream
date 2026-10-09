@@ -691,16 +691,33 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     // Persistent run logs (#529): route captured (already-redacted) logs into the
     // durable backend so they survive past the ephemeral SSE drain window. The
     // in-memory backend stays ephemeral by default (persist only to a real DB).
-    if !config.log_retention.is_zero()
-        && !matches!(
-            config.history,
-            crate::serve::config::HistoryBackendSpec::Memory
-        )
-    {
+    // With log shipping on (#806) the log store is the shipping buffer, so it
+    // is enabled whatever the backend — the in-memory one is a non-durable
+    // buffer, lost on restart.
+    let shipping = crate::serve::log_export::LogExport::from_config(&config).configured();
+    let memory_history = matches!(
+        config.history,
+        crate::serve::config::HistoryBackendSpec::Memory
+    );
+    if crate::serve::log_export::LogExport::unsupported(&config) {
+        tracing::warn!(
+            "--otel-config exports `logs` but this binary was built without --features otel; \
+             run logs are not shipped"
+        );
+    }
+    if shipping && memory_history {
+        tracing::warn!(
+            "log shipping is on with --history memory: undelivered run logs are buffered in \
+             memory and lost if the server restarts; use a SQLite or Postgres --history for a \
+             durable buffer"
+        );
+    }
+    if shipping || (!config.log_retention.is_zero() && !memory_history) {
         log_hub.enable_persistence(history.clone(), config.log_max_lines_per_run);
         tracing::info!(
             retention_secs = config.log_retention.as_secs(),
             max_lines_per_run = config.log_max_lines_per_run,
+            shipping,
             "persistent run logs enabled"
         );
     }
@@ -870,8 +887,16 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     let maintenance = tokio::spawn(maintenance_loop(
         state.history(),
         config.retain_terminal_runs,
-        config.log_retention,
+        Duration::ZERO,
         purge_period,
+        shutdown.clone(),
+    ));
+    // Run-log retention + log shipping (#806): delivery-aware retention and
+    // the OTLP shipper when `--otel-config` exports logs, time-based
+    // retention otherwise.
+    let log_shipper = tokio::spawn(crate::serve::log_export::run_loop(
+        state.log_export().clone(),
+        state.history(),
         shutdown.clone(),
     ));
 
@@ -1000,6 +1025,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     )
     .await;
     maintenance.abort();
+    log_shipper.abort();
     leases.abort();
     change_expiry.abort();
     #[cfg(feature = "catalog")]
@@ -1019,6 +1045,13 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         .log_hub()
         .shutdown_persistence(Duration::from_secs(10))
         .await;
+    // Ship what the last runs logged (#806), bounded.
+    crate::serve::log_export::final_flush(
+        state.log_export(),
+        state.history().as_ref(),
+        Duration::from_secs(10),
+    )
+    .await;
     // Flush any buffered OTLP telemetry after in-flight runs drain (no-op without
     // the `otel` feature).
     faucet_core::shutdown_otel();

@@ -27,6 +27,8 @@ pub mod list;
 pub mod masking;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "otel")]
+pub mod logs;
 pub mod migrate;
 pub mod new;
 #[cfg(feature = "notify")]

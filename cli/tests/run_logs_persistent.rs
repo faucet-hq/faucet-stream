@@ -26,6 +26,7 @@ fn log_line(seq: u64, ts: &str, line: &str) -> RunLogLine {
         ts: ts.into(),
         level: "INFO".into(),
         line: line.into(),
+        attrs: Default::default(),
     }
 }
 
@@ -80,6 +81,7 @@ async fn truncation_sentinel_sets_flag_and_is_excluded() {
             ts: String::new(),
             level: "WARN".into(),
             line: "truncated".into(),
+            attrs: Default::default(),
         }],
     )
     .await

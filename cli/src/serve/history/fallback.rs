@@ -374,6 +374,66 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.purge_run_logs(older_than), f => f.purge_run_logs(older_than))
     }
 
+    // ── Log delivery (#806) ───────────────────────────────────────────────────
+
+    async fn log_ship_rows(
+        &self,
+        pending_only: bool,
+    ) -> Result<Vec<crate::serve::history::LogShipRow>, HistoryError> {
+        via!(self, p => p.log_ship_rows(pending_only), f => f.log_ship_rows(pending_only))
+    }
+    async fn log_ship_row(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::serve::history::LogShipRow>, HistoryError> {
+        via!(self, p => p.log_ship_row(run_id), f => f.log_ship_row(run_id))
+    }
+    async fn log_ship_claim(
+        &self,
+        run_id: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, HistoryError> {
+        via!(self, p => p.log_ship_claim(run_id, ttl), f => f.log_ship_claim(run_id, ttl))
+    }
+    async fn log_ship_ack(&self, run_id: &str, delivered_seq: u64) -> Result<bool, HistoryError> {
+        via!(self, p => p.log_ship_ack(run_id, delivered_seq), f => f.log_ship_ack(run_id, delivered_seq))
+    }
+    async fn log_ship_fail(&self, run_id: &str, error: &str) -> Result<bool, HistoryError> {
+        via!(self, p => p.log_ship_fail(run_id, error), f => f.log_ship_fail(run_id, error))
+    }
+    async fn log_ship_release(&self, run_id: &str) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_release(run_id), f => f.log_ship_release(run_id))
+    }
+    async fn log_ship_add_dropped(&self, run_id: &str, n: u64) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_add_dropped(run_id, n), f => f.log_ship_add_dropped(run_id, n))
+    }
+    async fn log_ship_mark_notified(
+        &self,
+        run_id: &str,
+        failure: bool,
+        drop: bool,
+    ) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_mark_notified(run_id, failure, drop), f => f.log_ship_mark_notified(run_id, failure, drop))
+    }
+    async fn log_ship_forget(&self, run_id: &str) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_forget(run_id), f => f.log_ship_forget(run_id))
+    }
+    async fn run_log_stats(
+        &self,
+        run_id: &str,
+        after: Option<u64>,
+        through: Option<u64>,
+    ) -> Result<crate::serve::history::RunLogStats, HistoryError> {
+        via!(self, p => p.run_log_stats(run_id, after, through), f => f.run_log_stats(run_id, after, through))
+    }
+    async fn delete_run_logs_through(
+        &self,
+        run_id: &str,
+        through: u64,
+    ) -> Result<usize, HistoryError> {
+        via!(self, p => p.delete_run_logs_through(run_id, through), f => f.delete_run_logs_through(run_id, through))
+    }
+
     // ── Data Movement Catalog (#279) ─────────────────────────────────────────
 
     async fn catalog_record(

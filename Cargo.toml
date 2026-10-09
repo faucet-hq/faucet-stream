@@ -383,6 +383,12 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "grpc-tonic", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.32.1"
 metrics-exporter-opentelemetry = "0.2.1"
+# OTLP log shipping from the durable local buffer (#806): requests are built from
+# the generated protobuf types and sent with the tonic/prost lines that
+# opentelemetry-proto 0.31 itself uses (the workspace's own tonic/prost are 0.13).
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "logs"] }
+tonic-otlp = { package = "tonic", version = "0.14", default-features = false, features = ["channel"] }
+prost-otlp = { package = "prost", version = "0.14" }
 bytes = "1"
 url = "2"
 percent-encoding = "2"

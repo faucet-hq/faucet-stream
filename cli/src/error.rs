@@ -521,6 +521,12 @@ pub enum CliError {
     #[error("{differences} differing key(s) between source and destination")]
     VerifyFailed { differences: usize },
 
+    /// `faucet logs ship` left runs with undelivered lines (#806). The report
+    /// is printed by the command; the exit code is the run count (clamped to
+    /// 255).
+    #[error("{runs} run(s) still have undelivered log lines")]
+    LogsUndelivered { runs: usize },
+
     /// A data-flow policy (#702) refused the config before any data moved:
     /// `validate` / `policy` / `run` / the serve submit path print the report
     /// and `main` maps this to an exit code equal to the violation count

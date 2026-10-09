@@ -76,6 +76,7 @@ fn serve_args(
         idempotency_retention_secs: 86_400,
         log_retention_secs: 604_800,
         log_max_lines_per_run: 100_000,
+        log_buffer: Default::default(),
         // A long window so the background sweeper cannot collect a file these
         // tests are about to preview.
         local_output_retention_days: 3650,
