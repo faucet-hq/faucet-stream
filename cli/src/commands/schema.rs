@@ -40,6 +40,8 @@ pub fn schema_targets() -> Vec<&'static str> {
     targets.push("source-template");
     targets.push("sink-template");
     targets.push("deployment");
+    targets.push("template-tests");
+    targets.push("test-suite");
     #[cfg(feature = "templates")]
     targets.push("template-test");
     #[cfg(feature = "templates-sync")]
@@ -350,6 +352,14 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
             crate::hub::spec::DeploymentTemplate
         ))
         .expect("schema serialization"),
+        SchemaTarget::TemplateTests => serde_json::to_value(faucet_core::schema_for!(
+            crate::template_tests::TestBundle
+        ))
+        .expect("schema serialization"),
+        SchemaTarget::TestSuite => serde_json::to_value(faucet_core::schema_for!(
+            crate::template_tests::TestSuiteTemplate
+        ))
+        .expect("schema serialization"),
         SchemaTarget::Test => {
             let s = faucet_core::schema_for!(crate::pipeline_test::spec::TestSpecFile);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
@@ -615,6 +625,20 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
         // The target must also be discoverable from `--list`.
         assert!(super::schema_targets().contains(&"template-test"));
+    }
+
+    #[tokio::test]
+    async fn template_tests_and_test_suite_targets_render() {
+        for target in [SchemaTarget::TemplateTests, SchemaTarget::TestSuite] {
+            let r = super::run(SchemaArgs {
+                target: Some(target),
+                list: false,
+            })
+            .await;
+            assert!(r.is_ok(), "{r:?}");
+        }
+        assert!(super::schema_targets().contains(&"template-tests"));
+        assert!(super::schema_targets().contains(&"test-suite"));
     }
 
     #[tokio::test]

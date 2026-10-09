@@ -100,6 +100,8 @@ const ROUTES_TEMPLATES: &[(&str, &str)] = &[
     ("POST", "/v1/templates/{id}/rollback"),
     ("POST", "/v1/templates/{id}/deprecate"),
     ("POST", "/v1/templates/{id}/versions/{version}/deprecate"),
+    ("POST", "/v1/templates/{id}/versions/{version}/test"),
+    ("GET", "/v1/templates/{id}/versions/{version}/tests"),
 ];
 
 #[cfg(feature = "templates-sync")]

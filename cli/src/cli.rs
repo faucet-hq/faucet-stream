@@ -2854,6 +2854,10 @@ pub enum SchemaTarget {
     SinkTemplate,
     /// JSON Schema for a `kind: deployment` overlay (#679).
     Deployment,
+    /// JSON Schema for the `tests:` block a template version carries (#856).
+    TemplateTests,
+    /// JSON Schema for a shared `kind: test-suite` document (#856).
+    TestSuite,
     /// JSON Schema for a `faucet template test` suite file (#648).
     #[cfg(feature = "templates")]
     TemplateTest,

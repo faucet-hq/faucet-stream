@@ -1131,6 +1131,16 @@ mod tests {
                 "/v1/templates/{id}/versions/{version}/deprecate",
                 TemplateAdmin,
             ),
+            (
+                Method::POST,
+                "/v1/templates/{id}/versions/{version}/test",
+                TemplateAdmin,
+            ),
+            (
+                Method::GET,
+                "/v1/templates/{id}/versions/{version}/tests",
+                TemplateRead,
+            ),
             (Method::POST, "/v1/templates/sync", TemplateAdmin),
             (Method::POST, "/v1/templates/{id}/publish", TemplateAdmin),
             (Method::POST, "/v1/reload", Reload),

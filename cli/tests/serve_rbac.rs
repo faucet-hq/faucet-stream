@@ -369,6 +369,8 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
             Method::POST,
             "/v1/templates/{id}/versions/{version}/deprecate",
         ),
+        (Method::POST, "/v1/templates/{id}/versions/{version}/test"),
+        (Method::GET, "/v1/templates/{id}/versions/{version}/tests"),
     ]);
     #[cfg(feature = "templates-sync")]
     v.extend([
@@ -522,6 +524,7 @@ fn an_operator_triggers_templates_but_cannot_manage_them() {
         "/v1/templates/{id}/rollback",
         "/v1/templates/{id}/deprecate",
         "/v1/templates/{id}/versions/{version}/deprecate",
+        "/v1/templates/{id}/versions/{version}/test",
         "/v1/templates/sync",
         "/v1/templates/{id}/publish",
     ] {
