@@ -23,14 +23,24 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{KAFKA_PORT, Kafka};
 
 async fn start_kafka() -> (testcontainers::ContainerAsync<Kafka>, String) {
-    // Single-broker transactions need these replication/ISR settings at 1.
-    let container = Kafka::default()
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
-        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
-        .start()
-        .await
-        .expect("kafka container start");
+    // Four brokers start at once on a shared runner; one that exits during
+    // launch is retried rather than failing the test.
+    let mut attempt = 0;
+    let container = loop {
+        attempt += 1;
+        // Single-broker transactions need these replication/ISR settings at 1.
+        let started = Kafka::default()
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+            .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+            .start()
+            .await;
+        match started {
+            Ok(c) => break c,
+            Err(e) if attempt < 3 => eprintln!("kafka container start failed, retrying: {e}"),
+            Err(e) => panic!("kafka container start: {e:?}"),
+        }
+    };
     let port = container
         .get_host_port_ipv4(KAFKA_PORT)
         .await
