@@ -1,0 +1,57 @@
+# Read JSON Lines objects from a Google Cloud Storage prefix and publish them
+# twice: as gzip-compressed, dated JSON Lines objects in a curated GCS prefix,
+# and as a CSV file dropped on a partner's SFTP server.
+#
+#   faucet validate cli/examples/gcs_to_gcs_and_sftp.yaml
+#   faucet run      cli/examples/gcs_to_gcs_and_sftp.yaml
+#
+# Prereqs (for a real run): Application Default Credentials with read access
+# to gs://acme-raw and write access to gs://acme-curated
+# (`gcloud auth application-default login`, a workload identity, or
+# GOOGLE_APPLICATION_CREDENTIALS), and an SFTP account whose private key is
+# at ./keys/partner_ed25519.
+version: 1
+name: gcs_to_gcs_and_sftp
+
+pipeline:
+  source:
+    type: gcs
+    config:
+      bucket: acme-raw
+      prefix: events/2026/
+      auth: { type: application_default }
+      file_format: json_lines
+      concurrency: 8
+
+  sinks:
+    curated:
+      type: gcs
+      config:
+        bucket: acme-curated
+        prefix: events/
+        # One object per run and part, under a dated folder.
+        path: "dt=${now.date}/part-{part}.jsonl.gz"
+        format: json_lines
+        compression: gzip
+        auth: { type: application_default }
+        max_records_per_file: 100000
+
+    partner_drop:
+      type: sftp
+      config:
+        host: sftp.example.com
+        port: 22
+        username: acme
+        type: private_key
+        config:
+          path: ./keys/partner_ed25519
+        known_hosts: { mode: accept_new }
+        path: /inbound/events
+        file_name: "events-${now.date}.csv"
+        format: csv
+
+matrix:
+  - id: curated
+    sink: { ref: curated }
+  - id: partner_drop
+    sink: { ref: partner_drop }

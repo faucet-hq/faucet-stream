@@ -1,0 +1,44 @@
+# Run an existing Singer tap and land one of its streams as JSON Lines. faucet
+# writes `tap_config` (and `catalog`, when set) to private temp files, passes
+# them to the tap as `--config` / `--catalog`, and hands the tap the bookmark
+# it saved last time as `--state`, so a re-run resumes where the tap's last
+# STATE message left off.
+#
+#   faucet validate cli/examples/singer_to_jsonl.yaml
+#   faucet run      cli/examples/singer_to_jsonl.yaml
+#
+# Prereqs (for a real run): a Singer CSV tap on PATH as `tap-csv` (its
+# `tap_config` shape below is the tap's own, not faucet's) and
+# ./data/orders.csv.
+# `faucet serve` runs subprocess connectors only when started with
+# `--allow-subprocess-connectors`.
+version: 1
+name: singer_to_jsonl
+
+pipeline:
+  source:
+    type: singer
+    config:
+      executable: tap-csv
+      tap_config:
+        files:
+          - entity: orders
+            path: ./data/orders.csv
+            keys: [order_id]
+      # Only RECORD messages for this stream are emitted.
+      stream: orders
+      # The tap gets PATH, HOME, LANG, LC_ALL and TMPDIR only — none of
+      # faucet's own credentials.
+      inherit_env: false
+      idle_timeout_secs: 600
+      on_malformed: fail
+
+  sink:
+    type: file
+    config:
+      path: ./out/singer_orders.jsonl
+
+  state:
+    type: file
+    config:
+      path: ./.faucet-state
