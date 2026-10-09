@@ -189,7 +189,7 @@ impl LogExportView {
             LogExportStatus::Pending | LogExportStatus::Failed => {
                 let mut s = format!(
                     "logs: {} line{} pending — run \"faucet logs ship\"",
-                    crate::logship::record::group(self.pending_lines),
+                    group(self.pending_lines),
                     if self.pending_lines == 1 { "" } else { "s" }
                 );
                 if let Some(e) = &self.last_error {
@@ -212,7 +212,7 @@ pub fn group(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

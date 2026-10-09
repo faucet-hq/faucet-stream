@@ -661,11 +661,7 @@ async fn process_run(
 
     let cutoff = now - chrono::Duration::from_std(opts.max_age).unwrap_or_default();
     let mut aged = 0u64;
-    loop {
-        let lines = match spool.read_lines(id, c.offset, MAX_LINES_PER_PASS) {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    while let Ok(lines) = spool.read_lines(id, c.offset, MAX_LINES_PER_PASS) {
         let mut advanced = false;
         for (l, end) in &lines {
             let old = DateTime::parse_from_rfc3339(&l.ts)

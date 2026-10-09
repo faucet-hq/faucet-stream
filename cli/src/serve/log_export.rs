@@ -219,36 +219,56 @@ impl LogExport {
         settle: Duration,
     ) -> Result<ShipSummary, HistoryError> {
         let mut summary = ShipSummary::default();
-        if !self.configured {
+        if !self.configured || !self.exporter_ready().await {
             return Ok(summary);
         }
-        #[cfg(feature = "otel")]
-        {
-            let Some(exporter) = self.exporter().await else {
-                return Ok(summary);
-            };
-            for row in history.log_ship_rows(true).await? {
-                if !history.log_ship_claim(&row.run_id, self.lease_ttl).await? {
-                    summary.skipped += 1;
-                    continue;
-                }
-                let res = self
-                    .ship_run(history, exporter, &row, settle, &mut summary)
-                    .await;
-                if let Err(e) = history.log_ship_release(&row.run_id).await {
-                    tracing::warn!(run_id = %row.run_id, error = %e, "releasing the log-delivery lease failed");
-                }
-                res?;
+        for row in history.log_ship_rows(true).await? {
+            if !history.log_ship_claim(&row.run_id, self.lease_ttl).await? {
+                summary.skipped += 1;
+                continue;
             }
+            let res = self.ship_run(history, &row, settle, &mut summary).await;
+            if let Err(e) = history.log_ship_release(&row.run_id).await {
+                tracing::warn!(run_id = %row.run_id, error = %e, "releasing the log-delivery lease failed");
+            }
+            res?;
         }
         Ok(summary)
     }
 
-    #[cfg(feature = "otel")]
+    async fn exporter_ready(&self) -> bool {
+        #[cfg(feature = "otel")]
+        {
+            self.exporter().await.is_some()
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            false
+        }
+    }
+
+    async fn export(
+        &self,
+        run_attrs: &BTreeMap<String, String>,
+        lines: &[ShipLine],
+    ) -> Result<u64, String> {
+        #[cfg(feature = "otel")]
+        {
+            match self.exporter().await {
+                Some(e) => e.export(run_attrs, lines).await,
+                None => Err("the OTLP log exporter could not be built".into()),
+            }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            let _ = (run_attrs, lines);
+            Err("this binary was built without the `otel` feature".into())
+        }
+    }
+
     async fn ship_run(
         &self,
         history: &dyn RunHistory,
-        exporter: &crate::logship::otlp::OtlpLogExporter,
         row: &LogShipRow,
         settle: Duration,
         summary: &mut ShipSummary,
@@ -271,7 +291,7 @@ impl LogExport {
             let Some(last) = lines.last().map(|l| l.seq) else {
                 break;
             };
-            match exporter.export(&run_attrs, &lines).await {
+            match self.export(&run_attrs, &lines).await {
                 Ok(_) => {
                     metrics::shipped(lines.len() as u64);
                     summary.shipped += lines.len() as u64;
