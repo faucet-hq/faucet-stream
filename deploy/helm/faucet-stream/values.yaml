@@ -335,8 +335,9 @@ serve:
       existingSecret: ""
       existingSecretKey: FAUCET_VAULT_KEY
     # Keys from before a rotation, tried when opening credentials (never used
-    # to seal). Each is passed as --vault-previous-key=$(FAUCET_VAULT_PREVIOUS_KEY_<n>)
-    # from its Secret, so it stays out of the pod spec.
+    # to seal). Each is read from its Secret and joined into
+    # FAUCET_VAULT_PREVIOUS_KEYS, so it stays out of the pod spec and the
+    # process arguments.
     previousKeys: []
     #  - existingSecret: faucet-vault-old
     #    existingSecretKey: FAUCET_VAULT_KEY

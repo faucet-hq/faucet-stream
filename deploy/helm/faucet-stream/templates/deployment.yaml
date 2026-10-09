@@ -89,11 +89,6 @@ spec:
             - --{{ $f.flag }}={{ $f.dir }}/{{ $block.fileName }}
             {{- end }}
             {{- end }}
-            {{- if .Values.serve.tenants.enabled }}
-            {{- range $i, $_ := .Values.serve.tenants.previousKeys }}
-            - --vault-previous-key=$(FAUCET_VAULT_PREVIOUS_KEY_{{ $i }})
-            {{- end }}
-            {{- end }}
             {{- with .Values.serve.approvals.require }}
             - --require-approval={{ join "," . }}
             {{- end }}
@@ -178,6 +173,10 @@ spec:
                 secretKeyRef:
                   name: {{ $k.existingSecret }}
                   key: {{ $k.existingSecretKey | default "FAUCET_VAULT_KEY" }}
+            {{- end }}
+            {{- with .Values.serve.tenants.previousKeys }}
+            - name: FAUCET_VAULT_PREVIOUS_KEYS
+              value: {{ $refs := list }}{{ range $i, $_ := . }}{{ $refs = append $refs (printf "$(FAUCET_VAULT_PREVIOUS_KEY_%d)" $i) }}{{ end }}{{ join "," $refs | quote }}
             {{- end }}
             {{- end }}
             {{- if eq .Values.serve.auth.mode "token" }}

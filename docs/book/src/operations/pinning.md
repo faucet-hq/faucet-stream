@@ -37,8 +37,15 @@ this pipeline requires faucet >=1.13; this binary is 1.12.0
 ```
 
 A malformed requirement is a config error at validate time. Hub source and
-sink templates accept the same key, and `faucet run --source X --sink Y`
-refuses a template whose requirement the binary does not meet.
+sink templates and deployment overlays accept the same key: `faucet run
+--source X --sink Y` refuses a template whose requirement the binary does not
+meet, and so does a server triggering a registered template another (newer)
+instance registered.
+
+Matching follows Cargo's rules, with one addition for pre-release binaries: a
+pre-release counts as the newest release before it. `1.15.0-rc.1` satisfies
+`>=1.14` but not `>=1.15`, because it may lack what 1.15.0 ships; a
+requirement that names the pre-release itself (`=1.15.0-rc.1`) matches it.
 
 Binaries released before `requires_faucet` existed do not know the key. Configs
 reject unknown top-level keys, so such a binary stops with an unknown-field
@@ -51,8 +58,11 @@ added; `faucet validate` on the older release tells you whether you have to.
 ## The project pin
 
 `faucet init` also pins the exact version in the project's
-[`mise.toml`](https://mise.jdx.dev/configuration.html). mise installs faucet
-straight from the GitHub release archives, verifying their build attestations:
+[`mise.toml`](https://mise.jdx.dev/configuration.html), next to the config it
+writes. It creates the file or adds the entry to an existing one (other tools
+and comments are kept), and never replaces a faucet pin that is already there;
+`faucet init --no-pin` skips it. mise installs faucet straight from the GitHub
+release archives, verifying their build attestations:
 
 ```toml
 [tools]

@@ -15,6 +15,13 @@
         }
       ]
     },
+    "requires_faucet": {
+      "description": "The faucet versions this config is written for, as a semver\nrequirement such as `\">=1.15\"`. A binary outside the range refuses the\nconfig before reading anything else in it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "version": {
       "description": "Config-format version. Currently always `1`.",
       "type": "integer",

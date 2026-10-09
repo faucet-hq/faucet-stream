@@ -241,9 +241,8 @@ serve:
 
 The vault key reaches the pod as `FAUCET_VAULT_KEY` from your Secret and never
 sits in Helm values. Each previous key is read from its Secret into
-`FAUCET_VAULT_PREVIOUS_KEY_<n>` and passed as
-`--vault-previous-key=$(FAUCET_VAULT_PREVIOUS_KEY_<n>)`, so it stays out of the
-pod spec (it is still in the process arguments inside the pod). The render
+`FAUCET_VAULT_PREVIOUS_KEY_<n>` and joined into `FAUCET_VAULT_PREVIOUS_KEYS`, so
+it stays out of both the pod spec and the process arguments. The render
 fails when tenants are enabled without a vault key or with `memory` history
 (tenants and their sealed connections live in the run history).
 `serve.connectProviders` requires `serve.tenants`.
@@ -389,7 +388,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.preview.maxRows` | `5000` | ceiling on one preview's rows (hard cap); a larger request — including `row_count_to_load=all` — is clamped to it. `0` lifts the ceiling, letting one request read an entire output file (still bounded by a 64 MiB response budget and a 30s deadline) |
 | `serve.triggers` / `.templatesSync` / `.policy` / `.connectProviders` / `.otel` | disabled | file-backed serve features: `enabled` + one of `content` / `existingConfigMap` / `existingSecret`, and `fileName` (see [Serve features](#serve-features)) |
 | `serve.tenants.enabled` | `false` | tenants; needs `vaultKey.existingSecret` (+ `existingSecretKey`, default `FAUCET_VAULT_KEY`) and persistent history |
-| `serve.tenants.previousKeys` | `[]` | `{existingSecret, existingSecretKey}` entries → `--vault-previous-key` |
+| `serve.tenants.previousKeys` | `[]` | `{existingSecret, existingSecretKey}` entries → `FAUCET_VAULT_PREVIOUS_KEYS` |
 | `serve.approvals.require` | `[]` | change kinds needing approval: `run`, `template_register`, `template_launch` |
 | `serve.approvals.expirySecs` | `null` | `--approval-expiry-secs` (server default 86400) |
 | `serve.mcp.enabled` / `.allowMutations` | `false` / `false` | `/mcp` endpoint / its mutating tools |

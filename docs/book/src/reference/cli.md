@@ -447,6 +447,12 @@ Required fields are surfaced with a typed placeholder and a `# REQUIRED` marker;
 optional fields are commented out so connector defaults apply. The interactive
 mode (`--interactive`) is gated behind the `cli-interactive` feature.
 
+The scaffold sets `requires_faucet: ">=<major>.<minor>"` for the binary that
+wrote it, and `faucet init` pins that exact version in the `mise.toml` next to
+the output file: it creates the file, or adds the faucet entry to an existing
+one, and leaves an existing faucet pin alone. `--no-pin` skips the pin. See
+[Pinning the faucet version](../operations/pinning.md).
+
 **Singer discovery.** For the [Singer bridge](connectors.md) source, add
 `--discover --executable <tap>` to run the tap's `--discover`, write the returned
 catalog to `catalog.json`, and scaffold a config that inlines the catalog and

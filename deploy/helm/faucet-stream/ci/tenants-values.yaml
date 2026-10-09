@@ -5,7 +5,9 @@
 # expect: name: FAUCET_VAULT_PREVIOUS_KEY_0
 # expect: name: faucet-vault-old
 # expect: key: OLD_KEY
-# expect: - --vault-previous-key=$(FAUCET_VAULT_PREVIOUS_KEY_0)
+# expect: name: FAUCET_VAULT_PREVIOUS_KEYS
+# expect: value: "$(FAUCET_VAULT_PREVIOUS_KEY_0)"
+# expect-not: --vault-previous-key
 # expect: - --connect-providers=/etc/faucet-connect-providers/providers.yaml
 # expect: name: my-providers
 # expect: /v1/connect/callback is public
