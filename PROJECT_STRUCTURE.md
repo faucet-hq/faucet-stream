@@ -28,6 +28,10 @@ cli/                          — faucet-cli: `faucet` binary, YAML/JSON pipelin
   examples/                   — ready-to-run pipeline YAMLs
   tests/                      — assert_cmd + wiremock + testcontainers integration tests
 hub/                          — Template Hub: sink templates + example source templates
+skills/                       — agent skills (Claude Code / Codex plugin), versioned with faucet-cli
+  .claude-plugin/ .codex-plugin/ — plugin manifests (version = faucet-cli)
+  faucet-connector/examples/  — example connector crates (not workspace members, never published)
+.claude-plugin/ .agents/      — marketplace manifests pointing at skills/
 schemas/                      — committed JSON Schema for pipeline configs (editor validation)
 examples/                     — repo-level examples: docker-compose infra stack + run index
   orchestration/              — ELT recipe: faucet (EL) + dbt (T) + Airflow/Dagster

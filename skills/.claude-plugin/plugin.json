@@ -1,0 +1,23 @@
+{
+  "name": "faucet",
+  "description": "Skills for coding agents working with faucet-stream: write and validate pipeline configs, debug failed or slow runs, deploy faucet, migrate to it, use and publish Template Hub templates, and build connector crates. The version equals the faucet-cli release it ships with.",
+  "version": "1.13.3",
+  "author": {
+    "name": "faucet-hq",
+    "url": "https://faucet-hq.github.io"
+  },
+  "homepage": "https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills.html",
+  "repository": "https://github.com/faucet-hq/faucet-stream",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "faucet",
+    "faucet-stream",
+    "data-pipelines",
+    "etl",
+    "cdc",
+    "data-movement",
+    "rust",
+    "agent-skills"
+  ],
+  "skills": "./"
+}

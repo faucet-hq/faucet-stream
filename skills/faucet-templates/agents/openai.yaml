@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Templates"
+  short_description: "Run, write, test and publish Template Hub templates"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-templates to write a source template for this HTTP API, test it, and get it ready to publish to the Template Hub."

@@ -1,0 +1,16 @@
+{
+  "name": "faucet",
+  "owner": {
+    "name": "faucet-hq",
+    "url": "https://faucet-hq.github.io"
+  },
+  "description": "Agent skills for faucet-stream, shipped with each faucet release.",
+  "plugins": [
+    {
+      "name": "faucet",
+      "source": "./skills",
+      "description": "Write and validate faucet pipeline configs, debug runs, deploy faucet, migrate to it, use and publish Template Hub templates, and build connector crates.",
+      "category": "Developer Tools"
+    }
+  ]
+}
