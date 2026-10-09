@@ -14,7 +14,6 @@ use faucet_core::file_format::{FileFormat, FormatOptions, decode};
 use faucet_sink_sftp::{SftpSink, SftpSinkConfig, SftpSinkFormat};
 use serde_json::{Value, json};
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::io::AsyncReadExt;
 
@@ -22,17 +21,16 @@ const USER: &str = "faucet";
 const PASS: &str = "secret";
 
 async fn start_sftp_inner() -> Option<(ContainerAsync<GenericImage>, u16)> {
-    let image = GenericImage::new("atmoz/sftp", "alpine")
-        .with_exposed_port(22.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-        .with_cmd(vec![format!("{USER}:{PASS}:::data")]);
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Skipping: Docker not available ({e})");
-            return None;
-        }
-    };
+    let container = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new("atmoz/sftp", "alpine")
+                .with_exposed_port(22.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+                .with_cmd(vec![format!("{USER}:{PASS}:::data")])
+        },
+        &Default::default(),
+    )
+    .await?;
     let port = container.get_host_port_ipv4(22).await.ok()?;
     Some((container, port))
 }
@@ -155,9 +153,10 @@ async fn avro_files_round_trip() {
 /// is set — CI provides Docker, so an unavailable backend is a failure there.
 async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
     let started = start_sftp_inner().await;
-    assert!(
-        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-        "start_sftp: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
-    );
+    if started.is_none() {
+        faucet_conformance::containers::backend_missing(
+            "start_sftp: the test backend is unavailable",
+        );
+    }
     started
 }

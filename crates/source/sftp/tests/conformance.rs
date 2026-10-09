@@ -14,7 +14,6 @@ use faucet_source_sftp::{SftpSource, SftpSourceConfig};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
 };
 
 const USER: &str = "faucet";
@@ -56,17 +55,16 @@ fn conformance_connector_name_nonempty() {
 /// `upload` directory. Returns the container handle and mapped port, or `None`
 /// when Docker is unavailable so the test skips cleanly.
 async fn start_sftp_inner() -> Option<(ContainerAsync<GenericImage>, u16)> {
-    let image = GenericImage::new("atmoz/sftp", "latest")
-        .with_exposed_port(22.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-        .with_cmd(vec![format!("{USER}:{PASS}:::{UPLOAD_DIR}")]);
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Skipping: Docker not available ({e})");
-            return None;
-        }
-    };
+    let container = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new("atmoz/sftp", "latest")
+                .with_exposed_port(22.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+                .with_cmd(vec![format!("{USER}:{PASS}:::{UPLOAD_DIR}")])
+        },
+        &Default::default(),
+    )
+    .await?;
     let port = container.get_host_port_ipv4(22).await.ok()?;
     Some((container, port))
 }
@@ -158,9 +156,10 @@ async fn conformance_errors_not_panics() {
 /// is set — CI provides Docker, so an unavailable backend is a failure there.
 async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
     let started = start_sftp_inner().await;
-    assert!(
-        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-        "start_sftp: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
-    );
+    if started.is_none() {
+        faucet_conformance::containers::backend_missing(
+            "start_sftp: the test backend is unavailable",
+        );
+    }
     started
 }

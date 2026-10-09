@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::{mysql::Mysql, postgres::Postgres};
 
 fn run_args(config: PathBuf) -> faucet_cli::cli::RunArgs {
@@ -107,11 +107,8 @@ const MORE: &str = "INSERT INTO items VALUES \
 
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_second_run_reads_only_new_rows() {
-    let c: ContainerAsync<Postgres> = Postgres::default()
-        .with_tag("16-alpine")
-        .start()
-        .await
-        .unwrap();
+    let c: ContainerAsync<Postgres> =
+        faucet_conformance::containers::start(|| Postgres::default().with_tag("16-alpine")).await;
     let port = c.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -131,7 +128,7 @@ async fn postgres_second_run_reads_only_new_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_second_run_reads_only_new_rows() {
     use sqlx::Connection;
-    let c: ContainerAsync<Mysql> = Mysql::default().start().await.unwrap();
+    let c: ContainerAsync<Mysql> = faucet_conformance::containers::start(Mysql::default).await;
     let port = c.get_host_port_ipv4(3306).await.unwrap();
     let url = format!("mysql://root@127.0.0.1:{port}/test");
     let mut conn = sqlx::MySqlConnection::connect(&url).await.unwrap();

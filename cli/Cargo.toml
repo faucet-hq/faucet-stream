@@ -728,6 +728,7 @@ libc = "0.2"
 rdkafka = { workspace = true, optional = true, features = ["sasl"] }
 
 [dev-dependencies]
+faucet-conformance = { workspace = true, features = ["containers"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 # `faucet schema config` composed-schema tests (#213): validate the shipped

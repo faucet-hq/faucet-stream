@@ -7,37 +7,18 @@ use std::time::Duration;
 
 use faucet_common_oracle::OracleConnectionConfig;
 use faucet_common_oracle::oracle;
+use faucet_conformance::containers::{self, StartOptions};
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 pub const USER: &str = "FAUCET";
 pub const PASSWORD: &str = "faucet";
 
-/// A missing test backend: a skip locally, a failure when CI requires the
-/// backends (`FAUCET_REQUIRE_BACKENDS`).
-fn backend_missing(why: &str) {
-    if std::env::var("FAUCET_REQUIRE_BACKENDS").is_ok() {
-        panic!("{why} (FAUCET_REQUIRE_BACKENDS is set)");
-    }
-    eprintln!("skipping: {why}");
-}
-
-/// The Oracle Free container (a multi-GB database image) does not start on
-/// the PR runners, so a start failure is fatal only where the nightly
-/// heavy-integration job asks for it (`FAUCET_REQUIRE_ORACLE`).
-fn container_missing(why: &str) {
-    if std::env::var("FAUCET_REQUIRE_ORACLE").is_ok() {
-        panic!("{why} (FAUCET_REQUIRE_ORACLE is set)");
-    }
-    eprintln!("skipping: {why}");
-}
-
 pub fn client_available() -> bool {
     match oracle::Version::client() {
         Ok(_) => true,
         Err(e) => {
-            backend_missing(&format!(
+            containers::backend_missing(&format!(
                 "Oracle integration test: Instant Client unavailable: {e}"
             ));
             false
@@ -49,22 +30,29 @@ pub async fn start_oracle() -> Option<(ContainerAsync<GenericImage>, OracleConne
     if !client_available() {
         return None;
     }
-    let image = GenericImage::new("gvenzl/oracle-free", "23-slim")
-        .with_exposed_port(1521.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("DATABASE IS READY TO USE!"))
-        .with_env_var("ORACLE_PASSWORD", "faucetsys")
-        .with_env_var("APP_USER", USER)
-        .with_env_var("APP_USER_PASSWORD", PASSWORD)
-        .with_startup_timeout(Duration::from_secs(900));
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            container_missing(&format!(
-                "Oracle integration test: container failed to start: {e}"
-            ));
-            return None;
-        }
+    // Oracle Free starts only where it is required (the nightly job), so
+    // only there is a failed start worth another attempt.
+    let attempts = if containers::required(containers::REQUIRE_ORACLE) {
+        containers::DEFAULT_ATTEMPTS
+    } else {
+        1
     };
+    let opts = StartOptions::default()
+        .startup_timeout(Duration::from_secs(900))
+        .attempts(attempts)
+        .require_env(containers::REQUIRE_ORACLE);
+    let container = containers::start_or_skip(
+        || {
+            GenericImage::new("gvenzl/oracle-free", "23-slim")
+                .with_exposed_port(1521.tcp())
+                .with_wait_for(WaitFor::message_on_stdout("DATABASE IS READY TO USE!"))
+                .with_env_var("ORACLE_PASSWORD", "faucetsys")
+                .with_env_var("APP_USER", USER)
+                .with_env_var("APP_USER_PASSWORD", PASSWORD)
+        },
+        &opts,
+    )
+    .await?;
     let port = container
         .get_host_port_ipv4(1521)
         .await

@@ -67,6 +67,29 @@ Sinks use the value form of check 1:
 synthetic records in pages — genuinely bounded) and a `TestSink` (append or
 keyed/upsert recording sink) for use in your own tests.
 
+## Starting test containers
+
+With the `containers` feature, `faucet_conformance::containers` starts a
+`testcontainers` backend the same way in every integration test: a 180 s
+start-up budget, up to three attempts for start-up failures only (logged, with
+backoff, the failed container dropped first), an optional readiness probe
+(TCP, HTTP or a custom check) and the `FAUCET_REQUIRE_BACKENDS` rule — skip
+locally, fail where the backends are required.
+
+```toml
+[dev-dependencies]
+faucet-conformance = { version = "1", features = ["containers"] }
+```
+
+```rust,ignore
+use faucet_conformance::containers::{self, ReadyProbe, StartOptions};
+
+let opts = StartOptions::default().ready(ReadyProbe::tcp(6379));
+let Some(redis) = containers::start_or_skip(Redis::default, &opts).await else {
+    return;
+};
+```
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

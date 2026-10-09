@@ -4,7 +4,6 @@ use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, QueueDeclareOpti
 use lapin::types::FieldTable;
 use lapin::{BasicProperties, Connection, ConnectionProperties};
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
 
 pub struct Broker {
@@ -13,12 +12,12 @@ pub struct Broker {
 }
 
 pub async fn start_broker() -> Broker {
-    let container = GenericImage::new("rabbitmq", "3-management")
-        .with_exposed_port(5672.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
-        .start()
-        .await
-        .expect("rabbitmq container start");
+    let container = faucet_conformance::containers::start(|| {
+        GenericImage::new("rabbitmq", "3-management")
+            .with_exposed_port(5672.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
+    })
+    .await;
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5672).await.expect("port");
     let url = format!("amqp://guest:guest@{host}:{port}/%2f");

@@ -13,7 +13,6 @@
 //! Import notes for testcontainers-modules 0.15:
 //! - `Kafka` lives at `testcontainers_modules::kafka::apache::Kafka`
 //! - The port constant is `testcontainers_modules::kafka::apache::KAFKA_PORT`
-//! - `AsyncRunner` is at `testcontainers::runners::AsyncRunner`
 
 use faucet_common_kafka::{KafkaAuth, KafkaValueFormat, OnDecodeError};
 use faucet_conformance::{
@@ -24,7 +23,6 @@ use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{KAFKA_PORT, Kafka};
 
 // ── Check 1: config schema ──────────────────────────────────────────────────
@@ -38,10 +36,7 @@ fn conformance_config_schema_valid() {
 // ── Check 2: bounded-memory streaming (Docker) ──────────────────────────────
 
 async fn start_kafka() -> (testcontainers::ContainerAsync<Kafka>, String) {
-    let container = Kafka::default()
-        .start()
-        .await
-        .expect("kafka container start");
+    let container = faucet_conformance::containers::start(Kafka::default).await;
     let port = container
         .get_host_port_ipv4(KAFKA_PORT)
         .await

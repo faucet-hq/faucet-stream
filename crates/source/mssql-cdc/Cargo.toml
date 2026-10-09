@@ -27,7 +27,7 @@ async-stream.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 serde_json.workspace = true
 schemars.workspace = true

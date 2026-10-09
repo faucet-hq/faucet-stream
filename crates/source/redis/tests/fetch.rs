@@ -12,16 +12,14 @@ use faucet_core::Source;
 use faucet_source_redis::{RedisSource, RedisSourceConfig, RedisSourceType};
 use redis::AsyncCommands;
 use std::collections::HashMap;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::redis::{REDIS_PORT, Redis};
 
 /// Start a Redis container and return both the container handle and a
 /// connection URL. The container is kept alive by the returned handle.
 async fn start_redis() -> (ContainerAsync<Redis>, String) {
-    let container: ContainerAsync<Redis> = Redis::default()
-        .start()
-        .await
-        .expect("redis container start");
+    let container: ContainerAsync<Redis> =
+        faucet_conformance::containers::start(Redis::default).await;
     let host = container.get_host().await.expect("redis host");
     let port = container
         .get_host_port_ipv4(REDIS_PORT)

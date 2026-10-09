@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::mysql::Mysql;
 
 /// Bounds concurrent MySQL container startups across all tests in this binary.
@@ -62,18 +62,16 @@ async fn start_mysql_cdc_tagged(tag: &str) -> (ContainerAsync<Mysql>, String) {
         .await
         .expect("startup semaphore closed");
 
-    let container = Mysql::default()
-        .with_tag(tag)
-        .with_cmd([
+    let container = faucet_conformance::containers::start(|| {
+        Mysql::default().with_tag(tag).with_cmd([
             "--server-id=1",
             "--log-bin=mysql-bin",
             "--binlog-format=ROW",
             "--binlog-row-image=FULL",
             "--binlog-row-metadata=FULL",
         ])
-        .start()
-        .await
-        .expect("mysql CDC container start");
+    })
+    .await;
 
     let port = container
         .get_host_port_ipv4(3306)
@@ -309,11 +307,12 @@ async fn check_reports_binlog_config_failure_when_row_metadata_minimal() {
         .acquire()
         .await
         .expect("startup semaphore closed");
-    let container = Mysql::default()
-        .with_cmd(["--server-id=1", "--log-bin=mysql-bin"]) // no row-metadata=FULL
-        .start()
-        .await
-        .expect("mysql start");
+    let container = faucet_conformance::containers::start(|| {
+        Mysql::default()
+            // no row-metadata=FULL
+            .with_cmd(["--server-id=1", "--log-bin=mysql-bin"])
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(3306)
         .await

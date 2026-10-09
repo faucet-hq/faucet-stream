@@ -14,7 +14,7 @@ use faucet_sink_parquet::{
 };
 use faucet_sink_s3::{S3Sink, S3SinkConfig, S3SinkFormat};
 use serde_json::{Value, json};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 
 const ACCESS_KEY: &str = "minioadmin";
@@ -23,15 +23,15 @@ const REGION: &str = "us-east-1";
 const BUCKET: &str = "faucet-parquet-parity";
 
 async fn start() -> (ContainerAsync<MinIO>, String, Client) {
-    let container = MinIO::default()
-        // tmpfs: MinIO refuses writes when the runner disk is nearly full.
-        .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
-        .with_name("cgr.dev/chainguard/minio")
-        .with_tag("latest")
-        .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
-        .start()
-        .await
-        .expect("minio container start");
+    let container = faucet_conformance::containers::start(|| {
+        MinIO::default()
+            // tmpfs: MinIO refuses writes when the runner disk is nearly full.
+            .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
+            .with_name("cgr.dev/chainguard/minio")
+            .with_tag("latest")
+            .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(9000)
         .await

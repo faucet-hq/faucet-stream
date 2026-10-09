@@ -16,13 +16,14 @@ use faucet_source_pubsub::{
 use gcloud_pubsub::client::{Client, ClientConfig};
 use testcontainers_modules::google_cloud_sdk_emulators::{CloudSdk, PUBSUB_PORT};
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const PROJECT: &str = "faucet-test";
 
 /// Start the Pub/Sub emulator, or `None` when Docker is unavailable.
 async fn start_emulator() -> Option<(ContainerAsync<CloudSdk>, String)> {
-    let container = CloudSdk::pubsub().start().await.ok()?;
+    let container =
+        faucet_conformance::containers::start_or_skip(CloudSdk::pubsub, &Default::default())
+            .await?;
     let port = container.get_host_port_ipv4(PUBSUB_PORT).await.ok()?;
     Some((container, format!("127.0.0.1:{port}")))
 }

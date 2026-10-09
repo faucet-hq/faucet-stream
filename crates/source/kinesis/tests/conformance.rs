@@ -15,7 +15,7 @@ use faucet_conformance::{
     assert_bookmark_roundtrip, assert_config_schema_valid_value, assert_errors_not_panics,
 };
 use faucet_source_kinesis::{KinesisCredentials, KinesisSource, KinesisSourceConfig};
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::localstack::LocalStack;
 
 // ── Check 1: config schema ──────────────────────────────────────────────────
@@ -31,8 +31,10 @@ fn conformance_config_schema_valid() {
 /// Start LocalStack with the kinesis service and return (container, endpoint).
 async fn start_localstack() -> (ContainerAsync<LocalStack>, String) {
     use testcontainers::ImageExt;
-    let image = LocalStack::default().with_env_var("SERVICES", "kinesis");
-    let container = image.start().await.expect("localstack start");
+    let container = faucet_conformance::containers::start(|| {
+        LocalStack::default().with_env_var("SERVICES", "kinesis")
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(4566)
         .await

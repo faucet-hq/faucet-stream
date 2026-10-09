@@ -20,14 +20,11 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Headers as _;
 use rdkafka::{ClientConfig, Message};
 use serde_json::json;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::kafka::apache::{KAFKA_PORT, Kafka};
 
 async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
-    let container = Kafka::default()
-        .start()
-        .await
-        .expect("kafka container start");
+    let container = faucet_conformance::containers::start(Kafka::default).await;
     let port = container
         .get_host_port_ipv4(KAFKA_PORT)
         .await

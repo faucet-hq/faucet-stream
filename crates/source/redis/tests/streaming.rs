@@ -10,7 +10,7 @@ use futures::StreamExt;
 use redis::AsyncCommands;
 use std::collections::HashMap;
 use std::time::Instant;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::redis::{REDIS_PORT, Redis};
 
 /// Start a Redis container and return both the container handle and a
@@ -19,10 +19,8 @@ use testcontainers_modules::redis::{REDIS_PORT, Redis};
 /// (including ones inside `RedisSource::stream_pages`) don't race the
 /// testcontainers wait-for-log-line with the docker port forwarder.
 async fn start_redis() -> (ContainerAsync<Redis>, String) {
-    let container: ContainerAsync<Redis> = Redis::default()
-        .start()
-        .await
-        .expect("redis container start");
+    let container: ContainerAsync<Redis> =
+        faucet_conformance::containers::start(Redis::default).await;
     let host = container.get_host().await.expect("redis host");
     let port = container
         .get_host_port_ipv4(REDIS_PORT)

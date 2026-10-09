@@ -440,11 +440,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn both_connection_kinds_carry_pipelines_and_report_their_database() {
         use redis::aio::ConnectionLike as _;
-        use testcontainers::runners::AsyncRunner as _;
-        let container = testcontainers_modules::redis::Redis::default()
-            .start()
-            .await
-            .expect("redis container start");
+        let container =
+            faucet_conformance::containers::start(testcontainers_modules::redis::Redis::default)
+                .await;
         let port = container.get_host_port_ipv4(6379).await.expect("port");
         let client = redis::Client::open(format!("redis://127.0.0.1:{port}/0")).unwrap();
         let mut shared = None;

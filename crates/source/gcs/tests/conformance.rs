@@ -13,7 +13,6 @@ use faucet_source_gcs::{GcsCredentials, GcsSource, GcsSourceConfig};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
 };
 
 // ── Check 1: config schema ──────────────────────────────────────────────────
@@ -41,20 +40,22 @@ async fn conformance_connector_name_nonempty() {
 /// Spawn `fake-gcs-server` and return `(host_url, bucket_name)`.
 /// Returns `None` when Docker is unavailable so tests skip cleanly.
 async fn spawn_fake_gcs_inner() -> Option<(ContainerAsync<GenericImage>, String, String)> {
-    let image = GenericImage::new("fsouza/fake-gcs-server", "latest")
-        .with_exposed_port(4443.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("server started at"))
-        .with_cmd(vec![
-            "-scheme=http".to_string(),
-            "-public-host=0.0.0.0:4443".to_string(),
-        ]);
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Skipping: Docker not available ({e})");
-            return None;
-        }
-    };
+    let container = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new("fsouza/fake-gcs-server", "latest")
+                .with_exposed_port(4443.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("server started at"))
+                .with_cmd(vec![
+                    "-scheme=http".to_string(),
+                    "-public-host=0.0.0.0:4443".to_string(),
+                ])
+                .with_mount(testcontainers::core::Mount::tmpfs_mount("/storage"))
+        },
+        &faucet_conformance::containers::StartOptions::default().ready(
+            faucet_conformance::containers::ReadyProbe::http(4443, "/storage/v1/b"),
+        ),
+    )
+    .await?;
     let port = container.get_host_port_ipv4(4443).await.ok()?;
     let host = format!("http://127.0.0.1:{port}");
     let bucket = "faucet-conformance".to_string();
@@ -219,9 +220,10 @@ async fn conformance_errors_not_panics() {
 /// is set — CI provides Docker, so an unavailable backend is a failure there.
 async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {
     let started = spawn_fake_gcs_inner().await;
-    assert!(
-        started.is_some() || std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-        "spawn_fake_gcs: the test backend is unavailable and FAUCET_REQUIRE_BACKENDS is set"
-    );
+    if started.is_none() {
+        faucet_conformance::containers::backend_missing(
+            "spawn_fake_gcs: the test backend is unavailable",
+        );
+    }
     started
 }

@@ -12,7 +12,7 @@
 use faucet_core::Source;
 use faucet_source_postgres_cdc::{PostgresCdcSource, PostgresCdcSourceConfig};
 use std::time::Duration;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::NoTls;
 
@@ -30,20 +30,21 @@ async fn start_postgres() -> (ContainerAsync<Postgres>, String) {
     // `with_host_auth()` must be called before `with_tag()` because
     // `with_host_auth` is defined on `Postgres` and `with_tag` converts it
     // into a `ContainerRequest<Postgres>` (testcontainers extension trait).
-    let image = Postgres::default()
-        .with_host_auth()
-        .with_tag("16-alpine")
-        .with_cmd([
-            "postgres",
-            "-c",
-            "wal_level=logical",
-            "-c",
-            "max_wal_senders=4",
-            "-c",
-            "max_replication_slots=4",
-        ]);
-    let container: ContainerAsync<Postgres> =
-        image.start().await.expect("postgres container start");
+    let container: ContainerAsync<Postgres> = faucet_conformance::containers::start(|| {
+        Postgres::default()
+            .with_host_auth()
+            .with_tag("16-alpine")
+            .with_cmd([
+                "postgres",
+                "-c",
+                "wal_level=logical",
+                "-c",
+                "max_wal_senders=4",
+                "-c",
+                "max_replication_slots=4",
+            ])
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(5432)
         .await

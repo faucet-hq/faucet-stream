@@ -22,7 +22,6 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::{Value, json};
 use testcontainers_modules::azurite::{Azurite, BLOB_PORT};
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const AZURITE_ACCOUNT: &str = "devstoreaccount1";
 const AZURITE_KEY: &str =
@@ -34,10 +33,23 @@ const CONTAINER: &str = "faucet-multipart";
 const RECORDS: usize = 16_000;
 
 async fn start_azurite() -> (ContainerAsync<Azurite>, u16) {
-    let container = Azurite::default()
-        .start()
-        .await
-        .expect("start azurite container");
+    let container = faucet_conformance::containers::start(|| {
+        // In-memory storage: a nearly full runner disk must not fail the emulator.
+        testcontainers::ImageExt::with_cmd(
+            Azurite::default(),
+            [
+                "azurite",
+                "--blobHost",
+                "0.0.0.0",
+                "--queueHost",
+                "0.0.0.0",
+                "--tableHost",
+                "0.0.0.0",
+                "--inMemoryPersistence",
+            ],
+        )
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(BLOB_PORT)
         .await

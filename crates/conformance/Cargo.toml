@@ -21,9 +21,15 @@ futures-core.workspace = true
 # backpressure arm of the reliability suites), which needs an async sleep in
 # non-test code. `time` only — this crate spawns no runtime of its own.
 tokio = { workspace = true, features = ["time"] }
+testcontainers = { version = "0.27", optional = true }
+
+[features]
+# The shared container start helper (#841) for connector integration tests;
+# off by default so the conformance battery pulls no Docker client.
+containers = ["dep:testcontainers", "tokio/net", "tokio/io-util"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 # The shared file-format layer (#604) is the one "connector" every file source
 # and sink shares, so its typed fidelity is asserted here against the same
 # corpus each connector pair uses.

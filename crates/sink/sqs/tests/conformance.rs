@@ -13,7 +13,7 @@
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::Sink;
 use faucet_sink_sqs::{SqsCredentials, SqsSink, SqsSinkConfig};
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::localstack::LocalStack;
 
 #[test]
@@ -26,8 +26,10 @@ fn conformance_config_schema_valid() {
 
 async fn start_localstack() -> (ContainerAsync<LocalStack>, String) {
     use testcontainers::ImageExt;
-    let image = LocalStack::default().with_env_var("SERVICES", "sqs");
-    let container = image.start().await.expect("localstack start");
+    let container = faucet_conformance::containers::start(|| {
+        LocalStack::default().with_env_var("SERVICES", "sqs")
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(4566)
         .await

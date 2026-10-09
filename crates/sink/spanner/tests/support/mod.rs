@@ -11,7 +11,6 @@ use gcloud_googleapis::spanner::admin::database::v1::CreateDatabaseRequest;
 use gcloud_googleapis::spanner::admin::instance::v1::{CreateInstanceRequest, Instance};
 use gcloud_spanner::statement::Statement;
 use testcontainers::core::ContainerPort;
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
 use tokio::sync::OnceCell;
 
@@ -24,9 +23,11 @@ static EMULATOR: OnceCell<(ContainerAsync<GenericImage>, String)> = OnceCell::co
 pub async fn emulator_host() -> String {
     let (_container, host) = EMULATOR
         .get_or_init(|| async {
-            let image = GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "latest")
-                .with_exposed_port(ContainerPort::Tcp(9010));
-            let container = image.start().await.expect("spanner emulator start");
+            let container = faucet_conformance::containers::start(|| {
+                GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "latest")
+                    .with_exposed_port(ContainerPort::Tcp(9010))
+            })
+            .await;
             let port = container
                 .get_host_port_ipv4(9010)
                 .await

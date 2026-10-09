@@ -25,7 +25,7 @@ base64.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["mysql"] }
