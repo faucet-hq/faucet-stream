@@ -414,7 +414,7 @@ flate2 = "1"
 zstd = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 glob = "0.3"
-duckdb = "1.10503"
+duckdb = "1.10506"
 # WebAssembly runtime for the `wasm` transform (issue #124). Lean embedding:
 # JIT via Cranelift + the runtime, on std platforms (native signal traps). We
 # drive core-wasm modules only — no component model, async, cache, or GC.
