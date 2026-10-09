@@ -1,0 +1,10 @@
+# File from an existing Secret: no chart ConfigMap is rendered for it.
+# expect: - --policy=/etc/faucet-policy/eu-pii.yaml
+# expect: secretName: my-policy
+# expect: mountPath: /etc/faucet-policy
+# expect-not: t-faucet-stream-serve-policy
+serve:
+  policy:
+    enabled: true
+    existingSecret: my-policy
+    fileName: eu-pii.yaml

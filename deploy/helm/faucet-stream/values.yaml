@@ -92,6 +92,17 @@ extraInitContainers: []
 #    image: my/secrets-fetcher:tag
 #    volumeMounts: [{ name: secret-files, mountPath: /var/run/secrets/faucet }]
 
+# Extra volumes and mounts (verbatim k8s specs) added to every faucet pod —
+# serve Deployment, Job and CronJob — e.g. a CSI secrets-store volume, a shared
+# emptyDir an extraInitContainer fills, or a CA bundle.
+extraVolumes: []
+#  - name: ca-bundle
+#    configMap: { name: corp-ca }
+extraVolumeMounts: []
+#  - name: ca-bundle
+#    mountPath: /etc/ssl/corp
+#    readOnly: true
+
 # -----------------------------------------------------------------------------
 # Pipeline config (a `faucet` YAML/JSON). Mounted read-only at
 # pipelineConfig.mountPath. Used by Job/CronJob, and optionally as the serve
@@ -242,6 +253,110 @@ serve:
   cluster:
     enabled: false
 
+  # ---------------------------------------------------------------------------
+  # File-backed serve features. Each block takes the file from exactly one of:
+  #   content            — inline (a YAML string, or a mapping rendered as YAML)
+  #                        → a chart-managed ConfigMap
+  #   existingConfigMap  — your ConfigMap holding `fileName`
+  #   existingSecret     — your Secret holding `fileName` (for a file that
+  #                        carries credentials; or use ${env:VAR} inside it)
+  # and is mounted read-only at /etc/faucet-<feature>/<fileName>, with the
+  # matching `faucet serve` flag pointing at it. Every one needs an image built
+  # with that feature — the published `full` image has all of them.
+  # ---------------------------------------------------------------------------
+
+  # Event-driven triggers (#196): --triggers. Image feature `triggers`
+  # (+ `triggers-object-store` / `triggers-redis` / `triggers-kafka`). A
+  # trigger's relative `config:` path resolves against /etc/faucet-triggers/;
+  # use an absolute path (e.g. the pipelineConfig mount), an inline config, or
+  # a registered `template:`.
+  triggers:
+    enabled: false
+    content: null
+    existingConfigMap: ""
+    existingSecret: ""
+    fileName: triggers.yaml
+
+  # Template hosting + sync (#589): --templates-sync. Image feature
+  # `templates-sync` (+ `templates-sync-object-store` for S3/GCS/Azure). Pair
+  # it with a persistent history backend: with `memory` the registry, versions
+  # and launches are lost on every restart.
+  templatesSync:
+    enabled: false
+    content: null
+    existingConfigMap: ""
+    existingSecret: ""
+    fileName: sync.yaml
+
+  # Data-flow policy (#702): --policy. Every submission is checked against it.
+  # Image feature `policy`.
+  policy:
+    enabled: false
+    content: null
+    existingConfigMap: ""
+    existingSecret: ""
+    fileName: policy.yaml
+
+  # Hosted OAuth connect providers (#709): --connect-providers. Requires
+  # tenants.enabled (connections are sealed with the vault key). Keep client
+  # secrets out of the file with `client_secret: ${env:CRM_CLIENT_SECRET}` and
+  # an env / envFrom Secret. Register <redirect_base>/v1/connect/callback with
+  # each provider; that route is public (see ingress below).
+  connectProviders:
+    enabled: false
+    content: null
+    existingConfigMap: ""
+    existingSecret: ""
+    fileName: providers.yaml
+
+  # OTLP export for the server (traces of every run and request; with
+  # `export: [metrics]` the /metrics series too): --otel-config. The file is a
+  # pipeline config's `observability.otel` block on its own. Image feature
+  # `otel`. It replaces the server file otel.logs renders, so with
+  # otel.logs.enabled list `logs` in its `export` (the chart refuses inline
+  # content that would silently stop log shipping).
+  otel:
+    enabled: false
+    content: null
+    #   endpoint: http://otel-collector:4318
+    #   protocol: http
+    #   export: [traces, metrics]
+    existingConfigMap: ""
+    existingSecret: ""
+    fileName: otel.yaml
+
+  # Multi-tenant embedded integrations (#709). Image feature `tenants`. The
+  # vault key seals tenant connection credentials at rest (at least 32 bytes of
+  # random key material); it reaches the pod as FAUCET_VAULT_KEY from your
+  # Secret, never from values. Needs a persistent history backend.
+  tenants:
+    enabled: false
+    vaultKey:
+      existingSecret: ""
+      existingSecretKey: FAUCET_VAULT_KEY
+    # Keys from before a rotation, tried when opening credentials (never used
+    # to seal). Each is passed as --vault-previous-key=$(FAUCET_VAULT_PREVIOUS_KEY_<n>)
+    # from its Secret, so it stays out of the pod spec.
+    previousKeys: []
+    #  - existingSecret: faucet-vault-old
+    #    existingSecretKey: FAUCET_VAULT_KEY
+
+  # Change requests (#703): actions that need an approved change request first.
+  # Kinds: run, template_register, template_launch → --require-approval.
+  # Who may approve is the `approvals:` block of the RBAC auth config
+  # (auth.rbacConfig). template_* cannot be combined with templatesSync.
+  approvals:
+    require: []
+    # Seconds a pending change request stays approvable (--approval-expiry-secs);
+    # null keeps the server default (86400).
+    expirySecs: null
+
+  # MCP endpoint at /mcp (--mcp); allowMutations adds the mutating tools
+  # (--mcp-allow-mutations). Image feature `mcp`. Inherits serve auth + RBAC.
+  mcp:
+    enabled: false
+    allowMutations: false
+
   # Extra raw args appended to `faucet serve`.
   extraArgs: []
   # - --cors-origin=https://app.example.com
@@ -311,10 +426,27 @@ service:
   port: 8080
   annotations: {}
 
+# Routes worth knowing when you put serve behind an Ingress:
+# - GET /v1/runs/{id}/logs is a Server-Sent Events stream (and /mcp is
+#   long-lived): the proxy must not buffer it and must allow long idle reads.
+#   `streamingAnnotations` does that for ingress-nginx; set the equivalent for
+#   your controller (on an AWS ALB raise the idle timeout), or set it to {} to
+#   drop them.
+# - GET /v1/connect/callback (tenants + connectProviders) is PUBLIC by design:
+#   the OAuth provider redirects the user's browser there and the single-use
+#   `state` is the credential. It must be reachable from browsers at the
+#   providers' `redirect_base`.
+# - POST|PUT /v1/triggers/{name} (webhook triggers) is bearer-authenticated
+#   like every /v1 route: the calling system must send a token.
 ingress:
   enabled: false
   className: ""
   annotations: {}
+  # Merged under `annotations` (a key you set in `annotations` wins).
+  streamingAnnotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   hosts:
     - host: faucet.example.com
       paths:

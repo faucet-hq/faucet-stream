@@ -1,0 +1,10 @@
+# Streaming annotations are on by default; a key set in `annotations` wins.
+# expect: nginx.ingress.kubernetes.io/proxy-buffering: "off"
+# expect: nginx.ingress.kubernetes.io/proxy-read-timeout: "7200"
+# expect: nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+# expect: cert-manager.io/cluster-issuer: letsencrypt
+ingress:
+  enabled: true
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "7200"

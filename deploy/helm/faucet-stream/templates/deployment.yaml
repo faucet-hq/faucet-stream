@@ -1,5 +1,7 @@
 {{- if .Values.serve.enabled -}}
 {{- $mountPath := .Values.serve.persistence.mountPath | trimSuffix "/" -}}
+{{- $features := include "faucet-stream.serveFileFeatures" . | fromYaml -}}
+{{- $serveFiles := include (print $.Template.BasePath "/configmap-serve-files.yaml") . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,6 +28,9 @@ spec:
       annotations:
         {{- if .Values.pipelineConfig.create }}
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if trim $serveFiles }}
+        checksum/serve-files: {{ $serveFiles | sha256sum }}
         {{- end }}
         {{- if .Values.secret.create }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret-env.yaml") . | sha256sum }}
@@ -78,6 +83,29 @@ spec:
             {{- if .Values.pipelineConfig.create }}
             - --default-config={{ include "faucet-stream.configFilePath" . }}
             {{- end }}
+            {{- range $key, $f := $features }}
+            {{- $block := index $.Values.serve $key }}
+            {{- if $block.enabled }}
+            - --{{ $f.flag }}={{ $f.dir }}/{{ $block.fileName }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.serve.tenants.enabled }}
+            {{- range $i, $_ := .Values.serve.tenants.previousKeys }}
+            - --vault-previous-key=$(FAUCET_VAULT_PREVIOUS_KEY_{{ $i }})
+            {{- end }}
+            {{- end }}
+            {{- with .Values.serve.approvals.require }}
+            - --require-approval={{ join "," . }}
+            {{- end }}
+            {{- with .Values.serve.approvals.expirySecs }}
+            - --approval-expiry-secs={{ int64 . }}
+            {{- end }}
+            {{- if .Values.serve.mcp.enabled }}
+            - --mcp
+            {{- if .Values.serve.mcp.allowMutations }}
+            - --mcp-allow-mutations
+            {{- end }}
+            {{- end }}
             {{- with .Values.serve.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -123,17 +151,33 @@ spec:
             {{- end }}
             {{- if .Values.otel.logs.enabled }}
             # Log shipping over OTLP (#806).
+            {{- if not .Values.serve.otel.enabled }}
             - name: FAUCET_SERVE_OTEL_CONFIG
               value: /etc/faucet-otel/otel.yaml
+            {{- end }}
             - name: FAUCET_SERVE_LOG_RETENTION_SECS
-              value: {{ .Values.otel.logs.retentionSeconds | quote }}
+              value: {{ .Values.otel.logs.retentionSeconds | int64 | quote }}
             - name: FAUCET_SERVE_LOG_BUFFER_MAX_AGE_SECS
-              value: {{ .Values.otel.logs.maxAgeSeconds | quote }}
+              value: {{ .Values.otel.logs.maxAgeSeconds | int64 | quote }}
             - name: FAUCET_SERVE_LOG_BUFFER_MAX_BYTES
-              value: {{ .Values.otel.logs.maxBytes | quote }}
+              value: {{ .Values.otel.logs.maxBytes | int64 | quote }}
             {{- with .Values.otel.logs.linkTemplate }}
             - name: FAUCET_SERVE_LOG_LINK_TEMPLATE
               value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.serve.tenants.enabled }}
+            - name: FAUCET_VAULT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.serve.tenants.vaultKey.existingSecret }}
+                  key: {{ .Values.serve.tenants.vaultKey.existingSecretKey }}
+            {{- range $i, $k := .Values.serve.tenants.previousKeys }}
+            - name: FAUCET_VAULT_PREVIOUS_KEY_{{ $i }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $k.existingSecret }}
+                  key: {{ $k.existingSecretKey | default "FAUCET_VAULT_KEY" }}
             {{- end }}
             {{- end }}
             {{- if eq .Values.serve.auth.mode "token" }}
@@ -172,16 +216,24 @@ spec:
               mountPath: /etc/faucet-auth
               readOnly: true
             {{- end }}
-            {{- if .Values.otel.logs.enabled }}
+            {{- if and .Values.otel.logs.enabled (not .Values.serve.otel.enabled) }}
             - name: otel-config
               mountPath: /etc/faucet-otel
               readOnly: true
+            {{- end }}
+            {{- range $key, $f := $features }}
+            {{- if (index $.Values.serve $key).enabled }}
+            - name: {{ $f.volume }}
+              mountPath: {{ $f.dir }}
+              readOnly: true
+            {{- end }}
             {{- end }}
             {{- if .Values.secretFiles.enabled }}
             - name: secret-files
               mountPath: {{ .Values.secretFiles.mountPath }}
               readOnly: true
             {{- end }}
+            {{- with include "faucet-stream.extraVolumeMounts" . | trim }}{{ . | nindent 12 }}{{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -198,10 +250,23 @@ spec:
           configMap:
             name: {{ include "faucet-stream.configMapName" . }}
         {{- end }}
-        {{- if .Values.otel.logs.enabled }}
+        {{- if and .Values.otel.logs.enabled (not .Values.serve.otel.enabled) }}
         - name: otel-config
           configMap:
             name: {{ include "faucet-stream.fullname" . }}-otel
+        {{- end }}
+        {{- range $key, $f := $features }}
+        {{- $block := index $.Values.serve $key }}
+        {{- if $block.enabled }}
+        - name: {{ $f.volume }}
+          {{- if $block.existingSecret }}
+          secret:
+            secretName: {{ $block.existingSecret }}
+          {{- else }}
+          configMap:
+            name: {{ $block.existingConfigMap | default (include "faucet-stream.serveFileConfigMapName" (dict "root" $ "volume" $f.volume)) }}
+          {{- end }}
+        {{- end }}
         {{- end }}
         {{- if eq .Values.serve.auth.mode "rbac" }}
         - name: rbac-auth
@@ -213,6 +278,7 @@ spec:
           secret:
             secretName: {{ .Values.secretFiles.existingSecret | default (include "faucet-stream.envSecretName" .) }}
         {{- end }}
+        {{- with include "faucet-stream.extraVolumes" . | trim }}{{ . | nindent 8 }}{{- end }}
       {{- with .Values.serve.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

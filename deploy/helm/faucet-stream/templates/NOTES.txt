@@ -36,6 +36,29 @@ Auth: RBAC. Principals are defined in the mounted auth config.
 
 Web console: open http://localhost:{{ .Values.service.port }}/ after port-forwarding.
 {{- end }}
+{{- if .Values.serve.mcp.enabled }}
+
+MCP endpoint: /mcp ({{ if .Values.serve.mcp.allowMutations }}read + mutating tools{{ else }}read-only tools{{ end }}; same bearer auth / RBAC as /v1).
+{{- end }}
+{{- if .Values.serve.connectProviders.enabled }}
+
+Hosted OAuth connect: GET /v1/connect/callback is public by design and must be
+reachable from your users' browsers at each provider's `redirect_base`.
+{{- end }}
+{{- if and .Values.serve.templatesSync.enabled (eq .Values.serve.history.backend "memory") }}
+
+WARNING: serve.templatesSync is on with serve.history.backend=memory. Synced
+templates, their versions and launches live in the run history, so every pod
+restart starts the registry from scratch (each template re-registers as
+version 1 and `stable` follows only the sidecars again). Use sqlite (with
+serve.persistence) or postgres to keep them.
+{{- end }}
+{{- if and .Values.serve.triggers.enabled (eq .Values.serve.history.backend "memory") }}
+
+Note: serve.triggers runs with serve.history.backend=memory, so trigger
+idempotency keys are forgotten on restart (an object_arrival trigger with
+start_at: beginning re-fires for objects it already loaded).
+{{- end }}
 {{- end }}
 
 {{ if .Values.cronjob.enabled -}}

@@ -1,0 +1,6 @@
+# expect-error: serve.tenants.enabled=true requires serve.tenants.vaultKey.existingSecret
+serve:
+  history:
+    backend: sqlite
+  tenants:
+    enabled: true
