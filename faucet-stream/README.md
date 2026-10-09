@@ -130,7 +130,7 @@ Transforms reshape records mid-pipeline. Enabling `source-rest` (the default) al
 |---------|-------------|
 | `transform-flatten` | Flatten nested objects |
 | `transform-rename-keys` | Regex key renaming |
-| `transform-keys-case` | Re-case every key (snake / camel / pascal / kebab / screaming_snake) |
+| `transform-keys-case` | Re-case every key (snake / camel / pascal / kebab / screaming_snake / dot) |
 | `transform-select` | Keep only listed top-level fields |
 | `transform-drop` | Remove listed top-level fields |
 | `transform-set` | Add/overwrite top-level fields with constants |
