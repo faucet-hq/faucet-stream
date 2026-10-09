@@ -26,9 +26,11 @@ path = "src/main.rs"
 # take everything with `--features full`.
 default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "policy", "cli-progress", "hub-remote", "google-sa", "file-format-csv", "file-format-parquet"]
 
-# Everything the default build ships, plus the long-running runtime modes:
-# `schedule` (cron scheduler) and `serve` (HTTP control plane).
-full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "tenants", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-oracle", "source-oracle-cdc", "sink-oracle", "source-rest-excel", "source-xml-excel", "file-formats"]
+# Every feature in this manifest: the default build plus every runtime mode,
+# transform, secrets resolver and catalog option. The container image's
+# complete build is exactly this set; `scripts/full-feature-coverage.py`
+# fails CI when a new feature is left out.
+full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "templates-sync", "templates-sync-object-store", "tenants", "cli-dev", "cli-interactive", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-oracle", "source-oracle-cdc", "sink-oracle", "source-rest-excel", "source-xml-excel", "file-formats", "secrets", "kafka-schema-registry", "quality-jsonschema", "arrow", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql"]
 
 # Remote Template Hub catalogs (#677): `--hub github:owner/repo[@ref][/path]`
 # fetches a catalog through the GitHub contents API and caches it locally;

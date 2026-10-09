@@ -13,13 +13,18 @@
 #   -k, --sinks <list>     Comma-separated sink short names   (e.g. bigquery,jsonl)
 #   -f, --features <list>  Raw cargo feature list (overrides -s/-k entirely)
 #   -e, --extras <list>    Non-connector features for a selective build
+#       --oracle           Add Oracle Instant Client (the Oracle connectors'
+#                          runtime library, ~40 MiB compressed)
 #       --push             docker push after a successful build
 #       --platform <p>     Buildx platform(s), e.g. linux/amd64,linux/arm64
 #   -h, --help             Show this help
 #
 # Examples:
-#   # Complete image (all connectors + serve):
+#   # Complete image (every connector and every feature):
 #   scripts/build-image.sh -t ghcr.io/you/faucet:full
+#
+#   # …with the Oracle client for the Oracle connectors:
+#   scripts/build-image.sh -t ghcr.io/you/faucet:full-oracle --oracle
 #
 #   # Lean "analytics" profile:
 #   scripts/build-image.sh -t ghcr.io/you/faucet:analytics \
@@ -34,6 +39,7 @@ FEATURES=""
 EXTRAS=""
 PUSH=0
 PLATFORM=""
+ORACLE=false
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -46,6 +52,7 @@ while [ $# -gt 0 ]; do
     -k|--sinks)    SINKS="$2"; shift 2 ;;
     -f|--features) FEATURES="$2"; shift 2 ;;
     -e|--extras)   EXTRAS="$2"; shift 2 ;;
+    --oracle)      ORACLE=true; shift ;;
     --push)        PUSH=1; shift ;;
     --platform)    PLATFORM="$2"; shift 2 ;;
     -h|--help)     usage 0 ;;
@@ -53,7 +60,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-args=(--build-arg "SOURCES=${SOURCES}" --build-arg "SINKS=${SINKS}")
+args=(--build-arg "SOURCES=${SOURCES}" --build-arg "SINKS=${SINKS}" --build-arg "ORACLE_CLIENT=${ORACLE}")
 [ -n "${FEATURES}" ] && args+=(--build-arg "FEATURES=${FEATURES}")
 [ -n "${EXTRAS}" ]   && args+=(--build-arg "EXTRAS=${EXTRAS}")
 
