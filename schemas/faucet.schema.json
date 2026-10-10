@@ -35790,9 +35790,62 @@
           "items": {
             "$ref": "#/$defs/SuiteRequirement"
           }
+        },
+        "locked_suites": {
+          "description": "Written by the registry, not by hand: the exact shared-suite releases\nresolved when this version was registered, copied in like a lockfile,\nso a later release or a deleted suite never changes what the version\ntests.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LockedSuite"
+          }
+        },
+        "inherited_from": {
+          "description": "Written by the registry, not by hand: the version these tests were\ncopied from, when this version was registered without a `tests:` block.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
         }
       },
       "additionalProperties": false
+    },
+    "LockedSuite": {
+      "description": "One shared suite as resolved at registration.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The requirement's `name`.",
+          "type": "string"
+        },
+        "range": {
+          "description": "The requirement's range.",
+          "type": "string"
+        },
+        "release": {
+          "description": "The release picked.",
+          "type": "string"
+        },
+        "registry_version": {
+          "description": "The registry version it came from.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "suite": {
+          "description": "The suite document itself."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "range",
+        "release",
+        "suite"
+      ]
     }
   }
 }
