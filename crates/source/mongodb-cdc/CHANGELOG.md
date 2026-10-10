@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.3.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mongodb-cdc-v1.3.1...faucet-source-mongodb-cdc-v1.3.2) - 2026-10-10
+
+### Bug Fixes
+
+- Per-change mirror replay skip, duckdb 1.10506; agent skills with requires_faucet; Helm values for every serve feature ([#858](https://github.com/faucet-hq/faucet-stream/pull/858))
+
 ## [1.3.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mongodb-cdc-v1.3.0...faucet-source-mongodb-cdc-v1.3.1) - 2026-10-08
 
 ### Bug Fixes

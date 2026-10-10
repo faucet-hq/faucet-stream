@@ -4774,7 +4774,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-cli"
-version = "1.13.3"
+version = "1.14.0"
 dependencies = [
  "assert_cmd",
  "async-stream",
@@ -5159,7 +5159,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-oracle"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-core"
-version = "1.13.2"
+version = "1.14.0"
 dependencies = [
  "aes-gcm 0.11.0",
  "apache-avro 0.22.0",
@@ -5430,7 +5430,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-lineage"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "arrow 58.3.0",
  "async-trait",
@@ -5756,7 +5756,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-kafka"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6318,7 +6318,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-duckdb"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6573,7 +6573,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-mongodb-cdc"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6619,7 +6619,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-mssql-cdc"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6642,7 +6642,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-mysql"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6662,7 +6662,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-mysql-cdc"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6723,7 +6723,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-oracle-cdc"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6766,7 +6766,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-postgres"
-version = "1.8.1"
+version = "1.9.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6786,7 +6786,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-postgres-cdc"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -7185,7 +7185,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-stream"
-version = "1.9.3"
+version = "1.10.0"
 dependencies = [
  "faucet-auth",
  "faucet-common-azure",
