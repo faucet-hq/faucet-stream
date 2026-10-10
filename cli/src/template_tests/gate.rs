@@ -238,7 +238,10 @@ mod tests {
             1,
             true,
             "h",
-            &[result(true, "h", "0.1.0"), result(true, "other", faucet_version())],
+            &[
+                result(true, "h", "0.1.0"),
+                result(true, "other", faucet_version()),
+            ],
         );
         assert_eq!(v.status, GateStatus::Stale);
         assert!(!v.allowed);
@@ -267,8 +270,18 @@ mod tests {
         let v = evaluate(&gate, "t", 1, true, "h", &[]);
         assert!(v.allowed);
         assert_eq!(v.skipped.as_deref(), Some("hotfix INC-12"));
-        let passing = evaluate(&gate, "t", 1, true, "h", &[result(true, "h", faucet_version())]);
-        assert!(passing.skipped.is_none(), "nothing to override when tests pass");
+        let passing = evaluate(
+            &gate,
+            "t",
+            1,
+            true,
+            "h",
+            &[result(true, "h", faucet_version())],
+        );
+        assert!(
+            passing.skipped.is_none(),
+            "nothing to override when tests pass"
+        );
         assert!(
             LaunchGate::new(true)
                 .with_skip(Some("   ".into()))
@@ -276,7 +289,13 @@ mod tests {
                 .to_string()
                 .contains("needs a reason")
         );
-        assert!(LaunchGate::new(true).with_skip(None).unwrap().skip_tests_reason.is_none());
+        assert!(
+            LaunchGate::new(true)
+                .with_skip(None)
+                .unwrap()
+                .skip_tests_reason
+                .is_none()
+        );
     }
 
     #[test]
@@ -290,6 +309,10 @@ mod tests {
             result_at: None,
             skipped: None,
         };
-        assert!(v.refusal("t", 3).to_string().contains("tests have not passed"));
+        assert!(
+            v.refusal("t", 3)
+                .to_string()
+                .contains("tests have not passed")
+        );
     }
 }

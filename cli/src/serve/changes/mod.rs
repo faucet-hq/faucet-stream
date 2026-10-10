@@ -343,12 +343,18 @@ pub struct LaunchPayload {
 
 /// A change that would launch past the test gate must be requested by an
 /// admin — the override is admin-only however the launch arrives (#856).
-fn check_skip_tests(actor: &AuthContext, kind: ChangeKind, payload: &Value) -> Result<(), ServeError> {
-    let skips = matches!(kind, ChangeKind::TemplateLaunch | ChangeKind::TemplateRegister)
-        && payload
-            .get("skip_tests_reason")
-            .and_then(Value::as_str)
-            .is_some();
+fn check_skip_tests(
+    actor: &AuthContext,
+    kind: ChangeKind,
+    payload: &Value,
+) -> Result<(), ServeError> {
+    let skips = matches!(
+        kind,
+        ChangeKind::TemplateLaunch | ChangeKind::TemplateRegister
+    ) && payload
+        .get("skip_tests_reason")
+        .and_then(Value::as_str)
+        .is_some();
     if skips && actor.role != crate::serve::rbac::Role::Admin {
         return Err(ServeError::Forbidden(
             "`skip_tests_reason` overrides the template test gate and is admin-only".into(),
@@ -1084,7 +1090,10 @@ async fn execute(
                     Ok(b) => b,
                     Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
                 };
-            let gate = match state.template_gate().with_skip(body.skip_tests_reason.clone()) {
+            let gate = match state
+                .template_gate()
+                .with_skip(body.skip_tests_reason.clone())
+            {
                 Ok(g) => g,
                 Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
             };
@@ -1123,7 +1132,10 @@ async fn execute(
             let target = body
                 .version
                 .unwrap_or_else(crate::serve::history::templates::VersionSelector::newest);
-            let gate = match state.template_gate().with_skip(body.skip_tests_reason.clone()) {
+            let gate = match state
+                .template_gate()
+                .with_skip(body.skip_tests_reason.clone())
+            {
                 Ok(g) => g,
                 Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
             };
@@ -1135,16 +1147,16 @@ async fn execute(
                 &gate,
             )
             .await
-                .map(|o| {
-                    (
-                        None,
-                        Some(TemplateOutcome {
-                            id: body.id.clone(),
-                            version: o.version,
-                        }),
-                    )
-                })
-                .map_err(template_err)
+            .map(|o| {
+                (
+                    None,
+                    Some(TemplateOutcome {
+                        id: body.id.clone(),
+                        version: o.version,
+                    }),
+                )
+            })
+            .map_err(template_err)
         }
         #[cfg(not(feature = "templates"))]
         ChangeKind::TemplateRegister | ChangeKind::TemplateLaunch => {

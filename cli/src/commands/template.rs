@@ -985,7 +985,10 @@ async fn test_document_bundle(args: &crate::cli::TemplateTestArgs) -> CliResult<
     let self_contained =
         kind == crate::hub::TemplateKind::Pipeline && bundle.requires_suites.is_empty();
     let root = if self_contained {
-        args.suite.parent().map(std::path::Path::to_path_buf).unwrap_or_default()
+        args.suite
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default()
     } else {
         let fallback = crate::hub::resolve_hub(args.hub.as_deref()).await?;
         crate::hub::bundles::hub_root_for(&args.suite, &fallback)
@@ -999,6 +1002,16 @@ async fn test_document_bundle(args: &crate::cli::TemplateTestArgs) -> CliResult<
 /// version's bundle and record the result on it (unless `--no-record`).
 async fn test_registered(args: &crate::cli::TemplateTestArgs) -> CliResult<()> {
     let raw = args.suite.to_string_lossy().to_string();
+    let looks_like_file = args
+        .suite
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "yaml" | "yml" | "json"));
+    if looks_like_file {
+        return Err(CliError::Config(format!(
+            "template test suite {raw}: no such file"
+        )));
+    }
     let (id, sel) = match raw.rsplit_once('@') {
         Some((id, v)) => (id.to_string(), v.to_string()),
         None => (raw.clone(), "newest".to_string()),

@@ -567,7 +567,11 @@ async fn bundle_findings(
         if out.passed() {
             continue;
         }
-        let lines: Vec<String> = out.failing().into_iter().map(|l| format!("tests: {l}")).collect();
+        let lines: Vec<String> = out
+            .failing()
+            .into_iter()
+            .map(|l| format!("tests: {l}"))
+            .collect();
         let key = f.display().to_string();
         match findings.iter_mut().find(|(t, _)| *t == key) {
             Some((_, existing)) => existing.extend(lines),

@@ -81,18 +81,33 @@ async fn sqlite_records_prunes_cascades_and_gates() {
     let reg = faucet_cli::templates::register_tested(&s, r).await.unwrap();
     let first = reg.tests.unwrap();
     assert!(!first.passed);
-    assert_eq!(first.cases.iter().find(|c| c.name == "rows").unwrap().attempts, 2);
+    assert_eq!(
+        first
+            .cases
+            .iter()
+            .find(|c| c.name == "rows")
+            .unwrap()
+            .attempts,
+        2
+    );
 
     let gate = LaunchGate::new(true);
-    let err = faucet_cli::templates::launch_gated(&s, "orders", VersionSelector::Pinned(1), None, &gate)
-        .await
-        .unwrap_err()
-        .to_string();
+    let err =
+        faucet_cli::templates::launch_gated(&s, "orders", VersionSelector::Pinned(1), None, &gate)
+            .await
+            .unwrap_err()
+            .to_string();
     assert!(err.contains("failed") && err.contains("rows:"), "{err}");
     let skip = gate.clone().with_skip(Some("INC-7".into())).unwrap();
-    faucet_cli::templates::launch_gated(&s, "orders", VersionSelector::Pinned(1), Some("root"), &skip)
-        .await
-        .unwrap();
+    faucet_cli::templates::launch_gated(
+        &s,
+        "orders",
+        VersionSelector::Pinned(1),
+        Some("root"),
+        &skip,
+    )
+    .await
+    .unwrap();
 
     // Reopen: the result and the launch note survived.
     drop(s);
@@ -109,10 +124,15 @@ async fn sqlite_records_prunes_cascades_and_gates() {
         s.template_record_test(&t).await.unwrap();
     }
     let all = s.template_test_results("orders", None, 100).await.unwrap();
-    assert_eq!(all.len(), faucet_cli::serve::history::templates::RESULTS_RETAIN);
+    assert_eq!(
+        all.len(),
+        faucet_cli::serve::history::templates::RESULTS_RETAIN
+    );
     assert!(all[0].recorded_at > all[1].recorded_at, "newest first");
 
-    faucet_cli::templates::register(&s, req(pipeline("orders", 2))).await.unwrap();
+    faucet_cli::templates::register(&s, req(pipeline("orders", 2)))
+        .await
+        .unwrap();
     let t2 = faucet_cli::templates::bundle::test_version(&s, "orders", 2, None)
         .await
         .unwrap();
@@ -123,10 +143,26 @@ async fn sqlite_records_prunes_cascades_and_gates() {
     assert_eq!(v.gate.status, GateStatus::Passed);
 
     s.template_delete("orders", Some(1)).await.unwrap();
-    assert!(s.template_test_results("orders", Some(1), 5).await.unwrap().is_empty());
-    assert_eq!(s.template_test_results("orders", None, 5).await.unwrap().len(), 1);
+    assert!(
+        s.template_test_results("orders", Some(1), 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        s.template_test_results("orders", None, 5)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     s.template_delete("orders", None).await.unwrap();
-    assert!(s.template_test_results("orders", None, 5).await.unwrap().is_empty());
+    assert!(
+        s.template_test_results("orders", None, 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -160,7 +196,10 @@ async fn sync_records_results_and_launches_through_the_gate() {
     assert_eq!(out.tested.len(), 2);
     assert!(!out.tested[0].passed && out.tested[1].passed);
     assert_eq!(out.failed.len(), 1);
-    assert!(out.failed[0].error.contains("cannot be launched"), "{out:?}");
+    assert!(
+        out.failed[0].error.contains("cannot be launched"),
+        "{out:?}"
+    );
     assert!(!out.registered[0].launched && out.registered[1].launched);
     assert_eq!(s.template_state("good").await.unwrap().stable, Some(1));
     assert_eq!(s.template_state("bad").await.unwrap().stable, None);
@@ -248,7 +287,9 @@ async fn hub_lint_and_check_run_bundles() {
             json: true,
         }),
     };
-    faucet_cli::commands::hub::run(lint(Vec::new())).await.unwrap();
+    faucet_cli::commands::hub::run(lint(Vec::new()))
+        .await
+        .unwrap();
     let check = || HubArgs {
         command: HubCommand::Check(HubCheckArgs {
             pair: HubPairArgs {
@@ -272,7 +313,9 @@ async fn hub_lint_and_check_run_bundles() {
         "test-suites/rest-conformance.yaml",
         &HUB_SUITE.replace("1.4.0", "2.0.0"),
     );
-    let err = faucet_cli::commands::hub::run(lint(Vec::new())).await.unwrap_err();
+    let err = faucet_cli::commands::hub::run(lint(Vec::new()))
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("findings"), "{err}");
     let err = faucet_cli::commands::hub::run(check()).await.unwrap_err();
     assert!(err.to_string().contains("test bundle failed"), "{err}");
@@ -290,9 +333,15 @@ async fn cli_tests_a_registered_version_and_a_template_file() {
     use faucet_cli::cli::{TemplateArgs, TemplateCommand, TemplateTestArgs};
     let dir = tempfile::tempdir().unwrap();
     let store_url = format!("sqlite:{}", dir.path().join("registry.db").display());
-    let s = faucet_cli::templates::resolve_store_url(&store_url).await.unwrap();
-    faucet_cli::templates::register(&s, req(pipeline("orders", 2))).await.unwrap();
-    faucet_cli::templates::register(&s, req(pipeline("orders", 7))).await.unwrap();
+    let s = faucet_cli::templates::resolve_store_url(&store_url)
+        .await
+        .unwrap();
+    faucet_cli::templates::register(&s, req(pipeline("orders", 2)))
+        .await
+        .unwrap();
+    faucet_cli::templates::register(&s, req(pipeline("orders", 7)))
+        .await
+        .unwrap();
     let args = |target: &str, no_record: bool, filter: Option<&str>| TemplateArgs {
         command: TemplateCommand::Test(TemplateTestArgs {
             suite: target.into(),
@@ -312,12 +361,27 @@ async fn cli_tests_a_registered_version_and_a_template_file() {
     let err = faucet_cli::commands::template::run(args("orders", false, None))
         .await
         .unwrap_err();
-    assert!(matches!(err, faucet_cli::error::CliError::TestsFailed { .. }));
-    assert_eq!(s.template_test_results("orders", None, 10).await.unwrap().len(), 2);
+    assert!(matches!(
+        err,
+        faucet_cli::error::CliError::TestsFailed { .. }
+    ));
+    assert_eq!(
+        s.template_test_results("orders", None, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     faucet_cli::commands::template::run(args("orders@1", true, Some("auto:*")))
         .await
         .unwrap();
-    assert_eq!(s.template_test_results("orders", None, 10).await.unwrap().len(), 2);
+    assert_eq!(
+        s.template_test_results("orders", None, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     let err = faucet_cli::commands::template::run(args("orders@1", false, Some("auto:*")))
         .await
         .unwrap_err();
@@ -341,7 +405,11 @@ async fn cli_tests_a_registered_version_and_a_template_file() {
     faucet_cli::commands::template::run(args(src.to_str().unwrap(), false, None))
         .await
         .unwrap();
-    let plain = write(dir.path(), "plain.yaml", "kind: pipeline\nversion: 1\npipeline: {}\n");
+    let plain = write(
+        dir.path(),
+        "plain.yaml",
+        "kind: pipeline\nversion: 1\npipeline: {}\n",
+    );
     let err = faucet_cli::commands::template::run(args(plain.to_str().unwrap(), false, None))
         .await
         .unwrap_err();
@@ -382,7 +450,10 @@ async fn serve(dir: &std::path::Path, require_approval: Vec<String>) -> String {
         max_concurrent_runs: Some(2),
         max_queued_runs: Some(8),
         default_config: None,
-        history: Some(format!("sqlite:{}", dir.join(format!("h-{port}.db")).display())),
+        history: Some(format!(
+            "sqlite:{}",
+            dir.join(format!("h-{port}.db")).display()
+        )),
         cors_origin: vec![],
         body_limit_bytes: 1_048_576,
         shutdown_grace_secs: 5,
@@ -447,7 +518,13 @@ async fn serve(dir: &std::path::Path, require_approval: Vec<String>) -> String {
     panic!("server did not start");
 }
 
-async fn call(base: &str, method: &str, token: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+async fn call(
+    base: &str,
+    method: &str,
+    token: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     let client = reqwest::Client::new();
     let mut rb = client
         .request(method.parse().unwrap(), format!("{base}{path}"))
@@ -458,7 +535,10 @@ async fn call(base: &str, method: &str, token: &str, path: &str, body: Option<Va
     let r = rb.send().await.unwrap();
     let code = r.status().as_u16();
     let text = r.text().await.unwrap();
-    (code, serde_json::from_str(&text).unwrap_or(Value::String(text)))
+    (
+        code,
+        serde_json::from_str(&text).unwrap_or(Value::String(text)),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -478,10 +558,22 @@ async fn http_gate_refuses_overrides_audits_and_reports() {
     assert_eq!(code, 201, "{r}");
     assert_eq!(r["tests"]["passed"], false, "{r}");
 
-    let (code, r) = call(b, "POST", "admin-tok", "/v1/templates/orders/launch", Some(json!({ "version": 1 }))).await;
+    let (code, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/v1/templates/orders/launch",
+        Some(json!({ "version": 1 })),
+    )
+    .await;
     assert_eq!(code, 422, "{r}");
     let failing = r["error"]["details"]["gate"]["failing"].as_array().unwrap();
-    assert!(failing.iter().any(|f| f.as_str().unwrap().starts_with("rows:")), "{r}");
+    assert!(
+        failing
+            .iter()
+            .any(|f| f.as_str().unwrap().starts_with("rows:")),
+        "{r}"
+    );
 
     let (code, _) = call(
         b,
@@ -512,7 +604,14 @@ async fn http_gate_refuses_overrides_audits_and_reports() {
     assert_eq!(code, 200, "{r}");
     assert_eq!(r["tests"]["skipped"], "INC-42 hotfix");
 
-    let (_, audit) = call(b, "GET", "admin-tok", "/v1/audit?action=template.launch", None).await;
+    let (_, audit) = call(
+        b,
+        "GET",
+        "admin-tok",
+        "/v1/audit?action=template.launch",
+        None,
+    )
+    .await;
     let entries = audit["entries"].as_array().unwrap();
     assert!(
         entries
@@ -539,22 +638,57 @@ async fn http_gate_refuses_overrides_audits_and_reports() {
     assert_eq!(r["gate"]["status"], "passed", "{r}");
     assert_eq!(r["tests"]["passed"], true);
 
-    let (code, r) = call(b, "GET", "viewer-tok", "/v1/templates/orders/versions/1/tests", None).await;
+    let (code, r) = call(
+        b,
+        "GET",
+        "viewer-tok",
+        "/v1/templates/orders/versions/1/tests",
+        None,
+    )
+    .await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(r["gate"]["status"], "failed");
     assert_eq!(r["gate"]["allowed"], false);
-    let (code, r) = call(b, "POST", "op-tok", "/v1/templates/orders/versions/2/test", None).await;
+    let (code, r) = call(
+        b,
+        "POST",
+        "op-tok",
+        "/v1/templates/orders/versions/2/test",
+        None,
+    )
+    .await;
     assert_eq!(code, 403, "{r}");
-    let (code, r) = call(b, "POST", "admin-tok", "/v1/templates/orders/versions/2/test", None).await;
+    let (code, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/v1/templates/orders/versions/2/test",
+        None,
+    )
+    .await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(r["passed"], true);
 
-    let (_, d) = call(b, "GET", "viewer-tok", "/v1/templates/orders?version=newest", None).await;
+    let (_, d) = call(
+        b,
+        "GET",
+        "viewer-tok",
+        "/v1/templates/orders?version=newest",
+        None,
+    )
+    .await;
     assert_eq!(d["tests"]["require_tests"], true, "{d}");
     assert_eq!(d["tests"]["versions"].as_array().unwrap().len(), 2);
     assert_eq!(d["launches"][1]["tests_skipped"], "INC-42 hotfix", "{d}");
 
-    let (code, r) = call(b, "POST", "admin-tok", "/v1/templates/orders/rollback", None).await;
+    let (code, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/v1/templates/orders/rollback",
+        None,
+    )
+    .await;
     assert_eq!(code, 422, "{r}");
     let (code, r) = call(
         b,
@@ -568,14 +702,41 @@ async fn http_gate_refuses_overrides_audits_and_reports() {
     assert_eq!(r["version"], 1);
 
     // MCP: the same gate, the same override, and the test tool.
-    let mcp = |id: u32, name: &str, args: Value| {
-        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } })
-    };
-    let (_, r) = call(b, "POST", "admin-tok", "/mcp", Some(mcp(1, "launch_template", json!({ "id": "orders", "version": 1 })))).await;
+    let mcp = |id: u32, name: &str, args: Value| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
+    let (_, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/mcp",
+        Some(mcp(
+            1,
+            "launch_template",
+            json!({ "id": "orders", "version": 1 }),
+        )),
+    )
+    .await;
     assert_eq!(r["result"]["isError"], false, "already live: {r}");
-    let (_, r) = call(b, "POST", "admin-tok", "/mcp", Some(mcp(2, "launch_template", json!({ "id": "orders", "version": 2 })))).await;
+    let (_, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/mcp",
+        Some(mcp(
+            2,
+            "launch_template",
+            json!({ "id": "orders", "version": 2 }),
+        )),
+    )
+    .await;
     assert_eq!(r["result"]["isError"], false, "{r}");
-    let (_, r) = call(b, "POST", "admin-tok", "/mcp", Some(mcp(3, "rollback_template", json!({ "id": "orders" })))).await;
+    let (_, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/mcp",
+        Some(mcp(3, "rollback_template", json!({ "id": "orders" }))),
+    )
+    .await;
     assert_eq!(r["result"]["isError"], true, "{r}");
     assert!(r.to_string().contains("cannot be launched"), "{r}");
     let (_, r) = call(
@@ -583,18 +744,37 @@ async fn http_gate_refuses_overrides_audits_and_reports() {
         "POST",
         "admin-tok",
         "/mcp",
-        Some(mcp(4, "rollback_template", json!({ "id": "orders", "skip_tests_reason": "agent rollback" }))),
+        Some(mcp(
+            4,
+            "rollback_template",
+            json!({ "id": "orders", "skip_tests_reason": "agent rollback" }),
+        )),
     )
     .await;
-    assert_eq!(r["result"]["isError"], false, "{r}");
-    let (_, r) = call(b, "POST", "admin-tok", "/mcp", Some(mcp(5, "test_template", json!({ "id": "orders", "version": 2 })))).await;
     assert_eq!(r["result"]["isError"], false, "{r}");
     let (_, r) = call(
         b,
         "POST",
         "admin-tok",
         "/mcp",
-        Some(mcp(6, "register_template", json!({ "config": pipeline("orders", 2), "test": true }))),
+        Some(mcp(
+            5,
+            "test_template",
+            json!({ "id": "orders", "version": 2 }),
+        )),
+    )
+    .await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let (_, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/mcp",
+        Some(mcp(
+            6,
+            "register_template",
+            json!({ "config": pipeline("orders", 2), "test": true }),
+        )),
     )
     .await;
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
@@ -606,25 +786,85 @@ async fn approved_launch_change_goes_through_the_gate() {
     let dir = tempfile::tempdir().unwrap();
     let base = serve(dir.path(), vec!["template_launch".into()]).await;
     let b = base.as_str();
-    let (code, r) = call(b, "POST", "admin-tok", "/v1/templates", Some(json!({ "config": pipeline("orders", 9), "test": true }))).await;
+    let (code, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/v1/templates",
+        Some(json!({ "config": pipeline("orders", 9), "test": true })),
+    )
+    .await;
     assert_eq!(code, 201, "{r}");
 
-    let propose = |payload: Value| json!({ "kind": "template_launch", "payload": payload, "reason": "ship" });
-    let (code, r) = call(b, "POST", "op-tok", "/v1/changes", Some(propose(json!({ "id": "orders", "version": 1, "skip_tests_reason": "x" })))).await;
+    let propose =
+        |payload: Value| json!({ "kind": "template_launch", "payload": payload, "reason": "ship" });
+    let (code, r) = call(
+        b,
+        "POST",
+        "op-tok",
+        "/v1/changes",
+        Some(propose(
+            json!({ "id": "orders", "version": 1, "skip_tests_reason": "x" }),
+        )),
+    )
+    .await;
     assert_eq!(code, 403, "an operator may not ask to skip tests: {r}");
 
-    let (code, c) = call(b, "POST", "admin-tok", "/v1/changes", Some(propose(json!({ "id": "orders", "version": 1 })))).await;
+    let (code, c) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/v1/changes",
+        Some(propose(json!({ "id": "orders", "version": 1 }))),
+    )
+    .await;
     assert_eq!(code, 201, "{c}");
     assert_eq!(c["plan"]["summary"]["tests"]["status"], "failed", "{c}");
     let id = c["id"].as_str().unwrap().to_string();
-    let (_, done) = call(b, "POST", "erin-tok", &format!("/v1/changes/{id}/approve"), Some(json!({}))).await;
+    let (_, done) = call(
+        b,
+        "POST",
+        "erin-tok",
+        &format!("/v1/changes/{id}/approve"),
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(done["status"], "failed", "{done}");
-    assert!(done["error"].as_str().unwrap_or_default().contains("cannot be launched"), "{done}");
+    assert!(
+        done["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be launched"),
+        "{done}"
+    );
 
-    let (_, c) = call(b, "POST", "admin-tok", "/v1/changes", Some(propose(json!({ "id": "orders", "version": 1, "skip_tests_reason": "approved risk" })))).await;
+    let (_, c) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/v1/changes",
+        Some(propose(
+            json!({ "id": "orders", "version": 1, "skip_tests_reason": "approved risk" }),
+        )),
+    )
+    .await;
     let id = c["id"].as_str().unwrap().to_string();
-    let (_, done) = call(b, "POST", "erin-tok", &format!("/v1/changes/{id}/approve"), Some(json!({}))).await;
+    let (_, done) = call(
+        b,
+        "POST",
+        "erin-tok",
+        &format!("/v1/changes/{id}/approve"),
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(done["status"], "executed", "{done}");
-    let (_, d) = call(b, "GET", "viewer-tok", "/v1/templates/orders?version=newest", None).await;
+    let (_, d) = call(
+        b,
+        "GET",
+        "viewer-tok",
+        "/v1/templates/orders?version=newest",
+        None,
+    )
+    .await;
     assert_eq!(d["launches"][0]["tests_skipped"], "approved risk", "{d}");
 }

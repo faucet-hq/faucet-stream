@@ -207,12 +207,9 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
         }
         Some(TemplateKind::TestSuite) => {
             let t = crate::template_tests::bundle::parse_test_suite(doc.clone())?;
-            if let Some(v) = crate::templates::bundle::registered_release(
-                store,
-                &t.id(),
-                &t.release_version()?,
-            )
-            .await?
+            if let Some(v) =
+                crate::templates::bundle::registered_release(store, &t.id(), &t.release_version()?)
+                    .await?
             {
                 return Err(CliError::Config(format!(
                     "release {} of test-suite '{}' is already registered as v{v} — a release is \
@@ -371,7 +368,10 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
 /// launch under a test gate) and launching it through the gate
 /// (`req.launch`). A refused launch leaves the version registered, inert, and
 /// says so.
-pub async fn register_tested(store: &TemplateStore, req: RegisterRequest) -> CliResult<Registration> {
+pub async fn register_tested(
+    store: &TemplateStore,
+    req: RegisterRequest,
+) -> CliResult<Registration> {
     let Prelude {
         doc,
         declared,

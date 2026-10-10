@@ -259,7 +259,10 @@ suite:
             .unwrap()
             .unwrap();
         let e = out.error.expect("unsatisfied");
-        assert!(e.contains("rest-conformance") && e.contains(">=1.0,<2"), "{e}");
+        assert!(
+            e.contains("rest-conformance") && e.contains(">=1.0,<2"),
+            "{e}"
+        );
     }
 
     #[tokio::test]
@@ -283,10 +286,13 @@ suite:
         );
         assert!(run_file(&plain, dir.path()).await.unwrap().is_none());
         assert!(
-            run_file(&dir.path().join("test-suites/rest-conformance.yaml"), dir.path())
-                .await
-                .unwrap()
-                .is_none()
+            run_file(
+                &dir.path().join("test-suites/rest-conformance.yaml"),
+                dir.path()
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
     }
 

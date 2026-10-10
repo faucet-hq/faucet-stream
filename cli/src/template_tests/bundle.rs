@@ -361,8 +361,8 @@ pub fn bundle_of(doc: &Value, kind: TemplateKind) -> CliResult<Option<TestBundle
     let Some(raw) = doc.get("tests") else {
         return Ok(None);
     };
-    let bundle: TestBundle = serde_json::from_value(raw.clone())
-        .map_err(|e| CliError::Config(format!("tests: {e}")))?;
+    let bundle: TestBundle =
+        serde_json::from_value(raw.clone()).map_err(|e| CliError::Config(format!("tests: {e}")))?;
     bundle.validate(kind)?;
     Ok(Some(bundle))
 }
@@ -460,9 +460,10 @@ requires_suites:
         .validate(TemplateKind::Pipeline)
         .expect_err("dup");
         assert!(err.to_string().contains("duplicate fixture"), "{err}");
-        let err = bundle("fixtures:\n  - { name: ' ', input: [], expect: { records_written: 0 } }\n")
-            .validate(TemplateKind::Pipeline)
-            .expect_err("blank");
+        let err =
+            bundle("fixtures:\n  - { name: ' ', input: [], expect: { records_written: 0 } }\n")
+                .validate(TemplateKind::Pipeline)
+                .expect_err("blank");
         assert!(err.to_string().contains("non-empty `name`"), "{err}");
         let err = bundle("fixtures:\n  - { name: a, input: [], expect: {} }\n")
             .validate(TemplateKind::Pipeline)
@@ -504,9 +505,10 @@ requires_suites:
             .validate(TemplateKind::Pipeline)
             .expect_err("range");
         assert!(err.to_string().contains("invalid version range"), "{err}");
-        let err = bundle("requires_suites: [{ name: c, version: '1' }, { name: c, version: '2' }]\n")
-            .validate(TemplateKind::Pipeline)
-            .expect_err("twice");
+        let err =
+            bundle("requires_suites: [{ name: c, version: '1' }, { name: c, version: '2' }]\n")
+                .validate(TemplateKind::Pipeline)
+                .expect_err("twice");
         assert!(err.to_string().contains("required twice"), "{err}");
         let err = bundle("requires_suites: [{ name: '', version: '1' }]\n")
             .validate(TemplateKind::Pipeline)
@@ -523,8 +525,11 @@ requires_suites:
                 .unwrap()
                 .is_none()
         );
-        let err = bundle_of(&serde_json::json!({"tests": {"nope": 1}}), TemplateKind::Pipeline)
-            .expect_err("unknown key");
+        let err = bundle_of(
+            &serde_json::json!({"tests": {"nope": 1}}),
+            TemplateKind::Pipeline,
+        )
+        .expect_err("unknown key");
         assert!(err.to_string().contains("nope"), "{err}");
     }
 

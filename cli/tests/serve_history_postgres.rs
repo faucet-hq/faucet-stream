@@ -220,7 +220,9 @@ async fn postgres_template_test_results_and_launch_notes() {
     };
     use faucet_cli::serve::load::ConfigFormat;
     let Ok(url) = std::env::var("FAUCET_TEST_POSTGRES_URL") else {
-        eprintln!("SKIP postgres_template_test_results_and_launch_notes: FAUCET_TEST_POSTGRES_URL unset");
+        eprintln!(
+            "SKIP postgres_template_test_results_and_launch_notes: FAUCET_TEST_POSTGRES_URL unset"
+        );
         return;
     };
     let h = PostgresHistory::connect(
@@ -253,14 +255,24 @@ async fn postgres_template_test_results_and_launch_notes() {
     let got = h.template_test_results(&id, Some(1), 100).await.unwrap();
     assert_eq!(got.len(), RESULTS_RETAIN);
     assert!(got[0].recorded_at > got[1].recorded_at);
-    assert_eq!(h.template_test_results(&id, None, 3).await.unwrap().len(), 3);
+    assert_eq!(
+        h.template_test_results(&id, None, 3).await.unwrap().len(),
+        3
+    );
     h.template_launch_noted(&id, 1, Some("root"), Some("hotfix"))
         .await
         .unwrap();
     assert_eq!(
-        h.template_launches(&id).await.unwrap()[0].tests_skipped.as_deref(),
+        h.template_launches(&id).await.unwrap()[0]
+            .tests_skipped
+            .as_deref(),
         Some("hotfix")
     );
     h.template_delete(&id, None).await.unwrap();
-    assert!(h.template_test_results(&id, None, 5).await.unwrap().is_empty());
+    assert!(
+        h.template_test_results(&id, None, 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

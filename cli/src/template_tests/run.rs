@@ -170,7 +170,10 @@ mod tests {
     fn an_unsatisfiable_range_names_the_suite_the_range_and_what_exists() {
         let err = pick(
             &req(">=3"),
-            vec![(None, suite("conf", "1.0.0")), (None, suite("conf", "2.1.0"))],
+            vec![
+                (None, suite("conf", "1.0.0")),
+                (None, suite("conf", "2.1.0")),
+            ],
         )
         .unwrap_err();
         assert!(matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }));
@@ -299,7 +302,8 @@ fixtures:
             version: None,
             suite: broken,
         }];
-        let bundle: TestBundle = serde_yaml::from_str("requires_suites: [{ name: conf, version: '1' }]\n").unwrap();
+        let bundle: TestBundle =
+            serde_yaml::from_str("requires_suites: [{ name: conf, version: '1' }]\n").unwrap();
         let out = run_bundle(&bundle, &doc_target(), &shared, None).await;
         assert!(out.error.unwrap().contains("suite:conf@1.0.0"));
     }

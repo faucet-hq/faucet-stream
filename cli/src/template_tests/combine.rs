@@ -319,7 +319,7 @@ fn from_auto(auto: &Auto, params: &ParamsSpec) -> Vec<GeneratedCase> {
             params: supplied,
             expect: Expect::default(),
             origin: Origin::Auto,
-                retries: auto.retries,
+            retries: auto.retries,
         });
     }
 
@@ -341,7 +341,7 @@ fn from_auto(auto: &Auto, params: &ParamsSpec) -> Vec<GeneratedCase> {
                     params: supplied,
                     expect: Expect::default(),
                     origin: Origin::Auto,
-                retries: auto.retries,
+                    retries: auto.retries,
                 });
             }
         }

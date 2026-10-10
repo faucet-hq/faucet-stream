@@ -352,10 +352,10 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
             crate::hub::spec::DeploymentTemplate
         ))
         .expect("schema serialization"),
-        SchemaTarget::TemplateTests => serde_json::to_value(faucet_core::schema_for!(
-            crate::template_tests::TestBundle
-        ))
-        .expect("schema serialization"),
+        SchemaTarget::TemplateTests => {
+            serde_json::to_value(faucet_core::schema_for!(crate::template_tests::TestBundle))
+                .expect("schema serialization")
+        }
         SchemaTarget::TestSuite => serde_json::to_value(faucet_core::schema_for!(
             crate::template_tests::TestSuiteTemplate
         ))

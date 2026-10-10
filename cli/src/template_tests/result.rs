@@ -73,13 +73,12 @@ impl BundleOutcome {
     /// `name: failure` for every failing case, plus the setup error.
     pub fn failing(&self) -> Vec<String> {
         let mut out: Vec<String> = self.error.iter().cloned().collect();
-        out.extend(self.cases.iter().filter(|c| !c.passed).map(|c| {
-            format!(
-                "{}: {}",
-                c.name,
-                c.failure.as_deref().unwrap_or("failed")
-            )
-        }));
+        out.extend(
+            self.cases
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| format!("{}: {}", c.name, c.failure.as_deref().unwrap_or("failed"))),
+        );
         out
     }
 }
@@ -186,7 +185,10 @@ pub fn render_human(title: &str, outcome: &BundleOutcome) -> String {
         } else {
             format!(" {}", c.source)
         };
-        out.push_str(&format!("  {mark} [{}{from}] {}{tries}\n", c.origin, c.name));
+        out.push_str(&format!(
+            "  {mark} [{}{from}] {}{tries}\n",
+            c.origin, c.name
+        ));
         if let Some(f) = &c.failure {
             out.push_str(&format!("       {f}\n"));
         }
@@ -279,7 +281,10 @@ mod tests {
             duration_ms: 5,
         };
         let text = render_human("orders v2", &o);
-        assert!(text.contains("suite conf >=1 → release 1.2.0 (v3)"), "{text}");
+        assert!(
+            text.contains("suite conf >=1 → release 1.2.0 (v3)"),
+            "{text}"
+        );
         assert!(text.contains("after 2 attempts"), "{text}");
         assert!(text.contains("suite:conf@1.2.0"), "{text}");
         assert!(text.contains("ERROR setup"), "{text}");

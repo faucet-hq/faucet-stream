@@ -864,17 +864,13 @@ pub async fn rollback_template(
         .template_gate()
         .with_skip(body.skip_tests_reason)
         .map_err(map_err)?;
-    let outcome = match crate::templates::rollback_gated(
-        &store(&state),
-        &id,
-        Some(&actor.principal),
-        &gate,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => return Err(refused(&state, &actor, &id, "template.rollback", e).await),
-    };
+    let outcome =
+        match crate::templates::rollback_gated(&store(&state), &id, Some(&actor.principal), &gate)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return Err(refused(&state, &actor, &id, "template.rollback", e).await),
+        };
     finish_launch(&state, &actor, &id, outcome, "template.rollback").await
 }
 

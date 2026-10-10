@@ -92,7 +92,8 @@ pub async fn registered_release(
         if rec.kind != TemplateKind::TestSuite {
             continue;
         }
-        let t = crate::template_tests::bundle::parse_test_suite(parse_body(&rec.body, rec.format)?)?;
+        let t =
+            crate::template_tests::bundle::parse_test_suite(parse_body(&rec.body, rec.format)?)?;
         if t.release_version().ok().as_ref() == Some(release) {
             return Ok(Some(v));
         }
@@ -201,13 +202,22 @@ async fn prepare(
         overlay: None,
     };
     if let Some(s) = &bundle.source {
-        c.source = Some((s.clone(), select(store, s, bundle.source_select.as_deref()).await?));
+        c.source = Some((
+            s.clone(),
+            select(store, s, bundle.source_select.as_deref()).await?,
+        ));
     }
     if let Some(s) = &bundle.sink {
-        c.sink = Some((s.clone(), select(store, s, bundle.sink_select.as_deref()).await?));
+        c.sink = Some((
+            s.clone(),
+            select(store, s, bundle.sink_select.as_deref()).await?,
+        ));
     }
     if let Some(s) = &bundle.overlay {
-        c.overlay = Some((s.clone(), select(store, s, bundle.overlay_select.as_deref()).await?));
+        c.overlay = Some((
+            s.clone(),
+            select(store, s, bundle.overlay_select.as_deref()).await?,
+        ));
     }
     let shared = resolve_shared(store, &bundle.requires_suites).await?;
     Ok((c, shared))
@@ -281,7 +291,14 @@ pub async fn version_tests(
         .template_test_results(id, Some(version), limit.max(1))
         .await
         .map_err(read_err)?;
-    let verdict = evaluate(gate, id, version, has_tests, &body_sha256(&rec.body), &results);
+    let verdict = evaluate(
+        gate,
+        id,
+        version,
+        has_tests,
+        &body_sha256(&rec.body),
+        &results,
+    );
     Ok(VersionTests {
         version,
         has_tests,
@@ -297,8 +314,14 @@ pub async fn check_gate(
     version: u32,
     gate: &LaunchGate,
 ) -> CliResult<GateVerdict> {
-    let t = version_tests(store, id, version, gate, crate::serve::history::templates::RESULTS_RETAIN)
-        .await?;
+    let t = version_tests(
+        store,
+        id,
+        version,
+        gate,
+        crate::serve::history::templates::RESULTS_RETAIN,
+    )
+    .await?;
     if t.gate.allowed {
         Ok(t.gate)
     } else {
@@ -375,17 +398,34 @@ tests:
         assert!(t.passed, "{t:#?}");
         assert_eq!(t.body_sha256, body_sha256(&reg.record.body));
         let names: Vec<&str> = t.cases.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"auto:region=eu") && names.contains(&"rows"), "{names:?}");
-        let vt = version_tests(&s, "orders", 1, &required(), 5).await.unwrap();
+        assert!(
+            names.contains(&"auto:region=eu") && names.contains(&"rows"),
+            "{names:?}"
+        );
+        let vt = version_tests(&s, "orders", 1, &required(), 5)
+            .await
+            .unwrap();
         assert!(vt.has_tests && vt.gate.allowed);
         assert_eq!(vt.gate.status, GateStatus::Passed);
-        let out = crate::templates::launch_gated(&s, "orders", VersionSelector::Pinned(1), None, &required())
-            .await
-            .unwrap();
+        let out = crate::templates::launch_gated(
+            &s,
+            "orders",
+            VersionSelector::Pinned(1),
+            None,
+            &required(),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.tests.unwrap().status, GateStatus::Passed);
-        let again = crate::templates::launch_gated(&s, "orders", VersionSelector::Pinned(1), None, &required())
-            .await
-            .unwrap();
+        let again = crate::templates::launch_gated(
+            &s,
+            "orders",
+            VersionSelector::Pinned(1),
+            None,
+            &required(),
+        )
+        .await
+        .unwrap();
         assert!(again.already_launched && again.tests.is_none());
     }
 
@@ -393,26 +433,47 @@ tests:
     async fn a_failing_or_missing_result_refuses_the_launch_until_an_admin_overrides() {
         let s = store().await;
         register(&s, req(pipeline("orders", 9))).await.unwrap();
-        let err = crate::templates::launch_gated(&s, "orders", VersionSelector::Pinned(1), None, &required())
-            .await
-            .unwrap_err();
+        let err = crate::templates::launch_gated(
+            &s,
+            "orders",
+            VersionSelector::Pinned(1),
+            None,
+            &required(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, CliError::LaunchGated { .. }));
         assert!(err.to_string().contains("never run"), "{err}");
 
         let t = test_version(&s, "orders", 1, Some("ci")).await.unwrap();
         assert!(!t.passed);
-        let err = crate::templates::launch_gated(&s, "orders", VersionSelector::Pinned(1), None, &required())
-            .await
-            .unwrap_err();
+        let err = crate::templates::launch_gated(
+            &s,
+            "orders",
+            VersionSelector::Pinned(1),
+            None,
+            &required(),
+        )
+        .await
+        .unwrap_err();
         let CliError::LaunchGated { failing, .. } = &err else {
             panic!("{err}")
         };
-        assert!(failing.iter().any(|f| f.starts_with("rows:")), "{failing:?}");
+        assert!(
+            failing.iter().any(|f| f.starts_with("rows:")),
+            "{failing:?}"
+        );
 
         let gate = required().with_skip(Some("hotfix".into())).unwrap();
-        let out = crate::templates::launch_gated(&s, "orders", VersionSelector::Pinned(1), Some("root"), &gate)
-            .await
-            .unwrap();
+        let out = crate::templates::launch_gated(
+            &s,
+            "orders",
+            VersionSelector::Pinned(1),
+            Some("root"),
+            &gate,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.tests.unwrap().skipped.as_deref(), Some("hotfix"));
         let log = s.template_launches("orders").await.unwrap();
         assert_eq!(log[0].tests_skipped.as_deref(), Some("hotfix"));
@@ -432,21 +493,51 @@ tests:
         assert_eq!(v.gate.status, GateStatus::NoTests);
         assert!(!v.gate.allowed);
         assert!(
-            crate::templates::launch_gated(&s, "plain", VersionSelector::Pinned(1), None, &required())
-                .await
-                .is_err()
-        );
-        crate::templates::launch_gated(&s, "plain", VersionSelector::Pinned(1), None, &LaunchGate::new(false))
+            crate::templates::launch_gated(
+                &s,
+                "plain",
+                VersionSelector::Pinned(1),
+                None,
+                &required()
+            )
             .await
-            .unwrap();
-        assert!(test_version(&s, "plain", 1, None).await.unwrap_err().to_string().contains("no `tests:`"));
+            .is_err()
+        );
+        crate::templates::launch_gated(
+            &s,
+            "plain",
+            VersionSelector::Pinned(1),
+            None,
+            &LaunchGate::new(false),
+        )
+        .await
+        .unwrap();
+        assert!(
+            test_version(&s, "plain", 1, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no `tests:`")
+        );
         let mut r = req(body.clone());
         r.test = true;
-        assert!(register(&s, r).await.unwrap_err().to_string().contains("no `tests:` block"));
+        assert!(
+            register(&s, r)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no `tests:` block")
+        );
         let mut r = req(body);
         r.launch = true;
         r.gate = required();
-        assert!(register(&s, r).await.unwrap_err().to_string().contains("cannot be registered and launched"));
+        assert!(
+            register(&s, r)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be registered and launched")
+        );
         assert_eq!(s.template_state("plain").await.unwrap().versions, vec![1]);
     }
 
@@ -457,10 +548,20 @@ tests:
         r.launch = true;
         r.gate = required();
         let err = register_tested(&s, r).await.unwrap_err();
-        assert!(err.to_string().contains("registered as v1 but not launched"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("registered as v1 but not launched"),
+            "{err}"
+        );
         let st = s.template_state("orders").await.unwrap();
         assert_eq!((st.versions.clone(), st.stable), (vec![1], None));
-        assert_eq!(s.template_test_results("orders", Some(1), 5).await.unwrap().len(), 1);
+        assert_eq!(
+            s.template_test_results("orders", Some(1), 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         let mut r = req(pipeline("orders", 2));
         r.launch = true;
@@ -483,9 +584,14 @@ tests:
             .await
             .unwrap_err();
         assert!(err.to_string().contains("v1"), "{err}");
-        crate::templates::rollback_gated(&s, "orders", None, &required().with_skip(Some("incident".into())).unwrap())
-            .await
-            .unwrap();
+        crate::templates::rollback_gated(
+            &s,
+            "orders",
+            None,
+            &required().with_skip(Some("incident".into())).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(s.template_state("orders").await.unwrap().stable, Some(1));
     }
 
@@ -497,16 +603,29 @@ tests:
         t.faucet_version = "0.0.1".into();
         t.recorded_at = chrono::Utc::now() + chrono::Duration::seconds(5);
         s.template_record_test(&t).await.unwrap();
-        let v = version_tests(&s, "orders", 1, &required(), 5).await.unwrap();
-        assert_eq!(v.gate.status, GateStatus::Passed, "an older valid pass still counts");
+        let v = version_tests(&s, "orders", 1, &required(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            v.gate.status,
+            GateStatus::Passed,
+            "an older valid pass still counts"
+        );
 
         s.template_delete("orders", None).await.unwrap();
-        assert!(s.template_test_results("orders", None, 5).await.unwrap().is_empty());
+        assert!(
+            s.template_test_results("orders", None, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         register(&s, req(pipeline("orders", 2))).await.unwrap();
         t.faucet_version = crate::template_tests::result::faucet_version().into();
         t.body_sha256 = "stale-body".into();
         s.template_record_test(&t).await.unwrap();
-        let v = version_tests(&s, "orders", 1, &required(), 5).await.unwrap();
+        let v = version_tests(&s, "orders", 1, &required(), 5)
+            .await
+            .unwrap();
         assert_eq!(v.gate.status, GateStatus::Stale);
     }
 
@@ -519,7 +638,9 @@ tests:
     fn requiring(range: &str) -> String {
         pipeline("orders", 2).replace(
             "tests:\n",
-            &format!("tests:\n  requires_suites:\n    - {{ name: conformance, version: \"{range}\" }}\n"),
+            &format!(
+                "tests:\n  requires_suites:\n    - {{ name: conformance, version: \"{range}\" }}\n"
+            ),
         )
     }
 
@@ -527,21 +648,31 @@ tests:
     async fn shared_suites_resolve_by_range_or_fail_registration_with_a_typed_error() {
         let s = store().await;
         let err = register(&s, req(requiring(">=1.2,<2"))).await.unwrap_err();
-        assert!(matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }), "{err}");
+        assert!(
+            matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }),
+            "{err}"
+        );
         assert!(err.to_string().contains("none registered"), "{err}");
 
         register(&s, req(suite_doc("1.1.0"))).await.unwrap();
         register(&s, req(suite_doc("1.3.0"))).await.unwrap();
         register(&s, req(suite_doc("2.0.0"))).await.unwrap();
         let dup = register(&s, req(suite_doc("1.3.0"))).await.unwrap_err();
-        assert!(dup.to_string().contains("already registered as v2"), "{dup}");
+        assert!(
+            dup.to_string().contains("already registered as v2"),
+            "{dup}"
+        );
 
         let rec = register(&s, req(requiring(">=1.2,<2"))).await.unwrap();
         let t = test_version(&s, "orders", rec.version, None).await.unwrap();
         assert!(t.passed, "{t:#?}");
         assert_eq!(t.suites[0].release, "1.3.0");
         assert_eq!(t.suites[0].version, Some(2));
-        assert!(t.cases.iter().any(|c| c.source == "suite:conformance@1.3.0"));
+        assert!(
+            t.cases
+                .iter()
+                .any(|c| c.source == "suite:conformance@1.3.0")
+        );
 
         crate::templates::set_version_deprecated(&s, "conformance", 2, None, None, true)
             .await
@@ -557,7 +688,11 @@ tests:
                 .to_string()
                 .contains("is a test-suite")
         );
-        let not_suite = register(&s, req(pipeline("conf2", 2).replace("name: conf2", "name: x"))).await;
+        let not_suite = register(
+            &s,
+            req(pipeline("conf2", 2).replace("name: conf2", "name: x")),
+        )
+        .await;
         assert!(not_suite.is_ok());
         let wrong = resolve_shared(
             &s,
@@ -608,8 +743,14 @@ tests:
                 "identical content hashes alike, so a sync registers nothing"
             );
         }
-        assert!(document_has_tests(&a.body, crate::serve::load::ConfigFormat::Yaml));
-        assert!(!document_has_tests("{", crate::serve::load::ConfigFormat::Yaml));
+        assert!(document_has_tests(
+            &a.body,
+            crate::serve::load::ConfigFormat::Yaml
+        ));
+        assert!(!document_has_tests(
+            "{",
+            crate::serve::load::ConfigFormat::Yaml
+        ));
     }
 
     fn source(sink_line: &str) -> String {
@@ -669,7 +810,9 @@ tests:
         .unwrap();
         assert!(test_version(&s, "ops", 1, None).await.unwrap().passed);
 
-        register(&s, req(source("sink: files\n  overlay: ops"))).await.unwrap();
+        register(&s, req(source("sink: files\n  overlay: ops")))
+            .await
+            .unwrap();
         crate::templates::launch(&s, "ops", VersionSelector::Pinned(1), None)
             .await
             .unwrap();
@@ -680,7 +823,9 @@ tests:
     async fn check_gate_and_version_tests_name_unknown_versions() {
         let s = store().await;
         assert!(matches!(
-            version_tests(&s, "nope", 1, &required(), 1).await.unwrap_err(),
+            version_tests(&s, "nope", 1, &required(), 1)
+                .await
+                .unwrap_err(),
             CliError::UnknownPipelineTemplate { .. }
         ));
         assert!(matches!(
@@ -688,7 +833,17 @@ tests:
             CliError::UnknownPipelineTemplate { .. }
         ));
         register(&s, req(pipeline("orders", 2))).await.unwrap();
-        assert!(check_gate(&s, "orders", 1, &LaunchGate::new(false)).await.unwrap().allowed);
-        assert!(registered_release(&s, "orders", &semver::Version::new(1, 0, 0)).await.unwrap().is_none());
+        assert!(
+            check_gate(&s, "orders", 1, &LaunchGate::new(false))
+                .await
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            registered_release(&s, "orders", &semver::Version::new(1, 0, 0))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

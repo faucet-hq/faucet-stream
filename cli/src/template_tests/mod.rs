@@ -28,7 +28,7 @@ pub mod spec;
 pub use bundle::{Fixture, SuiteRequirement, TestBundle, TestSuiteTemplate};
 pub use gate::{GateStatus, GateVerdict, LaunchGate};
 pub use result::{BundleOutcome, TemplateTestResult};
-pub use runner::{CaseOutcome, SuiteOutcome, Target, run};
 #[cfg(feature = "templates")]
 pub use runner::resolve_target_version;
+pub use runner::{CaseOutcome, SuiteOutcome, Target, run};
 pub use spec::SuiteFile;
