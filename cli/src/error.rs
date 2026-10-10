@@ -378,6 +378,18 @@ pub enum CliError {
     )]
     TestsRequired { id: String },
 
+    /// A version's `tests:` block is larger than a test run accepts (#856).
+    #[error(
+        "template '{id}' v{version}: the `tests:` block is {bytes} bytes, over the {limit}-byte \
+         limit for a test run — move shared cases into a `kind: test-suite` and require it"
+    )]
+    TestBundleTooLarge {
+        id: String,
+        version: u32,
+        bytes: usize,
+        limit: usize,
+    },
+
     /// A connector's `auth: { ref }` named a provider not declared in the
     /// top-level `auth:` catalog.
     #[error(

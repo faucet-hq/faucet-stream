@@ -54,6 +54,47 @@ pub struct TestBundle {
     /// each picked by a semver range over its `release:`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires_suites: Vec<SuiteRequirement>,
+    /// Written by the registry, not by hand: the exact shared-suite releases
+    /// resolved when this version was registered, copied in like a lockfile,
+    /// so a later release or a deleted suite never changes what the version
+    /// tests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locked_suites: Vec<LockedSuite>,
+    /// Written by the registry, not by hand: the version these tests were
+    /// copied from, when this version was registered without a `tests:` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_from: Option<u32>,
+}
+
+/// One shared suite as resolved at registration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LockedSuite {
+    /// The requirement's `name`.
+    pub name: String,
+    /// The requirement's range.
+    pub range: String,
+    /// The release picked.
+    pub release: String,
+    /// The registry version it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_version: Option<u32>,
+    /// The suite document itself.
+    pub suite: Value,
+}
+
+impl TestBundle {
+    /// The locked copy for `req`, when one was written at registration.
+    pub fn locked(&self, req: &SuiteRequirement) -> Option<&LockedSuite> {
+        self.locked_suites
+            .iter()
+            .find(|l| l.name == req.name && l.range == req.version)
+    }
+
+    /// Whether every requirement has its locked copy.
+    pub fn fully_locked(&self) -> bool {
+        self.requires_suites.iter().all(|r| self.locked(r).is_some())
+    }
 }
 
 /// A shared suite named by version range.
@@ -226,10 +267,24 @@ impl TestBundle {
         self.suite.is_empty() && self.fixtures.is_empty() && self.requires_suites.is_empty()
     }
 
+    /// True when the bundle declares nothing to run for a document of
+    /// `kind`. A deployment's bundle is structural: naming its source and
+    /// sink is enough, because composing them and checking the result
+    /// validates and expands is a case of its own.
+    pub fn is_empty_for(&self, kind: TemplateKind) -> bool {
+        self.is_empty()
+            && !(kind == TemplateKind::Deployment && self.source.is_some() && self.sink.is_some())
+    }
+
+    /// Whether running it adds the implicit structural case.
+    pub fn is_structural(&self, kind: TemplateKind) -> bool {
+        kind == TemplateKind::Deployment && self.suite.is_empty() && self.fixtures.is_empty()
+    }
+
     /// Structural checks for a bundle carried by a document of `kind`.
     pub fn validate(&self, kind: TemplateKind) -> CliResult<()> {
         let what = "tests";
-        if self.is_empty() {
+        if self.is_empty_for(kind) {
             return Err(CliError::Config(
                 "tests: the block declares no cases — add `suite:`, `fixtures:` or \
                  `requires_suites:`. An empty bundle would record a green result for nothing."
@@ -298,6 +353,19 @@ impl TestBundle {
             }
             parse_range(r)?;
         }
+        for l in &self.locked_suites {
+            if !self
+                .requires_suites
+                .iter()
+                .any(|r| r.name == l.name && r.version == l.range)
+            {
+                return Err(CliError::Config(format!(
+                    "tests: `locked_suites` names '{}' ({}), which `requires_suites` does not \
+                     require",
+                    l.name, l.range
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -364,7 +432,7 @@ pub fn bundle_of(doc: &Value, kind: TemplateKind) -> CliResult<Option<TestBundle
     };
     let bundle: TestBundle =
         serde_json::from_value(raw.clone()).map_err(|e| CliError::Config(format!("tests: {e}")))?;
-    if bundle.is_empty() {
+    if bundle.is_empty_for(kind) {
         return Ok(None);
     }
     bundle.validate(kind)?;

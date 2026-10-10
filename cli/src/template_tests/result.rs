@@ -1,5 +1,5 @@
 //! The recorded outcome of running a template version's test bundle (#856),
-//! and the launch gate that reads it.
+//! with the provenance that decides whether it still counts.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -83,24 +83,54 @@ impl BundleOutcome {
     }
 }
 
-/// A bundle run recorded on one template version.
+/// The result shape this binary writes. A result with another (older)
+/// schema never counts as evidence.
+pub const RESULT_SCHEMA: u32 = 1;
+
+/// Who and what produced a result, besides the body and the binary.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// The connectors and transforms compiled into the binary
+    /// (`source:csv`, `sink:jsonl`, `transform:flatten`, …), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_features: Vec<String>,
+    /// Custom connectors registered through a `PluginRegistry`, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<String>,
+    /// The companion templates the bundle ran with (`id@version`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub companions: Vec<String>,
+    /// The `faucet serve` instance that ran it; `None` for the CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+}
+
+/// A bundle run recorded on one template version: the evidence a label move
+/// relies on. Produced only by a test run, never accepted from a caller.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TemplateTestResult {
+    /// This result's id — what a label move records as its evidence.
+    #[serde(default)]
+    pub result_id: String,
+    /// Result shape version ([`RESULT_SCHEMA`]).
+    #[serde(default)]
+    pub schema: u32,
     pub id: String,
     pub version: u32,
-    /// sha256 of the version body the run tested. A result whose hash differs
-    /// from the stored body (a version number reused after a delete) never
-    /// satisfies the gate.
+    /// sha256 of the version body the run tested.
     pub body_sha256: String,
     pub passed: bool,
-    /// The faucet binary that ran it. The gate accepts a result only from the
-    /// running binary's major version.
+    /// The full version of the faucet binary that ran it.
     pub faucet_version: String,
     pub recorded_at: DateTime<Utc>,
     pub duration_ms: u64,
+    /// Who asked for the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_by: Option<String>,
+    #[serde(default, flatten)]
+    pub provenance: Provenance,
     pub cases: Vec<CaseResult>,
+    /// The shared-suite releases the run used.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suites: Vec<ResolvedSuiteRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,9 +145,18 @@ pub fn faucet_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Major component of a faucet version string (`None` when unparseable).
-pub fn major_of(version: &str) -> Option<u64> {
-    semver::Version::parse(version).ok().map(|v| v.major)
+/// `(major, minor)` of a faucet version string (`None` when unparseable).
+pub fn release_line(version: &str) -> Option<(u64, u64)> {
+    semver::Version::parse(version)
+        .ok()
+        .map(|v| (v.major, v.minor))
+}
+
+/// `major.minor` of the running binary, as stored in the revalidation marker.
+pub fn running_line() -> String {
+    release_line(faucet_version())
+        .map(|(a, b)| format!("{a}.{b}"))
+        .unwrap_or_else(|| faucet_version().to_string())
 }
 
 impl TemplateTestResult {
@@ -129,6 +168,8 @@ impl TemplateTestResult {
         recorded_by: Option<String>,
     ) -> Self {
         Self {
+            result_id: uuid::Uuid::new_v4().to_string(),
+            schema: RESULT_SCHEMA,
             id: id.to_string(),
             version,
             body_sha256,
@@ -137,6 +178,7 @@ impl TemplateTestResult {
             recorded_at: Utc::now(),
             duration_ms: outcome.duration_ms,
             recorded_by,
+            provenance: Provenance::default(),
             cases: outcome.cases,
             suites: outcome.suites,
             error: outcome.error,
@@ -151,13 +193,6 @@ impl TemplateTestResult {
             error: self.error.clone(),
             duration_ms: self.duration_ms,
         }
-    }
-
-    /// Whether this result may stand in for `body_sha256` under `major`.
-    pub fn counts_for(&self, body_sha256: &str, major: Option<u64>) -> bool {
-        self.body_sha256 == body_sha256
-            && major.is_some()
-            && major_of(&self.faucet_version) == major
     }
 }
 
@@ -244,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_counts_only_for_its_body_and_the_running_major() {
+    fn a_new_result_carries_an_id_the_schema_and_the_binary() {
         let r = TemplateTestResult::new(
             "t",
             1,
@@ -255,14 +290,16 @@ mod tests {
             },
             Some("ci".into()),
         );
-        assert!(r.passed);
-        let major = major_of(faucet_version());
-        assert!(r.counts_for("abc", major));
-        assert!(!r.counts_for("other", major));
-        assert!(!r.counts_for("abc", major.map(|m| m + 1)));
-        assert!(!r.counts_for("abc", None));
+        assert!(r.passed && !r.result_id.is_empty());
+        assert_eq!(r.schema, RESULT_SCHEMA);
+        assert_eq!(r.faucet_version, faucet_version());
         assert_eq!(r.outcome().cases.len(), 1);
-        assert_eq!(major_of("not a version"), None);
+        assert_eq!(release_line("1.13.3"), Some((1, 13)));
+        assert_eq!(release_line("not a version"), None);
+        assert_eq!(running_line().matches('.').count(), 1);
+        let json = serde_json::to_value(&r).unwrap();
+        let back: TemplateTestResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]

@@ -253,6 +253,21 @@ fn global() -> &'static PluginRegistry {
     GLOBAL_REGISTRY.get_or_init(PluginRegistry::default)
 }
 
+/// The custom connectors registered through a [`PluginRegistry`]
+/// (`source:<name>` / `sink:<name>`), sorted — part of a template test
+/// result's provenance (#856).
+pub fn plugin_connectors() -> Vec<String> {
+    let g = global();
+    let mut out: Vec<String> = g
+        .sources
+        .keys()
+        .map(|n| format!("source:{n}"))
+        .chain(g.sinks.keys().map(|n| format!("sink:{n}")))
+        .collect();
+    out.sort();
+    out
+}
+
 type Built<T> = std::pin::Pin<Box<dyn std::future::Future<Output = CliResult<Box<T>>> + Send>>;
 
 /// Await a source constructor on the heap, so the future of the `match` in
@@ -2473,7 +2488,7 @@ pub fn source_descriptions() -> Vec<(&'static str, &'static str)> {
 
 /// One-line summary of every compiled-in built-in source connector (no customs).
 #[allow(clippy::vec_init_then_push)]
-fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
+pub(crate) fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&'static str, &'static str)> = Vec::new();
     #[cfg(feature = "source-rest")]
     v.push(("rest", "REST API source with pagination, auth, transforms"));
@@ -2626,7 +2641,7 @@ pub fn sink_descriptions() -> Vec<(&'static str, &'static str)> {
 
 /// One-line summary of every compiled-in built-in sink connector (no customs).
 #[allow(clippy::vec_init_then_push)]
-fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
+pub(crate) fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&'static str, &'static str)> = Vec::new();
     #[cfg(feature = "sink-bigquery")]
     v.push((

@@ -354,11 +354,17 @@ fn render_list(
         .max()
         .unwrap_or(0)
         .max(12);
-    let tests = |t: Option<&crate::template_tests::TestBundle>| {
+    let status_of = |subdir: &str, id: &str| -> Option<String> {
+        index
+            .and_then(|i| i.entry(subdir, id))
+            .and_then(|e| e.stable_test_status.clone())
+    };
+    let tests = |t: Option<&crate::template_tests::TestBundle>, status: Option<String>| {
         let f = hub::catalog::tests_fields(t);
-        match f["test_cases"].as_u64() {
+        match (status, f["test_cases"].as_u64()) {
+            (Some(s), _) if s != "no_tests" => format!("tests {}", s.replace('_', " ")),
             _ if f["has_tests"] != true => "no tests".to_string(),
-            Some(n) if n > 0 => format!("{n} test(s)"),
+            (_, Some(n)) if n > 0 => format!("{n} test(s)"),
             _ => "tested".to_string(),
         }
     };
@@ -366,11 +372,11 @@ fn render_list(
     for &i in &src_order {
         let s = &cat.sources[i].1;
         out.push_str(&format!(
-            "  {:<w$} {:<10} {:>3} stream(s) {:<11} {:>7} {:<10}  {}\n",
+            "  {:<w$} {:<10} {:>3} stream(s) {:<14} {:>7} {:<10}  {}\n",
             src_ids[i],
             s.source.kind,
             s.streams.len(),
-            tests(s.tests.as_ref()),
+            tests(s.tests.as_ref(), status_of(SOURCE_DIR, &src_ids[i])),
             stars(&src_trust[i]),
             updated(&src_trust[i]),
             s.description.as_deref().unwrap_or("")
@@ -380,7 +386,7 @@ fn render_list(
     for &i in &snk_order {
         let k = &cat.sinks[i].1;
         out.push_str(&format!(
-            "  {:<w$} {:<10} {:<28} {:<11} {:>7} {:<10}  {}\n",
+            "  {:<w$} {:<10} {:<28} {:<14} {:>7} {:<10}  {}\n",
             snk_ids[i],
             k.sink.kind,
             crate::registry::sink_supported_write_modes(&k.sink.kind)
@@ -388,7 +394,7 @@ fn render_list(
                 .map(|m| m.as_str())
                 .collect::<Vec<_>>()
                 .join("|"),
-            tests(k.tests.as_ref()),
+            tests(k.tests.as_ref(), status_of(SINK_DIR, &snk_ids[i])),
             stars(&snk_trust[i]),
             updated(&snk_trust[i]),
             k.description.as_deref().unwrap_or("")

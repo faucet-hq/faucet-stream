@@ -141,9 +141,24 @@ impl SyncPlan {
 /// Content hash of a template body after canonicalization (comments stripped,
 /// keys re-emitted in canonical YAML), so a formatting-only edit upstream does
 /// not register a new version. JSON bodies canonicalize the same way.
+///
+/// What the registry writes into a version itself — tests a version inherited
+/// and the lock of its shared suites (#856) — is not origin content, so it is
+/// left out: an origin body never matches its stored version otherwise.
 pub fn body_hash(body: &str) -> CliResult<String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(body)
+    let mut value: serde_yaml::Value = serde_yaml::from_str(body)
         .map_err(|e| CliError::Config(format!("body is not valid YAML/JSON: {e}")))?;
+    if let Some(map) = value.as_mapping_mut() {
+        let inherited = map
+            .get("tests")
+            .and_then(|t| t.get("inherited_from"))
+            .is_some();
+        if inherited {
+            map.remove("tests");
+        } else if let Some(t) = map.get_mut("tests").and_then(|t| t.as_mapping_mut()) {
+            t.remove("locked_suites");
+        }
+    }
     let canonical = serde_yaml::to_string(&value)
         .map_err(|e| CliError::Config(format!("body could not be canonicalized: {e}")))?;
     let digest = Sha256::digest(canonical.as_bytes());
@@ -407,6 +422,16 @@ mod tests {
         assert_ne!(a, c);
         // JSON canonicalizes to the same YAML.
         assert_eq!(a, body_hash(r#"{"version":1,"name":"a"}"#).unwrap());
+        // What the registry writes into a version is not origin content.
+        let inherited = body_hash(
+            "version: 1\nname: a\ntests:\n  inherited_from: 2\n  suite: { auto: { defaults_baseline: true } }\n",
+        )
+        .unwrap();
+        assert_eq!(a, inherited);
+        let own = "version: 1\nname: a\ntests:\n  requires_suites: [{ name: s, version: '1' }]\n";
+        let locked = format!("{own}  locked_suites: [{{ name: s, range: '1', release: 1.0.0, suite: {{}} }}]\n");
+        assert_eq!(body_hash(own).unwrap(), body_hash(&locked).unwrap());
+        assert_ne!(a, body_hash(own).unwrap());
         assert!(body_hash(": : :").is_err());
     }
 

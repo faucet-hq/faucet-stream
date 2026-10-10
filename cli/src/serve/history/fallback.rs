@@ -684,8 +684,21 @@ impl RunHistory for FallbackHistory {
         id: &str,
         tag: &str,
         version: u32,
+        evidence: Option<&super::templates::EvidenceClaim>,
     ) -> Result<(), HistoryError> {
-        strict!(self, p => p.template_set_tag(id, tag, version), f => f.template_set_tag(id, tag, version))
+        strict!(self, p => p.template_set_tag(id, tag, version, evidence), f => f.template_set_tag(id, tag, version, evidence))
+    }
+    async fn template_tag_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<super::templates::TagRecord>, HistoryError> {
+        strict!(self, p => p.template_tag_records(id), f => f.template_tag_records(id))
+    }
+    async fn meta_get(&self, key: &str) -> Result<Option<String>, HistoryError> {
+        strict!(self, p => p.meta_get(key), f => f.meta_get(key))
+    }
+    async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
+        strict!(self, p => p.meta_put(key, value), f => f.meta_put(key, value))
     }
     async fn template_tags(
         &self,
@@ -701,11 +714,12 @@ impl RunHistory for FallbackHistory {
         id: &str,
         version: u32,
         launched_by: Option<&str>,
+        evidence: Option<&super::templates::EvidenceClaim>,
     ) -> Result<Option<u32>, HistoryError> {
         strict!(
             self,
-            p => p.template_launch(id, version, launched_by),
-            f => f.template_launch(id, version, launched_by)
+            p => p.template_launch(id, version, launched_by, evidence),
+            f => f.template_launch(id, version, launched_by, evidence)
         )
     }
     async fn template_record_test(

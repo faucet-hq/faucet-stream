@@ -20,6 +20,23 @@ use std::sync::Arc;
 
 /// Map a registry read/write failure: a degraded run-history backend is
 /// [`CliError::HistoryUnavailable`] (retryable), anything else internal.
+/// A failed label write: evidence that stopped deciding the version is a
+/// refusal, anything else a registry error.
+fn label_write_err(
+    id: &str,
+    version: u32,
+    action: &str,
+    what: &str,
+    e: history::HistoryError,
+) -> CliError {
+    match e {
+        history::HistoryError::StaleEvidence(why) => {
+            crate::templates::bundle::stale_evidence(id, version, action, why)
+        }
+        other => registry_err(what, other),
+    }
+}
+
 pub(crate) fn registry_err(what: &str, e: history::HistoryError) -> CliError {
     match e {
         history::HistoryError::Degraded(m) => CliError::HistoryUnavailable(m),
@@ -312,17 +329,40 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
             .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
             .is_empty()
     {
-        let (from, tests) = crate::templates::bundle::inheritable_tests(store, id.as_str())
+        let (from, mut tests) = crate::templates::bundle::inheritable_tests(store, id.as_str())
             .await?
             .ok_or_else(|| CliError::TestsRequired {
                 id: id.as_str().to_string(),
             })?;
+        if let Some(t) = tests.as_object_mut() {
+            t.insert("inherited_from".into(), Value::from(from));
+        }
         body = crate::templates::bundle::with_tests(&req.body, req.format, &tests)?;
         bundle = crate::template_tests::bundle::bundle_of(&parse_body(&body, req.format)?, kind)?;
         tests_inherited_from = Some(from);
     }
-    if let Some(b) = &bundle {
-        crate::templates::bundle::resolve_shared(store, &b.requires_suites).await?;
+    // Shared suites are copied in at their resolved releases, like a
+    // lockfile: an unsatisfiable range fails here, and a later release or a
+    // deleted suite never changes what this version tests. Inherited tests
+    // keep the lock they were registered with.
+    if let Some(b) = &bundle
+        && !b.requires_suites.is_empty()
+        && (tests_inherited_from.is_none() || !b.fully_locked())
+    {
+        let locked = crate::templates::bundle::lock_suites(store, b).await?;
+        let mut tests = parse_body(&body, req.format)?
+            .get("tests")
+            .cloned()
+            .unwrap_or_default();
+        if let Some(t) = tests.as_object_mut() {
+            t.insert(
+                "locked_suites".into(),
+                serde_json::to_value(&locked)
+                    .map_err(|e| CliError::Internal(format!("locking shared suites: {e}")))?,
+            );
+        }
+        body = crate::templates::bundle::with_tests(&body, req.format, &tests)?;
+        bundle = crate::template_tests::bundle::bundle_of(&parse_body(&body, req.format)?, kind)?;
     }
     Ok(Prelude {
         doc,
@@ -754,12 +794,13 @@ pub async fn promote(
     if current.get(tag.as_str()) == Some(&version) {
         return Ok(version);
     }
-    crate::templates::bundle::require_passing(store, id, version, &format!("channel `{tag}`"))
-        .await?;
+    let action = format!("channel `{tag}`");
+    let (_, claim) =
+        crate::templates::bundle::require_passing(store, id, version, &action).await?;
     store
-        .template_set_tag(id, tag.as_str(), version)
+        .template_set_tag(id, tag.as_str(), version, Some(&claim))
         .await
-        .map_err(|e| crate::templates::store::registry_err("template channel write", e))?;
+        .map_err(|e| label_write_err(id, version, &action, "template channel write", e))?;
     Ok(version)
 }
 
@@ -823,11 +864,12 @@ pub async fn launch(
             tests: None,
         });
     }
-    let verdict = crate::templates::bundle::require_passing(store, id, version, "launch").await?;
+    let (verdict, claim) =
+        crate::templates::bundle::require_passing(store, id, version, "launch").await?;
     let seq = store
-        .template_launch(id, version, launched_by)
+        .template_launch(id, version, launched_by, Some(&claim))
         .await
-        .map_err(|e| crate::templates::store::registry_err("template launch write", e))?;
+        .map_err(|e| label_write_err(id, version, "launch", "template launch write", e))?;
     Ok(LaunchOutcome {
         version,
         replaced: before.stable,
@@ -1140,7 +1182,18 @@ pub async fn materialize_for_run_selected(
     mode: Materialize,
     selection: Option<&crate::select::SelectionRequest>,
 ) -> CliResult<MaterializedConfig> {
-    let untested = run_gate(store, id, version, sink.allow_untested).await?;
+    let mut untested = run_gate(store, id, version, sink.allow_untested).await?;
+    // Each composed part is checked through its own label.
+    if let Some(sink_id) = &sink.id
+        && let Ok(v) = resolve_version(store, sink_id, sink.version).await
+    {
+        untested = untested.or(run_gate(store, sink_id, v, sink.allow_untested).await?);
+    }
+    if let Some(OverlayChoice::Registered { id: oid, version: sel }) = &sink.overlay
+        && let Ok(v) = resolve_version(store, oid, *sel).await
+    {
+        untested = untested.or(run_gate(store, oid, v, sink.allow_untested).await?);
+    }
     let mut m = materialize_kind(
         store,
         id,
@@ -1156,22 +1209,28 @@ pub async fn materialize_for_run_selected(
     Ok(m)
 }
 
-/// Whether a run of `id`@`version` may go ahead (#856). A draft template (never
-/// launched) runs any version. After a launch, a version whose tests are not
-/// `passing` runs only with `allow_untested`, and then its status is returned
-/// so the caller can label and audit the run.
+/// Whether a run of `id`@`version` may go ahead (#856).
+///
+/// A label authorizes the runs through it: a version that holds `stable`, a
+/// channel or `newest` always runs, even when a faucet upgrade has made its
+/// evidence stale — the label was justified when it moved. A draft template
+/// (never launched) runs any version. Otherwise, after a launch, a version
+/// whose tests are not `passing` runs only with `allow_untested`, and then
+/// its status is returned so the caller can label and audit the run.
 pub async fn run_gate(
     store: &TemplateStore,
     id: &str,
     version: u32,
     allow_untested: bool,
 ) -> CliResult<Option<crate::template_tests::TestStatus>> {
-    let launched = !store
-        .template_launches(id)
-        .await
-        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
-        .is_empty();
-    if !launched {
+    let state = template_state(store, id).await?;
+    if state.stable.is_none() {
+        return Ok(None);
+    }
+    let labelled = state.stable == Some(version)
+        || state.newest == Some(version)
+        || state.tags.values().any(|v| *v == version);
+    if labelled {
         return Ok(None);
     }
     let st = crate::templates::bundle::version_status(store, id, version).await?;
@@ -1184,8 +1243,8 @@ pub async fn run_gate(
     let mut refusal = st.refusal(id, version, "a run");
     if let CliError::VersionNotPassing { reason, .. } = &mut refusal {
         reason.push_str(
-            " — or run it anyway with `allow_untested` (`--allow-untested`), which labels and \
-             audits the run",
+            " — run a version that holds a label, or run this one anyway with \
+             `allow_untested` (`--allow-untested`), which labels and audits the run",
         );
     }
     Err(refusal)

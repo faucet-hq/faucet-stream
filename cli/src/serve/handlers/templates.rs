@@ -1211,6 +1211,24 @@ pub async fn trigger_template_outcome(
             "a tenant-scoped principal may not override a template's environment (`env`)".into(),
         ));
     }
+    // A run for a tenant never runs a version whose tests are not passing
+    // (#856): `allow_untested` is an operator's escape hatch, not a tenant's.
+    if actor.tenant.is_some() && body.allow_untested {
+        crate::serve::audit::write_target_detail(
+            &state,
+            &actor,
+            "template.run",
+            format!("template:{id}"),
+            "allow_untested refused for a tenant".into(),
+            "denied",
+        )
+        .await;
+        return Err(ServeError::Forbidden(
+            "`allow_untested` is never allowed for a tenant-scoped principal or a run made for a \
+             tenant — run a version that holds a label"
+                .into(),
+        ));
+    }
     let overlay = body.overlay_choice();
     let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
     // Resolve through the registry: a channel needs a lookup, and an unpinned

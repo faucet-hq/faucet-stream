@@ -166,21 +166,63 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Run `once` up to `1 + retries` times, stopping at the first pass. Returns
+tokio::task_local! {
+    /// The limits and deadline of the bundle run in progress (#856).
+    static RUN_LIMITS: (super::trust::TestLimits, tokio::time::Instant);
+}
+
+/// Run `fut` under `limits`: every case started inside is held to the
+/// per-case timeout and fails once the run's budget is spent.
+pub async fn with_run_limits<F: std::future::Future>(
+    limits: super::trust::TestLimits,
+    fut: F,
+) -> F::Output {
+    RUN_LIMITS
+        .scope((limits, tokio::time::Instant::now() + limits.run_budget), fut)
+        .await
+}
+
+/// Run `once` up to `1 + retries` times, stopping at the first pass, within
+/// the per-case time limit and whatever is left of the run's budget. Returns
 /// the last failure (`None` on a pass) and the attempts used.
 async fn attempt<F, Fut>(retries: u32, mut once: F) -> (Option<String>, u32)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = CliResult<Option<String>>>,
 {
+    let (limits, run_deadline) = RUN_LIMITS
+        .try_with(|l| (l.0, Some(l.1)))
+        .unwrap_or((super::trust::limits(), None));
+    let case_deadline = tokio::time::Instant::now() + limits.case_timeout;
+    let (deadline, by_run) = match run_deadline {
+        Some(r) if r < case_deadline => (r, true),
+        _ => (case_deadline, false),
+    };
+    let ran_out = || {
+        if by_run {
+            format!(
+                "the test run's {}s time budget ran out",
+                limits.run_budget.as_secs()
+            )
+        } else {
+            format!(
+                "timed out after {}s (the per-case limit)",
+                limits.case_timeout.as_secs()
+            )
+        }
+    };
     let mut attempts = 0;
     let mut last = None;
     while attempts <= retries {
+        if tokio::time::Instant::now() >= deadline {
+            return (Some(ran_out()), attempts.max(1));
+        }
         attempts += 1;
-        last = match once().await {
-            Ok(None) => return (None, attempts),
-            Ok(Some(msg)) => Some(msg),
-            Err(e) => Some(e.to_string()),
+        last = match tokio::time::timeout_at(deadline, once()).await {
+            Ok(Ok(None)) => return (None, attempts),
+            Ok(Ok(Some(msg))) => Some(msg),
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => return (Some(ran_out()), attempts),
         };
     }
     (last, attempts)
@@ -477,7 +519,7 @@ async fn behavioral_inner(
         &node,
         input,
         b.page_size.unwrap_or(0),
-        chrono::Utc::now().fixed_offset(),
+        super::trust::pinned_clock(),
     );
     evaluate(&resolved, &expect).await
 }
@@ -487,7 +529,7 @@ async fn fixture_inner(f: &Fixture, target: &Target<'_>) -> CliResult<Option<Str
     let clock = match &f.clock {
         Some(s) => crate::commands::run::resolve_run_clock(Some(s))
             .map_err(|e| CliError::Config(format!("fixture '{}': clock: {e}", f.name)))?,
-        None => chrono::Utc::now().fixed_offset(),
+        None => super::trust::pinned_clock(),
     };
     let resolved = match &f.pipeline {
         Some(p) => crate::pipeline_test::runner::ResolvedCase {
@@ -596,6 +638,23 @@ fn pick_row<'a>(
 
 /// Materialize the template body for one param combination.
 async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> CliResult<String> {
+    // A secret param only ever gets a placeholder here: a value a case names
+    // for one is refused, and a required one is filled in.
+    let mut owned = supplied.clone();
+    for (name, p) in declared_params(target).await? {
+        if !p.secret {
+            continue;
+        }
+        let placeholder = p.kind.placeholder();
+        match owned.get(&name) {
+            Some(v) if *v != placeholder => return Err(super::trust::secret_param_refused(&name)),
+            None if p.required && p.default.is_none() => {
+                owned.insert(name, placeholder);
+            }
+            _ => {}
+        }
+    }
+    let supplied = &owned;
     match target {
         // `Materialize::Local` (not `Persisted`): a suite runs in this
         // process, so load-time directives resolve here exactly as they would
@@ -617,20 +676,43 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
                 overlay: overlay.clone(),
                 allow_untested: true,
             };
-            Ok(crate::templates::materialize_for_run(
+            if super::trust::server_policy().is_none() {
+                return Ok(crate::templates::materialize_for_run(
+                    store,
+                    id,
+                    *version,
+                    &choice,
+                    supplied,
+                    &BTreeMap::new(),
+                    crate::templates::Materialize::Local,
+                )
+                .await?
+                .body);
+            }
+            // On a server: screen the composed document before any load-time
+            // directive in it is resolved, as a submitted config would be.
+            let body = crate::templates::materialize_for_run(
                 store,
                 id,
                 *version,
                 &choice,
                 supplied,
                 &BTreeMap::new(),
-                crate::templates::Materialize::Local,
+                crate::templates::Materialize::Persisted,
             )
             .await?
-            .body)
+            .body;
+            let mut doc: Value = serde_json::from_str(&body)
+                .or_else(|_| serde_yaml::from_str(&body))
+                .map_err(|e| CliError::Internal(format!("template test: {e}")))?;
+            super::trust::screen(&doc)?;
+            crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
+            serde_json::to_string(&doc)
+                .map_err(|e| CliError::Internal(format!("template test: {e}")))
         }
         Target::Document { .. } => {
             let mut doc = effective_document(target).await?;
+            super::trust::screen(&doc)?;
             // The env/file/secret pass a local materialization runs first (CLI-121).
             crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
             crate::params::bind_document(&mut doc, supplied, crate::params::BindMode::Strict)?;

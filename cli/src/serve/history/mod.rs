@@ -368,6 +368,10 @@ pub enum HistoryError {
     /// degraded fallback.
     #[error("run-history backend error: {0}")]
     Unreachable(String),
+    /// A label move's evidence stopped deciding the version between the check
+    /// and the write (#856); the move was not made.
+    #[error("{0}")]
+    StaleEvidence(String),
 }
 
 impl HistoryError {
@@ -1492,13 +1496,18 @@ pub trait RunHistory: Send + Sync {
     /// Point a named channel (`dev`, `prod`, …) at an existing version, moving it
     /// if it was already set. `latest` is derived from the version list and never
     /// stored, so callers reject it before reaching here. Default: unsupported.
+    ///
+    /// With `evidence`, the version's results are re-read in the same
+    /// transaction and the move is refused with
+    /// [`HistoryError::StaleEvidence`] unless that result still decides it.
     async fn template_set_tag(
         &self,
         id: &str,
         tag: &str,
         version: u32,
+        evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<(), HistoryError> {
-        let _ = (id, tag, version);
+        let _ = (id, tag, version, evidence);
         Err(HistoryError::Backend(
             "this run-history backend does not support pipeline-template channels".into(),
         ))
@@ -1509,6 +1518,24 @@ pub trait RunHistory: Send + Sync {
     async fn template_tags(&self, id: &str) -> Result<BTreeMap<String, u32>, HistoryError> {
         let _ = id;
         Ok(BTreeMap::new())
+    }
+
+    /// Every stored channel pointer with the evidence it moved on. Default:
+    /// [`template_tags`](Self::template_tags) without evidence.
+    async fn template_tag_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::TagRecord>, HistoryError> {
+        Ok(self
+            .template_tags(id)
+            .await?
+            .into_iter()
+            .map(|(tag, version)| templates::TagRecord {
+                tag,
+                version,
+                evidence: None,
+            })
+            .collect())
     }
 
     /// Remove one channel pointer. Returns whether it existed. Default: `false`.
@@ -1522,13 +1549,17 @@ pub trait RunHistory: Send + Sync {
     /// stable (a re-launch is a no-op, which keeps `previous` meaningful rather
     /// than letting it degrade into a duplicate of `stable`). Default:
     /// unsupported.
+    ///
+    /// With `evidence`, checked against the version's results in the same
+    /// transaction as [`template_set_tag`](Self::template_set_tag) does.
     async fn template_launch(
         &self,
         id: &str,
         version: u32,
         launched_by: Option<&str>,
+        evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<Option<u32>, HistoryError> {
-        let _ = (id, version, launched_by);
+        let _ = (id, version, launched_by, evidence);
         Err(HistoryError::Backend(
             "this run-history backend does not support pipeline-template launches".into(),
         ))
@@ -1612,6 +1643,21 @@ pub trait RunHistory: Send + Sync {
     ) -> Result<Vec<templates::TemplateTestResult>, HistoryError> {
         let _ = (id, version, limit);
         Ok(Vec::new())
+    }
+
+    /// A small server-wide setting (#856: the faucet release line templates
+    /// were last revalidated under). Default: none.
+    async fn meta_get(&self, key: &str) -> Result<Option<String>, HistoryError> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Store a server-wide setting. Default: unsupported.
+    async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
+        let _ = (key, value);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store server settings".into(),
+        ))
     }
 
     /// The template's full release state: versions, launch-derived `stable` /

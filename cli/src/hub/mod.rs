@@ -839,6 +839,10 @@ pub struct IndexEntry {
     /// Cases its `tests:` block writes out (#856).
     #[serde(default)]
     pub test_cases: usize,
+    /// The test status of the version the catalog marks stable (`passing`,
+    /// `failing`, `no_tests`), when the catalog records one (#856).
+    #[serde(default)]
+    pub stable_test_status: Option<String>,
     /// Stars, freshness and track record, when the catalog records them (#685).
     #[serde(default)]
     pub trust: Option<trust::TrustSignals>,

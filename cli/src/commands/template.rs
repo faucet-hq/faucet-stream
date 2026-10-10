@@ -8,7 +8,7 @@
 
 use crate::cli::{
     TemplateArgs, TemplateCommand, TemplateDeleteArgs, TemplateDeprecateArgs, TemplateLaunchArgs,
-    TemplateListArgs, TemplatePromoteArgs, TemplateRegisterArgs, TemplateRollbackArgs,
+    TemplateListArgs, TemplateRevalidateArgs, TemplatePromoteArgs, TemplateRegisterArgs, TemplateRollbackArgs,
     TemplateRunArgs, TemplateShowArgs, TemplateStoreArgs,
 };
 use crate::error::{CliError, CliResult};
@@ -23,6 +23,7 @@ pub async fn run(args: TemplateArgs) -> CliResult<()> {
     match args.command {
         TemplateCommand::Register(a) => register(a).await,
         TemplateCommand::List(a) => list(a).await,
+        TemplateCommand::Revalidate(a) => revalidate(a).await,
         TemplateCommand::Show(a) => show(a).await,
         TemplateCommand::Launch(a) => launch(a).await,
         TemplateCommand::Rollback(a) => rollback(a).await,
@@ -279,6 +280,29 @@ fn print_params(summary: &TemplateSummary) {
             }
         );
     }
+}
+
+async fn revalidate(args: TemplateRevalidateArgs) -> CliResult<()> {
+    let store = connect(&args.common).await?;
+    let report = crate::templates::revalidate::revalidate(&store, None).await?;
+    store
+        .meta_put(
+            crate::templates::revalidate::META_KEY,
+            &report.faucet,
+        )
+        .await
+        .map_err(|e| crate::templates::store::registry_err("server setting write", e))?;
+    if args.common.json {
+        println!("{}", to_pretty(&report)?);
+    } else {
+        print!("{}", report.render_human());
+    }
+    if report.failed() > 0 {
+        return Err(CliError::TestsFailed {
+            failed: report.failed(),
+        });
+    }
+    Ok(())
 }
 
 async fn list(args: TemplateListArgs) -> CliResult<()> {

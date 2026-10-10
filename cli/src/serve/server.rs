@@ -835,6 +835,18 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
+    // Template tests this server runs are screened like submitted configs
+    // and record this instance on their results (#856).
+    #[cfg(feature = "templates")]
+    {
+        crate::template_tests::trust::install_server_policy(
+            crate::template_tests::trust::ServerTestPolicy {
+                instance: instance_id.clone(),
+                allow_subprocess: config.allow_subprocess_connectors,
+            },
+        );
+        crate::templates::metrics::describe();
+    }
     #[cfg(feature = "policy")]
     if let Some(p) = policy {
         tracing::info!(rules = p.rules.len(), "data-flow policy loaded");
@@ -877,6 +889,24 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         }
         None => Vec::new(),
     };
+    // On a new faucet release line, re-test every label holder and rollback
+    // target in the background; it records results only (#856).
+    #[cfg(feature = "templates")]
+    {
+        let store: crate::templates::TemplateStore = state.history();
+        tokio::spawn(async move {
+            match crate::templates::revalidate::revalidate_if_new_release(&store).await {
+                Ok(Some(r)) => tracing::info!(
+                    versions = r.versions.len(),
+                    failed = r.failed(),
+                    faucet = %r.faucet,
+                    "revalidated template versions under a new faucet release"
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "template revalidation failed"),
+            }
+        });
+    }
     let app = build_router(state.clone(), &config, &mcp);
 
     let listener = tokio::net::TcpListener::bind(config.listen)

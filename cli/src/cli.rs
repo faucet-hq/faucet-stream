@@ -628,6 +628,10 @@ pub enum TemplateCommand {
     Rows(TemplateRowsArgs),
     /// Run a parameter-combination test suite against a template (#648).
     Test(TemplateTestArgs),
+    /// Re-run the tests of every version that holds a label or is a rollback
+    /// target, under this faucet release (#856). Records results only; never
+    /// moves a label.
+    Revalidate(TemplateRevalidateArgs),
     /// Pull templates from the origins in a `--config` sync file into the
     /// registry (RFC 0006). Appends new versions, never deletes.
     #[cfg(feature = "templates-sync")]
@@ -846,6 +850,13 @@ pub struct TemplateListArgs {
     /// Show only templates of this kind.
     #[arg(long, value_enum)]
     pub kind: Option<TemplateKindArg>,
+}
+
+/// `faucet template revalidate`.
+#[derive(Debug, Parser)]
+pub struct TemplateRevalidateArgs {
+    #[command(flatten)]
+    pub common: TemplateStoreArgs,
 }
 
 /// `--kind` filter for `faucet template list`.

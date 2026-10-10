@@ -664,15 +664,20 @@ pub fn registry_run_command(source: &SourceTemplate, sink: &SinkTemplate) -> Str
 
 /// The index fields describing a template's `tests:` block (#856):
 /// `has_tests`, `test_cases` (cases written out — `cases`, `behavioral`,
-/// `fixtures`; `combine` / `auto` generate more at run time) and
-/// `requires_suites`.
+/// `fixtures`; `combine` / `auto` generate more at run time) and, where a
+/// status follows from the document alone, `stable_test_status` (`no_tests`).
+/// A catalog that runs each template's bundle in CI sets
+/// `stable_test_status` for the rest (`passing` / `failing`).
 pub fn tests_fields(tests: Option<&crate::template_tests::TestBundle>) -> Value {
     let t = tests.filter(|t| !t.is_empty());
-    json!({
+    let mut out = json!({
         "has_tests": t.is_some(),
         "test_cases": t.map_or(0, |t| t.suite.cases.len() + t.suite.behavioral.len() + t.fixtures.len()),
-        "requires_suites": t.map(|t| t.requires_suites.iter().map(|r| json!({"name": r.name, "version": r.version})).collect::<Vec<_>>()).unwrap_or_default(),
-    })
+    });
+    if t.is_none() {
+        out["stable_test_status"] = json!("no_tests");
+    }
+    out
 }
 
 fn with_tests(mut entry: Value, tests: Option<&crate::template_tests::TestBundle>) -> Value {

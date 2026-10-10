@@ -51,6 +51,8 @@
 //! distinction is enforced.
 
 pub mod bundle;
+pub mod metrics;
+pub mod revalidate;
 pub mod rows;
 pub mod store;
 pub use crate::template_tests as suite;

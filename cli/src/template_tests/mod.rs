@@ -13,6 +13,7 @@
 //! - [`runner`] — materialize per combination, then validate or run fixtures.
 //! - [`run`] — a whole bundle, shared suites included.
 //! - [`result`] / [`gate`] — what a run records and what a launch requires.
+//! - [`trust`] — the server's trust boundary and the limits of a run.
 //! - [`report`] — human checklist + `--json`.
 
 pub mod bundle;
@@ -24,6 +25,7 @@ pub mod run;
 pub mod runner;
 pub mod selector;
 pub mod spec;
+pub mod trust;
 
 pub use bundle::{Fixture, SuiteRequirement, TestBundle, TestSuiteTemplate};
 pub use gate::{TestStatus, VersionStatus, status_of};

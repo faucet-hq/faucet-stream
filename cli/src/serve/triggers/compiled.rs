@@ -94,6 +94,21 @@ impl CompiledTriggers {
                     if tpl.id.trim().is_empty() {
                         return Err(format!("triggers: '{}' template id is empty", t.name));
                     }
+                    if tpl.allow_untested {
+                        if t.tenants.is_some() {
+                            return Err(format!(
+                                "triggers: '{}' sets `allow_untested` and `tenants` — a run made \
+                                 for a tenant never runs a version whose tests are not passing",
+                                t.name
+                            ));
+                        }
+                        tracing::warn!(
+                            trigger = %t.name,
+                            template = %tpl.id,
+                            "trigger sets `allow_untested`: its runs may execute a template version \
+                             whose tests are not passing (each such run is labelled and audited)"
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -308,6 +323,20 @@ mod tests {
             compile_err(&format!("{base}    template: {{ id: \" \" }}\n"))
                 .contains("template id is empty")
         );
+        #[cfg(feature = "templates")]
+        {
+            CompiledTriggers::compile(file(&format!(
+                "{base}    template: {{ id: tpl, allow_untested: true }}\n"
+            )))
+            .expect("allowed, with a warning");
+            #[cfg(feature = "tenants")]
+            assert!(
+                compile_err(&format!(
+                    "{base}    template: {{ id: tpl, allow_untested: true }}\n    tenants: all\n"
+                ))
+                .contains("never runs a version")
+            );
+        }
         assert!(
             compile_err(&format!("{base}    config: ./x.yaml\n    tenants: every\n"))
                 .contains("\"all\"")

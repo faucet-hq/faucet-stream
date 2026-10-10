@@ -2,14 +2,17 @@
 //! registry reads the facts, this decides.
 //!
 //! One vocabulary everywhere: `passing` (its tests ran and passed under this
-//! faucet major), `failing` (ran and failed), `untested` (has tests, but no
-//! result for this body under this major) and `no_tests`. Only a `passing`
-//! version may hold a label — `stable` or any channel.
+//! faucet major.minor), `failing` (ran and failed), `untested` (has tests, but
+//! no result for this body under this major.minor) and `no_tests`. Only a
+//! `passing` version may take a label — `stable` or any channel.
+//!
+//! Whether a recorded result still counts is decided by [`evidence_counts`]
+//! alone, so the policy can change in one place.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::result::{TemplateTestResult, faucet_version, major_of};
+use super::result::{RESULT_SCHEMA, TemplateTestResult, faucet_version, release_line, running_line};
 use crate::error::CliError;
 
 /// Where the rules for template tests and labels are explained.
@@ -20,11 +23,11 @@ pub const TESTS_DOC: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestStatus {
-    /// Its tests ran and passed under this faucet major.
+    /// Its tests ran and passed under this faucet major.minor.
     Passing,
-    /// Its latest run under this faucet major failed.
+    /// Its latest run under this faucet major.minor failed.
     Failing,
-    /// It has tests, but no result for this body under this faucet major.
+    /// It has tests, but no result for this body under this faucet major.minor.
     Untested,
     /// It carries no `tests:` block.
     NoTests,
@@ -66,6 +69,40 @@ pub struct VersionStatus {
     /// When the deciding run was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_at: Option<DateTime<Utc>>,
+    /// The deciding result's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+/// The validity policy: whether `r` is evidence for a version whose body
+/// hashes to `body_sha256`, judged by the running binary. Today: the same
+/// body, run by a faucet of the same major.minor, in the current result
+/// schema. Every status, label move and run check reads results through this.
+pub fn evidence_counts(r: &TemplateTestResult, body_sha256: &str) -> bool {
+    r.schema >= RESULT_SCHEMA
+        && !r.result_id.is_empty()
+        && r.body_sha256 == body_sha256
+        && release_line(&r.faucet_version).is_some()
+        && release_line(&r.faucet_version) == release_line(faucet_version())
+}
+
+/// The result that decides a version's status: the newest one that counts.
+/// `results` are newest first.
+pub fn deciding_evidence<'a>(
+    results: &'a [TemplateTestResult],
+    body_sha256: &str,
+) -> Option<&'a TemplateTestResult> {
+    results.iter().find(|r| evidence_counts(r, body_sha256))
+}
+
+/// Whether the newest result for this exact body passed under any faucet
+/// release — what keeps a once-passing version eligible for `newest` after
+/// an upgrade made its evidence stale.
+pub fn last_passed_any_release(results: &[TemplateTestResult], body_sha256: &str) -> bool {
+    results
+        .iter()
+        .find(|r| r.schema >= RESULT_SCHEMA && r.body_sha256 == body_sha256)
+        .is_some_and(|r| r.passed)
 }
 
 /// The status of `version` (body hash `body_sha256`) given its results,
@@ -86,15 +123,16 @@ pub fn status_of(
             )),
             failing: Vec::new(),
             result_at: None,
+            evidence: None,
         };
     }
-    let major = major_of(faucet_version());
-    match results.iter().find(|r| r.counts_for(body_sha256, major)) {
+    match deciding_evidence(results, body_sha256) {
         Some(r) if r.passed => VersionStatus {
             status: TestStatus::Passing,
             reason: None,
             failing: Vec::new(),
             result_at: Some(r.recorded_at),
+            evidence: Some(r.result_id.clone()),
         },
         Some(r) => VersionStatus {
             status: TestStatus::Failing,
@@ -104,16 +142,18 @@ pub fn status_of(
             )),
             failing: r.outcome().failing(),
             result_at: Some(r.recorded_at),
+            evidence: Some(r.result_id.clone()),
         },
         None => VersionStatus {
             status: TestStatus::Untested,
             reason: Some(format!(
                 "v{version} has no test result under faucet {} — run `faucet template test \
                  {id}@{version}`",
-                faucet_version()
+                running_line()
             )),
             failing: Vec::new(),
             result_at: None,
+            evidence: None,
         },
     }
 }
@@ -190,17 +230,55 @@ mod tests {
         assert!(e.contains("v1 is failing") && e.contains("a: bad"), "{e}");
     }
 
+    fn other_minor() -> String {
+        let (major, minor) = release_line(faucet_version()).unwrap();
+        format!("{major}.{}.0", minor + 1)
+    }
+
     #[test]
-    fn results_from_another_major_or_body_or_none_are_untested() {
+    fn results_from_another_release_line_body_or_schema_are_untested() {
+        let mut legacy = result(true, "h", faucet_version());
+        legacy.schema = 0;
+        let mut anonymous = result(true, "h", faucet_version());
+        anonymous.result_id.clear();
         let v = status_of(
             "t",
             1,
             true,
             "h",
-            &[result(true, "h", "0.1.0"), result(true, "other", faucet_version())],
+            &[
+                result(true, "h", "0.1.0"),
+                result(true, "h", &other_minor()),
+                result(true, "other", faucet_version()),
+                legacy,
+                anonymous,
+            ],
         );
         assert_eq!(v.status, TestStatus::Untested);
+        assert!(v.reason.unwrap().contains(&running_line()));
         assert_eq!(status_of("t", 2, true, "h", &[]).status, TestStatus::Untested);
+        assert!(!evidence_counts(&result(true, "h", "garbage"), "h"));
+    }
+
+    #[test]
+    fn the_same_major_and_minor_counts_whatever_the_patch() {
+        let (major, minor) = release_line(faucet_version()).unwrap();
+        let r = result(true, "h", &format!("{major}.{minor}.999"));
+        assert!(evidence_counts(&r, "h"));
+        let v = status_of("t", 1, true, "h", std::slice::from_ref(&r));
+        assert_eq!(v.status, TestStatus::Passing);
+        assert_eq!(v.evidence.as_deref(), Some(r.result_id.as_str()));
+        assert_eq!(deciding_evidence(std::slice::from_ref(&r), "h"), Some(&r));
+    }
+
+    #[test]
+    fn a_stale_pass_keeps_a_version_eligible_for_newest() {
+        assert!(last_passed_any_release(&[result(true, "h", &other_minor())], "h"));
+        assert!(!last_passed_any_release(
+            &[result(false, "h", &other_minor()), result(true, "h", faucet_version())],
+            "h"
+        ));
+        assert!(!last_passed_any_release(&[result(true, "x", faucet_version())], "h"));
     }
 
     #[test]
@@ -218,6 +296,7 @@ mod tests {
             reason: None,
             failing: Vec::new(),
             result_at: None,
+            evidence: None,
         };
         assert!(
             v.refusal("t", 3, "channel prod")
