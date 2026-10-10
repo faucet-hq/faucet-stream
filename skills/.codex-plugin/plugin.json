@@ -1,6 +1,6 @@
 {
   "name": "faucet",
-  "version": "1.13.3",
+  "version": "1.14.0",
   "description": "Skills for writing, running, debugging and deploying faucet-stream data pipelines, Template Hub templates and connector crates. The version equals the faucet-cli release it ships with.",
   "author": {
     "name": "faucet-hq",
