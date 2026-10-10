@@ -298,6 +298,13 @@ impl ServeConfig {
             .listen
             .parse()
             .map_err(|e| CliError::Serve(format!("invalid --listen '{}': {e}", args.listen)))?;
+        if args.allow_unauthenticated_network && !matches!(auth, AuthMode::None) {
+            return Err(CliError::Serve(
+                "--allow-unauthenticated-network only applies with --no-auth; this server \
+                 authenticates, so drop it"
+                    .into(),
+            ));
+        }
         if matches!(auth, AuthMode::None) && !listen.ip().is_loopback() {
             if !args.allow_unauthenticated_network {
                 return Err(CliError::Serve(format!(
@@ -763,6 +770,15 @@ mod tests {
             a.listen = listen.into();
             assert!(ServeConfig::from_args(a).is_ok(), "{listen}");
         }
+    }
+
+    #[test]
+    fn the_opt_in_without_no_auth_is_refused() {
+        let mut a = base_args();
+        a.auth_token = Some("t".into());
+        a.allow_unauthenticated_network = true;
+        let err = ServeConfig::from_args(a).unwrap_err().to_string();
+        assert!(err.contains("only applies with --no-auth"), "{err}");
     }
 
     #[test]

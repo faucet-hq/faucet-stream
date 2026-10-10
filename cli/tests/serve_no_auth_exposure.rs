@@ -5,10 +5,12 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::time::Duration;
 
 fn faucet() -> Command {
     let mut cmd = Command::cargo_bin("faucet").unwrap();
-    cmd.env_remove("FAUCET_SERVE_LISTEN")
+    cmd.timeout(Duration::from_secs(60))
+        .env_remove("FAUCET_SERVE_LISTEN")
         .env_remove("FAUCET_SERVE_AUTH_TOKEN")
         .env_remove("FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK");
     cmd
@@ -45,5 +47,7 @@ fn the_opt_in_requires_no_auth() {
         .args(["serve", "--allow-unauthenticated-network"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--no-auth"));
+        .stderr(predicate::str::contains(
+            "--allow-unauthenticated-network only applies with --no-auth",
+        ));
 }

@@ -2021,11 +2021,7 @@ pub struct ServeArgs {
     /// With `--no-auth`, allow listening on a non-loopback address. Without
     /// it an unauthenticated server refuses to bind anything but loopback,
     /// because anyone who can reach the port can run pipelines.
-    #[arg(
-        long,
-        env = "FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK",
-        requires = "no_auth"
-    )]
+    #[arg(long, env = "FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK")]
     pub allow_unauthenticated_network: bool,
     /// Path to an RBAC auth config (YAML/JSON) defining principals — each a
     /// `{ name, token, role }` where role is `viewer` / `operator` / `admin`.
