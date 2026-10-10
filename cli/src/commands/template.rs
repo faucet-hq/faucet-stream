@@ -974,13 +974,21 @@ fn is_template_with_bundle(path: &std::path::Path) -> CliResult<bool> {
 /// `faucet template test <file>` on a template carrying `tests:` — run the
 /// bundle offline, reading companions and shared suites from a hub.
 async fn test_document_bundle(args: &crate::cli::TemplateTestArgs) -> CliResult<()> {
-    let fallback = crate::hub::resolve_hub(args.hub.as_deref()).await?;
-    let root = crate::hub::bundles::hub_root_for(&args.suite, &fallback);
     let Some((kind, text, bundle)) = crate::hub::bundles::file_bundle(&args.suite)? else {
         return Err(CliError::Config(format!(
             "{} carries no `tests:` block",
             args.suite.display()
         )));
+    };
+    // Only companions and shared suites are read from a hub; a self-contained
+    // pipeline bundle never resolves one (which could mean a network fetch).
+    let self_contained =
+        kind == crate::hub::TemplateKind::Pipeline && bundle.requires_suites.is_empty();
+    let root = if self_contained {
+        args.suite.parent().map(std::path::Path::to_path_buf).unwrap_or_default()
+    } else {
+        let fallback = crate::hub::resolve_hub(args.hub.as_deref()).await?;
+        crate::hub::bundles::hub_root_for(&args.suite, &fallback)
     };
     let outcome =
         crate::hub::bundles::run_parsed(kind, &text, &bundle, &root, args.filter.as_deref()).await;

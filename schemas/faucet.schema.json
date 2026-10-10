@@ -53,6 +53,17 @@
         "$ref": "#/$defs/ParamSpec"
       }
     },
+    "tests": {
+      "description": "Optional test bundle (#856): parameter-space cases, fixture cases and\nrequired shared suites that `faucet template test` runs against this\nconfig. Stored with a registered template version, so changing a test\nis a new version; a test-gated launch needs a passing result. Ignored\nby `faucet run`. See `faucet schema template-tests`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TestBundle"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "auth": {
       "description": "Optional named auth providers. Each entry is a `{ type, config }` spec\n(the same shape as inline auth) built once and shared across every\nconnector that references it via `auth: { ref: <name> }`. Values are kept\nas raw JSON so `faucet-auth` owns the per-type schema.",
       "type": [
@@ -35270,6 +35281,518 @@
           "additionalProperties": true
         }
       ]
+    },
+    "Auto": {
+      "description": "Cases derived from the template's own `params:` block.",
+      "type": "object",
+      "properties": {
+        "enum_coverage": {
+          "description": "One case per declared value of each param carrying a closed `values:`\nset — \"does this template still work for every sink it advertises?\".",
+          "type": "boolean",
+          "default": false
+        },
+        "required_omitted": {
+          "description": "One case per `required` param, omitting it, expecting a failure. Pins\nthat a missing required param fails *cleanly* rather than producing a\nconfig with a hole in it.",
+          "type": "boolean",
+          "default": false
+        },
+        "defaults_baseline": {
+          "description": "The all-defaults case — the combination most callers actually use, and\nthe one most easily forgotten in a hand-written suite.",
+          "type": "boolean",
+          "default": false
+        },
+        "retries": {
+          "description": "Extra attempts for every derived case.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Behavioral": {
+      "description": "A behavioural case: fixture records through the real pipeline.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Case name.",
+          "type": "string"
+        },
+        "params": {
+          "description": "Param values for the combination under test.",
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "page_size": {
+          "description": "Records per page fed to the pipeline.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "row": {
+          "description": "Which row (stream) of the materialized config the case runs. Required\nwhen it expands to more than one root row.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input": {
+          "description": "Inline records, or a path to a `.jsonl` / `.json` / `.yaml` fixture —\nthe same shapes `faucet test` accepts."
+        },
+        "expect": {
+          "description": "Expectations, in `faucet test`'s grammar."
+        },
+        "retries": {
+          "description": "Extra attempts before the case is reported failed.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "input",
+        "expect"
+      ]
+    },
+    "Case": {
+      "description": "One explicitly-written case.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Case name, used in the report and by `--filter`.",
+          "type": "string"
+        },
+        "params": {
+          "description": "Param values for this combination.",
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "expect": {
+          "description": "What the case asserts.",
+          "$ref": "#/$defs/Expect",
+          "default": {
+            "valid": true
+          }
+        },
+        "retries": {
+          "description": "Extra attempts before the case is reported failed. Explicit and\nrecorded: a case that needed a retry says so in the result.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Combine": {
+      "description": "A generated cartesian product.",
+      "type": "object",
+      "properties": {
+        "params": {
+          "description": "Param name → the values to sweep. The generated case count is the\nproduct of the list lengths (before `exclude` and `pairwise`).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": true
+          }
+        },
+        "exclude": {
+          "description": "Combinations to drop — each entry is a partial assignment, and any\ngenerated combination that matches all of its keys is excluded. This is\nhow a genuinely-invalid pairing (a sink that cannot take an option) is\nkept out without hand-writing every valid one.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "pairwise": {
+          "description": "Reduce to an **all-pairs** set rather than the full product.\n\nMost param-interaction bugs involve two params, so all-pairs keeps the\ncoverage that matters while turning a multiplicative case count into\nroughly the product of the two largest lists.",
+          "type": "boolean",
+          "default": false
+        },
+        "expect": {
+          "description": "What every generated case asserts.",
+          "$ref": "#/$defs/Expect",
+          "default": {
+            "valid": true
+          }
+        },
+        "retries": {
+          "description": "Extra attempts for every generated case.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "params"
+      ]
+    },
+    "Expect": {
+      "description": "What a validation-tier case asserts.",
+      "type": "object",
+      "properties": {
+        "valid": {
+          "description": "The combination must materialize into a config that expands and whose\ntransforms compile. Defaults to `true`.",
+          "type": "boolean",
+          "default": true
+        },
+        "error": {
+          "description": "The combination must **fail**, with an error containing this substring.\nSetting it implies `valid: false` — a case cannot assert both.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Expectation": {
+      "description": "Expected outcome of a test case. Every field is optional but at least one\nmust be set; all set fields are asserted together.",
+      "type": "object",
+      "properties": {
+        "records": {
+          "description": "The exact records the sink must receive, in order (set\n`unordered: true` to compare as a multiset). Compared per `match`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": true,
+          "default": null
+        },
+        "dlq": {
+          "description": "The original record payloads that must land in the DLQ (quality /\ncontract quarantines), in order. Envelope metadata (timestamps, error\nmessages) is not compared — only the quarantined payload itself.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": true,
+          "default": null
+        },
+        "records_written": {
+          "description": "Total records the sink must receive (a count-only alternative to\n`records`).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "dlq_count": {
+          "description": "Total DLQ envelopes (a count-only alternative to `dlq`).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "error": {
+          "description": "The run must FAIL, and the error message must contain this substring\n(e.g. a quality `abort` or contract `on_breach: fail`). Without this\nfield, a failing run fails the case.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "unordered": {
+          "description": "Compare `records` / `dlq` as multisets instead of ordered lists.",
+          "type": "boolean",
+          "default": false
+        },
+        "match": {
+          "description": "How individual records are compared.",
+          "$ref": "#/$defs/MatchMode",
+          "default": "exact"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Fixture": {
+      "description": "One fixture case: records through the pipeline, then `faucet test`'s\nexpectations.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Case name, unique within the bundle's fixtures.",
+          "type": "string"
+        },
+        "pipeline": {
+          "description": "Inline transforms / quality / contract / masking. Omitted = the\ntemplate's own materialized config.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InlinePipeline"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "row": {
+          "description": "Which row of the template's config to run (when it has several).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Param values bound before the template is materialized.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "input": {
+          "description": "Inline records. A path is refused: the version stores the document\nonly, so a fixture file would not travel with it.",
+          "$ref": "#/$defs/InputSpec"
+        },
+        "page_size": {
+          "description": "Records per page (`0` = one page).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "clock": {
+          "description": "Fixed `${now.*}` clock (RFC 3339 or a date).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expect": {
+          "$ref": "#/$defs/Expectation"
+        },
+        "retries": {
+          "description": "Extra attempts before the case is reported failed.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "input",
+        "expect"
+      ]
+    },
+    "InlinePipeline": {
+      "description": "Inline pipeline logic for a test case that doesn't reference a config file.",
+      "type": "object",
+      "properties": {
+        "transforms": {
+          "description": "Transform chain, identical to `pipeline.transforms` in a config file.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TransformSpec"
+          },
+          "default": []
+        },
+        "quality": {
+          "description": "Quality checks, identical to `pipeline.quality` in a config file.\nQuarantined records are capturable via `expect.dlq` / `dlq_count`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QualitySpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "contract": {
+          "description": "Data contract, identical to `pipeline.contract` in a config file.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContractSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "masking": {
+          "description": "PII masking policy, identical to `pipeline.masking` in a config file.\nOffline there is no destination sink, so every rule applies regardless\nof its `applies_to` scoping.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MaskingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "InputSpec": {
+      "description": "Fixture input — inline records or a fixture-file path.",
+      "anyOf": [
+        {
+          "description": "Inline JSON records.",
+          "type": "array",
+          "items": true
+        },
+        {
+          "description": "Path to a `.jsonl` (one record per line) or `.json` / `.yaml` /\n`.yml` (top-level array) fixture file, relative to the spec file.",
+          "type": "string"
+        }
+      ]
+    },
+    "MatchMode": {
+      "description": "Record-comparison mode for `expect.records` / `expect.dlq`.",
+      "oneOf": [
+        {
+          "description": "Expected and actual records must be deeply equal.",
+          "type": "string",
+          "const": "exact"
+        },
+        {
+          "description": "Each expected record must be a recursive subset of the actual record:\nevery expected object field must be present and match, but the actual\nrecord may carry extra fields. Arrays still compare element-by-element\n(same length), applying subset semantics to nested objects.",
+          "type": "string",
+          "const": "subset"
+        }
+      ]
+    },
+    "Suite": {
+      "description": "The three ways cases come into existence, applied in this order:\nexplicit, generated, derived.",
+      "type": "object",
+      "properties": {
+        "cases": {
+          "description": "Named cases, written out in full.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Case"
+          }
+        },
+        "combine": {
+          "description": "A generated cartesian product over named param values.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Combine"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "auto": {
+          "description": "Cases derived from the template's own `params:` declaration.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Auto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "behavioral": {
+          "description": "Behavioural cases: fixture records through the real pipeline.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Behavioral"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SuiteRequirement": {
+      "description": "A shared suite named by version range.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The suite's id (`name`, or `owner/name`).",
+          "type": "string"
+        },
+        "version": {
+          "description": "A semver range over the suite's `release:` (`\">=1.2,<2\"`).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "TestBundle": {
+      "description": "The `tests:` block of a template document.",
+      "type": "object",
+      "properties": {
+        "source": {
+          "description": "For a `sink-template` or `deployment`: the source template the bundle\ncomposes with (a registered id, or a hub id when run from a hub).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_select": {
+          "description": "Version of `source`: a number or a channel. Default `stable`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sink": {
+          "description": "For a `source-template` or `deployment`: the sink template to compose\nwith.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sink_select": {
+          "description": "Version of `sink`. Default `stable`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "overlay": {
+          "description": "For a `source-template`: a deployment overlay applied over the\ncomposition.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "overlay_select": {
+          "description": "Version of `overlay`. Default `stable`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suite": {
+          "description": "Parameter-space cases — the `faucet template test` grammar (`cases`,\n`combine`, `auto`, `behavioral`).",
+          "$ref": "#/$defs/Suite"
+        },
+        "fixtures": {
+          "description": "Fixture cases — the `faucet test` grammar, run through this template's\nown config (or an inline `pipeline:`).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Fixture"
+          }
+        },
+        "requires_suites": {
+          "description": "Shared suites (`kind: test-suite`) that run as part of this bundle,\neach picked by a semver range over its `release:`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SuiteRequirement"
+          }
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

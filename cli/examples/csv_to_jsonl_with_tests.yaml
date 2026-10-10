@@ -1,0 +1,64 @@
+# A pipeline template that carries its own test bundle (#856). The `tests:`
+# block is stored with every registered version, so changing a test is a new
+# version; `faucet run` ignores it.
+#
+#   faucet template test cli/examples/csv_to_jsonl_with_tests.yaml      # offline, no registry
+#   faucet template register cli/examples/csv_to_jsonl_with_tests.yaml --test --store sqlite:faucet.db
+#   faucet template launch orders_export --require-tests --store sqlite:faucet.db
+#
+# On `faucet serve --require-template-tests` a version launches only with a
+# passing result recorded under this faucet major version.
+kind: pipeline
+version: 1
+name: orders_export
+
+params:
+  region:
+    type: string
+    default: us
+    values: [us, eu]
+
+pipeline:
+  source:
+    type: file
+    config:
+      path: ./data/${param.region}/orders.csv
+  transforms:
+    - type: set
+      config:
+        values:
+          exported: true
+  sink:
+    type: file
+    config:
+      path: ./out/${param.region}/orders.jsonl
+
+tests:
+  suite:
+    auto:
+      enum_coverage: true
+      defaults_baseline: true
+    cases:
+      - name: unknown-region-is-refused
+        params: { region: apac }
+        expect: { error: region }
+  fixtures:
+    - name: rows-are-stamped
+      params: { region: eu }
+      input:
+        - { id: 1, total: 9.5 }
+        - { id: 2, total: 12 }
+      expect:
+        records:
+          - { id: 1, total: 9.5, exported: true }
+          - { id: 2, total: 12, exported: true }
+    - name: inline-filter
+      retries: 1
+      pipeline:
+        transforms:
+          - type: filter
+            config: { path: status, op: eq, value: paid }
+      input:
+        - { id: 1, status: paid }
+        - { id: 2, status: open }
+      expect: { records_written: 1 }

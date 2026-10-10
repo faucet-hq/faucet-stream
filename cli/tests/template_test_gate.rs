@@ -333,6 +333,19 @@ async fn cli_tests_a_registered_version_and_a_template_file() {
             .await
             .is_err()
     );
+
+    // A hub kind reads its companions and shared suites from the hub it lives in.
+    let src = write(dir.path(), "source-templates/acme.yaml", HUB_SOURCE);
+    write(dir.path(), "sink-templates/files.yaml", HUB_SINK);
+    write(dir.path(), "test-suites/rest-conformance.yaml", HUB_SUITE);
+    faucet_cli::commands::template::run(args(src.to_str().unwrap(), false, None))
+        .await
+        .unwrap();
+    let plain = write(dir.path(), "plain.yaml", "kind: pipeline\nversion: 1\npipeline: {}\n");
+    let err = faucet_cli::commands::template::run(args(plain.to_str().unwrap(), false, None))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("template test suite"), "{err}");
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
