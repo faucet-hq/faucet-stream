@@ -353,7 +353,9 @@ fn from_auto(auto: &Auto, params: &ParamsSpec) -> Vec<GeneratedCase> {
             .filter(|(_, p)| p.required && p.computed.is_none())
             .map(|(n, _)| n)
             .collect();
-        for omitted in &required {
+        // A secret param is never omitted: a test run always fills it with a
+        // placeholder, so leaving it out cannot fail.
+        for omitted in required.iter().filter(|n| !params[n.as_str()].secret) {
             let supplied: BTreeMap<String, Value> = params
                 .iter()
                 .filter(|(n, p)| p.required && p.computed.is_none() && n != omitted)
@@ -610,6 +612,40 @@ mod tests {
         // Required params are still supplied, or every derived case would fail
         // for a reason that has nothing to do with the value under test.
         assert!(cases.iter().all(|c| c.params.contains_key("tenant")));
+    }
+
+    #[test]
+    fn auto_required_omitted_never_omits_a_secret_param() {
+        let mut params = params_spec();
+        params.insert(
+            "token".into(),
+            ParamSpec {
+                kind: ParamType::String,
+                required: true,
+                default: None,
+                secret: true,
+                description: None,
+                computed: None,
+                values: Vec::new(),
+            },
+        );
+        let suite = Suite {
+            cases: Vec::new(),
+            combine: None,
+            auto: Some(Auto {
+                enum_coverage: false,
+                required_omitted: true,
+                defaults_baseline: false,
+                retries: 0,
+            }),
+            behavioral: Vec::new(),
+        };
+        let names: Vec<String> = generate(&suite, &params)
+            .expect("generate")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["auto:missing-tenant".to_string()]);
     }
 
     #[test]
