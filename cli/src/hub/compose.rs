@@ -107,6 +107,9 @@ impl Composition {
     }
 }
 
+/// The phrase every [`Incompatible`] rendering carries.
+pub const INCOMPATIBLE: &str = "cannot compose with sink-template";
+
 /// Why a stream cannot run against a sink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamIncompatibility {
@@ -126,7 +129,7 @@ pub struct Incompatible {
 impl Incompatible {
     pub fn render(&self) -> String {
         let mut s = format!(
-            "source-template '{}' cannot compose with sink-template '{}' — {} stream(s) have no viable write mode:",
+            "source-template '{}' {INCOMPATIBLE} '{}' — {} stream(s) have no viable write mode:",
             self.source,
             self.sink,
             self.streams.len()
