@@ -860,7 +860,7 @@ mod templates {
         // First launch: stable moves, previous stays unset (nothing to go back
         // to). The return is the assigned launch-log sequence number.
         assert_eq!(
-            s.template_launch("orders", 1, Some("ci")).await.unwrap(),
+            s.template_launch("orders", 1, Some("ci"), None).await.unwrap(),
             Some(1)
         );
         let st = s.template_state("orders").await.unwrap();
@@ -869,13 +869,13 @@ mod templates {
 
         // Re-launching what is already live is a no-op (`None`) — appending would
         // make `previous` a duplicate of `stable` and destroy the rollback target.
-        assert_eq!(s.template_launch("orders", 1, None).await.unwrap(), None);
+        assert_eq!(s.template_launch("orders", 1, None, None).await.unwrap(), None);
         assert_eq!(s.template_launches("orders").await.unwrap().len(), 1);
 
         // Launching a different version advances stable; the old one becomes
         // `previous`.
         assert_eq!(
-            s.template_launch("orders", 3, Some("ci")).await.unwrap(),
+            s.template_launch("orders", 3, Some("ci"), None).await.unwrap(),
             Some(2)
         );
         let st = s.template_state("orders").await.unwrap();
@@ -894,7 +894,7 @@ mod templates {
 
         // Rolling back is an ordinary launch, so the log keeps growing and
         // `previous` becomes the version just rolled off.
-        assert_eq!(s.template_launch("orders", 1, None).await.unwrap(), Some(3));
+        assert_eq!(s.template_launch("orders", 1, None, None).await.unwrap(), Some(3));
         let st = s.template_state("orders").await.unwrap();
         assert_eq!((st.stable, st.previous), (Some(1), Some(3)));
         assert_eq!(s.template_launches("orders").await.unwrap().len(), 3);
@@ -905,7 +905,7 @@ mod templates {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir, "tpl-deprecate.db").await;
         s.template_register(&draft("legacy", None)).await.unwrap();
-        s.template_launch("legacy", 1, None).await.unwrap();
+        s.template_launch("legacy", 1, None, None).await.unwrap();
 
         assert!(s.template_deprecation("legacy").await.unwrap().is_none());
 
@@ -939,7 +939,7 @@ mod templates {
         for _ in 0..3 {
             s.template_register(&draft("orders", None)).await.unwrap();
         }
-        s.template_launch("orders", 2, None).await.unwrap();
+        s.template_launch("orders", 2, None, None).await.unwrap();
         let marker = DeprecationRecord {
             deprecated_at: Utc::now(),
             deprecated_by: Some("admin".into()),
@@ -1007,9 +1007,9 @@ mod templates {
         for _ in 0..3 {
             s.template_register(&draft("orders", None)).await.unwrap();
         }
-        s.template_launch("orders", 1, None).await.unwrap();
-        s.template_launch("orders", 2, None).await.unwrap();
-        s.template_set_tag("orders", "prod", 3).await.unwrap();
+        s.template_launch("orders", 1, None, None).await.unwrap();
+        s.template_launch("orders", 2, None, None).await.unwrap();
+        s.template_set_tag("orders", "prod", 3, None).await.unwrap();
         for _ in 0..22 {
             s.template_register(&draft("orders", None)).await.unwrap();
         }
@@ -1045,10 +1045,10 @@ mod templates {
         for _ in 0..2 {
             s.template_register(&draft("orders", None)).await.unwrap();
         }
-        s.template_set_tag("orders", "prod", 1).await.unwrap();
-        s.template_set_tag("orders", "dev", 2).await.unwrap();
-        s.template_launch("orders", 1, None).await.unwrap();
-        s.template_launch("orders", 2, None).await.unwrap();
+        s.template_set_tag("orders", "prod", 1, None).await.unwrap();
+        s.template_set_tag("orders", "dev", 2, None).await.unwrap();
+        s.template_launch("orders", 1, None, None).await.unwrap();
+        s.template_launch("orders", 2, None, None).await.unwrap();
 
         // Dropping v1 must take its channel *and* its launch-log entries with it,
         // so no pointer outlives its target.
@@ -1141,7 +1141,7 @@ mod templates {
         let mut set = tokio::task::JoinSet::new();
         for v in 1..=6u32 {
             let s = s.clone();
-            set.spawn(async move { s.template_launch("orders", v, None).await.unwrap() });
+            set.spawn(async move { s.template_launch("orders", v, None, None).await.unwrap() });
         }
         while let Some(r) = set.join_next().await {
             r.unwrap();

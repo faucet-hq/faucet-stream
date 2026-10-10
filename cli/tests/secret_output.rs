@@ -46,12 +46,13 @@ fn template_dry_run_json_masks_values_bound_from_the_environment() {
     std::fs::write(
         &tpl,
         format!(
-            "version: 1\nname: tpl\nkind: pipeline\npipeline:\n  source: {{ type: csv, config: {{ path: {in_} }} }}\n  sink: {{ type: jsonl, config: {{ path: \"${{env:FAUCET_TEST_SINK_PATH}}\" }} }}\n",
+            "version: 1\nname: tpl\nkind: pipeline\npipeline:\n  source: {{ type: csv, config: {{ path: {in_} }} }}\n  sink: {{ type: jsonl, config: {{ path: \"${{env:FAUCET_TEST_SINK_PATH}}\" }} }}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
             in_ = dir.path().join("in.csv").display()
         ),
     )
     .unwrap();
     faucet()
+        .env("FAUCET_TEST_SINK_PATH", "/tmp/sink-secret-path-77.jsonl")
         .args(["template", "register"])
         .arg(&tpl)
         .args(["--store", &store, "--launch"])

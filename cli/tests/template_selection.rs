@@ -102,9 +102,23 @@ impl Api {
     }
     async fn register(&self, body: String) {
         let (code, v) = self
-            .post("/v1/templates", json!({ "config": body, "launch": true }))
+            .post("/v1/templates", json!({ "config": body }))
             .await;
         assert_eq!(code, 201, "{v}");
+    }
+    /// Test each template again (its companions are registered by now) and
+    /// launch it (#856).
+    async fn launch(&self, ids: &[&str]) {
+        for id in ids {
+            let (code, v) = self
+                .post(&format!("/v1/templates/{id}/versions/1/test"), json!({}))
+                .await;
+            assert_eq!(code, 200, "{v}");
+            let (code, v) = self
+                .post(&format!("/v1/templates/{id}/launch"), json!({ "version": 1 }))
+                .await;
+            assert_eq!(code, 200, "{id}: {v}");
+        }
     }
     async fn wait_terminal(&self, run_id: &str) -> Value {
         for _ in 0..800 {
@@ -185,6 +199,14 @@ streams:
     source: {{ config: {{ path: "${{param.data_dir}}/audit.csv" }} }}
     primary_keys: [id]
     write: upsert
+tests:
+  sink: files
+  sink_select: newest
+  suite:
+    cases:
+      - name: the-whole-pairing-needs-a-selection
+        params: {{}}
+        expect: {{ error: audit }}
 "#,
         d = data.display()
     )
@@ -203,6 +225,14 @@ sink:
   config: {{ append: true }}
 per_stream:
   path: "${{param.out_dir}}/${{stream}}.jsonl"
+tests:
+  source: crm
+  source_select: newest
+  suite:
+    cases:
+      - name: the-whole-pairing-needs-a-selection
+        params: {{}}
+        expect: {{ error: audit }}
 "#,
         o = out.display()
     )
@@ -234,6 +264,9 @@ matrix:
     sink: {{ ref: out, config: {{ path: "{o}/payroll.jsonl" }} }}
     depends_on: [audit]
     tags: [finance]
+tests:
+  suite:
+    auto: {{ defaults_baseline: true }}
 "#,
         d = data.display(),
         o = out.display(),
@@ -243,7 +276,7 @@ matrix:
 
 fn topology_template(data: &Path, out: &Path) -> String {
     format!(
-        "kind: pipeline\nversion: 1\nname: topo\npipeline:\n  sources:\n    s: {{ type: csv, config: {{ path: \"{}/accounts.csv\" }} }}\n  sinks:\n    o: {{ type: jsonl, config: {{ path: \"{}/topo.jsonl\" }} }}\n  nodes:\n    src: {{ kind: source, ref: s }}\n    w: {{ kind: sink, ref: o }}\n  edges:\n    - {{ from: src, to: w }}\n",
+        "kind: pipeline\nversion: 1\nname: topo\npipeline:\n  sources:\n    s: {{ type: csv, config: {{ path: \"{}/accounts.csv\" }} }}\n  sinks:\n    o: {{ type: jsonl, config: {{ path: \"{}/topo.jsonl\" }} }}\n  nodes:\n    src: {{ kind: source, ref: s }}\n    w: {{ kind: sink, ref: o }}\n  edges:\n    - {{ from: src, to: w }}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
         data.display(),
         out.display()
     )
@@ -273,6 +306,7 @@ async fn rows_api_describes_every_group_and_resolves_selections() {
     api.register(sink_template(&out)).await;
     api.register(pipeline_template(&d, &out, &state)).await;
     api.register(topology_template(&d, &out)).await;
+    api.launch(&["crm", "files", "hr", "topo"]).await;
 
     // A source template without a sink: identity, hierarchy, read, shape,
     // inputs — no sink-dependent facts.
@@ -398,10 +432,11 @@ async fn rows_api_describes_every_group_and_resolves_selections() {
 
     // An overlay's state store backs the state group of a composed listing.
     let ops = format!(
-        "kind: deployment\nname: ops\nstate: {{ type: file, config: {{ path: \"{}\" }} }}\n",
+        "kind: deployment\nname: ops\nstate: {{ type: file, config: {{ path: \"{}\" }} }}\ntests:\n  source: crm\n  source_select: newest\n  sink: files\n  sink_select: newest\n  suite:\n    cases:\n      - {{ name: pairing, params: {{}}, expect: {{ error: audit }} }}\n",
         dir.path().join("ops-state").display()
     );
     api.register(ops).await;
+    api.launch(&["ops"]).await;
     let (code, r) = api
         .get("/v1/templates/crm/rows?sink=files&overlay=ops")
         .await;
@@ -446,6 +481,7 @@ async fn a_selection_runs_the_subset_from_every_http_path() {
     api.register(sink_template(&out)).await;
     api.register(pipeline_template(&d, &out, &state)).await;
     api.register(topology_template(&d, &out)).await;
+    api.launch(&["crm", "files", "hr", "topo"]).await;
 
     // The whole pairing cannot run (`audit` wants upsert)…
     let (code, v) = api
@@ -624,6 +660,7 @@ async fn a_clustered_run_applies_the_stored_selection() {
     api.register(source_template(&d)).await;
     api.register(sink_template(&out)).await;
     api.register(pipeline_template(&d, &out, &state)).await;
+    api.launch(&["crm", "files", "hr"]).await;
 
     let (code, v) = api
         .post(
@@ -668,6 +705,7 @@ async fn a_schedule_trigger_runs_its_selection() {
     let api = start(a).await;
     api.register(source_template(&d)).await;
     api.register(sink_template(&out)).await;
+    api.launch(&["crm", "files"]).await;
     let mut done = false;
     for _ in 0..400 {
         let (_, page) = api.get("/v1/runs").await;
@@ -732,16 +770,27 @@ fn the_cli_lists_rows_and_runs_a_subset() {
                 "template",
                 "register",
                 p.to_str().unwrap(),
-                "--launch",
                 "--store",
                 &store,
             ]
             .iter()
             .map(|s| s.to_string())
             .collect();
-            cli(&a).await.unwrap();
+            // Registered either way; a red bundle (its companion is not
+            // registered yet) only makes the command exit non-zero.
+            if let Err(e) = cli(&a).await {
+                assert!(e.to_string().contains("failed"), "{e}");
+            }
         }
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        for id in ["crm", "files", "hr"] {
+            cli(&s(&["template", "test", &format!("{id}@1"), "--store", &store]))
+                .await
+                .unwrap();
+            cli(&s(&["template", "launch", id, "--version", "1", "--store", &store]))
+                .await
+                .unwrap();
+        }
         cli(&s(&[
             "template", "rows", "crm", "--sink", "files", "--store", &store,
         ]))

@@ -104,7 +104,13 @@ pub async fn run_suite(
     base_dir: Option<&std::path::Path>,
     prefix: &str,
 ) -> CliResult<SuiteOutcome> {
-    let params_spec = declared_params(target).await?;
+    // A target that does not even compose can still be tested by explicit
+    // cases that expect exactly that error; generated cases need its params.
+    let params_spec = match declared_params(target).await {
+        Ok(p) => p,
+        Err(_) if suite.auto.is_none() && suite.combine.is_none() => Default::default(),
+        Err(e) => return Err(e),
+    };
     let cases = generate(suite, &params_spec)?;
 
     let mut outcome = SuiteOutcome::default();

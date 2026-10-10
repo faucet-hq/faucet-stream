@@ -173,10 +173,10 @@ async fn run_version_traced(
     let (outcome, companions) = match prepare(store, &rec, &bundle).await {
         Ok((companions, shared)) => {
             let target = companions.target(store, &rec);
-            let outcome = crate::template_tests::runner::with_run_limits(
+            let outcome = Box::pin(crate::template_tests::runner::with_run_limits(
                 limits,
                 run_bundle(&bundle, &target, &shared, filter),
-            )
+            ))
             .await;
             (outcome, companions.names())
         }
@@ -334,7 +334,7 @@ pub async fn test_version(
     version: u32,
     recorded_by: Option<&str>,
 ) -> CliResult<TemplateTestResult> {
-    let (rec, outcome, companions) = run_version_traced(store, id, version, None)
+    let (rec, outcome, companions) = Box::pin(run_version_traced(store, id, version, None))
         .await?
         .ok_or_else(|| no_bundle(id, version))?;
     let mut result = TemplateTestResult::new(
@@ -439,7 +439,7 @@ pub async fn require_passing(
     let rec = record(store, id, version).await?;
     let mut st = version_status(store, id, version).await?;
     if st.status == TestStatus::Untested {
-        test_version(store, id, version, None).await?;
+        Box::pin(test_version(store, id, version, None)).await?;
         st = version_status(store, id, version).await?;
     }
     match (&st.evidence, st.status.can_hold_label()) {

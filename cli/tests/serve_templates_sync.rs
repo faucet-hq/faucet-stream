@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const BODY: &str = "version: 1\nname: nightly\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\n";
+const BODY: &str = "version: 1\nname: nightly\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\ntests:\n  suite:\n    auto: {defaults_baseline: true}\n";
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")

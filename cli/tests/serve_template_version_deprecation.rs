@@ -99,7 +99,7 @@ async fn start(port: u16, history: Option<String>) -> (reqwest::Client, String) 
 fn pipeline(dir: &std::path::Path, n: u32) -> String {
     std::fs::write(dir.join("in.csv"), "id\n1\n").unwrap();
     format!(
-        "kind: pipeline\nversion: 1\nname: orders\nvars: {{ build: {n} }}\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+        "kind: pipeline\nversion: 1\nname: orders\nvars: {{ build: {n} }}\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
         dir.join("in.csv").display(),
         dir.join(format!("out{n}.jsonl")).display()
     )

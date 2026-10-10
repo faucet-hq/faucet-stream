@@ -477,12 +477,15 @@ async fn a_registered_template_may_use_a_subprocess_connector() {
         .post(
             "admin-tok",
             "/v1/templates",
-            json!({"config": singer_config(dir.path()).replace("version: 1\n", "version: 1\nkind: pipeline\n"), "id": "tap", "launch": true}),
+            json!({"config": format!(
+                "{}tests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
+                singer_config(dir.path()).replace("version: 1\n", "version: 1\nkind: pipeline\n")
+            ), "id": "tap"}),
         )
         .await;
     assert_eq!(code, 201, "{reg}");
     let (code, r) = api
-        .post("op-tok", "/v1/templates/tap/runs", json!({}))
+        .post("op-tok", "/v1/templates/tap/runs", json!({ "version": 1 }))
         .await;
-    assert_eq!(code, 202, "{r}");
+    assert_eq!(code, 202, "a draft still runs: {r}");
 }

@@ -497,12 +497,12 @@ pub async fn register_tested(
 
     let tests = if bundle.is_some() {
         Some(
-            crate::templates::bundle::test_version(
+            Box::pin(crate::templates::bundle::test_version(
                 store,
                 &record.id,
                 record.version,
                 req.created_by.as_deref(),
-            )
+            ))
             .await?,
         )
     } else {

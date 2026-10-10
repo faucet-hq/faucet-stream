@@ -115,6 +115,9 @@ pipeline:
   source: {{ type: csv, config: {{ path: {input} }} }}
   sink: {{ type: jsonl, config: {{ path: {out} }} }}
   state: {{ type: file, config: {{ path: {state} }} }}
+tests:
+  suite:
+    auto: {{ defaults_baseline: true }}
 "#,
         input = dir.join("in.csv").display(),
         out = dir.join("out.jsonl").display(),

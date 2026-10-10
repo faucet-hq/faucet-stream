@@ -99,14 +99,14 @@ async fn start(port: u16) -> (reqwest::Client, String) {
 fn source(dir: &std::path::Path) -> String {
     std::fs::write(dir.join("invoices.csv"), "id,total\n1,10\n").unwrap();
     format!(
-        "kind: source-template\nname: billing\nowner: acme\ndescription: Acme billing exports\nparams:\n  data_dir: {{ type: string, default: {} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/invoices.csv\"\nstreams:\n  - name: invoices\n    write: [append]\n",
+        "kind: source-template\nname: billing\nowner: acme\ndescription: Acme billing exports\nparams:\n  data_dir: {{ type: string, default: {} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/invoices.csv\"\nstreams:\n  - name: invoices\n    write: [append]\ntests:\n  sink: faucet-hq/files\n  sink_select: newest\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
         dir.display()
     )
 }
 
 fn sink(dir: &std::path::Path) -> String {
     format!(
-        "kind: sink-template\nname: files\nowner: faucet-hq\ndescription: Local JSON Lines\nparams:\n  out_dir: {{ type: string, default: {} }}\nsink:\n  type: jsonl\n  config: {{}}\nper_stream:\n  path: \"${{param.out_dir}}/${{owner}}/${{source}}/${{stream}}.jsonl\"\n",
+        "kind: sink-template\nname: files\nowner: faucet-hq\ndescription: Local JSON Lines\nparams:\n  out_dir: {{ type: string, default: {} }}\nsink:\n  type: jsonl\n  config: {{}}\nper_stream:\n  path: \"${{param.out_dir}}/${{owner}}/${{source}}/${{stream}}.jsonl\"\ntests:\n  source: acme/billing\n  source_select: newest\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
         dir.display()
     )
 }
@@ -118,11 +118,22 @@ async fn owner_ids_are_addressed_as_one_percent_encoded_segment() {
     for body in [source(dir.path()), sink(dir.path())] {
         let r = client
             .post(format!("{base}/v1/templates"))
-            .json(&json!({ "config": body, "launch": true }))
+            .json(&json!({ "config": body }))
             .send()
             .await
             .unwrap();
         assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    }
+    // Each one's tests compose with the other, so test again now both are
+    // registered, then launch (#856).
+    for id in ["acme%2Fbilling", "faucet-hq%2Ffiles"] {
+        for (path, body) in [
+            (format!("{base}/v1/templates/{id}/versions/1/test"), json!({})),
+            (format!("{base}/v1/templates/{id}/launch"), json!({ "version": 1 })),
+        ] {
+            let r = client.post(path).json(&body).send().await.unwrap();
+            assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+        }
     }
 
     let got: Value = client

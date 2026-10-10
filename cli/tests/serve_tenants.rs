@@ -193,7 +193,7 @@ async fn spawn_with(
 
 fn template(api_base: &str, out_dir: &std::path::Path, state_dir: &std::path::Path) -> String {
     format!(
-        "version: 1\nkind: pipeline\nname: tenant-sync\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: {api_base}\n      path: /items\n      records_path: \"$.items[*]\"\n      auth: {{ ref: api }}\n  sink:\n    type: jsonl\n    config:\n      path: \"{}/out-${{tenant.id}}.jsonl\"\n  state:\n    type: file\n    config:\n      path: {}\n",
+        "version: 1\nkind: pipeline\nname: tenant-sync\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: {api_base}\n      path: /items\n      records_path: \"$.items[*]\"\n      auth: {{ ref: api }}\n  sink:\n    type: jsonl\n    config:\n      path: \"{}/out-${{tenant.id}}.jsonl\"\n  state:\n    type: file\n    config:\n      path: {}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
         out_dir.display(),
         state_dir.display()
     )
@@ -358,6 +358,17 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         "{}",
         std::fs::read_to_string(out.join("out-acme.jsonl")).unwrap_or_default()
     );
+
+    // A run for a tenant never runs an untested version (#856).
+    let (code, r) = api
+        .post(
+            "op-tok",
+            &format!("/v1/tenants/acme/templates/{id}/runs"),
+            json!({"version": 1, "allow_untested": true}),
+        )
+        .await;
+    assert_eq!(code, 403, "{r}");
+    assert!(r.to_string().contains("allow_untested"), "{r}");
 
     // ── Fan-out across every tenant ────────────────────────────────────────
     let (code, fan) = api
