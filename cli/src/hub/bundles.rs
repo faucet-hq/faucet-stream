@@ -112,6 +112,13 @@ pub fn document_target(
 /// (or `sink-templates/`, `deployments/`, `test-suites/`) directory, else
 /// `fallback`.
 pub fn hub_root_for(path: &Path, fallback: &Path) -> std::path::PathBuf {
+    inferred_hub_root(path).unwrap_or_else(|| fallback.to_path_buf())
+}
+
+/// The hub a template file lives in, read from its path alone: the parent of
+/// its `source-templates/` (or `sink-templates/`, `deployments/`,
+/// `test-suites/`) directory.
+pub fn inferred_hub_root(path: &Path) -> Option<std::path::PathBuf> {
     const DIRS: &[&str] = &[
         SOURCE_DIR,
         SINK_DIR,
@@ -125,7 +132,7 @@ pub fn hub_root_for(path: &Path, fallback: &Path) -> std::path::PathBuf {
                 .is_some_and(|n| DIRS.contains(&n))
         })
         .and_then(Path::parent)
-        .map_or_else(|| fallback.to_path_buf(), Path::to_path_buf)
+        .map(Path::to_path_buf)
 }
 
 /// Run the bundle of the template at `path`, resolving companions and shared

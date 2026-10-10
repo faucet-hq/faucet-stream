@@ -529,13 +529,23 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
                 }
             }
         }
-        let fallback = hub::resolve_hub(a.hub.as_deref()).await?;
-        let mut by_root: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        // A file's own location names its hub; the `--hub` / default hub is
+        // resolved (possibly fetched) only for a bundle that needs one.
+        let mut fallback: Option<std::path::PathBuf> = None;
         for f in &a.files {
-            by_root.push((f.clone(), hub::bundles::hub_root_for(f, &fallback)));
-        }
-        for (f, root) in by_root {
-            bundle_findings(std::slice::from_ref(&f), &root, &mut findings).await?;
+            let root = match (a.hub.as_deref(), hub::bundles::inferred_hub_root(f)) {
+                (None, Some(root)) => root,
+                _ if hub::bundles::file_bundle(f)?.is_none() => continue,
+                _ => match &fallback {
+                    Some(root) => root.clone(),
+                    None => {
+                        let root = hub::resolve_hub(a.hub.as_deref()).await?;
+                        fallback = Some(root.clone());
+                        root
+                    }
+                },
+            };
+            bundle_findings(std::slice::from_ref(f), &root, &mut findings).await?;
         }
     }
     if a.json {
