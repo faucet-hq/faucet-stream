@@ -30,9 +30,7 @@ pub async fn run(args: McpArgs) -> CliResult<()> {
     // advertised at all.
     #[cfg(feature = "templates")]
     if let Some(url) = args.template_store.as_deref() {
-        ctx = ctx
-            .with_templates(crate::templates::resolve_store_url(url).await?)
-            .with_require_template_tests(args.require_template_tests);
+        ctx = ctx.with_templates(crate::templates::resolve_store_url(url).await?);
         tracing::info!(store = %url, "pipeline-template registry attached");
     }
 

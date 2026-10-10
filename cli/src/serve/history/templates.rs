@@ -545,9 +545,6 @@ pub struct LaunchRecord {
     /// Principal that launched it (`None` for a CLI launch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launched_by: Option<String>,
-    /// Set when an admin launched past the test gate (#856): the reason given.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tests_skipped: Option<String>,
 }
 
 /// Why and when a template was retired. Stored only while deprecated; clearing it
@@ -595,6 +592,16 @@ pub struct TemplateState {
     /// Individually retired versions, newest first (#697).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deprecated_versions: Vec<VersionDeprecation>,
+    /// Each version's test status (#856): `passing`, `failing`, `untested` or
+    /// `no_tests`. Only a `passing` version may hold a label.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub test_status: BTreeMap<u32, crate::template_tests::TestStatus>,
+    /// Whether the newest registered version carries a `tests:` block.
+    #[serde(default)]
+    pub has_tests: bool,
+    /// The launched version's test status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_tests: Option<crate::template_tests::TestStatus>,
 }
 
 impl TemplateState {
@@ -620,6 +627,9 @@ impl TemplateState {
             tags,
             deprecation,
             deprecated_versions,
+            test_status: BTreeMap::new(),
+            has_tests: false,
+            stable_tests: None,
         }
     }
 
@@ -781,7 +791,6 @@ mod tests {
             version,
             launched_at: DateTime::from_timestamp(seq as i64, 0).unwrap(),
             launched_by: None,
-            tests_skipped: None,
         };
         let launches = vec![launch(3, 2), launch(2, 1), launch(1, 4)];
         let tags = BTreeMap::from([("prod".to_string(), 3)]);

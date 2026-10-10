@@ -6,9 +6,11 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{CliError, CliResult};
 use crate::hub::TemplateKind;
-use crate::serve::history::templates::{TemplateRecord, TemplateTestResult, VersionSelector};
+use crate::serve::history::templates::{
+    RESULTS_RETAIN, TemplateRecord, TemplateTestResult, VersionSelector,
+};
 use crate::template_tests::bundle::{SuiteRequirement, TestBundle, TestSuiteTemplate, bundle_of};
-use crate::template_tests::gate::{GateVerdict, LaunchGate, evaluate};
+use crate::template_tests::gate::{TestStatus, VersionStatus, status_of};
 use crate::template_tests::result::BundleOutcome;
 use crate::template_tests::run::{SharedSuite, pick, run_bundle};
 use crate::template_tests::runner::Target;
@@ -260,79 +262,184 @@ fn no_bundle(id: &str, version: u32) -> CliError {
     ))
 }
 
-/// A version's standing against the gate, with its recent runs.
+/// A version's test status with its recent runs.
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionTests {
     pub version: u32,
     pub has_tests: bool,
-    pub gate: GateVerdict,
+    #[serde(flatten)]
+    pub status: VersionStatus,
     /// Recent runs, newest first.
     pub results: Vec<TemplateTestResult>,
 }
 
-/// Evaluate `gate` for `id`@`version` against what the registry holds.
-pub async fn version_tests(
-    store: &TemplateStore,
-    id: &str,
-    version: u32,
-    gate: &LaunchGate,
-    limit: usize,
-) -> CliResult<VersionTests> {
-    let rec = store
+async fn record(store: &TemplateStore, id: &str, version: u32) -> CliResult<TemplateRecord> {
+    store
         .template_get(id, Some(version))
         .await
         .map_err(read_err)?
         .ok_or_else(|| CliError::UnknownPipelineTemplate {
             id: id.to_string(),
             version: Some(version),
-        })?;
+        })
+}
+
+/// `id`@`version`'s test status and up to `limit` recent runs.
+pub async fn version_tests(
+    store: &TemplateStore,
+    id: &str,
+    version: u32,
+    limit: usize,
+) -> CliResult<VersionTests> {
+    let rec = record(store, id, version).await?;
     let has_tests = bundle_in(&rec)?.is_some();
     let results = store
         .template_test_results(id, Some(version), limit.max(1))
         .await
         .map_err(read_err)?;
-    let verdict = evaluate(
-        gate,
-        id,
-        version,
-        has_tests,
-        &body_sha256(&rec.body),
-        &results,
-    );
     Ok(VersionTests {
         version,
         has_tests,
-        gate: verdict,
+        status: status_of(id, version, has_tests, &body_sha256(&rec.body), &results),
         results,
     })
 }
 
-/// The gate's decision for launching `id`@`version`; `Err` when refused.
-pub async fn check_gate(
+/// `id`@`version`'s test status.
+pub async fn version_status(
     store: &TemplateStore,
     id: &str,
     version: u32,
-    gate: &LaunchGate,
-) -> CliResult<GateVerdict> {
-    let t = version_tests(
-        store,
-        id,
-        version,
-        gate,
-        crate::serve::history::templates::RESULTS_RETAIN,
-    )
-    .await?;
-    if t.gate.allowed {
-        Ok(t.gate)
-    } else {
-        Err(t.gate.refusal(id, version))
+) -> CliResult<VersionStatus> {
+    Ok(version_tests(store, id, version, RESULTS_RETAIN).await?.status)
+}
+
+/// Refuse `action` unless `id`@`version` is `passing` — the one check every
+/// label move (launch, rollback, a channel) goes through. An `untested`
+/// version has its bundle run first, through the normal record path, and is
+/// then decided on that result; a `failing` one is never re-run here.
+pub async fn require_passing(
+    store: &TemplateStore,
+    id: &str,
+    version: u32,
+    action: &str,
+) -> CliResult<VersionStatus> {
+    let mut st = version_status(store, id, version).await?;
+    if st.status == TestStatus::Untested {
+        test_version(store, id, version, None).await?;
+        st = version_status(store, id, version).await?;
     }
+    if st.status.can_hold_label() {
+        Ok(st)
+    } else {
+        Err(st.refusal(id, version, action))
+    }
+}
+
+/// Fill in each version's test status, whether the template's newest
+/// version has tests, the stable version's status, and — once the template
+/// has been launched — make `newest` skip versions that are not `passing`.
+pub async fn annotate(
+    store: &TemplateStore,
+    id: &str,
+    state: &mut crate::serve::history::templates::TemplateState,
+) -> CliResult<()> {
+    for v in state.versions.clone() {
+        let st = version_status(store, id, v).await?;
+        state.test_status.insert(v, st.status);
+    }
+    state.has_tests = state
+        .versions
+        .first()
+        .and_then(|v| state.test_status.get(v))
+        .is_some_and(|s| *s != TestStatus::NoTests);
+    state.stable_tests = state.stable.and_then(|v| state.test_status.get(&v).copied());
+    if state.stable.is_some() {
+        let retired = |v: u32| state.version_deprecation(v).is_some();
+        state.newest = state.versions.iter().copied().find(|v| {
+            !retired(*v) && state.test_status.get(v) == Some(&TestStatus::Passing)
+        });
+    }
+    Ok(())
+}
+
+/// The newest stored version of `id` carrying a `tests:` block, with that block.
+pub async fn inheritable_tests(
+    store: &TemplateStore,
+    id: &str,
+) -> CliResult<Option<(u32, serde_json::Value)>> {
+    for v in store.template_versions(id).await.map_err(read_err)? {
+        let rec = record(store, id, v).await?;
+        if bundle_in(&rec)?.is_some()
+            && let Some(t) = parse_body(&rec.body, rec.format)?.get("tests")
+        {
+            return Ok(Some((v, t.clone())));
+        }
+    }
+    Ok(None)
+}
+
+/// `body` with a top-level `tests:` block added. A YAML document keeps its
+/// text and comments, with the block appended; a document that does not read
+/// back identically that way (flow style) is re-emitted.
+pub fn with_tests(
+    body: &str,
+    format: crate::serve::load::ConfigFormat,
+    tests: &serde_json::Value,
+) -> CliResult<String> {
+    let mut doc = parse_body(body, format)?;
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| CliError::Config("a template must be a mapping".into()))?;
+    obj.insert("tests".into(), tests.clone());
+    let emit_err = |e: String| CliError::Internal(format!("adding inherited tests: {e}"));
+    match format {
+        crate::serve::load::ConfigFormat::Json => {
+            serde_json::to_string_pretty(&doc).map_err(|e| emit_err(e.to_string()))
+        }
+        crate::serve::load::ConfigFormat::Yaml => {
+            let block = serde_yaml::to_string(&serde_json::json!({ "tests": tests }))
+                .map_err(|e| emit_err(e.to_string()))?;
+            let appended = format!("{}\n{block}", body.trim_end());
+            if parse_body(&appended, format).ok().as_ref() == Some(&doc) {
+                Ok(appended)
+            } else {
+                serde_yaml::to_string(&doc).map_err(|e| emit_err(e.to_string()))
+            }
+        }
+    }
+}
+
+/// Test support: `body` with a minimal `tests:` block (the all-defaults
+/// case) when it is a pipeline document without one, so tests about other
+/// behaviour can launch it.
+#[cfg(test)]
+pub(crate) fn smoke(body: &str) -> String {
+    let doc: serde_json::Value = serde_yaml::from_str(body).unwrap_or_default();
+    let pipeline = doc.get("pipeline").is_some()
+        && doc.get("kind").and_then(|k| k.as_str()).is_none_or(|k| k == "pipeline");
+    if !pipeline || doc.get("tests").is_some() {
+        return body.to_string();
+    }
+    format!(
+        "{}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
+        body.trim_end()
+    )
+}
+
+/// Test support: run `id`'s newest version's bundle again and record it — for
+/// hub-kind pairs whose companions were registered after them.
+#[cfg(test)]
+pub(crate) async fn retest(store: &TemplateStore, id: &str) -> TemplateTestResult {
+    let v = store.template_versions(id).await.unwrap()[0];
+    test_version(store, id, v, None).await.unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template_tests::{GateStatus, LaunchGate};
+    use crate::serve::history::templates::VersionChannel;
+    use crate::template_tests::TestStatus;
     use crate::templates::{RegisterRequest, register, register_tested};
 
     pub(crate) fn pipeline(name: &str, expect_written: usize) -> String {
@@ -352,7 +459,7 @@ pipeline:
       base_url: "https://${{param.region}}.example.com"
       path: /rows
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out.jsonl
 tests:
@@ -366,6 +473,11 @@ tests:
         )
     }
 
+    fn untested_body(name: &str) -> String {
+        let body = pipeline(name, 2);
+        body[..body.find("tests:").unwrap()].to_string()
+    }
+
     fn req(body: String) -> RegisterRequest {
         RegisterRequest {
             id: None,
@@ -375,8 +487,6 @@ tests:
             tags: Vec::new(),
             launch: false,
             created_by: Some("ci".into()),
-            test: false,
-            gate: LaunchGate::default(),
         }
     }
 
@@ -384,227 +494,239 @@ tests:
         crate::templates::resolve_store_url("memory").await.unwrap()
     }
 
-    fn required() -> LaunchGate {
-        LaunchGate::new(true)
+    async fn status(s: &TemplateStore, id: &str, v: u32) -> TestStatus {
+        version_status(s, id, v).await.unwrap().status
+    }
+
+    fn pin(v: u32) -> VersionSelector {
+        VersionSelector::Pinned(v)
     }
 
     #[tokio::test]
-    async fn a_passing_bundle_is_recorded_and_unlocks_a_gated_launch() {
+    async fn register_runs_the_bundle_and_a_passing_version_launches() {
         let s = store().await;
-        let mut r = req(pipeline("orders", 2));
-        r.test = true;
-        let reg = register_tested(&s, r).await.unwrap();
-        let t = reg.tests.expect("ran");
+        let reg = register_tested(&s, req(pipeline("orders", 2))).await.unwrap();
+        let t = reg.tests.expect("ran on register");
         assert!(t.passed, "{t:#?}");
         assert_eq!(t.body_sha256, body_sha256(&reg.record.body));
         let names: Vec<&str> = t.cases.iter().map(|c| c.name.as_str()).collect();
-        assert!(
-            names.contains(&"auto:region=eu") && names.contains(&"rows"),
-            "{names:?}"
-        );
-        let vt = version_tests(&s, "orders", 1, &required(), 5)
-            .await
-            .unwrap();
-        assert!(vt.has_tests && vt.gate.allowed);
-        assert_eq!(vt.gate.status, GateStatus::Passed);
-        let out = crate::templates::launch_gated(
-            &s,
-            "orders",
-            VersionSelector::Pinned(1),
-            None,
-            &required(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out.tests.unwrap().status, GateStatus::Passed);
-        let again = crate::templates::launch_gated(
-            &s,
-            "orders",
-            VersionSelector::Pinned(1),
-            None,
-            &required(),
-        )
-        .await
-        .unwrap();
+        assert!(names.contains(&"auto:region=eu") && names.contains(&"rows"), "{names:?}");
+        let vt = version_tests(&s, "orders", 1, 5).await.unwrap();
+        assert!(vt.has_tests);
+        assert_eq!(vt.status.status, TestStatus::Passing);
+        let out = crate::templates::launch(&s, "orders", pin(1), None).await.unwrap();
+        assert_eq!(out.tests.unwrap().status, TestStatus::Passing);
+        let again = crate::templates::launch(&s, "orders", pin(1), None).await.unwrap();
         assert!(again.already_launched && again.tests.is_none());
+        let st = crate::templates::template_state(&s, "orders").await.unwrap();
+        assert!(st.has_tests);
+        assert_eq!(st.stable_tests, Some(TestStatus::Passing));
     }
 
     #[tokio::test]
-    async fn a_failing_or_missing_result_refuses_the_launch_until_an_admin_overrides() {
+    async fn a_failing_version_registers_but_takes_no_label() {
         let s = store().await;
-        register(&s, req(pipeline("orders", 9))).await.unwrap();
-        let err = crate::templates::launch_gated(
-            &s,
-            "orders",
-            VersionSelector::Pinned(1),
-            None,
-            &required(),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, CliError::LaunchGated { .. }));
-        assert!(err.to_string().contains("never run"), "{err}");
-
-        let t = test_version(&s, "orders", 1, Some("ci")).await.unwrap();
-        assert!(!t.passed);
-        let err = crate::templates::launch_gated(
-            &s,
-            "orders",
-            VersionSelector::Pinned(1),
-            None,
-            &required(),
-        )
-        .await
-        .unwrap_err();
-        let CliError::LaunchGated { failing, .. } = &err else {
+        let reg = register_tested(&s, req(pipeline("orders", 9))).await.unwrap();
+        assert!(!reg.tests.unwrap().passed, "registered, and marked failing");
+        assert_eq!(status(&s, "orders", 1).await, TestStatus::Failing);
+        let err = crate::templates::launch(&s, "orders", pin(1), None).await.unwrap_err();
+        let CliError::VersionNotPassing { status, failing, .. } = &err else {
             panic!("{err}")
         };
-        assert!(
-            failing.iter().any(|f| f.starts_with("rows:")),
-            "{failing:?}"
-        );
+        assert_eq!(status, "failing");
+        assert!(failing.iter().any(|f| f.starts_with("rows:")), "{failing:?}");
+        for tag in [VersionChannel::Dev, VersionChannel::Prod] {
+            let err = crate::templates::promote(&s, "orders", tag, pin(1)).await.unwrap_err();
+            assert!(err.to_string().contains("needs a passing version"), "{err}");
+        }
+        let mut r = req(pipeline("orders", 9));
+        r.launch = true;
+        let err = register_tested(&s, r).await.unwrap_err();
+        assert!(err.to_string().contains("registered as v2, but not labelled"), "{err}");
+        let mut r = req(pipeline("orders", 9));
+        r.tags = vec![VersionChannel::Dev];
+        assert!(register_tested(&s, r).await.is_err());
+        let st = s.template_state("orders").await.unwrap();
+        assert_eq!((st.versions.len(), st.stable), (3, None));
+        assert!(st.tags.is_empty());
+    }
 
-        let gate = required().with_skip(Some("hotfix".into())).unwrap();
-        let out = crate::templates::launch_gated(
+    #[tokio::test]
+    async fn a_draft_runs_and_registers_anything_but_labels_only_passing() {
+        let s = store().await;
+        register(&s, req(untested_body("orders"))).await.unwrap();
+        assert_eq!(status(&s, "orders", 1).await, TestStatus::NoTests);
+        let err = crate::templates::launch(&s, "orders", pin(1), None).await.unwrap_err();
+        assert!(err.to_string().contains("no `tests:` block"), "{err}");
+        let m = crate::templates::materialize_for_run(
             &s,
             "orders",
-            VersionSelector::Pinned(1),
-            Some("root"),
-            &gate,
+            1,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            crate::templates::Materialize::Local,
         )
         .await
-        .unwrap();
-        assert_eq!(out.tests.unwrap().skipped.as_deref(), Some("hotfix"));
-        let log = s.template_launches("orders").await.unwrap();
-        assert_eq!(log[0].tests_skipped.as_deref(), Some("hotfix"));
-
-        crate::templates::launch(&s, "orders", VersionSelector::Pinned(1), None)
-            .await
-            .expect("an ungated launch keeps today's behaviour");
+        .expect("a draft runs any version");
+        assert!(m.untested.is_none());
+        let st = crate::templates::template_state(&s, "orders").await.unwrap();
+        assert!(!st.has_tests);
+        assert_eq!(st.newest, Some(st.versions[0]), "a draft's newest is the highest");
     }
 
     #[tokio::test]
-    async fn a_version_without_tests_launches_even_when_tests_are_required() {
+    async fn an_empty_tests_block_counts_as_no_tests() {
         let s = store().await;
-        let body = pipeline("plain", 2);
-        let body = body[..body.find("tests:").unwrap()].to_string();
-        register(&s, req(body.clone())).await.unwrap();
-        let v = version_tests(&s, "plain", 1, &required(), 5).await.unwrap();
-        assert_eq!(v.gate.status, GateStatus::NoTests);
-        assert!(v.gate.allowed, "tests are optional");
-        crate::templates::launch_gated(&s, "plain", VersionSelector::Pinned(1), None, &required())
+        register(&s, req(untested_body("orders") + "tests: {}\n")).await.unwrap();
+        assert_eq!(status(&s, "orders", 1).await, TestStatus::NoTests);
+        register(&s, req(pipeline("orders", 2))).await.unwrap();
+        crate::templates::launch(&s, "orders", pin(2), None).await.unwrap();
+        let reg = register_tested(&s, req(untested_body("orders") + "tests: {}\n"))
             .await
             .unwrap();
-        assert!(
-            test_version(&s, "plain", 1, None)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("no `tests:`")
-        );
-        let mut r = req(body.clone());
-        r.test = true;
-        assert!(
-            register(&s, r)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("no `tests:` block")
-        );
-        let mut r = req(body);
-        r.launch = true;
-        r.gate = required();
-        register(&s, r).await.unwrap();
-        let st = s.template_state("plain").await.unwrap();
-        assert_eq!((st.versions, st.stable), (vec![1, 2], Some(2)));
+        assert_eq!(reg.tests_inherited_from, Some(2), "after a launch, empty = missing");
     }
 
     #[tokio::test]
-    async fn register_and_launch_under_the_gate_tests_first_and_reports_a_refusal() {
+    async fn an_untested_version_is_tested_before_a_label_moves_onto_it() {
         let s = store().await;
-        let mut r = req(pipeline("orders", 9));
-        r.launch = true;
-        r.gate = required();
-        let err = register_tested(&s, r).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("registered as v1 but not launched"),
-            "{err}"
-        );
-        let st = s.template_state("orders").await.unwrap();
-        assert_eq!((st.versions.clone(), st.stable), (vec![1], None));
+        let draft = TemplateDraftFor::new("orders", &pipeline("orders", 2));
+        s.template_register(&draft.0).await.unwrap();
+        assert_eq!(status(&s, "orders", 1).await, TestStatus::Untested);
+        crate::templates::promote(&s, "orders", VersionChannel::Dev, pin(1))
+            .await
+            .expect("an untested version is run first, then labelled");
+        assert_eq!(s.template_test_results("orders", Some(1), 5).await.unwrap().len(), 1);
+        assert_eq!(status(&s, "orders", 1).await, TestStatus::Passing);
+
+        let bad = TemplateDraftFor::new("orders", &pipeline("orders", 9));
+        s.template_register(&bad.0).await.unwrap();
+        let err = crate::templates::launch(&s, "orders", pin(2), None).await.unwrap_err();
+        assert!(err.to_string().contains("is failing"), "{err}");
+        assert_eq!(s.template_test_results("orders", Some(2), 5).await.unwrap().len(), 1);
+        let err = crate::templates::launch(&s, "orders", pin(2), None).await.unwrap_err();
+        assert!(err.to_string().contains("is failing"), "{err}");
         assert_eq!(
-            s.template_test_results("orders", Some(1), 5)
-                .await
-                .unwrap()
-                .len(),
-            1
+            s.template_test_results("orders", Some(2), 5).await.unwrap().len(),
+            1,
+            "a failing version is never re-run by a label move"
         );
+    }
 
-        let mut r = req(pipeline("orders", 2));
-        r.launch = true;
-        r.gate = required();
-        let reg = register_tested(&s, r).await.unwrap();
-        assert!(reg.tests.unwrap().passed);
-        assert_eq!(reg.launch.unwrap().version, 2);
+    struct TemplateDraftFor(crate::serve::history::templates::TemplateDraft);
+
+    impl TemplateDraftFor {
+        fn new(id: &str, body: &str) -> Self {
+            Self(crate::serve::history::templates::TemplateDraft {
+                id: crate::serve::history::templates::TemplateId::parse(id).unwrap(),
+                kind: TemplateKind::Pipeline,
+                name: Some(id.into()),
+                description: None,
+                body: body.into(),
+                format: crate::serve::load::ConfigFormat::Yaml,
+                params: Default::default(),
+                created_by: None,
+            })
+        }
     }
 
     #[tokio::test]
-    async fn rollback_goes_through_the_same_gate() {
+    async fn a_launched_template_inherits_tests_into_new_versions() {
         let s = store().await;
-        let mut r = req(pipeline("orders", 9));
-        r.launch = true;
-        register_tested(&s, r).await.unwrap();
         let mut r = req(pipeline("orders", 2));
         r.launch = true;
         register_tested(&s, r).await.unwrap();
-        let err = crate::templates::rollback_gated(&s, "orders", None, &required())
+        let body = format!("# keep this comment\n{}", untested_body("orders"));
+        let reg = register_tested(&s, req(body)).await.unwrap();
+        assert_eq!(reg.tests_inherited_from, Some(1));
+        assert!(reg.record.body.contains("# keep this comment"));
+        assert!(reg.record.body.contains("tests:"));
+        assert!(reg.tests.unwrap().passed);
+        assert_eq!(status(&s, "orders", 2).await, TestStatus::Passing);
+        assert!(document_has_tests(&reg.record.body, crate::serve::load::ConfigFormat::Yaml));
+    }
+
+    #[tokio::test]
+    async fn a_template_launched_without_tests_must_add_them() {
+        let s = store().await;
+        register(&s, req(untested_body("legacy"))).await.unwrap();
+        s.template_launch("legacy", 1, None).await.unwrap();
+        let err = register(&s, req(untested_body("legacy"))).await.unwrap_err();
+        assert!(matches!(err, CliError::TestsRequired { .. }), "{err}");
+        assert!(err.to_string().contains("add a `tests:` block"), "{err}");
+        let st = crate::templates::template_state(&s, "legacy").await.unwrap();
+        assert_eq!(st.stable, Some(1), "an existing label stays");
+        assert_eq!(st.stable_tests, Some(TestStatus::NoTests));
+        assert_eq!(st.newest, None, "newest skips a version that is not passing");
+        register(&s, req(pipeline("legacy", 2))).await.unwrap();
+        crate::templates::launch(&s, "legacy", pin(2), None).await.unwrap();
+        let err = crate::templates::rollback(&s, "legacy", None).await.unwrap_err();
+        assert!(err.to_string().contains("adds one"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_status_change_never_moves_a_label() {
+        let s = store().await;
+        let mut r = req(pipeline("orders", 2));
+        r.launch = true;
+        r.tags = vec![VersionChannel::Prod];
+        register_tested(&s, r).await.unwrap();
+        let mut failed = s.template_test_results("orders", Some(1), 1).await.unwrap()[0].clone();
+        failed.passed = false;
+        failed.recorded_at = chrono::Utc::now() + chrono::Duration::seconds(5);
+        s.template_record_test(&failed).await.unwrap();
+        let st = crate::templates::template_state(&s, "orders").await.unwrap();
+        assert_eq!(st.stable, Some(1));
+        assert_eq!(st.tags.get("prod"), Some(&1));
+        assert_eq!(st.stable_tests, Some(TestStatus::Failing));
+        let err = crate::templates::promote(&s, "orders", VersionChannel::Dev, pin(1))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("v1"), "{err}");
-        crate::templates::rollback_gated(
-            &s,
-            "orders",
-            None,
-            &required().with_skip(Some("incident".into())).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(s.template_state("orders").await.unwrap().stable, Some(1));
+        assert!(err.to_string().contains("is failing"), "{err}");
+        crate::templates::promote(&s, "orders", VersionChannel::Prod, pin(1))
+            .await
+            .expect("re-pointing a channel where it already is moves nothing");
     }
 
     #[tokio::test]
-    async fn a_result_from_another_body_or_major_is_stale() {
+    async fn after_a_launch_newest_and_runs_skip_or_refuse_non_passing_versions() {
         let s = store().await;
-        register(&s, req(pipeline("orders", 2))).await.unwrap();
-        let mut t = test_version(&s, "orders", 1, None).await.unwrap();
-        t.faucet_version = "0.0.1".into();
-        t.recorded_at = chrono::Utc::now() + chrono::Duration::seconds(5);
-        s.template_record_test(&t).await.unwrap();
-        let v = version_tests(&s, "orders", 1, &required(), 5)
-            .await
-            .unwrap();
-        assert_eq!(
-            v.gate.status,
-            GateStatus::Passed,
-            "an older valid pass still counts"
-        );
-
-        s.template_delete("orders", None).await.unwrap();
+        let mut r = req(pipeline("orders", 2));
+        r.launch = true;
+        register_tested(&s, r).await.unwrap();
+        register(&s, req(pipeline("orders", 9))).await.unwrap();
+        let st = crate::templates::template_state(&s, "orders").await.unwrap();
+        assert_eq!(st.newest, Some(1));
+        assert_eq!(st.test_status.get(&2), Some(&TestStatus::Failing));
+        let run = |allow: bool| {
+            let s = s.clone();
+            async move {
+                crate::templates::materialize_for_run(
+                    &s,
+                    "orders",
+                    2,
+                    &crate::templates::SinkChoice {
+                        allow_untested: allow,
+                        ..Default::default()
+                    },
+                    &Default::default(),
+                    &Default::default(),
+                    crate::templates::Materialize::Local,
+                )
+                .await
+            }
+        };
+        let err = run(false).await.unwrap_err();
+        assert!(err.to_string().contains("allow_untested"), "{err}");
+        let m = run(true).await.unwrap();
+        assert_eq!(m.untested, Some(TestStatus::Failing));
         assert!(
-            s.template_test_results("orders", None, 5)
+            crate::templates::run_gate(&s, "orders", 1, false)
                 .await
                 .unwrap()
-                .is_empty()
+                .is_none()
         );
-        register(&s, req(pipeline("orders", 2))).await.unwrap();
-        t.faucet_version = crate::template_tests::result::faucet_version().into();
-        t.body_sha256 = "stale-body".into();
-        s.template_record_test(&t).await.unwrap();
-        let v = version_tests(&s, "orders", 1, &required(), 5)
-            .await
-            .unwrap();
-        assert_eq!(v.gate.status, GateStatus::Stale);
     }
 
     fn suite_doc(release: &str) -> String {
@@ -626,31 +748,21 @@ tests:
     async fn shared_suites_resolve_by_range_or_fail_registration_with_a_typed_error() {
         let s = store().await;
         let err = register(&s, req(requiring(">=1.2,<2"))).await.unwrap_err();
-        assert!(
-            matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }),
-            "{err}"
-        );
+        assert!(matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }), "{err}");
         assert!(err.to_string().contains("none registered"), "{err}");
 
         register(&s, req(suite_doc("1.1.0"))).await.unwrap();
         register(&s, req(suite_doc("1.3.0"))).await.unwrap();
         register(&s, req(suite_doc("2.0.0"))).await.unwrap();
         let dup = register(&s, req(suite_doc("1.3.0"))).await.unwrap_err();
-        assert!(
-            dup.to_string().contains("already registered as v2"),
-            "{dup}"
-        );
+        assert!(dup.to_string().contains("already registered as v2"), "{dup}");
 
         let rec = register(&s, req(requiring(">=1.2,<2"))).await.unwrap();
         let t = test_version(&s, "orders", rec.version, None).await.unwrap();
         assert!(t.passed, "{t:#?}");
         assert_eq!(t.suites[0].release, "1.3.0");
         assert_eq!(t.suites[0].version, Some(2));
-        assert!(
-            t.cases
-                .iter()
-                .any(|c| c.source == "suite:conformance@1.3.0")
-        );
+        assert!(t.cases.iter().any(|c| c.source == "suite:conformance@1.3.0"));
 
         crate::templates::set_version_deprecated(&s, "conformance", 2, None, None, true)
             .await
@@ -666,12 +778,7 @@ tests:
                 .to_string()
                 .contains("is a test-suite")
         );
-        let not_suite = register(
-            &s,
-            req(pipeline("conf2", 2).replace("name: conf2", "name: x")),
-        )
-        .await;
-        assert!(not_suite.is_ok());
+        register(&s, req(pipeline("x", 2))).await.unwrap();
         let wrong = resolve_shared(
             &s,
             &[SuiteRequirement {
@@ -721,14 +828,20 @@ tests:
                 "identical content hashes alike, so a sync registers nothing"
             );
         }
-        assert!(document_has_tests(
-            &a.body,
-            crate::serve::load::ConfigFormat::Yaml
-        ));
-        assert!(!document_has_tests(
-            "{",
-            crate::serve::load::ConfigFormat::Yaml
-        ));
+        assert!(!document_has_tests("{", crate::serve::load::ConfigFormat::Yaml));
+    }
+
+    #[test]
+    fn inherited_tests_are_appended_to_yaml_or_re_emitted() {
+        use crate::serve::load::ConfigFormat;
+        let tests = serde_json::json!({"suite": {"auto": {"defaults_baseline": true}}});
+        let y = with_tests("# c\nname: a\n", ConfigFormat::Yaml, &tests).unwrap();
+        assert!(y.starts_with("# c\nname: a\n") && y.contains("defaults_baseline"), "{y}");
+        let flow = with_tests("{name: a}", ConfigFormat::Yaml, &tests).unwrap();
+        assert!(parse_body(&flow, ConfigFormat::Yaml).unwrap().get("tests").is_some());
+        let j = with_tests("{\"name\": \"a\"}", ConfigFormat::Json, &tests).unwrap();
+        assert!(parse_body(&j, ConfigFormat::Json).unwrap().get("tests").is_some());
+        assert!(with_tests("[1]", ConfigFormat::Json, &tests).is_err());
     }
 
     fn source(sink_line: &str) -> String {
@@ -753,11 +866,11 @@ tests:
     const SINK: &str = r#"kind: sink-template
 name: files
 description: files
-sink: { type: jsonl, config: {} }
+sink: { type: file, config: {} }
 per_stream: { path: "./out/${stream}.jsonl" }
-write_mode_aliases: { overwrite: append }
 tests:
   source: acme
+  source_select: newest
   suite:
     auto: { defaults_baseline: true }
 "#;
@@ -765,45 +878,39 @@ tests:
     #[tokio::test]
     async fn hub_kind_bundles_compose_with_their_registered_companions() {
         let s = store().await;
-        register(&s, req(SINK.into())).await.unwrap();
-        crate::templates::launch(&s, "files", VersionSelector::Pinned(1), None)
-            .await
-            .unwrap();
-        let t = test_version(&s, "files", 1, None).await.unwrap();
-        let e = t.error.expect("acme is not registered yet");
+        let reg = register_tested(&s, req(SINK.into())).await.unwrap();
+        let e = reg.tests.unwrap().error.expect("acme is not registered yet");
         assert!(e.contains("acme"), "{e}");
 
-        register(&s, req(source("sink: files"))).await.unwrap();
-        crate::templates::launch(&s, "acme", VersionSelector::Pinned(1), None)
+        let src = register_tested(&s, req(source("sink: files\n  sink_select: newest")))
             .await
             .unwrap();
-        assert!(test_version(&s, "acme", 1, None).await.unwrap().passed);
+        let t = src.tests.unwrap();
+        assert!(t.passed, "{t:?}");
         assert!(test_version(&s, "files", 1, None).await.unwrap().passed);
 
-        register(
+        let ops = register_tested(
             &s,
-            req("kind: deployment\nname: ops\nstate: { type: memory }\ntests:\n  source: acme\n  sink: files\n  suite:\n    auto: { defaults_baseline: true }\n".into()),
+            req("kind: deployment\nname: ops\nstate: { type: memory }\ntests:\n  source: acme\n  source_select: newest\n  sink: files\n  sink_select: newest\n  suite:\n    auto: { defaults_baseline: true }\n".into()),
         )
         .await
         .unwrap();
-        assert!(test_version(&s, "ops", 1, None).await.unwrap().passed);
+        assert!(ops.tests.unwrap().passed);
 
-        register(&s, req(source("sink: files\n  overlay: ops")))
-            .await
-            .unwrap();
-        crate::templates::launch(&s, "ops", VersionSelector::Pinned(1), None)
-            .await
-            .unwrap();
-        assert!(test_version(&s, "acme", 2, None).await.unwrap().passed);
+        let with_overlay = register_tested(
+            &s,
+            req(source("sink: files\n  sink_select: newest\n  overlay: ops\n  overlay_select: newest")),
+        )
+        .await
+        .unwrap();
+        assert!(with_overlay.tests.unwrap().passed);
     }
 
     #[tokio::test]
-    async fn check_gate_and_version_tests_name_unknown_versions() {
+    async fn version_tests_and_run_version_name_unknown_versions() {
         let s = store().await;
         assert!(matches!(
-            version_tests(&s, "nope", 1, &required(), 1)
-                .await
-                .unwrap_err(),
+            version_tests(&s, "nope", 1, 1).await.unwrap_err(),
             CliError::UnknownPipelineTemplate { .. }
         ));
         assert!(matches!(
@@ -811,17 +918,13 @@ tests:
             CliError::UnknownPipelineTemplate { .. }
         ));
         register(&s, req(pipeline("orders", 2))).await.unwrap();
-        assert!(
-            check_gate(&s, "orders", 1, &LaunchGate::new(false))
-                .await
-                .unwrap()
-                .allowed
-        );
+        assert!(require_passing(&s, "orders", 1, "launch").await.is_ok());
         assert!(
             registered_release(&s, "orders", &semver::Version::new(1, 0, 0))
                 .await
                 .unwrap()
                 .is_none()
         );
+        assert!(inheritable_tests(&s, "orders").await.unwrap().is_some());
     }
 }

@@ -35,7 +35,6 @@ pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (2, "faucet_serve_changes", "tenant"),
     (3, "faucet_serve_audit", "target"),
     (4, "faucet_serve_run_logs", "attrs"),
-    (5, "faucet_template_launches", "tests_skipped"),
     (5, "faucet_serve_audit", "detail"),
 ];
 
@@ -1563,10 +1562,9 @@ impl Stmts {
                 FROM faucet_template_launches WHERE id=$1"
                 .into(),
             template_insert_launch: "INSERT INTO faucet_template_launches \
-                (id, seq, version, launched_at, launched_by, tests_skipped) \
-                VALUES ($1,$2,$3,$4,$5,$6)"
+                (id, seq, version, launched_at, launched_by) VALUES ($1,$2,$3,$4,$5)"
                 .into(),
-            template_select_launches: "SELECT seq, version, launched_at, launched_by, tests_skipped \
+            template_select_launches: "SELECT seq, version, launched_at, launched_by \
                 FROM faucet_template_launches WHERE id=$1 ORDER BY CAST(seq AS BIGINT) DESC"
                 .into(),
             template_delete_launches_all: "DELETE FROM faucet_template_launches WHERE id=$1".into(),
@@ -2066,10 +2064,9 @@ impl Stmts {
                 FROM faucet_template_launches WHERE id=?"
                 .into(),
             template_insert_launch: "INSERT INTO faucet_template_launches \
-                (id, seq, version, launched_at, launched_by, tests_skipped) \
-                VALUES (?,?,?,?,?,?)"
+                (id, seq, version, launched_at, launched_by) VALUES (?,?,?,?,?)"
                 .into(),
-            template_select_launches: "SELECT seq, version, launched_at, launched_by, tests_skipped \
+            template_select_launches: "SELECT seq, version, launched_at, launched_by \
                 FROM faucet_template_launches WHERE id=? ORDER BY CAST(seq AS INTEGER) DESC"
                 .into(),
             template_delete_launches_all: "DELETE FROM faucet_template_launches WHERE id=?".into(),
@@ -5290,17 +5287,6 @@ macro_rules! impl_sql_history {
                 version: u32,
                 launched_by: Option<&str>,
             ) -> Result<Option<u32>, $crate::serve::history::HistoryError> {
-                self.template_launch_noted(id, version, launched_by, None)
-                    .await
-            }
-
-            async fn template_launch_noted(
-                &self,
-                id: &str,
-                version: u32,
-                launched_by: Option<&str>,
-                tests_skipped: Option<&str>,
-            ) -> Result<Option<u32>, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
                 use $crate::serve::history::HistoryError;
                 use $crate::serve::history::{sql, templates};
@@ -5343,7 +5329,6 @@ macro_rules! impl_sql_history {
                         .bind(version.to_string())
                         .bind(sql::fmt_ts(chrono::Utc::now()))
                         .bind(launched_by)
-                        .bind(tests_skipped)
                         .execute(&self.pool)
                         .await;
                     match insert {
@@ -5384,8 +5369,6 @@ macro_rules! impl_sql_history {
                     let version: String = r.try_get("version").map_err(backend)?;
                     let launched_at: String = r.try_get("launched_at").map_err(backend)?;
                     let launched_by: Option<String> = r.try_get("launched_by").map_err(backend)?;
-                    let tests_skipped: Option<String> =
-                        r.try_get("tests_skipped").map_err(backend)?;
                     // Skip an unparseable row rather than failing the whole read —
                     // a corrupt entry must not make a template unusable.
                     let (Ok(seq), Ok(version)) = (seq.parse::<u32>(), version.parse::<u32>()) else {
@@ -5396,7 +5379,6 @@ macro_rules! impl_sql_history {
                         version,
                         launched_at: sql::parse_ts(&launched_at),
                         launched_by,
-                        tests_skipped,
                     });
                 }
                 Ok(out)

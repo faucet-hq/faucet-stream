@@ -55,19 +55,19 @@ pub struct RegisterRequest {
     pub launch: bool,
     /// Principal performing the registration, for provenance.
     pub created_by: Option<String>,
-    /// Run the new version's `tests:` bundle right after registering it and
-    /// record the result (#856). A launch under a test gate runs it anyway.
-    pub test: bool,
-    /// The gate a `launch` in the same step goes through.
-    pub gate: crate::template_tests::LaunchGate,
 }
 
 /// What [`register_tested`] did: the new version, its test run, its launch.
 #[derive(Debug, Clone)]
 pub struct Registration {
     pub record: TemplateRecord,
-    /// The bundle run recorded on the new version, when one ran.
+    /// The bundle run recorded on the new version (every version with a
+    /// `tests:` block is tested as it is registered).
     pub tests: Option<crate::serve::history::templates::TemplateTestResult>,
+    /// The version whose `tests:` block this one inherited: a launched
+    /// template's new version registered without one gets the newest earlier
+    /// block written into its stored body.
+    pub tests_inherited_from: Option<u32>,
     /// The launch, when the request asked for one.
     pub launch: Option<LaunchOutcome>,
 }
@@ -103,6 +103,10 @@ pub struct MaterializedConfig {
     pub overlay_contributes: Vec<String>,
     /// Operator-facing warnings about the composed run.
     pub warnings: Vec<String>,
+    /// Set when the run went ahead with `allow_untested` on a version whose
+    /// tests are not `passing` (#856): that version's status, for the run's
+    /// label and the audit log.
+    pub untested: Option<crate::template_tests::TestStatus>,
     /// The row selection to apply to the materialized config's rows (#741):
     /// the caller's for a `pipeline`; for a composed run, the streams the
     /// caller's selection resolved to (the composition carries only those).
@@ -153,6 +157,9 @@ struct Prelude {
     id: TemplateId,
     pipeline: Option<crate::config::PipelineConfig>,
     bundle: Option<crate::template_tests::TestBundle>,
+    /// The body to store: the submitted one, or it plus an inherited `tests:`.
+    body: String,
+    tests_inherited_from: Option<u32>,
 }
 
 async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliResult<Prelude> {
@@ -288,17 +295,34 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
     // The bundle, and every shared suite it requires resolving to a
     // registered release in range — an unsatisfiable range fails here, not
     // at launch time.
-    let bundle = match kind {
+    let mut bundle = match kind {
         TemplateKind::TestSuite => None,
         k => crate::template_tests::bundle::bundle_of(&doc, k)?,
     };
+    // Once launched, every new version carries tests: one registered without
+    // a `tests:` block takes the newest earlier block into its own body, so
+    // the version (and its hash) still is "template + its tests".
+    let mut body = req.body.clone();
+    let mut tests_inherited_from = None;
+    if bundle.is_none()
+        && kind != TemplateKind::TestSuite
+        && !store
+            .template_launches(id.as_str())
+            .await
+            .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
+            .is_empty()
+    {
+        let (from, tests) = crate::templates::bundle::inheritable_tests(store, id.as_str())
+            .await?
+            .ok_or_else(|| CliError::TestsRequired {
+                id: id.as_str().to_string(),
+            })?;
+        body = crate::templates::bundle::with_tests(&req.body, req.format, &tests)?;
+        bundle = crate::template_tests::bundle::bundle_of(&parse_body(&body, req.format)?, kind)?;
+        tests_inherited_from = Some(from);
+    }
     if let Some(b) = &bundle {
         crate::templates::bundle::resolve_shared(store, &b.requires_suites).await?;
-    }
-    if req.test && bundle.is_none() {
-        return Err(CliError::Config(
-            "test-on-register was asked for, but the document has no `tests:` block".into(),
-        ));
     }
     Ok(Prelude {
         doc,
@@ -308,6 +332,8 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
         id,
         pipeline: pipeline_cfg,
         bundle,
+        body,
+        tests_inherited_from,
     })
 }
 
@@ -368,6 +394,8 @@ pub async fn register_tested(
         name,
         id,
         bundle,
+        body,
+        tests_inherited_from,
         ..
     } = register_prelude(store, &req).await?;
 
@@ -417,7 +445,7 @@ pub async fn register_tested(
         kind,
         name,
         description,
-        body: req.body.clone(),
+        body,
         format: req.format,
         params: declared,
         created_by: req.created_by.clone(),
@@ -427,15 +455,7 @@ pub async fn register_tested(
         .await
         .map_err(|e| crate::templates::store::registry_err("template registry write", e))?;
 
-    // Point the requested channels at the version just created.
-    for tag in &req.tags {
-        store
-            .template_set_tag(&record.id, tag.as_str(), record.version)
-            .await
-            .map_err(|e| crate::templates::store::registry_err("template channel write", e))?;
-    }
-    let gated = req.launch && req.gate.require_tests && req.gate.skip_tests_reason.is_none();
-    let tests = if bundle.is_some() && (req.test || gated) {
+    let tests = if bundle.is_some() {
         Some(
             crate::templates::bundle::test_version(
                 store,
@@ -448,39 +468,55 @@ pub async fn register_tested(
     } else {
         None
     };
-    // `--launch` is the only way a register makes a version live.
-    let launch = if req.launch {
-        match launch_gated(
+    // A label in the same step needs a passing version; the version stays
+    // registered (and its result recorded) either way.
+    let registered = |e: CliError| match e {
+        CliError::VersionNotPassing {
+            id,
+            version,
+            status,
+            action,
+            reason,
+            failing,
+        } => CliError::VersionNotPassing {
+            id,
+            version,
+            status,
+            action,
+            reason: format!("registered as v{version}, but not labelled — {reason}"),
+            failing,
+        },
+        other => other,
+    };
+    for tag in &req.tags {
+        promote(
             store,
             &record.id,
+            *tag,
             VersionSelector::Pinned(record.version),
-            req.created_by.as_deref(),
-            &req.gate,
         )
         .await
-        {
-            Ok(o) => Some(o),
-            Err(CliError::LaunchGated {
-                id,
-                version,
-                reason,
-                failing,
-            }) => {
-                return Err(CliError::LaunchGated {
-                    id,
-                    version,
-                    reason: format!("registered as v{version} but not launched — {reason}"),
-                    failing,
-                });
-            }
-            Err(e) => return Err(e),
-        }
+        .map_err(registered)?;
+    }
+    // `--launch` is the only way a register makes a version live.
+    let launch = if req.launch {
+        Some(
+            launch(
+                store,
+                &record.id,
+                VersionSelector::Pinned(record.version),
+                req.created_by.as_deref(),
+            )
+            .await
+            .map_err(registered)?,
+        )
     } else {
         None
     };
     Ok(Registration {
         record,
         tests,
+        tests_inherited_from,
         launch,
     })
 }
@@ -671,10 +707,12 @@ pub async fn list_with_state(store: &TemplateStore) -> CliResult<Vec<TemplateSum
 /// The template's full release state (status, `stable` / `previous` / `newest`,
 /// channel pointers). Errors only if the registry itself is unreadable.
 pub async fn template_state(store: &TemplateStore, id: &str) -> CliResult<TemplateState> {
-    store
+    let mut state = store
         .template_state(id)
         .await
-        .map_err(|e| crate::templates::store::registry_err("template registry read", e))
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?;
+    crate::templates::bundle::annotate(store, id, &mut state).await?;
+    Ok(state)
 }
 
 /// Confirm a version exists, returning a typed error naming it if not.
@@ -709,6 +747,15 @@ pub async fn promote(
     reject_derived(tag)?;
     let version = resolve_version(store, id, target).await?;
     require_version(store, id, version).await?;
+    let current = store
+        .template_tags(id)
+        .await
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?;
+    if current.get(tag.as_str()) == Some(&version) {
+        return Ok(version);
+    }
+    crate::templates::bundle::require_passing(store, id, version, &format!("channel `{tag}`"))
+        .await?;
     store
         .template_set_tag(id, tag.as_str(), version)
         .await
@@ -727,12 +774,16 @@ pub struct LaunchOutcome {
     pub already_launched: bool,
     /// Whether this launch flipped the template out of `draft`.
     pub first_launch: bool,
-    /// The test gate's verdict for the launched version (#856); `None` when
-    /// nothing changed (the version was already live).
-    pub tests: Option<crate::template_tests::GateVerdict>,
+    /// The launched version's test status (#856); `None` when nothing changed
+    /// (the version was already live).
+    pub tests: Option<crate::template_tests::VersionStatus>,
 }
 
 /// **Launch** a version: make it `stable`, so unpinned callers start using it.
+///
+/// Only a `passing` version may be launched (#856) — its `tests:` bundle ran
+/// and passed under this faucet major. Every launch surface (CLI, HTTP, MCP,
+/// template sync, approved change requests, rollback) comes through here.
 ///
 /// This is the one deliberate act that moves consumers. Registering a build never
 /// does — that is the whole point of the model, so a nightly can land without
@@ -746,21 +797,6 @@ pub async fn launch(
     id: &str,
     target: VersionSelector,
     launched_by: Option<&str>,
-) -> CliResult<LaunchOutcome> {
-    launch_gated(store, id, target, launched_by, &Default::default()).await
-}
-
-/// [`launch`] through the test gate (#856): with `gate.require_tests`, the
-/// version needs a passing bundle result recorded under this faucet major
-/// version, unless an admin passed `gate.skip_tests_reason` — which is then
-/// written on the launch log. Every launch surface (CLI, HTTP, MCP, template
-/// sync, approved change requests) comes through here.
-pub async fn launch_gated(
-    store: &TemplateStore,
-    id: &str,
-    target: VersionSelector,
-    launched_by: Option<&str>,
-    gate: &crate::template_tests::LaunchGate,
 ) -> CliResult<LaunchOutcome> {
     let version = resolve_version(store, id, target).await?;
     require_version(store, id, version).await?;
@@ -787,9 +823,9 @@ pub async fn launch_gated(
             tests: None,
         });
     }
-    let verdict = crate::templates::bundle::check_gate(store, id, version, gate).await?;
+    let verdict = crate::templates::bundle::require_passing(store, id, version, "launch").await?;
     let seq = store
-        .template_launch_noted(id, version, launched_by, verdict.skipped.as_deref())
+        .template_launch(id, version, launched_by)
         .await
         .map_err(|e| crate::templates::store::registry_err("template launch write", e))?;
     Ok(LaunchOutcome {
@@ -808,23 +844,11 @@ pub async fn rollback(
     id: &str,
     launched_by: Option<&str>,
 ) -> CliResult<LaunchOutcome> {
-    rollback_gated(store, id, launched_by, &Default::default()).await
-}
-
-/// [`rollback`] through the test gate: the previous version is launched again,
-/// so it must pass the same gate a fresh launch does.
-pub async fn rollback_gated(
-    store: &TemplateStore,
-    id: &str,
-    launched_by: Option<&str>,
-    gate: &crate::template_tests::LaunchGate,
-) -> CliResult<LaunchOutcome> {
-    launch_gated(
+    launch(
         store,
         id,
         VersionSelector::Channel(VersionChannel::Previous),
         launched_by,
-        gate,
     )
     .await
 }
@@ -992,6 +1016,7 @@ pub async fn materialize(
         overlay_contributes: Vec::new(),
         warnings: Vec::new(),
         selection: None,
+        untested: None,
     })
 }
 
@@ -1003,6 +1028,10 @@ pub struct SinkChoice {
     pub version: VersionSelector,
     /// The deployment overlay to apply over the pairing (#679).
     pub overlay: Option<OverlayChoice>,
+    /// Run a version whose tests are not `passing` (#856). Once a template has
+    /// been launched, a run that resolves to such a version is refused
+    /// without it; a draft template needs none.
+    pub allow_untested: bool,
 }
 
 /// Where a trigger's deployment overlay comes from.
@@ -1102,6 +1131,68 @@ pub async fn materialize_for_run(
 /// cannot run does not block the ones selected.
 #[allow(clippy::too_many_arguments)]
 pub async fn materialize_for_run_selected(
+    store: &TemplateStore,
+    id: &str,
+    version: u32,
+    sink: &SinkChoice,
+    supplied: &SuppliedParams,
+    env_overrides: &BTreeMap<String, String>,
+    mode: Materialize,
+    selection: Option<&crate::select::SelectionRequest>,
+) -> CliResult<MaterializedConfig> {
+    let untested = run_gate(store, id, version, sink.allow_untested).await?;
+    let mut m = materialize_kind(
+        store,
+        id,
+        version,
+        sink,
+        supplied,
+        env_overrides,
+        mode,
+        selection,
+    )
+    .await?;
+    m.untested = untested;
+    Ok(m)
+}
+
+/// Whether a run of `id`@`version` may go ahead (#856). A draft template (never
+/// launched) runs any version. After a launch, a version whose tests are not
+/// `passing` runs only with `allow_untested`, and then its status is returned
+/// so the caller can label and audit the run.
+pub async fn run_gate(
+    store: &TemplateStore,
+    id: &str,
+    version: u32,
+    allow_untested: bool,
+) -> CliResult<Option<crate::template_tests::TestStatus>> {
+    let launched = !store
+        .template_launches(id)
+        .await
+        .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
+        .is_empty();
+    if !launched {
+        return Ok(None);
+    }
+    let st = crate::templates::bundle::version_status(store, id, version).await?;
+    if st.status.can_hold_label() {
+        return Ok(None);
+    }
+    if allow_untested {
+        return Ok(Some(st.status));
+    }
+    let mut refusal = st.refusal(id, version, "a run");
+    if let CliError::VersionNotPassing { reason, .. } = &mut refusal {
+        reason.push_str(
+            " — or run it anyway with `allow_untested` (`--allow-untested`), which labels and \
+             audits the run",
+        );
+    }
+    Err(refusal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_kind(
     store: &TemplateStore,
     id: &str,
     version: u32,
@@ -1271,6 +1362,7 @@ async fn materialize_pair_selected(
         overlay_contributes,
         warnings,
         selection: effective,
+        untested: None,
     })
 }
 
@@ -1458,14 +1550,12 @@ pipeline:
     fn req(body: &str) -> RegisterRequest {
         RegisterRequest {
             id: None,
-            body: body.to_string(),
+            body: crate::templates::bundle::smoke(body),
             format: ConfigFormat::Yaml,
             description: Some("test".into()),
             tags: Vec::new(),
             launch: false,
             created_by: Some("tester".into()),
-            test: false,
-            gate: Default::default(),
         }
     }
 
@@ -1486,7 +1576,11 @@ pipeline:
         assert_eq!(first.created_by.as_deref(), Some("tester"));
         assert!(first.params["tenant_id"].required);
         assert_eq!(first.params["page"].default, Some(json!(100)));
-        assert_eq!(first.body, PARAMETERIZED, "body stored verbatim");
+        assert_eq!(
+            first.body,
+            crate::templates::bundle::smoke(PARAMETERIZED),
+            "body stored verbatim"
+        );
 
         let second = register(&s, req(PARAMETERIZED)).await.unwrap();
         assert_eq!(second.version, 2);
@@ -2346,6 +2440,11 @@ streams:
     source: {{ config: {{ path: \"${{param.data_dir}}/customers.csv\" }} }}
     primary_keys: [id]
     write: [overwrite, upsert]
+tests:
+  sink: local-jsonl
+  sink_select: newest
+  suite:
+    auto: {{ defaults_baseline: true }}
 ",
             dir.display()
         )
@@ -2367,9 +2466,28 @@ per_stream:
   path: \"${{param.out_dir}}/${{source}}/${{stream}}.jsonl\"
 write_mode_aliases:
   overwrite: append
+tests:
+  source: acme-exports
+  source_select: newest
+  suite:
+    auto: {{ defaults_baseline: true }}
 ",
             dir.display()
         )
+    }
+
+    /// Register a source × sink pair whose bundles name each other, re-test
+    /// the first (its companion did not exist yet), and launch both.
+    async fn launch_pair(s: &TemplateStore, source: &str, sink: &str) {
+        let src = register(s, req(source)).await.unwrap();
+        let snk = register(s, req(sink)).await.unwrap();
+        crate::templates::bundle::retest(s, &src.id).await;
+        launch(s, &src.id, VersionSelector::Pinned(src.version), None)
+            .await
+            .unwrap();
+        launch(s, &snk.id, VersionSelector::Pinned(snk.version), None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2386,10 +2504,7 @@ write_mode_aliases:
             assert!(matches!(err, CliError::IncompatibleFaucet { .. }), "{err}");
         }
         let ok = format!("requires_faucet: \">=1\"\n{}", source_template(dir.path()));
-        register(&s, req_launched(&ok)).await.unwrap();
-        register(&s, req_launched(&sink_template(dir.path())))
-            .await
-            .unwrap();
+        launch_pair(&s, &ok, &sink_template(dir.path())).await;
         // A newer instance registered it; this one cannot run it.
         let stored = s
             .template_register(&crate::serve::history::templates::TemplateDraft {
@@ -2425,7 +2540,7 @@ write_mode_aliases:
     async fn hub_kinds_register_under_their_name_and_keep_their_kind() {
         let dir = tempfile::tempdir().unwrap();
         let s = store();
-        let src = register(&s, req_launched(&source_template(dir.path())))
+        let src = register(&s, req(&source_template(dir.path())))
             .await
             .unwrap();
         assert_eq!(src.id, "acme-exports", "a hub template's id is its name");
@@ -2452,7 +2567,7 @@ write_mode_aliases:
         let third = register(&s, req(&edited)).await.unwrap();
         assert_eq!(third.description.as_deref(), Some("Acme — orders only"));
 
-        let mut fresh = req_launched(&sink_template(dir.path()));
+        let mut fresh = req(&sink_template(dir.path()));
         fresh.description = None;
         let sink = register(&s, fresh).await.unwrap();
         assert_eq!(sink.kind, TemplateKind::SinkTemplate);
@@ -2523,12 +2638,7 @@ write_mode_aliases:
     async fn materialize_refuses_hub_kinds_and_for_run_dispatches_on_kind() {
         let dir = tempfile::tempdir().unwrap();
         let s = store();
-        register(&s, req_launched(&source_template(dir.path())))
-            .await
-            .unwrap();
-        register(&s, req_launched(&sink_template(dir.path())))
-            .await
-            .unwrap();
+        launch_pair(&s, &source_template(dir.path()), &sink_template(dir.path())).await;
         register(&s, req_launched(PARAMETERIZED)).await.unwrap();
         let none = BTreeMap::new();
         let supplied = SuppliedParams::new();
@@ -2550,6 +2660,7 @@ write_mode_aliases:
             id: Some("local-jsonl".into()),
             version: Default::default(),
             overlay: None,
+            allow_untested: false,
         };
         let err = materialize_for_run(
             &s,
@@ -2596,6 +2707,7 @@ write_mode_aliases:
             id: Some("tenant-sync".into()),
             version: Default::default(),
             overlay: None,
+            allow_untested: false,
         };
         let err = materialize_for_run(
             &s,
@@ -2676,6 +2788,7 @@ write_mode_aliases:
             id: Some("local-jsonl".into()),
             version: VersionSelector::Pinned(9),
             overlay: None,
+            allow_untested: false,
         };
         let err = materialize_for_run(
             &s,
@@ -2698,16 +2811,11 @@ write_mode_aliases:
     async fn deployments_register_and_overlay_a_composed_trigger() {
         let s = store();
         let dir = tempfile::tempdir().unwrap();
-        register(&s, req_launched(&source_template(dir.path())))
-            .await
-            .unwrap();
-        register(&s, req_launched(&sink_template(dir.path())))
-            .await
-            .unwrap();
+        launch_pair(&s, &source_template(dir.path()), &sink_template(dir.path())).await;
         register(&s, req_launched(PARAMETERIZED)).await.unwrap();
         let state_dir = dir.path().join("state");
         let overlay_yaml = format!(
-            "kind: deployment\nname: prod-ops\ndescription: prod\nstate: {{ type: file, config: {{ path: '{}' }} }}\nstreams:\n  orders: {{ delivery: at_least_once }}\n",
+            "kind: deployment\nname: prod-ops\ndescription: prod\nstate: {{ type: file, config: {{ path: '{}' }} }}\nstreams:\n  orders: {{ delivery: at_least_once }}\ntests:\n  source: acme-exports\n  sink: local-jsonl\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
             state_dir.display()
         );
         let rec = register(&s, req_launched(&overlay_yaml)).await.unwrap();
@@ -2719,6 +2827,7 @@ write_mode_aliases:
             id: Some("local-jsonl".into()),
             version: Default::default(),
             overlay,
+            allow_untested: false,
         };
 
         // A registered overlay lands on the composed document with provenance.
@@ -2830,6 +2939,7 @@ write_mode_aliases:
                 id: None,
                 version: Default::default(),
                 overlay: Some(OverlayChoice::Inline(json!({}))),
+                allow_untested: false,
             },
             &supplied,
             &none,

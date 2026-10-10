@@ -375,6 +375,7 @@ pub fn template_body(
         idempotency_key: Some(context::idempotency_key(name, event)),
         selection: compiled.spec.run.selection.clone(),
         standing_approval: true,
+        allow_untested: tpl.allow_untested,
         ..Default::default()
     })
 }
@@ -473,6 +474,7 @@ mod tests {
             sink_version: Some("stable".into()),
             overlay: Some("prod".into()),
             overlay_version: None,
+            allow_untested: false,
         };
         let e = TriggerEvent::Schedule {
             tick: "2026-01-01T00:00:00Z".into(),

@@ -326,17 +326,6 @@ pub async fn sync_origin(
     dry_run: bool,
     actor: Option<&str>,
 ) -> CliResult<SyncReport> {
-    sync_origin_gated(store, origin, dry_run, actor, &Default::default()).await
-}
-
-/// [`sync_origin`] with launches going through `gate` (#856).
-pub async fn sync_origin_gated(
-    store: &TemplateStore,
-    origin: &Origin,
-    dry_run: bool,
-    actor: Option<&str>,
-    gate: &crate::template_tests::LaunchGate,
-) -> CliResult<SyncReport> {
     let labels = [("origin", origin.name.clone())];
     metrics::gauge!(METRIC_SYNC_LAST, &labels).set(now_secs());
     // One pull per origin at a time in this process: an HTTP-triggered sync
@@ -344,7 +333,7 @@ pub async fn sync_origin_gated(
     // register the same body twice.
     let lock = origin_lock(&origin.name);
     let _guard = lock.lock().await;
-    let result = sync_origin_inner(store, origin, dry_run, actor, gate).await;
+    let result = sync_origin_inner(store, origin, dry_run, actor).await;
     let outcome = match &result {
         Ok(r) if r.failed() > 0 => "partial",
         Ok(_) => "ok",
@@ -365,7 +354,6 @@ async fn sync_origin_inner(
     origin: &Origin,
     dry_run: bool,
     actor: Option<&str>,
-    gate: &crate::template_tests::LaunchGate,
 ) -> CliResult<SyncReport> {
     let fetcher = fetch::fetcher_for(&origin.source)?;
     let files = fetcher.list().await?;
@@ -396,7 +384,7 @@ async fn sync_origin_inner(
         let actor = actor
             .map(str::to_string)
             .unwrap_or_else(|| sync_actor(&origin.name));
-        Some(apply::apply_gated(store, plan, &actor, gate).await)
+        Some(apply::apply(store, plan, &actor).await)
     };
     Ok(SyncReport {
         origin: origin.name.clone(),
@@ -417,18 +405,6 @@ pub async fn sync_all(
     dry_run: bool,
     actor: Option<&str>,
 ) -> CliResult<Vec<Result<SyncReport, (String, CliError)>>> {
-    sync_all_gated(store, file, only, dry_run, actor, &Default::default()).await
-}
-
-/// [`sync_all`] with launches going through `gate` (#856).
-pub async fn sync_all_gated(
-    store: &TemplateStore,
-    file: &SyncFile,
-    only: Option<&str>,
-    dry_run: bool,
-    actor: Option<&str>,
-    gate: &crate::template_tests::LaunchGate,
-) -> CliResult<Vec<Result<SyncReport, (String, CliError)>>> {
     let origins: Vec<&Origin> = match only {
         Some(name) => vec![file.origin(name)?],
         None => file.origins.iter().collect(),
@@ -436,7 +412,7 @@ pub async fn sync_all_gated(
     let mut out = Vec::with_capacity(origins.len());
     for o in origins {
         out.push(
-            sync_origin_gated(store, o, dry_run, actor, gate)
+            sync_origin(store, o, dry_run, actor)
                 .await
                 .map_err(|e| (o.name.clone(), e)),
         );
@@ -514,16 +490,6 @@ pub fn spawn_interval_syncs(
     file: Arc<SyncFile>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    spawn_interval_syncs_gated(store, file, shutdown, Default::default())
-}
-
-/// [`spawn_interval_syncs`] with launches going through `gate` (#856).
-pub fn spawn_interval_syncs_gated(
-    store: TemplateStore,
-    file: Arc<SyncFile>,
-    shutdown: tokio_util::sync::CancellationToken,
-    gate: crate::template_tests::LaunchGate,
-) -> Vec<tokio::task::JoinHandle<()>> {
     file.origins
         .iter()
         .filter_map(|o| o.interval_secs.map(|s| (o.name.clone(), s)))
@@ -531,7 +497,6 @@ pub fn spawn_interval_syncs_gated(
             let store = store.clone();
             let file = Arc::clone(&file);
             let shutdown = shutdown.clone();
-            let gate = gate.clone();
             tokio::spawn(async move {
                 let interval = std::time::Duration::from_secs(secs);
                 loop {
@@ -541,7 +506,7 @@ pub fn spawn_interval_syncs_gated(
                         _ = tokio::time::sleep(interval) => {}
                     }
                     let Ok(origin) = file.origin(&name) else { break };
-                    match sync_origin_gated(&store, origin, false, None, &gate).await {
+                    match sync_origin(&store, origin, false, None).await {
                         Ok(r) => {
                             if r.failed() > 0 {
                                 tracing::warn!(origin = %name, failed = r.failed(), "periodic template sync had failures");
@@ -565,7 +530,7 @@ mod tests {
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const BODY: &str = "version: 1\nname: t\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\n";
+    const BODY: &str = "version: 1\nname: t\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\ntests:\n  suite:\n    auto: { defaults_baseline: true }\n";
 
     fn store() -> TemplateStore {
         Arc::new(MemoryHistory::new(Duration::from_secs(60)))
@@ -739,14 +704,12 @@ mod tests {
                 &s,
                 crate::templates::RegisterRequest {
                     id: Some(id.into()),
-                    body: BODY.into(),
+                    body: crate::templates::bundle::smoke(BODY),
                     format: ConfigFormat::Yaml,
                     description: None,
                     tags: vec![],
                     launch: true,
                     created_by: None,
-                    test: false,
-                    gate: Default::default(),
                 },
             )
             .await
@@ -859,14 +822,12 @@ mod tests {
             &s,
             crate::templates::RegisterRequest {
                 id: Some("plat-out".into()),
-                body: BODY.into(),
+                body: crate::templates::bundle::smoke(BODY),
                 format: ConfigFormat::Yaml,
                 description: None,
                 tags: vec![],
                 launch: true,
                 created_by: None,
-                test: false,
-                gate: Default::default(),
             },
         )
         .await
@@ -1086,14 +1047,12 @@ mod tests {
             &s,
             crate::templates::RegisterRequest {
                 id: Some("flaky".into()),
-                body: BODY.into(),
+                body: crate::templates::bundle::smoke(BODY),
                 format: ConfigFormat::Yaml,
                 description: None,
                 tags: Vec::new(),
                 launch: true,
                 created_by: None,
-                test: false,
-                gate: Default::default(),
             },
         )
         .await
@@ -1116,14 +1075,12 @@ mod tests {
                 &s,
                 crate::templates::RegisterRequest {
                     id: Some(id.into()),
-                    body: body.into(),
+                    body: crate::templates::bundle::smoke(body),
                     format: ConfigFormat::Yaml,
                     description: None,
                     tags: vec![],
                     launch: false,
                     created_by: None,
-                    test: false,
-                    gate: Default::default(),
                 },
             )
             .await

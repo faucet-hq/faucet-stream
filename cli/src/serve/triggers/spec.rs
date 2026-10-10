@@ -128,6 +128,10 @@ pub struct TemplateTrigger {
     pub overlay: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_version: Option<String>,
+    /// Run the template even when the resolved version's tests are not
+    /// `passing` (#856). Each such run is labelled and audited.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_untested: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]

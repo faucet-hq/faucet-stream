@@ -139,6 +139,7 @@ async fn template_body(
         id: src.sink.clone(),
         version: VersionSelector::default(),
         overlay: None,
+        allow_untested: true,
     };
     let m = crate::templates::materialize_for_run(
         &store,

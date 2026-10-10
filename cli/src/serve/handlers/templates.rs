@@ -34,7 +34,7 @@ fn map_err(e: crate::error::CliError) -> ServeError {
         CliError::UnknownPipelineTemplate { .. } => ServeError::NotFound,
         CliError::Internal(m) => ServeError::Internal(m),
         CliError::HistoryUnavailable(m) => ServeError::Unavailable(m),
-        gated @ CliError::LaunchGated { .. } => gate_refusal(gated),
+        refused @ CliError::VersionNotPassing { .. } => not_passing(refused),
         other if crate::select::is_selection_error(&other) => {
             ServeError::BadConfig(other.to_string())
         }
@@ -45,17 +45,23 @@ fn map_err(e: crate::error::CliError) -> ServeError {
     }
 }
 
-/// A test-gate refusal (#856): 422 with the failing cases under
-/// `details.gate`, so a client can list them without parsing the message.
-pub(crate) fn gate_refusal(e: crate::error::CliError) -> ServeError {
+/// A label refused because the version is not `passing` (#856): 422 with the
+/// status and failing cases under `details.tests`, so a client can list them
+/// without parsing the message.
+pub(crate) fn not_passing(e: crate::error::CliError) -> ServeError {
     let details = match &e {
-        crate::error::CliError::LaunchGated {
+        crate::error::CliError::VersionNotPassing {
             id,
             version,
+            status,
+            action,
             reason,
             failing,
         } => Some(serde_json::json!({
-            "gate": { "id": id, "version": version, "reason": reason, "failing": failing }
+            "tests": {
+                "id": id, "version": version, "status": status, "action": action,
+                "reason": reason, "failing": failing
+            }
         })),
         _ => None,
     };
@@ -110,28 +116,22 @@ pub struct RegisterBody {
     /// register is inert so a new build never moves existing callers.
     #[serde(default)]
     pub launch: bool,
-    /// Run the new version's `tests:` bundle and record the result (#856); the
-    /// response carries it. A launch under `--require-template-tests` runs it
-    /// anyway.
-    #[serde(default)]
-    pub test: bool,
-    /// With `launch`: launch past a failing or missing test result, recording
-    /// this reason in the launch log and the audit log.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skip_tests_reason: Option<String>,
 }
 
-/// `POST /v1/templates` response: the version's summary, plus the test run
-/// and the launch verdict when the request asked for them.
+/// `POST /v1/templates` response: the version's summary, plus the bundle run
+/// recorded on it (every version with a `tests:` block is tested as it is
+/// registered) and where an inherited `tests:` block came from.
 #[derive(Debug, Serialize)]
 pub struct RegisterResponse {
     #[serde(flatten)]
     pub summary: TemplateSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tests: Option<crate::serve::history::templates::TemplateTestResult>,
-    /// The launch's test-gate verdict, when the register also launched.
+    /// The version whose `tests:` block this one inherited (#856): a launched
+    /// template's version registered without one takes the newest earlier
+    /// block into its stored body.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gate: Option<crate::template_tests::GateVerdict>,
+    pub tests_inherited_from: Option<u32>,
 }
 
 /// `POST /v1/templates` → 201 with the newly registered version's summary.
@@ -149,10 +149,6 @@ pub async fn register_template(
     } else {
         approval_gate(&state, &[ChangeKind::TemplateRegister])?;
     }
-    let gate = state
-        .template_gate()
-        .with_skip(body.skip_tests_reason.clone())
-        .map_err(map_err)?;
     let registered = crate::templates::register_tested(
         &store(&state),
         RegisterRequest {
@@ -163,8 +159,6 @@ pub async fn register_template(
             tags: body.tags,
             launch: body.launch,
             created_by: Some(actor.principal.clone()),
-            test: body.test,
-            gate,
         },
     )
     .await
@@ -195,18 +189,6 @@ pub async fn register_template(
         "ok",
     )
     .await;
-    let gate_verdict = registered.launch.and_then(|l| l.tests);
-    if let Some(reason) = gate_verdict.as_ref().and_then(|g| g.skipped.clone()) {
-        crate::serve::audit::write_target_detail(
-            &state,
-            &actor,
-            "template.launch",
-            format!("template:{}@{}", record.id, record.version),
-            Some(format!("tests skipped: {reason}")),
-            "ok",
-        )
-        .await;
-    }
     let mut summary = record.summary();
     // Data-flow policy (#702): a registered pipeline that would violate the
     // server policy is warned about — it may be composed with a compliant sink
@@ -240,7 +222,7 @@ pub async fn register_template(
         Json(RegisterResponse {
             summary,
             tests: registered.tests,
-            gate: gate_verdict,
+            tests_inherited_from: registered.tests_inherited_from,
         }),
     ))
 }
@@ -429,17 +411,14 @@ pub struct GetResponse {
     pub is_stable: bool,
     /// The launch log, newest first — who blessed which build, and when.
     pub launches: Vec<crate::serve::history::templates::LaunchRecord>,
-    /// Each stored version's test bundle standing (#856): whether it has
-    /// tests, the gate's verdict under this server's settings, and its recent
-    /// runs.
+    /// Each stored version's test status (#856) — `passing` / `failing` /
+    /// `untested` / `no_tests` — with its recent runs.
     pub tests: TestsView,
 }
 
-/// The test-gate view of a template's versions.
+/// The test view of a template's versions.
 #[derive(Debug, Serialize)]
 pub struct TestsView {
-    /// Whether this server refuses a launch without a passing result.
-    pub require_tests: bool,
     /// One entry per stored version, newest first.
     pub versions: Vec<crate::templates::bundle::VersionTests>,
 }
@@ -473,11 +452,10 @@ pub async fn get_template(
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
     let is_stable = state.stable == Some(template.version);
-    let gate = server.template_gate();
     let mut versions = Vec::with_capacity(state.versions.len());
     for v in &state.versions {
         versions.push(
-            crate::templates::bundle::version_tests(&s, &id, *v, &gate, DETAIL_TEST_RUNS)
+            crate::templates::bundle::version_tests(&s, &id, *v, DETAIL_TEST_RUNS)
                 .await
                 .map_err(map_err)?,
         );
@@ -487,10 +465,7 @@ pub async fn get_template(
         state,
         is_stable,
         launches,
-        tests: TestsView {
-            require_tests: gate.require_tests,
-            versions,
-        },
+        tests: TestsView { versions },
     }))
 }
 
@@ -758,18 +733,6 @@ pub struct LaunchBody {
     /// common case.
     #[serde(default)]
     pub version: Option<VersionSelector>,
-    /// Launch past a failing or missing test result (#856). Admin-only (the
-    /// route already is); recorded in the launch log and the audit log.
-    #[serde(default)]
-    pub skip_tests_reason: Option<String>,
-}
-
-/// `POST /v1/templates/{id}/rollback` request body (optional).
-#[derive(Debug, Default, Deserialize)]
-pub struct RollbackBody {
-    /// As for a launch: roll back past a failing or missing test result.
-    #[serde(default)]
-    pub skip_tests_reason: Option<String>,
 }
 
 /// Response for launch / rollback.
@@ -785,15 +748,17 @@ pub struct LaunchResponse {
     pub already_launched: bool,
     /// The template's status after the launch.
     pub status: String,
-    /// The test gate's verdict for the launched version (#856).
+    /// The launched version's test status (#856).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tests: Option<crate::template_tests::GateVerdict>,
+    pub tests: Option<crate::template_tests::VersionStatus>,
 }
 
 /// `POST /v1/templates/{id}/launch` → 200 / 404 / 422.
 ///
 /// The one operation that moves unpinned callers. Registering a build does not;
 /// that separation is what lets a nightly land without dragging anyone along.
+/// Only a `passing` version can be launched (#856); anything else is a `422`
+/// with `details.tests`, audited as `refused`.
 pub async fn launch_template(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
@@ -802,18 +767,8 @@ pub async fn launch_template(
 ) -> Result<Json<LaunchResponse>, ServeError> {
     approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
     let target = body.version.unwrap_or_else(VersionSelector::newest);
-    let gate = state
-        .template_gate()
-        .with_skip(body.skip_tests_reason)
-        .map_err(map_err)?;
-    let outcome = match crate::templates::launch_gated(
-        &store(&state),
-        &id,
-        target,
-        Some(&actor.principal),
-        &gate,
-    )
-    .await
+    let outcome = match crate::templates::launch(&store(&state), &id, target, Some(&actor.principal))
+        .await
     {
         Ok(o) => o,
         Err(e) => return Err(refused(&state, &actor, &id, "template.launch", e).await),
@@ -821,7 +776,7 @@ pub async fn launch_template(
     finish_launch(&state, &actor, &id, outcome, "template.launch").await
 }
 
-/// Audit a gate refusal (`result: refused`) before answering with it.
+/// Audit a refused label (`result: refused`) before answering with it.
 async fn refused(
     state: &ServerState,
     actor: &AuthContext,
@@ -829,16 +784,12 @@ async fn refused(
     action: &str,
     e: crate::error::CliError,
 ) -> ServeError {
-    if let crate::error::CliError::LaunchGated {
-        version, reason, ..
-    } = &e
-    {
-        crate::serve::audit::write_target_detail(
+    if let crate::error::CliError::VersionNotPassing { version, .. } = &e {
+        crate::serve::audit::write_target(
             state,
             actor,
             action,
             format!("template:{id}@{version}"),
-            Some(reason.clone()),
             "refused",
         )
         .await;
@@ -851,26 +802,13 @@ pub async fn rollback_template(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
-    raw: axum::body::Bytes,
 ) -> Result<Json<LaunchResponse>, ServeError> {
     approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
-    let body: RollbackBody = if raw.iter().all(u8::is_ascii_whitespace) {
-        RollbackBody::default()
-    } else {
-        serde_json::from_slice(&raw)
-            .map_err(|e| ServeError::BadConfig(format!("rollback body: {e}")))?
+    let outcome = match crate::templates::rollback(&store(&state), &id, Some(&actor.principal)).await
+    {
+        Ok(o) => o,
+        Err(e) => return Err(refused(&state, &actor, &id, "template.rollback", e).await),
     };
-    let gate = state
-        .template_gate()
-        .with_skip(body.skip_tests_reason)
-        .map_err(map_err)?;
-    let outcome =
-        match crate::templates::rollback_gated(&store(&state), &id, Some(&actor.principal), &gate)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return Err(refused(&state, &actor, &id, "template.rollback", e).await),
-        };
     finish_launch(&state, &actor, &id, outcome, "template.rollback").await
 }
 
@@ -895,16 +833,11 @@ async fn finish_launch(
         action,
         "pipeline template launch"
     );
-    crate::serve::audit::write_target_detail(
+    crate::serve::audit::write_target(
         state,
         actor,
         action,
         format!("template:{id}@{}", outcome.version),
-        outcome
-            .tests
-            .as_ref()
-            .and_then(|g| g.skipped.as_ref())
-            .map(|r| format!("tests skipped: {r}")),
         "ok",
     )
     .await;
@@ -1034,17 +967,12 @@ pub async fn test_version(
     let result = crate::templates::bundle::test_version(&s, &id, version, Some(&actor.principal))
         .await
         .map_err(map_err)?;
-    crate::serve::audit::write_target_detail(
+    crate::serve::audit::write_target(
         &state,
         &actor,
         "template.test",
         format!("template:{id}@{version}"),
-        Some(format!(
-            "{} case(s), {}",
-            result.cases.len(),
-            if result.passed { "passed" } else { "failed" }
-        )),
-        "ok",
+        if result.passed { "ok" } else { "failed" },
     )
     .await;
     Ok(Json(result))
@@ -1076,7 +1004,7 @@ pub async fn version_tests(
         .unwrap_or(crate::serve::history::templates::RESULTS_RETAIN)
         .clamp(1, crate::serve::history::templates::RESULTS_RETAIN);
     Ok(Json(
-        crate::templates::bundle::version_tests(&s, &id, version, &state.template_gate(), limit)
+        crate::templates::bundle::version_tests(&s, &id, version, limit)
             .await
             .map_err(map_err)?,
     ))
@@ -1150,6 +1078,11 @@ pub struct TriggerBody {
     /// Ask for an approved change request (#703) instead of a run.
     #[serde(default)]
     pub require_approval: bool,
+    /// Run a version whose tests are not `passing` (#856). Once the template
+    /// has been launched such a run is refused without it; with it the run is
+    /// labelled `allow_untested=true` and audited. Never applies to launches.
+    #[serde(default)]
+    pub allow_untested: bool,
     /// Why, for the approvers (with `require_approval`).
     #[serde(default)]
     pub reason: Option<String>,
@@ -1231,6 +1164,8 @@ pub struct TriggerResponse {
 /// by provenance.
 const LABEL_TEMPLATE: &str = "template";
 const LABEL_TEMPLATE_VERSION: &str = "template_version";
+/// Run label marking a run of a non-`passing` version (#856).
+pub const LABEL_ALLOW_UNTESTED: &str = "allow_untested";
 const LABEL_SINK_TEMPLATE: &str = "sink_template";
 const LABEL_SINK_TEMPLATE_VERSION: &str = "sink_template_version";
 const LABEL_OVERLAY: &str = "overlay";
@@ -1318,6 +1253,7 @@ pub async fn trigger_template_outcome(
         id: body.sink.clone(),
         version: body.sink_version.unwrap_or_default(),
         overlay,
+        allow_untested: body.allow_untested,
     };
     if let Some(sink_id) = &sink.id {
         let sink_state = crate::templates::template_state(&s, sink_id)
@@ -1375,6 +1311,18 @@ pub async fn trigger_template_outcome(
 
     let mut labels = body.labels;
     labels.insert(LABEL_TEMPLATE.into(), materialized.template_id.clone());
+    if let Some(status) = materialized.untested {
+        labels.insert(LABEL_ALLOW_UNTESTED.into(), "true".into());
+        crate::serve::audit::write_target_detail(
+            &state,
+            &actor,
+            "template.run",
+            format!("template:{}@{}", materialized.template_id, materialized.version),
+            format!("allow_untested: v{} is {status}", materialized.version),
+            "ok",
+        )
+        .await;
+    }
     labels.insert(
         LABEL_TEMPLATE_VERSION.into(),
         materialized.version.to_string(),
@@ -1501,13 +1449,11 @@ mod tests {
             Extension(actor()),
             Json(RegisterBody {
                 id: None,
-                config: template_yaml(out),
+                config: crate::templates::bundle::smoke(&template_yaml(out)),
                 config_format: ConfigFormatWire::Yaml,
                 description: Some("demo".into()),
                 tags: vec![],
                 launch,
-                test: false,
-                skip_tests_reason: None,
             }),
         )
         .await
@@ -1638,6 +1584,11 @@ streams:
     source: {{ config: {{ path: \"${{param.data_dir}}/customers.csv\" }} }}
     primary_keys: [id]
     write: [overwrite, upsert]
+tests:
+  sink: local-jsonl
+  sink_select: newest
+  suite:
+    auto: {{ defaults_baseline: true }}
 ",
             dir.display()
         )
@@ -1659,31 +1610,53 @@ per_stream:
   path: \"${{param.out_dir}}/${{source}}/${{stream}}.jsonl\"
 write_mode_aliases:
   overwrite: append
+tests:
+  source: acme-exports
+  source_select: newest
+  suite:
+    auto: {{ defaults_baseline: true }}
 ",
             dir.display()
         )
     }
 
     async fn register_body(state: &ServerState, config: String) -> TemplateSummary {
-        register_template(
+        let summary = register_template(
             State(state.clone()),
             Extension(actor()),
             Json(RegisterBody {
                 id: None,
-                config,
+                config: crate::templates::bundle::smoke(&config),
                 config_format: ConfigFormatWire::Yaml,
                 description: None,
                 tags: vec![],
-                launch: true,
-                test: false,
-                skip_tests_reason: None,
+                launch: false,
             }),
         )
         .await
         .expect("register")
         .1
         .0
-        .summary
+        .summary;
+        settle(state).await;
+        summary
+    }
+
+    /// Re-test every template's newest version (a pair's companion may have
+    /// arrived after it) and launch each one that passes.
+    async fn settle(state: &ServerState) {
+        let s = store(state);
+        for t in s.template_list().await.unwrap() {
+            if t.kind == crate::hub::TemplateKind::TestSuite {
+                continue;
+            }
+            let r = crate::templates::bundle::retest(&s, &t.id).await;
+            if r.passed {
+                crate::templates::launch(&s, &t.id, VersionSelector::Pinned(t.version), None)
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -1785,7 +1758,7 @@ write_mode_aliases:
         // stamp provenance labels, and report what they set.
         register_body(
             &state,
-            "kind: deployment\nname: ops\nstate: { type: memory }\n".into(),
+            "kind: deployment\nname: ops\nstate: { type: memory }\ntests:\n  source: acme-exports\n  sink: local-jsonl\n  suite:\n    auto: { defaults_baseline: true }\n".into(),
         )
         .await;
         let (_, resp) = trigger_pair(
@@ -1896,8 +1869,6 @@ write_mode_aliases:
                 description: None,
                 tags: vec![],
                 launch: false,
-                test: false,
-                skip_tests_reason: None,
             }),
         )
         .await
@@ -2116,7 +2087,6 @@ write_mode_aliases:
             State(state.clone()),
             Extension(actor()),
             Path("tpl-demo".into()),
-            axum::body::Bytes::new(),
         )
         .await
         .unwrap()
@@ -2266,7 +2236,6 @@ write_mode_aliases:
             Path("tpl-demo".into()),
             Json(LaunchBody {
                 version: Some(VersionSelector::Pinned(2)),
-                skip_tests_reason: None,
             }),
         )
         .await
@@ -2435,13 +2404,11 @@ write_mode_aliases:
             Extension(actor()),
             Json(RegisterBody {
                 id: None,
-                config: body,
+                config: crate::templates::bundle::smoke(&body),
                 config_format: ConfigFormatWire::Yaml,
                 description: None,
                 tags: vec![],
                 launch: true,
-                test: false,
-                skip_tests_reason: None,
             }),
         )
         .await
@@ -2482,13 +2449,11 @@ write_mode_aliases:
             Extension(actor()),
             Json(RegisterBody {
                 id: None,
-                config: body,
+                config: crate::templates::bundle::smoke(&body),
                 config_format: ConfigFormatWire::Yaml,
                 description: None,
                 tags: vec![],
-                launch: true,
-                test: false,
-                skip_tests_reason: None,
+                launch: false,
             }),
         )
         .await
@@ -2498,7 +2463,10 @@ write_mode_aliases:
             State(state),
             Extension(actor()),
             Path("tpl-secret-default".into()),
-            Json(TriggerBody::default()),
+            Json(TriggerBody {
+                version: Some(VersionSelector::newest()),
+                ..Default::default()
+            }),
         )
         .await
         .expect("a deferred default is not refused");
@@ -2523,13 +2491,11 @@ write_mode_aliases:
             Extension(actor()),
             Json(RegisterBody {
                 id: None,
-                config: body,
+                config: crate::templates::bundle::smoke(&body),
                 config_format: ConfigFormatWire::Yaml,
                 description: None,
                 tags: vec![],
-                launch: true,
-                test: false,
-                skip_tests_reason: None,
+                launch: false,
             }),
         )
         .await
@@ -2540,6 +2506,7 @@ write_mode_aliases:
             Extension(actor()),
             Path("tpl-env".into()),
             Json(TriggerBody {
+                version: Some(VersionSelector::newest()),
                 env: [("SRC_PATH".to_string(), "s3cret-path".to_string())].into(),
                 ..Default::default()
             }),
@@ -2578,10 +2545,8 @@ write_mode_aliases:
                 format: crate::serve::load::ConfigFormat::Yaml,
                 description: None,
                 tags: vec![],
-                launch: true,
+                launch: false,
                 created_by: None,
-                test: false,
-                gate: Default::default(),
             },
         )
         .await
@@ -2770,13 +2735,12 @@ pub async fn sync_templates(
         )?;
     }
     let sync_origin = body.origin.clone();
-    let results = crate::templates::sync::sync_all_gated(
+    let results = crate::templates::sync::sync_all(
         &store(&state),
         &file,
         body.origin.as_deref(),
         body.dry_run,
         Some(&actor.principal),
-        &state.template_gate(),
     )
     .await
     .map_err(map_err)?;

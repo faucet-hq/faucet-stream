@@ -615,6 +615,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
                     None => Default::default(),
                 },
                 overlay: overlay.clone(),
+                allow_untested: true,
             };
             Ok(crate::templates::materialize_for_run(
                 store,
@@ -1036,14 +1037,12 @@ suite:
             &store,
             crate::templates::RegisterRequest {
                 id: Some("suite-fixture".into()),
-                body: template(),
+                body: crate::templates::bundle::smoke(&template()),
                 format: crate::serve::load::ConfigFormat::Yaml,
                 description: None,
                 tags: Vec::new(),
                 launch: true,
                 created_by: None,
-                test: false,
-                gate: Default::default(),
             },
         )
         .await
@@ -1252,14 +1251,12 @@ suite:
                 &store,
                 crate::templates::RegisterRequest {
                     id: None,
-                    body,
+                    body: crate::templates::bundle::smoke(&body),
                     format: crate::serve::load::ConfigFormat::Yaml,
                     description: None,
                     tags: Vec::new(),
-                    launch: true,
+                    launch: false,
                     created_by: None,
-                    test: false,
-                    gate: Default::default(),
                 },
             )
             .await
@@ -1276,7 +1273,7 @@ suite:
             sink: Some(("local-jsonl", 1)),
             overlay: Some(crate::templates::OverlayChoice::Registered {
                 id: "ops".into(),
-                version: Default::default(),
+                version: crate::serve::history::templates::VersionSelector::newest(),
             }),
         };
         let out = run(&file, registered(), None).await.expect("runs");
@@ -1309,14 +1306,12 @@ suite:
                 &store,
                 crate::templates::RegisterRequest {
                     id: None,
-                    body,
+                    body: crate::templates::bundle::smoke(&body),
                     format: crate::serve::load::ConfigFormat::Yaml,
                     description: None,
                     tags: Vec::new(),
-                    launch: true,
+                    launch: false,
                     created_by: None,
-                    test: false,
-                    gate: Default::default(),
                 },
             )
             .await

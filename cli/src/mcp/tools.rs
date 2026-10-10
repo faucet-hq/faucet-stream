@@ -135,7 +135,7 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
         if ctx.allow_mutations && ctx.allow_template_admin {
             defs.push(ToolDef {
                 name: "register_template",
-                description: "Register a template document as a new version: `kind: source-template` (a system + its streams), `kind: sink-template` (a destination), or `kind: pipeline` (a complete config). Params are declared with `params:`. MUTATING — gated behind --allow-mutations.",
+                description: "Register a template document as a new version: `kind: source-template` (a system + its streams), `kind: sink-template` (a destination), or `kind: pipeline` (a complete config). Params are declared with `params:`; a `tests:` block is run on register and its result returned. Once a template has been launched, a version without `tests:` inherits the newest earlier block. MUTATING — gated behind --allow-mutations.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -143,22 +143,19 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "id": { "type": "string", "description": "Template id. Derived from the config's `name:` when omitted." },
                         "description": { "type": "string" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Named environment channels to point at the new version (dev/test/staging/pre-prod/canary/prod). Derived channels (stable/previous/newest) are rejected." },
-                        "launch": { "type": "boolean", "description": "Make the new version live immediately. Off by default: a register is inert, so a new build never moves existing callers until it is launched." },
-                        "test": { "type": "boolean", "description": "Run the new version's `tests:` bundle and record the result; the response carries it. A launch on a test-gated server runs it anyway." },
-                        "skip_tests_reason": { "type": "string", "description": "With launch: launch past a failing or missing test result. Recorded on the launch log." }
+                        "launch": { "type": "boolean", "description": "Make the new version live immediately. Off by default: a register is inert, so a new build never moves existing callers until it is launched." }
                     },
                     "required": ["config"]
                 }),
             });
             defs.push(ToolDef {
                 name: "launch_template",
-                description: "Make a template version live — what unpinned runs will use. MUTATING. This is the only action that moves existing callers; registering a build does not.",
+                description: "Make a template version live — what unpinned runs will use. MUTATING. This is the only action that moves existing callers; registering a build does not. Only a version whose tests are `passing` can be launched (an `untested` one has its tests run first).",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
-                        "version": { "description": "Version to launch: a number, or a channel whose current target to copy. Defaults to \"newest\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
-                        "skip_tests_reason": { "type": "string", "description": "Launch past a failing or missing test result (a test-gated server refuses otherwise). Recorded on the launch log." }
+                        "version": { "description": "Version to launch: a number, or a channel whose current target to copy. Defaults to \"newest\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] }
                     },
                     "required": ["id"]
                 }),
@@ -169,8 +166,7 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "id": { "type": "string" },
-                        "skip_tests_reason": { "type": "string", "description": "Roll back past a failing or missing test result of the previous version." }
+                        "id": { "type": "string" }
                     },
                     "required": ["id"]
                 }),
@@ -217,7 +213,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "overlay_version": { "description": "Version of a registered overlay: a number or a channel. Default \"stable\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
                         "env": { "type": "object", "description": "Per-run overrides for ${env:VAR} resolution." },
                         "dry_run": { "type": "boolean", "description": "If true, materialize + validate only; do not write to any sink." },
-                        "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." }
+                        "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
+                        "allow_untested": { "type": "boolean", "description": "Run a version whose tests are not `passing`. Once the template has been launched such a run is refused without it; with it the run is labelled `allow_untested=true` and audited. Default false." }
                     },
                     "required": ["id"]
                 }),
@@ -948,7 +945,6 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
     use crate::templates::RegisterRequest;
     let store = template_store(ctx)?;
     let config = str_arg(args, "config")?;
-    let gate = template_gate(ctx, args)?;
     let registered = crate::templates::register_tested(
         store,
         RegisterRequest {
@@ -963,8 +959,6 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
             tags: tags_arg(args)?,
             launch: args.get("launch").and_then(Value::as_bool).unwrap_or(false),
             created_by: Some(actor_name(ctx)),
-            test: args.get("test").and_then(Value::as_bool).unwrap_or(false),
-            gate,
         },
     )
     .await
@@ -972,24 +966,8 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
     Ok(pretty(&json!({
         "registered": registered.record.summary(),
         "tests": registered.tests,
-        "gate": registered.launch.and_then(|l| l.tests),
+        "tests_inherited_from": registered.tests_inherited_from,
     })))
-}
-
-/// The launch gate for a tool call: the context's setting plus the call's
-/// `skip_tests_reason`.
-#[cfg(feature = "templates")]
-fn template_gate(
-    ctx: &McpContext,
-    args: &Value,
-) -> Result<crate::template_tests::LaunchGate, String> {
-    crate::template_tests::LaunchGate::new(ctx.require_template_tests)
-        .with_skip(
-            args.get("skip_tests_reason")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        )
-        .map_err(|e| e.to_string())
 }
 
 #[cfg(feature = "templates")]
@@ -1019,8 +997,7 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
         None | Some(Value::Null) => VersionSelector::newest(),
         Some(_) => version_arg(args)?,
     };
-    let gate = template_gate(ctx, args)?;
-    let outcome = crate::templates::launch_gated(store, id, target, Some(&actor_name(ctx)), &gate)
+    let outcome = crate::templates::launch(store, id, target, Some(&actor_name(ctx)))
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
@@ -1037,8 +1014,7 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
 async fn rollback_template(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let store = template_store(ctx)?;
     let id = str_arg(args, "id")?;
-    let gate = template_gate(ctx, args)?;
-    let outcome = crate::templates::rollback_gated(store, id, Some(&actor_name(ctx)), &gate)
+    let outcome = crate::templates::rollback(store, id, Some(&actor_name(ctx)))
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
@@ -1154,6 +1130,10 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             Some(v @ Value::Object(_)) => Some(crate::templates::OverlayChoice::Inline(v.clone())),
             Some(_) => return Err("`overlay` must be a deployment id or a mapping".into()),
         },
+        allow_untested: args
+            .get("allow_untested")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     };
     let selection = selection_arg(args)?;
     if !dry_run && let Some(server) = &ctx.server {
@@ -1266,6 +1246,7 @@ async fn run_template_on_server(
         overlay,
         overlay_version,
         selection,
+        allow_untested: sink.allow_untested,
         ..Default::default()
     };
     let outcome = trigger_template_outcome(
@@ -1748,7 +1729,7 @@ mod tests {
             let csv = dir.join("in.csv");
             std::fs::write(&csv, "id,name\n1,alice\n2,bob\n").unwrap();
             format!(
-                "version: 1\nname: mcp-tpl\nparams:\n  tag: {{ required: true }}\npipeline:\n  source:\n    type: csv\n    config:\n      path: {}\n  sink:\n    type: jsonl\n    config:\n      path: {}\n",
+                "version: 1\nname: mcp-tpl\nparams:\n  tag: {{ required: true }}\npipeline:\n  source:\n    type: csv\n    config:\n      path: {}\n  sink:\n    type: jsonl\n    config:\n      path: {}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
                 csv.display(),
                 dir.join("out-${param.tag}.jsonl").display()
             )
@@ -1757,14 +1738,33 @@ mod tests {
         fn hub_pair(dir: &std::path::Path) -> (String, String) {
             std::fs::write(dir.join("orders.csv"), "id,total\n1,10\n").unwrap();
             let source = format!(
-                "kind: source-template\nname: acme-exports\ndescription: Acme exports\nparams:\n  data_dir: {{ type: string, default: {} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, primary_keys: [id], write: [overwrite, upsert] }}\n",
+                "kind: source-template\nname: acme-exports\ndescription: Acme exports\nparams:\n  data_dir: {{ type: string, default: {} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, primary_keys: [id], write: [overwrite, upsert] }}\ntests:\n  sink: local-jsonl\n  sink_select: newest\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
                 dir.display()
             );
             let sink = format!(
-                "kind: sink-template\nname: local-jsonl\ndescription: Local files\nparams:\n  out_dir: {{ type: string, default: {} }}\nsink:\n  type: jsonl\n  config: {{ append: false }}\nper_stream:\n  path: \"${{param.out_dir}}/${{source}}/${{stream}}.jsonl\"\nwrite_mode_aliases: {{ overwrite: append }}\n",
+                "kind: sink-template\nname: local-jsonl\ndescription: Local files\nparams:\n  out_dir: {{ type: string, default: {} }}\nsink:\n  type: jsonl\n  config: {{ append: false }}\nper_stream:\n  path: \"${{param.out_dir}}/${{source}}/${{stream}}.jsonl\"\nwrite_mode_aliases: {{ overwrite: append }}\ntests:\n  source: acme-exports\n  source_select: newest\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
                 dir.display()
             );
             (source, sink)
+        }
+
+        /// Re-test every template's newest version (a pair's companion may
+        /// have arrived after it) and launch each one that passes.
+        async fn settle(ctx: &McpContext) {
+            let s = ctx.templates.as_ref().unwrap();
+            for t in s.template_list().await.unwrap() {
+                let r = crate::templates::bundle::retest(s, &t.id).await;
+                if r.passed {
+                    crate::templates::launch(
+                        s,
+                        &t.id,
+                        crate::serve::history::templates::VersionSelector::Pinned(t.version),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
         }
 
         #[tokio::test]
@@ -1774,19 +1774,16 @@ mod tests {
             std::fs::write(dir.path().join("orders.csv"), "id,total\n1,10\n").unwrap();
             std::fs::write(dir.path().join("items.csv"), "id,sku\n1,a\n").unwrap();
             let source = format!(
-                "kind: source-template\nname: shop\nparams:\n  data_dir: {{ type: string, default: {d} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, write: append }}\n  - {{ name: items, source: {{ config: {{ path: \"${{param.data_dir}}/items.csv\" }} }}, write: append }}\n",
+                "kind: source-template\nname: shop\nparams:\n  data_dir: {{ type: string, default: {d} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, write: append }}\n  - {{ name: items, source: {{ config: {{ path: \"${{param.data_dir}}/items.csv\" }} }}, write: append }}\ntests:\n  sink: local-jsonl\n  sink_select: newest\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
                 d = dir.path().display()
             );
             let (_, sink) = hub_pair(dir.path());
+            let sink = sink.replace("source: acme-exports", "source: shop");
             for config in [source, sink] {
-                let out = call_tool(
-                    &ctx,
-                    "register_template",
-                    &json!({"config": config, "launch": true}),
-                )
-                .await;
+                let out = call_tool(&ctx, "register_template", &json!({"config": config})).await;
                 assert_eq!(out["isError"], false, "{out}");
             }
+            settle(&ctx).await;
             let out = call_tool(
                 &ctx,
                 "list_template_rows",
@@ -1867,14 +1864,10 @@ mod tests {
             let ctx = tpl_ctx(true);
             let (source, sink) = hub_pair(dir.path());
             for config in [source, sink] {
-                let out = call_tool(
-                    &ctx,
-                    "register_template",
-                    &json!({"config": config, "launch": true}),
-                )
-                .await;
+                let out = call_tool(&ctx, "register_template", &json!({"config": config})).await;
                 assert_eq!(out["isError"], false, "{out}");
             }
+            settle(&ctx).await;
             // The list carries each template's kind.
             let out = call_tool(&ctx, "list_templates", &json!({})).await;
             let text = out["content"][0]["text"].as_str().unwrap();
@@ -2305,13 +2298,13 @@ mod tests {
             call_tool(
                 &ctx,
                 "register_template",
-                &json!({ "config": cfg, "launch": true }),
+                &json!({ "config": cfg }),
             )
             .await;
             let out = call_tool(
                 &ctx,
                 "run_template",
-                &json!({"id":"mcp-env","env":{"MCP_TPL_SUFFIX":"eu"}}),
+                &json!({"id":"mcp-env","version":"newest","env":{"MCP_TPL_SUFFIX":"eu"}}),
             )
             .await;
             assert_eq!(out["isError"], false, "{}", out["content"][0]["text"]);

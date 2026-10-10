@@ -47,15 +47,8 @@ async fn sync(args: crate::cli::TemplateSyncArgs) -> CliResult<()> {
     use crate::templates::sync as tsync;
     let store = connect(&args.common).await?;
     let file = tsync::load_sync_file(&args.config).await?;
-    let results = tsync::sync_all_gated(
-        &store,
-        &file,
-        args.origin.as_deref(),
-        args.dry_run,
-        None,
-        &crate::template_tests::LaunchGate::new(args.require_tests),
-    )
-    .await?;
+    let results =
+        tsync::sync_all(&store, &file, args.origin.as_deref(), args.dry_run, None).await?;
     let mut origin_errors = Vec::new();
     let mut failed = 0usize;
     let mut reports = Vec::new();
@@ -168,8 +161,6 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
             tags: tags.clone(),
             launch: args.launch,
             created_by: None,
-            test: args.test,
-            gate: gate_of(&args.gate)?,
         },
     )
     .await?;
@@ -190,8 +181,8 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
         if let Some(obj) = v.as_object_mut() {
             obj.insert("tests".into(), serde_json::json!(registered.tests));
             obj.insert(
-                "gate".into(),
-                serde_json::json!(registered.launch.as_ref().and_then(|l| l.tests.clone())),
+                "tests_inherited_from".into(),
+                serde_json::json!(registered.tests_inherited_from),
             );
         }
         println!("{}", to_pretty(&v)?);
@@ -206,13 +197,8 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
             )
         );
     }
-    if let Some(reason) = registered
-        .launch
-        .as_ref()
-        .and_then(|l| l.tests.as_ref())
-        .and_then(|g| g.skipped.as_ref())
-    {
-        eprintln!("warning: launched past the test gate — {reason}");
+    if let Some(from) = registered.tests_inherited_from {
+        eprintln!("note: no `tests:` block — inherited v{from}'s tests (stored with this version)");
     }
     println!(
         "registered template '{}' version {}{}",
@@ -241,11 +227,6 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
         )
     );
     tests_exit(registered.tests.as_ref())
-}
-
-/// The gate a launching verb applies.
-fn gate_of(a: &crate::cli::TemplateGateArgs) -> CliResult<crate::template_tests::LaunchGate> {
-    crate::template_tests::LaunchGate::new(a.require_tests).with_skip(a.skip_tests_reason.clone())
 }
 
 /// Fail the command (exit = failed-case count) when a recorded run failed.
@@ -540,9 +521,7 @@ fn report_launch(
         );
         return Ok(());
     }
-    if let Some(reason) = outcome.tests.as_ref().and_then(|g| g.skipped.as_ref()) {
-        eprintln!("warning: launched past the test gate — {reason}");
-    }
+
     if outcome.already_launched {
         println!(
             "template '{id}': v{} was already live — nothing changed",
@@ -564,16 +543,13 @@ fn report_launch(
 async fn launch(args: TemplateLaunchArgs) -> CliResult<()> {
     let store = connect(&args.common).await?;
     let target = VersionSelector::parse(&args.version)?;
-    let outcome =
-        crate::templates::launch_gated(&store, &args.id, target, None, &gate_of(&args.gate)?)
-            .await?;
+    let outcome = crate::templates::launch(&store, &args.id, target, None).await?;
     report_launch(&args.id, &outcome, args.common.json, "launched")
 }
 
 async fn rollback(args: TemplateRollbackArgs) -> CliResult<()> {
     let store = connect(&args.common).await?;
-    let outcome =
-        crate::templates::rollback_gated(&store, &args.id, None, &gate_of(&args.gate)?).await?;
+    let outcome = crate::templates::rollback(&store, &args.id, None).await?;
     report_launch(&args.id, &outcome, args.common.json, "rolled back to")
 }
 
@@ -705,6 +681,7 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         id: args.sink.clone(),
         version: VersionSelector::parse(&args.sink_version)?,
         overlay: overlay_choice(args.overlay.as_deref(), &args.overlay_version)?,
+        allow_untested: args.allow_untested,
     };
     let selection = crate::select::SelectionRequest::from_flags(&args.selection)?;
     let materialized = crate::templates::materialize_for_run_selected(
@@ -719,6 +696,12 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         selection.as_ref(),
     )
     .await?;
+    if let Some(status) = materialized.untested {
+        eprintln!(
+            "warning: '{}' v{} is {status} — running it because of --allow-untested",
+            materialized.template_id, materialized.version
+        );
+    }
 
     tracing::info!(
         template = %materialized.template_id,
@@ -1151,6 +1134,7 @@ pipeline:
             dry_run: true,
             limit: None,
             selection: Default::default(),
+            allow_untested: false,
             common: common("memory", false),
         };
         let f = run_template(args);
@@ -1203,9 +1187,7 @@ pipeline:
                 id: None,
                 description: None,
                 tag: vec![],
-                launch: true,
-                test: false,
-                gate: Default::default(),
+                launch: false,
                 common: common(&store, false),
             })
             .await
@@ -1218,8 +1200,6 @@ pipeline:
             description: None,
             tag: vec![],
             launch: false,
-            test: false,
-            gate: Default::default(),
             common: common(&store, false),
         })
         .await
@@ -1241,7 +1221,7 @@ pipeline:
         }
         show(TemplateShowArgs {
             id: "acme-exports".into(),
-            version: "stable".into(),
+            version: "newest".into(),
             clean: false,
             common: common(&store, true),
         })
@@ -1250,16 +1230,17 @@ pipeline:
 
         let run_args = |sink: Option<&str>, dry_run: bool| TemplateRunArgs {
             id: "acme-exports".into(),
-            version: "stable".into(),
+            version: "newest".into(),
             sink: sink.map(str::to_string),
-            sink_version: "stable".into(),
+            sink_version: "newest".into(),
             overlay: None,
-            overlay_version: "stable".into(),
+            overlay_version: "newest".into(),
             param: vec![],
             param_env: vec![],
             dry_run,
             limit: None,
             selection: Default::default(),
+            allow_untested: false,
             common: common(&store, false),
         };
         let err = run_template(run_args(None, true))
@@ -1425,8 +1406,11 @@ pipeline:
         let cfg_path = dir.path().join("tpl.yaml");
         std::fs::write(
             &cfg_path,
-            BODY.replace("IN_PATH", &input.display().to_string())
-                .replace("OUT_PATH", &output.display().to_string()),
+            crate::templates::bundle::smoke(
+                &BODY
+                    .replace("IN_PATH", &input.display().to_string())
+                    .replace("OUT_PATH", &output.display().to_string()),
+            ),
         )
         .unwrap();
         let store = format!("sqlite:{}", dir.path().join("registry.db").display());
@@ -1436,8 +1420,6 @@ pipeline:
             description: Some("round trip".into()),
             tag,
             launch,
-            test: false,
-            gate: Default::default(),
             common: common(&store, false),
         };
 
@@ -1465,6 +1447,7 @@ pipeline:
             dry_run: true,
             limit: None,
             selection: Default::default(),
+            allow_untested: false,
             common: common(&store, false),
         })
         .await
@@ -1476,7 +1459,6 @@ pipeline:
         launch(TemplateLaunchArgs {
             id: "cli-tpl".into(),
             version: "newest".into(),
-            gate: Default::default(),
             common: common(&store, false),
         })
         .await
@@ -1493,6 +1475,7 @@ pipeline:
             dry_run: false,
             limit: None,
             selection: Default::default(),
+            allow_untested: false,
             common: common(&store, false),
         })
         .await
@@ -1525,14 +1508,12 @@ pipeline:
         launch(TemplateLaunchArgs {
             id: "cli-tpl".into(),
             version: "pre-prod".into(),
-            gate: Default::default(),
             common: common(&store, true),
         })
         .await
         .expect("launch from channel");
         rollback(TemplateRollbackArgs {
             id: "cli-tpl".into(),
-            gate: Default::default(),
             common: common(&store, false),
         })
         .await
@@ -1586,7 +1567,6 @@ pipeline:
         let err = launch(TemplateLaunchArgs {
             id: "cli-tpl".into(),
             version: "1".into(),
-            gate: Default::default(),
             common: common(&store, false),
         })
         .await
@@ -1738,8 +1718,6 @@ pipeline:
             description: None,
             tag: vec![],
             launch: false,
-            test: false,
-            gate: Default::default(),
             common: common("memory", false),
         })
         .await
@@ -1752,8 +1730,6 @@ pipeline:
             description: None,
             tag: vec![],
             launch: false,
-            test: false,
-            gate: Default::default(),
             common: common("memory", false),
         })
         .await
@@ -1951,7 +1927,7 @@ suite:
             &store,
             crate::templates::RegisterRequest {
                 id: Some("adapter-registered".into()),
-                body: r#"version: 1
+                body: crate::templates::bundle::smoke(r#"version: 1
 name: adapter-registered
 params:
   tenant: { type: string, required: true }
@@ -1962,15 +1938,12 @@ pipeline:
   sink:
     type: jsonl
     config: { path: "./out/${param.tenant}.jsonl" }
-"#
-                .into(),
+"#),
                 format: ConfigFormat::Yaml,
                 description: None,
                 tags: Vec::new(),
                 launch: true,
                 created_by: None,
-                test: false,
-                gate: Default::default(),
             },
         )
         .await
@@ -2010,14 +1983,12 @@ pipeline:
                 &store,
                 crate::templates::RegisterRequest {
                     id: None,
-                    body,
+                    body: crate::templates::bundle::smoke(&body),
                     format: ConfigFormat::Yaml,
                     description: None,
                     tags: Vec::new(),
-                    launch: true,
+                    launch: false,
                     created_by: None,
-                    test: false,
-                    gate: Default::default(),
                 },
             )
             .await
@@ -2026,7 +1997,7 @@ pipeline:
         let suite = dir.path().join("suite.yaml");
         std::fs::write(
             &suite,
-            "version: 1\ntemplate: faucet-hq/example-csv\nsink: faucet-hq/sqlite\noverlay: ops\noverlay_select: stable\nsuite:\n  cases:\n    - name: defaults\n      params: {}\n",
+            "version: 1\ntemplate: faucet-hq/example-csv\nselect: newest\nsink: faucet-hq/sqlite\nsink_select: newest\noverlay: ops\noverlay_select: newest\nsuite:\n  cases:\n    - name: defaults\n      params: {}\n",
         )
         .expect("write suite");
         let mut args = test_args(&suite);

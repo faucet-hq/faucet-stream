@@ -485,7 +485,6 @@ async fn serve(dir: &std::path::Path, require_approval: Vec<String>) -> String {
         mcp_allow_mutations: true,
         require_approval,
         approval_expiry_secs: 86_400,
-        require_template_tests: true,
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,

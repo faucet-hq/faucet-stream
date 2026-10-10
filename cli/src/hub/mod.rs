@@ -833,6 +833,12 @@ pub struct IndexEntry {
     pub versions: Vec<IndexVersion>,
     #[serde(default)]
     pub official: bool,
+    /// Whether the template carries a `tests:` block (#856).
+    #[serde(default)]
+    pub has_tests: bool,
+    /// Cases its `tests:` block writes out (#856).
+    #[serde(default)]
+    pub test_cases: usize,
     /// Stars, freshness and track record, when the catalog records them (#685).
     #[serde(default)]
     pub trust: Option<trust::TrustSignals>,

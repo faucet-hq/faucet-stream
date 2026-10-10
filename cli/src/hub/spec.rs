@@ -442,7 +442,7 @@ impl SourceTemplate {
                 self.contract.clone().unwrap_or(Value::Null),
             ],
         )?;
-        if let Some(b) = &self.tests {
+        if let Some(b) = self.tests.as_ref().filter(|b| !b.is_empty()) {
             b.validate(TemplateKind::SourceTemplate)
                 .map_err(|e| CliError::Config(format!("source-template '{}': {e}", self.name)))?;
         }
@@ -612,7 +612,7 @@ impl SinkTemplate {
                 serde_json::to_value(&self.per_stream).unwrap_or(Value::Null),
             ],
         )?;
-        if let Some(b) = &self.tests {
+        if let Some(b) = self.tests.as_ref().filter(|b| !b.is_empty()) {
             b.validate(TemplateKind::SinkTemplate)
                 .map_err(|e| CliError::Config(format!("sink-template '{}': {e}", self.name)))?;
         }
@@ -866,7 +866,7 @@ impl DeploymentTemplate {
                 )));
             }
         }
-        if let Some(b) = &self.tests {
+        if let Some(b) = self.tests.as_ref().filter(|b| !b.is_empty()) {
             b.validate(TemplateKind::Deployment)
                 .map_err(|e| CliError::Config(format!("deployment '{}': {e}", self.name)))?;
         }

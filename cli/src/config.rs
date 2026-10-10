@@ -1614,7 +1614,7 @@ impl PipelineConfig {
             });
         }
         crate::interpolate::resolve_config_refs(&mut cfg)?;
-        if let Some(b) = &cfg.tests {
+        if let Some(b) = cfg.tests.as_ref().filter(|b| !b.is_empty()) {
             b.validate(crate::hub::TemplateKind::Pipeline)?;
         }
         if let Some(obs) = cfg.observability.as_ref()

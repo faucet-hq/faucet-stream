@@ -84,7 +84,6 @@ async fn run_action(
     store: &TemplateStore,
     origin: &str,
     actor: &str,
-    gate: &crate::template_tests::LaunchGate,
     action: SyncAction,
     out: &mut ApplyOutcome,
 ) -> CliResult<()> {
@@ -107,7 +106,6 @@ async fn run_action(
                 tracing::debug!(template = %id, version, "body already registered by a concurrent pull");
                 return Ok(());
             }
-            let test = crate::templates::bundle::document_has_tests(&body, format);
             let r = crate::templates::register_tested(
                 store,
                 RegisterRequest {
@@ -115,11 +113,9 @@ async fn run_action(
                     body,
                     format,
                     description,
-                    tags,
+                    tags: Vec::new(),
                     launch: false,
                     created_by: Some(actor.to_string()),
-                    test,
-                    gate: Default::default(),
                 },
             )
             .await?;
@@ -138,31 +134,23 @@ async fn run_action(
                 version,
                 launched: false,
             });
-            // A refused launch leaves the version registered and inert; the
-            // failure names why.
+            // Channels and the launch need a passing version; a refusal leaves
+            // the version registered and inert, and the failure names why.
+            for tag in tags {
+                crate::templates::promote(store, &id, tag, VersionSelector::Pinned(version))
+                    .await?;
+            }
             if launch {
-                crate::templates::launch_gated(
-                    store,
-                    &id,
-                    VersionSelector::Pinned(version),
-                    Some(actor),
-                    gate,
-                )
-                .await?;
+                crate::templates::launch(store, &id, VersionSelector::Pinned(version), Some(actor))
+                    .await?;
                 if let Some(last) = out.registered.last_mut() {
                     last.launched = true;
                 }
             }
         }
         SyncAction::Launch { id, version } => {
-            crate::templates::launch_gated(
-                store,
-                &id,
-                VersionSelector::Pinned(version),
-                Some(actor),
-                gate,
-            )
-            .await?;
+            crate::templates::launch(store, &id, VersionSelector::Pinned(version), Some(actor))
+                .await?;
             out.launched.push(Registered {
                 id,
                 version,
@@ -227,23 +215,13 @@ fn action_id(a: &SyncAction) -> String {
 /// Apply every action in order. `actor` is recorded as `created_by` /
 /// `launched_by` / `deprecated_by` (`sync:<origin>` from a pull; the
 /// principal's name when a person triggers the sync over HTTP).
+/// Every registered version that carries a `tests:` block has its bundle run
+/// and recorded; channels and launches need a `passing` version (#856).
 pub async fn apply(store: &TemplateStore, plan: SyncPlan, actor: &str) -> ApplyOutcome {
-    apply_gated(store, plan, actor, &Default::default()).await
-}
-
-/// [`apply`] with launches going through `gate` (#856). Every registered
-/// version that carries a `tests:` block has its bundle run and recorded
-/// before any launch is attempted.
-pub async fn apply_gated(
-    store: &TemplateStore,
-    plan: SyncPlan,
-    actor: &str,
-    gate: &crate::template_tests::LaunchGate,
-) -> ApplyOutcome {
     let mut out = ApplyOutcome::default();
     for action in plan.actions {
         let id = action_id(&action);
-        if let Err(e) = run_action(store, &plan.origin, actor, gate, action, &mut out).await {
+        if let Err(e) = run_action(store, &plan.origin, actor, action, &mut out).await {
             tracing::warn!(origin = %plan.origin, template = %id, error = %e, "template sync action failed");
             out.failed.push(Failure {
                 id,
@@ -263,7 +241,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    const BODY: &str = "version: 1\nname: t\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\n";
+    const BODY: &str = "version: 1\nname: t\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\ntests:\n  suite:\n    auto: { defaults_baseline: true }\n";
 
     fn store() -> TemplateStore {
         Arc::new(MemoryHistory::new(Duration::from_secs(60)))

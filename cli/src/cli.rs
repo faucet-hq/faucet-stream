@@ -652,11 +652,6 @@ pub struct TemplateSyncArgs {
     /// Plan and print what would change without touching the registry.
     #[arg(long)]
     pub dry_run: bool,
-    /// Launches the sync performs (a sidecar's `launch: true`, `launch:
-    /// always`) need a passing test-bundle result, which the sync records for
-    /// each version it registers (#856).
-    #[arg(long, env = "FAUCET_REQUIRE_TEMPLATE_TESTS")]
-    pub require_tests: bool,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
@@ -773,28 +768,8 @@ pub struct TemplateRegisterArgs {
     /// existing callers until you launch it.
     #[arg(long)]
     pub launch: bool,
-    /// Run the new version's `tests:` bundle right after registering it and
-    /// record the result on the version (#856).
-    #[arg(long)]
-    pub test: bool,
-    #[command(flatten)]
-    pub gate: TemplateGateArgs,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
-}
-
-/// The test gate a launching `faucet template` verb applies (#856).
-#[cfg(feature = "templates")]
-#[derive(Debug, Clone, Default, Parser)]
-pub struct TemplateGateArgs {
-    /// Refuse the launch unless the version's `tests:` bundle has a passing
-    /// result recorded under this faucet major version.
-    #[arg(long, env = "FAUCET_REQUIRE_TEMPLATE_TESTS")]
-    pub require_tests: bool,
-    /// Launch past a failing or missing test result anyway, recording this
-    /// reason on the launch log.
-    #[arg(long, value_name = "REASON")]
-    pub skip_tests_reason: Option<String>,
 }
 
 /// `faucet template promote <id>` arguments.
@@ -829,8 +804,6 @@ pub struct TemplateLaunchArgs {
     #[arg(long, default_value = "newest")]
     pub version: String,
     #[command(flatten)]
-    pub gate: TemplateGateArgs,
-    #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
 
@@ -840,8 +813,6 @@ pub struct TemplateLaunchArgs {
 pub struct TemplateRollbackArgs {
     /// Template id.
     pub id: String,
-    #[command(flatten)]
-    pub gate: TemplateGateArgs,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
@@ -974,6 +945,11 @@ pub struct TemplateRunArgs {
     /// template, matrix rows of a pipeline. `faucet template rows` lists them.
     #[command(flatten)]
     pub selection: SelectionArgs,
+    /// Run a version whose tests are not `passing` (#856). Once the template
+    /// has been launched such a run is refused without this; a draft template
+    /// needs none.
+    #[arg(long)]
+    pub allow_untested: bool,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
@@ -2256,13 +2232,6 @@ pub struct ServeArgs {
     /// `--auth-config` `approvals.expire_secs` does not say. Default 24h.
     #[arg(long, default_value_t = 86_400)]
     pub approval_expiry_secs: u64,
-    /// Refuse to launch a template version (HTTP, MCP, template sync, an
-    /// approved change request) unless its `tests:` bundle has a passing
-    /// result recorded under this faucet major version (#856). An admin may
-    /// launch past it with a reason (`skip_tests_reason`), which is audited.
-    /// Off by default so existing deployments keep launching as before.
-    #[arg(long, env = "FAUCET_REQUIRE_TEMPLATE_TESTS")]
-    pub require_template_tests: bool,
     /// Key that seals tenant connection credentials at rest (#709,
     /// AES-256-GCM). At least 32 bytes of random key material. Prefer the env
     /// var (avoids `ps` leakage). Without it the server refuses to store or
@@ -2332,12 +2301,6 @@ pub struct McpArgs {
     #[cfg(feature = "templates")]
     #[arg(long, env = "FAUCET_TEMPLATE_STORE", hide_env_values = true)]
     pub template_store: Option<String>,
-    /// Refuse `launch_template` / `rollback_template` (and a launching
-    /// `register_template`) unless the version's `tests:` bundle has a passing
-    /// result recorded under this faucet major version (#856).
-    #[cfg(feature = "templates")]
-    #[arg(long)]
-    pub require_template_tests: bool,
 }
 
 /// `faucet run` arguments.

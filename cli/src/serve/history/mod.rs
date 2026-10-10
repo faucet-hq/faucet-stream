@@ -503,8 +503,8 @@ pub struct AuditEntry {
     /// `connection:<tenant>/<name>`, `mcp:<tool>`, …
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
-    /// Free-text detail an action records beside its outcome — e.g. the
-    /// reason an admin gave for launching past the test gate (#856).
+    /// Free-text detail beside the outcome — e.g. the test status of a
+    /// template version run with `allow_untested` (#856).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Outcome: `"ok"` (action performed) or `"denied"` (403 — insufficient role).
@@ -1587,20 +1587,6 @@ pub trait RunHistory: Send + Sync {
     ) -> Result<Vec<templates::VersionDeprecation>, HistoryError> {
         let _ = id;
         Ok(Vec::new())
-    }
-
-    /// [`template_launch`](Self::template_launch) carrying a note for the
-    /// launch log: the reason an admin gave for launching past the test gate
-    /// (#856). Default: the plain launch (the note is dropped).
-    async fn template_launch_noted(
-        &self,
-        id: &str,
-        version: u32,
-        launched_by: Option<&str>,
-        tests_skipped: Option<&str>,
-    ) -> Result<Option<u32>, HistoryError> {
-        let _ = tests_skipped;
-        self.template_launch(id, version, launched_by).await
     }
 
     /// Record one test-bundle run on a template version (#856), keeping the

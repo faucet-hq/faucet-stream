@@ -26,7 +26,7 @@ pub mod selector;
 pub mod spec;
 
 pub use bundle::{Fixture, SuiteRequirement, TestBundle, TestSuiteTemplate};
-pub use gate::{GateStatus, GateVerdict, LaunchGate};
+pub use gate::{TestStatus, VersionStatus, status_of};
 pub use result::{BundleOutcome, TemplateTestResult};
 #[cfg(feature = "templates")]
 pub use runner::resolve_target_version;

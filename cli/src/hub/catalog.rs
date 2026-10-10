@@ -662,6 +662,26 @@ pub fn registry_run_command(source: &SourceTemplate, sink: &SinkTemplate) -> Str
     )
 }
 
+/// The index fields describing a template's `tests:` block (#856):
+/// `has_tests`, `test_cases` (cases written out — `cases`, `behavioral`,
+/// `fixtures`; `combine` / `auto` generate more at run time) and
+/// `requires_suites`.
+pub fn tests_fields(tests: Option<&crate::template_tests::TestBundle>) -> Value {
+    let t = tests.filter(|t| !t.is_empty());
+    json!({
+        "has_tests": t.is_some(),
+        "test_cases": t.map_or(0, |t| t.suite.cases.len() + t.suite.behavioral.len() + t.fixtures.len()),
+        "requires_suites": t.map(|t| t.requires_suites.iter().map(|r| json!({"name": r.name, "version": r.version})).collect::<Vec<_>>()).unwrap_or_default(),
+    })
+}
+
+fn with_tests(mut entry: Value, tests: Option<&crate::template_tests::TestBundle>) -> Value {
+    if let (Some(obj), Value::Object(extra)) = (entry.as_object_mut(), tests_fields(tests)) {
+        obj.extend(extra);
+    }
+    entry
+}
+
 fn index_json_unsorted(
     cat: &Catalog,
     command: fn(&SourceTemplate, &SinkTemplate) -> String,
@@ -669,7 +689,7 @@ fn index_json_unsorted(
     let cells = cat.matrix();
     json!({
         "version": 1,
-        "sources": cat.sources.iter().map(|(p, s)| json!({
+        "sources": cat.sources.iter().map(|(p, s)| with_tests(json!({
             "id": s.id(),
             "owner": s.owner,
             "official": s.is_official(),
@@ -689,8 +709,8 @@ fn index_json_unsorted(
                 "name": n, "type": p.kind, "required": p.required, "secret": p.secret,
                 "description": p.description, "default": p.default,
             })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "sinks": cat.sinks.iter().map(|(p, k)| json!({
+        }), s.tests.as_ref())).collect::<Vec<_>>(),
+        "sinks": cat.sinks.iter().map(|(p, k)| with_tests(json!({
             "id": k.id(),
             "owner": k.owner,
             "official": k.is_official(),
@@ -705,7 +725,7 @@ fn index_json_unsorted(
                 "name": n, "type": p.kind, "required": p.required, "secret": p.secret,
                 "description": p.description, "default": p.default,
             })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
+        }), k.tests.as_ref())).collect::<Vec<_>>(),
         "matrix": cells.iter().map(|c| json!({
             "source": c.source,
             "sink": c.sink,

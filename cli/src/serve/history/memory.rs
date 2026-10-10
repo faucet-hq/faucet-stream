@@ -1418,17 +1418,6 @@ impl RunHistory for MemoryHistory {
         version: u32,
         launched_by: Option<&str>,
     ) -> Result<Option<u32>, HistoryError> {
-        self.template_launch_noted(id, version, launched_by, None)
-            .await
-    }
-
-    async fn template_launch_noted(
-        &self,
-        id: &str,
-        version: u32,
-        launched_by: Option<&str>,
-        tests_skipped: Option<&str>,
-    ) -> Result<Option<u32>, HistoryError> {
         let mut launches = self
             .template_launches
             .lock()
@@ -1447,7 +1436,6 @@ impl RunHistory for MemoryHistory {
                 version,
                 launched_at: Utc::now(),
                 launched_by: launched_by.map(str::to_string),
-                tests_skipped: tests_skipped.map(str::to_string),
             },
         );
         Ok(Some(seq))

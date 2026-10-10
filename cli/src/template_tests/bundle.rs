@@ -356,13 +356,17 @@ fn check_fixtures(what: &str, fixtures: &[Fixture]) -> CliResult<()> {
 }
 
 /// Read the `tests:` block of an untyped template document, validated against
-/// the document's kind. `None` when the document has none.
+/// the document's kind. `None` when the document has none — or an empty one,
+/// which counts as no tests.
 pub fn bundle_of(doc: &Value, kind: TemplateKind) -> CliResult<Option<TestBundle>> {
     let Some(raw) = doc.get("tests") else {
         return Ok(None);
     };
     let bundle: TestBundle =
         serde_json::from_value(raw.clone()).map_err(|e| CliError::Config(format!("tests: {e}")))?;
+    if bundle.is_empty() {
+        return Ok(None);
+    }
     bundle.validate(kind)?;
     Ok(Some(bundle))
 }
@@ -524,6 +528,12 @@ requires_suites:
             bundle_of(&serde_json::json!({}), TemplateKind::Pipeline)
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            bundle_of(&serde_json::json!({"tests": {}}), TemplateKind::Pipeline)
+                .unwrap()
+                .is_none(),
+            "an empty block counts as no tests"
         );
         let err = bundle_of(
             &serde_json::json!({"tests": {"nope": 1}}),

@@ -354,14 +354,23 @@ fn render_list(
         .max()
         .unwrap_or(0)
         .max(12);
+    let tests = |t: Option<&crate::template_tests::TestBundle>| {
+        let f = hub::catalog::tests_fields(t);
+        match f["test_cases"].as_u64() {
+            _ if f["has_tests"] != true => "no tests".to_string(),
+            Some(n) if n > 0 => format!("{n} test(s)"),
+            _ => "tested".to_string(),
+        }
+    };
     let mut out = format!("source templates ({}):\n", cat.sources.len());
     for &i in &src_order {
         let s = &cat.sources[i].1;
         out.push_str(&format!(
-            "  {:<w$} {:<10} {:>3} stream(s) {:>7} {:<10}  {}\n",
+            "  {:<w$} {:<10} {:>3} stream(s) {:<11} {:>7} {:<10}  {}\n",
             src_ids[i],
             s.source.kind,
             s.streams.len(),
+            tests(s.tests.as_ref()),
             stars(&src_trust[i]),
             updated(&src_trust[i]),
             s.description.as_deref().unwrap_or("")
@@ -371,7 +380,7 @@ fn render_list(
     for &i in &snk_order {
         let k = &cat.sinks[i].1;
         out.push_str(&format!(
-            "  {:<w$} {:<10} {:<28} {:>7} {:<10}  {}\n",
+            "  {:<w$} {:<10} {:<28} {:<11} {:>7} {:<10}  {}\n",
             snk_ids[i],
             k.sink.kind,
             crate::registry::sink_supported_write_modes(&k.sink.kind)
@@ -379,6 +388,7 @@ fn render_list(
                 .map(|m| m.as_str())
                 .collect::<Vec<_>>()
                 .join("|"),
+            tests(k.tests.as_ref()),
             stars(&snk_trust[i]),
             updated(&snk_trust[i]),
             k.description.as_deref().unwrap_or("")

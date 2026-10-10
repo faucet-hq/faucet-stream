@@ -414,7 +414,7 @@ function listRow(t) {
   el.innerHTML = `
     ${statusPill(st.status || "draft")}
     <span class="tpl-row-id">
-      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b></span>
+      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b>${st.stable != null && st.stable_tests ? testPill(st.stable_tests, `v${st.stable} `) : st.has_tests ? "" : testPill("no_tests")}</span>
       ${t.description ? `<span class="tpl-row-desc">${escapeHtml(t.description)}</span>` : ""}
     </span>
     <span class="tpl-row-kind">${kindPill(kindOf(t))}</span>
@@ -552,7 +552,6 @@ streams:
         <select id="tr-format"><option value="yaml">yaml</option><option value="json">json</option></select>
       </label>
       <label>description <input id="tr-desc" value="${escapeHtml(presetDesc)}" /></label>
-      <label><input id="tr-test" type="checkbox" /> run its tests: bundle</label>
       <label><input id="tr-launch" type="checkbox" /> launch it (make live now)</label>
     </fieldset>
     <div class="submit-actions"><button id="tr-go" class="btn-primary">${newVersion ? "Register new version" : "Register"}</button></div>
@@ -569,12 +568,12 @@ streams:
     if (id) body.id = id;
     if (desc) body.description = desc;
     if (el.querySelector("#tr-launch").checked) body.launch = true;
-    if (el.querySelector("#tr-test").checked) body.test = true;
     try {
       const resp = await api("/v1/templates", { method: "POST", body });
       out.hidden = true;
-      if (resp.tests && !resp.tests.passed) toast(`${resp.id} v${resp.version} registered — its tests failed`, "error");
-      else toast(`${resp.id} v${resp.version} registered${resp.tests ? " — tests passed" : ""}`);
+      const inherited = resp.tests_inherited_from != null ? ` (tests inherited from v${resp.tests_inherited_from})` : "";
+      if (resp.tests && !resp.tests.passed) toast(`${resp.id} v${resp.version} registered${inherited} — its tests fail, so it can take no label`, "error");
+      else toast(`${resp.id} v${resp.version} registered${inherited}${resp.tests ? " — tests passing" : ""}`);
       // Adding a version from the detail page stays put and reloads; the
       // list-page flow navigates into the freshly-registered template.
       if (!newVersion) navigate(`#/templates/${encodeURIComponent(resp.id)}`);
@@ -795,31 +794,43 @@ function channelsFor(v, st) {
   return out;
 }
 
+/** One vocabulary for a version's test status (#856). */
 const TEST_PILL = {
-  passed: ["tests passed", "pill-completed"],
-  failed: ["tests failed", "pill-failed"],
-  stale: ["tests stale", "pill-queued"],
-  not_run: ["tests not run", "pill-queued"],
+  passing: ["passing", "pill-completed"],
+  failing: ["failing", "pill-failed"],
+  untested: ["untested", "pill-queued"],
   no_tests: ["no tests", "pill-cancelled"],
 };
 
-/** The test-gate standing of one version (#856), from the detail response. */
+/** A small test-status pill, with an optional prefix. */
+function testPill(status, prefix = "") {
+  const [label, cls] = TEST_PILL[status] || [status, "pill-cancelled"];
+  return `<span class="pill ${cls}" title="tests: ${escapeHtml(label)}">${escapeHtml(prefix + label)}</span>`;
+}
+
+/** The test status of one version (#856), from the detail response. */
 function testsFor(d, v) {
   return (d.tests && (d.tests.versions || []).find((x) => x.version === v)) || null;
 }
 
-/** The pill, and the blocked-launch / history block under a version row. */
-function testsBlock(t, requireTests) {
+/** Whether a label (launch, a channel) may move onto a version: `passing`,
+ *  or `untested` — whose tests then run first and decide. */
+function canTakeLabel(t) {
+  return !!t && (t.status === "passing" || t.status === "untested");
+}
+
+/** The pill, and the "why no label" / run-history block under a version row. */
+function testsBlock(t) {
   if (!t) return { pill: "", body: "" };
-  const [label, cls] = TEST_PILL[t.gate.status] || [t.gate.status, "pill-cancelled"];
-  const pill = `<span class="pill ${cls}" title="${escapeHtml(t.gate.reason || "the latest run passed under this faucet version")}">${escapeHtml(label)}</span>`;
+  const pill = testPill(t.status, "tests ");
   const lines = [];
-  if (!t.gate.allowed && t.gate.failing && t.gate.failing.length) {
-    lines.push(`<div class="tpl-tests-why"><b>Launch blocked</b> — failing cases:<ul>${t.gate.failing.map((f) => `<li class="mono">${escapeHtml(f)}</li>`).join("")}</ul></div>`);
-  } else if (!t.gate.allowed && t.gate.reason) {
-    lines.push(`<div class="tpl-tests-why"><b>Launch blocked</b> — ${mdInline(t.gate.reason)}</div>`);
-  } else if (!requireTests && !["passed", "no_tests"].includes(t.gate.status)) {
-    lines.push(`<div class="tpl-tests-why tpl-tests-warn">${mdInline(t.gate.reason || "Tests have not passed.")} Launching is allowed only because this server does not require tests.</div>`);
+  if (t.status === "failing") {
+    const cases = (t.failing || []).map((f) => `<li class="mono">${escapeHtml(f)}</li>`).join("");
+    lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — its tests fail.${cases ? `<ul>${cases}</ul>` : ""}</div>`);
+  } else if (t.status === "no_tests") {
+    lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — ${mdInline(t.reason || "it has no `tests:` block.")}</div>`);
+  } else if (t.status === "untested") {
+    lines.push(`<div class="tpl-tests-why tpl-tests-warn">No test result under this faucet version — launching or assigning a channel runs its tests first.</div>`);
   }
   if (t.results && t.results.length) {
     const rows = t.results
@@ -836,7 +847,6 @@ function testsBlock(t, requireTests) {
 
 function renderVersions(host, id, st, d, reload) {
   host.innerHTML = "";
-  const requireTests = !!(d.tests && d.tests.require_tests);
   if (!st.versions.length) {
     host.innerHTML = `<div class="empty">No versions stored.</div>`;
     return;
@@ -854,17 +864,17 @@ function renderVersions(host, id, st, d, reload) {
         .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
         .join("");
     const t = testsFor(d, v);
-    const tb = testsBlock(t, requireTests);
-    const gated = !!t && !t.gate.allowed && st.stable !== v;
-    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : gated ? `tests block the launch: ${t.gate.reason || "see below"}` : `make v${v} live for unpinned runs`;
+    const tb = testsBlock(t);
+    const blocked = !canTakeLabel(t);
+    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : blocked ? `only a version whose tests pass can be launched (v${v} is ${t ? t.status : "unknown"})` : `make v${v} live for unpinned runs`;
     row.innerHTML = `
       <span class="tpl-vnum mono">v${v}</span>
       <span class="tpl-vchannels">${pills || `<span class="run-meta">no channel</span>`}${tb.pill}</span>
-      <select class="tpl-assign" data-perm="template_admin" title="point a channel at v${v}">
+      <select class="tpl-assign" data-perm="template_admin" ${blocked ? "disabled" : ""} title="${blocked ? `only a version whose tests pass can take a channel` : `point a channel at v${v}`}">
         <option value="">assign channel</option>
         ${ASSIGNABLE.map((c) => `<option value="${c}">${c}</option>`).join("")}
       </select>
-      <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired || gated ? "disabled" : ""}
+      <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired || blocked ? "disabled" : ""}
         title="${escapeHtml(launchTitle)}">Launch</button>
       ${t && t.has_tests ? `<button class="btn-ghost tpl-runtests" data-perm="template_admin" title="run v${v}'s tests: bundle and record the result">Run tests</button>` : ""}
       <button class="btn-ghost tpl-view">Config</button>
