@@ -46,6 +46,7 @@ docs/superpowers/
 !/scripts/patch-coverage.py
 !/scripts/integration-coverage.py
 !/scripts/retry-on-image-pull.sh
+!/scripts/docker-hub-mirror.sh
 !/scripts/semver-exclude.py
 !/scripts/test_integration_coverage.py
 !/scripts/demo_catalog.py

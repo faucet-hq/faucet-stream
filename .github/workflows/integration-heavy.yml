@@ -78,6 +78,9 @@ jobs:
           dir="$(ls -d /opt/oracle/instantclient_* | sort -V | tail -1)"
           echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pull Docker Hub images through a mirror
+        # Avoids Docker Hub's anonymous pull rate limit on shared runners.
+        run: scripts/docker-hub-mirror.sh
       - name: Run the Oracle container suites
         run: >-
           scripts/retry-on-image-pull.sh cargo test -p faucet-source-oracle -p faucet-source-oracle-cdc
