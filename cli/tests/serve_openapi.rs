@@ -100,6 +100,8 @@ const ROUTES_TEMPLATES: &[(&str, &str)] = &[
     ("POST", "/v1/templates/{id}/rollback"),
     ("POST", "/v1/templates/{id}/deprecate"),
     ("POST", "/v1/templates/{id}/versions/{version}/deprecate"),
+    ("POST", "/v1/templates/{id}/versions/{version}/test"),
+    ("GET", "/v1/templates/{id}/versions/{version}/tests"),
 ];
 
 #[cfg(feature = "templates-sync")]
@@ -285,6 +287,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        require_template_tests: false,
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,

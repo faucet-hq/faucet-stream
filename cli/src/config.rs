@@ -83,6 +83,14 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "ParamsSpec::is_empty")]
     pub params: ParamsSpec,
 
+    /// Optional test bundle (#856): parameter-space cases, fixture cases and
+    /// required shared suites that `faucet template test` runs against this
+    /// config. Stored with a registered template version, so changing a test
+    /// is a new version; a test-gated launch needs a passing result. Ignored
+    /// by `faucet run`. See `faucet schema template-tests`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<crate::template_tests::TestBundle>,
+
     /// Optional named auth providers. Each entry is a `{ type, config }` spec
     /// (the same shape as inline auth) built once and shared across every
     /// connector that references it via `auth: { ref: <name> }`. Values are kept
@@ -1606,6 +1614,9 @@ impl PipelineConfig {
             });
         }
         crate::interpolate::resolve_config_refs(&mut cfg)?;
+        if let Some(b) = &cfg.tests {
+            b.validate(crate::hub::TemplateKind::Pipeline)?;
+        }
         if let Some(obs) = cfg.observability.as_ref()
             && let Some(otel) = obs.otel.as_ref()
         {

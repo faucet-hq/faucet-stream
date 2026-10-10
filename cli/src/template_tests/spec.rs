@@ -57,7 +57,7 @@ pub struct SuiteFile {
 
 /// The three ways cases come into existence, applied in this order:
 /// explicit, generated, derived.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Suite {
     /// Named cases, written out in full.
@@ -75,7 +75,7 @@ pub struct Suite {
 }
 
 /// One explicitly-written case.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Case {
     /// Case name, used in the report and by `--filter`.
@@ -86,6 +86,10 @@ pub struct Case {
     /// What the case asserts.
     #[serde(default)]
     pub expect: Expect,
+    /// Extra attempts before the case is reported failed. Explicit and
+    /// recorded: a case that needed a retry says so in the result.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u32,
 }
 
 /// What a validation-tier case asserts.
@@ -125,7 +129,7 @@ impl Expect {
 }
 
 /// A generated cartesian product.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Combine {
     /// Param name → the values to sweep. The generated case count is the
@@ -147,10 +151,13 @@ pub struct Combine {
     /// What every generated case asserts.
     #[serde(default)]
     pub expect: Expect,
+    /// Extra attempts for every generated case.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u32,
 }
 
 /// Cases derived from the template's own `params:` block.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Auto {
     /// One case per declared value of each param carrying a closed `values:`
@@ -166,10 +173,13 @@ pub struct Auto {
     /// the one most easily forgotten in a hand-written suite.
     #[serde(default)]
     pub defaults_baseline: bool,
+    /// Extra attempts for every derived case.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u32,
 }
 
 /// A behavioural case: fixture records through the real pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Behavioral {
     /// Case name.
@@ -189,7 +199,18 @@ pub struct Behavioral {
     pub input: Value,
     /// Expectations, in `faucet test`'s grammar.
     pub expect: Value,
+    /// Extra attempts before the case is reported failed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u32,
 }
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The most extra attempts a case may ask for. A case that needs more is
+/// broken, and a long retry loop would hide it.
+pub const MAX_RETRIES: u32 = 5;
 
 /// Hard ceiling on generated cases.
 ///
@@ -231,46 +252,76 @@ impl SuiteFile {
                 "template test suite: `template` must name a registered id or a config path".into(),
             ));
         }
-        let auto_on = self
-            .suite
-            .auto
-            .as_ref()
-            .is_some_and(|a| a.enum_coverage || a.required_omitted || a.defaults_baseline);
-        if self.suite.cases.is_empty()
-            && self.suite.combine.is_none()
-            && self.suite.behavioral.is_empty()
-            && !auto_on
-        {
+        if self.suite.is_empty() {
             return Err(CliError::Config(
                 "template test suite: no cases — add `cases:`, `combine:`, `auto:` or \
                  `behavioral:`. An empty suite reports green, which is worse than no suite."
                     .into(),
             ));
         }
-        for c in &self.suite.cases {
+        self.suite.validate("template test suite")
+    }
+}
+
+impl Suite {
+    /// True when the suite would generate no case at all.
+    pub fn is_empty(&self) -> bool {
+        let auto_on = self
+            .auto
+            .as_ref()
+            .is_some_and(|a| a.enum_coverage || a.required_omitted || a.defaults_baseline);
+        self.cases.is_empty() && self.combine.is_none() && self.behavioral.is_empty() && !auto_on
+    }
+
+    /// Structural checks shared by a suite file, a template's `tests:` block
+    /// and a shared suite. `what` prefixes every message.
+    pub fn validate(&self, what: &str) -> CliResult<()> {
+        for c in &self.cases {
             if c.name.trim().is_empty() {
-                return Err(CliError::Config(
-                    "template test suite: every case needs a non-empty `name`".into(),
-                ));
+                return Err(CliError::Config(format!(
+                    "{what}: every case needs a non-empty `name`"
+                )));
             }
+            check_retries(what, &c.name, c.retries)?;
         }
-        if let Some(cb) = &self.suite.combine {
+        if let Some(cb) = &self.combine {
             if cb.params.is_empty() {
-                return Err(CliError::Config(
-                    "template test suite: `combine.params` is empty — nothing to generate".into(),
-                ));
+                return Err(CliError::Config(format!(
+                    "{what}: `combine.params` is empty — nothing to generate"
+                )));
             }
             for (name, values) in &cb.params {
                 if values.is_empty() {
                     return Err(CliError::Config(format!(
-                        "template test suite: `combine.params.{name}` is an empty list, which \
+                        "{what}: `combine.params.{name}` is an empty list, which \
                          would generate zero cases for every other param too"
                     )));
                 }
             }
+            check_retries(what, "combine", cb.retries)?;
+        }
+        if let Some(a) = &self.auto {
+            check_retries(what, "auto", a.retries)?;
+        }
+        for b in &self.behavioral {
+            if b.name.trim().is_empty() {
+                return Err(CliError::Config(format!(
+                    "{what}: every behavioral case needs a non-empty `name`"
+                )));
+            }
+            check_retries(what, &b.name, b.retries)?;
         }
         Ok(())
     }
+}
+
+pub(crate) fn check_retries(what: &str, case: &str, retries: u32) -> CliResult<()> {
+    if retries > MAX_RETRIES {
+        return Err(CliError::Config(format!(
+            "{what}: case '{case}' asks for {retries} retries; at most {MAX_RETRIES} are allowed"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

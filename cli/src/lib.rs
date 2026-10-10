@@ -83,6 +83,7 @@ pub mod sla;
 pub mod sql_bind;
 pub mod state;
 pub mod status;
+pub mod template_tests;
 #[cfg(feature = "templates")]
 pub mod templates;
 pub mod tenant_tokens;

@@ -24,7 +24,7 @@ use std::time::Duration;
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Columns added to a table after it first shipped, with the schema version
 /// that added them. `CREATE TABLE IF NOT EXISTS` never alters an existing
@@ -35,6 +35,8 @@ pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (2, "faucet_serve_changes", "tenant"),
     (3, "faucet_serve_audit", "target"),
     (4, "faucet_serve_run_logs", "attrs"),
+    (5, "faucet_template_launches", "tests_skipped"),
+    (5, "faucet_serve_audit", "detail"),
 ];
 
 /// The columns of a `faucet_serve_log_ship` row, in [`decode_log_ship`] order.
@@ -466,6 +468,15 @@ pub const DDL: &[&str] = &[
         deprecated_at TEXT NOT NULL,\
         deprecated_by TEXT,\
         reason TEXT)",
+    // Test-bundle runs recorded on template versions (#856). `body` is the
+    // whole `TemplateTestResult`; the newest `RESULTS_RETAIN` per version are
+    // kept, and deleting a version or template deletes its rows.
+    "CREATE TABLE IF NOT EXISTS faucet_template_test_results (\
+        id TEXT NOT NULL,\
+        version TEXT NOT NULL,\
+        recorded_at TEXT NOT NULL,\
+        body TEXT NOT NULL,\
+        PRIMARY KEY (id, version, recorded_at))",
     // Per-version deprecation markers (#697).
     "CREATE TABLE IF NOT EXISTS faucet_template_version_deprecations (\
         id TEXT NOT NULL,\
@@ -896,6 +907,18 @@ pub struct Stmts {
     pub template_delete_version_deprecation: String,
     /// Clear every version deprecation of a template. Param: id.
     pub template_delete_version_deprecations_all: String,
+    /// Record one test-bundle run. Params: id, version, recorded_at, body.
+    pub template_insert_test: String,
+    /// A template's test runs, newest first. Params: id, limit.
+    pub template_select_tests: String,
+    /// One version's test runs, newest first. Params: id, version, limit.
+    pub template_select_tests_version: String,
+    /// Keep the newest runs of one version. Params: id, version, id, version, keep.
+    pub template_prune_tests: String,
+    /// Delete one version's runs. Params: id, version.
+    pub template_delete_tests_version: String,
+    /// Delete every run of a template. Param: id.
+    pub template_delete_tests_all: String,
     /// The dialect these statements were built for. Needed by the one query that
     /// cannot be a fixed string: the local-output listing pushes its filter and
     /// `LIMIT` into SQL (#587), so the placeholder style has to be known at call
@@ -1285,10 +1308,11 @@ impl Stmts {
                 .into(),
             insert_audit: "INSERT INTO faucet_serve_audit \
                 (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result, \
-                target) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
+                target, detail) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"
                 .into(),
             list_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
-                config_fingerprint, source_ip, result, a.target AS target, t.tenant AS tenant \
+                config_fingerprint, source_ip, result, a.target AS target, a.detail AS detail, \
+                t.tenant AS tenant \
                 FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
                 WHERE ($1::text IS NULL OR principal = $2::text) \
                 AND ($3::text IS NULL OR action = $4::text) \
@@ -1539,9 +1563,10 @@ impl Stmts {
                 FROM faucet_template_launches WHERE id=$1"
                 .into(),
             template_insert_launch: "INSERT INTO faucet_template_launches \
-                (id, seq, version, launched_at, launched_by) VALUES ($1,$2,$3,$4,$5)"
+                (id, seq, version, launched_at, launched_by, tests_skipped) \
+                VALUES ($1,$2,$3,$4,$5,$6)"
                 .into(),
-            template_select_launches: "SELECT seq, version, launched_at, launched_by \
+            template_select_launches: "SELECT seq, version, launched_at, launched_by, tests_skipped \
                 FROM faucet_template_launches WHERE id=$1 ORDER BY CAST(seq AS BIGINT) DESC"
                 .into(),
             template_delete_launches_all: "DELETE FROM faucet_template_launches WHERE id=$1".into(),
@@ -1570,6 +1595,25 @@ impl Stmts {
                 "DELETE FROM faucet_template_version_deprecations WHERE id=$1 AND version=$2".into(),
             template_delete_version_deprecations_all:
                 "DELETE FROM faucet_template_version_deprecations WHERE id=$1".into(),
+            template_insert_test: "INSERT INTO faucet_template_test_results \
+                (id, version, recorded_at, body) VALUES ($1,$2,$3,$4) \
+                ON CONFLICT (id, version, recorded_at) DO NOTHING"
+                .into(),
+            template_select_tests: "SELECT body FROM faucet_template_test_results \
+                WHERE id=$1 ORDER BY recorded_at DESC LIMIT $2"
+                .into(),
+            template_select_tests_version: "SELECT body FROM faucet_template_test_results \
+                WHERE id=$1 AND version=$2 ORDER BY recorded_at DESC LIMIT $3"
+                .into(),
+            template_prune_tests: "DELETE FROM faucet_template_test_results \
+                WHERE id=$1 AND version=$2 AND recorded_at NOT IN (\
+                    SELECT recorded_at FROM faucet_template_test_results \
+                    WHERE id=$3 AND version=$4 ORDER BY recorded_at DESC LIMIT $5)"
+                .into(),
+            template_delete_tests_version:
+                "DELETE FROM faucet_template_test_results WHERE id=$1 AND version=$2".into(),
+            template_delete_tests_all:
+                "DELETE FROM faucet_template_test_results WHERE id=$1".into(),
             dialect: Dialect::Postgres,
         }
     }
@@ -1768,10 +1812,11 @@ impl Stmts {
                 .into(),
             insert_audit: "INSERT INTO faucet_serve_audit \
                 (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result, \
-                target) VALUES (?,?,?,?,?,?,?,?,?,?)"
+                target, detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
                 .into(),
             list_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
-                config_fingerprint, source_ip, result, a.target AS target, t.tenant AS tenant \
+                config_fingerprint, source_ip, result, a.target AS target, a.detail AS detail, \
+                t.tenant AS tenant \
                 FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
                 WHERE (? IS NULL OR principal = ?) \
                 AND (? IS NULL OR action = ?) \
@@ -2021,9 +2066,10 @@ impl Stmts {
                 FROM faucet_template_launches WHERE id=?"
                 .into(),
             template_insert_launch: "INSERT INTO faucet_template_launches \
-                (id, seq, version, launched_at, launched_by) VALUES (?,?,?,?,?)"
+                (id, seq, version, launched_at, launched_by, tests_skipped) \
+                VALUES (?,?,?,?,?,?)"
                 .into(),
-            template_select_launches: "SELECT seq, version, launched_at, launched_by \
+            template_select_launches: "SELECT seq, version, launched_at, launched_by, tests_skipped \
                 FROM faucet_template_launches WHERE id=? ORDER BY CAST(seq AS INTEGER) DESC"
                 .into(),
             template_delete_launches_all: "DELETE FROM faucet_template_launches WHERE id=?".into(),
@@ -2052,6 +2098,25 @@ impl Stmts {
                 "DELETE FROM faucet_template_version_deprecations WHERE id=? AND version=?".into(),
             template_delete_version_deprecations_all:
                 "DELETE FROM faucet_template_version_deprecations WHERE id=?".into(),
+            template_insert_test: "INSERT INTO faucet_template_test_results \
+                (id, version, recorded_at, body) VALUES (?,?,?,?) \
+                ON CONFLICT (id, version, recorded_at) DO NOTHING"
+                .into(),
+            template_select_tests: "SELECT body FROM faucet_template_test_results \
+                WHERE id=? ORDER BY recorded_at DESC LIMIT ?"
+                .into(),
+            template_select_tests_version: "SELECT body FROM faucet_template_test_results \
+                WHERE id=? AND version=? ORDER BY recorded_at DESC LIMIT ?"
+                .into(),
+            template_prune_tests: "DELETE FROM faucet_template_test_results \
+                WHERE id=? AND version=? AND recorded_at NOT IN (\
+                    SELECT recorded_at FROM faucet_template_test_results \
+                    WHERE id=? AND version=? ORDER BY recorded_at DESC LIMIT ?)"
+                .into(),
+            template_delete_tests_version:
+                "DELETE FROM faucet_template_test_results WHERE id=? AND version=?".into(),
+            template_delete_tests_all:
+                "DELETE FROM faucet_template_test_results WHERE id=?".into(),
             dialect: Dialect::Sqlite,
         }
     }
@@ -3564,6 +3629,7 @@ macro_rules! impl_sql_history {
                     .bind(entry.source_ip.as_deref())
                     .bind(&entry.result)
                     .bind(entry.target.as_deref())
+                    .bind(entry.detail.as_deref())
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
@@ -3624,6 +3690,7 @@ macro_rules! impl_sql_history {
                         source_ip: r.try_get("source_ip").map_err(backend)?,
                         tenant: r.try_get("tenant").map_err(backend)?,
                         target: r.try_get("target").map_err(backend)?,
+                        detail: r.try_get("detail").map_err(backend)?,
                         result: r.try_get("result").map_err(backend)?,
                     });
                 }
@@ -5122,6 +5189,12 @@ macro_rules! impl_sql_history {
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?;
+                        sqlx::query(&self.stmts.template_delete_tests_version)
+                            .bind(id)
+                            .bind(v.to_string())
+                            .execute(&self.pool)
+                            .await
+                            .map_err(backend)?;
                         sqlx::query(&self.stmts.template_delete_version)
                             .bind(id)
                             .bind(v.to_string())
@@ -5134,6 +5207,7 @@ macro_rules! impl_sql_history {
                             &self.stmts.template_delete_launches_all,
                             &self.stmts.template_delete_deprecation,
                             &self.stmts.template_delete_version_deprecations_all,
+                            &self.stmts.template_delete_tests_all,
                         ] {
                             sqlx::query(stmt)
                                 .bind(id)
@@ -5216,6 +5290,17 @@ macro_rules! impl_sql_history {
                 version: u32,
                 launched_by: Option<&str>,
             ) -> Result<Option<u32>, $crate::serve::history::HistoryError> {
+                self.template_launch_noted(id, version, launched_by, None)
+                    .await
+            }
+
+            async fn template_launch_noted(
+                &self,
+                id: &str,
+                version: u32,
+                launched_by: Option<&str>,
+                tests_skipped: Option<&str>,
+            ) -> Result<Option<u32>, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
                 use $crate::serve::history::HistoryError;
                 use $crate::serve::history::{sql, templates};
@@ -5258,6 +5343,7 @@ macro_rules! impl_sql_history {
                         .bind(version.to_string())
                         .bind(sql::fmt_ts(chrono::Utc::now()))
                         .bind(launched_by)
+                        .bind(tests_skipped)
                         .execute(&self.pool)
                         .await;
                     match insert {
@@ -5298,6 +5384,8 @@ macro_rules! impl_sql_history {
                     let version: String = r.try_get("version").map_err(backend)?;
                     let launched_at: String = r.try_get("launched_at").map_err(backend)?;
                     let launched_by: Option<String> = r.try_get("launched_by").map_err(backend)?;
+                    let tests_skipped: Option<String> =
+                        r.try_get("tests_skipped").map_err(backend)?;
                     // Skip an unparseable row rather than failing the whole read —
                     // a corrupt entry must not make a template unusable.
                     let (Ok(seq), Ok(version)) = (seq.parse::<u32>(), version.parse::<u32>()) else {
@@ -5308,6 +5396,7 @@ macro_rules! impl_sql_history {
                         version,
                         launched_at: sql::parse_ts(&launched_at),
                         launched_by,
+                        tests_skipped,
                     });
                 }
                 Ok(out)
@@ -5340,6 +5429,68 @@ macro_rules! impl_sql_history {
                     }
                 }
                 Ok(())
+            }
+
+            async fn template_record_test(
+                &self,
+                result: &$crate::serve::history::templates::TemplateTestResult,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::{sql, templates};
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let version = result.version.to_string();
+                sqlx::query(&self.stmts.template_insert_test)
+                    .bind(&result.id)
+                    .bind(&version)
+                    .bind(sql::fmt_ts(result.recorded_at))
+                    .bind(sql::encode_json(result, "template test result")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                sqlx::query(&self.stmts.template_prune_tests)
+                    .bind(&result.id)
+                    .bind(&version)
+                    .bind(&result.id)
+                    .bind(&version)
+                    .bind(templates::RESULTS_RETAIN as i64)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn template_test_results(
+                &self,
+                id: &str,
+                version: Option<u32>,
+                limit: usize,
+            ) -> Result<
+                Vec<$crate::serve::history::templates::TemplateTestResult>,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+                let rows = match version {
+                    Some(v) => sqlx::query(&self.stmts.template_select_tests_version)
+                        .bind(id)
+                        .bind(v.to_string())
+                        .bind(limit)
+                        .fetch_all(&self.pool)
+                        .await,
+                    None => sqlx::query(&self.stmts.template_select_tests)
+                        .bind(id)
+                        .bind(limit)
+                        .fetch_all(&self.pool)
+                        .await,
+                }
+                .map_err(backend)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let body: String = r.try_get("body").map_err(backend)?;
+                    out.push(sql::decode_json(&body, "template test result")?);
+                }
+                Ok(out)
             }
 
             async fn template_set_version_deprecation(

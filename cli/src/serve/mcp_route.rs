@@ -55,7 +55,8 @@ pub async fn handle(
         .with_config_execution(can_execute_config)
         .with_template_admin(actor.role.grants(Permission::TemplateAdmin))
         .with_submitted_origin(state.caller_origin())
-        .with_approval_required(state.require_approval().to_vec());
+        .with_approval_required(state.require_approval().to_vec())
+        .with_require_template_tests(state.template_gate().require_tests);
     let ctx = ctx.with_server(crate::mcp::ChangeProposer {
         state: state.clone(),
         actor: actor.clone(),

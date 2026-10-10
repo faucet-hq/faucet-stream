@@ -438,6 +438,8 @@ impl From<TemplateId> for String {
     }
 }
 
+pub use crate::template_tests::result::{RESULTS_RETAIN, TemplateTestResult};
+
 /// One registered version of a template.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateRecord {
@@ -543,6 +545,9 @@ pub struct LaunchRecord {
     /// Principal that launched it (`None` for a CLI launch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launched_by: Option<String>,
+    /// Set when an admin launched past the test gate (#856): the reason given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_skipped: Option<String>,
 }
 
 /// Why and when a template was retired. Stored only while deprecated; clearing it
@@ -776,6 +781,7 @@ mod tests {
             version,
             launched_at: DateTime::from_timestamp(seq as i64, 0).unwrap(),
             launched_by: None,
+            tests_skipped: None,
         };
         let launches = vec![launch(3, 2), launch(2, 1), launch(1, 4)];
         let tags = BTreeMap::from([("prod".to_string(), 3)]);

@@ -332,6 +332,7 @@ pub fn build_pipeline_config(env: &HashMap<String, String>) -> CliResult<Pipelin
         // Pure-env mode has no `params:` surface: every value already comes from
         // the environment, which is what params would be overriding.
         params: Default::default(),
+        tests: None,
         // Pure-env mode doesn't (yet) assemble a shared `auth:` catalog; inline
         // auth via FAUCET_*_AUTH_JSON still works.
         auth: None,

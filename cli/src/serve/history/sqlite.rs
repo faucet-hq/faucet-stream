@@ -289,6 +289,7 @@ mod shard_tests {
                 source_ip: Some("127.0.0.1".into()),
                 tenant: None,
                 target: Some(format!("t:{id}")),
+                detail: None,
                 result: result.into(),
             };
         h.record_audit(&entry("1", "alice", "run.submit", "ok", 3))

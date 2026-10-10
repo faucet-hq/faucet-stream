@@ -151,6 +151,7 @@ fn config() -> ServeConfig {
         callback_allow_hosts: Vec::new(),
         require_approval: Vec::new(),
         approval_expiry: Duration::from_secs(86_400),
+        require_template_tests: false,
         vault: None,
         connect_providers_path: None,
         allow_subprocess_connectors: false,

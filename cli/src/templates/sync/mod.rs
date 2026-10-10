@@ -131,6 +131,16 @@ impl SyncReport {
             s.push_str(&format!("  warning    {w}\n"));
         }
         if let Some(o) = &self.outcome {
+            for t in &o.tested {
+                s.push_str(&format!(
+                    "  tested     {} v{}: {} ({} case(s), {} failed)\n",
+                    t.id,
+                    t.version,
+                    if t.passed { "pass" } else { "FAIL" },
+                    t.cases,
+                    t.failed_cases
+                ));
+            }
             for f in &o.failed {
                 s.push_str(&format!("  FAILED     {}: {}\n", f.id, f.error));
             }
@@ -316,6 +326,17 @@ pub async fn sync_origin(
     dry_run: bool,
     actor: Option<&str>,
 ) -> CliResult<SyncReport> {
+    sync_origin_gated(store, origin, dry_run, actor, &Default::default()).await
+}
+
+/// [`sync_origin`] with launches going through `gate` (#856).
+pub async fn sync_origin_gated(
+    store: &TemplateStore,
+    origin: &Origin,
+    dry_run: bool,
+    actor: Option<&str>,
+    gate: &crate::template_tests::LaunchGate,
+) -> CliResult<SyncReport> {
     let labels = [("origin", origin.name.clone())];
     metrics::gauge!(METRIC_SYNC_LAST, &labels).set(now_secs());
     // One pull per origin at a time in this process: an HTTP-triggered sync
@@ -323,7 +344,7 @@ pub async fn sync_origin(
     // register the same body twice.
     let lock = origin_lock(&origin.name);
     let _guard = lock.lock().await;
-    let result = sync_origin_inner(store, origin, dry_run, actor).await;
+    let result = sync_origin_inner(store, origin, dry_run, actor, gate).await;
     let outcome = match &result {
         Ok(r) if r.failed() > 0 => "partial",
         Ok(_) => "ok",
@@ -344,6 +365,7 @@ async fn sync_origin_inner(
     origin: &Origin,
     dry_run: bool,
     actor: Option<&str>,
+    gate: &crate::template_tests::LaunchGate,
 ) -> CliResult<SyncReport> {
     let fetcher = fetch::fetcher_for(&origin.source)?;
     let files = fetcher.list().await?;
@@ -374,7 +396,7 @@ async fn sync_origin_inner(
         let actor = actor
             .map(str::to_string)
             .unwrap_or_else(|| sync_actor(&origin.name));
-        Some(apply::apply(store, plan, &actor).await)
+        Some(apply::apply_gated(store, plan, &actor, gate).await)
     };
     Ok(SyncReport {
         origin: origin.name.clone(),
@@ -395,6 +417,18 @@ pub async fn sync_all(
     dry_run: bool,
     actor: Option<&str>,
 ) -> CliResult<Vec<Result<SyncReport, (String, CliError)>>> {
+    sync_all_gated(store, file, only, dry_run, actor, &Default::default()).await
+}
+
+/// [`sync_all`] with launches going through `gate` (#856).
+pub async fn sync_all_gated(
+    store: &TemplateStore,
+    file: &SyncFile,
+    only: Option<&str>,
+    dry_run: bool,
+    actor: Option<&str>,
+    gate: &crate::template_tests::LaunchGate,
+) -> CliResult<Vec<Result<SyncReport, (String, CliError)>>> {
     let origins: Vec<&Origin> = match only {
         Some(name) => vec![file.origin(name)?],
         None => file.origins.iter().collect(),
@@ -402,7 +436,7 @@ pub async fn sync_all(
     let mut out = Vec::with_capacity(origins.len());
     for o in origins {
         out.push(
-            sync_origin(store, o, dry_run, actor)
+            sync_origin_gated(store, o, dry_run, actor, gate)
                 .await
                 .map_err(|e| (o.name.clone(), e)),
         );
@@ -480,6 +514,16 @@ pub fn spawn_interval_syncs(
     file: Arc<SyncFile>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    spawn_interval_syncs_gated(store, file, shutdown, Default::default())
+}
+
+/// [`spawn_interval_syncs`] with launches going through `gate` (#856).
+pub fn spawn_interval_syncs_gated(
+    store: TemplateStore,
+    file: Arc<SyncFile>,
+    shutdown: tokio_util::sync::CancellationToken,
+    gate: crate::template_tests::LaunchGate,
+) -> Vec<tokio::task::JoinHandle<()>> {
     file.origins
         .iter()
         .filter_map(|o| o.interval_secs.map(|s| (o.name.clone(), s)))
@@ -487,6 +531,7 @@ pub fn spawn_interval_syncs(
             let store = store.clone();
             let file = Arc::clone(&file);
             let shutdown = shutdown.clone();
+            let gate = gate.clone();
             tokio::spawn(async move {
                 let interval = std::time::Duration::from_secs(secs);
                 loop {
@@ -496,7 +541,7 @@ pub fn spawn_interval_syncs(
                         _ = tokio::time::sleep(interval) => {}
                     }
                     let Ok(origin) = file.origin(&name) else { break };
-                    match sync_origin(&store, origin, false, None).await {
+                    match sync_origin_gated(&store, origin, false, None, &gate).await {
                         Ok(r) => {
                             if r.failed() > 0 {
                                 tracing::warn!(origin = %name, failed = r.failed(), "periodic template sync had failures");
@@ -700,6 +745,8 @@ mod tests {
                     tags: vec![],
                     launch: true,
                     created_by: None,
+                    test: false,
+                    gate: Default::default(),
                 },
             )
             .await
@@ -818,6 +865,8 @@ mod tests {
                 tags: vec![],
                 launch: true,
                 created_by: None,
+                test: false,
+                gate: Default::default(),
             },
         )
         .await
@@ -1043,6 +1092,8 @@ mod tests {
                 tags: Vec::new(),
                 launch: true,
                 created_by: None,
+                test: false,
+                gate: Default::default(),
             },
         )
         .await
@@ -1071,6 +1122,8 @@ mod tests {
                     tags: vec![],
                     launch: false,
                     created_by: None,
+                    test: false,
+                    gate: Default::default(),
                 },
             )
             .await

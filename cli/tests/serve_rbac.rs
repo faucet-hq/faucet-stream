@@ -73,6 +73,7 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        require_template_tests: false,
         vault_key: None,
         vault_previous_key: Vec::new(),
         connect_providers: None,
@@ -369,6 +370,8 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
             Method::POST,
             "/v1/templates/{id}/versions/{version}/deprecate",
         ),
+        (Method::POST, "/v1/templates/{id}/versions/{version}/test"),
+        (Method::GET, "/v1/templates/{id}/versions/{version}/tests"),
     ]);
     #[cfg(feature = "templates-sync")]
     v.extend([
@@ -522,6 +525,7 @@ fn an_operator_triggers_templates_but_cannot_manage_them() {
         "/v1/templates/{id}/rollback",
         "/v1/templates/{id}/deprecate",
         "/v1/templates/{id}/versions/{version}/deprecate",
+        "/v1/templates/{id}/versions/{version}/test",
         "/v1/templates/sync",
         "/v1/templates/{id}/publish",
     ] {

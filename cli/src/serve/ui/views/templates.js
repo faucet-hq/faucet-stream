@@ -552,6 +552,7 @@ streams:
         <select id="tr-format"><option value="yaml">yaml</option><option value="json">json</option></select>
       </label>
       <label>description <input id="tr-desc" value="${escapeHtml(presetDesc)}" /></label>
+      <label><input id="tr-test" type="checkbox" /> run its tests: bundle</label>
       <label><input id="tr-launch" type="checkbox" /> launch it (make live now)</label>
     </fieldset>
     <div class="submit-actions"><button id="tr-go" class="btn-primary">${newVersion ? "Register new version" : "Register"}</button></div>
@@ -568,10 +569,12 @@ streams:
     if (id) body.id = id;
     if (desc) body.description = desc;
     if (el.querySelector("#tr-launch").checked) body.launch = true;
+    if (el.querySelector("#tr-test").checked) body.test = true;
     try {
       const resp = await api("/v1/templates", { method: "POST", body });
       out.hidden = true;
-      toast(`${resp.id} v${resp.version} registered`);
+      if (resp.tests && !resp.tests.passed) toast(`${resp.id} v${resp.version} registered — its tests failed`, "error");
+      else toast(`${resp.id} v${resp.version} registered${resp.tests ? " — tests passed" : ""}`);
       // Adding a version from the detail page stays put and reloads; the
       // list-page flow navigates into the freshly-registered template.
       if (!newVersion) navigate(`#/templates/${encodeURIComponent(resp.id)}`);
@@ -792,8 +795,50 @@ function channelsFor(v, st) {
   return out;
 }
 
+const TEST_PILL = {
+  passed: ["tests passed", "pill-completed"],
+  failed: ["tests failed", "pill-failed"],
+  stale: ["tests stale", "pill-queued"],
+  not_run: ["tests not run", "pill-queued"],
+  no_tests: ["no tests", "pill-cancelled"],
+};
+
+/** The test-gate standing of one version (#856), from the detail response. */
+function testsFor(d, v) {
+  return (d.tests && (d.tests.versions || []).find((x) => x.version === v)) || null;
+}
+
+/** The pill, and the blocked-launch / history block under a version row. */
+function testsBlock(t, requireTests) {
+  if (!t) return { pill: "", body: "" };
+  const [label, cls] = TEST_PILL[t.gate.status] || [t.gate.status, "pill-cancelled"];
+  const pill = `<span class="pill ${cls}" title="${escapeHtml(t.gate.reason || "the latest run passed under this faucet version")}">${escapeHtml(label)}</span>`;
+  const lines = [];
+  if (!t.gate.allowed && t.gate.failing && t.gate.failing.length) {
+    lines.push(`<div class="tpl-tests-why"><b>Launch blocked</b> — failing cases:<ul>${t.gate.failing.map((f) => `<li class="mono">${escapeHtml(f)}</li>`).join("")}</ul></div>`);
+  } else if (!t.gate.allowed && t.gate.reason) {
+    lines.push(`<div class="tpl-tests-why"><b>Launch blocked</b> — ${mdInline(t.gate.reason)}</div>`);
+  } else if (!requireTests && t.gate.status === "no_tests") {
+    lines.push(`<div class="tpl-tests-why tpl-tests-warn">No <code>tests:</code> block — this version launches untested. A server with <code>--require-template-tests</code> would refuse it.</div>`);
+  } else if (!requireTests && t.gate.status !== "passed") {
+    lines.push(`<div class="tpl-tests-why tpl-tests-warn">${mdInline(t.gate.reason || "Tests have not passed.")} Launching is allowed only because this server does not require tests.</div>`);
+  }
+  if (t.results && t.results.length) {
+    const rows = t.results
+      .map((r) => {
+        const failed = r.cases.filter((c) => !c.passed).length;
+        const retried = r.cases.filter((c) => c.attempts > 1).length;
+        return `<tr><td class="tpl-launch-when">${fmtTime(r.recorded_at)}</td><td><span class="pill ${r.passed ? "pill-completed" : "pill-failed"}">${r.passed ? "pass" : "fail"}</span></td><td class="tpl-tests-cases">${r.cases.length - failed}/${r.cases.length}${retried ? ` · ${retried} retried` : ""}${r.error ? ` · ${escapeHtml(r.error)}` : ""}</td><td class="mono">${escapeHtml(r.faucet_version)}</td><td>${escapeHtml(r.recorded_by || "cli")}</td></tr>`;
+      })
+      .join("");
+    lines.push(`<div class="tpl-launch-wrap"><table class="tbl tpl-tests-tbl"><thead><tr><th>run</th><th>result</th><th>cases</th><th>faucet</th><th>by</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+  }
+  return { pill, body: lines.length ? `<div class="tpl-tests">${lines.join("")}</div>` : "" };
+}
+
 function renderVersions(host, id, st, d, reload) {
   host.innerHTML = "";
+  const requireTests = !!(d.tests && d.tests.require_tests);
   if (!st.versions.length) {
     host.innerHTML = `<div class="empty">No versions stored.</div>`;
     return;
@@ -810,22 +855,47 @@ function renderVersions(host, id, st, d, reload) {
       channelsFor(v, st)
         .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
         .join("");
-    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : `make v${v} live for unpinned runs`;
+    const t = testsFor(d, v);
+    const tb = testsBlock(t, requireTests);
+    const gated = !!t && !t.gate.allowed && st.stable !== v;
+    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : gated ? `tests block the launch: ${t.gate.reason || "see below"}` : `make v${v} live for unpinned runs`;
     row.innerHTML = `
       <span class="tpl-vnum mono">v${v}</span>
-      <span class="tpl-vchannels">${pills || `<span class="run-meta">no channel</span>`}</span>
+      <span class="tpl-vchannels">${pills || `<span class="run-meta">no channel</span>`}${tb.pill}</span>
       <select class="tpl-assign" data-perm="template_admin" title="point a channel at v${v}">
         <option value="">assign channel</option>
         ${ASSIGNABLE.map((c) => `<option value="${c}">${c}</option>`).join("")}
       </select>
-      <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired ? "disabled" : ""}
-        title="${launchTitle}">Launch</button>
+      <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired || gated ? "disabled" : ""}
+        title="${escapeHtml(launchTitle)}">Launch</button>
+      ${t && t.has_tests ? `<button class="btn-ghost tpl-runtests" data-perm="template_admin" title="run v${v}'s tests: bundle and record the result">Run tests</button>` : ""}
       <button class="btn-ghost tpl-view">Config</button>
       <button class="btn-ghost tpl-view-clean" title="comments stripped, canonical YAML">Clean</button>
       <button class="${retired ? "btn-ghost" : "btn-warn"} tpl-vdeprecate" data-perm="template_admin"
         title="${retired ? `make v${v} usable again` : `retire v${v}: pinned runs still work but warn, newest skips it, launch refuses it`}">${retired ? "Revive" : "Deprecate"}</button>
       <button class="btn-danger tpl-del" data-perm="template_admin">Delete</button>
+      ${tb.body}
       <pre class="tpl-body" hidden></pre>`;
+
+    const runTests = row.querySelector(".tpl-runtests");
+    if (runTests) {
+      runTests.onclick = async (ev) => {
+        ev.stopPropagation();
+        runTests.disabled = true;
+        runTests.textContent = "Running…";
+        try {
+          const r = await api(`/v1/templates/${encodeURIComponent(id)}/versions/${v}/test`, { method: "POST", body: {} });
+          const failed = r.cases.filter((c) => !c.passed).length;
+          if (r.passed) toast(`v${v}: ${r.cases.length} case(s) passed`);
+          else toast(`v${v}: ${failed} of ${r.cases.length} case(s) failed`, "error");
+          reload();
+        } catch (e) {
+          toast(e.message, "error");
+          runTests.disabled = false;
+          runTests.textContent = "Run tests";
+        }
+      };
+    }
 
     row.querySelector(".tpl-assign").onchange = async (ev) => {
       const tag = ev.target.value;
@@ -1131,7 +1201,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   for (const r of rows) {
     r.title = `run v${r.dataset.version}`;
     r.onclick = (ev) => {
-      if (ev.target.closest("button, select, a, pre")) return;
+      if (ev.target.closest("button, select, a, pre, .tpl-tests")) return;
       versionSel.value = r.dataset.version;
       markPicked();
       renderParams();

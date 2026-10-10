@@ -1371,6 +1371,22 @@ is the failed-case count. Example:
 [`examples/tests/template_suite.yaml`](examples/tests/template_suite.yaml);
 `faucet schema template-test` prints the suite schema.
 
+**Test bundles and the launch gate (#856).** A template document may carry its
+own `tests:` block — `suite:` cases, `fixtures:` (`faucet test` cases run through
+the template, `retries: n` explicit and recorded) and `requires_suites:` (shared
+`kind: test-suite` documents picked by semver range over their `release:`). It
+is stored with the version, so a test change is a new version. `faucet template
+test <file>` runs a bundle offline; `faucet template test <id>@<version> --store
+…` (or `register --test`, or `POST /v1/templates/{id}/versions/{version}/test`)
+runs a registered version's bundle and records the result on it. With `faucet
+serve --require-template-tests` (off by default) — and `--require-tests` on the
+CLI — every launch (HTTP, MCP, sync, approved change requests) needs a passing
+result recorded under the running faucet major version; an admin can override
+with `--skip-tests-reason` / `skip_tests_reason`, written to the launch log and
+the audit log. `faucet hub check` / `lint` run hub templates' bundles. Example:
+[`examples/csv_to_jsonl_with_tests.yaml`](examples/csv_to_jsonl_with_tests.yaml);
+`faucet schema template-tests` / `faucet schema test-suite` print the schemas.
+
 ### Transforms
 
 Eleven built-in transforms are exposed as `type:` values: `flatten`,

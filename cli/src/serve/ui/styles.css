@@ -1386,6 +1386,19 @@ select {
 .tpl-version .btn-ghost, .tpl-version .btn-danger, .tpl-version .btn-warn { padding: 5px 11px; font-size: 0.8rem; }
 .tpl-version-retired { background: color-mix(in srgb, var(--surface-sunken) 60%, var(--surface)); }
 .tpl-version-retired .tpl-vnum { color: var(--ink-dim); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--ink-faint) 70%, transparent); }
+.tpl-version .tpl-runtests { min-width: 92px; }
+.tpl-tests { flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.tpl-tests-why { font-size: 0.82rem; color: var(--ink-dim); padding: 7px 10px; border-left: 3px solid var(--fail); background: color-mix(in srgb, var(--fail) 7%, var(--surface)); border-radius: 4px; }
+.tpl-tests-why b { color: var(--ink); }
+.tpl-tests-why ul { margin: 4px 0 0; padding-left: 18px; }
+.tpl-tests-why li { font-size: 0.78rem; overflow-wrap: anywhere; }
+.tpl-tests-warn { border-left-color: var(--cancelled); background: color-mix(in srgb, var(--cancelled) 7%, var(--surface)); }
+.tpl-tests-why code { font-family: var(--font-mono); font-size: 0.78rem; }
+.tpl-tests-cases { white-space: nowrap; }
+.tpl-tests-warn code { font-family: var(--font-mono); font-size: 0.78rem; }
+.tpl-tests-tbl { font-size: 0.78rem; table-layout: auto; min-width: 560px; }
+.tpl-tests-tbl td, .tpl-tests-tbl th { white-space: nowrap; }
+.tpl-tests-tbl td, .tpl-tests-tbl th { padding: 4px 8px; }
 .tpl-launch-wrap { overflow-x: auto; }
 .tpl-launch-tbl th:nth-child(1), .tpl-launch-tbl td:nth-child(1) { width: 4rem; }
 .tpl-launch-tbl th:nth-child(2), .tpl-launch-tbl td:nth-child(2) { width: 6rem; }

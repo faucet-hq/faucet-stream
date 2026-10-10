@@ -1,4 +1,4 @@
-//! Running a template test suite (#648).
+//! Running a template test suite (#648) or a version's test bundle (#856).
 //!
 //! Two tiers, both offline:
 //!
@@ -18,11 +18,11 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use super::bundle::Fixture;
 use super::combine::{GeneratedCase, generate};
-use super::spec::{Behavioral, SuiteFile};
+use super::spec::{Behavioral, Suite, SuiteFile};
 use crate::error::{CliError, CliResult};
 use crate::params::SuppliedParams;
-use crate::templates::{Materialize, TemplateStore, resolve_version};
 
 /// What one case did.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +33,11 @@ pub struct CaseOutcome {
     pub passed: bool,
     /// Why it failed, or `None` when it passed.
     pub failure: Option<String>,
+    /// How many times the case ran: `1`, or more when it asked for retries
+    /// and an earlier attempt failed.
+    pub attempts: u32,
+    /// Wall time across every attempt.
+    pub duration_ms: u64,
 }
 
 /// The whole suite's result.
@@ -56,8 +61,9 @@ pub enum Target<'a> {
     /// A registered template, resolved through the store. `sink` is the
     /// registered sink template (id, version) a `source-template` composes
     /// with; ignored by a `pipeline` template.
+    #[cfg(feature = "templates")]
     Registered {
-        store: &'a TemplateStore,
+        store: &'a crate::templates::TemplateStore,
         id: &'a str,
         version: u32,
         sink: Option<(&'a str, u32)>,
@@ -67,14 +73,16 @@ pub enum Target<'a> {
     /// A config file on disk — lets a template be tested **before** it is
     /// registered, which is when these failures are cheapest to fix.
     /// `sink_body` is the sink template document a `source-template` file
-    /// composes with.
+    /// composes with; `overlay` is a deployment overlay document applied over
+    /// the composition.
     Document {
         body: String,
         sink_body: Option<String>,
-        /// The deployment overlay applied over the composition (#679); a
-        /// file-based suite reads it from disk, so it is always inline here.
-        overlay: Option<crate::templates::OverlayChoice>,
+        overlay: Option<Value>,
     },
+    #[cfg(not(feature = "templates"))]
+    #[doc(hidden)]
+    Never(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
 }
 
 /// Run every case in `file` against `target`, optionally filtered by name.
@@ -83,31 +91,106 @@ pub async fn run(
     target: Target<'_>,
     filter: Option<&str>,
 ) -> CliResult<SuiteOutcome> {
-    let params_spec = declared_params(&target).await?;
-    let cases = generate(&file.suite, &params_spec)?;
+    run_suite(&file.suite, &target, filter, file.base_dir.as_deref(), "").await
+}
+
+/// Run one suite's cases against `target`. `prefix` is prepended to every
+/// case name (a shared suite's `name@release:`), and `filter` matches the
+/// prefixed name.
+pub async fn run_suite(
+    suite: &Suite,
+    target: &Target<'_>,
+    filter: Option<&str>,
+    base_dir: Option<&std::path::Path>,
+    prefix: &str,
+) -> CliResult<SuiteOutcome> {
+    let params_spec = declared_params(target).await?;
+    let cases = generate(suite, &params_spec)?;
 
     let mut outcome = SuiteOutcome::default();
     for case in &cases {
-        if !name_matches(&case.name, filter) {
+        let name = format!("{prefix}{}", case.name);
+        if !name_matches(&name, filter) {
             continue;
         }
-        outcome.cases.push(run_validation_case(case, &target).await);
+        let started = std::time::Instant::now();
+        let mut c = run_validation_case(case, target).await;
+        c.name = name;
+        c.duration_ms = elapsed_ms(started);
+        outcome.cases.push(c);
     }
-    for b in &file.suite.behavioral {
-        if !name_matches(&b.name, filter) {
+    for b in &suite.behavioral {
+        let name = format!("{prefix}{}", b.name);
+        if !name_matches(&name, filter) {
             continue;
         }
-        outcome
-            .cases
-            .push(run_behavioral_case(b, &target, file.base_dir.as_deref()).await);
+        let started = std::time::Instant::now();
+        let mut c = run_behavioral_case(b, target, base_dir).await;
+        c.name = name;
+        c.duration_ms = elapsed_ms(started);
+        outcome.cases.push(c);
     }
     Ok(outcome)
 }
 
+/// Run fixture cases (the `faucet test` grammar) against `target`.
+pub async fn run_fixtures(
+    fixtures: &[Fixture],
+    target: &Target<'_>,
+    filter: Option<&str>,
+    prefix: &str,
+) -> SuiteOutcome {
+    let mut outcome = SuiteOutcome::default();
+    for f in fixtures {
+        let name = format!("{prefix}{}", f.name);
+        if !name_matches(&name, filter) {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let (failure, attempts) =
+            attempt(f.retries, || async { fixture_inner(f, target).await }).await;
+        outcome.cases.push(CaseOutcome {
+            name,
+            origin: "fixture",
+            params: f.params.clone(),
+            passed: failure.is_none(),
+            failure,
+            attempts,
+            duration_ms: elapsed_ms(started),
+        });
+    }
+    outcome
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Run `once` up to `1 + retries` times, stopping at the first pass. Returns
+/// the last failure (`None` on a pass) and the attempts used.
+async fn attempt<F, Fut>(retries: u32, mut once: F) -> (Option<String>, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = CliResult<Option<String>>>,
+{
+    let mut attempts = 0;
+    let mut last = None;
+    while attempts <= retries {
+        attempts += 1;
+        last = match once().await {
+            Ok(None) => return (None, attempts),
+            Ok(Some(msg)) => Some(msg),
+            Err(e) => Some(e.to_string()),
+        };
+    }
+    (last, attempts)
+}
+
 /// Resolve a version selector against the store, so a suite can say
 /// `select: stable` rather than pinning a number that goes stale.
+#[cfg(feature = "templates")]
 pub async fn resolve_target_version(
-    store: &TemplateStore,
+    store: &crate::templates::TemplateStore,
     id: &str,
     select: Option<&str>,
 ) -> CliResult<u32> {
@@ -115,12 +198,12 @@ pub async fn resolve_target_version(
         Some(s) => crate::serve::history::templates::VersionSelector::parse(s)?,
         None => Default::default(),
     };
-    resolve_version(store, id, selector).await
+    crate::templates::resolve_version(store, id, selector).await
 }
 
 /// Glob-ish filter: `*` matches any run of characters. A plain name is an
 /// exact match, so `--filter auto:defaults` runs one case.
-fn name_matches(name: &str, filter: Option<&str>) -> bool {
+pub(crate) fn name_matches(name: &str, filter: Option<&str>) -> bool {
     let Some(pat) = filter else { return true };
     let mut rest = name;
     let mut parts = pat.split('*').peekable();
@@ -190,16 +273,11 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                             })?;
                     let c = crate::hub::compose(&source, &sink)?;
                     Ok(match overlay {
-                        Some(crate::templates::OverlayChoice::Inline(v)) => {
+                        Some(v) => {
                             c.apply_overlay(&crate::hub::DeploymentTemplate::from_value(
                                 v.clone(),
                             )?)?
                             .document
-                        }
-                        Some(crate::templates::OverlayChoice::Registered { id, .. }) => {
-                            return Err(CliError::Config(format!(
-                                "template test: a file-based suite applies an overlay file, not the registered '{id}'"
-                            )));
                         }
                         None => c.document,
                     })
@@ -209,9 +287,15 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                      `template:` at a source template and name this one under `sink:`"
                         .into(),
                 )),
+                Some(crate::hub::TemplateKind::TestSuite) => Err(CliError::Config(
+                    "template test: a test-suite is not a template — it runs as part of the \
+                     bundle of a template that requires it"
+                        .into(),
+                )),
                 _ => Ok(doc),
             }
         }
+        #[cfg(feature = "templates")]
         Target::Registered {
             store,
             id,
@@ -273,46 +357,55 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                 crate::hub::TemplateKind::Deployment => Err(CliError::Config(format!(
                     "template test: '{id}' is a deployment overlay — name it under `overlay:` of a source template's suite"
                 ))),
+                crate::hub::TemplateKind::TestSuite => Err(CliError::Config(format!(
+                    "template test: '{id}' is a test-suite — it runs as part of the bundle of a template that requires it"
+                ))),
             }
         }
+        #[cfg(not(feature = "templates"))]
+        Target::Never(n, _) => match *n {},
     }
 }
 
 /// Materialize one combination and check it expands and compiles.
 async fn run_validation_case(case: &GeneratedCase, target: &Target<'_>) -> CaseOutcome {
     let supplied: SuppliedParams = case.params.clone().into_iter().collect();
-    let result = materialize_and_check(&supplied, target).await;
-
-    let (passed, failure) = match (&result, case.expect.expects_failure()) {
-        // Expected to work, and did.
-        (Ok(()), false) => (true, None),
-        // Expected to work, didn't.
-        (Err(e), false) => (false, Some(e.to_string())),
-        // Expected to fail, and did — check the message when one was named.
-        (Err(e), true) => match &case.expect.error {
-            Some(want) if !e.to_string().contains(want.as_str()) => (
-                false,
-                Some(format!(
-                    "failed as expected, but the error did not mention '{want}': {e}"
-                )),
-            ),
-            _ => (true, None),
-        },
-        // Expected to fail, didn't. This is the direction that matters most:
-        // a negative case silently turning green means the guard it pins is
-        // gone.
-        (Ok(()), true) => (
-            false,
-            Some("expected this combination to fail, but it materialized cleanly".into()),
-        ),
-    };
-
+    let (failure, attempts) = attempt(case.retries, || async {
+        let result = materialize_and_check(&supplied, target).await;
+        Ok(validation_verdict(&result, &case.expect))
+    })
+    .await;
     CaseOutcome {
         name: case.name.clone(),
         origin: case.origin.as_str(),
         params: case.params.clone(),
-        passed,
+        passed: failure.is_none(),
         failure,
+        attempts,
+        duration_ms: 0,
+    }
+}
+
+/// `None` when the case's expectation holds for `result`, else why not.
+fn validation_verdict(result: &CliResult<()>, expect: &super::spec::Expect) -> Option<String> {
+    match (result, expect.expects_failure()) {
+        // Expected to work, and did.
+        (Ok(()), false) => None,
+        // Expected to work, didn't.
+        (Err(e), false) => Some(e.to_string()),
+        // Expected to fail, and did — check the message when one was named.
+        (Err(e), true) => match &expect.error {
+            Some(want) if !e.to_string().contains(want.as_str()) => Some(format!(
+                "failed as expected, but the error did not mention '{want}': {e}"
+            )),
+            _ => None,
+        },
+        // Expected to fail, didn't. This is the direction that matters most:
+        // a negative case silently turning green means the guard it pins is
+        // gone.
+        (Ok(()), true) => {
+            Some("expected this combination to fail, but it materialized cleanly".into())
+        }
     }
 }
 
@@ -348,17 +441,18 @@ async fn run_behavioral_case(
     base_dir: Option<&std::path::Path>,
 ) -> CaseOutcome {
     let supplied: SuppliedParams = b.params.clone().into_iter().collect();
-    let failure = match behavioral_inner(b, &supplied, target, base_dir).await {
-        Ok(None) => None,
-        Ok(Some(msg)) => Some(msg),
-        Err(e) => Some(e.to_string()),
-    };
+    let (failure, attempts) = attempt(b.retries, || {
+        behavioral_inner(b, &supplied, target, base_dir)
+    })
+    .await;
     CaseOutcome {
         name: b.name.clone(),
         origin: "behavioral",
         params: b.params.clone(),
         passed: failure.is_none(),
         failure,
+        attempts,
+        duration_ms: 0,
     }
 }
 
@@ -371,22 +465,77 @@ async fn behavioral_inner(
     // Materialize first so the case tests the *combination*, not an unbound
     // template — which is the whole point of attaching fixtures to a param
     // set rather than to the template as a whole.
-    let body = materialize_body(supplied, target).await?;
-    let cfg = crate::config::PipelineConfig::from_text(&body, std::path::Path::new("suite.json"))?;
-    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
-    let node = pick_row(&nodes, b)?;
-
+    let node = template_row(supplied, target, &b.name, b.row.as_deref()).await?;
     let input = crate::pipeline_test::fixtures::load_input(
         base_dir.unwrap_or(std::path::Path::new(".")),
         &parse_input(&b.input)?,
     )?;
     let expect: crate::pipeline_test::spec::Expectation = serde_json::from_value(b.expect.clone())
         .map_err(|e| CliError::Config(format!("behavioral case '{}': `expect`: {e}", b.name)))?;
+    let resolved = resolved_from_node(
+        b.name.clone(),
+        &node,
+        input,
+        b.page_size.unwrap_or(0),
+        chrono::Utc::now().fixed_offset(),
+    );
+    evaluate(&resolved, &expect).await
+}
 
-    // The same resolved-case shape `faucet test` runs, so the matchers and
-    // their semantics are shared rather than reimplemented here.
-    let resolved = crate::pipeline_test::runner::ResolvedCase {
-        name: b.name.clone(),
+async fn fixture_inner(f: &Fixture, target: &Target<'_>) -> CliResult<Option<String>> {
+    let input = crate::pipeline_test::fixtures::load_input(std::path::Path::new("."), &f.input)?;
+    let clock = match &f.clock {
+        Some(s) => crate::commands::run::resolve_run_clock(Some(s))
+            .map_err(|e| CliError::Config(format!("fixture '{}': clock: {e}", f.name)))?,
+        None => chrono::Utc::now().fixed_offset(),
+    };
+    let resolved = match &f.pipeline {
+        Some(p) => crate::pipeline_test::runner::ResolvedCase {
+            name: f.name.clone(),
+            transforms: p.transforms.clone(),
+            #[cfg(feature = "quality")]
+            quality: p.quality.clone(),
+            #[cfg(feature = "contract")]
+            contract: p.contract.clone(),
+            #[cfg(feature = "masking")]
+            masking: p.masking.clone(),
+            input,
+            page_size: f.page_size,
+            clock,
+        },
+        None => {
+            let supplied: SuppliedParams = f.params.clone().into_iter().collect();
+            let node = template_row(&supplied, target, &f.name, f.row.as_deref()).await?;
+            resolved_from_node(f.name.clone(), &node, input, f.page_size, clock)
+        }
+    };
+    evaluate(&resolved, &f.expect).await
+}
+
+/// The materialized template's row a fixture runs.
+async fn template_row(
+    supplied: &SuppliedParams,
+    target: &Target<'_>,
+    case: &str,
+    row: Option<&str>,
+) -> CliResult<crate::expand::ExpandedNode> {
+    let body = materialize_body(supplied, target).await?;
+    let cfg = crate::config::PipelineConfig::from_text(&body, std::path::Path::new("suite.json"))?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
+    pick_row(&nodes, case, row).cloned()
+}
+
+/// The same resolved-case shape `faucet test` runs, so the matchers and
+/// their semantics are shared rather than reimplemented here.
+fn resolved_from_node(
+    name: String,
+    node: &crate::expand::ExpandedNode,
+    input: Vec<Value>,
+    page_size: usize,
+    clock: chrono::DateTime<chrono::FixedOffset>,
+) -> crate::pipeline_test::runner::ResolvedCase {
+    crate::pipeline_test::runner::ResolvedCase {
+        name,
         transforms: node.transforms.clone(),
         #[cfg(feature = "quality")]
         quality: node.quality.clone(),
@@ -395,25 +544,32 @@ async fn behavioral_inner(
         #[cfg(feature = "masking")]
         masking: node.masking.clone(),
         input,
-        page_size: b.page_size.unwrap_or(0),
-        clock: chrono::Utc::now().fixed_offset(),
-    };
-    let run = crate::pipeline_test::runner::run_case(&resolved).await?;
-    let failures = crate::pipeline_test::diff::evaluate(&expect, &run);
-    Ok(failures.first().cloned())
+        page_size,
+        clock,
+    }
 }
 
-/// The row a behavioural case runs: the one it names, or the only root row.
+async fn evaluate(
+    resolved: &crate::pipeline_test::runner::ResolvedCase,
+    expect: &crate::pipeline_test::spec::Expectation,
+) -> CliResult<Option<String>> {
+    let run = crate::pipeline_test::runner::run_case(resolved).await?;
+    Ok(crate::pipeline_test::diff::evaluate(expect, &run)
+        .first()
+        .cloned())
+}
+
+/// The row a fixture runs: the one it names, or the only root row.
 fn pick_row<'a>(
     nodes: &'a [crate::expand::ExpandedNode],
-    b: &Behavioral,
+    case: &str,
+    row: Option<&str>,
 ) -> CliResult<&'a crate::expand::ExpandedNode> {
-    if let Some(row) = &b.row {
-        return nodes.iter().find(|n| &n.id == row).ok_or_else(|| {
+    if let Some(row) = row {
+        return nodes.iter().find(|n| n.id == row).ok_or_else(|| {
             let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
             CliError::Config(format!(
-                "behavioral case '{}': no row '{row}' (rows: {})",
-                b.name,
+                "behavioral case '{case}': no row '{row}' (rows: {})",
                 ids.join(", ")
             ))
         });
@@ -425,12 +581,10 @@ fn pick_row<'a>(
     match roots.as_slice() {
         [one] => Ok(one),
         [] => Err(CliError::Config(format!(
-            "behavioral case '{}': the materialized config expands to no rows",
-            b.name
+            "behavioral case '{case}': the materialized config expands to no rows"
         ))),
         many => Err(CliError::Config(format!(
-            "behavioral case '{}': the config has {} rows ({}) — name one with `row:`",
-            b.name,
+            "behavioral case '{case}': the config has {} rows ({}) — name one with `row:`",
             many.len(),
             many.iter()
                 .map(|n| n.id.as_str())
@@ -446,6 +600,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
         // `Materialize::Local` (not `Persisted`): a suite runs in this
         // process, so load-time directives resolve here exactly as they would
         // on a `faucet template run`.
+        #[cfg(feature = "templates")]
         Target::Registered {
             store,
             id,
@@ -468,7 +623,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
                 &choice,
                 supplied,
                 &BTreeMap::new(),
-                Materialize::Local,
+                crate::templates::Materialize::Local,
             )
             .await?
             .body)
@@ -480,10 +635,13 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
             crate::params::bind_document(&mut doc, supplied, crate::params::BindMode::Strict)?;
             if let Some(map) = doc.as_object_mut() {
                 map.remove("params");
+                map.remove("tests");
             }
             serde_json::to_string(&doc)
                 .map_err(|e| CliError::Internal(format!("template test: {e}")))
         }
+        #[cfg(not(feature = "templates"))]
+        Target::Never(n, _) => match *n {},
     }
 }
 
@@ -884,6 +1042,8 @@ suite:
                 tags: Vec::new(),
                 launch: true,
                 created_by: None,
+                test: false,
+                gate: Default::default(),
             },
         )
         .await
@@ -1073,31 +1233,13 @@ suite:
             Target::Document {
                 body: source.clone(),
                 sink_body: Some(sink.clone()),
-                overlay: Some(crate::templates::OverlayChoice::Inline(overlay)),
+                overlay: Some(overlay),
             },
             None,
         )
         .await
         .expect("runs");
         assert_eq!(out.passed(), 2, "{:?}", out.cases);
-
-        // A file-based suite cannot reach a registry.
-        let err = run(
-            &file,
-            Target::Document {
-                body: source.clone(),
-                sink_body: Some(sink.clone()),
-                overlay: Some(crate::templates::OverlayChoice::Registered {
-                    id: "ops".into(),
-                    version: Default::default(),
-                }),
-            },
-            None,
-        )
-        .await
-        .expect_err("registered overlay in a file suite")
-        .to_string();
-        assert!(err.contains("applies an overlay file"), "{err}");
 
         // Registered: source, sink and overlay all come from the store.
         let store = crate::templates::resolve_store_url("memory").await.unwrap();
@@ -1116,6 +1258,8 @@ suite:
                     tags: Vec::new(),
                     launch: true,
                     created_by: None,
+                    test: false,
+                    gate: Default::default(),
                 },
             )
             .await
@@ -1171,6 +1315,8 @@ suite:
                     tags: Vec::new(),
                     launch: true,
                     created_by: None,
+                    test: false,
+                    gate: Default::default(),
                 },
             )
             .await
@@ -1248,6 +1394,8 @@ suite:
                     params: BTreeMap::new(),
                     passed: true,
                     failure: None,
+                    attempts: 1,
+                    duration_ms: 0,
                 },
                 CaseOutcome {
                     name: "b".into(),
@@ -1255,6 +1403,8 @@ suite:
                     params: BTreeMap::new(),
                     passed: false,
                     failure: Some("nope".into()),
+                    attempts: 1,
+                    duration_ms: 0,
                 },
             ],
         };

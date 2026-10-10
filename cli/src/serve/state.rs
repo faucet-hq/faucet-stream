@@ -65,6 +65,9 @@ struct Inner {
     /// Fallback expiry of a pending change request when the approval policy
     /// sets none (`--approval-expiry-secs`).
     approval_expiry: Duration,
+    /// Whether a launch needs a passing test-bundle result
+    /// (`--require-template-tests`, #856).
+    require_template_tests: bool,
     /// Whether a caller-supplied config may use subprocess connectors
     /// (`--allow-subprocess-connectors`).
     allow_subprocess_connectors: bool,
@@ -112,6 +115,7 @@ impl ServerState {
                 tenants: RwLock::new(Arc::new(Default::default())),
                 require_approval: config.require_approval.clone(),
                 approval_expiry: config.approval_expiry,
+                require_template_tests: config.require_template_tests,
                 allow_subprocess_connectors: config.allow_subprocess_connectors,
                 draining: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -162,6 +166,11 @@ impl ServerState {
             Some(secs) => Duration::from_secs(secs),
             None => self.inner.approval_expiry,
         }
+    }
+
+    /// The launch gate this server applies (#856), with no override.
+    pub fn template_gate(&self) -> crate::template_tests::LaunchGate {
+        crate::template_tests::LaunchGate::new(self.inner.require_template_tests)
     }
 
     /// Install the tenant runtime (server startup, #709).
@@ -374,6 +383,7 @@ mod tests {
             callback_allow_hosts: Vec::new(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
+            require_template_tests: false,
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
