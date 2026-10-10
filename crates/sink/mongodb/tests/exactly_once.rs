@@ -14,7 +14,7 @@ use mongodb::Client;
 use mongodb::bson::{Document, doc};
 use serde_json::json;
 use std::sync::Arc;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::mongo::Mongo;
 
 const DB: &str = "testdb";
@@ -24,10 +24,8 @@ const TOKEN_COLLECTION: &str = "_faucet_commit_token";
 /// Start a single-node MongoDB **replica set** container (transactions
 /// available) and return the handle + a direct-connection URI.
 async fn start_mongo_repl_set() -> (ContainerAsync<Mongo>, String) {
-    let container: ContainerAsync<Mongo> = Mongo::repl_set()
-        .start()
-        .await
-        .expect("mongo repl-set container start");
+    let container: ContainerAsync<Mongo> =
+        faucet_conformance::containers::start(Mongo::repl_set).await;
     let port = container
         .get_host_port_ipv4(27017)
         .await
@@ -40,10 +38,8 @@ async fn start_mongo_repl_set() -> (ContainerAsync<Mongo>, String) {
 
 /// Start a plain **standalone** MongoDB container (no transactions).
 async fn start_mongo_standalone() -> (ContainerAsync<Mongo>, String) {
-    let container: ContainerAsync<Mongo> = Mongo::default()
-        .start()
-        .await
-        .expect("mongo container start");
+    let container: ContainerAsync<Mongo> =
+        faucet_conformance::containers::start(Mongo::default).await;
     let port = container
         .get_host_port_ipv4(27017)
         .await

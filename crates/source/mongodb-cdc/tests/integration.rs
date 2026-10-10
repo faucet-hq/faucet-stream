@@ -23,7 +23,6 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
 use testcontainers::ContainerAsync;
-use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::mongo::Mongo;
 
 const DB: &str = "app";
@@ -31,10 +30,7 @@ const COLL: &str = "users";
 
 /// Start a single-node replica set and return the container handle + URI.
 async fn start_repl_set() -> (ContainerAsync<Mongo>, String) {
-    let container = Mongo::repl_set()
-        .start()
-        .await
-        .expect("mongo replica-set container start");
+    let container = faucet_conformance::containers::start(Mongo::repl_set).await;
     let port = container
         .get_host_port_ipv4(27017)
         .await
@@ -342,10 +338,7 @@ async fn new_warns_but_succeeds_with_pre_image_request() {
 async fn new_rejects_standalone_topology() {
     // A standalone mongod (not a replica set) does not support change streams;
     // new() must fail via ensure_changestream_capable with a Source error.
-    let container = Mongo::default()
-        .start()
-        .await
-        .expect("standalone mongo start");
+    let container = faucet_conformance::containers::start(Mongo::default).await;
     let port = container.get_host_port_ipv4(27017).await.expect("port");
     let uri = format!("mongodb://127.0.0.1:{port}/?directConnection=true");
 

@@ -58,11 +58,10 @@ mod docker {
     use super::*;
     use faucet_source_nats::Source;
     use futures::StreamExt;
-    use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::nats::Nats;
 
     async fn start_nats() -> (testcontainers::ContainerAsync<Nats>, String) {
-        let container = Nats::default().start().await.expect("nats container start");
+        let container = faucet_conformance::containers::start(Nats::default).await;
         let host = container.get_host().await.expect("nats host");
         let port = container.get_host_port_ipv4(4222).await.expect("nats port");
         let url = format!("nats://{host}:{port}");
@@ -193,11 +192,8 @@ mod docker {
         use testcontainers::ImageExt;
         use testcontainers_modules::nats::NatsServerCmd;
         let cmd = NatsServerCmd::default().with_jetstream();
-        let container = Nats::default()
-            .with_cmd(&cmd)
-            .start()
-            .await
-            .expect("nats jetstream container start");
+        let container =
+            faucet_conformance::containers::start(|| Nats::default().with_cmd(&cmd)).await;
         let host = container.get_host().await.expect("nats host");
         let port = container.get_host_port_ipv4(4222).await.expect("nats port");
         let url = format!("nats://{host}:{port}");

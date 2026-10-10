@@ -67,7 +67,14 @@
 //! - [`fidelity`] — the shared typed round-trip corpus and assertion helper, so
 //!   every source↔sink pair inherits a type-exactness test instead of
 //!   hand-rolling one.
+//!
+//! With the `containers` feature, the `containers` module is the one way integration
+//! tests start a testcontainers backend: a shared start-up budget, a bounded
+//! retry of start-up failures, an optional readiness probe, and the
+//! `FAUCET_REQUIRE_BACKENDS` skip-or-fail rule.
 
+#[cfg(feature = "containers")]
+pub mod containers;
 pub mod doubles;
 pub mod fidelity;
 pub mod scripted;

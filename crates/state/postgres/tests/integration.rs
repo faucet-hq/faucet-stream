@@ -8,14 +8,14 @@ use faucet_core::check::{CheckContext, ProbeStatus};
 use faucet_core::state::StateStore;
 use faucet_state_postgres::PostgresStateStore;
 use serde_json::json;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
 /// Start a Postgres container and return the handle (keeps it alive) plus a
 /// connection URL.
 async fn start_postgres() -> (ContainerAsync<Postgres>, String) {
-    let image = Postgres::default().with_tag("16-alpine");
-    let container = image.start().await.expect("postgres container start");
+    let container =
+        faucet_conformance::containers::start(|| Postgres::default().with_tag("16-alpine")).await;
     let port = container
         .get_host_port_ipv4(5432)
         .await

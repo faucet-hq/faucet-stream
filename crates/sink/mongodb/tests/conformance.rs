@@ -47,7 +47,7 @@ mod idempotent {
     use faucet_sink_mongodb::{MongoSink, MongoSinkConfig};
     use mongodb::Client;
     use mongodb::bson::{Document, doc};
-    use testcontainers::{ContainerAsync, runners::AsyncRunner};
+    use testcontainers::ContainerAsync;
     use testcontainers_modules::mongo::Mongo;
 
     const DB: &str = "testdb";
@@ -56,10 +56,8 @@ mod idempotent {
     /// Start a single-node MongoDB **replica set** container (transactions
     /// available) — mirrors `exactly_once.rs::start_mongo_repl_set`.
     async fn start_mongo_repl_set() -> (ContainerAsync<Mongo>, String) {
-        let container: ContainerAsync<Mongo> = Mongo::repl_set()
-            .start()
-            .await
-            .expect("mongo repl-set container start");
+        let container: ContainerAsync<Mongo> =
+            faucet_conformance::containers::start(Mongo::repl_set).await;
         let port = container
             .get_host_port_ipv4(27017)
             .await

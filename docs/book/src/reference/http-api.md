@@ -132,6 +132,8 @@ someone does.
 | `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | — | ✓ |
 | `POST /v1/templates/{id}/{tags,launch,rollback,deprecate}` | — | — | ✓ |
 | `POST /v1/templates/{id}/versions/{version}/deprecate` | — | — | ✓ |
+| `GET /v1/templates/{id}/versions/{version}/tests` | ✓ | ✓ | ✓ |
+| `POST /v1/templates/{id}/versions/{version}/test` | — | — | ✓ |
 | `POST /v1/templates/sync`, `POST /v1/templates/{id}/publish` | — | — | ✓ |
 | `GET /v1/whoami` | ✓ | ✓ | ✓ |
 | `GET /v1/changes`, `GET /v1/changes/{id}` | ✓ | ✓ | ✓ |
@@ -241,6 +243,8 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `POST` | `/v1/templates/{id}/rollback` | `200` | Re-launch `previous` (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/deprecate` | `200` | Retire a template, or revive it with `{"undo":true}` (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/versions/{version}/deprecate` | `200` | Retire one version (`{"reason":"…"}`), or revive it with `{"undo":true}`. It still runs when pinned, with a `deprecated` warning; `newest` skips it and `launch` refuses it (admin / `TemplateAdmin`) |
+| `POST` | `/v1/templates/{id}/versions/{version}/test` | `200` | Run the version's `tests:` bundle and record the result on it; `200` even when cases fail, `422` without a bundle (admin / `TemplateAdmin`) |
+| `GET` | `/v1/templates/{id}/versions/{version}/tests` | `200` | The version's test standing: `has_tests`, the launch-gate verdict under this server's `--require-template-tests`, recent runs (`?limit=`, max 20) (viewer / `TemplateRead`) |
 | `POST` | `/v1/templates/sync` | `200` | Pull the `--templates-sync` origins into the registry — `{origin?, dry_run?}`; one report per origin, appends only (admin / `TemplateAdmin`; requires the `templates-sync` feature; `422` when the server has no origins) |
 | `POST` | `/v1/templates/{id}/publish` | `200` | Write one version back to an origin — `{origin, version?}` (admin / `TemplateAdmin`; `templates-sync`) |
 | `GET` | `/v1/whoami` | `200` | The caller's `principal`, `role` and `permissions` (every role / `Identity`) |
@@ -769,6 +773,22 @@ curl -sX POST http://127.0.0.1:8080/v1/templates \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"id":"tenant-sync","config":"version: 1\nname: tenant-sync\n…","config_format":"yaml"}'
 # → 201 {"id":"tenant-sync","version":1,"params":{…},"created_at":"…","created_by":"…"}
+
+# Test bundles and the launch gate (#856): register + run the version's
+# `tests:` block, then launch. On a `--require-template-tests` server a failing,
+# stale or missing result answers 422 with the failing cases.
+curl -sX POST http://127.0.0.1:8080/v1/templates \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"config":"kind: pipeline\n…\ntests:\n  suite: …","test":true}'
+# → 201 {…,"tests":{"passed":false,"cases":[{"name":"rows","passed":false,"attempts":2,…}],…}}
+curl -sX POST http://127.0.0.1:8080/v1/templates/orders/launch \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"version":2}'
+# → 422 {"error":{"code":"unprocessable","message":"template 'orders' v2 cannot be launched: …",
+#        "details":{"gate":{"id":"orders","version":2,"reason":"…","failing":["rows: …"]}}}}
+curl -sX POST http://127.0.0.1:8080/v1/templates/orders/launch \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"version":2,"skip_tests_reason":"INC-7 hotfix"}'   # admin override, audited
+# → 200 {…,"tests":{"status":"failed","allowed":true,"skipped":"INC-7 hotfix",…}}
 
 # Trigger a pipeline template.
 curl -sX POST http://127.0.0.1:8080/v1/templates/tenant-sync/runs \

@@ -16,14 +16,12 @@ use mongodb::Client;
 use mongodb::bson::{Document, doc};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::mongo::Mongo;
 
 async fn start_mongo() -> (ContainerAsync<Mongo>, String) {
-    let container: ContainerAsync<Mongo> = Mongo::default()
-        .start()
-        .await
-        .expect("mongo container start");
+    let container: ContainerAsync<Mongo> =
+        faucet_conformance::containers::start(Mongo::default).await;
     let port = container
         .get_host_port_ipv4(27017)
         .await

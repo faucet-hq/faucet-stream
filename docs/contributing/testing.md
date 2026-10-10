@@ -16,11 +16,12 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 - **Integration tests** live in the crate's `tests/` directory. HTTP connectors
   use [`wiremock`](https://docs.rs/wiremock); database/queue connectors use
   [`testcontainers`](https://docs.rs/testcontainers) (these need Docker and are
-  CI-gated). A test whose backend cannot start (no Docker, an image that will
-  not come up, a missing client library) may skip locally, but must check
-  `FAUCET_REQUIRE_BACKENDS` first and **panic** when it is set — the `Test`,
-  `Coverage` and Kafka CI jobs set it, so an unavailable backend fails CI
-  instead of passing silently. Suites too heavy for every PR stay `#[ignore]`d
+  CI-gated), always started through the shared helper described in
+  [Starting a test container](#starting-a-test-container). A test whose
+  backend cannot start (no Docker, an image that will not come up, a missing
+  client library) may skip locally, but must **panic** when
+  `FAUCET_REQUIRE_BACKENDS` is set — the `Test`, `Coverage` and Kafka CI jobs
+  set it, so an unavailable backend fails CI instead of passing silently. Suites too heavy for every PR stay `#[ignore]`d
   and run nightly in `.github/workflows/integration-heavy.yml` (SQL Server CDC,
   the secrets managers, the scaffold build). The Oracle Free container is
   the one exception on PRs: it does not start on the hosted runners, so its
@@ -51,6 +52,60 @@ against doubles that fail at one named boundary and assert on the recorded event
 sequence. They are Docker-free, run in seconds, and are a **required** CI check.
 See [Reliability testing](../book/src/operations/reliability-testing.md) for the
 tier map and how to add a guarantee.
+
+## Starting a test container
+
+Every container an integration test needs is started through
+`faucet_conformance::containers` (#841), never with a bare `.start().await`.
+Add the helper as a dev-dependency with its `containers` feature (off by
+default, so the conformance battery itself pulls no Docker client):
+
+```toml
+[dev-dependencies]
+faucet-conformance = { workspace = true, features = ["containers"] }
+```
+
+The image is built by a closure, because a start consumes its request and a
+retry needs a fresh one:
+
+```rust
+use faucet_conformance::containers::{self, ReadyProbe, StartOptions};
+
+// Panics when the container does not start (the test cannot run without it).
+let pg = containers::start(|| Postgres::default().with_tag("16-alpine")).await;
+
+// Skips locally, fails when FAUCET_REQUIRE_BACKENDS is set.
+let opts = StartOptions::default().ready(ReadyProbe::http(8123, "/ping"));
+let Some(ch) = containers::start_or_skip(ClickHouse::default, &opts).await else {
+    return;
+};
+```
+
+What every start gets:
+
+| | Default | Override |
+|---|---|---|
+| Start-up budget (wait strategy) per attempt | 180 s | `.startup_timeout(d)` |
+| Attempts | 3, logged as `image: start attempt n/N failed, retrying: …` | `.attempts(n)` |
+| Backoff before attempt 2, doubled after | 2 s | `.backoff(d)` |
+| Readiness probe after the wait strategy | none | `.ready(ReadyProbe::tcp(port) \| http(port, path) \| custom(port, \|ep\| async {…}))` |
+| Readiness budget per attempt (each probe call ≤ 5 s) | 60 s | `.ready_timeout(d)` |
+| Variable that turns "did not start" into a failure | `FAUCET_REQUIRE_BACKENDS` | `.require_env(containers::REQUIRE_ORACLE)` |
+
+Only start-up failures are retried: the wait strategy timing out or its log
+stream ending, Docker failing to pull, create, start, inspect or map ports for
+the container, or the readiness probe never passing. A failed attempt's
+container is dropped (and removed) before the next one. A Docker daemon that
+cannot be reached is not retried, and nothing that happens after the
+container is handed to the test is ever retried, so a retry cannot hide a
+real bug. `start_container` returns the typed `StartError` instead of
+panicking or skipping; `containers::backend_missing(why)` applies the same
+skip-or-fail rule to a backend a test finds missing some other way (a client
+library, a bucket that could not be created).
+
+Emulators that write their data to disk keep it in memory, so a nearly full
+runner disk cannot fail them: MinIO and fake-gcs-server mount a tmpfs over
+their data directory, and Azurite runs with `--inMemoryPersistence`.
 
 ## The coverage gates
 

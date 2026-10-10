@@ -305,12 +305,13 @@ flags: `--log-retention-secs` (default 24 h, kept *after* delivery),
 `--log-buffer-max-age-secs`, `--log-buffer-max-bytes`, `--log-link-template`,
 `--log-export-notify-after-secs`. See the observability guide's *Shipping logs*.
 
-Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** without `--no-auth`, startup fails (an unauthenticated server is never accidental). The default bind is loopback.
+Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** without `--no-auth`, startup fails (an unauthenticated server is never accidental). The default bind is loopback, and `--no-auth` on any other address also needs `--allow-unauthenticated-network`.
 
 | Flag | Purpose |
 |------|---------|
 | `--listen <addr>` | Bind address (default `127.0.0.1:8080`; env `FAUCET_SERVE_LISTEN`). |
 | `--auth-token <t>` / `--no-auth` | Bearer token (prefer the env var) or explicit no-auth opt-in. |
+| `--allow-unauthenticated-network` | With `--no-auth`, allow a non-loopback `--listen` (`0.0.0.0`, `::`, a LAN address). Without it that combination refuses to start; with it the server logs a warning. Env: `FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK`. |
 | `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — role enforcement + admin-only `GET /v1/audit`. Tokens resolve `${env:}` / `${file:}` / secret-manager references at startup. Mutually exclusive with `--auth-token`/`--no-auth`. |
 | `--allow-subprocess-connectors` | Let a config submitted over HTTP / MCP use `singer` (it runs a program on the host). Off by default; tenant configs are refused regardless; registered templates are always allowed. |
 | `--max-concurrent-runs` / `--max-queued-runs` | Concurrency + queue caps (submit past the queue → 429 + `Retry-After`). |
@@ -1369,6 +1370,22 @@ is involved, so a template can be tested before it is ever registered. Exit code
 is the failed-case count. Example:
 [`examples/tests/template_suite.yaml`](examples/tests/template_suite.yaml);
 `faucet schema template-test` prints the suite schema.
+
+**Test bundles and the launch gate (#856).** A template document may carry its
+own `tests:` block — `suite:` cases, `fixtures:` (`faucet test` cases run through
+the template, `retries: n` explicit and recorded) and `requires_suites:` (shared
+`kind: test-suite` documents picked by semver range over their `release:`). It
+is stored with the version, so a test change is a new version. `faucet template
+test <file>` runs a bundle offline; `faucet template test <id>@<version> --store
+…` (or `register --test`, or `POST /v1/templates/{id}/versions/{version}/test`)
+runs a registered version's bundle and records the result on it. With `faucet
+serve --require-template-tests` (off by default) — and `--require-tests` on the
+CLI — every launch (HTTP, MCP, sync, approved change requests) needs a passing
+result recorded under the running faucet major version; an admin can override
+with `--skip-tests-reason` / `skip_tests_reason`, written to the launch log and
+the audit log. `faucet hub check` / `lint` run hub templates' bundles. Example:
+[`examples/csv_to_jsonl_with_tests.yaml`](examples/csv_to_jsonl_with_tests.yaml);
+`faucet schema template-tests` / `faucet schema test-suite` print the schemas.
 
 ### Transforms
 

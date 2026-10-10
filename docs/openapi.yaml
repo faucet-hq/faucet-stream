@@ -1877,10 +1877,21 @@ paths:
             schema: { $ref: "#/components/schemas/RegisterTemplateRequest" }
       responses:
         "201":
-          description: The newly registered version's summary.
+          description: >
+            The newly registered version's summary, plus `tests` (the bundle run
+            recorded on it, with `test: true` or a launch on a test-gated server)
+            and `gate` (the launch's test-gate verdict, with `launch: true`). A
+            launch the gate refuses answers `422` with `error.details.gate`; the
+            version stays registered, inert.
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/TemplateSummary" }
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/TemplateSummary" }
+                  - type: object
+                    properties:
+                      tests: { $ref: "#/components/schemas/TemplateTestResult" }
+                      gate: { $ref: "#/components/schemas/GateVerdict" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "422": { $ref: "#/components/responses/Error" }
@@ -2052,6 +2063,11 @@ paths:
         (`{"version":"pre-prod"}`). Re-launching the already-live version is a
         no-op (`already_launched: true`), keeping `previous` a real rollback
         target. A deprecated template refuses to launch — revive it first.
+        On a server started with `--require-template-tests` the version needs a
+        passing test-bundle result recorded under this faucet major version
+        (#856); otherwise `422` with `error.details.gate` = `{id, version,
+        reason, failing}` and a `template.launch` audit entry with result
+        `refused`. `skip_tests_reason` overrides it.
         409 when the server runs with `--require-approval template_launch`
         (propose it with `POST /v1/changes` instead); the same applies to
         `/rollback`, `/tags`, a register that launches or assigns channels,
@@ -2072,6 +2088,14 @@ paths:
                 version:
                   description: "Version to make live: a number, or a channel whose target to copy. Defaults to `newest`."
                   $ref: "#/components/schemas/VersionSelector"
+                skip_tests_reason:
+                  type: string
+                  description: >
+                    Launch past a failing, stale or missing test result on a
+                    `--require-template-tests` server (#856). Recorded on the
+                    launch log (`tests_skipped`) and in the audit log
+                    (`template.launch`, `detail: tests skipped: <reason>`). A blank
+                    reason is refused.
       responses:
         "200":
           description: The version now live.
@@ -2091,11 +2115,20 @@ paths:
         trail and `previous` becomes the version you just rolled off. A template
         with fewer than two launches has nothing to roll back to (`422`). Requires
         the `TemplateAdmin` permission (admin) and the `templates` Cargo
-        feature.
+        feature. The previous version passes the same test gate a launch does
+        (#856); `skip_tests_reason` overrides it.
       operationId: rollbackTemplate
       security: [{ bearerAuth: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                skip_tests_reason: { type: string, description: "Roll back past a failing or missing test result; audited." }
       responses:
         "200":
           description: The version now live.
@@ -2182,6 +2215,55 @@ paths:
         "403": { description: Principal's role lacks the required permission }
         "404": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
+  /v1/templates/{id}/versions/{version}/test:
+    post:
+      summary: Run a template version's test bundle and record the result
+      description: >
+        Runs the version's `tests:` bundle (#856) — its `suite` cases, `fixtures`
+        and every shared suite `requires_suites` names — offline on this server
+        and records the result on the version: per-case pass/fail and attempts,
+        the faucet version, timestamp and duration. A test-gated launch reads
+        it. `200` even when cases fail; `422` when the version has no `tests:`
+        block or is a `test-suite`. Requires the `TemplateAdmin` permission
+        (admin) and the `templates` Cargo feature.
+      operationId: testTemplateVersion
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string }, description: "A version number or a channel name." }
+      responses:
+        "200":
+          description: The recorded run.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TemplateTestResult" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/templates/{id}/versions/{version}/tests:
+    get:
+      summary: A template version's test results and gate verdict
+      description: >
+        Whether the version carries a `tests:` bundle, the launch gate's verdict
+        under this server's `--require-template-tests` setting, and its recent
+        recorded runs, newest first (#856). Requires the `TemplateRead`
+        permission (viewer) and the `templates` Cargo feature.
+      operationId: templateVersionTests
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string }, description: "A version number or a channel name." }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 20, default: 20 } }
+      responses:
+        "200":
+          description: The version's test standing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionTests" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { $ref: "#/components/responses/Error" }
   /v1/templates/sync:
     post:
       summary: Pull pipeline templates from the configured remote origins
@@ -2882,6 +2964,7 @@ components:
         action: { type: string, description: "e.g. run.submit / run.cancel / run.delete / trigger.fire / <route> (denials)." }
         tenant: { type: string, description: "The tenant the action was taken for (#709)." }
         target: { type: string, nullable: true, description: "What the action was taken on: template:<id>@<version>, template:<id>, connection:<tenant>/<name>, origin:<name>, mcp:<tool>." }
+        detail: { type: string, nullable: true, description: "Free-text detail — e.g. `tests skipped: <reason>` on a launch past the test gate, or the refusal reason on a `refused` launch (#856)." }
         run_id: { type: string, nullable: true }
         config_fingerprint: { type: string, nullable: true, description: "sha256 of the merged config (submit actions)." }
         source_ip: { type: string, nullable: true }
@@ -3774,6 +3857,7 @@ components:
         version: { type: integer }
         launched_at: { type: string, format: date-time }
         launched_by: { type: string, nullable: true, description: "Principal that launched it; null for a CLI launch." }
+        tests_skipped: { type: string, nullable: true, description: "Set when an admin launched past the test gate: the reason given (#856)." }
       example:
         seq: 1
         version: 3
@@ -3816,6 +3900,16 @@ components:
               type: array
               description: The launch log, newest first.
               items: { $ref: "#/components/schemas/LaunchRecord" }
+            tests:
+              type: object
+              description: Each stored version's test-bundle standing under this server's gate (#856).
+              required: [require_tests, versions]
+              properties:
+                require_tests: { type: boolean, description: "Whether this server runs with `--require-template-tests`." }
+                versions:
+                  type: array
+                  description: One entry per stored version, newest first, with up to 5 recent runs each.
+                  items: { $ref: "#/components/schemas/VersionTests" }
     LaunchResponse:
       type: object
       description: Result of a launch or rollback.
@@ -3826,12 +3920,70 @@ components:
         replaced: { type: integer, description: "The version it replaced — the new `previous`. Absent on a first launch." }
         already_launched: { type: boolean, description: "True when the version was already live, so nothing changed." }
         status: { $ref: "#/components/schemas/TemplateStatus" }
+        tests: { $ref: "#/components/schemas/GateVerdict" }
       example:
         id: orders_to_warehouse
         version: 3
         replaced: 1
         already_launched: false
         status: draft
+    TemplateTestResult:
+      type: object
+      description: One test-bundle run recorded on a template version (#856).
+      required: [id, version, body_sha256, passed, faucet_version, recorded_at, duration_ms, cases]
+      properties:
+        id: { type: string }
+        version: { type: integer }
+        body_sha256: { type: string, description: "sha256 of the version body tested; a result for another body never satisfies the gate." }
+        passed: { type: boolean }
+        faucet_version: { type: string, description: "The faucet binary that ran it; the gate accepts only the running binary's major version." }
+        recorded_at: { type: string, format: date-time }
+        duration_ms: { type: integer }
+        recorded_by: { type: string, nullable: true }
+        error: { type: string, nullable: true, description: "Why the bundle could not run at all (a companion or shared suite that does not resolve)." }
+        suites:
+          type: array
+          items:
+            type: object
+            required: [name, range, release]
+            properties:
+              name: { type: string }
+              range: { type: string }
+              version: { type: integer, nullable: true }
+              release: { type: string }
+        cases:
+          type: array
+          items:
+            type: object
+            required: [name, source, origin, passed, attempts, duration_ms]
+            properties:
+              name: { type: string }
+              source: { type: string, description: "`bundle`, or `suite:<id>@<release>` for a shared suite's case." }
+              origin: { type: string, enum: [explicit, combine, auto, behavioral, fixture] }
+              passed: { type: boolean }
+              attempts: { type: integer, description: "More than 1 only when the case declared `retries` and an earlier attempt failed." }
+              duration_ms: { type: integer }
+              failure: { type: string, nullable: true }
+    GateVerdict:
+      type: object
+      description: The launch gate's decision for one version (#856).
+      required: [status, allowed, require_tests]
+      properties:
+        status: { type: string, enum: [passed, failed, stale, not_run, no_tests] }
+        allowed: { type: boolean }
+        require_tests: { type: boolean }
+        reason: { type: string, nullable: true }
+        failing: { type: array, items: { type: string }, description: "`case: failure` lines from the deciding run." }
+        result_at: { type: string, format: date-time, nullable: true }
+        skipped: { type: string, nullable: true, description: "The override reason, when an admin launched past a refusal." }
+    VersionTests:
+      type: object
+      required: [version, has_tests, gate, results]
+      properties:
+        version: { type: integer }
+        has_tests: { type: boolean }
+        gate: { $ref: "#/components/schemas/GateVerdict" }
+        results: { type: array, items: { $ref: "#/components/schemas/TemplateTestResult" } }
     RegisterTemplateRequest:
       type: object
       required: [config]
@@ -3850,6 +4002,15 @@ components:
           description: >
             Launch the newly registered version immediately, making it `stable`.
             Off by default: registering a build must never move existing callers.
+            On a test-gated server the bundle runs first and the launch goes
+            through the gate.
+        test:
+          type: boolean
+          default: false
+          description: "Run the new version's `tests:` bundle and record the result; returned as `tests` (#856)."
+        skip_tests_reason:
+          type: string
+          description: "With `launch`: launch past a failing or missing test result; audited."
       example:
         id: orders_to_warehouse
         config_format: yaml

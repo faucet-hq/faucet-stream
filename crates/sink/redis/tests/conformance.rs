@@ -23,15 +23,13 @@ mod idempotent {
     use faucet_core::Sink as _;
     use faucet_sink_redis::{RedisSink, RedisSinkConfig, RedisSinkType};
     use redis::AsyncCommands;
-    use testcontainers::{ContainerAsync, runners::AsyncRunner};
+    use testcontainers::ContainerAsync;
     use testcontainers_modules::redis::{REDIS_PORT, Redis};
 
     /// Boot a Redis container — mirrors `exactly_once.rs::start_redis`.
     async fn start_redis() -> (ContainerAsync<Redis>, String) {
-        let container: ContainerAsync<Redis> = Redis::default()
-            .start()
-            .await
-            .expect("redis container start");
+        let container: ContainerAsync<Redis> =
+            faucet_conformance::containers::start(Redis::default).await;
         let host = container.get_host().await.expect("redis host");
         let port = container
             .get_host_port_ipv4(REDIS_PORT)

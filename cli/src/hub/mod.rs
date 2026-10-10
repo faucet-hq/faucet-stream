@@ -16,6 +16,7 @@
 //! `expand` / `run_expanded` untouched and inherits every gate they enforce.
 //! Zero `faucet-core` changes.
 
+pub mod bundles;
 pub mod catalog;
 pub mod compose;
 #[cfg(feature = "hub-remote")]
@@ -763,6 +764,12 @@ pub fn misplaced_document(path: &Path, verb: &str) -> Option<String> {
                 "apply it over a pairing: `faucet {verb} --source <source-template> --sink <sink-template> --overlay {}`",
                 path.display()
             ),
+        ),
+        TemplateKind::TestSuite => (
+            "shared test suite".to_string(),
+            "require it from a template's `tests.requires_suites`; it runs as part of that \
+             template's bundle"
+                .to_string(),
         ),
         TemplateKind::Pipeline => return None,
     };

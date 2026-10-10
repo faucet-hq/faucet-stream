@@ -20,6 +20,7 @@ rustls = { workspace = true, features = ["ring"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+faucet-conformance = { workspace = true, features = ["containers"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["redis"] }

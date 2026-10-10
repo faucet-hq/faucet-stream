@@ -22,13 +22,12 @@ use faucet_conformance::fidelity::{self, ROW_KEY, Tolerance};
 use faucet_core::Sink;
 use faucet_sink_postgres::{PostgresColumnMapping, PostgresSink, PostgresSinkConfig};
 use serde_json::{Value, json};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
 async fn start_postgres() -> (ContainerAsync<Postgres>, String) {
-    let image = Postgres::default().with_tag("16-alpine");
     let container: ContainerAsync<Postgres> =
-        image.start().await.expect("postgres container start");
+        faucet_conformance::containers::start(|| Postgres::default().with_tag("16-alpine")).await;
     let port = container
         .get_host_port_ipv4(5432)
         .await

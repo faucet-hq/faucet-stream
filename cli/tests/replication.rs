@@ -11,24 +11,26 @@ use faucet_cli::config::PipelineConfig;
 use faucet_cli::replication::compiled::CompiledReplication;
 use faucet_cli::replication::{ReplicationOptions, run_replication};
 use std::time::Duration;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::NoTls;
 
 async fn start_postgres() -> (ContainerAsync<Postgres>, String) {
-    let image = Postgres::default()
-        .with_host_auth()
-        .with_tag("16-alpine")
-        .with_cmd([
-            "postgres",
-            "-c",
-            "wal_level=logical",
-            "-c",
-            "max_wal_senders=4",
-            "-c",
-            "max_replication_slots=4",
-        ]);
-    let container = image.start().await.expect("pg start");
+    let container = faucet_conformance::containers::start(|| {
+        Postgres::default()
+            .with_host_auth()
+            .with_tag("16-alpine")
+            .with_cmd([
+                "postgres",
+                "-c",
+                "wal_level=logical",
+                "-c",
+                "max_wal_senders=4",
+                "-c",
+                "max_replication_slots=4",
+            ])
+    })
+    .await;
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres@127.0.0.1:{port}/postgres");
     (container, url)

@@ -708,6 +708,37 @@ impl RunHistory for FallbackHistory {
             f => f.template_launch(id, version, launched_by)
         )
     }
+    async fn template_launch_noted(
+        &self,
+        id: &str,
+        version: u32,
+        launched_by: Option<&str>,
+        tests_skipped: Option<&str>,
+    ) -> Result<Option<u32>, HistoryError> {
+        strict!(
+            self,
+            p => p.template_launch_noted(id, version, launched_by, tests_skipped),
+            f => f.template_launch_noted(id, version, launched_by, tests_skipped)
+        )
+    }
+    async fn template_record_test(
+        &self,
+        result: &crate::serve::history::templates::TemplateTestResult,
+    ) -> Result<(), HistoryError> {
+        strict!(self, p => p.template_record_test(result), f => f.template_record_test(result))
+    }
+    async fn template_test_results(
+        &self,
+        id: &str,
+        version: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<crate::serve::history::templates::TemplateTestResult>, HistoryError> {
+        strict!(
+            self,
+            p => p.template_test_results(id, version, limit),
+            f => f.template_test_results(id, version, limit)
+        )
+    }
     async fn template_launches(
         &self,
         id: &str,

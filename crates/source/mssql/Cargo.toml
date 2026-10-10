@@ -31,7 +31,7 @@ url.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 serde_json.workspace = true
 schemars.workspace = true

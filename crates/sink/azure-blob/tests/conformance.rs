@@ -22,7 +22,6 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use testcontainers_modules::azurite::{Azurite, BLOB_PORT};
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const AZURITE_ACCOUNT: &str = "devstoreaccount1";
 const AZURITE_KEY: &str =
@@ -31,7 +30,26 @@ const CONTAINER: &str = "faucet-test";
 
 /// Start Azurite, or `None` when Docker is unavailable.
 async fn start_azurite() -> Option<(ContainerAsync<Azurite>, u16)> {
-    let container = Azurite::default().start().await.ok()?;
+    let container = faucet_conformance::containers::start_or_skip(
+        || {
+            // In-memory storage: a nearly full runner disk must not fail the emulator.
+            testcontainers::ImageExt::with_cmd(
+                Azurite::default(),
+                [
+                    "azurite",
+                    "--blobHost",
+                    "0.0.0.0",
+                    "--queueHost",
+                    "0.0.0.0",
+                    "--tableHost",
+                    "0.0.0.0",
+                    "--inMemoryPersistence",
+                ],
+            )
+        },
+        &Default::default(),
+    )
+    .await?;
     let port = container.get_host_port_ipv4(BLOB_PORT).await.ok()?;
     Some((container, port))
 }
@@ -135,11 +153,7 @@ async fn conformance_connector_name_nonempty() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_capabilities_truthful() {
     let Some((_c, port)) = start_azurite().await else {
-        assert!(
-            std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-            "Docker unavailable and FAUCET_REQUIRE_BACKENDS is set"
-        );
-        eprintln!("skipping azure-blob conformance_capabilities_truthful: Docker unavailable");
+        faucet_conformance::containers::backend_missing("Docker unavailable");
         return;
     };
     create_container(port).await;

@@ -143,7 +143,9 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "id": { "type": "string", "description": "Template id. Derived from the config's `name:` when omitted." },
                         "description": { "type": "string" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Named environment channels to point at the new version (dev/test/staging/pre-prod/canary/prod). Derived channels (stable/previous/newest) are rejected." },
-                        "launch": { "type": "boolean", "description": "Make the new version live immediately. Off by default: a register is inert, so a new build never moves existing callers until it is launched." }
+                        "launch": { "type": "boolean", "description": "Make the new version live immediately. Off by default: a register is inert, so a new build never moves existing callers until it is launched." },
+                        "test": { "type": "boolean", "description": "Run the new version's `tests:` bundle and record the result; the response carries it. A launch on a test-gated server runs it anyway." },
+                        "skip_tests_reason": { "type": "string", "description": "With launch: launch past a failing or missing test result. Recorded on the launch log." }
                     },
                     "required": ["config"]
                 }),
@@ -155,7 +157,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
-                        "version": { "description": "Version to launch: a number, or a channel whose current target to copy. Defaults to \"newest\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] }
+                        "version": { "description": "Version to launch: a number, or a channel whose current target to copy. Defaults to \"newest\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+                        "skip_tests_reason": { "type": "string", "description": "Launch past a failing or missing test result (a test-gated server refuses otherwise). Recorded on the launch log." }
                     },
                     "required": ["id"]
                 }),
@@ -165,7 +168,22 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                 description: "Re-launch a template's previously launched version. MUTATING.",
                 input_schema: json!({
                     "type": "object",
-                    "properties": { "id": { "type": "string" } },
+                    "properties": {
+                        "id": { "type": "string" },
+                        "skip_tests_reason": { "type": "string", "description": "Roll back past a failing or missing test result of the previous version." }
+                    },
+                    "required": ["id"]
+                }),
+            });
+            defs.push(ToolDef {
+                name: "test_template",
+                description: "Run a template version's `tests:` bundle (its own cases, fixtures and required shared suites) and record the result on the version — what a test-gated launch requires. MUTATING (records a result).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "version": { "description": "Version: a number or a channel. Default \"newest\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] }
+                    },
                     "required": ["id"]
                 }),
             });
@@ -342,6 +360,16 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
                     Err(e) => Err(e),
                     Ok(()) => rollback_template(ctx, args).await,
                 }
+            }
+        }
+        #[cfg(feature = "templates")]
+        "test_template" => {
+            if !ctx.allow_mutations {
+                Err(MUTATION_GATE.to_string())
+            } else if !ctx.allow_template_admin {
+                Err(TEMPLATE_ADMIN_GATE.to_string())
+            } else {
+                test_template(ctx, args).await
             }
         }
         #[cfg(feature = "templates")]
@@ -920,7 +948,8 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
     use crate::templates::RegisterRequest;
     let store = template_store(ctx)?;
     let config = str_arg(args, "config")?;
-    let record = crate::templates::register(
+    let gate = template_gate(ctx, args)?;
+    let registered = crate::templates::register_tested(
         store,
         RegisterRequest {
             id: args.get("id").and_then(Value::as_str).map(str::to_string),
@@ -934,13 +963,51 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
             tags: tags_arg(args)?,
             launch: args.get("launch").and_then(Value::as_bool).unwrap_or(false),
             created_by: Some(actor_name(ctx)),
+            test: args.get("test").and_then(Value::as_bool).unwrap_or(false),
+            gate,
         },
     )
     .await
     .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
-        "registered": record.summary(),
+        "registered": registered.record.summary(),
+        "tests": registered.tests,
+        "gate": registered.launch.and_then(|l| l.tests),
     })))
+}
+
+/// The launch gate for a tool call: the context's setting plus the call's
+/// `skip_tests_reason`.
+#[cfg(feature = "templates")]
+fn template_gate(
+    ctx: &McpContext,
+    args: &Value,
+) -> Result<crate::template_tests::LaunchGate, String> {
+    crate::template_tests::LaunchGate::new(ctx.require_template_tests)
+        .with_skip(
+            args.get("skip_tests_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "templates")]
+async fn test_template(ctx: &McpContext, args: &Value) -> Result<String, String> {
+    use crate::serve::history::templates::VersionSelector;
+    let store = template_store(ctx)?;
+    let id = str_arg(args, "id")?;
+    let target = match args.get("version") {
+        None | Some(Value::Null) => VersionSelector::newest(),
+        Some(_) => version_arg(args)?,
+    };
+    let version = crate::templates::resolve_version(store, id, target)
+        .await
+        .map_err(|e| e.to_string())?;
+    let result = crate::templates::bundle::test_version(store, id, version, Some(&actor_name(ctx)))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(pretty(&json!(result)))
 }
 
 #[cfg(feature = "templates")]
@@ -952,7 +1019,8 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
         None | Some(Value::Null) => VersionSelector::newest(),
         Some(_) => version_arg(args)?,
     };
-    let outcome = crate::templates::launch(store, id, target, Some(&actor_name(ctx)))
+    let gate = template_gate(ctx, args)?;
+    let outcome = crate::templates::launch_gated(store, id, target, Some(&actor_name(ctx)), &gate)
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
@@ -961,6 +1029,7 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
         "replaced": outcome.replaced,
         "already_launched": outcome.already_launched,
         "first_launch": outcome.first_launch,
+        "tests": outcome.tests,
     })))
 }
 
@@ -968,13 +1037,15 @@ async fn launch_template(ctx: &McpContext, args: &Value) -> Result<String, Strin
 async fn rollback_template(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let store = template_store(ctx)?;
     let id = str_arg(args, "id")?;
-    let outcome = crate::templates::rollback(store, id, Some(&actor_name(ctx)))
+    let gate = template_gate(ctx, args)?;
+    let outcome = crate::templates::rollback_gated(store, id, Some(&actor_name(ctx)), &gate)
         .await
         .map_err(|e| e.to_string())?;
     Ok(pretty(&json!({
         "id": id,
         "version": outcome.version,
         "replaced": outcome.replaced,
+        "tests": outcome.tests,
     })))
 }
 

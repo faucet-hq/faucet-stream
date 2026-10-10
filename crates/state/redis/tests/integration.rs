@@ -8,15 +8,12 @@ use faucet_core::check::{CheckContext, ProbeStatus};
 use faucet_core::state::StateStore;
 use faucet_state_redis::RedisStateStore;
 use serde_json::json;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::redis::Redis;
 
 /// Start a Redis container and return the handle (keeps it alive) plus a URL.
 async fn start_redis() -> (ContainerAsync<Redis>, String) {
-    let container = Redis::default()
-        .start()
-        .await
-        .expect("redis container start");
+    let container = faucet_conformance::containers::start(Redis::default).await;
     let port = container
         .get_host_port_ipv4(6379)
         .await

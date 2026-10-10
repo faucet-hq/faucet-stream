@@ -542,37 +542,22 @@ async fn exactly_once_rows_keep_a_sink_safe_sequence() {
     assert!(sink_token(&sink_cfg, key).await.is_none());
 }
 
-/// Start a container, or `None` (skip) when no Docker daemon answers.
-#[cfg(any(feature = "state-postgres", feature = "state-redis"))]
-async fn start<I: testcontainers::Image>(
-    image: testcontainers::ContainerRequest<I>,
-) -> Option<testcontainers::ContainerAsync<I>> {
-    use testcontainers::runners::AsyncRunner;
-    match image.start().await {
-        Ok(c) => Some(c),
-        Err(e) => {
-            assert!(
-                std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-                "no Docker daemon and FAUCET_REQUIRE_BACKENDS is set: {e}"
-            );
-            eprintln!("skipping: no Docker daemon ({e})");
-            None
-        }
-    }
-}
-
 #[cfg(all(feature = "state-postgres", feature = "state-redis"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn verbs_work_against_redis_and_postgres_and_migrate_between_them() {
     use testcontainers::ImageExt;
-    let Some(pg) =
-        start(testcontainers_modules::postgres::Postgres::default().with_tag("16-alpine")).await
+    let Some(pg) = faucet_conformance::containers::start_or_skip(
+        || testcontainers_modules::postgres::Postgres::default().with_tag("16-alpine"),
+        &Default::default(),
+    )
+    .await
     else {
         return;
     };
-    let Some(rd) = start(testcontainers::ContainerRequest::from(
-        testcontainers_modules::redis::Redis::default(),
-    ))
+    let Some(rd) = faucet_conformance::containers::start_or_skip(
+        testcontainers_modules::redis::Redis::default,
+        &Default::default(),
+    )
     .await
     else {
         return;

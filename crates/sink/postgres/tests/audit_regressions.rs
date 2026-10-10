@@ -6,15 +6,12 @@ use faucet_sink_postgres::{
     PostgresColumnMapping, PostgresSink, PostgresSinkConfig, PostgresWriteMethod,
 };
 use serde_json::{Value, json};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
 async fn start_postgres() -> (ContainerAsync<Postgres>, String) {
-    let container = Postgres::default()
-        .with_tag("16-alpine")
-        .start()
-        .await
-        .expect("postgres container start");
+    let container =
+        faucet_conformance::containers::start(|| Postgres::default().with_tag("16-alpine")).await;
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     (container, url)

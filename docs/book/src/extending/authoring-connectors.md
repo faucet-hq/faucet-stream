@@ -273,7 +273,8 @@ bookmark handling (including a missing cursor and a malformed bookmark), error
 mapping, capability probes per config, and a `Debug` that hides secrets.
 Integration tests in `tests/` use `wiremock` for HTTP backends (a `Respond` impl
 can model pagination or a keyed store) and `testcontainers` for databases and
-queues: a multi-page read, a resume, a retried 5xx, a non-retried 4xx, a
+queues (start them with `faucet_conformance::containers` from the `containers`
+feature, which retries a flaky start and waits for readiness): a multi-page read, a resume, a retried 5xx, a non-retried 4xx, a
 malformed response, per-row sink failures and every write mode you advertise.
 Assert exact outcomes — records, bookmark values, error variants.
 

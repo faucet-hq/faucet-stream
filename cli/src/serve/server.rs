@@ -155,6 +155,14 @@ pub fn build_router(
             .route(
                 "/v1/templates/{id}/versions/{version}/deprecate",
                 post(templates::deprecate_version),
+            )
+            .route(
+                "/v1/templates/{id}/versions/{version}/test",
+                post(templates::test_version),
+            )
+            .route(
+                "/v1/templates/{id}/versions/{version}/tests",
+                get(templates::version_tests),
             );
         // Template hosting + sync (RFC 0006 / #589). Static `/sync` is matched
         // ahead of the `{id}` parameter by the router, so a template can never
@@ -849,7 +857,15 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             state.set_templates_sync(std::sync::Arc::clone(file));
             let store: crate::templates::TemplateStore = state.history();
             for origin in &file.origins {
-                match crate::templates::sync::sync_origin(&store, origin, false, None).await {
+                match crate::templates::sync::sync_origin_gated(
+                    &store,
+                    origin,
+                    false,
+                    None,
+                    &state.template_gate(),
+                )
+                .await
+                {
                     Ok(r) => tracing::info!(
                         origin = %r.origin,
                         mutations = r.mutations(),
@@ -861,10 +877,11 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
                     }
                 }
             }
-            crate::templates::sync::spawn_interval_syncs(
+            crate::templates::sync::spawn_interval_syncs_gated(
                 store,
                 std::sync::Arc::clone(file),
                 shutdown.clone(),
+                state.template_gate(),
             )
         }
         None => Vec::new(),

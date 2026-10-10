@@ -308,8 +308,20 @@ faucet hub matrix    [--format table|markdown|json] [--out FILE]
 faucet hub lint      [--hub DIR] [FILE…]                   # publishability lint + typed config validation
 faucet run           --source X --sink Y [--overlay O] [--param k=v] …  # compose + run
 faucet validate      --source X --sink Y [--overlay O] [--show-composed]  # compose + validate offline
-faucet schema source-template | sink-template | deployment
+faucet schema source-template | sink-template | deployment | test-suite | template-tests
 ```
+
+`hub check` and `hub lint` also run every template's **test bundle** (its
+`tests:` block, see [Test bundles](templates.md#test-bundles-and-the-launch-gate)):
+check runs the source's and the sink's, lint runs every source, sink and
+deployment in the catalog (or the files named). A failing case is a finding and
+fails the command. A bundle's companions (`tests.sink`, `tests.source`,
+`tests.overlay`) resolve in the same hub, and `requires_suites` resolves against
+the hub's `test-suites/` directory (`<hub>/test-suites/[<owner>/]<name>.yaml`, one
+release per file). A hub's CI should run `faucet hub lint` so a template whose
+tests fail never merges; a server mirroring the hub with `--templates-sync` runs
+each new version's bundle as it registers it and records the result, so a
+`launch: true` sidecar launches only what passed when the server requires tests.
 
 `--source` / `--sink` take a **path** or a **hub id**, resolved as
 `<hub>/source-templates/<id>.yaml` and `<hub>/sink-templates/<id>.yaml`. The

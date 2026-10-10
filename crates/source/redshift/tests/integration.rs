@@ -24,7 +24,7 @@ use faucet_source_redshift::{
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
 /// Serialize container startup within this binary so the tests don't race on
@@ -37,9 +37,8 @@ fn serial() -> &'static tokio::sync::Mutex<()> {
 /// Start a Postgres container; return the handle and its mapped host port. The
 /// container stays alive while the returned handle is held.
 async fn start_postgres() -> (ContainerAsync<Postgres>, u16) {
-    let image = Postgres::default().with_tag("16-alpine");
     let container: ContainerAsync<Postgres> =
-        image.start().await.expect("postgres container start");
+        faucet_conformance::containers::start(|| Postgres::default().with_tag("16-alpine")).await;
     let port = container
         .get_host_port_ipv4(5432)
         .await

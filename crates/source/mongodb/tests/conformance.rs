@@ -11,7 +11,7 @@ use faucet_core::Source;
 use faucet_source_mongodb::{MongoSource, MongoSourceConfig};
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::mongo::Mongo;
 
 // ── Check 1: config schema ──────────────────────────────────────────────────
@@ -27,10 +27,8 @@ fn conformance_config_schema_valid() {
 /// Start a MongoDB container and return both the container handle and a
 /// connection URI. The container is kept alive by the returned handle.
 async fn start_mongo() -> (ContainerAsync<Mongo>, String) {
-    let container: ContainerAsync<Mongo> = Mongo::default()
-        .start()
-        .await
-        .expect("mongo container start");
+    let container: ContainerAsync<Mongo> =
+        faucet_conformance::containers::start(Mongo::default).await;
     let port = container
         .get_host_port_ipv4(27017)
         .await

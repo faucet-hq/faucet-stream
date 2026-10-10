@@ -27,7 +27,8 @@ Submit a run:
   curl -sX POST localhost:{{ .Values.service.port }}/v1/runs -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/yaml' --data-binary @pipeline.yaml
 {{- else if eq .Values.serve.auth.mode "none" }}
 
-Auth: DISABLED (--no-auth). Do not expose this Service outside the cluster.
+Auth: DISABLED (--no-auth --allow-unauthenticated-network): every pod that can reach
+this Service can submit and run pipelines. Do not expose it outside the cluster.
 {{- else }}
 
 Auth: RBAC. Principals are defined in the mounted auth config.

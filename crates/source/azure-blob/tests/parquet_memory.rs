@@ -22,7 +22,6 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::Value;
 use testcontainers_modules::azurite::{Azurite, BLOB_PORT};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 struct Counting;
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -125,16 +124,28 @@ async fn a_parquet_blob_streams_in_bounded_memory() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(400_000);
-    let container = match Azurite::default().start().await {
-        Ok(c) => c,
-        Err(e) => {
-            assert!(
-                std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-                "Docker unavailable and FAUCET_REQUIRE_BACKENDS is set: {e}"
-            );
-            eprintln!("Skipping: Docker not available ({e})");
-            return;
-        }
+    let Some(container) = faucet_conformance::containers::start_or_skip(
+        || {
+            // In-memory storage: a nearly full runner disk must not fail the emulator.
+            testcontainers::ImageExt::with_cmd(
+                Azurite::default(),
+                [
+                    "azurite",
+                    "--blobHost",
+                    "0.0.0.0",
+                    "--queueHost",
+                    "0.0.0.0",
+                    "--tableHost",
+                    "0.0.0.0",
+                    "--inMemoryPersistence",
+                ],
+            )
+        },
+        &Default::default(),
+    )
+    .await
+    else {
+        return;
     };
     let port = container.get_host_port_ipv4(BLOB_PORT).await.unwrap();
     let endpoint = format!("http://127.0.0.1:{port}/{ACCOUNT}");

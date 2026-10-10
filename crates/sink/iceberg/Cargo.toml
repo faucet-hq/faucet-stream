@@ -51,7 +51,7 @@ iceberg-catalog-sql = "0.10.0"
 # feature must be enabled".
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "any"] }
 serde_json.workspace = true
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 schemars.workspace = true
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["minio"] }

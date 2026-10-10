@@ -44,7 +44,7 @@ encryption = ["faucet-common-file/encryption"]
 arrow = ["faucet-core/arrow", "faucet-common-file/file-format-parquet", "dep:arrow"]
 
 [dev-dependencies]
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
 faucet-common-sftp.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json.workspace = true

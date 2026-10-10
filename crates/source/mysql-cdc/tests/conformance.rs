@@ -24,7 +24,7 @@ use faucet_source_mysql_cdc::{MysqlCdcSource, MysqlCdcSourceConfig};
 use mysql_async::{Conn, Opts, prelude::Queryable};
 use serde_json::json;
 use std::time::Duration;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::mysql::Mysql;
 
 const BATCH: usize = 250;
@@ -43,18 +43,16 @@ fn conformance_config_schema_valid() {
 // ── Check 2: bounded-memory streaming (Docker) ───────────────────────────────
 
 async fn start_mysql_cdc() -> (ContainerAsync<Mysql>, String) {
-    let container = Mysql::default()
-        .with_tag("8.1")
-        .with_cmd([
+    let container = faucet_conformance::containers::start(|| {
+        Mysql::default().with_tag("8.1").with_cmd([
             "--server-id=1",
             "--log-bin=mysql-bin",
             "--binlog-format=ROW",
             "--binlog-row-image=FULL",
             "--binlog-row-metadata=FULL",
         ])
-        .start()
-        .await
-        .expect("mysql CDC container start");
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(3306)
         .await

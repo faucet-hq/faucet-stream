@@ -341,6 +341,31 @@ pub enum CliError {
     )]
     UnknownPipelineTemplate { id: String, version: Option<u32> },
 
+    /// A `tests.requires_suites` range matched no registered release of the
+    /// shared suite (#856).
+    #[error(
+        "shared test suite '{suite}' has no release matching '{range}' (available: {})",
+        if available.is_empty() { String::from("none registered") } else { available.join(", ") }
+    )]
+    UnsatisfiedSuiteRequirement {
+        suite: String,
+        range: String,
+        available: Vec<String>,
+    },
+
+    /// A launch the test gate refused (#856): the version has no passing test
+    /// result recorded under this faucet major version.
+    #[error(
+        "template '{id}' v{version} cannot be launched: {reason}{}",
+        if failing.is_empty() { String::new() } else { format!("\n  - {}", failing.join("\n  - ")) }
+    )]
+    LaunchGated {
+        id: String,
+        version: u32,
+        reason: String,
+        failing: Vec<String>,
+    },
+
     /// A connector's `auth: { ref }` named a provider not declared in the
     /// top-level `auth:` catalog.
     #[error(

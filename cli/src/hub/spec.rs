@@ -37,6 +37,9 @@ pub enum TemplateKind {
     /// notifications, SLA and delivery policy, applied over a source × sink
     /// composition. Never runnable on its own.
     Deployment,
+    /// A shared test suite (#856), required by other templates' `tests:`
+    /// blocks by version range. Never runnable on its own.
+    TestSuite,
 }
 
 impl TemplateKind {
@@ -46,6 +49,7 @@ impl TemplateKind {
             Self::SinkTemplate => "sink-template",
             Self::Pipeline => "pipeline",
             Self::Deployment => "deployment",
+            Self::TestSuite => "test-suite",
         }
     }
 
@@ -56,6 +60,7 @@ impl TemplateKind {
             "sink-template" => Some(Self::SinkTemplate),
             "pipeline" => Some(Self::Pipeline),
             "deployment" => Some(Self::Deployment),
+            "test-suite" => Some(Self::TestSuite),
             _ => None,
         }
     }
@@ -106,7 +111,7 @@ pub fn split_hub_id(id: &str) -> (Option<&str>, &str) {
     }
 }
 
-fn check_slug(what: &str, raw: &str, allow_dash: bool) -> CliResult<()> {
+pub(crate) fn check_slug(what: &str, raw: &str, allow_dash: bool) -> CliResult<()> {
     let ok = !raw.is_empty()
         && raw.len() <= 64
         && raw
@@ -340,6 +345,11 @@ pub struct SourceTemplate {
     pub contract: Option<Value>,
     /// The tables this source produces; one matrix row each.
     pub streams: Vec<Stream>,
+    /// The version's test bundle (#856): cases run against this template
+    /// composed with `tests.sink`, recorded on the version and required by a
+    /// test-gated launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<crate::template_tests::TestBundle>,
 }
 
 impl SourceTemplate {
@@ -432,6 +442,10 @@ impl SourceTemplate {
                 self.contract.clone().unwrap_or(Value::Null),
             ],
         )?;
+        if let Some(b) = &self.tests {
+            b.validate(TemplateKind::SourceTemplate)
+                .map_err(|e| CliError::Config(format!("source-template '{}': {e}", self.name)))?;
+        }
         Ok(())
     }
 
@@ -487,6 +501,10 @@ pub struct SinkTemplate {
     /// / `delete` cannot be aliased).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub write_mode_aliases: BTreeMap<String, WriteMode>,
+    /// The version's test bundle (#856), run against `tests.source` composed
+    /// with this sink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<crate::template_tests::TestBundle>,
 }
 
 impl SinkTemplate {
@@ -594,6 +612,10 @@ impl SinkTemplate {
                 serde_json::to_value(&self.per_stream).unwrap_or(Value::Null),
             ],
         )?;
+        if let Some(b) = &self.tests {
+            b.validate(TemplateKind::SinkTemplate)
+                .map_err(|e| CliError::Config(format!("sink-template '{}': {e}", self.name)))?;
+        }
         Ok(())
     }
 }
@@ -725,6 +747,10 @@ pub struct DeploymentTemplate {
     /// paired with, so a sink swap resumes; never run two pairings at once).
     #[serde(default, skip_serializing_if = "StateScope::is_default")]
     pub state_scope: StateScope,
+    /// The version's test bundle (#856), run against `tests.source` ×
+    /// `tests.sink` with this overlay applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<crate::template_tests::TestBundle>,
 }
 
 /// The state namespace of a composed run.
@@ -767,6 +793,7 @@ impl DeploymentTemplate {
                 "streams",
                 "notify",
                 "state_scope",
+                "tests",
             ];
             let refused: Vec<&str> = obj
                 .keys()
@@ -838,6 +865,10 @@ impl DeploymentTemplate {
                     self.name
                 )));
             }
+        }
+        if let Some(b) = &self.tests {
+            b.validate(TemplateKind::Deployment)
+                .map_err(|e| CliError::Config(format!("deployment '{}': {e}", self.name)))?;
         }
         Ok(())
     }

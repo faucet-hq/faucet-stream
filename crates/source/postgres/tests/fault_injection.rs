@@ -23,7 +23,7 @@ use std::time::Duration;
 use faucet_conformance::doubles::TestSink;
 use faucet_core::{Pipeline, Source};
 use faucet_source_postgres::{PostgresSource, PostgresSourceConfig};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
 /// Hard ceiling for every run here. A cut connection must resolve well inside
@@ -43,11 +43,8 @@ async fn within<F: std::future::Future>(label: &str, fut: F) -> F::Output {
 }
 
 async fn start_postgres() -> (ContainerAsync<Postgres>, String) {
-    let container: ContainerAsync<Postgres> = Postgres::default()
-        .with_tag("16-alpine")
-        .start()
-        .await
-        .expect("postgres container start");
+    let container: ContainerAsync<Postgres> =
+        faucet_conformance::containers::start(|| Postgres::default().with_tag("16-alpine")).await;
     let port = container
         .get_host_port_ipv4(5432)
         .await

@@ -50,7 +50,12 @@ Mitigations are deployment-level and **mandatory**:
 
 - Never run with `--no-auth` on a non-loopback bind. The no-auth gate is
   explicit: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** without
-  `--no-auth`, startup fails.
+  `--no-auth`, startup fails. `--no-auth` with a non-loopback `--listen` /
+  `FAUCET_SERVE_LISTEN` (`0.0.0.0`, `::`, a LAN address) also fails unless
+  `--allow-unauthenticated-network` (`FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK`)
+  accepts the exposure, and then the server logs a warning at startup. Inside a
+  container that binds `0.0.0.0`, publish the port on loopback only
+  (`-p 127.0.0.1:8080:8080`) when you pass it.
 - Run single-tenant, behind authentication, behind egress controls / network
   policy. The default loopback bind (`127.0.0.1`) is deliberate — exposing
   externally is an explicit choice.

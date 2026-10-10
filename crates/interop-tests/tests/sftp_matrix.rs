@@ -17,7 +17,6 @@ use faucet_core::{FaucetError, Sink};
 use remote_matrix::{BoxFut, Remote, run_matrix_with};
 use serde_json::{Value, json};
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::io::AsyncReadExt;
 
@@ -95,20 +94,18 @@ impl Remote for SftpRemote {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn every_writable_format_takes_every_option_on_sftp() {
-    let image = GenericImage::new("atmoz/sftp", "alpine")
-        .with_exposed_port(22.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-        .with_cmd(vec![format!("{USER}:{PASS}:::data")]);
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            assert!(
-                std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-                "Docker unavailable and FAUCET_REQUIRE_BACKENDS is set: {e}"
-            );
-            eprintln!("Skipping: Docker not available ({e})");
-            return;
-        }
+    let Some(container) = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new("atmoz/sftp", "alpine")
+                .with_exposed_port(22.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+                .with_cmd(vec![format!("{USER}:{PASS}:::data")])
+        },
+        &Default::default(),
+    )
+    .await
+    else {
+        return;
     };
     let port = container.get_host_port_ipv4(22).await.expect("port");
     let full = std::env::var("FAUCET_MATRIX_FULL").is_ok();

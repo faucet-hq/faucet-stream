@@ -29,7 +29,7 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tempfile::TempDir;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 
 /// MinIO's Docker Hub repository was withdrawn (September 2026): pulling
@@ -49,15 +49,15 @@ const BUCKET: &str = "faucet-iceberg-tests";
 
 /// Start a MinIO container; return the handle + `http://127.0.0.1:port` endpoint.
 async fn start_minio() -> (ContainerAsync<MinIO>, String) {
-    let container = MinIO::default()
-        // tmpfs: MinIO refuses writes when the runner disk is nearly full.
-        .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
-        .with_name(MINIO_IMAGE_NAME)
-        .with_tag(MINIO_IMAGE_TAG)
-        .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
-        .start()
-        .await
-        .expect("minio start");
+    let container = faucet_conformance::containers::start(|| {
+        MinIO::default()
+            // tmpfs: MinIO refuses writes when the runner disk is nearly full.
+            .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
+            .with_name(MINIO_IMAGE_NAME)
+            .with_tag(MINIO_IMAGE_TAG)
+            .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(9000)
         .await

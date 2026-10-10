@@ -23,6 +23,8 @@ pub struct GeneratedCase {
     /// Where the case came from, for the report — an operator seeing a red
     /// `auto` case should not have to guess why a case they never wrote exists.
     pub origin: Origin,
+    /// Extra attempts the case's author allowed.
+    pub retries: u32,
 }
 
 /// How a case came to exist.
@@ -59,6 +61,7 @@ pub fn generate(suite: &Suite, params: &ParamsSpec) -> CliResult<Vec<GeneratedCa
             params: c.params.clone(),
             expect: c.expect.clone(),
             origin: Origin::Explicit,
+            retries: c.retries,
         })
         .collect();
 
@@ -158,6 +161,7 @@ fn from_combine(cb: &Combine, params: &ParamsSpec) -> CliResult<Vec<GeneratedCas
                 params,
                 expect: cb.expect.clone(),
                 origin: Origin::Combined,
+                retries: cb.retries,
             }
         })
         .collect())
@@ -315,6 +319,7 @@ fn from_auto(auto: &Auto, params: &ParamsSpec) -> Vec<GeneratedCase> {
             params: supplied,
             expect: Expect::default(),
             origin: Origin::Auto,
+            retries: auto.retries,
         });
     }
 
@@ -336,6 +341,7 @@ fn from_auto(auto: &Auto, params: &ParamsSpec) -> Vec<GeneratedCase> {
                     params: supplied,
                     expect: Expect::default(),
                     origin: Origin::Auto,
+                    retries: auto.retries,
                 });
             }
         }
@@ -364,6 +370,7 @@ fn from_auto(auto: &Auto, params: &ParamsSpec) -> Vec<GeneratedCase> {
                     error: Some((*omitted).clone()),
                 },
                 origin: Origin::Auto,
+                retries: auto.retries,
             });
         }
     }
@@ -399,6 +406,7 @@ mod tests {
             exclude: Vec::new(),
             pairwise,
             expect: Expect::default(),
+            retries: 0,
         }
     }
 
@@ -591,6 +599,7 @@ mod tests {
                 enum_coverage: true,
                 required_omitted: false,
                 defaults_baseline: false,
+                retries: 0,
             }),
             behavioral: Vec::new(),
         };
@@ -612,6 +621,7 @@ mod tests {
                 enum_coverage: false,
                 required_omitted: true,
                 defaults_baseline: false,
+                retries: 0,
             }),
             behavioral: Vec::new(),
         };
@@ -637,6 +647,7 @@ mod tests {
                 enum_coverage: false,
                 required_omitted: false,
                 defaults_baseline: true,
+                retries: 0,
             }),
             behavioral: Vec::new(),
         };
@@ -674,6 +685,7 @@ mod tests {
                 enum_coverage: false,
                 required_omitted: false,
                 defaults_baseline: true,
+                retries: 0,
             }),
             behavioral: Vec::new(),
         };
@@ -705,6 +717,7 @@ mod tests {
                 enum_coverage: true,
                 required_omitted: true,
                 defaults_baseline: true,
+                retries: 0,
             }),
             behavioral: Vec::new(),
         };
@@ -735,11 +748,13 @@ mod tests {
                     name: "a".into(),
                     params: BTreeMap::new(),
                     expect: Expect::default(),
+                    retries: 0,
                 },
                 Case {
                     name: "a".into(),
                     params: BTreeMap::new(),
                     expect: Expect::default(),
+                    retries: 0,
                 },
             ],
             combine: None,
@@ -758,11 +773,13 @@ mod tests {
                     name: "z".into(),
                     params: BTreeMap::new(),
                     expect: Expect::default(),
+                    retries: 0,
                 },
                 Case {
                     name: "a".into(),
                     params: BTreeMap::new(),
                     expect: Expect::default(),
+                    retries: 0,
                 },
             ],
             combine: Some(combine(&[("s", vec![json!(1)])], false)),

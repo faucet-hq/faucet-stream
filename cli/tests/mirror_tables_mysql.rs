@@ -16,22 +16,20 @@ use faucet_cli::verify::{VerifyInputs, VerifySpec};
 use faucet_core::StateStore as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::mysql::Mysql;
 
 async fn start_mysql() -> (ContainerAsync<Mysql>, String) {
-    let container = Mysql::default()
-        .with_tag("8.1")
-        .with_cmd([
+    let container = faucet_conformance::containers::start(|| {
+        Mysql::default().with_tag("8.1").with_cmd([
             "--server-id=1",
             "--log-bin=mysql-bin",
             "--binlog-format=ROW",
             "--binlog-row-image=FULL",
             "--binlog-row-metadata=FULL",
         ])
-        .start()
-        .await
-        .expect("mysql start");
+    })
+    .await;
     let port = container.get_host_port_ipv4(3306).await.expect("port");
     (container, format!("mysql://root@127.0.0.1:{port}/test"))
 }

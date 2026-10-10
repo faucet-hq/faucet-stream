@@ -24,7 +24,6 @@ use mongodb::bson::{Document, doc};
 use serde_json::json;
 use std::time::Duration;
 use testcontainers::ContainerAsync;
-use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::mongo::Mongo;
 
 const DB: &str = "app";
@@ -45,10 +44,7 @@ fn conformance_config_schema_valid() {
 // ── Check 2: bounded-memory streaming (Docker) ───────────────────────────────
 
 async fn start_repl_set() -> (ContainerAsync<Mongo>, String) {
-    let container = Mongo::repl_set()
-        .start()
-        .await
-        .expect("mongo replica-set container start");
+    let container = faucet_conformance::containers::start(Mongo::repl_set).await;
     let port = container
         .get_host_port_ipv4(27017)
         .await

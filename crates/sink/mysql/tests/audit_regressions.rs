@@ -6,14 +6,11 @@ use faucet_core::{ColumnChange, SchemaEvolution, Sink, WriteMode, WriteSpec};
 use faucet_sink_mysql::{MysqlColumnMapping, MysqlSink, MysqlSinkConfig};
 use serde_json::json;
 use sqlx::Row;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::mysql::Mysql;
 
 async fn start_mysql() -> (ContainerAsync<Mysql>, String) {
-    let container = Mysql::default()
-        .start()
-        .await
-        .expect("mysql container start");
+    let container = faucet_conformance::containers::start(Mysql::default).await;
     let port = container
         .get_host_port_ipv4(3306)
         .await

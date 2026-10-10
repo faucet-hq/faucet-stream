@@ -115,8 +115,9 @@ serve:
 ```
 
 - **Auth**: `token` (bearer; the chart mints a stable random token into a Secret,
-  or use `auth.token` / `auth.existingSecret`), `none` (`--no-auth`, never expose
-  externally), or `rbac` (inline `auth.rbacConfig` principals → mounted file).
+  or use `auth.token` / `auth.existingSecret`), `none` (`--no-auth --allow-unauthenticated-network`:
+  the pod listens on `0.0.0.0`, so anything that can reach the Service can run
+  pipelines; never expose it externally), or `rbac` (inline `auth.rbacConfig` principals → mounted file).
 - **History**: `memory` (ephemeral), `sqlite` (needs `persistence.enabled` for
   durability), or `postgres` (required for `cluster.enabled` multi-instance
   failover). The URL reaches the pod as the `FAUCET_SERVE_HISTORY` env var,

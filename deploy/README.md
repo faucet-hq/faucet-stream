@@ -34,9 +34,10 @@ docker run --rm -v "$PWD":/w -w /w faucet:full run pipeline.yaml
 
 `serve --no-auth` turns authentication off: anyone who can reach the port can
 submit and run pipelines with the container's credentials and network access.
-Use it only for a local demo bound to loopback
-(`docker run -p 127.0.0.1:8080:8080 faucet:full serve --no-auth`), never on a
-published port.
+The image listens on `0.0.0.0`, so `--no-auth` there also needs
+`--allow-unauthenticated-network`. Use it only for a local demo published on
+loopback (`docker run -p 127.0.0.1:8080:8080 faucet:full serve --no-auth
+--allow-unauthenticated-network`), never on a published port.
 
 ### Lean, named images (recommended for k8s — "profile B")
 

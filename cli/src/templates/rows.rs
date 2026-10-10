@@ -145,7 +145,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
             report.sink_version = sink.map(|(_, v)| v);
             report
         }
-        TemplateKind::SinkTemplate | TemplateKind::Deployment => {
+        TemplateKind::SinkTemplate | TemplateKind::Deployment | TemplateKind::TestSuite => {
             return Err(CliError::Config(format!(
                 "'{}' is a {} — it has no rows of its own; list a source template's rows with \
                  `sink` set to it",

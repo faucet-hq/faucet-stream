@@ -13,7 +13,7 @@ This is the authoritative statement of the repository's testing rules. The [cont
 ## Where tests live
 
 - **Unit tests MUST live in `#[cfg(test)]` modules** at the bottom of the source file, for logic that needs no network I/O — JSONPath extraction, pagination state, auth-header generation, config validation, pure planning functions (`plan_writes`, `plan_pk_shards`, `diff_schema`).
-- **Integration tests MUST live in the crate's `tests/` directory**, using `wiremock` for HTTP connectors and `testcontainers` for database/queue connectors.
+- **Integration tests MUST live in the crate's `tests/` directory**, using `wiremock` for HTTP connectors and `testcontainers` for database/queue connectors. Containers MUST be started through `faucet_conformance::containers` (the `containers` feature), never with a bare `.start().await`: it owns the start-up budget, the retry of start-up failures, the readiness probe and the `FAUCET_REQUIRE_BACKENDS` rule.
 - **SHOULD refactor an untestable line rather than exempt it.** Extract the pure logic; make the I/O a thin, separately-covered shim. Most low coverage is a design smell, not an inherent limit.
 
 ## Modifying existing tests

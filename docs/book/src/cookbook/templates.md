@@ -575,6 +575,135 @@ machine-readable report. The exit code is the failed-case count, mirroring
 `faucet test`, so CI gates on it without parsing output. `faucet schema
 template-test` prints the suite schema.
 
+## Test bundles and the launch gate
+
+A suite file lives next to a template; a **test bundle** lives *inside* it. Add a
+`tests:` block to any template document — `kind: pipeline`, `source-template`,
+`sink-template` or `deployment` — and the tests are stored verbatim with the
+version, covered by its content hash. Changing a test is a new version, exactly
+like changing the config, so "v3 passed its tests" always means v3's tests.
+
+<!-- faucet:no-validate -->
+```yaml
+# cli/examples/csv_to_jsonl_with_tests.yaml (abridged)
+kind: pipeline
+version: 1
+name: orders_export
+params:
+  region: { type: string, default: us, values: [us, eu] }
+pipeline: { … }
+tests:
+  suite:                       # the `faucet template test` grammar above
+    auto: { enum_coverage: true, defaults_baseline: true }
+    cases:
+      - { name: unknown-region-is-refused, params: { region: apac }, expect: { error: region } }
+  fixtures:                    # `faucet test` cases, run through this template
+    - name: rows-are-stamped
+      params: { region: eu }
+      input: [{ id: 1 }, { id: 2 }]
+      expect: { records: [{ id: 1, exported: true }, { id: 2, exported: true }] }
+    - name: inline-filter      # or an inline `pipeline:` instead of the template's own
+      retries: 1               # explicit and recorded — never a silent retry
+      pipeline: { transforms: [{ type: filter, config: { path: status, op: eq, value: paid } }] }
+      input: [{ id: 1, status: paid }, { id: 2, status: open }]
+      expect: { records_written: 1 }
+  requires_suites:             # shared suites, picked by semver range
+    - { name: rest-conformance, version: ">=1.2,<2" }
+```
+
+| Field | Meaning |
+|---|---|
+| `suite` | Parameter-space cases (`cases`, `combine`, `auto`, `behavioral`), as in a suite file. |
+| `fixtures` | `faucet test` cases. Without `pipeline:` a fixture runs the template's own materialized config (`params:` bind it, `row:` picks a row); with `pipeline:` it runs that inline logic. |
+| `requires_suites` | Shared `kind: test-suite` documents, by `name` and semver `version` range over their `release:`. |
+| `sink` / `source` / `overlay` (+ `*_select`) | The companions a hub kind composes with: a source template names its `sink` (and optionally an `overlay`); a sink template names its `source`; a deployment overlay names both. Selectors default to `stable`. A `pipeline` takes none. |
+| `retries` (on any case) | Extra attempts, at most 5. A case that passed on a retry says so (`attempts`). |
+
+Everything runs **offline**: records are inline (a fixture path is refused — the
+version stores only the document) and no connector is ever opened. Live checks
+against real systems are deliberately not part of the gate.
+
+### Running a bundle
+
+```bash
+faucet template test cli/examples/csv_to_jsonl_with_tests.yaml          # a file — no registry
+faucet template register orders.yaml --test --store sqlite:./faucet-templates.db
+faucet template test orders_export@3 --store sqlite:./faucet-templates.db   # run + record on v3
+faucet template test orders_export@3 --no-record --filter 'auto:*' --store …  # a subset, not recorded
+```
+
+A registered run is **recorded on the version**: per-case pass/fail, attempts and
+duration, the faucet binary version, the time, who ran it, the sha256 of the body
+it tested, and which shared-suite releases it resolved. The newest 20 runs per
+version are kept; deleting a version (or the template) deletes its results. Over
+HTTP: `POST /v1/templates` with `"test": true`, `POST
+/v1/templates/{id}/versions/{version}/test`, and `GET …/versions/{version}/tests`;
+over MCP: `register_template {test: true}` and `test_template`.
+
+### Shared suites
+
+A suite many templates share — a conformance suite for every REST source, say — is
+its own document, registered (or kept in a hub's `test-suites/` directory) and
+versioned by a semver `release`:
+
+```yaml
+kind: test-suite
+name: rest-conformance
+release: 1.4.0
+suite:
+  auto: { defaults_baseline: true, required_omitted: true }
+fixtures: [ … ]
+```
+
+A `requires_suites` range resolves to the **highest registered, non-deprecated
+release** in range each time the bundle runs; the result records which release ran.
+A release is immutable — registering the same `release:` twice is refused. A range
+nothing satisfies fails **registration** of the requiring template with a typed
+error naming the suite, the range and the releases that exist. A test-suite is
+never runnable on its own. `faucet schema test-suite` / `faucet schema
+template-tests` print the two schemas.
+
+### The launch gate
+
+`faucet serve --require-template-tests` (or `FAUCET_REQUIRE_TEMPLATE_TESTS=1`)
+makes the registry refuse to **launch** a version unless a passing bundle result is
+recorded for that exact version body under the **running faucet major version**.
+Every launch path goes through the same check — `POST /v1/templates/{id}/launch`
+and `/rollback`, a register with `launch: true` (the bundle runs first), the MCP
+`launch_template` / `rollback_template` / `register_template` tools, template sync
+launches, and approved `template_launch` change requests. A refusal is a `422`
+whose `error.details.gate` lists the failing cases, and is audited
+(`template.launch`, result `refused`).
+
+| Version | `--require-template-tests` off (default) | on |
+|---|---|---|
+| passing result, this major | launches | launches |
+| failing result | launches (console warns) | refused, failing cases listed |
+| results only from another major, or another body | launches | refused — rerun the bundle |
+| bundle never run | launches | refused |
+| no `tests:` block | launches | launches — tests are optional |
+
+An admin can launch past a refusal with a reason — `--skip-tests-reason "<why>"`
+on `faucet template launch|rollback|register`, `skip_tests_reason` in the HTTP
+body or MCP arguments. The reason is written on the launch log (`tests_skipped`)
+and in the audit log (`detail: tests skipped: <why>`). The override is admin-only
+however it arrives: the launch routes and tools already are, and a change request
+carrying `skip_tests_reason` may only be proposed by an admin.
+
+The CLI applies the gate with `--require-tests` on `faucet template launch`,
+`rollback`, `register --launch` and `sync`.
+
+> **Migration.** The gate is **off by default** in this release so existing
+> deployments keep launching as before. To adopt it: add `tests:` blocks, run
+> `faucet template test <id>@<version>` for each version you intend to launch
+> (or re-register with `--test`), then start the server with
+> `--require-template-tests`. After a faucet major upgrade, rerun the bundles —
+> results from the previous major no longer count.
+
+The console's versions page shows each version's test status and recent runs, a
+**Run tests** button, and disables **Launch** with the failing cases listed when
+the gate would refuse.
+
 ## Running a subset of streams
 
 A template with rows — the `streams:` of a source template, the `matrix:` of a

@@ -6,37 +6,45 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, PutRequest,
     ScalarAttributeType, StreamSpecification, StreamViewType, WriteRequest,
 };
+use faucet_conformance::containers::{self, Endpoint, ReadyProbe, StartOptions};
 use faucet_source_dynamodb::{DynamoDbCredentials, DynamoDbSourceConfig};
 use std::collections::HashMap;
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::{ContainerAsync, GenericImage, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, GenericImage};
 
 pub type Container = ContainerAsync<GenericImage>;
 
-/// Start DynamoDB Local; `None` (test skipped) when Docker is unavailable.
+/// Start DynamoDB Local once it answers `ListTables`; `None` (test skipped)
+/// when Docker is unavailable.
 pub async fn start() -> Option<(Container, String, Client)> {
-    let image = GenericImage::new("amazon/dynamodb-local", "latest")
-        .with_exposed_port(8000.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("CorsParams"));
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Skipping: Docker not available ({e})");
-            return None;
-        }
-    };
+    let opts = StartOptions::default().ready(ReadyProbe::custom(8000, |ep: Endpoint| async move {
+        let endpoint = format!("http://127.0.0.1:{}", ep.port);
+        let client =
+            faucet_source_dynamodb::build_client(Some("us-east-1"), Some(&endpoint), &creds())
+                .await
+                .map_err(|e| e.to_string())?;
+        client
+            .list_tables()
+            .send()
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }));
+    let container = containers::start_or_skip(
+        || {
+            GenericImage::new("amazon/dynamodb-local", "latest")
+                .with_exposed_port(8000.tcp())
+                .with_wait_for(WaitFor::message_on_stdout("CorsParams"))
+        },
+        &opts,
+    )
+    .await?;
     let port = container.get_host_port_ipv4(8000).await.ok()?;
     let endpoint = format!("http://127.0.0.1:{port}");
     let client = faucet_source_dynamodb::build_client(Some("us-east-1"), Some(&endpoint), &creds())
         .await
         .expect("client");
-    for _ in 0..120 {
-        if client.list_tables().send().await.is_ok() {
-            return Some((container, endpoint, client));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    panic!("dynamodb local never became ready");
+    Some((container, endpoint, client))
 }
 
 pub fn creds() -> DynamoDbCredentials {

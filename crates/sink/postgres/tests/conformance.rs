@@ -14,7 +14,7 @@
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::{DeleteMarker, Sink, WriteMode, WriteSpec};
 use faucet_sink_postgres::{PostgresColumnMapping, PostgresSink, PostgresSinkConfig};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
 #[test]
@@ -29,9 +29,8 @@ fn conformance_config_schema_valid() {
 /// A fresh container with a keyed table `t(id PK, v)` and an upsert-mode
 /// Postgres sink pointed at it.
 async fn fresh_sink() -> (ContainerAsync<Postgres>, String, PostgresSink) {
-    let image = Postgres::default().with_tag("16-alpine");
     let container: ContainerAsync<Postgres> =
-        image.start().await.expect("postgres container start");
+        faucet_conformance::containers::start(|| Postgres::default().with_tag("16-alpine")).await;
     let port = container
         .get_host_port_ipv4(5432)
         .await

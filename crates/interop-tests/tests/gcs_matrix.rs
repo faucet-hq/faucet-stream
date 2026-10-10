@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
 };
 
 const BUCKET: &str = "faucet-matrix";
@@ -84,23 +83,24 @@ impl Remote for GcsRemote {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn every_writable_format_takes_every_option_on_gcs() {
-    let image = GenericImage::new("fsouza/fake-gcs-server", "latest")
-        .with_exposed_port(4443.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("server started at"))
-        .with_cmd(vec![
-            "-scheme=http".to_string(),
-            "-public-host=0.0.0.0:4443".to_string(),
-        ]);
-    let container = match image.start().await {
-        Ok(c) => c,
-        Err(e) => {
-            assert!(
-                std::env::var_os("FAUCET_REQUIRE_BACKENDS").is_none(),
-                "Docker unavailable and FAUCET_REQUIRE_BACKENDS is set: {e}"
-            );
-            eprintln!("Skipping: Docker not available ({e})");
-            return;
-        }
+    let Some(container) = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new("fsouza/fake-gcs-server", "latest")
+                .with_exposed_port(4443.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("server started at"))
+                .with_cmd(vec![
+                    "-scheme=http".to_string(),
+                    "-public-host=0.0.0.0:4443".to_string(),
+                ])
+                .with_mount(testcontainers::core::Mount::tmpfs_mount("/storage"))
+        },
+        &faucet_conformance::containers::StartOptions::default().ready(
+            faucet_conformance::containers::ReadyProbe::http(4443, "/storage/v1/b"),
+        ),
+    )
+    .await
+    else {
+        return;
     };
     let port = container.get_host_port_ipv4(4443).await.expect("port");
     let host = format!("http://127.0.0.1:{port}");

@@ -209,3 +209,70 @@ async fn postgres_version_deprecation_round_trips() {
             .is_empty()
     );
 }
+
+/// #856 on the Postgres dialect: test results record, read back newest
+/// first, prune per version and cascade on delete; a launch keeps its
+/// skipped-tests note.
+#[tokio::test]
+async fn postgres_template_test_results_and_launch_notes() {
+    use faucet_cli::serve::history::templates::{
+        RESULTS_RETAIN, TemplateDraft, TemplateId, TemplateTestResult,
+    };
+    use faucet_cli::serve::load::ConfigFormat;
+    let Ok(url) = std::env::var("FAUCET_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "SKIP postgres_template_test_results_and_launch_notes: FAUCET_TEST_POSTGRES_URL unset"
+        );
+        return;
+    };
+    let h = PostgresHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        "pg-test".into(),
+    )
+    .await
+    .expect("connect postgres history");
+    let id = format!("pgt{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    h.template_register(&TemplateDraft {
+        id: TemplateId::parse(&id).unwrap(),
+        name: Some(id.clone()),
+        description: None,
+        body: format!("version: 1\nname: {id}\n"),
+        format: ConfigFormat::Yaml,
+        params: Default::default(),
+        created_by: None,
+        kind: faucet_cli::hub::TemplateKind::Pipeline,
+    })
+    .await
+    .unwrap();
+    let base = TemplateTestResult::new(&id, 1, "sha".into(), Default::default(), None);
+    for i in 0..(RESULTS_RETAIN + 2) {
+        let mut r = base.clone();
+        r.recorded_at = base.recorded_at + chrono::Duration::seconds(i as i64);
+        h.template_record_test(&r).await.unwrap();
+    }
+    let got = h.template_test_results(&id, Some(1), 100).await.unwrap();
+    assert_eq!(got.len(), RESULTS_RETAIN);
+    assert!(got[0].recorded_at > got[1].recorded_at);
+    assert_eq!(
+        h.template_test_results(&id, None, 3).await.unwrap().len(),
+        3
+    );
+    h.template_launch_noted(&id, 1, Some("root"), Some("hotfix"))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.template_launches(&id).await.unwrap()[0]
+            .tests_skipped
+            .as_deref(),
+        Some("hotfix")
+    );
+    h.template_delete(&id, None).await.unwrap();
+    assert!(
+        h.template_test_results(&id, None, 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

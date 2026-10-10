@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 use tokio::net::TcpListener;
 
@@ -38,15 +38,15 @@ const TEST_BUCKET: &str = "faucet-stream-tests";
 /// `http://host:port` endpoint URL. The container is kept alive by the
 /// returned handle; drop it to stop the container.
 async fn start_minio() -> (ContainerAsync<MinIO>, String) {
-    let container: ContainerAsync<MinIO> = MinIO::default()
-        // tmpfs: MinIO refuses writes when the runner disk is nearly full.
-        .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
-        .with_name(MINIO_IMAGE_NAME)
-        .with_tag(MINIO_IMAGE_TAG)
-        .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
-        .start()
-        .await
-        .expect("minio container start");
+    let container: ContainerAsync<MinIO> = faucet_conformance::containers::start(|| {
+        MinIO::default()
+            // tmpfs: MinIO refuses writes when the runner disk is nearly full.
+            .with_mount(testcontainers_modules::testcontainers::core::Mount::tmpfs_mount("/data"))
+            .with_name(MINIO_IMAGE_NAME)
+            .with_tag(MINIO_IMAGE_TAG)
+            .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
+    })
+    .await;
     let port = container
         .get_host_port_ipv4(9000)
         .await
