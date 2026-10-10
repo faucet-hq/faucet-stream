@@ -321,6 +321,9 @@ jobs:
           echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           echo "Oracle Instant Client installed at $dir"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pull Docker Hub images through a mirror
+        # Avoids Docker Hub's anonymous pull rate limit on shared runners.
+        run: scripts/docker-hub-mirror.sh
       - name: Clear Docker before the container-backed tests
         # Testcontainer images and volumes left by earlier steps count against
         # the runner disk the tests (MinIO's free-space check among them) need.
@@ -789,6 +792,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pull Docker Hub images through a mirror
+        # Avoids Docker Hub's anonymous pull rate limit on shared runners.
+        run: scripts/docker-hub-mirror.sh
       # These steps boot Docker containers (Kafka, Elasticsearch) via
       # testcontainers, whose in-process (bollard) image pull intermittently
       # fails. Only an image-pull failure is retried; anything else fails once.
@@ -962,6 +968,10 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pull Docker Hub images through a mirror
+        # Avoids Docker Hub's anonymous pull rate limit on shared runners.
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        run: scripts/docker-hub-mirror.sh
       - name: Clear Docker before the container-backed tests
         # Testcontainer images and volumes left by earlier steps count against
         # the runner disk the tests (MinIO's free-space check among them) need.
