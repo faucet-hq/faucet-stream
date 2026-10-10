@@ -489,18 +489,18 @@ suite:
   # template gains params instead of going stale like a hand-written list.
   auto:
     enum_coverage: true      # one case per declared value of every `values:` param
-    required_omitted: true   # one per required non-secret param, omitted, expecting a named failure
+    required_omitted: true   # one per required param, omitted, expecting a named failure
     defaults_baseline: true  # the all-defaults combination
 
   cases:
     - name: eu-small-pages
-      params: { tenant_id: acme, region: eu, page_size: 50 }
+      params: { tenant_id: acme, api_token: t0ken, region: eu, page_size: 50 }
 
     # `error:` implies the case must fail *and* that the message mentions the
     # substring — a real assertion rather than "it failed somehow", which would
     # also pass on an unrelated break.
     - name: rejects-an-undeclared-region
-      params: { tenant_id: acme, region: antarctica }
+      params: { tenant_id: acme, api_token: t0ken, region: antarctica }
       expect: { error: region }
 
   combine:
@@ -515,7 +515,7 @@ suite:
   # `faucet test`'s matchers.
   behavioral:
     - name: shapes-a-record
-      params: { tenant_id: acme }
+      params: { tenant_id: acme, api_token: t0ken }
       input: [{ "Id": "1", "Name": "Acme" }]
       expect: { records_written: 1 }
 ```
@@ -526,9 +526,10 @@ template ./tenant-sync.yaml
   ok   [explicit] rejects-an-undeclared-region
   ok   [combine] page_size=1,region=us
   …
+  ok   [auto] auto:missing-api_token
   ok   [auto] auto:missing-tenant_id
 
-12 case(s): 12 passed, 0 failed
+13 case(s): 13 passed, 0 failed
 ```
 
 **Two tiers, both offline.** The default *validation* tier materializes the
@@ -548,10 +549,12 @@ reimplementing them.
 mystery. Required params a `combine:` sweep does not name are filled
 automatically, so generated cases test the axes you listed and nothing else.
 
-**Secret params never get a value.** A case may not set a `secret: true` param
-(the run refuses it), and its default is never resolved: every test run fills
-it with a typed placeholder, so no credential reaches a test or its recorded
-result. `required_omitted` therefore skips secret params.
+**A secret param's default never resolves in a test.** A `secret: true` param
+a case leaves unset gets a typed placeholder when it has a default, so a
+default such as `${env:API_TOKEN}` never pulls a real credential into a test
+run; one without a default stays missing and fails by name, as a real trigger
+would. A value a case names itself (a dummy like `t0ken`) is used, kept out of
+logs, and shown as `***` in the report and in recorded failures.
 
 **Guard rails.**
 

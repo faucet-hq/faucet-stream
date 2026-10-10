@@ -264,8 +264,26 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    const PEM: &str = "-----BEGIN KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEF\nshort\n-----END KEY-----";
+
+    /// Drop only the values these tests register: the registry is global,
+    /// and wiping it would remove a secret a concurrent test elsewhere just
+    /// registered.
     fn clear() {
-        *registry().write().unwrap() = Registry::default();
+        for s in [
+            "supersecrettoken",
+            "pa\"ss\\word-1",
+            PEM,
+            "abcd",
+            "abcdXYZW",
+            "supersecretvalue",
+            "rotated-away-token",
+            "still-live-token",
+            "alpha-secret",
+            "hunter2pass",
+        ] {
+            unregister(s);
+        }
     }
 
     #[test]
@@ -288,7 +306,7 @@ mod tests {
         assert!(!redact(&json).contains("word-1"), "{}", redact(&json));
         let dbg = format!("{:?}", "pa\"ss\\word-1");
         assert_eq!(redact(&dbg), "\"***\"");
-        let pem = "-----BEGIN KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEF\nshort\n-----END KEY-----";
+        let pem = PEM;
         register(pem);
         assert!(!redact("line: MIIBVgIBADANBgkqhkiG9w0BAQEF").contains("MIIBVg"));
         let escaped = serde_json::to_string(pem).unwrap();

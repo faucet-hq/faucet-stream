@@ -41,7 +41,7 @@ fn the_shipped_example_suite_passes() {
         .arg("cli/examples/tests/template_suite.yaml")
         .assert()
         .success()
-        .stdout(contains("12 case(s): 12 passed, 0 failed"))
+        .stdout(contains("13 case(s): 13 passed, 0 failed"))
         // Every origin the suite exercises must actually have produced cases;
         // an `auto:` block that silently generated nothing would still print
         // "0 failed".
@@ -58,10 +58,9 @@ fn the_filter_narrows_the_run() {
         .args(["--filter", "auto:missing-*"])
         .assert()
         .success()
-        .stdout(contains("1 case(s): 1 passed, 0 failed"))
-        .stdout(contains("auto:missing-tenant_id"))
-        // A secret param is always placeholder-filled, so it is never omitted.
-        .stdout(contains("auto:missing-api_token").not());
+        .stdout(contains("2 case(s): 2 passed, 0 failed"))
+        .stdout(contains("auto:missing-api_token"))
+        .stdout(contains("auto:missing-tenant_id"));
 }
 
 #[test]
@@ -75,12 +74,12 @@ fn json_output_is_parseable_and_agrees_with_the_checklist() {
         .stdout
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&out).expect("--json emits parseable JSON");
-    assert_eq!(v["total"], 12);
-    assert_eq!(v["passed"], 12);
+    assert_eq!(v["total"], 13);
+    assert_eq!(v["passed"], 13);
     assert_eq!(v["failed"], 0);
     assert_eq!(v["template"], "cli/examples/rest_to_jsonl_templated.yaml");
     let cases = v["cases"].as_array().expect("cases array");
-    assert_eq!(cases.len(), 12);
+    assert_eq!(cases.len(), 13);
     assert!(
         cases.iter().all(|c| c["status"] == "pass"),
         "every case must report its own status: {v}"

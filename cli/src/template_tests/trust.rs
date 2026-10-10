@@ -90,14 +90,6 @@ pub fn screen_with(_policy: &ServerTestPolicy, doc: &Value) -> CliResult<()> {
     Ok(())
 }
 
-/// The message for a case that would need a secret param.
-pub fn secret_param_refused(name: &str) -> CliError {
-    CliError::Config(format!(
-        "param `{name}` is secret, and secret params are never supplied to tests — test the \
-         template with that param left to its default, or give it a non-secret default"
-    ))
-}
-
 /// The connectors and transforms compiled into this binary, sorted.
 pub fn build_features() -> Vec<String> {
     let mut out: Vec<String> = crate::registry::builtin_source_descriptions()
@@ -129,11 +121,6 @@ mod tests {
         let f = build_features();
         assert!(f.iter().any(|x| x.starts_with("source:")), "{f:?}");
         assert!(f.windows(2).all(|w| w[0] <= w[1]));
-        assert!(
-            secret_param_refused("token")
-                .to_string()
-                .contains("never supplied to tests")
-        );
     }
 
     #[cfg(feature = "serve")]

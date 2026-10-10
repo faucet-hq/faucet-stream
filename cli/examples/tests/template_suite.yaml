@@ -26,8 +26,7 @@ suite:
     # set — here, each of the three regions.
     enum_coverage: true
     # One case per `required` param, omitting it, asserting it fails *and* that
-    # the error names the param (secret params excepted: a test run always fills
-    # them with a placeholder, and never accepts a value for one). Pins that a missing value fails cleanly
+    # the error names the param. Pins that a missing value fails cleanly
     # instead of producing a config with a hole in it.
     required_omitted: true
     # The all-defaults combination — what most callers actually trigger, and
@@ -38,6 +37,7 @@ suite:
     - name: eu-small-pages
       params:
         tenant_id: acme
+        api_token: t0ken
         region: eu
         page_size: 50
 
@@ -48,13 +48,14 @@ suite:
     - name: rejects-an-undeclared-region
       params:
         tenant_id: acme
+        api_token: t0ken
         region: antarctica
       expect:
         error: region
 
   # A generated sweep. Required params the sweep does not name (`tenant_id`,
-  # and the secret `api_token`, which no case may set) are filled
-  # automatically, so the cases test the axes below and nothing else.
+  # `api_token`) are filled automatically, so the cases test the axes below and
+  # nothing else.
   combine:
     params:
       region: [us, eu, apac]

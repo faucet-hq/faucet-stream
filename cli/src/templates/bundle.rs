@@ -1658,32 +1658,35 @@ tests:
     }
 
     #[tokio::test]
-    async fn a_case_naming_a_secret_param_fails_and_a_required_one_gets_a_placeholder() {
+    async fn a_required_secret_is_missing_unless_a_case_names_it_and_its_value_is_redacted() {
         let s = store().await;
         let secret = pipeline("vaulted", 2).replace(
             "params:\n",
             "params:\n  token: { type: string, required: true, secret: true }\n",
         );
+        // The fixture leaves the required secret unset: it fails by name, as
+        // a real trigger would (no placeholder without a default to protect).
         let reg = register_tested(&s, req(secret.clone())).await.unwrap();
+        let t = reg.tests.unwrap();
+        assert!(!t.passed);
         assert!(
-            reg.tests.unwrap().passed,
-            "a required secret gets a placeholder"
+            t.cases
+                .iter()
+                .any(|c| c.name == "rows" && c.failure.as_deref().unwrap_or("").contains("token")),
+            "{t:#?}"
         );
+        // Named by the fixture, the value is used and never recorded.
         let named = secret.replacen(
-            "  suite:\n    auto:",
-            "  suite:\n    cases:\n      - name: leaks\n        params: { token: hunter2 }\n    auto:",
+            "    - name: rows\n",
+            "    - name: rows\n      params: { token: hunter2-856 }\n",
             1,
         );
         let reg = register_tested(&s, req(named)).await.unwrap();
         let t = reg.tests.unwrap();
-        assert!(!t.passed);
+        assert!(t.passed, "{t:#?}");
         assert!(
-            t.cases.iter().any(|c| c
-                .failure
-                .as_deref()
-                .unwrap_or("")
-                .contains("never supplied to tests")),
-            "{t:#?}"
+            !serde_json::to_string(&t).unwrap().contains("hunter2-856"),
+            "the recorded result never carries the value"
         );
     }
 

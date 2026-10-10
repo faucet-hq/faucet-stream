@@ -707,13 +707,13 @@ mod tests {
             tracing::info!("orphan event");
             let span = tracing::info_span!("faucet.serve.run", serve_run_id = "run-xyz");
             let _g = span.enter();
-            tracing::info!("hello from the run");
+            tracing::info!("run-span event 7f3a");
         });
         let (snapshot, _rx, _ended) = hub.reader("run-xyz").expect("buffer for the run exists");
         let captured = snapshot
             .iter()
-            .find(|l| l.line.contains("hello from the run"))
-            .expect("in-span event must be captured");
+            .find(|l| l.line.contains("run-span event 7f3a"))
+            .unwrap_or_else(|| panic!("in-span event must be captured: {snapshot:?}"));
         // The rendered line is self-describing: it leads with an RFC3339 timestamp,
         // then the level and target, mirroring the stderr fmt format.
         assert!(

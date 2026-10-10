@@ -143,7 +143,34 @@ pub async fn run_suite(
         c.duration_ms = elapsed_ms(started);
         outcome.cases.push(c);
     }
+    redact_secret_params(&mut outcome, &params_spec);
     Ok(outcome)
+}
+
+/// Record a secret param a case named as `***`, so a test result never
+/// carries its value.
+fn redact_secret_params(outcome: &mut SuiteOutcome, params: &crate::params::ParamsSpec) {
+    for c in &mut outcome.cases {
+        let mut values = Vec::new();
+        for (name, v) in c.params.iter_mut() {
+            if params.get(name).is_some_and(|p| p.secret) {
+                let text = match &*v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if !text.is_empty() {
+                    values.push(text);
+                }
+                *v = Value::String("***".into());
+            }
+        }
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        if let Some(f) = &mut c.failure {
+            for v in &values {
+                *f = f.replace(v.as_str(), "***");
+            }
+        }
+    }
 }
 
 /// Run fixture cases (the `faucet test` grammar) against `target`.
@@ -171,6 +198,9 @@ pub async fn run_fixtures(
             attempts,
             duration_ms: elapsed_ms(started),
         });
+    }
+    if let Ok(params) = declared_params(target).await {
+        redact_secret_params(&mut outcome, &params);
     }
     outcome
 }
@@ -656,20 +686,15 @@ fn pick_row<'a>(
 
 /// Materialize the template body for one param combination.
 async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> CliResult<String> {
-    // A secret param only ever gets a placeholder here — its default is
-    // never resolved — and a value a case names for one is refused.
+    // A secret param's default is never resolved: an unset one that has a
+    // default gets a placeholder (one without stays missing, and fails by
+    // name as a real trigger would). A value the case itself names is used,
+    // and recorded as `***` (see `redact_secret_params`).
     let mut owned = supplied.clone();
+    let defaulted = secret_params_with_default(&effective_document(target).await?);
     for (name, p) in declared_params(target).await? {
-        if !p.secret {
-            continue;
-        }
-        let placeholder = p.kind.placeholder();
-        match owned.get(&name) {
-            Some(v) if *v != placeholder => return Err(super::trust::secret_param_refused(&name)),
-            Some(_) => {}
-            None => {
-                owned.insert(name, placeholder);
-            }
+        if defaulted.contains(&name) && !owned.contains_key(&name) {
+            owned.insert(name, p.kind.placeholder());
         }
     }
     let supplied = &owned;
@@ -734,6 +759,23 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
 
 /// Drop the default of every `secret: true` param (and mark it required), so
 /// a test never resolves one: the run supplies a placeholder instead.
+/// The secret params a document declares with a `default:`.
+fn secret_params_with_default(doc: &Value) -> std::collections::BTreeSet<String> {
+    doc.get("params")
+        .and_then(Value::as_object)
+        .map(|params| {
+            params
+                .iter()
+                .filter(|(_, spec)| {
+                    spec.get("secret").and_then(Value::as_bool) == Some(true)
+                        && spec.get("default").is_some()
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn neutralize_secret_defaults(doc: &mut Value) {
     let Some(params) = doc.get_mut("params").and_then(Value::as_object_mut) else {
         return;
@@ -1485,6 +1527,38 @@ suite:
         .expect_err("sink alone")
         .to_string();
         assert!(err.contains("no streams"), "{err}");
+    }
+
+    #[test]
+    fn a_secret_params_value_is_recorded_redacted() {
+        let mut params = crate::params::ParamsSpec::new();
+        for (name, secret) in [("token", true), ("region", false)] {
+            params.insert(
+                name.into(),
+                serde_json::from_value(serde_json::json!({ "type": "string", "secret": secret }))
+                    .unwrap(),
+            );
+        }
+        let mut outcome = SuiteOutcome {
+            cases: vec![CaseOutcome {
+                name: "c".into(),
+                origin: "explicit",
+                params: [
+                    ("token".to_string(), Value::from("hunter2-runner")),
+                    ("region".to_string(), Value::from("eu")),
+                ]
+                .into(),
+                passed: false,
+                failure: Some("bad token hunter2-runner".into()),
+                attempts: 1,
+                duration_ms: 0,
+            }],
+        };
+        redact_secret_params(&mut outcome, &params);
+        let c = &outcome.cases[0];
+        assert_eq!(c.params["token"], Value::from("***"));
+        assert_eq!(c.params["region"], Value::from("eu"));
+        assert!(!c.failure.as_deref().unwrap().contains("hunter2-runner"));
     }
 
     #[test]
