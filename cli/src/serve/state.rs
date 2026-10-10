@@ -53,6 +53,8 @@ struct Inner {
     /// handlers and the console.
     #[cfg(feature = "templates-sync")]
     templates_sync: RwLock<Option<Arc<crate::templates::sync::SyncFile>>>,
+    #[cfg(feature = "templates")]
+    test_policy: RwLock<Option<crate::template_tests::trust::ServerTestPolicy>>,
     /// The server-wide data-flow policy (`--policy`, #702), when one was given.
     #[cfg(feature = "policy")]
     policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
@@ -106,6 +108,8 @@ impl ServerState {
                 triggers,
                 #[cfg(feature = "templates-sync")]
                 templates_sync: RwLock::new(None),
+                #[cfg(feature = "templates")]
+                test_policy: RwLock::new(None),
                 #[cfg(feature = "policy")]
                 policy: RwLock::new(None),
                 #[cfg(feature = "tenants")]
@@ -195,6 +199,26 @@ impl ServerState {
     pub fn policy(&self) -> Option<Arc<faucet_core::PolicySpec>> {
         self.inner
             .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Set the policy template tests run under on this server (#856).
+    #[cfg(feature = "templates")]
+    pub fn set_test_policy(&self, policy: crate::template_tests::trust::ServerTestPolicy) {
+        *self
+            .inner
+            .test_policy
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(policy);
+    }
+
+    /// The policy template tests run under on this server (#856).
+    #[cfg(feature = "templates")]
+    pub fn test_policy(&self) -> Option<crate::template_tests::trust::ServerTestPolicy> {
+        self.inner
+            .test_policy
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()

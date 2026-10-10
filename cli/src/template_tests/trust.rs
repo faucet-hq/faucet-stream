@@ -1,12 +1,13 @@
 //! Where and how a template's tests run (#856): the server's trust boundary
 //! for test runs it performs, and the limits every run is held to.
 //!
-//! `faucet serve` installs a [`ServerTestPolicy`] at startup. While one is
-//! installed, every document a test run executes is screened exactly like a
-//! submitted config (the server's own credentials and, unless allowed,
-//! subprocess connectors are refused), and each result records the instance
-//! that produced it. The CLI, which already holds direct store access, runs
-//! without one.
+//! `faucet serve` scopes a [`ServerTestPolicy`] around every request and
+//! background task it runs ([`with_server_policy`]). Inside that scope every
+//! document a test run executes is screened for the server's own credentials,
+//! and each result records the instance that produced it. The documents are
+//! registered template versions, which the server already trusts to run, so
+//! subprocess connectors are not refused here. The CLI, which already holds
+//! direct store access, runs without a policy.
 
 use std::sync::RwLock;
 use std::time::Duration;
@@ -20,22 +21,23 @@ use crate::error::{CliError, CliResult};
 pub struct ServerTestPolicy {
     /// This server instance, recorded on every result it produces.
     pub instance: String,
-    /// `--allow-subprocess-connectors`.
-    pub allow_subprocess: bool,
 }
 
-static POLICY: RwLock<Option<ServerTestPolicy>> = RwLock::new(None);
-
-/// Install the policy for this process (called by `faucet serve`).
-pub fn install_server_policy(policy: ServerTestPolicy) {
-    if let Ok(mut p) = POLICY.write() {
-        *p = Some(policy);
-    }
+tokio::task_local! {
+    static POLICY: ServerTestPolicy;
 }
 
-/// The installed policy, if this process is a server.
+/// Run `fut` as work of the server `policy` belongs to.
+pub async fn with_server_policy<F: std::future::Future>(
+    policy: ServerTestPolicy,
+    fut: F,
+) -> F::Output {
+    POLICY.scope(policy, fut).await
+}
+
+/// The policy of the server this task works for, if any.
 pub fn server_policy() -> Option<ServerTestPolicy> {
-    POLICY.read().ok().and_then(|p| p.clone())
+    POLICY.try_with(Clone::clone).ok()
 }
 
 /// The limits a test run is held to.
@@ -89,24 +91,12 @@ pub fn screen(doc: &Value) -> CliResult<()> {
 }
 
 /// [`screen`] under an explicit policy.
-pub fn screen_with(policy: &ServerTestPolicy, doc: &Value) -> CliResult<()> {
+pub fn screen_with(_policy: &ServerTestPolicy, doc: &Value) -> CliResult<()> {
     #[cfg(feature = "serve")]
-    {
-        crate::serve::load::refuse_server_secrets(doc)
-            .map_err(|e| CliError::Config(format!("refused by the server: {e}")))?;
-        if !policy.allow_subprocess {
-            let kinds = crate::serve::load::subprocess_kinds_in(doc);
-            if !kinds.is_empty() {
-                return Err(CliError::Config(format!(
-                    "refused by the server: connector type(s) {} run a program on the server, \
-                     and this server was not started with --allow-subprocess-connectors",
-                    kinds.into_iter().collect::<Vec<_>>().join(", ")
-                )));
-            }
-        }
-    }
+    crate::serve::load::refuse_server_secrets(doc)
+        .map_err(|e| CliError::Config(format!("refused by the server: {e}")))?;
     #[cfg(not(feature = "serve"))]
-    let _ = (doc, policy);
+    let _ = doc;
     Ok(())
 }
 
@@ -156,30 +146,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_server_refuses_its_own_secrets_and_unallowed_subprocesses() {
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn a_server_refuses_its_own_secrets_but_runs_its_trusted_templates() {
         let policy = ServerTestPolicy {
             instance: "i-1".into(),
-            allow_subprocess: false,
         };
         let secret = serde_json::json!({"x": "${env:FAUCET_VAULT_KEY}"});
-        let e = screen_with(&policy, &secret).unwrap_err().to_string();
-        assert!(e.contains("refused by the server"), "{e}");
         let singer = serde_json::json!({"pipeline": {"source": {"type": "singer"}}});
-        let e = screen_with(&policy, &singer).unwrap_err().to_string();
-        assert!(e.contains("--allow-subprocess-connectors"), "{e}");
-        let allowed = ServerTestPolicy {
-            allow_subprocess: true,
-            ..policy
-        };
-        screen_with(&allowed, &singer).unwrap();
-        screen_with(&allowed, &serde_json::json!({"x": "plain"})).unwrap();
+        with_server_policy(policy.clone(), async {
+            assert_eq!(server_policy(), Some(policy.clone()));
+            let e = screen(&secret).unwrap_err().to_string();
+            assert!(e.contains("refused by the server"), "{e}");
+            screen(&singer).unwrap();
+        })
+        .await;
     }
 
-    #[test]
-    fn outside_a_server_nothing_is_screened() {
-        if server_policy().is_none() {
-            screen(&serde_json::json!({"x": "${env:FAUCET_VAULT_KEY}"})).unwrap();
-        }
+    #[tokio::test]
+    async fn the_policy_is_scoped_to_its_server_task() {
+        assert_eq!(server_policy(), None);
+        screen(&serde_json::json!({"x": "${env:FAUCET_VAULT_KEY}"})).unwrap();
+        let a = ServerTestPolicy {
+            instance: "a".into(),
+        };
+        let b = ServerTestPolicy {
+            instance: "b".into(),
+        };
+        let (ra, rb) = tokio::join!(
+            with_server_policy(a.clone(), async { server_policy() }),
+            with_server_policy(b.clone(), async { server_policy() }),
+        );
+        assert_eq!((ra, rb), (Some(a), Some(b)));
+        assert_eq!(server_policy(), None);
     }
 }

@@ -282,7 +282,27 @@ pub fn build_router(
         .layer(RequestBodyLimitLayer::new(config.body_limit_bytes))
         .layer(axum::middleware::from_fn(metrics::track_metrics))
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            scope_test_policy,
+        ))
         .with_state(state)
+}
+
+/// Run each request as this server's work, so template tests it starts
+/// screen for this server's credentials and record its instance (#856).
+async fn scope_test_policy(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    #[cfg(feature = "templates")]
+    if let Some(policy) = state.test_policy() {
+        return crate::template_tests::trust::with_server_policy(policy, next.run(req)).await;
+    }
+    #[cfg(not(feature = "templates"))]
+    let _ = &state;
+    next.run(req).await
 }
 
 /// The `--cors-origin` layer: the listed origins may call every `/v1` route
@@ -835,16 +855,13 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
-    // Template tests this server runs are screened like submitted configs
-    // and record this instance on their results (#856).
+    // Template tests this server runs screen for its credentials and record
+    // this instance on their results (#856).
     #[cfg(feature = "templates")]
     {
-        crate::template_tests::trust::install_server_policy(
-            crate::template_tests::trust::ServerTestPolicy {
-                instance: instance_id.clone(),
-                allow_subprocess: config.allow_subprocess_connectors,
-            },
-        );
+        state.set_test_policy(crate::template_tests::trust::ServerTestPolicy {
+            instance: instance_id.clone(),
+        });
         crate::templates::metrics::describe();
     }
     #[cfg(feature = "policy")]
@@ -869,7 +886,12 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             state.set_templates_sync(std::sync::Arc::clone(file));
             let store: crate::templates::TemplateStore = state.history();
             for origin in &file.origins {
-                match crate::templates::sync::sync_origin(&store, origin, false, None).await {
+                let synced = crate::templates::sync::sync_origin(&store, origin, false, None);
+                let synced = match state.test_policy() {
+                    Some(p) => crate::template_tests::trust::with_server_policy(p, synced).await,
+                    None => synced.await,
+                };
+                match synced {
                     Ok(r) => tracing::info!(
                         origin = %r.origin,
                         mutations = r.mutations(),
@@ -885,6 +907,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
                 store,
                 std::sync::Arc::clone(file),
                 shutdown.clone(),
+                state.test_policy(),
             )
         }
         None => Vec::new(),
@@ -894,8 +917,14 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     #[cfg(feature = "templates")]
     {
         let store: crate::templates::TemplateStore = state.history();
+        let policy = state.test_policy();
         tokio::spawn(async move {
-            match crate::templates::revalidate::revalidate_if_new_release(&store).await {
+            let revalidated = crate::templates::revalidate::revalidate_if_new_release(&store);
+            let revalidated = match policy {
+                Some(p) => crate::template_tests::trust::with_server_policy(p, revalidated).await,
+                None => revalidated.await,
+            };
+            match revalidated {
                 Ok(Some(r)) => tracing::info!(
                     versions = r.versions.len(),
                     failed = r.failed(),

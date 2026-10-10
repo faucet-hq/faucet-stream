@@ -749,10 +749,14 @@ database). Metrics: `faucet_serve_template_tests_total{outcome}`,
 
 ### Inside the server's trust boundary
 
-Tests a server runs are screened exactly like a submitted config: a template
-that reads the server's own credentials, or a subprocess connector (`singer`)
-on a server without `--allow-subprocess-connectors`, fails its tests with the
-reason — so it can never take a label there.
+A server runs the tests of registered versions only, which it already trusts to
+run, so they get the same trust as the template's own runs: a subprocess
+connector (`singer`) is allowed, as it is when the template runs. Every
+document a test executes is still screened for the server's own credentials
+(`FAUCET_VAULT_KEY`, the serve tokens, the auth-config sources) before any
+`${env:}` / `${file:}` resolves; a template that reads them fails its tests
+with the reason, so it can never take a label there. Each result records the
+server instance that produced it.
 
 > **Breaking change.** There is no longer a `--require-template-tests` switch,
 > `--require-tests` or `--skip-tests-reason`: the rules above always apply.
