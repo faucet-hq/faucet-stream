@@ -3,11 +3,11 @@
 # version; `faucet run` ignores it.
 #
 #   faucet template test cli/examples/csv_to_jsonl_with_tests.yaml      # offline, no registry
-#   faucet template register cli/examples/csv_to_jsonl_with_tests.yaml --test --store sqlite:faucet.db
-#   faucet template launch orders_export --require-tests --store sqlite:faucet.db
+#   faucet template register cli/examples/csv_to_jsonl_with_tests.yaml --store sqlite:faucet.db
+#   faucet template launch orders_export --store sqlite:faucet.db
 #
-# On `faucet serve --require-template-tests` a version launches only with a
-# passing result recorded under this faucet major version.
+# Registering runs the bundle and records the result; only a version whose
+# tests pass under the running faucet major.minor can be launched.
 kind: pipeline
 version: 1
 name: orders_export

@@ -312,7 +312,7 @@ faucet schema source-template | sink-template | deployment | test-suite | templa
 ```
 
 `hub check` and `hub lint` also run every template's **test bundle** (its
-`tests:` block, see [Test bundles](templates.md#test-bundles-and-the-launch-gate)):
+`tests:` block, see [Test bundles](templates.md#template-tests-and-labels)):
 check runs the source's and the sink's, lint runs every source, sink and
 deployment in the catalog (or the files named). A failing case is a finding and
 fails the command. A bundle's companions (`tests.sink`, `tests.source`,

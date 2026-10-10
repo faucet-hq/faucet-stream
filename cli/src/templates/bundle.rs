@@ -1,5 +1,5 @@
-//! Running a registered version's test bundle, recording the result, and the
-//! launch gate over the registry (#856).
+//! Running a registered version's test bundle, recording the result as
+//! evidence, and the one check every label move goes through (#856).
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};

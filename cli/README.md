@@ -1371,19 +1371,27 @@ is the failed-case count. Example:
 [`examples/tests/template_suite.yaml`](examples/tests/template_suite.yaml);
 `faucet schema template-test` prints the suite schema.
 
-**Test bundles and the launch gate (#856).** A template document may carry its
+**Template tests and labels (#856).** A template document may carry its
 own `tests:` block — `suite:` cases, `fixtures:` (`faucet test` cases run through
 the template, `retries: n` explicit and recorded) and `requires_suites:` (shared
 `kind: test-suite` documents picked by semver range over their `release:`). It
 is stored with the version, so a test change is a new version. `faucet template
-test <file>` runs a bundle offline; `faucet template test <id>@<version> --store
-…` (or `register --test`, or `POST /v1/templates/{id}/versions/{version}/test`)
-runs a registered version's bundle and records the result on it. With `faucet
-serve --require-template-tests` (off by default) — and `--require-tests` on the
-CLI — every launch (HTTP, MCP, sync, approved change requests) needs a passing
-result recorded under the running faucet major version; an admin can override
-with `--skip-tests-reason` / `skip_tests_reason`, written to the launch log and
-the audit log. `faucet hub check` / `lint` run hub templates' bundles. Example:
+test <file>` runs a bundle offline; registering a version runs and records its
+bundle, and `faucet template test <id>@<version> --store …` (or `POST
+/v1/templates/{id}/versions/{version}/test`) runs it again. Only a `passing`
+version — tests passed for this exact body under the running faucet
+major.minor — takes a label (`stable`, any channel, a rollback target), through
+every path and with no override; an `untested` one is tested first. After the
+first launch every new version has tests (a version without a block inherits the
+previous one's), and a pinned run of an unlabelled, non-passing version needs
+`--allow-untested` / `allow_untested` (labelled and audited; never for a tenant).
+Runs through a label always go ahead. `faucet template revalidate` (and `faucet
+serve` on a new release line) re-tests label holders and rollback targets,
+recording results only. **Breaking change:** `--require-template-tests`,
+`--require-tests` and `--skip-tests-reason` are gone; a template launched before
+this release without tests keeps its labels but cannot register a new version or
+roll back until a version with a `tests:` block is registered — see
+[Template tests and labels](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#template-tests-and-labels). `faucet hub check` / `lint` run hub templates' bundles. Example:
 [`examples/csv_to_jsonl_with_tests.yaml`](examples/csv_to_jsonl_with_tests.yaml);
 `faucet schema template-tests` / `faucet schema test-suite` print the schemas.
 

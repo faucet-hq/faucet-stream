@@ -28,6 +28,7 @@ triggers:
       params: {}            # optional; string values may use ${trigger.*}
       sink: <sink template> # optional: for a source template
       overlay: <overlay id> # optional deployment overlay
+      allow_untested: false # optional: run a pinned version whose tests are not passing (#856)
     tenants: all            # optional: `all` or [tenant ids] — one run per tenant
     run:                    # optional run-shaping
       name: <template>      # run name; supports {name}, {object_key}, {bucket}, etc.
@@ -42,6 +43,11 @@ The `config:` field accepts either a **path string** (resolved **relative to the
 triggers file**, not the process CWD) or an **inline pipeline document**
 (`{ pipeline: … }`). `template:` runs a registered
 [template](../cookbook/templates.md) instead (needs the `templates` feature).
+A trigger pinned to a version that holds no label and whose tests are not
+passing needs `allow_untested: true`; each such run is labelled and audited, the
+server logs a warning naming the trigger when the file loads, and
+`allow_untested` together with `tenants:` is refused (see
+[Runs follow labels](../cookbook/templates.md#runs-follow-labels)).
 `tenants:` fans each fire out to one run per tenant, each run **as** that
 tenant — its connections, `${tenant.*}` values, state namespace and limits
 ([embedded integrations](../cookbook/embedded-integrations.md); needs the

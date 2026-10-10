@@ -575,7 +575,7 @@ machine-readable report. The exit code is the failed-case count, mirroring
 `faucet test`, so CI gates on it without parsing output. `faucet schema
 template-test` prints the suite schema.
 
-## Test bundles and the launch gate
+## Template tests and labels
 
 A suite file lives next to a template; a **test bundle** lives *inside* it. Add a
 `tests:` block to any template document — `kind: pipeline`, `source-template`,
@@ -619,26 +619,37 @@ tests:
 | `sink` / `source` / `overlay` (+ `*_select`) | The companions a hub kind composes with: a source template names its `sink` (and optionally an `overlay`); a sink template names its `source`; a deployment overlay names both. Selectors default to `stable`. A `pipeline` takes none. |
 | `retries` (on any case) | Extra attempts, at most 5. A case that passed on a retry says so (`attempts`). |
 
-Everything runs **offline**: records are inline (a fixture path is refused — the
-version stores only the document) and no connector is ever opened. Live checks
-against real systems are deliberately not part of the gate.
+Everything runs **offline** and repeatably: records are inline (a fixture path is
+refused — the version stores only the document), no connector is ever opened,
+every case runs at a fixed clock (`2000-01-01T00:00:00Z` unless the fixture sets
+`clock:`), and a `secret: true` param only ever gets a placeholder (a case that
+names a value for one fails, saying so). A flaky test is a bug in the test;
+`retries` must be written into the case. Each case has a 60-second limit, a run a
+10-minute budget, and a `tests:` block may be at most 1 MiB; hitting a limit
+records a failure with the reason.
+
+A **deployment** overlay's bundle is structural: naming its `source` and `sink`
+is enough, and the run composes the three and checks the result validates and
+expands. Fixture cases are optional.
 
 ### Running a bundle
 
 ```bash
 faucet template test cli/examples/csv_to_jsonl_with_tests.yaml          # a file — no registry
-faucet template register orders.yaml --test --store sqlite:./faucet-templates.db
+faucet template register orders.yaml --store sqlite:./faucet-templates.db     # runs + records the bundle
 faucet template test orders_export@3 --store sqlite:./faucet-templates.db   # run + record on v3
 faucet template test orders_export@3 --no-record --filter 'auto:*' --store …  # a subset, not recorded
 ```
 
-A registered run is **recorded on the version**: per-case pass/fail, attempts and
-duration, the faucet binary version, the time, who ran it, the sha256 of the body
-it tested, and which shared-suite releases it resolved. The newest 20 runs per
-version are kept; deleting a version (or the template) deletes its results. Over
-HTTP: `POST /v1/templates` with `"test": true`, `POST
-/v1/templates/{id}/versions/{version}/test`, and `GET …/versions/{version}/tests`;
-over MCP: `register_template {test: true}` and `test_template`.
+Registering a version runs its bundle. Every registered run is **recorded on the
+version** as evidence: a result id, per-case pass/fail, attempts and duration, the
+sha256 of the body it tested, the full faucet version, the connectors and
+transforms compiled in, any plugin connectors, the shared-suite releases and
+companion templates it ran with, the server instance (when a server ran it) and
+who asked. The newest 20 runs per version are kept; deleting a version (or the
+template) deletes its results. No API accepts a result — evidence comes only
+from a test run. Over HTTP: `POST /v1/templates/{id}/versions/{version}/test` and
+`GET …/versions/{version}/tests`; over MCP: `test_template`.
 
 ### Shared suites
 
@@ -656,53 +667,105 @@ fixtures: [ … ]
 ```
 
 A `requires_suites` range resolves to the **highest registered, non-deprecated
-release** in range each time the bundle runs; the result records which release ran.
+release** in range when the requiring version is **registered**, and that release
+is copied into the version (`tests.locked_suites`, written by the registry), like a
+lockfile. A later release, a retired release or a deleted suite never changes what
+an existing version tests.
 A release is immutable — registering the same `release:` twice is refused. A range
 nothing satisfies fails **registration** of the requiring template with a typed
 error naming the suite, the range and the releases that exist. A test-suite is
 never runnable on its own. `faucet schema test-suite` / `faucet schema
 template-tests` print the two schemas.
 
-### The launch gate
+### Labels need passing tests
 
-`faucet serve --require-template-tests` (or `FAUCET_REQUIRE_TEMPLATE_TESTS=1`)
-makes the registry refuse to **launch** a version unless a passing bundle result is
-recorded for that exact version body under the **running faucet major version**.
-Every launch path goes through the same check — `POST /v1/templates/{id}/launch`
-and `/rollback`, a register with `launch: true` (the bundle runs first), the MCP
-`launch_template` / `rollback_template` / `register_template` tools, template sync
-launches, and approved `template_launch` change requests. A refusal is a `422`
-whose `error.details.gate` lists the failing cases, and is audited
-(`template.launch`, result `refused`).
+Every **label** — `stable` (launch), `previous` as a rollback target, every
+environment channel including `dev` and `test`, and `newest` once a template has
+been launched — only moves onto a version whose status is **`passing`**:
 
-| Version | `--require-template-tests` off (default) | on |
+| Status | Means | Can take a label |
 |---|---|---|
-| passing result, this major | launches | launches |
-| failing result | launches (console warns) | refused, failing cases listed |
-| results only from another major, or another body | launches | refused — rerun the bundle |
-| bundle never run | launches | refused |
-| no `tests:` block | launches | launches — tests are optional |
+| `passing` | Its tests ran and passed for this exact body under the running faucet **major.minor** | yes |
+| `failing` | Its newest such result failed | no |
+| `untested` | It has tests but no result for this body under this faucet major.minor | after its tests run and pass |
+| `no_tests` | No `tests:` block (an empty or zero-case block counts as none) | no |
 
-An admin can launch past a refusal with a reason — `--skip-tests-reason "<why>"`
-on `faucet template launch|rollback|register`, `skip_tests_reason` in the HTTP
-body or MCP arguments. The reason is written on the launch log (`tests_skipped`)
-and in the audit log (`detail: tests skipped: <why>`). The override is admin-only
-however it arrives: the launch routes and tools already are, and a change request
-carrying `skip_tests_reason` may only be proposed by an admin.
+One check covers every way a label moves — launch, rollback, promote, a register
+with `launch` / `tags`, template sync, approved change requests and MCP — and
+there is no override for anyone. Moving a label onto an `untested` version runs
+its tests first, records the result, and proceeds only if they pass; a `failing`
+version is never re-run automatically. A refusal is a `422` whose
+`error.details.tests` lists the status and failing cases, and is audited
+(`template.launch`, result `refused`). Each move records the result it relied on
+(`evidence` on the launch log and on each channel), re-read in the same
+transaction as the move, so a result recorded in between can never be skipped.
 
-The CLI applies the gate with `--require-tests` on `faucet template launch`,
-`rollback`, `register --launch` and `sync`.
+Status gates labels, never registration: a failing version is still registered,
+so its author sees the failing cases. Status is derived from the recorded
+results, never stored, and **labels never move by themselves** — a failing
+re-run, a faucet upgrade or a deleted suite only blocks *future* moves onto that
+version.
 
-> **Migration.** The gate is **off by default** in this release so existing
-> deployments keep launching as before. To adopt it: add `tests:` blocks, run
-> `faucet template test <id>@<version>` for each version you intend to launch
-> (or re-register with `--test`), then start the server with
-> `--require-template-tests`. After a faucet major upgrade, rerun the bundles —
-> results from the previous major no longer count.
+**Drafts.** A template with no launch in its history is a draft: its versions may
+have tests or not, passing or failing, and any of them runs when pinned. Deleting
+the whole template deletes its evidence, so registering it again starts a new
+draft.
 
-The console's versions page shows each version's test status and recent runs, a
-**Run tests** button, and disables **Launch** with the failing cases listed when
-the gate would refuse.
+**After the first launch, every new version has tests.** A version registered
+without a `tests:` block inherits the newest earlier version's block, copied into
+the new version (`tests.inherited_from` records where from; the response carries
+`tests_inherited_from`). With nothing to inherit, the registration is refused
+with a message saying to add a `tests:` block.
+
+### Runs follow labels
+
+A run that resolves **through a label** — `stable`, a channel, or `newest` —
+always goes ahead, even after a faucet upgrade has made that version's evidence
+stale: the label was justified when it moved. After the first launch, a run of a
+**pinned** version that holds no label and is not `passing` is refused unless the
+request sets `allow_untested: true` (`--allow-untested` on `faucet template run`,
+the `allow_untested` argument of MCP `run_template`, `allow_untested` on a
+trigger's `template:`). Such a run is labelled `allow_untested=true` and audited
+(`template.run`, detail naming the status). It needs only the run permission.
+`allow_untested` never affects labels, and a tenant-scoped principal or a run made
+for a tenant can never use it (`403`, audited). A trigger that sets it is logged
+when the triggers file loads.
+
+A composed run checks each part — source, sink and overlay — through its own
+label.
+
+### Faucet upgrades and revalidation
+
+Evidence counts only under the faucet **major.minor** that produced it. After an
+upgrade the labels stay where they are and keep authorizing runs, but moving one
+needs fresh evidence. `faucet template revalidate --store …` re-runs the tests of
+every version that holds a label or is a rollback target (`previous`), records
+the results, and exits with the number that no longer pass; it never moves a
+label. `faucet serve` does the same in the background when it starts on a
+release line other than the one it last revalidated under (kept in the history
+database). Metrics: `faucet_serve_template_tests_total{outcome}`,
+`faucet_serve_template_label_refusals_total{reason}`,
+`faucet_serve_template_revalidations_total{outcome}`.
+
+### Inside the server's trust boundary
+
+Tests a server runs are screened exactly like a submitted config: a template
+that reads the server's own credentials, or a subprocess connector (`singer`)
+on a server without `--allow-subprocess-connectors`, fails its tests with the
+reason — so it can never take a label there.
+
+> **Breaking change.** There is no longer a `--require-template-tests` switch,
+> `--require-tests` or `--skip-tests-reason`: the rules above always apply.
+> **Migrating:** a template already launched without tests keeps its labels and
+> keeps running, but it cannot register a new version or roll back until a
+> version with tests exists. Add a `tests:` block (even a minimal
+> `suite: { auto: { defaults_baseline: true } }`), register that version, and
+> launch it. Before upgrading, check that your label-holding versions pass with
+> `faucet template revalidate`.
+
+The console shows each template's stable test status in the list, each version's
+status and recent runs on the versions page, a **Run tests** button, and disables
+**Launch** and the channel selector on a version that cannot take a label.
 
 ## Running a subset of streams
 

@@ -1031,8 +1031,10 @@ faucet template test      suite.yaml                            # suite names a 
 faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
 faucet template test      orders.yaml                           # a template's own tests: bundle, offline
 faucet template test      orders@3 --store sqlite:./faucet-templates.db   # run v3's bundle and record the result
-faucet template register  orders.yaml --test [--launch --require-tests] --store …  # register, test, launch through the gate
-faucet template launch    orders --version 3 --require-tests [--skip-tests-reason "INC-7"] --store …
+faucet template register  orders.yaml [--launch] --store …    # register (runs + records its tests); launch needs passing
+faucet template launch    orders --version 3 --store …        # only a passing version takes a label
+faucet template run       orders --version 2 --allow-untested --store …   # a pinned, unlabelled, non-passing version; labelled + audited
+faucet template revalidate --store … [--json]                 # re-test label holders + rollback targets under this release
 faucet template sync      --store sqlite:./faucet-templates.db --config sync.yaml --dry-run   # pull remote origins (RFC 0006)
 faucet template sync      --store sqlite:./faucet-templates.db --config sync.yaml --origin platform
 faucet template publish   platform-nightly --store sqlite:./faucet-templates.db --config sync.yaml --origin platform
@@ -1129,12 +1131,16 @@ Given a template file with a `tests:` block, `faucet template test` runs that
 **bundle** offline (companions and shared suites from `--hub`); given
 `<id>@<version>` with `--store`, it runs the registered version's bundle and
 **records** the result on it (`--no-record` to just look; `--filter` needs
-`--no-record`, since a subset is not a result). `register --test` does the same
-right after registering. `launch`, `rollback`, `register --launch` and `sync` take
-`--require-tests` (env `FAUCET_REQUIRE_TEMPLATE_TESTS`): refuse a version without
-a passing result recorded under this faucet major version; `--skip-tests-reason`
-launches anyway and writes the reason on the launch log. See
-[Test bundles and the launch gate](../cookbook/templates.md#test-bundles-and-the-launch-gate).
+`--no-record`, since a subset is not a result). `register` runs and records the
+new version's bundle itself. Every label move (`launch`, `rollback`, `promote`,
+`register --launch` / `--tag`, `sync`) needs a `passing` version, with no override;
+after a template's first launch, `template run` of a pinned version that holds no
+label and is not passing needs `--allow-untested`. `faucet template revalidate`
+re-runs the tests of every label holder and rollback target under the running
+faucet release, records the results, never moves a label, and exits with the
+number that no longer pass. `--require-tests` and `--skip-tests-reason` were
+removed. See
+[Template tests and labels](../cookbook/templates.md#template-tests-and-labels).
 
 ## `hub`
 
@@ -1380,7 +1386,6 @@ Selected flags (`faucet serve --help` for the full list):
 | `--log-link-template <url>` | Link to a run's logs in the log service, shown in the console and returned by the log endpoint once the local copy aged out. Placeholders `{run_id} {pipeline} {row} {tenant} {started_at} {ended_at}` (env `FAUCET_SERVE_LOG_LINK_TEMPLATE`). |
 | `--log-export-notify-after-secs <n>` | Emit `log_export_failed` once a run's log export has been failing this long (default `300`). |
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](./triggers.md). |
-| `--require-template-tests` | Refuse every template launch (HTTP, MCP, template sync, approved change requests) unless the version's `tests:` bundle has a passing result recorded under this faucet major version; admins may override with `skip_tests_reason`, which is audited. Env `FAUCET_REQUIRE_TEMPLATE_TESTS`. Off by default. See [the launch gate](../cookbook/templates.md#the-launch-gate). |
 | `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`) and cannot be combined with `--templates-sync`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
 | `--vault-key <key>` | Key that seals tenant connection credentials at rest (AES-256-GCM; env `FAUCET_VAULT_KEY`). At least 32 bytes of random key material (`openssl rand -hex 32`); a shorter key is refused at startup. Each sealed value is bound to its owner (tenant + connection), so a row copied onto another record does not open. Without it the server refuses to store or open [tenant connections](../cookbook/embedded-integrations.md). Requires the `tenants` feature. |

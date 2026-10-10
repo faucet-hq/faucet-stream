@@ -419,10 +419,9 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
     register_tested(store, req).await.map(|r| r.record)
 }
 
-/// [`register`], also running the new version's test bundle (`req.test`, or a
-/// launch under a test gate) and launching it through the gate
-/// (`req.launch`). A refused launch leaves the version registered, inert, and
-/// says so.
+/// [`register`], also running and recording the new version's test bundle,
+/// then moving `req.tags` / `req.launch` onto it through the label check. A
+/// refused label leaves the version registered, unlabelled, and says so.
 pub async fn register_tested(
     store: &TemplateStore,
     req: RegisterRequest,
