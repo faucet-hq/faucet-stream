@@ -158,6 +158,7 @@
       "description": "Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert",
       "docs": "https://faucet-hq.github.io/faucet-stream/reference/connectors.html",
       "file": "sink-templates/faucet-hq/bigquery.yaml",
+      "has_tests": false,
       "id": "faucet-hq/bigquery",
       "name": "bigquery",
       "official": true,
@@ -189,10 +190,12 @@
         }
       ],
       "sink_type": "bigquery",
+      "stable_test_status": "no_tests",
       "tags": [
         "warehouse",
         "gcp"
       ],
+      "test_cases": 0,
       "write_modes": [
         "append",
         "upsert",
@@ -204,6 +207,7 @@
       "description": "Local JSON Lines files, one per stream — the local validation destination",
       "docs": null,
       "file": "sink-templates/faucet-hq/jsonl.yaml",
+      "has_tests": false,
       "id": "faucet-hq/jsonl",
       "name": "jsonl",
       "official": true,
@@ -219,10 +223,12 @@
         }
       ],
       "sink_type": "file",
+      "stable_test_status": "no_tests",
       "tags": [
         "file",
         "local"
       ],
+      "test_cases": 0,
       "write_modes": [
         "append",
         "overwrite"
@@ -232,6 +238,7 @@
       "description": "PostgreSQL — one auto-mapped table per stream, transactional overwrite or ON CONFLICT upsert",
       "docs": null,
       "file": "sink-templates/faucet-hq/postgres.yaml",
+      "has_tests": false,
       "id": "faucet-hq/postgres",
       "name": "postgres",
       "official": true,
@@ -255,9 +262,11 @@
         }
       ],
       "sink_type": "postgres",
+      "stable_test_status": "no_tests",
       "tags": [
         "database"
       ],
+      "test_cases": 0,
       "write_modes": [
         "append",
         "upsert",
@@ -269,6 +278,7 @@
       "description": "Local SQLite database — one auto-mapped table per stream, real overwrite/upsert semantics without infrastructure",
       "docs": null,
       "file": "sink-templates/faucet-hq/sqlite.yaml",
+      "has_tests": false,
       "id": "faucet-hq/sqlite",
       "name": "sqlite",
       "official": true,
@@ -284,10 +294,12 @@
         }
       ],
       "sink_type": "sqlite",
+      "stable_test_status": "no_tests",
       "tags": [
         "database",
         "local"
       ],
+      "test_cases": 0,
       "write_modes": [
         "append",
         "upsert",
@@ -301,6 +313,7 @@
       "description": "Example — two CSV exports as two streams (runs offline, no credentials)",
       "docs": null,
       "file": "source-templates/faucet-hq/example-csv.yaml",
+      "has_tests": false,
       "id": "faucet-hq/example-csv",
       "name": "example-csv",
       "official": true,
@@ -316,6 +329,7 @@
         }
       ],
       "source_type": "file",
+      "stable_test_status": "no_tests",
       "streams": [
         {
           "description": null,
@@ -343,12 +357,14 @@
       "tags": [
         "example",
         "file"
-      ]
+      ],
+      "test_cases": 0
     },
     {
       "description": "Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint",
       "docs": null,
       "file": "source-templates/faucet-hq/example-rest-api.yaml",
+      "has_tests": false,
       "id": "faucet-hq/example-rest-api",
       "name": "example-rest-api",
       "official": true,
@@ -372,6 +388,7 @@
         }
       ],
       "source_type": "rest",
+      "stable_test_status": "no_tests",
       "streams": [
         {
           "description": null,
@@ -399,7 +416,8 @@
       "tags": [
         "example",
         "rest"
-      ]
+      ],
+      "test_cases": 0
     }
   ],
   "version": 1
