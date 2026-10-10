@@ -814,6 +814,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(env)]
     fn an_auth_config_file_resolves_and_protects_its_references() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.yaml");

@@ -1652,11 +1652,62 @@ pub trait RunHistory: Send + Sync {
         Ok(None)
     }
 
+    /// Set `key` to `value` only while it still holds `expected` (`None` =
+    /// unset); returns whether this call set it. Default: unsupported.
+    async fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, HistoryError> {
+        let _ = (key, expected, value);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store server settings".into(),
+        ))
+    }
+
     /// Store a server-wide setting. Default: unsupported.
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         let _ = (key, value);
         Err(HistoryError::Backend(
             "this run-history backend does not store server settings".into(),
+        ))
+    }
+
+    /// Every stored version of a template, newest first — one read for the
+    /// whole template. Default: one [`template_get`](Self::template_get) per
+    /// version.
+    async fn template_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::TemplateRecord>, HistoryError> {
+        let mut out = Vec::new();
+        for v in self.template_versions(id).await? {
+            if let Some(r) = self.template_get(id, Some(v)).await? {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every recorded test result of a template, newest first, in one read,
+    /// with the versions whose stored results could not be decoded (#856:
+    /// those versions read as `unknown` rather than failing the whole
+    /// template). Default: [`template_test_results`](Self::template_test_results)
+    /// with nothing undecodable.
+    async fn template_test_results_lenient(
+        &self,
+        id: &str,
+    ) -> Result<
+        (
+            Vec<templates::TemplateTestResult>,
+            std::collections::BTreeSet<u32>,
+        ),
+        HistoryError,
+    > {
+        Ok((
+            self.template_test_results(id, None, usize::MAX).await?,
+            Default::default(),
         ))
     }
 
@@ -1687,10 +1738,24 @@ pub trait RunHistory: Send + Sync {
         if versions.len() <= templates::VERSION_RETAIN {
             return Ok(());
         }
-        let protected = templates::protected_versions(
-            &self.template_launches(id).await?,
-            &self.template_tags(id).await?,
-        );
+        let launches = self.template_launches(id).await?;
+        let mut protected =
+            templates::protected_versions(&launches, &self.template_tags(id).await?);
+        if !launches.is_empty() {
+            // The sticky `newest` holder is a label too (#856).
+            let (results, _) = self.template_test_results_lenient(id).await?;
+            let retired: std::collections::BTreeSet<u32> = self
+                .template_version_deprecations(id)
+                .await?
+                .iter()
+                .map(|d| d.version)
+                .collect();
+            if let Some(v) =
+                templates::sticky_newest(&self.template_records(id).await?, &results, &retired)
+            {
+                protected.insert(v);
+            }
+        }
         for stale in templates::versions_to_prune(versions, &protected) {
             self.template_delete(id, Some(stale)).await?;
         }

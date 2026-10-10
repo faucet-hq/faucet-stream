@@ -149,7 +149,7 @@ pub async fn register_template(
     } else {
         approval_gate(&state, &[ChangeKind::TemplateRegister])?;
     }
-    let registered = crate::templates::register_tested(
+    let mut registered = crate::templates::register_staged(
         &store(&state),
         RegisterRequest {
             id: body.id,
@@ -163,6 +163,7 @@ pub async fn register_template(
     )
     .await
     .map_err(map_err)?;
+    let after = registered.after.take();
     let record = registered.record;
 
     // `config_fingerprint` carries the sha256 of the registered document — a
@@ -189,6 +190,17 @@ pub async fn register_template(
         "ok",
     )
     .await;
+    // Stored and audited; a refused test run, channel or launch is still the
+    // answer.
+    if let Some(e) = after {
+        let action = match &e {
+            crate::error::CliError::VersionNotPassing { action, .. } if action == "launch" => {
+                "template.launch"
+            }
+            _ => "template.promote",
+        };
+        return Err(refused(&state, &actor, &record.id, action, e).await);
+    }
     let mut summary = record.summary();
     // Data-flow policy (#702): a registered pipeline that would violate the
     // server policy is warned about — it may be composed with a compliant sink
@@ -693,14 +705,18 @@ pub async fn promote_template(
     Json(body): Json<PromoteBody>,
 ) -> Result<Json<PromoteResponse>, ServeError> {
     approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
-    let version = crate::templates::promote(
+    let version = match crate::templates::store::promote_by(
         &store(&state),
         &id,
         body.tag,
         body.version.unwrap_or_default(),
+        Some(&actor.principal),
     )
     .await
-    .map_err(map_err)?;
+    {
+        Ok(v) => v,
+        Err(e) => return Err(refused(&state, &actor, &id, "template.promote", e).await),
+    };
     tracing::info!(
         principal = %actor.principal,
         template = %id,
@@ -2457,6 +2473,7 @@ tests:
     /// #789 CLI-118: a secret param bound from its deferred `${env:…}` default
     /// is not caller-supplied, so a clustered server accepts the trigger.
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn a_secret_param_left_at_its_deferred_default_runs_on_a_clustered_server() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::serve::test_support::test_state_clustered();
@@ -2547,6 +2564,7 @@ tests:
     /// server's own credentials into the shared run-history database. The
     /// executing instance resolves them instead.
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn a_clustered_trigger_persists_tokens_not_resolved_values() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: single-threaded test; the value is read back below only via the
@@ -2787,6 +2805,18 @@ pub async fn sync_templates(
         dry_run = body.dry_run,
         "template sync requested"
     );
+    for rep in &reports {
+        for reg in rep.outcome.iter().flat_map(|o| o.registered.iter()) {
+            crate::serve::audit::write_target(
+                &state,
+                &actor,
+                "template.register",
+                format!("template:{}@{}", reg.id, reg.version),
+                "ok",
+            )
+            .await;
+        }
+    }
     crate::serve::audit::write_target(
         &state,
         &actor,

@@ -1168,6 +1168,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn hub_location_precedence_flag_env_local_default_remote() {
         // SAFETY (test): env var private to this test binary.
         unsafe { std::env::remove_var("FAUCET_HUB") };

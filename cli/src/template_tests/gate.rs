@@ -31,8 +31,11 @@ pub enum TestStatus {
     Failing,
     /// It has tests, but no result for this body under this faucet major.minor.
     Untested,
-    /// It carries no `tests:` block.
+    /// It carries no `tests:` block, or its block generates no cases.
     NoTests,
+    /// Its `tests:` block or its recorded results cannot be read, so nothing
+    /// can be said about it. Never takes a label and never counts as `newest`.
+    Unknown,
 }
 
 impl TestStatus {
@@ -42,6 +45,7 @@ impl TestStatus {
             Self::Failing => "failing",
             Self::Untested => "untested",
             Self::NoTests => "no_tests",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -97,14 +101,30 @@ pub fn deciding_evidence<'a>(
     results.iter().find(|r| evidence_counts(r, body_sha256))
 }
 
-/// Whether the newest result for this exact body passed under any faucet
-/// release — what keeps a once-passing version eligible for `newest` after
-/// an upgrade made its evidence stale.
-pub fn last_passed_any_release(results: &[TemplateTestResult], body_sha256: &str) -> bool {
+/// The eligibility rule for `newest` once a template has been launched:
+/// whether this exact body has **ever** had a passing result, under any
+/// faucet release. Distinct from [`evidence_counts`], which governs label
+/// moves: `newest` is sticky, so a later failing run, a failed revalidation
+/// or a stale release line never moves it — only a newer version passing, or
+/// deprecating or deleting this one, does.
+pub fn ever_passed(results: &[TemplateTestResult], body_sha256: &str) -> bool {
     results
         .iter()
-        .find(|r| r.schema >= RESULT_SCHEMA && r.body_sha256 == body_sha256)
-        .is_some_and(|r| r.passed)
+        .any(|r| r.schema >= RESULT_SCHEMA && r.body_sha256 == body_sha256 && r.passed)
+}
+
+/// The error a bundle that generated no cases records.
+pub const NO_CASES: &str = "the bundle produced no cases";
+
+/// A version's status when its tests or results cannot be read.
+pub fn unknown(why: String) -> VersionStatus {
+    VersionStatus {
+        status: TestStatus::Unknown,
+        reason: Some(why),
+        failing: Vec::new(),
+        result_at: None,
+        evidence: None,
+    }
 }
 
 /// The status of `version` (body hash `body_sha256`) given its results,
@@ -129,6 +149,16 @@ pub fn status_of(
         };
     }
     match deciding_evidence(results, body_sha256) {
+        Some(r) if r.cases.is_empty() && r.error.as_deref() == Some(NO_CASES) => VersionStatus {
+            status: TestStatus::NoTests,
+            reason: Some(format!(
+                "v{version}'s `tests:` block generates no cases — register a new version whose \
+                 tests run at least one case ({TESTS_DOC})"
+            )),
+            failing: Vec::new(),
+            result_at: Some(r.recorded_at),
+            evidence: Some(r.result_id.clone()),
+        },
         Some(r) if r.passed => VersionStatus {
             status: TestStatus::Passing,
             reason: None,
@@ -277,22 +307,34 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_pass_keeps_a_version_eligible_for_newest() {
-        assert!(last_passed_any_release(
-            &[result(true, "h", &other_minor())],
-            "h"
-        ));
-        assert!(!last_passed_any_release(
+    fn newest_eligibility_is_sticky_on_any_pass_of_this_body() {
+        // A later failure (a flake, a failed revalidation) keeps it eligible.
+        assert!(ever_passed(
             &[
-                result(false, "h", &other_minor()),
-                result(true, "h", faucet_version())
+                result(false, "h", faucet_version()),
+                result(true, "h", &other_minor())
             ],
             "h"
         ));
-        assert!(!last_passed_any_release(
-            &[result(true, "x", faucet_version())],
-            "h"
-        ));
+        assert!(ever_passed(&[result(true, "h", &other_minor())], "h"));
+        assert!(!ever_passed(&[result(false, "h", faucet_version())], "h"));
+        assert!(!ever_passed(&[result(true, "x", faucet_version())], "h"));
+        let mut legacy = result(true, "h", faucet_version());
+        legacy.schema = 0;
+        assert!(!ever_passed(&[legacy], "h"));
+    }
+
+    #[test]
+    fn a_bundle_with_no_cases_is_no_tests_and_unknown_never_takes_a_label() {
+        let mut r = result(false, "h", faucet_version());
+        r.cases.clear();
+        r.error = Some(NO_CASES.into());
+        let v = status_of("t", 1, true, "h", &[r]);
+        assert_eq!(v.status, TestStatus::NoTests);
+        assert!(v.reason.unwrap().contains("generates no cases"));
+        let u = unknown("bad".into());
+        assert!(!u.status.can_hold_label());
+        assert_eq!(u.status.to_string(), "unknown");
     }
 
     #[test]

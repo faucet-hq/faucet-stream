@@ -285,10 +285,7 @@ fn print_params(summary: &TemplateSummary) {
 async fn revalidate(args: TemplateRevalidateArgs) -> CliResult<()> {
     let store = connect(&args.common).await?;
     let report = crate::templates::revalidate::revalidate(&store, None).await?;
-    store
-        .meta_put(crate::templates::revalidate::META_KEY, &report.faucet)
-        .await
-        .map_err(|e| crate::templates::store::registry_err("server setting write", e))?;
+    crate::templates::revalidate::record_line(&store, &report).await?;
     if args.common.json {
         println!("{}", to_pretty(&report)?);
     } else {
@@ -1419,6 +1416,7 @@ pipeline:
     /// Without the SQL backend feature the whole test is skipped.
     #[cfg(feature = "serve-history-sqlite")]
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn register_launch_promote_run_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.csv");

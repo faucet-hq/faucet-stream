@@ -76,7 +76,7 @@ async fn newest_with_body(store: &TemplateStore, id: &str, body: &str) -> CliRes
     else {
         return Ok(None);
     };
-    let same = super::plan::body_hash(&rec.body).ok() == super::plan::body_hash(body).ok();
+    let same = super::plan::stored_body_hash(&rec.body).ok() == super::plan::body_hash(body).ok();
     Ok(same.then_some(rec.version))
 }
 
@@ -106,7 +106,7 @@ async fn run_action(
                 tracing::debug!(template = %id, version, "body already registered by a concurrent pull");
                 return Ok(());
             }
-            let r = crate::templates::register_tested(
+            let mut r = crate::templates::register_staged(
                 store,
                 RegisterRequest {
                     id: Some(id.clone()),
@@ -119,6 +119,7 @@ async fn run_action(
                 },
             )
             .await?;
+            let after = r.after.take();
             let version = r.record.version;
             if let Some(t) = &r.tests {
                 out.tested.push(Tested {
@@ -134,11 +135,20 @@ async fn run_action(
                 version,
                 launched: false,
             });
+            if let Some(e) = after {
+                return Err(e);
+            }
             // Channels and the launch need a passing version; a refusal leaves
             // the version registered and inert, and the failure names why.
             for tag in tags {
-                crate::templates::promote(store, &id, tag, VersionSelector::Pinned(version))
-                    .await?;
+                crate::templates::store::promote_by(
+                    store,
+                    &id,
+                    tag,
+                    VersionSelector::Pinned(version),
+                    Some(actor),
+                )
+                .await?;
             }
             if launch {
                 crate::templates::launch(store, &id, VersionSelector::Pinned(version), Some(actor))

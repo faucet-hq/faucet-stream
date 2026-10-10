@@ -2,7 +2,6 @@
 //! evidence, and the one check every label move goes through (#856).
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::error::{CliError, CliResult};
 use crate::hub::TemplateKind;
@@ -20,10 +19,7 @@ fn read_err(e: crate::serve::history::HistoryError) -> CliError {
     crate::templates::store::registry_err("template registry read", e)
 }
 
-/// sha256 of a stored body, exactly as stored.
-pub fn body_sha256(body: &str) -> String {
-    format!("{:x}", Sha256::digest(body.as_bytes()))
-}
+pub use crate::serve::history::templates::body_sha256;
 
 /// Whether a document carries a `tests:` block (unparseable = no).
 pub fn document_has_tests(body: &str, format: crate::serve::load::ConfigFormat) -> bool {
@@ -393,6 +389,45 @@ async fn record(store: &TemplateStore, id: &str, version: u32) -> CliResult<Temp
         })
 }
 
+/// A version's test status from what is stored about it (`results` are its
+/// own, newest first; `undecodable` when some of them could not be read):
+/// whether it has tests, its status, and whether it is eligible for `newest`.
+/// A `tests:` block or results that cannot be read make it `unknown` instead
+/// of failing every reader of the template.
+pub fn judge(
+    rec: &TemplateRecord,
+    results: &[TemplateTestResult],
+    undecodable: bool,
+) -> (bool, VersionStatus, bool) {
+    let has_tests = match bundle_in(rec) {
+        Ok(b) => b.is_some(),
+        Err(e) => {
+            return (
+                true,
+                crate::template_tests::gate::unknown(format!(
+                    "v{}'s `tests:` block cannot be read: {e}",
+                    rec.version
+                )),
+                false,
+            );
+        }
+    };
+    if undecodable {
+        return (
+            has_tests,
+            crate::template_tests::gate::unknown(format!(
+                "v{}'s recorded test results cannot be read",
+                rec.version
+            )),
+            false,
+        );
+    }
+    let sha = body_sha256(&rec.body);
+    let status = status_of(&rec.id, rec.version, has_tests, &sha, results);
+    let eligible = has_tests && crate::template_tests::gate::ever_passed(results, &sha);
+    (has_tests, status, eligible)
+}
+
 /// `id`@`version`'s test status and up to `limit` recent runs.
 pub async fn version_tests(
     store: &TemplateStore,
@@ -401,16 +436,18 @@ pub async fn version_tests(
     limit: usize,
 ) -> CliResult<VersionTests> {
     let rec = record(store, id, version).await?;
-    let has_tests = bundle_in(&rec)?.is_some();
-    let results = store
-        .template_test_results(id, Some(version), limit.max(1))
+    let (all, broken) = store
+        .template_test_results_lenient(id)
         .await
         .map_err(read_err)?;
+    let results: Vec<TemplateTestResult> =
+        all.into_iter().filter(|r| r.version == version).collect();
+    let (has_tests, status, _) = judge(&rec, &results, broken.contains(&version));
     Ok(VersionTests {
         version,
         has_tests,
-        status: status_of(id, version, has_tests, &body_sha256(&rec.body), &results),
-        results,
+        status,
+        results: results.into_iter().take(limit.max(1)).collect(),
     })
 }
 
@@ -437,11 +474,12 @@ pub async fn require_passing(
     id: &str,
     version: u32,
     action: &str,
+    by: Option<&str>,
 ) -> CliResult<(VersionStatus, EvidenceClaim)> {
     let rec = record(store, id, version).await?;
     let mut st = version_status(store, id, version).await?;
     if st.status == TestStatus::Untested {
-        Box::pin(test_version(store, id, version, None)).await?;
+        Box::pin(test_version(store, id, version, by)).await?;
         st = version_status(store, id, version).await?;
     }
     match (&st.evidence, st.status.can_hold_label()) {
@@ -457,6 +495,7 @@ pub async fn require_passing(
                 TestStatus::Failing => "failing",
                 TestStatus::Untested => "untested",
                 TestStatus::NoTests => "no_tests",
+                TestStatus::Unknown => "unknown",
                 TestStatus::Passing => "stale_evidence",
             });
             Err(st.refusal(id, version, action))
@@ -478,27 +517,33 @@ pub fn stale_evidence(id: &str, version: u32, action: &str, why: String) -> CliE
 }
 
 /// Fill in each version's test status, whether the template's newest
-/// version has tests, the stable version's status, and — once the template
-/// has been launched — make `newest` skip versions that are not `passing`.
+/// version has tests and the stable version's status, from two reads for the
+/// whole template. Once the template has been launched, `newest` is the
+/// highest live version whose exact body has ever passed
+/// ([`ever_passed`](crate::template_tests::gate::ever_passed)) — sticky, so a
+/// later failure or a stale release line never moves it.
 pub async fn annotate(
     store: &TemplateStore,
     id: &str,
     state: &mut crate::serve::history::templates::TemplateState,
 ) -> CliResult<()> {
+    let records = store.template_records(id).await.map_err(read_err)?;
+    let (results, broken) = store
+        .template_test_results_lenient(id)
+        .await
+        .map_err(read_err)?;
     let mut eligible = std::collections::BTreeSet::new();
-    for v in state.versions.clone() {
-        let t = version_tests(store, id, v, RESULTS_RETAIN).await?;
-        let rec = record(store, id, v).await?;
-        if t.status.status == TestStatus::Passing
-            || (t.status.status == TestStatus::Untested
-                && crate::template_tests::gate::last_passed_any_release(
-                    &t.results,
-                    &body_sha256(&rec.body),
-                ))
-        {
-            eligible.insert(v);
+    for rec in &records {
+        let own: Vec<TemplateTestResult> = results
+            .iter()
+            .filter(|r| r.version == rec.version)
+            .cloned()
+            .collect();
+        let (_, status, ever) = judge(rec, &own, broken.contains(&rec.version));
+        if ever {
+            eligible.insert(rec.version);
         }
-        state.test_status.insert(v, t.status.status);
+        state.test_status.insert(rec.version, status.status);
     }
     for t in store.template_tag_records(id).await.map_err(read_err)? {
         if let Some(e) = t.evidence {
@@ -514,6 +559,7 @@ pub async fn annotate(
         .stable
         .and_then(|v| state.test_status.get(&v).copied());
     if state.stable.is_some() {
+        // Sticky: the highest live version whose body ever passed.
         let retired = |v: u32| state.version_deprecation(v).is_some();
         state.newest = state
             .versions
@@ -1231,7 +1277,11 @@ tests:
             CliError::UnknownPipelineTemplate { .. }
         ));
         register(&s, req(pipeline("orders", 2))).await.unwrap();
-        assert!(require_passing(&s, "orders", 1, "launch").await.is_ok());
+        assert!(
+            require_passing(&s, "orders", 1, "launch", None)
+                .await
+                .is_ok()
+        );
         assert!(
             registered_release(&s, "orders", &semver::Version::new(1, 0, 0))
                 .await
@@ -1569,7 +1619,14 @@ tests:
             seen,
             vec![
                 (1, vec!["previous".to_string()]),
-                (2, vec!["stable".to_string(), "prod".to_string()])
+                (
+                    2,
+                    vec![
+                        "stable".to_string(),
+                        "newest".to_string(),
+                        "prod".to_string()
+                    ]
+                )
             ]
         );
         assert_eq!(report.failed(), 0);
@@ -1690,5 +1747,340 @@ tests:
             !out.contains("# old") && out.contains("enum_coverage"),
             "{out}"
         );
+    }
+
+    async fn launched(s: &TemplateStore, body: String) {
+        let mut r = req(body);
+        r.launch = true;
+        register_tested(s, r).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn newest_is_sticky_through_a_flake_a_failed_revalidation_and_a_stale_line() {
+        let s = store().await;
+        launched(&s, pipeline("orders", 2)).await;
+        register_tested(&s, req(pipeline("orders", 2).replace("rows", "rows-v2")))
+            .await
+            .unwrap();
+        let newest = |s: TemplateStore| async move {
+            crate::templates::template_state(&s, "orders")
+                .await
+                .unwrap()
+                .newest
+        };
+        assert_eq!(newest(s.clone()).await, Some(2));
+        // A flake: v2's newest result fails.
+        inject(
+            &s,
+            "orders",
+            2,
+            false,
+            crate::template_tests::result::faucet_version(),
+        )
+        .await;
+        assert_eq!(status(&s, "orders", 2).await, TestStatus::Failing);
+        assert_eq!(
+            newest(s.clone()).await,
+            Some(2),
+            "a later failure never moves it"
+        );
+        // A stale line: its only evidence is from another release.
+        inject(&s, "orders", 2, false, &next_minor()).await;
+        assert_eq!(newest(s.clone()).await, Some(2));
+        // A newer version that never passed does not take it.
+        register_tested(&s, req(pipeline("orders", 9)))
+            .await
+            .unwrap();
+        assert_eq!(newest(s.clone()).await, Some(2));
+        // Deprecating the holder does.
+        crate::templates::set_version_deprecated(&s, "orders", 2, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(newest(s.clone()).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_revalidation_keeps_newest_and_keeps_the_marker_unwritten_on_error() {
+        let s = store().await;
+        // v1 passed once (under an older faucet, say) and was launched; its
+        // tests fail when re-run now.
+        register_tested(&s, req(pipeline("orders", 9)))
+            .await
+            .unwrap();
+        inject(&s, "orders", 1, true, &next_minor()).await;
+        s.template_launch("orders", 1, None, None).await.unwrap();
+        let state = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
+        assert_eq!((state.stable, state.newest), (Some(1), Some(1)));
+        // An `error` outcome (here: a version whose stored body does not
+        // parse its tests) leaves the marker for the next start.
+        let mut broken = req(pipeline("broken", 2));
+        broken.launch = true;
+        register_tested(&s, broken).await.unwrap();
+        let rec = s.template_get("broken", Some(1)).await.unwrap().unwrap();
+        s.template_delete("broken", Some(1)).await.unwrap();
+        let mut draft = crate::serve::history::templates::TemplateDraft {
+            id: crate::serve::history::templates::TemplateId::parse("broken").unwrap(),
+            kind: TemplateKind::Pipeline,
+            name: Some("broken".into()),
+            description: None,
+            body: rec
+                .body
+                .replace("records_written: 2", "records_written: not-a-number"),
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+        };
+        let v = s.template_register(&draft).await.unwrap().version;
+        s.template_launch("broken", v, None, None).await.unwrap();
+        draft.created_by = None;
+        let r = crate::templates::revalidate::revalidate_if_new_release(&s)
+            .await
+            .unwrap()
+            .expect("due");
+        assert!(r.versions.iter().any(|v| v.outcome == "error"), "{r:?}");
+        let marker = s
+            .meta_get(crate::templates::revalidate::META_KEY)
+            .await
+            .unwrap();
+        assert_ne!(
+            marker.as_deref(),
+            Some(crate::template_tests::result::running_line().as_str()),
+            "an error leaves revalidation due"
+        );
+        let state = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
+        assert_eq!(
+            state.newest,
+            Some(1),
+            "a failed revalidation never moves newest"
+        );
+        assert_eq!(state.test_status.get(&1), Some(&TestStatus::Failing));
+        assert_eq!(
+            crate::templates::template_state(&s, "broken")
+                .await
+                .unwrap()
+                .test_status
+                .get(&v),
+            Some(&TestStatus::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_marker_is_claimed_once_and_an_older_line_never_takes_it_back() {
+        use crate::templates::revalidate::{META_KEY, is_newer, revalidate_if_new_release};
+        let s = store().await;
+        let line = crate::template_tests::result::running_line();
+        let (a, b) = tokio::join!(revalidate_if_new_release(&s), revalidate_if_new_release(&s));
+        assert_eq!(
+            [a.unwrap().is_some(), b.unwrap().is_some()]
+                .iter()
+                .filter(|x| **x)
+                .count(),
+            1,
+            "one claim"
+        );
+        assert_eq!(s.meta_get(META_KEY).await.unwrap(), Some(line.clone()));
+        s.meta_put(META_KEY, "999.0").await.unwrap();
+        assert!(revalidate_if_new_release(&s).await.unwrap().is_none());
+        assert_eq!(
+            s.meta_get(META_KEY).await.unwrap().as_deref(),
+            Some("999.0")
+        );
+        assert!(is_newer("1.14", Some("1.13")) && !is_newer("1.13", Some("1.14")));
+        assert!(is_newer("1.13", Some("")) && is_newer("1.13", None));
+        assert!(
+            !s.meta_compare_and_set(META_KEY, Some("1.0"), "2.0")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_the_newest_holder() {
+        use crate::serve::history::templates::{VERSION_RETAIN, sticky_newest};
+        let s = store().await;
+        launched(&s, pipeline("orders", 2)).await;
+        register_tested(&s, req(pipeline("orders", 2).replace("rows", "rows-v2")))
+            .await
+            .unwrap();
+        for i in 0..(VERSION_RETAIN + 2) {
+            let body = pipeline("orders", 9).replace("rows", &format!("rows-x{i}"));
+            register(&s, req(body)).await.unwrap();
+        }
+        let versions = s.template_versions("orders").await.unwrap();
+        assert!(
+            versions.contains(&2),
+            "the newest holder survives the prune: {versions:?}"
+        );
+        let (results, _) = s.template_test_results_lenient("orders").await.unwrap();
+        assert_eq!(
+            sticky_newest(
+                &s.template_records("orders").await.unwrap(),
+                &results,
+                &Default::default()
+            ),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_bundle_or_results_make_one_version_unknown_not_the_template() {
+        let s = store().await;
+        launched(&s, pipeline("orders", 2)).await;
+        let rec = s.template_get("orders", Some(1)).await.unwrap().unwrap();
+        let mut bad = rec.clone();
+        bad.body = rec
+            .body
+            .replace("records_written: 2", "records_written: [nope]");
+        let (has, st, eligible) = judge(&bad, &[], false);
+        assert!(has && !eligible);
+        assert_eq!(st.status, TestStatus::Unknown);
+        assert!(st.reason.unwrap().contains("cannot be read"));
+        let (_, st, eligible) = judge(&rec, &[], true);
+        assert_eq!(st.status, TestStatus::Unknown);
+        assert!(!eligible && !st.status.can_hold_label());
+        // A version stored with an unreadable bundle: the state still reads,
+        // runs through `stable` still go ahead, and no label moves onto it.
+        let draft = crate::serve::history::templates::TemplateDraft {
+            id: crate::serve::history::templates::TemplateId::parse("orders").unwrap(),
+            kind: TemplateKind::Pipeline,
+            name: Some("orders".into()),
+            description: None,
+            body: bad.body.clone(),
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+        };
+        let v = s.template_register(&draft).await.unwrap().version;
+        let state = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
+        assert_eq!(state.test_status.get(&v), Some(&TestStatus::Unknown));
+        assert_eq!(state.newest, Some(1));
+        assert_eq!(
+            crate::templates::run_gate(&s, "orders", 1, false)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            crate::templates::launch(&s, "orders", pin(v), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::templates::promote(&s, "orders", VersionChannel::Dev, pin(v))
+                .await
+                .is_err()
+        );
+        let vt = version_tests(&s, "orders", v, 5).await.unwrap();
+        assert_eq!(vt.status.status, TestStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_result_for_a_deleted_version_is_refused() {
+        let s = store().await;
+        register_tested(&s, req(pipeline("orders", 2)))
+            .await
+            .unwrap();
+        let rec = s.template_get("orders", Some(1)).await.unwrap().unwrap();
+        s.template_delete("orders", Some(1)).await.unwrap();
+        let r = TemplateTestResult::new(
+            "orders",
+            1,
+            body_sha256(&rec.body),
+            Default::default(),
+            None,
+        );
+        let err = s.template_record_test(&r).await.unwrap_err();
+        assert!(err.to_string().contains("no longer exists"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn registry_written_test_fields_are_refused_in_a_submitted_document() {
+        let s = store().await;
+        for extra in ["  inherited_from: 1\n", "  locked_suites: []\n"] {
+            let body = pipeline("orders", 2).replace("tests:\n", &format!("tests:\n{extra}"));
+            let err = register(&s, req(body)).await.unwrap_err();
+            assert!(err.to_string().contains("written by the registry"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bundle_that_generates_no_cases_is_no_tests() {
+        let s = store().await;
+        // `enum_coverage` over a template with no closed-set params.
+        let body = pipeline("orders", 2)
+            .replace("    values: [us, eu]\n", "")
+            .replace(
+                "    auto: { enum_coverage: true, defaults_baseline: true }\n  fixtures:\n    - name: rows\n      input: [{ \"id\": 1 }, { \"id\": 2 }]\n      expect: { records_written: 2 }\n",
+                "    auto: { enum_coverage: true }\n",
+            );
+        assert!(!body.contains("fixtures"), "{body}");
+        let reg = register_tested(&s, req(body)).await.unwrap();
+        assert!(reg.tests.unwrap().cases.is_empty());
+        assert_eq!(status(&s, "orders", 1).await, TestStatus::NoTests);
+        let err = crate::templates::launch(&s, "orders", pin(1), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("generates no cases"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_lands_mid_registration_refuses_the_untested_version() {
+        let s = store().await;
+        let rec = register(&s, req(untested_body("orders"))).await.unwrap();
+        // The launch lands after the registration's read of the launch log.
+        s.template_launch("orders", 1, None, None).await.unwrap();
+        let err = crate::templates::store::refuse_if_launched_meanwhile(&s, &rec, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("register it again"), "{err}");
+        assert!(s.template_get("orders", Some(1)).await.unwrap().is_none());
+        crate::templates::store::refuse_if_launched_meanwhile(&s, &rec, true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_auto_run_records_who_asked() {
+        let s = store().await;
+        register(&s, req(pipeline("orders", 2))).await.unwrap();
+        // Make it untested: only stale evidence.
+        let rec = s.template_get("orders", Some(1)).await.unwrap().unwrap();
+        s.template_delete("orders", Some(1)).await.unwrap();
+        let draft = crate::serve::history::templates::TemplateDraft {
+            id: crate::serve::history::templates::TemplateId::parse("orders").unwrap(),
+            kind: TemplateKind::Pipeline,
+            name: Some("orders".into()),
+            description: None,
+            body: rec.body,
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+        };
+        let v = s.template_register(&draft).await.unwrap().version;
+        crate::templates::launch(&s, "orders", pin(v), Some("ann"))
+            .await
+            .unwrap();
+        let r = s.template_test_results("orders", Some(v), 1).await.unwrap();
+        assert_eq!(r[0].recorded_by.as_deref(), Some("ann"));
+    }
+
+    #[tokio::test]
+    async fn a_secret_params_default_never_resolves_in_a_test_run() {
+        let s = store().await;
+        let body = pipeline("vaulted", 2)
+            .replace(
+                "params:\n",
+                "params:\n  token: { type: string, secret: true, default: \"${env:FAUCET_856_NEVER_SET}\" }\n",
+            )
+            .replace("path: /rows", "path: \"/rows/${param.token}\"");
+        let reg = register_tested(&s, req(body)).await.unwrap();
+        let t = reg.tests.unwrap();
+        assert!(t.passed, "the default was never resolved: {t:#?}");
     }
 }

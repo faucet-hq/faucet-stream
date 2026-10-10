@@ -945,7 +945,7 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
     use crate::templates::RegisterRequest;
     let store = template_store(ctx)?;
     let config = str_arg(args, "config")?;
-    let registered = crate::templates::register_tested(
+    let mut registered = crate::templates::register_staged(
         store,
         RegisterRequest {
             id: args.get("id").and_then(Value::as_str).map(str::to_string),
@@ -963,6 +963,28 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
     )
     .await
     .map_err(|e| e.to_string())?;
+    tracing::info!(
+        template = %registered.record.id,
+        version = registered.record.version,
+        actor = %actor_name(ctx),
+        "registered pipeline template"
+    );
+    if let Some(server) = &ctx.server {
+        crate::serve::audit::write_target(
+            &server.state,
+            &server.actor,
+            "template.register",
+            format!(
+                "template:{}@{}",
+                registered.record.id, registered.record.version
+            ),
+            "ok",
+        )
+        .await;
+    }
+    if let Some(e) = registered.after.take() {
+        return Err(e.to_string());
+    }
     Ok(pretty(&json!({
         "registered": registered.record.summary(),
         "tests": registered.tests,

@@ -622,8 +622,8 @@ tests:
 Everything runs **offline** and repeatably: records are inline (a fixture path is
 refused — the version stores only the document), no connector is ever opened,
 every case runs at a fixed clock (`2000-01-01T00:00:00Z` unless the fixture sets
-`clock:`), and a `secret: true` param only ever gets a placeholder (a case that
-names a value for one fails, saying so). A flaky test is a bug in the test;
+`clock:`), and a `secret: true` param only ever gets a placeholder — its default
+is never resolved, and a case that names a value for one fails, saying so. A flaky test is a bug in the test;
 `retries` must be written into the case. Each case has a 60-second limit, a run a
 10-minute budget, and a `tests:` block may be at most 1 MiB; hitting a limit
 records a failure with the reason.
@@ -679,16 +679,17 @@ template-tests` print the two schemas.
 
 ### Labels need passing tests
 
-Every **label** — `stable` (launch), `previous` as a rollback target, every
-environment channel including `dev` and `test`, and `newest` once a template has
-been launched — only moves onto a version whose status is **`passing`**:
+Every **label** — `stable` (launch), `previous` as a rollback target and every
+environment channel including `dev` and `test` — only moves onto a version whose
+status is **`passing`**:
 
 | Status | Means | Can take a label |
 |---|---|---|
 | `passing` | Its tests ran and passed for this exact body under the running faucet **major.minor** | yes |
 | `failing` | Its newest such result failed | no |
 | `untested` | It has tests but no result for this body under this faucet major.minor | after its tests run and pass |
-| `no_tests` | No `tests:` block (an empty or zero-case block counts as none) | no |
+| `no_tests` | No `tests:` block, an empty one, or one that generates no cases | no |
+| `unknown` | Its `tests:` block or its recorded results cannot be read | no |
 
 One check covers every way a label moves — launch, rollback, promote, a register
 with `launch` / `tags`, template sync, approved change requests and MCP — and
@@ -706,6 +707,14 @@ results, never stored, and **labels never move by themselves** — a failing
 re-run, a faucet upgrade or a deleted suite only blocks *future* moves onto that
 version.
 
+**`newest`** is derived, not moved. Before the first launch it is the highest
+version that is not deprecated. After it, `newest` is **sticky**: the highest
+non-deprecated version whose exact body has *ever* had a passing result, under
+any faucet release. A later failing run, a failed revalidation or a stale
+release line never moves it; only a newer version passing, or deprecating or
+deleting the holder, does. A version marked `unknown` never holds it. The
+`newest` holder is protected from version pruning like any label holder.
+
 **Drafts.** A template with no launch in its history is a draft: its versions may
 have tests or not, passing or failing, and any of them runs when pinned. Deleting
 the whole template deletes its evidence, so registering it again starts a new
@@ -715,7 +724,9 @@ draft.
 without a `tests:` block inherits the newest earlier version's block, copied into
 the new version (`tests.inherited_from` records where from; the response carries
 `tests_inherited_from`). With nothing to inherit, the registration is refused
-with a message saying to add a `tests:` block.
+with a message saying to add a `tests:` block. `inherited_from` and
+`locked_suites` are written by the registry; a submitted document that carries
+either is refused.
 
 ### Runs follow labels
 
@@ -739,11 +750,15 @@ label.
 Evidence counts only under the faucet **major.minor** that produced it. After an
 upgrade the labels stay where they are and keep authorizing runs, but moving one
 needs fresh evidence. `faucet template revalidate --store …` re-runs the tests of
-every version that holds a label or is a rollback target (`previous`), records
-the results, and exits with the number that no longer pass; it never moves a
-label. `faucet serve` does the same in the background when it starts on a
-release line other than the one it last revalidated under (kept in the history
-database). Metrics: `faucet_serve_template_tests_total{outcome}`,
+every version that holds a label (`stable`, `newest`, each channel) or is a
+rollback target (`previous`), records the results, and exits with the number
+that no longer pass; it never moves a label. `faucet serve` does the same in the
+background when it starts on a release line **newer** than the one last
+revalidated under (kept in the history database). The marker is claimed with a
+compare-and-set, so of several instances starting on the new line only one
+revalidates, and an instance on an older line never claims it back; when a
+version could not be tested at all (`error`) the claim is released and the next
+start tries again. Metrics: `faucet_serve_template_tests_total{outcome}`,
 `faucet_serve_template_label_refusals_total{reason}`,
 `faucet_serve_template_revalidations_total{outcome}`.
 

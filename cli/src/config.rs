@@ -1877,6 +1877,7 @@ pipeline:
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn from_path_interpolates_env_var() {
         unsafe { std::env::set_var("FAUCET_CFG_URL", "https://x.example") };
         let dir = tempfile::tempdir().unwrap();

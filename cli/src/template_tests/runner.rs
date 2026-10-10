@@ -290,6 +290,7 @@ pub(crate) fn name_matches(name: &str, filter: Option<&str>) -> bool {
 /// params merged), because that is the surface a trigger binds.
 async fn declared_params(target: &Target<'_>) -> CliResult<crate::params::ParamsSpec> {
     let mut doc = effective_document(target).await?;
+    neutralize_secret_defaults(&mut doc);
     super::trust::screen(&doc)?;
     // Defaults like `${env:PORT}` resolve before binding, as a real run does.
     crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
@@ -655,8 +656,8 @@ fn pick_row<'a>(
 
 /// Materialize the template body for one param combination.
 async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> CliResult<String> {
-    // A secret param only ever gets a placeholder here: a value a case names
-    // for one is refused, and a required one is filled in.
+    // A secret param only ever gets a placeholder here — its default is
+    // never resolved — and a value a case names for one is refused.
     let mut owned = supplied.clone();
     for (name, p) in declared_params(target).await? {
         if !p.secret {
@@ -665,17 +666,17 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
         let placeholder = p.kind.placeholder();
         match owned.get(&name) {
             Some(v) if *v != placeholder => return Err(super::trust::secret_param_refused(&name)),
-            None if p.required && p.default.is_none() => {
+            Some(_) => {}
+            None => {
                 owned.insert(name, placeholder);
             }
-            _ => {}
         }
     }
     let supplied = &owned;
     match target {
-        // `Materialize::Local` (not `Persisted`): a suite runs in this
-        // process, so load-time directives resolve here exactly as they would
-        // on a `faucet template run`.
+        // Materialized without resolving load-time directives, so a secret
+        // param's default never resolves and a server can screen the result;
+        // the rest then resolve here, as on a `faucet template run`.
         #[cfg(feature = "templates")]
         Target::Registered {
             store,
@@ -693,21 +694,6 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
                 overlay: overlay.clone(),
                 allow_untested: true,
             };
-            if super::trust::server_policy().is_none() {
-                return Ok(crate::templates::materialize_for_run(
-                    store,
-                    id,
-                    *version,
-                    &choice,
-                    supplied,
-                    &BTreeMap::new(),
-                    crate::templates::Materialize::Local,
-                )
-                .await?
-                .body);
-            }
-            // On a server: screen the composed document before any load-time
-            // directive in it is resolved, as a submitted config would be.
             let body = crate::templates::materialize_for_run(
                 store,
                 id,
@@ -729,6 +715,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
         }
         Target::Document { .. } => {
             let mut doc = effective_document(target).await?;
+            neutralize_secret_defaults(&mut doc);
             super::trust::screen(&doc)?;
             // The env/file/secret pass a local materialization runs first (CLI-121).
             crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
@@ -742,6 +729,22 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
         }
         #[cfg(not(feature = "templates"))]
         Target::Never(n, _) => match *n {},
+    }
+}
+
+/// Drop the default of every `secret: true` param (and mark it required), so
+/// a test never resolves one: the run supplies a placeholder instead.
+fn neutralize_secret_defaults(doc: &mut Value) {
+    let Some(params) = doc.get_mut("params").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for spec in params.values_mut() {
+        if let Some(obj) = spec.as_object_mut()
+            && obj.get("secret").and_then(Value::as_bool) == Some(true)
+            && obj.remove("default").is_some()
+        {
+            obj.insert("required".into(), Value::Bool(true));
+        }
     }
 }
 
@@ -1128,6 +1131,7 @@ suite:
     /// Register the same fixture into an in-process store so the
     /// `Target::Registered` path — version resolution and the registry read —
     /// is exercised without a database.
+    #[cfg(feature = "templates")]
     async fn registered() -> crate::templates::TemplateStore {
         let store = crate::templates::resolve_store_url("memory")
             .await
@@ -1149,6 +1153,7 @@ suite:
         store
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn a_registered_template_resolves_and_runs() {
         let store = registered().await;
@@ -1183,6 +1188,7 @@ suite:
         assert_eq!(out.passed(), 1, "{:?}", out.cases);
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn an_explicit_selector_is_honoured() {
         let store = registered().await;
@@ -1206,6 +1212,7 @@ suite:
         );
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn an_unknown_registered_template_is_an_error() {
         let store = registered().await;
@@ -1302,6 +1309,7 @@ suite:
         assert!(err.contains("no streams"), "{err}");
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn suites_apply_a_deployment_overlay_to_the_composition() {
         // #679: the overlay's params join the swept surface, and its blocks
@@ -1395,6 +1403,7 @@ suite:
         assert!(err.contains("deployment overlay"), "{err}");
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn a_registered_source_template_composes_with_a_registered_sink() {
         let dir = tempfile::tempdir().unwrap();

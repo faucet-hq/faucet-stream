@@ -152,29 +152,71 @@ async fn sqlite_records_evidence_refuses_stale_claims_prunes_and_cascades() {
             .is_err()
     );
 
+    // A result row that does not decode makes that version `unknown`; the
+    // template's state still reads.
+    {
+        use sqlx::Connection as _;
+        let mut conn = sqlx::SqliteConnection::connect(&format!(
+            "sqlite:{}",
+            dir.path().join("registry.db").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE faucet_template_test_results SET body='{not json' WHERE id='orders' AND version='1'",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    let st = faucet_cli::templates::template_state(&s, "orders")
+        .await
+        .unwrap();
+    assert_eq!(st.test_status.get(&1), Some(&TestStatus::Unknown));
+    assert_eq!(st.stable, Some(2));
+    assert!(
+        faucet_cli::templates::launch(&s, "orders", VersionSelector::Pinned(1), None)
+            .await
+            .is_err()
+    );
+    // A result for a version that no longer exists is refused.
+    s.template_delete("orders", Some(1)).await.unwrap();
+    let mut orphan = first.clone();
+    orphan.result_id = "orphan".into();
+    assert!(
+        s.template_record_test(&orphan)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no longer exists")
+    );
+
     // Server settings.
     assert_eq!(s.meta_get("k").await.unwrap(), None);
     s.meta_put("k", "1.13").await.unwrap();
     s.meta_put("k", "1.14").await.unwrap();
     assert_eq!(s.meta_get("k").await.unwrap().as_deref(), Some("1.14"));
 
+    let v = faucet_cli::templates::bundle::version_tests(&s, "orders", 2, 3)
+        .await
+        .unwrap();
+    assert_eq!(v.status.status, TestStatus::Passing);
+
     // Retention keeps the newest RESULTS_RETAIN per version.
     for i in 0..(faucet_cli::serve::history::templates::RESULTS_RETAIN + 3) {
         let mut t: TemplateTestResult = first.clone();
+        t.version = 2;
+        t.result_id = format!("r-{i}");
         t.recorded_at = first.recorded_at + chrono::Duration::seconds(i as i64 + 1);
         s.template_record_test(&t).await.unwrap();
     }
     assert_eq!(
-        s.template_test_results("orders", Some(1), 100)
+        s.template_test_results("orders", Some(2), 100)
             .await
             .unwrap()
             .len(),
         faucet_cli::serve::history::templates::RESULTS_RETAIN
     );
-    let v = faucet_cli::templates::bundle::version_tests(&s, "orders", 2, 3)
-        .await
-        .unwrap();
-    assert_eq!(v.status.status, TestStatus::Passing);
 
     s.template_delete("orders", Some(1)).await.unwrap();
     assert!(
@@ -622,6 +664,74 @@ async fn http_labels_need_passing_versions_and_runs_follow_labels() {
     assert!(r["tests"]["instance"].is_string(), "server provenance: {r}");
     assert_eq!(r["tests"]["schema"], 1);
 
+    // A register whose launch is refused still audits the registration.
+    let (code, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/v1/templates",
+        Some(json!({ "config": pipeline("refused", 9), "launch": true })),
+    )
+    .await;
+    assert_eq!(code, 422, "{r}");
+    let (_, audit) = call(
+        b,
+        "GET",
+        "admin-tok",
+        "/v1/audit?action=template.register",
+        None,
+    )
+    .await;
+    assert!(
+        audit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["target"] == "template:refused@1" && e["result"] == "ok"),
+        "{audit}"
+    );
+    let (_, audit) = call(
+        b,
+        "GET",
+        "admin-tok",
+        "/v1/audit?action=template.launch",
+        None,
+    )
+    .await;
+    assert!(
+        audit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["target"] == "template:refused@1" && e["result"] == "refused"),
+        "{audit}"
+    );
+    let (code, r) = call(
+        b,
+        "POST",
+        "admin-tok",
+        "/v1/templates/orders/tags",
+        Some(json!({ "tag": "prod", "version": 1 })),
+    )
+    .await;
+    assert_eq!(code, 422, "{r}");
+    let (_, audit) = call(
+        b,
+        "GET",
+        "admin-tok",
+        "/v1/audit?action=template.promote",
+        None,
+    )
+    .await;
+    assert!(
+        audit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["target"] == "template:orders@1" && e["result"] == "refused"),
+        "{audit}"
+    );
+
     let (code, r) = call(
         b,
         "POST",
@@ -999,11 +1109,11 @@ async fn a_server_on_a_new_release_line_revalidates_label_holders() {
         .await
         .unwrap();
     for _ in 0..400 {
-        if s.meta_get(faucet_cli::templates::revalidate::META_KEY)
+        if s.template_test_results("orders", None, 50)
             .await
             .unwrap()
-            .as_deref()
-            == Some(faucet_cli::template_tests::result::running_line().as_str())
+            .len()
+            > before
         {
             break;
         }

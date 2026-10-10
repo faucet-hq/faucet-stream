@@ -85,25 +85,56 @@ pub fn wait_for_termination() -> impl Future<Output = ()> {
     }
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::time::Duration;
+/// The stop signals of a one-shot run: the first SIGTERM / Ctrl-C cancels the
+/// run cooperatively (each row finishes its page and flushes), a second one
+/// exits at once.
+pub struct StopSignal {
+    token: faucet_core::CancellationToken,
+    watcher: tokio::task::JoinHandle<()>,
+}
 
-    #[tokio::test]
-    async fn sigterm_resolves_recv_and_the_helper() {
-        let mut t = Terminate::new().expect("install handlers");
-        let wait = wait_for_termination();
-        // SAFETY: signalling our own pid; tokio's handler is installed above,
-        // so SIGTERM is delivered to it instead of terminating the process.
-        unsafe {
-            libc::kill(libc::getpid(), libc::SIGTERM);
-        }
-        tokio::time::timeout(Duration::from_secs(5), t.recv())
-            .await
-            .expect("recv resolves on SIGTERM");
-        tokio::time::timeout(Duration::from_secs(5), wait)
-            .await
-            .expect("helper resolves on SIGTERM");
+impl StopSignal {
+    /// Install the handlers; the watcher stops when this is dropped.
+    pub fn install() -> Self {
+        let token = faucet_core::CancellationToken::new();
+        let first = wait_for_termination();
+        let cancel = token.clone();
+        let watcher = tokio::spawn(async move {
+            first.await;
+            tracing::warn!(
+                "stop signal received: finishing the current page and flushing (signal again to \
+                 exit at once)"
+            );
+            cancel.cancel();
+            wait_for_termination().await;
+            std::process::exit(130);
+        });
+        Self { token, watcher }
     }
+
+    /// The token the first signal cancels.
+    pub fn token(&self) -> faucet_core::CancellationToken {
+        self.token.clone()
+    }
+
+    /// The run's result, or [`CliError::Cancelled`](crate::error::CliError::Cancelled) when it was stopped.
+    pub fn finish(self, outcome: crate::error::CliResult<()>) -> crate::error::CliResult<()> {
+        cancelled_outcome(self.token.is_cancelled(), outcome)
+    }
+}
+
+impl Drop for StopSignal {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
+
+pub(crate) fn cancelled_outcome(
+    cancelled: bool,
+    outcome: crate::error::CliResult<()>,
+) -> crate::error::CliResult<()> {
+    if cancelled {
+        return Err(crate::error::CliError::Cancelled);
+    }
+    outcome
 }

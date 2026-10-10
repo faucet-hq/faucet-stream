@@ -1314,6 +1314,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn env_override_parsing() {
         let map = collect_env_overrides(&["A=1".into()]).unwrap();
         assert_eq!(map["A"], "1");

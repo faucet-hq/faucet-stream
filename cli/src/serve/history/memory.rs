@@ -1454,6 +1454,23 @@ impl RunHistory for MemoryHistory {
         Ok(meta.get(key).cloned())
     }
 
+    async fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, HistoryError> {
+        let mut meta = self
+            .meta
+            .lock()
+            .map_err(|_| HistoryError::Backend("meta lock poisoned".into()))?;
+        if meta.get(key).map(String::as_str) != expected {
+            return Ok(false);
+        }
+        meta.insert(key.to_string(), value.to_string());
+        Ok(true)
+    }
+
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         let mut meta = self
             .meta
@@ -1524,10 +1541,34 @@ impl RunHistory for MemoryHistory {
         Ok(Some(seq))
     }
 
+    async fn template_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::TemplateRecord>, HistoryError> {
+        let map = self
+            .templates
+            .lock()
+            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+        Ok(map
+            .get(id)
+            .map(|v| v.values().rev().cloned().collect())
+            .unwrap_or_default())
+    }
+
     async fn template_record_test(
         &self,
         result: &templates::TemplateTestResult,
     ) -> Result<(), HistoryError> {
+        let map = self
+            .templates
+            .lock()
+            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+        if !map
+            .get(&result.id)
+            .is_some_and(|v| v.contains_key(&result.version))
+        {
+            return Err(missing_version(&result.id, result.version));
+        }
         let mut tests = self
             .template_tests
             .lock()
@@ -1661,6 +1702,13 @@ impl RunHistory for MemoryHistory {
     fn degraded(&self) -> bool {
         false
     }
+}
+
+/// A test result for a version that is not (or no longer) stored.
+fn missing_version(id: &str, version: u32) -> HistoryError {
+    HistoryError::Backend(format!(
+        "template '{id}' v{version} no longer exists; its test result was not recorded"
+    ))
 }
 
 /// The evidence of one template's channels: tag → (version, result id).

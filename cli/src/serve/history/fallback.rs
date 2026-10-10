@@ -694,8 +694,34 @@ impl RunHistory for FallbackHistory {
     ) -> Result<Vec<super::templates::TagRecord>, HistoryError> {
         strict!(self, p => p.template_tag_records(id), f => f.template_tag_records(id))
     }
+    async fn template_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<super::templates::TemplateRecord>, HistoryError> {
+        strict!(self, p => p.template_records(id), f => f.template_records(id))
+    }
+    async fn template_test_results_lenient(
+        &self,
+        id: &str,
+    ) -> Result<
+        (
+            Vec<super::templates::TemplateTestResult>,
+            std::collections::BTreeSet<u32>,
+        ),
+        HistoryError,
+    > {
+        strict!(self, p => p.template_test_results_lenient(id), f => f.template_test_results_lenient(id))
+    }
     async fn meta_get(&self, key: &str) -> Result<Option<String>, HistoryError> {
         strict!(self, p => p.meta_get(key), f => f.meta_get(key))
+    }
+    async fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.meta_compare_and_set(key, expected, value), f => f.meta_compare_and_set(key, expected, value))
     }
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.meta_put(key, value), f => f.meta_put(key, value))

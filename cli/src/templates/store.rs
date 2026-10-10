@@ -75,7 +75,7 @@ pub struct RegisterRequest {
 }
 
 /// What [`register_tested`] did: the new version, its test run, its launch.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Registration {
     pub record: TemplateRecord,
     /// The bundle run recorded on the new version (every version with a
@@ -87,6 +87,9 @@ pub struct Registration {
     pub tests_inherited_from: Option<u32>,
     /// The launch, when the request asked for one.
     pub launch: Option<LaunchOutcome>,
+    /// What failed after the version was stored — its test run, a channel or
+    /// the launch. The version stays registered either way.
+    pub after: Option<CliError>,
 }
 
 /// A template rendered for one trigger: a config document with every
@@ -312,6 +315,18 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
     // The bundle, and every shared suite it requires resolving to a
     // registered release in range — an unsatisfiable range fails here, not
     // at launch time.
+    // The registry writes these into a version; a submitted document that
+    // carries them would forge a lineage or a suite lock.
+    if let Some(t) = doc.get("tests") {
+        for key in ["inherited_from", "locked_suites"] {
+            if t.get(key).is_some() {
+                return Err(CliError::Config(format!(
+                    "tests: `{key}` is written by the registry when a version is registered, \
+                     not by hand — remove it"
+                )));
+            }
+        }
+    }
     let mut bundle = match kind {
         TemplateKind::TestSuite => None,
         k => crate::template_tests::bundle::bundle_of(&doc, k)?,
@@ -426,6 +441,20 @@ pub async fn register_tested(
     store: &TemplateStore,
     req: RegisterRequest,
 ) -> CliResult<Registration> {
+    let mut r = register_staged(store, req).await?;
+    match r.after.take() {
+        Some(e) => Err(e),
+        None => Ok(r),
+    }
+}
+
+/// [`register_tested`], returning the stored version even when its test run,
+/// a channel or the launch then failed (in [`Registration::after`]) — so a
+/// caller can audit the registration before reporting the refusal.
+pub async fn register_staged(
+    store: &TemplateStore,
+    req: RegisterRequest,
+) -> CliResult<Registration> {
     let Prelude {
         doc,
         declared,
@@ -494,19 +523,36 @@ pub async fn register_tested(
         .await
         .map_err(|e| crate::templates::store::registry_err("template registry write", e))?;
 
-    let tests = if bundle.is_some() {
-        Some(
-            Box::pin(crate::templates::bundle::test_version(
-                store,
-                &record.id,
-                record.version,
-                req.created_by.as_deref(),
-            ))
-            .await?,
-        )
-    } else {
-        None
+    refuse_if_launched_meanwhile(
+        store,
+        &record,
+        bundle.is_some() || kind == TemplateKind::TestSuite,
+    )
+    .await?;
+
+    let mut out = Registration {
+        record,
+        tests: None,
+        tests_inherited_from,
+        launch: None,
+        after: None,
     };
+    if bundle.is_some() {
+        match Box::pin(crate::templates::bundle::test_version(
+            store,
+            &out.record.id,
+            out.record.version,
+            req.created_by.as_deref(),
+        ))
+        .await
+        {
+            Ok(t) => out.tests = Some(t),
+            Err(e) => {
+                out.after = Some(e);
+                return Ok(out);
+            }
+        }
+    }
     // A label in the same step needs a passing version; the version stays
     // registered (and its result recorded) either way.
     let registered = |e: CliError| match e {
@@ -528,36 +574,63 @@ pub async fn register_tested(
         other => other,
     };
     for tag in &req.tags {
-        promote(
+        if let Err(e) = promote_by(
             store,
-            &record.id,
+            &out.record.id,
             *tag,
-            VersionSelector::Pinned(record.version),
+            VersionSelector::Pinned(out.record.version),
+            req.created_by.as_deref(),
         )
         .await
-        .map_err(registered)?;
+        {
+            out.after = Some(registered(e));
+            return Ok(out);
+        }
     }
     // `--launch` is the only way a register makes a version live.
-    let launch = if req.launch {
-        Some(
-            launch(
-                store,
-                &record.id,
-                VersionSelector::Pinned(record.version),
-                req.created_by.as_deref(),
-            )
-            .await
-            .map_err(registered)?,
+    if req.launch {
+        match launch(
+            store,
+            &out.record.id,
+            VersionSelector::Pinned(out.record.version),
+            req.created_by.as_deref(),
         )
-    } else {
-        None
-    };
-    Ok(Registration {
-        record,
-        tests,
-        tests_inherited_from,
-        launch,
-    })
+        .await
+        {
+            Ok(l) => out.launch = Some(l),
+            Err(e) => out.after = Some(registered(e)),
+        }
+    }
+    Ok(out)
+}
+
+/// A launch that landed between the registration's read of the launch log
+/// and the insert would leave a launched template with a version that has no
+/// tests: delete the version just stored and refuse.
+pub(crate) async fn refuse_if_launched_meanwhile(
+    store: &TemplateStore,
+    record: &TemplateRecord,
+    has_tests: bool,
+) -> CliResult<()> {
+    if has_tests
+        || store
+            .template_launches(record.id.as_str())
+            .await
+            .map_err(|e| crate::templates::store::registry_err("template registry read", e))?
+            .is_empty()
+    {
+        return Ok(());
+    }
+    store
+        .template_delete(&record.id, Some(record.version))
+        .await
+        .map_err(|e| crate::templates::store::registry_err("template registry write", e))?;
+    Err(CliError::Config(format!(
+        "template '{}' was launched while this version was being registered, and the \
+         version carries no `tests:` block — register it again so it inherits the launched \
+         template's tests",
+        record.id
+    )))
 }
 
 /// The publishability lint, as a registry gate: a literal credential or a
@@ -783,6 +856,17 @@ pub async fn promote(
     tag: VersionChannel,
     target: VersionSelector,
 ) -> CliResult<u32> {
+    promote_by(store, id, tag, target, None).await
+}
+
+/// [`promote`], naming who asked — recorded on any test run it triggers.
+pub async fn promote_by(
+    store: &TemplateStore,
+    id: &str,
+    tag: VersionChannel,
+    target: VersionSelector,
+    by: Option<&str>,
+) -> CliResult<u32> {
     reject_derived(tag)?;
     let version = resolve_version(store, id, target).await?;
     require_version(store, id, version).await?;
@@ -794,7 +878,8 @@ pub async fn promote(
         return Ok(version);
     }
     let action = format!("channel `{tag}`");
-    let (_, claim) = crate::templates::bundle::require_passing(store, id, version, &action).await?;
+    let (_, claim) =
+        crate::templates::bundle::require_passing(store, id, version, &action, by).await?;
     store
         .template_set_tag(id, tag.as_str(), version, Some(&claim))
         .await
@@ -863,7 +948,8 @@ pub async fn launch(
         });
     }
     let (verdict, claim) =
-        crate::templates::bundle::require_passing(store, id, version, "launch").await?;
+        crate::templates::bundle::require_passing(store, id, version, "launch", launched_by)
+            .await?;
     let seq = store
         .template_launch(id, version, launched_by, Some(&claim))
         .await
@@ -2153,6 +2239,7 @@ pipeline:
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn env_overrides_win_over_the_process_environment() {
         let s = store();
         let body = "\

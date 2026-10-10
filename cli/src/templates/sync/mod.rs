@@ -261,7 +261,7 @@ pub async fn local_snapshot(store: &TemplateStore, prefix: &str) -> CliResult<Ve
         let newest = state.versions.first().copied();
         let newest_hash = match newest {
             Some(v) => match store.template_get(&s.id, Some(v)).await {
-                Ok(Some(rec)) => plan::body_hash(&rec.body).ok(),
+                Ok(Some(rec)) => plan::stored_body_hash(&rec.body).ok(),
                 Ok(None) => None,
                 Err(e) => {
                     return Err(crate::templates::store::registry_err(
@@ -957,6 +957,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn load_sync_file_interpolates_validates_and_redacts() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sync.yaml");
@@ -1011,6 +1012,7 @@ mod tests {
     /// newline stays inside its string (#789 CLI-106), and a whole-value
     /// directive can still produce a number.
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn load_sync_file_cannot_be_restructured_by_an_env_value() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sync.yaml");

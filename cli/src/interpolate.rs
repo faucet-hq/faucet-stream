@@ -923,6 +923,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn substitutes_env_var() {
         unsafe { std::env::set_var("FAUCET_TEST_VAR", "hello") };
         let out = interpolate("token=${env:FAUCET_TEST_VAR}").unwrap();
@@ -931,6 +932,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn missing_env_var_is_an_error() {
         unsafe { std::env::remove_var("FAUCET_TEST_MISSING") };
         let err = interpolate("token=${env:FAUCET_TEST_MISSING}").unwrap_err();
@@ -941,6 +943,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn interpolate_value_resolves_scalars_in_strings_keys_and_arrays() {
         unsafe { std::env::set_var("FAUCET_F43_TOKEN", "sekret") };
         let mut v = json!({
@@ -964,6 +967,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn interpolate_value_keeps_resolved_value_as_a_single_scalar() {
         // F43: a resolved value containing markup-significant characters must
         // NOT alter the document's structure — it stays one scalar string,
@@ -979,6 +983,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn secret_prefix_is_env_alias_for_now() {
         unsafe { std::env::set_var("FAUCET_SECRET_VAR", "shh") };
         let out = interpolate("${secret:FAUCET_SECRET_VAR}").unwrap();
@@ -987,6 +992,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn resolved_env_and_secret_values_are_registered_for_redaction() {
         // M3 (#146): credentials supplied via ${env:}/${secret:} must be
         // scrubbed from faucet's tracing/log/error output, just like
@@ -1042,6 +1048,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn load_time_leaves_id_path_tokens_alone() {
         unsafe { std::env::set_var("FAUCET_T", "v") };
         let out = interpolate("a=${env:FAUCET_T} b=${users.id}").unwrap();
@@ -1161,6 +1168,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn multiple_directives_resolve_in_order() {
         unsafe { std::env::set_var("FAUCET_A", "one") };
         unsafe { std::env::set_var("FAUCET_B", "two") };

@@ -568,9 +568,14 @@ async fn plan_template_launch(
     let st = crate::templates::template_state(&store, &payload.id)
         .await
         .map_err(template_err)?;
-    let tests = crate::templates::bundle::version_tests(&store, &payload.id, version, 1)
-        .await
-        .map_err(template_err)?;
+    let tests = crate::templates::bundle::version_tests(
+        &store,
+        &payload.id,
+        version,
+        crate::serve::history::templates::RESULTS_RETAIN,
+    )
+    .await
+    .map_err(template_err)?;
     Ok(ChangePlan {
         material: sha_hex(&format!("{}\n{}\n{:?}", payload.id, version, st.stable)),
         summary: json!({

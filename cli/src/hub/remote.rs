@@ -953,6 +953,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn an_owners_own_token_wins_over_the_global_one() {
         assert_eq!(
             owner_token_var("acme-corp/hub"),

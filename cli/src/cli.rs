@@ -853,6 +853,7 @@ pub struct TemplateListArgs {
 }
 
 /// `faucet template revalidate`.
+#[cfg(feature = "templates")]
 #[derive(Debug, Parser)]
 pub struct TemplateRevalidateArgs {
     #[command(flatten)]

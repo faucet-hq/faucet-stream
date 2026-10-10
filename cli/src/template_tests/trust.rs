@@ -9,7 +9,6 @@
 //! subprocess connectors are not refused here. The CLI, which already holds
 //! direct store access, runs without a policy.
 
-use std::sync::RwLock;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -58,18 +57,9 @@ pub const DEFAULT_LIMITS: TestLimits = TestLimits {
     max_bundle_bytes: 1024 * 1024,
 };
 
-static LIMITS: RwLock<TestLimits> = RwLock::new(DEFAULT_LIMITS);
-
 /// The limits in force.
 pub fn limits() -> TestLimits {
-    LIMITS.read().map(|l| *l).unwrap_or(DEFAULT_LIMITS)
-}
-
-/// Replace the limits for this process.
-pub fn set_limits(limits: TestLimits) {
-    if let Ok(mut l) = LIMITS.write() {
-        *l = limits;
-    }
+    DEFAULT_LIMITS
 }
 
 /// The clock every case runs at unless it pins its own, so a test gives the

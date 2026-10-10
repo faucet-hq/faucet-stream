@@ -74,15 +74,17 @@ impl RevalidateReport {
     }
 }
 
-/// The versions of `id` to re-test, with what each one is.
+/// The versions of `id` to re-test, with what each one is: every label
+/// holder (`stable`, `newest` once launched, each channel) and the rollback
+/// target.
 pub async fn targets(store: &TemplateStore, id: &str) -> CliResult<BTreeMap<u32, Vec<String>>> {
-    let state = store
-        .template_state(id)
-        .await
-        .map_err(|e| registry_err("template registry read", e))?;
+    let state = crate::templates::template_state(store, id).await?;
     let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     if let Some(v) = state.stable {
         out.entry(v).or_default().push("stable".into());
+        if let Some(n) = state.newest {
+            out.entry(n).or_default().push("newest".into());
+        }
     }
     if let Some(v) = state.previous {
         out.entry(v).or_default().push("previous".into());
@@ -143,8 +145,14 @@ pub async fn revalidate(
     })
 }
 
-/// [`revalidate`] when the registry was last revalidated under another faucet
-/// release line (or never), then record this one. `None` when nothing was due.
+/// [`revalidate`] when the registry was last revalidated under an older faucet
+/// release line (or never). `None` when nothing was due.
+///
+/// The marker is claimed with a compare-and-set before the run, so of several
+/// instances starting on the same new line only one revalidates; an instance
+/// on an older line never claims it back, so a mixed-line cluster does not
+/// re-run on every restart. When any version could not be tested (`error`)
+/// the claim is released, and the next start tries again.
 pub async fn revalidate_if_new_release(
     store: &TemplateStore,
 ) -> CliResult<Option<RevalidateReport>> {
@@ -153,13 +161,63 @@ pub async fn revalidate_if_new_release(
         .meta_get(META_KEY)
         .await
         .map_err(|e| registry_err("server setting read", e))?;
-    if marker.as_deref() == Some(line.as_str()) {
+    if !is_newer(&line, marker.as_deref()) {
         return Ok(None);
     }
-    let report = revalidate(store, Some("revalidate")).await?;
-    store
-        .meta_put(META_KEY, &line)
+    let claimed = store
+        .meta_compare_and_set(META_KEY, marker.as_deref(), &line)
         .await
         .map_err(|e| registry_err("server setting write", e))?;
-    Ok(Some(report))
+    if !claimed {
+        return Ok(None);
+    }
+    let report = revalidate(store, Some("revalidate")).await;
+    let errored = match &report {
+        Ok(r) => r.versions.iter().any(|v| v.outcome == "error"),
+        Err(_) => true,
+    };
+    if errored {
+        let restored = match marker.as_deref() {
+            Some(old) => store.meta_compare_and_set(META_KEY, Some(&line), old).await,
+            None => store.meta_put(META_KEY, "").await.map(|_| true),
+        };
+        if let Err(e) = restored {
+            tracing::warn!(error = %e, "could not release the revalidation marker");
+        }
+    }
+    report.map(Some)
+}
+
+/// After a revalidation run outside the server's start-up claim: record its
+/// release line when every version could be tested and the line is newer
+/// than the one recorded.
+pub async fn record_line(store: &TemplateStore, report: &RevalidateReport) -> CliResult<()> {
+    if report.versions.iter().any(|v| v.outcome == "error") {
+        return Ok(());
+    }
+    let marker = store
+        .meta_get(META_KEY)
+        .await
+        .map_err(|e| registry_err("server setting read", e))?;
+    if is_newer(&report.faucet, marker.as_deref()) {
+        store
+            .meta_compare_and_set(META_KEY, marker.as_deref(), &report.faucet)
+            .await
+            .map_err(|e| registry_err("server setting write", e))?;
+    }
+    Ok(())
+}
+
+/// Whether release line `line` (`major.minor`) is newer than `marker`. An
+/// empty or unreadable marker is older than anything.
+pub fn is_newer(line: &str, marker: Option<&str>) -> bool {
+    let parse = |s: &str| -> Option<(u64, u64)> {
+        let (a, b) = s.split_once('.')?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    };
+    match (parse(line), marker.and_then(parse)) {
+        (Some(l), Some(m)) => l > m,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }

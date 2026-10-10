@@ -120,7 +120,7 @@ pub async fn run_bundle(
     } else if out.cases.is_empty() {
         out.error = Some(match filter {
             Some(f) => format!("no case matches the filter '{f}'"),
-            None => "the bundle produced no cases".into(),
+            None => super::gate::NO_CASES.into(),
         });
     }
     out.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);

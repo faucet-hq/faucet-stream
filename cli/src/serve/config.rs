@@ -499,6 +499,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(env)]
     fn otel_config_file_loads_resolves_env_and_validates() {
         let dir = tempfile::tempdir().unwrap();
         let ok = dir.path().join("otel.yaml");
@@ -1005,6 +1006,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn the_history_url_can_come_from_the_environment() {
         use clap::Parser;
         // #789 SUPPLY-07: a DSN with a password stays out of `ps` by

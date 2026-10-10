@@ -3798,7 +3798,7 @@ components:
           items: { type: integer }
         stable: { type: integer, nullable: true, description: "The launched version — what `stable` and an unpinned request resolve to. Null while the template is a draft." }
         previous: { type: integer, nullable: true, description: "The version launched before the current one; the rollback target." }
-        newest: { type: integer, nullable: true, description: "Highest version number that is not deprecated. Once the template has been launched it also skips versions that are not `passing` (a version whose last pass is only stale from an older faucet release stays eligible). Null when nothing qualifies." }
+        newest: { type: integer, nullable: true, description: "Highest version number that is not deprecated. Once the template has been launched it is sticky: the highest such version whose exact body has ever had a passing result, under any faucet release, so a later failure, a failed revalidation or a stale release line never moves it. Null when nothing qualifies." }
         tags:
           type: object
           description: "Assignable channel pointers ({channel: version}), excluding the derived `stable` / `previous` / `newest`."
@@ -3977,9 +3977,11 @@ components:
       description: >
         A template version's test status (#856): `passing` (its tests ran and
         passed for this body under this faucet major.minor), `failing`,
-        `untested` (it has tests but no such result) or `no_tests`. Only a
-        `passing` version can take a label.
-      enum: [passing, failing, untested, no_tests]
+        `untested` (it has tests but no such result), `no_tests` (no `tests:`
+        block, or one that generates no cases) or `unknown` (its `tests:` block
+        or its recorded results cannot be read). Only a `passing` version can
+        take a label.
+      enum: [passing, failing, untested, no_tests, unknown]
     VersionStatus:
       type: object
       description: A version's test status with what explains it (#856).

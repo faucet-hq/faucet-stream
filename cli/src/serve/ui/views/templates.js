@@ -800,6 +800,7 @@ const TEST_PILL = {
   failing: ["failing", "pill-failed"],
   untested: ["untested", "pill-queued"],
   no_tests: ["no tests", "pill-cancelled"],
+  unknown: ["unknown", "pill-failed"],
 };
 
 /** A small test-status pill, with an optional prefix. */
@@ -829,6 +830,8 @@ function testsBlock(t) {
     lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — its tests fail.${cases ? `<ul>${cases}</ul>` : ""}</div>`);
   } else if (t.status === "no_tests") {
     lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — ${mdInline(t.reason || "it has no `tests:` block.")}</div>`);
+  } else if (t.status === "unknown") {
+    lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — ${mdInline(t.reason || "its tests or results cannot be read.")}</div>`);
   } else if (t.status === "untested") {
     lines.push(`<div class="tpl-tests-why tpl-tests-warn">No test result under this faucet version — launching or assigning a channel runs its tests first.</div>`);
   }

@@ -761,6 +761,37 @@ pub fn protected_versions(
         .collect()
 }
 
+/// sha256 of a stored body, exactly as stored.
+pub fn body_sha256(body: &str) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(body.as_bytes()))
+}
+
+/// The `newest` holder of a launched template (#856): the highest version, not
+/// in `retired`, whose exact body has ever had a passing result. `records`
+/// and `results` cover the whole template.
+pub fn sticky_newest(
+    records: &[TemplateRecord],
+    results: &[TemplateTestResult],
+    retired: &std::collections::BTreeSet<u32>,
+) -> Option<u32> {
+    let mut versions: Vec<&TemplateRecord> = records.iter().collect();
+    versions.sort_by_key(|r| std::cmp::Reverse(r.version));
+    versions
+        .into_iter()
+        .filter(|r| !retired.contains(&r.version))
+        .find(|r| {
+            let sha = body_sha256(&r.body);
+            let own: Vec<TemplateTestResult> = results
+                .iter()
+                .filter(|t| t.version == r.version)
+                .cloned()
+                .collect();
+            crate::template_tests::gate::ever_passed(&own, &sha)
+        })
+        .map(|r| r.version)
+}
+
 /// The version numbers to delete so at most [`VERSION_RETAIN`] remain for an id,
 /// never including a `protected` one.
 pub fn versions_to_prune(

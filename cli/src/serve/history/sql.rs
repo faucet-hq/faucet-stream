@@ -483,11 +483,13 @@ pub const DDL: &[&str] = &[
     // whole `TemplateTestResult`; the newest `RESULTS_RETAIN` per version are
     // kept, and deleting a version or template deletes its rows.
     "CREATE TABLE IF NOT EXISTS faucet_template_test_results (\
+        result_id TEXT PRIMARY KEY,\
         id TEXT NOT NULL,\
         version TEXT NOT NULL,\
         recorded_at TEXT NOT NULL,\
-        body TEXT NOT NULL,\
-        PRIMARY KEY (id, version, recorded_at))",
+        body TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS faucet_template_test_results_version_idx \
+        ON faucet_template_test_results (id, version, recorded_at)",
     // Server-wide settings (#856): the faucet release line templates were last
     // revalidated under.
     "CREATE TABLE IF NOT EXISTS faucet_serve_meta (\
@@ -936,6 +938,10 @@ pub struct Stmts {
     pub template_delete_tests_version: String,
     /// Delete every run of a template. Param: id.
     pub template_delete_tests_all: String,
+    /// Every version of one template. Param: id.
+    pub template_select_id_all: String,
+    /// Every result of one template with its version. Param: id.
+    pub template_select_tests_all: String,
     /// Take the write lock on one version's row, so a label move and a new
     /// test result for it serialize. Params: id, version.
     pub template_lock_version: String,
@@ -945,6 +951,10 @@ pub struct Stmts {
     pub meta_select: String,
     /// Upsert one server setting. Params: key, value, updated_at.
     pub meta_upsert: String,
+    /// Insert a setting that is not there yet. Params: key, value, updated_at.
+    pub meta_insert_new: String,
+    /// Replace a setting holding an expected value. Params: value, updated_at, key, expected.
+    pub meta_replace: String,
     /// The dialect these statements were built for. Needed by the one query that
     /// cannot be a fixed string: the local-output listing pushes its filter and
     /// `LIMIT` into SQL (#587), so the placeholder style has to be known at call
@@ -1621,8 +1631,7 @@ impl Stmts {
             template_delete_version_deprecations_all:
                 "DELETE FROM faucet_template_version_deprecations WHERE id=$1".into(),
             template_insert_test: "INSERT INTO faucet_template_test_results \
-                (id, version, recorded_at, body) VALUES ($1,$2,$3,$4) \
-                ON CONFLICT (id, version, recorded_at) DO NOTHING"
+                (result_id, id, version, recorded_at, body) VALUES ($1,$2,$3,$4,$5)"
                 .into(),
             template_select_tests: "SELECT body FROM faucet_template_test_results \
                 WHERE id=$1 ORDER BY recorded_at DESC LIMIT $2"
@@ -1639,6 +1648,10 @@ impl Stmts {
                 "DELETE FROM faucet_template_test_results WHERE id=$1 AND version=$2".into(),
             template_delete_tests_all:
                 "DELETE FROM faucet_template_test_results WHERE id=$1".into(),
+            template_select_id_all: "SELECT body FROM faucet_templates WHERE id=$1".into(),
+            template_select_tests_all: "SELECT version, body FROM faucet_template_test_results \
+                WHERE id=$1 ORDER BY recorded_at DESC"
+                .into(),
             template_lock_version: "UPDATE faucet_templates SET version=version \
                 WHERE id=$1 AND version=$2"
                 .into(),
@@ -1649,6 +1662,12 @@ impl Stmts {
             meta_upsert: "INSERT INTO faucet_serve_meta (key, value, updated_at) \
                 VALUES ($1,$2,$3) ON CONFLICT (key) DO UPDATE SET value=excluded.value, \
                 updated_at=excluded.updated_at"
+                .into(),
+            meta_insert_new: "INSERT INTO faucet_serve_meta (key, value, updated_at) \
+                VALUES ($1,$2,$3) ON CONFLICT (key) DO NOTHING"
+                .into(),
+            meta_replace: "UPDATE faucet_serve_meta SET value=$1, updated_at=$2 \
+                WHERE key=$3 AND value=$4"
                 .into(),
             dialect: Dialect::Postgres,
         }
@@ -2134,8 +2153,7 @@ impl Stmts {
             template_delete_version_deprecations_all:
                 "DELETE FROM faucet_template_version_deprecations WHERE id=?".into(),
             template_insert_test: "INSERT INTO faucet_template_test_results \
-                (id, version, recorded_at, body) VALUES (?,?,?,?) \
-                ON CONFLICT (id, version, recorded_at) DO NOTHING"
+                (result_id, id, version, recorded_at, body) VALUES (?,?,?,?,?)"
                 .into(),
             template_select_tests: "SELECT body FROM faucet_template_test_results \
                 WHERE id=? ORDER BY recorded_at DESC LIMIT ?"
@@ -2152,6 +2170,10 @@ impl Stmts {
                 "DELETE FROM faucet_template_test_results WHERE id=? AND version=?".into(),
             template_delete_tests_all:
                 "DELETE FROM faucet_template_test_results WHERE id=?".into(),
+            template_select_id_all: "SELECT body FROM faucet_templates WHERE id=?".into(),
+            template_select_tests_all: "SELECT version, body FROM faucet_template_test_results \
+                WHERE id=? ORDER BY recorded_at DESC"
+                .into(),
             template_lock_version: "UPDATE faucet_templates SET version=version \
                 WHERE id=? AND version=?"
                 .into(),
@@ -2162,6 +2184,12 @@ impl Stmts {
             meta_upsert: "INSERT INTO faucet_serve_meta (key, value, updated_at) \
                 VALUES (?,?,?) ON CONFLICT (key) DO UPDATE SET value=excluded.value, \
                 updated_at=excluded.updated_at"
+                .into(),
+            meta_insert_new: "INSERT INTO faucet_serve_meta (key, value, updated_at) \
+                VALUES (?,?,?) ON CONFLICT (key) DO NOTHING"
+                .into(),
+            meta_replace: "UPDATE faucet_serve_meta SET value=?, updated_at=? \
+                WHERE key=? AND value=?"
                 .into(),
             dialect: Dialect::Sqlite,
         }
@@ -5362,6 +5390,34 @@ macro_rules! impl_sql_history {
                     .map_err(backend)
             }
 
+            async fn meta_compare_and_set(
+                &self,
+                key: &str,
+                expected: Option<&str>,
+                value: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let now = sql::fmt_ts(chrono::Utc::now());
+                let done = match expected {
+                    None => sqlx::query(&self.stmts.meta_insert_new)
+                        .bind(key)
+                        .bind(value)
+                        .bind(now)
+                        .execute(&self.pool)
+                        .await,
+                    Some(old) => sqlx::query(&self.stmts.meta_replace)
+                        .bind(value)
+                        .bind(now)
+                        .bind(key)
+                        .bind(old)
+                        .execute(&self.pool)
+                        .await,
+                }
+                .map_err(backend)?;
+                Ok(done.rows_affected() == 1)
+            }
+
             async fn meta_put(
                 &self,
                 key: &str,
@@ -5603,13 +5659,20 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let version = result.version.to_string();
                 let mut tx = self.pool.begin().await.map_err(backend)?;
-                sqlx::query(&self.stmts.template_lock_version)
+                let locked = sqlx::query(&self.stmts.template_lock_version)
                     .bind(&result.id)
                     .bind(&version)
                     .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
+                if locked.rows_affected() != 1 {
+                    return Err($crate::serve::history::HistoryError::Backend(format!(
+                        "template '{}' v{} no longer exists; its test result was not recorded",
+                        result.id, result.version
+                    )));
+                }
                 sqlx::query(&self.stmts.template_insert_test)
+                    .bind(&result.result_id)
                     .bind(&result.id)
                     .bind(&version)
                     .bind(sql::fmt_ts(result.recorded_at))
@@ -5628,6 +5691,66 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
                 Ok(())
+            }
+
+            async fn template_records(
+                &self,
+                id: &str,
+            ) -> Result<
+                Vec<$crate::serve::history::templates::TemplateRecord>,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let rows = sqlx::query(&self.stmts.template_select_id_all)
+                    .bind(id)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let mut out: Vec<$crate::serve::history::templates::TemplateRecord> =
+                    Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let body: String = r.try_get("body").map_err(backend)?;
+                    out.push(sql::decode_json(&body, "pipeline template")?);
+                }
+                out.sort_by_key(|r| std::cmp::Reverse(r.version));
+                Ok(out)
+            }
+
+            async fn template_test_results_lenient(
+                &self,
+                id: &str,
+            ) -> Result<
+                (
+                    Vec<$crate::serve::history::templates::TemplateTestResult>,
+                    std::collections::BTreeSet<u32>,
+                ),
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let rows = sqlx::query(&self.stmts.template_select_tests_all)
+                    .bind(id)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let mut out = Vec::with_capacity(rows.len());
+                let mut broken = std::collections::BTreeSet::new();
+                for r in &rows {
+                    let version: String = r.try_get("version").map_err(backend)?;
+                    let body: String = r.try_get("body").map_err(backend)?;
+                    match sql::decode_json(&body, "template test result") {
+                        Ok(t) => out.push(t),
+                        Err(_) => {
+                            if let Ok(v) = version.parse::<u32>() {
+                                broken.insert(v);
+                            }
+                        }
+                    }
+                }
+                Ok((out, broken))
             }
 
             async fn template_test_results(

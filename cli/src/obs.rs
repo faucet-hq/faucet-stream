@@ -119,6 +119,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn cli_flag_beats_env_and_yaml() {
         with_clean_env(|| {
             unsafe {
@@ -133,6 +134,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn faucet_log_beats_rust_log_and_yaml() {
         with_clean_env(|| {
             unsafe {
@@ -147,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn rust_log_beats_yaml() {
         with_clean_env(|| {
             unsafe {
