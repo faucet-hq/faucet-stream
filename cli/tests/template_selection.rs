@@ -101,9 +101,7 @@ impl Api {
         (code, r.json().await.unwrap_or(Value::Null))
     }
     async fn register(&self, body: String) {
-        let (code, v) = self
-            .post("/v1/templates", json!({ "config": body }))
-            .await;
+        let (code, v) = self.post("/v1/templates", json!({ "config": body })).await;
         assert_eq!(code, 201, "{v}");
     }
     /// Test each template again (its companions are registered by now) and
@@ -115,7 +113,10 @@ impl Api {
                 .await;
             assert_eq!(code, 200, "{v}");
             let (code, v) = self
-                .post(&format!("/v1/templates/{id}/launch"), json!({ "version": 1 }))
+                .post(
+                    &format!("/v1/templates/{id}/launch"),
+                    json!({ "version": 1 }),
+                )
                 .await;
             assert_eq!(code, 200, "{id}: {v}");
         }
@@ -784,12 +785,26 @@ fn the_cli_lists_rows_and_runs_a_subset() {
         }
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         for id in ["crm", "files", "hr"] {
-            cli(&s(&["template", "test", &format!("{id}@1"), "--store", &store]))
-                .await
-                .unwrap();
-            cli(&s(&["template", "launch", id, "--version", "1", "--store", &store]))
-                .await
-                .unwrap();
+            cli(&s(&[
+                "template",
+                "test",
+                &format!("{id}@1"),
+                "--store",
+                &store,
+            ]))
+            .await
+            .unwrap();
+            cli(&s(&[
+                "template",
+                "launch",
+                id,
+                "--version",
+                "1",
+                "--store",
+                &store,
+            ]))
+            .await
+            .unwrap();
         }
         cli(&s(&[
             "template", "rows", "crm", "--sink", "files", "--store", &store,

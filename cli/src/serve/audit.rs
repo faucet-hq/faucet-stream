@@ -42,7 +42,17 @@ pub async fn write_target_detail(
     detail: String,
     result: &str,
 ) {
-    persist(state, ctx, action, None, None, Some(target), Some(detail), result).await;
+    persist(
+        state,
+        ctx,
+        action,
+        None,
+        None,
+        Some(target),
+        Some(detail),
+        result,
+    )
+    .await;
 }
 
 /// [`write()`] with every field (run id, fingerprint and target).
@@ -55,7 +65,17 @@ pub async fn record(
     target: Option<String>,
     result: &str,
 ) {
-    persist(state, ctx, action, run_id, config_fingerprint, target, None, result).await;
+    persist(
+        state,
+        ctx,
+        action,
+        run_id,
+        config_fingerprint,
+        target,
+        None,
+        result,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]

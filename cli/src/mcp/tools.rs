@@ -2295,12 +2295,7 @@ mod tests {
                 csv.display(),
                 dir.path().display()
             );
-            call_tool(
-                &ctx,
-                "register_template",
-                &json!({ "config": cfg }),
-            )
-            .await;
+            call_tool(&ctx, "register_template", &json!({ "config": cfg })).await;
             let out = call_tool(
                 &ctx,
                 "run_template",

@@ -794,8 +794,7 @@ pub async fn promote(
         return Ok(version);
     }
     let action = format!("channel `{tag}`");
-    let (_, claim) =
-        crate::templates::bundle::require_passing(store, id, version, &action).await?;
+    let (_, claim) = crate::templates::bundle::require_passing(store, id, version, &action).await?;
     store
         .template_set_tag(id, tag.as_str(), version, Some(&claim))
         .await
@@ -1188,7 +1187,10 @@ pub async fn materialize_for_run_selected(
     {
         untested = untested.or(run_gate(store, sink_id, v, sink.allow_untested).await?);
     }
-    if let Some(OverlayChoice::Registered { id: oid, version: sel }) = &sink.overlay
+    if let Some(OverlayChoice::Registered {
+        id: oid,
+        version: sel,
+    }) = &sink.overlay
         && let Ok(v) = resolve_version(store, oid, *sel).await
     {
         untested = untested.or(run_gate(store, oid, v, sink.allow_untested).await?);

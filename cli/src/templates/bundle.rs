@@ -420,7 +420,9 @@ pub async fn version_status(
     id: &str,
     version: u32,
 ) -> CliResult<VersionStatus> {
-    Ok(version_tests(store, id, version, RESULTS_RETAIN).await?.status)
+    Ok(version_tests(store, id, version, RESULTS_RETAIN)
+        .await?
+        .status)
 }
 
 /// Refuse `action` unless `id`@`version` is `passing` — the one check every
@@ -468,7 +470,7 @@ pub fn stale_evidence(id: &str, version: u32, action: &str, why: String) -> CliE
     CliError::VersionNotPassing {
         id: id.to_string(),
         version,
-        status: "untested".into(),
+        status: TestStatus::Untested,
         action: action.to_string(),
         reason: format!("{why} — check the version's test results and try again"),
         failing: Vec::new(),
@@ -508,7 +510,9 @@ pub async fn annotate(
         .first()
         .and_then(|v| state.test_status.get(v))
         .is_some_and(|s| *s != TestStatus::NoTests);
-    state.stable_tests = state.stable.and_then(|v| state.test_status.get(&v).copied());
+    state.stable_tests = state
+        .stable
+        .and_then(|v| state.test_status.get(&v).copied());
     if state.stable.is_some() {
         let retired = |v: u32| state.version_deprecation(v).is_some();
         state.newest = state
@@ -593,7 +597,10 @@ pub fn with_tests(
 pub(crate) fn smoke(body: &str) -> String {
     let doc: serde_json::Value = serde_yaml::from_str(body).unwrap_or_default();
     let pipeline = doc.get("pipeline").is_some()
-        && doc.get("kind").and_then(|k| k.as_str()).is_none_or(|k| k == "pipeline");
+        && doc
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .is_none_or(|k| k == "pipeline");
     if !pipeline || doc.get("tests").is_some() {
         return body.to_string();
     }
@@ -681,20 +688,31 @@ tests:
     #[tokio::test]
     async fn register_runs_the_bundle_and_a_passing_version_launches() {
         let s = store().await;
-        let reg = register_tested(&s, req(pipeline("orders", 2))).await.unwrap();
+        let reg = register_tested(&s, req(pipeline("orders", 2)))
+            .await
+            .unwrap();
         let t = reg.tests.expect("ran on register");
         assert!(t.passed, "{t:#?}");
         assert_eq!(t.body_sha256, body_sha256(&reg.record.body));
         let names: Vec<&str> = t.cases.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"auto:region=eu") && names.contains(&"rows"), "{names:?}");
+        assert!(
+            names.contains(&"auto:region=eu") && names.contains(&"rows"),
+            "{names:?}"
+        );
         let vt = version_tests(&s, "orders", 1, 5).await.unwrap();
         assert!(vt.has_tests);
         assert_eq!(vt.status.status, TestStatus::Passing);
-        let out = crate::templates::launch(&s, "orders", pin(1), None).await.unwrap();
+        let out = crate::templates::launch(&s, "orders", pin(1), None)
+            .await
+            .unwrap();
         assert_eq!(out.tests.unwrap().status, TestStatus::Passing);
-        let again = crate::templates::launch(&s, "orders", pin(1), None).await.unwrap();
+        let again = crate::templates::launch(&s, "orders", pin(1), None)
+            .await
+            .unwrap();
         assert!(again.already_launched && again.tests.is_none());
-        let st = crate::templates::template_state(&s, "orders").await.unwrap();
+        let st = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert!(st.has_tests);
         assert_eq!(st.stable_tests, Some(TestStatus::Passing));
     }
@@ -702,23 +720,39 @@ tests:
     #[tokio::test]
     async fn a_failing_version_registers_but_takes_no_label() {
         let s = store().await;
-        let reg = register_tested(&s, req(pipeline("orders", 9))).await.unwrap();
+        let reg = register_tested(&s, req(pipeline("orders", 9)))
+            .await
+            .unwrap();
         assert!(!reg.tests.unwrap().passed, "registered, and marked failing");
         assert_eq!(status(&s, "orders", 1).await, TestStatus::Failing);
-        let err = crate::templates::launch(&s, "orders", pin(1), None).await.unwrap_err();
-        let CliError::VersionNotPassing { status, failing, .. } = &err else {
+        let err = crate::templates::launch(&s, "orders", pin(1), None)
+            .await
+            .unwrap_err();
+        let CliError::VersionNotPassing {
+            status, failing, ..
+        } = &err
+        else {
             panic!("{err}")
         };
-        assert_eq!(status, "failing");
-        assert!(failing.iter().any(|f| f.starts_with("rows:")), "{failing:?}");
+        assert_eq!(*status, TestStatus::Failing);
+        assert!(
+            failing.iter().any(|f| f.starts_with("rows:")),
+            "{failing:?}"
+        );
         for tag in [VersionChannel::Dev, VersionChannel::Prod] {
-            let err = crate::templates::promote(&s, "orders", tag, pin(1)).await.unwrap_err();
+            let err = crate::templates::promote(&s, "orders", tag, pin(1))
+                .await
+                .unwrap_err();
             assert!(err.to_string().contains("needs a passing version"), "{err}");
         }
         let mut r = req(pipeline("orders", 9));
         r.launch = true;
         let err = register_tested(&s, r).await.unwrap_err();
-        assert!(err.to_string().contains("registered as v2, but not labelled"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("registered as v2, but not labelled"),
+            "{err}"
+        );
         let mut r = req(pipeline("orders", 9));
         r.tags = vec![VersionChannel::Dev];
         assert!(register_tested(&s, r).await.is_err());
@@ -732,7 +766,9 @@ tests:
         let s = store().await;
         register(&s, req(untested_body("orders"))).await.unwrap();
         assert_eq!(status(&s, "orders", 1).await, TestStatus::NoTests);
-        let err = crate::templates::launch(&s, "orders", pin(1), None).await.unwrap_err();
+        let err = crate::templates::launch(&s, "orders", pin(1), None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("no `tests:` block"), "{err}");
         let m = crate::templates::materialize_for_run(
             &s,
@@ -746,22 +782,36 @@ tests:
         .await
         .expect("a draft runs any version");
         assert!(m.untested.is_none());
-        let st = crate::templates::template_state(&s, "orders").await.unwrap();
+        let st = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert!(!st.has_tests);
-        assert_eq!(st.newest, Some(st.versions[0]), "a draft's newest is the highest");
+        assert_eq!(
+            st.newest,
+            Some(st.versions[0]),
+            "a draft's newest is the highest"
+        );
     }
 
     #[tokio::test]
     async fn an_empty_tests_block_counts_as_no_tests() {
         let s = store().await;
-        register(&s, req(untested_body("orders") + "tests: {}\n")).await.unwrap();
+        register(&s, req(untested_body("orders") + "tests: {}\n"))
+            .await
+            .unwrap();
         assert_eq!(status(&s, "orders", 1).await, TestStatus::NoTests);
         register(&s, req(pipeline("orders", 2))).await.unwrap();
-        crate::templates::launch(&s, "orders", pin(2), None).await.unwrap();
+        crate::templates::launch(&s, "orders", pin(2), None)
+            .await
+            .unwrap();
         let reg = register_tested(&s, req(untested_body("orders") + "tests: {}\n"))
             .await
             .unwrap();
-        assert_eq!(reg.tests_inherited_from, Some(2), "after a launch, empty = missing");
+        assert_eq!(
+            reg.tests_inherited_from,
+            Some(2),
+            "after a launch, empty = missing"
+        );
     }
 
     #[tokio::test]
@@ -773,18 +823,37 @@ tests:
         crate::templates::promote(&s, "orders", VersionChannel::Dev, pin(1))
             .await
             .expect("an untested version is run first, then labelled");
-        assert_eq!(s.template_test_results("orders", Some(1), 5).await.unwrap().len(), 1);
+        assert_eq!(
+            s.template_test_results("orders", Some(1), 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(status(&s, "orders", 1).await, TestStatus::Passing);
 
         let bad = TemplateDraftFor::new("orders", &pipeline("orders", 9));
         s.template_register(&bad.0).await.unwrap();
-        let err = crate::templates::launch(&s, "orders", pin(2), None).await.unwrap_err();
-        assert!(err.to_string().contains("is failing"), "{err}");
-        assert_eq!(s.template_test_results("orders", Some(2), 5).await.unwrap().len(), 1);
-        let err = crate::templates::launch(&s, "orders", pin(2), None).await.unwrap_err();
+        let err = crate::templates::launch(&s, "orders", pin(2), None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("is failing"), "{err}");
         assert_eq!(
-            s.template_test_results("orders", Some(2), 5).await.unwrap().len(),
+            s.template_test_results("orders", Some(2), 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let err = crate::templates::launch(&s, "orders", pin(2), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is failing"), "{err}");
+        assert_eq!(
+            s.template_test_results("orders", Some(2), 5)
+                .await
+                .unwrap()
+                .len(),
             1,
             "a failing version is never re-run by a label move"
         );
@@ -820,7 +889,10 @@ tests:
         assert!(reg.record.body.contains("tests:"));
         assert!(reg.tests.unwrap().passed);
         assert_eq!(status(&s, "orders", 2).await, TestStatus::Passing);
-        assert!(document_has_tests(&reg.record.body, crate::serve::load::ConfigFormat::Yaml));
+        assert!(document_has_tests(
+            &reg.record.body,
+            crate::serve::load::ConfigFormat::Yaml
+        ));
     }
 
     #[tokio::test]
@@ -828,16 +900,27 @@ tests:
         let s = store().await;
         register(&s, req(untested_body("legacy"))).await.unwrap();
         s.template_launch("legacy", 1, None, None).await.unwrap();
-        let err = register(&s, req(untested_body("legacy"))).await.unwrap_err();
+        let err = register(&s, req(untested_body("legacy")))
+            .await
+            .unwrap_err();
         assert!(matches!(err, CliError::TestsRequired { .. }), "{err}");
         assert!(err.to_string().contains("add a `tests:` block"), "{err}");
-        let st = crate::templates::template_state(&s, "legacy").await.unwrap();
+        let st = crate::templates::template_state(&s, "legacy")
+            .await
+            .unwrap();
         assert_eq!(st.stable, Some(1), "an existing label stays");
         assert_eq!(st.stable_tests, Some(TestStatus::NoTests));
-        assert_eq!(st.newest, None, "newest skips a version that is not passing");
+        assert_eq!(
+            st.newest, None,
+            "newest skips a version that is not passing"
+        );
         register(&s, req(pipeline("legacy", 2))).await.unwrap();
-        crate::templates::launch(&s, "legacy", pin(2), None).await.unwrap();
-        let err = crate::templates::rollback(&s, "legacy", None).await.unwrap_err();
+        crate::templates::launch(&s, "legacy", pin(2), None)
+            .await
+            .unwrap();
+        let err = crate::templates::rollback(&s, "legacy", None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("adds one"), "{err}");
     }
 
@@ -852,7 +935,9 @@ tests:
         failed.passed = false;
         failed.recorded_at = chrono::Utc::now() + chrono::Duration::seconds(5);
         s.template_record_test(&failed).await.unwrap();
-        let st = crate::templates::template_state(&s, "orders").await.unwrap();
+        let st = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert_eq!(st.stable, Some(1));
         assert_eq!(st.tags.get("prod"), Some(&1));
         assert_eq!(st.stable_tests, Some(TestStatus::Failing));
@@ -872,7 +957,9 @@ tests:
         r.launch = true;
         register_tested(&s, r).await.unwrap();
         register(&s, req(pipeline("orders", 9))).await.unwrap();
-        let st = crate::templates::template_state(&s, "orders").await.unwrap();
+        let st = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert_eq!(st.newest, Some(1));
         assert_eq!(st.test_status.get(&2), Some(&TestStatus::Failing));
         let run = |allow: bool| {
@@ -924,25 +1011,39 @@ tests:
     async fn shared_suites_resolve_by_range_or_fail_registration_with_a_typed_error() {
         let s = store().await;
         let err = register(&s, req(requiring(">=1.2,<2"))).await.unwrap_err();
-        assert!(matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }), "{err}");
+        assert!(
+            matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }),
+            "{err}"
+        );
         assert!(err.to_string().contains("none registered"), "{err}");
 
         register(&s, req(suite_doc("1.1.0"))).await.unwrap();
         register(&s, req(suite_doc("1.3.0"))).await.unwrap();
         register(&s, req(suite_doc("2.0.0"))).await.unwrap();
         let dup = register(&s, req(suite_doc("1.3.0"))).await.unwrap_err();
-        assert!(dup.to_string().contains("already registered as v2"), "{dup}");
+        assert!(
+            dup.to_string().contains("already registered as v2"),
+            "{dup}"
+        );
 
         let rec = register(&s, req(requiring(">=1.2,<2"))).await.unwrap();
         let t = test_version(&s, "orders", rec.version, None).await.unwrap();
         assert!(t.passed, "{t:#?}");
         assert_eq!(t.suites[0].release, "1.3.0");
         assert_eq!(t.suites[0].version, Some(2));
-        assert!(t.cases.iter().any(|c| c.source == "suite:conformance@1.3.0"));
+        assert!(
+            t.cases
+                .iter()
+                .any(|c| c.source == "suite:conformance@1.3.0")
+        );
 
         // The version holds its own copy of 1.3.0: a newer release, a retired
         // release or a deleted suite changes nothing about what it tests.
-        let stored = s.template_get("orders", Some(rec.version)).await.unwrap().unwrap();
+        let stored = s
+            .template_get("orders", Some(rec.version))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(stored.body.contains("locked_suites"), "{}", stored.body);
         register(&s, req(suite_doc("1.4.0"))).await.unwrap();
         crate::templates::set_version_deprecated(&s, "conformance", 2, None, None, true)
@@ -964,7 +1065,10 @@ tests:
         assert!(t.passed && t.suites[0].release == "1.3.0", "{t:#?}");
         // A new registration resolves against what is registered now.
         let err = register(&s, req(requiring(">=1.2,<2"))).await.unwrap_err();
-        assert!(matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }), "{err}");
+        assert!(
+            matches!(err, CliError::UnsatisfiedSuiteRequirement { .. }),
+            "{err}"
+        );
         register(&s, req(pipeline("x", 2))).await.unwrap();
         let wrong = resolve_shared(
             &s,
@@ -1015,7 +1119,10 @@ tests:
                 "identical content hashes alike, so a sync registers nothing"
             );
         }
-        assert!(!document_has_tests("{", crate::serve::load::ConfigFormat::Yaml));
+        assert!(!document_has_tests(
+            "{",
+            crate::serve::load::ConfigFormat::Yaml
+        ));
     }
 
     #[test]
@@ -1023,11 +1130,24 @@ tests:
         use crate::serve::load::ConfigFormat;
         let tests = serde_json::json!({"suite": {"auto": {"defaults_baseline": true}}});
         let y = with_tests("# c\nname: a\n", ConfigFormat::Yaml, &tests).unwrap();
-        assert!(y.starts_with("# c\nname: a\n") && y.contains("defaults_baseline"), "{y}");
+        assert!(
+            y.starts_with("# c\nname: a\n") && y.contains("defaults_baseline"),
+            "{y}"
+        );
         let flow = with_tests("{name: a}", ConfigFormat::Yaml, &tests).unwrap();
-        assert!(parse_body(&flow, ConfigFormat::Yaml).unwrap().get("tests").is_some());
+        assert!(
+            parse_body(&flow, ConfigFormat::Yaml)
+                .unwrap()
+                .get("tests")
+                .is_some()
+        );
         let j = with_tests("{\"name\": \"a\"}", ConfigFormat::Json, &tests).unwrap();
-        assert!(parse_body(&j, ConfigFormat::Json).unwrap().get("tests").is_some());
+        assert!(
+            parse_body(&j, ConfigFormat::Json)
+                .unwrap()
+                .get("tests")
+                .is_some()
+        );
         assert!(with_tests("[1]", ConfigFormat::Json, &tests).is_err());
     }
 
@@ -1066,7 +1186,11 @@ tests:
     async fn hub_kind_bundles_compose_with_their_registered_companions() {
         let s = store().await;
         let reg = register_tested(&s, req(SINK.into())).await.unwrap();
-        let e = reg.tests.unwrap().error.expect("acme is not registered yet");
+        let e = reg
+            .tests
+            .unwrap()
+            .error
+            .expect("acme is not registered yet");
         assert!(e.contains("acme"), "{e}");
 
         let src = register_tested(&s, req(source("sink: files\n  sink_select: newest")))
@@ -1086,7 +1210,9 @@ tests:
 
         let with_overlay = register_tested(
             &s,
-            req(source("sink: files\n  sink_select: newest\n  overlay: ops\n  overlay_select: newest")),
+            req(source(
+                "sink: files\n  sink_select: newest\n  overlay: ops\n  overlay_select: newest",
+            )),
         )
         .await
         .unwrap();
@@ -1143,9 +1269,10 @@ tests:
     }
 
     fn next_minor() -> String {
-        let (major, minor) =
-            crate::template_tests::result::release_line(crate::template_tests::result::faucet_version())
-                .unwrap();
+        let (major, minor) = crate::template_tests::result::release_line(
+            crate::template_tests::result::faucet_version(),
+        )
+        .unwrap();
         format!("{major}.{}.0", minor + 1)
     }
 
@@ -1158,19 +1285,39 @@ tests:
         crate::templates::promote(&s, "orders", VersionChannel::Prod, pin(1))
             .await
             .unwrap();
-        register_tested(&s, req(pipeline("orders", 9))).await.unwrap();
+        register_tested(&s, req(pipeline("orders", 9)))
+            .await
+            .unwrap();
         // v1's newest evidence now fails (a flake, or an upgrade's re-run).
-        inject(&s, "orders", 1, false, crate::template_tests::result::faucet_version()).await;
+        inject(
+            &s,
+            "orders",
+            1,
+            false,
+            crate::template_tests::result::faucet_version(),
+        )
+        .await;
         assert_eq!(status(&s, "orders", 1).await, TestStatus::Failing);
-        let state = crate::templates::template_state(&s, "orders").await.unwrap();
+        let state = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert_eq!((state.stable, state.tags.get("prod")), (Some(1), Some(&1)));
         // Through `stable`, `prod`, or pinned while it holds them: it runs.
-        assert_eq!(crate::templates::run_gate(&s, "orders", 1, false).await.unwrap(), None);
+        assert_eq!(
+            crate::templates::run_gate(&s, "orders", 1, false)
+                .await
+                .unwrap(),
+            None
+        );
         // v2 holds no label and fails: pinned, it needs `allow_untested`.
-        let err = crate::templates::run_gate(&s, "orders", 2, false).await.unwrap_err();
+        let err = crate::templates::run_gate(&s, "orders", 2, false)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("allow_untested"), "{err}");
         assert_eq!(
-            crate::templates::run_gate(&s, "orders", 2, true).await.unwrap(),
+            crate::templates::run_gate(&s, "orders", 2, true)
+                .await
+                .unwrap(),
             Some(TestStatus::Failing)
         );
         // But no new label moves onto the failing v1.
@@ -1202,26 +1349,41 @@ tests:
         let v = s.template_register(&draft).await.unwrap().version;
         inject(&s, "orders", v, true, &next_minor()).await;
         assert_eq!(status(&s, "orders", v).await, TestStatus::Untested);
-        let state = crate::templates::template_state(&s, "orders").await.unwrap();
+        let state = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert_eq!(state.newest, Some(v), "a stale pass keeps `newest`");
-        assert_eq!(crate::templates::run_gate(&s, "orders", v, false).await.unwrap(), None);
+        assert_eq!(
+            crate::templates::run_gate(&s, "orders", v, false)
+                .await
+                .unwrap(),
+            None
+        );
         // A label move onto it re-runs its tests first, under this release.
-        let out = crate::templates::launch(&s, "orders", pin(v), None).await.unwrap();
+        let out = crate::templates::launch(&s, "orders", pin(v), None)
+            .await
+            .unwrap();
         assert_eq!(out.tests.unwrap().status, TestStatus::Passing);
     }
 
     #[tokio::test]
     async fn every_label_move_records_its_evidence_and_a_stale_claim_is_refused() {
         let s = store().await;
-        register_tested(&s, req(pipeline("orders", 2))).await.unwrap();
-        let out = crate::templates::launch(&s, "orders", pin(1), Some("ann")).await.unwrap();
+        register_tested(&s, req(pipeline("orders", 2)))
+            .await
+            .unwrap();
+        let out = crate::templates::launch(&s, "orders", pin(1), Some("ann"))
+            .await
+            .unwrap();
         let evidence = out.tests.unwrap().evidence.expect("launch evidence");
         let log = s.template_launches("orders").await.unwrap();
         assert_eq!(log[0].evidence.as_deref(), Some(evidence.as_str()));
         crate::templates::promote(&s, "orders", VersionChannel::Canary, pin(1))
             .await
             .unwrap();
-        let state = crate::templates::template_state(&s, "orders").await.unwrap();
+        let state = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert_eq!(state.evidence.get("stable"), Some(&evidence));
         assert_eq!(state.evidence.get("canary"), Some(&evidence));
         // A claim a newer result superseded is refused inside the write.
@@ -1230,23 +1392,46 @@ tests:
             result_id: evidence.clone(),
             body_sha256: body_sha256(&rec.body),
         };
-        let newer = inject(&s, "orders", 1, true, crate::template_tests::result::faucet_version()).await;
+        let newer = inject(
+            &s,
+            "orders",
+            1,
+            true,
+            crate::template_tests::result::faucet_version(),
+        )
+        .await;
         let err = s
             .template_set_tag("orders", "dev", 1, Some(&claim))
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::serve::history::HistoryError::StaleEvidence(_)), "{err}");
+        assert!(
+            matches!(err, crate::serve::history::HistoryError::StaleEvidence(_)),
+            "{err}"
+        );
         let fresh = EvidenceClaim {
             result_id: newer,
             ..claim
         };
-        s.template_set_tag("orders", "dev", 1, Some(&fresh)).await.unwrap();
-        let fail = inject(&s, "orders", 1, false, crate::template_tests::result::faucet_version()).await;
+        s.template_set_tag("orders", "dev", 1, Some(&fresh))
+            .await
+            .unwrap();
+        let fail = inject(
+            &s,
+            "orders",
+            1,
+            false,
+            crate::template_tests::result::faucet_version(),
+        )
+        .await;
         let failing = EvidenceClaim {
             result_id: fail,
             body_sha256: body_sha256(&rec.body),
         };
-        assert!(s.template_set_tag("orders", "test", 1, Some(&failing)).await.is_err());
+        assert!(
+            s.template_set_tag("orders", "test", 1, Some(&failing))
+                .await
+                .is_err()
+        );
         // The store's stale-evidence refusal reads as a refused label move.
         let e = crate::templates::bundle::stale_evidence("orders", 1, "launch", "changed".into());
         assert!(e.to_string().contains("try again"), "{e}");
@@ -1255,20 +1440,27 @@ tests:
     #[tokio::test]
     async fn results_carry_their_provenance() {
         let s = store().await;
-        let reg = register_tested(&s, req(pipeline("orders", 2))).await.unwrap();
+        let reg = register_tested(&s, req(pipeline("orders", 2)))
+            .await
+            .unwrap();
         let t = reg.tests.unwrap();
         assert_eq!(t.schema, crate::template_tests::result::RESULT_SCHEMA);
         assert!(!t.result_id.is_empty());
         assert!(!t.provenance.build_features.is_empty());
         assert_eq!(t.recorded_by.as_deref(), Some("ci"));
-        assert_eq!(t.faucet_version, crate::template_tests::result::faucet_version());
+        assert_eq!(
+            t.faucet_version,
+            crate::template_tests::result::faucet_version()
+        );
     }
 
     #[tokio::test]
     async fn a_deployment_bundle_is_structural() {
         let s = store().await;
         register(&s, req(SINK.into())).await.unwrap();
-        register(&s, req(source("sink: files\n  sink_select: newest"))).await.unwrap();
+        register(&s, req(source("sink: files\n  sink_select: newest")))
+            .await
+            .unwrap();
         let ops = register_tested(
             &s,
             req("kind: deployment\nname: ops\nstate: { type: memory }\ntests:\n  source: acme\n  source_select: newest\n  sink: files\n  sink_select: newest\n".into()),
@@ -1278,11 +1470,17 @@ tests:
         let t = ops.tests.expect("a structural bundle runs");
         assert!(t.passed, "{t:#?}");
         assert!(!t.cases.is_empty());
-        assert_eq!(t.provenance.companions, vec!["acme@1".to_string(), "files@1".to_string()]);
+        assert_eq!(
+            t.provenance.companions,
+            vec!["acme@1".to_string(), "files@1".to_string()]
+        );
         // Without both companions there is nothing to compose: no tests.
         let bare = register_tested(
             &s,
-            req("kind: deployment\nname: ops2\nstate: { type: memory }\ntests:\n  source: acme\n".into()),
+            req(
+                "kind: deployment\nname: ops2\nstate: { type: memory }\ntests:\n  source: acme\n"
+                    .into(),
+            ),
         )
         .await;
         assert!(bare.is_err() || bare.unwrap().tests.is_none());
@@ -1291,7 +1489,9 @@ tests:
     #[tokio::test]
     async fn an_oversized_bundle_records_a_failure_with_the_reason() {
         let s = store().await;
-        let rows: Vec<String> = (0..60_000).map(|i| format!("{{\"id\": {i}, \"pad\": \"xxxxxxxx\"}}")).collect();
+        let rows: Vec<String> = (0..60_000)
+            .map(|i| format!("{{\"id\": {i}, \"pad\": \"xxxxxxxx\"}}"))
+            .collect();
         let body = pipeline("big", 60_000).replace(
             "input: [{ \"id\": 1 }, { \"id\": 2 }]",
             &format!("input: [{}]", rows.join(", ")),
@@ -1299,7 +1499,11 @@ tests:
         let reg = register_tested(&s, req(body)).await.unwrap();
         let t = reg.tests.unwrap();
         assert!(!t.passed);
-        assert!(t.error.as_deref().unwrap_or("").contains("byte"), "{:?}", t.error);
+        assert!(
+            t.error.as_deref().unwrap_or("").contains("byte"),
+            "{:?}",
+            t.error
+        );
     }
 
     #[tokio::test]
@@ -1309,12 +1513,26 @@ tests:
         r.launch = true;
         register_tested(&s, r).await.unwrap();
         s.template_delete("orders", None).await.unwrap();
-        assert!(s.template_test_results("orders", None, 50).await.unwrap().is_empty());
-        let again = register_tested(&s, req(untested_body("orders"))).await.unwrap();
+        assert!(
+            s.template_test_results("orders", None, 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let again = register_tested(&s, req(untested_body("orders")))
+            .await
+            .unwrap();
         assert!(again.tests.is_none() && again.tests_inherited_from.is_none());
-        let state = crate::templates::template_state(&s, "orders").await.unwrap();
+        let state = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert!(state.stable.is_none(), "a draft again");
-        assert_eq!(crate::templates::run_gate(&s, "orders", 1, false).await.unwrap(), None);
+        assert_eq!(
+            crate::templates::run_gate(&s, "orders", 1, false)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1329,14 +1547,23 @@ tests:
         crate::templates::promote(&s, "orders", VersionChannel::Prod, pin(2))
             .await
             .unwrap();
-        register_tested(&s, req(pipeline("orders", 9))).await.unwrap();
-        let before = s.template_test_results("orders", None, 100).await.unwrap().len();
+        register_tested(&s, req(pipeline("orders", 9)))
+            .await
+            .unwrap();
+        let before = s
+            .template_test_results("orders", None, 100)
+            .await
+            .unwrap()
+            .len();
         let report = crate::templates::revalidate::revalidate_if_new_release(&s)
             .await
             .unwrap()
             .expect("never revalidated");
-        let mut seen: Vec<(u32, Vec<String>)> =
-            report.versions.iter().map(|v| (v.version, v.labels.clone())).collect();
+        let mut seen: Vec<(u32, Vec<String>)> = report
+            .versions
+            .iter()
+            .map(|v| (v.version, v.labels.clone()))
+            .collect();
         seen.sort();
         assert_eq!(
             seen,
@@ -1348,10 +1575,15 @@ tests:
         assert_eq!(report.failed(), 0);
         assert!(report.render_human().contains("orders@2"));
         assert_eq!(
-            s.template_test_results("orders", None, 100).await.unwrap().len(),
+            s.template_test_results("orders", None, 100)
+                .await
+                .unwrap()
+                .len(),
             before + 2
         );
-        let state = crate::templates::template_state(&s, "orders").await.unwrap();
+        let state = crate::templates::template_state(&s, "orders")
+            .await
+            .unwrap();
         assert_eq!(state.stable, Some(2), "labels never move");
         assert!(
             crate::templates::revalidate::revalidate_if_new_release(&s)
@@ -1361,7 +1593,9 @@ tests:
             "once per release line"
         );
         assert_eq!(
-            s.meta_get(crate::templates::revalidate::META_KEY).await.unwrap(),
+            s.meta_get(crate::templates::revalidate::META_KEY)
+                .await
+                .unwrap(),
             Some(crate::template_tests::result::running_line())
         );
     }
@@ -1374,7 +1608,10 @@ tests:
             "params:\n  token: { type: string, required: true, secret: true }\n",
         );
         let reg = register_tested(&s, req(secret.clone())).await.unwrap();
-        assert!(reg.tests.unwrap().passed, "a required secret gets a placeholder");
+        assert!(
+            reg.tests.unwrap().passed,
+            "a required secret gets a placeholder"
+        );
         let named = secret.replacen(
             "  suite:\n    auto:",
             "  suite:\n    cases:\n      - name: leaks\n        params: { token: hunter2 }\n    auto:",
@@ -1384,7 +1621,11 @@ tests:
         let t = reg.tests.unwrap();
         assert!(!t.passed);
         assert!(
-            t.cases.iter().any(|c| c.failure.as_deref().unwrap_or("").contains("never supplied to tests")),
+            t.cases.iter().any(|c| c
+                .failure
+                .as_deref()
+                .unwrap_or("")
+                .contains("never supplied to tests")),
             "{t:#?}"
         );
     }
@@ -1413,7 +1654,11 @@ tests:
         )
         .await;
         assert!(!out.passed());
-        assert!(out.cases.iter().all(|c| c.failure.as_deref().unwrap_or("").contains("time budget")));
+        assert!(
+            out.cases
+                .iter()
+                .all(|c| c.failure.as_deref().unwrap_or("").contains("time budget"))
+        );
         let tight = TestLimits {
             case_timeout: std::time::Duration::ZERO,
             ..DEFAULT_LIMITS
@@ -1423,7 +1668,12 @@ tests:
             run_bundle(&bundle, &target, &[], None),
         )
         .await;
-        assert!(out.cases.iter().all(|c| c.failure.as_deref().unwrap_or("").contains("per-case limit")));
+        assert!(out.cases.iter().all(|c| {
+            c.failure
+                .as_deref()
+                .unwrap_or("")
+                .contains("per-case limit")
+        }));
     }
 
     #[test]
@@ -1432,7 +1682,13 @@ tests:
         let body = "# keep me\nname: a\ntests:\n  # old\n  suite: { auto: { defaults_baseline: true } }\nafter: 1\n";
         let tests = serde_json::json!({"suite": {"auto": {"enum_coverage": true}}});
         let out = with_tests(body, ConfigFormat::Yaml, &tests).unwrap();
-        assert!(out.starts_with("# keep me\nname: a\n") && out.contains("after: 1"), "{out}");
-        assert!(!out.contains("# old") && out.contains("enum_coverage"), "{out}");
+        assert!(
+            out.starts_with("# keep me\nname: a\n") && out.contains("after: 1"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("# old") && out.contains("enum_coverage"),
+            "{out}"
+        );
     }
 }

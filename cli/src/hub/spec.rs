@@ -866,7 +866,11 @@ impl DeploymentTemplate {
                 )));
             }
         }
-        if let Some(b) = self.tests.as_ref().filter(|b| !b.is_empty_for(TemplateKind::Deployment)) {
+        if let Some(b) = self
+            .tests
+            .as_ref()
+            .filter(|b| !b.is_empty_for(TemplateKind::Deployment))
+        {
             b.validate(TemplateKind::Deployment)
                 .map_err(|e| CliError::Config(format!("deployment '{}': {e}", self.name)))?;
         }

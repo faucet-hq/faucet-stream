@@ -1383,6 +1383,7 @@ select {
 .tpl-version .tpl-vdeprecate { min-width: 96px; }
 .tpl-version .tpl-launch { min-width: 76px; }
 .tpl-assign { max-width: 160px; }
+.tpl-assign:disabled { opacity: 0.5; cursor: not-allowed; }
 .tpl-version .btn-ghost, .tpl-version .btn-danger, .tpl-version .btn-warn { padding: 5px 11px; font-size: 0.8rem; }
 .tpl-version-retired { background: color-mix(in srgb, var(--surface-sunken) 60%, var(--surface)); }
 .tpl-version-retired .tpl-vnum { color: var(--ink-dim); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--ink-faint) 70%, transparent); }

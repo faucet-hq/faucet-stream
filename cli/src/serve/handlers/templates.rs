@@ -767,12 +767,11 @@ pub async fn launch_template(
 ) -> Result<Json<LaunchResponse>, ServeError> {
     approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
     let target = body.version.unwrap_or_else(VersionSelector::newest);
-    let outcome = match crate::templates::launch(&store(&state), &id, target, Some(&actor.principal))
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => return Err(refused(&state, &actor, &id, "template.launch", e).await),
-    };
+    let outcome =
+        match crate::templates::launch(&store(&state), &id, target, Some(&actor.principal)).await {
+            Ok(o) => o,
+            Err(e) => return Err(refused(&state, &actor, &id, "template.launch", e).await),
+        };
     finish_launch(&state, &actor, &id, outcome, "template.launch").await
 }
 
@@ -804,11 +803,11 @@ pub async fn rollback_template(
     Path(id): Path<String>,
 ) -> Result<Json<LaunchResponse>, ServeError> {
     approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
-    let outcome = match crate::templates::rollback(&store(&state), &id, Some(&actor.principal)).await
-    {
-        Ok(o) => o,
-        Err(e) => return Err(refused(&state, &actor, &id, "template.rollback", e).await),
-    };
+    let outcome =
+        match crate::templates::rollback(&store(&state), &id, Some(&actor.principal)).await {
+            Ok(o) => o,
+            Err(e) => return Err(refused(&state, &actor, &id, "template.rollback", e).await),
+        };
     finish_launch(&state, &actor, &id, outcome, "template.rollback").await
 }
 
@@ -1335,7 +1334,10 @@ pub async fn trigger_template_outcome(
             &state,
             &actor,
             "template.run",
-            format!("template:{}@{}", materialized.template_id, materialized.version),
+            format!(
+                "template:{}@{}",
+                materialized.template_id, materialized.version
+            ),
             format!("allow_untested: v{} is {status}", materialized.version),
             "ok",
         )

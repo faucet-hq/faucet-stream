@@ -362,7 +362,7 @@ pub enum CliError {
     VersionNotPassing {
         id: String,
         version: u32,
-        status: String,
+        status: crate::template_tests::TestStatus,
         action: String,
         reason: String,
         failing: Vec<String>,

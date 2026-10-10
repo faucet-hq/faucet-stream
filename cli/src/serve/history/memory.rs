@@ -82,8 +82,7 @@ pub struct MemoryHistory {
     /// Test-bundle runs per template (#856), newest first.
     template_tests: Mutex<std::collections::HashMap<String, Vec<templates::TemplateTestResult>>>,
     /// The evidence each channel pointer moved on: id → tag → (version, result id).
-    template_tag_evidence:
-        Mutex<std::collections::HashMap<String, BTreeMap<String, (u32, String)>>>,
+    template_tag_evidence: Mutex<std::collections::HashMap<String, TagEvidence>>,
     /// Server-wide settings (#856).
     meta: Mutex<std::collections::HashMap<String, String>>,
     /// Persistent run logs (#529): run_id → lines (append order == seq order).
@@ -1664,6 +1663,9 @@ impl RunHistory for MemoryHistory {
     }
 }
 
+/// The evidence of one template's channels: tag → (version, result id).
+type TagEvidence = BTreeMap<String, (u32, String)>;
+
 /// One version's recorded results, newest first.
 fn version_results(
     tests: &std::collections::HashMap<String, Vec<templates::TemplateTestResult>>,
@@ -1672,7 +1674,12 @@ fn version_results(
 ) -> Vec<templates::TemplateTestResult> {
     tests
         .get(id)
-        .map(|runs| runs.iter().filter(|r| r.version == version).cloned().collect())
+        .map(|runs| {
+            runs.iter()
+                .filter(|r| r.version == version)
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -2268,4 +2275,3 @@ mod tests {
         );
     }
 }
-

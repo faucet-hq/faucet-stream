@@ -128,8 +128,14 @@ async fn owner_ids_are_addressed_as_one_percent_encoded_segment() {
     // registered, then launch (#856).
     for id in ["acme%2Fbilling", "faucet-hq%2Ffiles"] {
         for (path, body) in [
-            (format!("{base}/v1/templates/{id}/versions/1/test"), json!({})),
-            (format!("{base}/v1/templates/{id}/launch"), json!({ "version": 1 })),
+            (
+                format!("{base}/v1/templates/{id}/versions/1/test"),
+                json!({}),
+            ),
+            (
+                format!("{base}/v1/templates/{id}/launch"),
+                json!({ "version": 1 }),
+            ),
         ] {
             let r = client.post(path).json(&body).send().await.unwrap();
             assert!(r.status().is_success(), "{}", r.text().await.unwrap());

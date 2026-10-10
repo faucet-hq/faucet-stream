@@ -64,7 +64,7 @@ pub use store::{
     RegisterRequest, Registration, SinkChoice, TemplateStore, deprecation_warning, launch,
     list_with_state, materialize, materialize_for_run, materialize_for_run_selected,
     materialize_pair, materialize_pair_overlaid, parse_body, preview_register, promote, register,
-    register_tested, run_gate, resolve_store_url, resolve_version, rollback, set_deprecated,
+    register_tested, resolve_store_url, resolve_version, rollback, run_gate, set_deprecated,
     set_version_deprecated, template_state,
 };
 

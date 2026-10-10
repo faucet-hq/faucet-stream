@@ -8,8 +8,8 @@
 
 use crate::cli::{
     TemplateArgs, TemplateCommand, TemplateDeleteArgs, TemplateDeprecateArgs, TemplateLaunchArgs,
-    TemplateListArgs, TemplateRevalidateArgs, TemplatePromoteArgs, TemplateRegisterArgs, TemplateRollbackArgs,
-    TemplateRunArgs, TemplateShowArgs, TemplateStoreArgs,
+    TemplateListArgs, TemplatePromoteArgs, TemplateRegisterArgs, TemplateRevalidateArgs,
+    TemplateRollbackArgs, TemplateRunArgs, TemplateShowArgs, TemplateStoreArgs,
 };
 use crate::error::{CliError, CliResult};
 use crate::serve::history::templates::{
@@ -286,10 +286,7 @@ async fn revalidate(args: TemplateRevalidateArgs) -> CliResult<()> {
     let store = connect(&args.common).await?;
     let report = crate::templates::revalidate::revalidate(&store, None).await?;
     store
-        .meta_put(
-            crate::templates::revalidate::META_KEY,
-            &report.faucet,
-        )
+        .meta_put(crate::templates::revalidate::META_KEY, &report.faucet)
         .await
         .map_err(|e| crate::templates::store::registry_err("server setting write", e))?;
     if args.common.json {
@@ -1951,7 +1948,8 @@ suite:
             &store,
             crate::templates::RegisterRequest {
                 id: Some("adapter-registered".into()),
-                body: crate::templates::bundle::smoke(r#"version: 1
+                body: crate::templates::bundle::smoke(
+                    r#"version: 1
 name: adapter-registered
 params:
   tenant: { type: string, required: true }
@@ -1962,7 +1960,8 @@ pipeline:
   sink:
     type: jsonl
     config: { path: "./out/${param.tenant}.jsonl" }
-"#),
+"#,
+                ),
                 format: ConfigFormat::Yaml,
                 description: None,
                 tags: Vec::new(),

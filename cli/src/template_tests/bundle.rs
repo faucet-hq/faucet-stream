@@ -93,7 +93,9 @@ impl TestBundle {
 
     /// Whether every requirement has its locked copy.
     pub fn fully_locked(&self) -> bool {
-        self.requires_suites.iter().all(|r| self.locked(r).is_some())
+        self.requires_suites
+            .iter()
+            .all(|r| self.locked(r).is_some())
     }
 }
 

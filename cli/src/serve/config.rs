@@ -741,7 +741,12 @@ mod tests {
 
     #[test]
     fn no_auth_on_a_network_address_is_refused_unless_allowed() {
-        for listen in ["0.0.0.0:8080", "10.1.2.3:8080", "[::]:8080", "[2001:db8::1]:8080"] {
+        for listen in [
+            "0.0.0.0:8080",
+            "10.1.2.3:8080",
+            "[::]:8080",
+            "[2001:db8::1]:8080",
+        ] {
             let mut a = base_args();
             a.no_auth = true;
             a.listen = listen.into();

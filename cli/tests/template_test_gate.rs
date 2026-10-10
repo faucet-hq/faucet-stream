@@ -95,7 +95,10 @@ async fn sqlite_records_evidence_refuses_stale_claims_prunes_and_cascades() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("v1 is failing") && err.contains("rows:"), "{err}");
+    assert!(
+        err.contains("v1 is failing") && err.contains("rows:"),
+        "{err}"
+    );
 
     faucet_cli::templates::register(&s, req(pipeline("orders", 2)))
         .await
@@ -143,7 +146,11 @@ async fn sqlite_records_evidence_refuses_stale_claims_prunes_and_cascades() {
         ),
         "{err}"
     );
-    assert!(s.template_launch("orders", 1, None, Some(&claim)).await.is_err());
+    assert!(
+        s.template_launch("orders", 1, None, Some(&claim))
+            .await
+            .is_err()
+    );
 
     // Server settings.
     assert_eq!(s.meta_get("k").await.unwrap(), None);
@@ -400,7 +407,11 @@ async fn cli_tests_a_registered_version_and_a_template_file() {
     faucet_cli::templates::launch(&s, "orders", VersionSelector::Pinned(1), None)
         .await
         .unwrap();
-    let before = s.template_test_results("orders", None, 50).await.unwrap().len();
+    let before = s
+        .template_test_results("orders", None, 50)
+        .await
+        .unwrap()
+        .len();
     faucet_cli::commands::template::run(TemplateArgs {
         command: TemplateCommand::Revalidate(faucet_cli::cli::TemplateRevalidateArgs {
             common: faucet_cli::cli::TemplateStoreArgs {
@@ -414,7 +425,10 @@ async fn cli_tests_a_registered_version_and_a_template_file() {
     .await
     .unwrap();
     assert_eq!(
-        s.template_test_results("orders", None, 50).await.unwrap().len(),
+        s.template_test_results("orders", None, 50)
+            .await
+            .unwrap()
+            .len(),
         before + 1
     );
     assert!(
@@ -484,56 +498,57 @@ async fn serve_with_history(
     let port = free_port();
     let auth = dir.join(format!("auth-{port}.yaml"));
     std::fs::write(&auth, AUTH).unwrap();
-    let args = faucet_cli::cli::ServeArgs {
-        listen: format!("127.0.0.1:{port}"),
-        auth_token: None,
-        auth_config: Some(auth),
-        read_token: None,
-        write_token: None,
-        admin_token: None,
-        no_auth: false,
-        allow_unauthenticated_network: false,
-        max_concurrent_runs: Some(2),
-        max_queued_runs: Some(8),
-        default_config: None,
-        history: Some(history.unwrap_or_else(|| {
-            format!("sqlite:{}", dir.join(format!("h-{port}.db")).display())
-        })),
-        cors_origin: vec![],
-        body_limit_bytes: 1_048_576,
-        shutdown_grace_secs: 5,
-        retain_terminal_runs_secs: 604_800,
-        idempotency_retention_secs: 86_400,
-        log_retention_secs: 604_800,
-        log_max_lines_per_run: 100_000,
-        log_buffer: Default::default(),
-        local_output_retention_days: 7,
-        local_output_in_flight_grace_secs: 60,
-        preview_local_outputs: false,
-        preview_default_rows: 500,
-        preview_max_rows: 5_000,
-        lease_ttl_secs: 30,
-        probe_timeout_secs: 5,
-        env_file: None,
-        no_env_file: true,
-        no_ui: true,
-        cluster: false,
-        cluster_poll_secs: 2,
-        cluster_max_attempts: 3,
-        triggers: None,
-        templates_sync: None,
-        policy: None,
-        otel_config: None,
-        callback_allow_host: Vec::new(),
-        mcp: true,
-        mcp_allow_mutations: true,
-        require_approval,
-        approval_expiry_secs: 86_400,
-        vault_key: None,
-        vault_previous_key: Vec::new(),
-        connect_providers: None,
-        allow_subprocess_connectors: false,
-    };
+    let args =
+        faucet_cli::cli::ServeArgs {
+            listen: format!("127.0.0.1:{port}"),
+            auth_token: None,
+            auth_config: Some(auth),
+            read_token: None,
+            write_token: None,
+            admin_token: None,
+            no_auth: false,
+            allow_unauthenticated_network: false,
+            max_concurrent_runs: Some(2),
+            max_queued_runs: Some(8),
+            default_config: None,
+            history: Some(history.unwrap_or_else(|| {
+                format!("sqlite:{}", dir.join(format!("h-{port}.db")).display())
+            })),
+            cors_origin: vec![],
+            body_limit_bytes: 1_048_576,
+            shutdown_grace_secs: 5,
+            retain_terminal_runs_secs: 604_800,
+            idempotency_retention_secs: 86_400,
+            log_retention_secs: 604_800,
+            log_max_lines_per_run: 100_000,
+            log_buffer: Default::default(),
+            local_output_retention_days: 7,
+            local_output_in_flight_grace_secs: 60,
+            preview_local_outputs: false,
+            preview_default_rows: 500,
+            preview_max_rows: 5_000,
+            lease_ttl_secs: 30,
+            probe_timeout_secs: 5,
+            env_file: None,
+            no_env_file: true,
+            no_ui: true,
+            cluster: false,
+            cluster_poll_secs: 2,
+            cluster_max_attempts: 3,
+            triggers: None,
+            templates_sync: None,
+            policy: None,
+            otel_config: None,
+            callback_allow_host: Vec::new(),
+            mcp: true,
+            mcp_allow_mutations: true,
+            require_approval,
+            approval_expiry_secs: 86_400,
+            vault_key: None,
+            vault_previous_key: Vec::new(),
+            connect_providers: None,
+            allow_subprocess_connectors: false,
+        };
     let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
     tokio::spawn(async move {
@@ -600,7 +615,10 @@ async fn http_labels_need_passing_versions_and_runs_follow_labels() {
     )
     .await;
     assert_eq!(code, 201, "{r}");
-    assert_eq!(r["tests"]["passed"], false, "registered, and its result recorded: {r}");
+    assert_eq!(
+        r["tests"]["passed"], false,
+        "registered, and its result recorded: {r}"
+    );
     assert!(r["tests"]["instance"].is_string(), "server provenance: {r}");
     assert_eq!(r["tests"]["schema"], 1);
 
@@ -613,7 +631,9 @@ async fn http_labels_need_passing_versions_and_runs_follow_labels() {
     )
     .await;
     assert_eq!(code, 422, "{r}");
-    let failing = r["error"]["details"]["tests"]["failing"].as_array().unwrap();
+    let failing = r["error"]["details"]["tests"]["failing"]
+        .as_array()
+        .unwrap();
     assert!(
         failing
             .iter()
@@ -629,7 +649,10 @@ async fn http_labels_need_passing_versions_and_runs_follow_labels() {
         Some(json!({ "tag": "dev", "version": 1 })),
     )
     .await;
-    assert_eq!(code, 422, "every label needs a passing version, dev too: {r}");
+    assert_eq!(
+        code, 422,
+        "every label needs a passing version, dev too: {r}"
+    );
 
     // A draft runs any version, pinned.
     let run = |v: Value, extra: Value| {
@@ -805,7 +828,11 @@ async fn http_labels_need_passing_versions_and_runs_follow_labels() {
         "POST",
         "admin-tok",
         "/mcp",
-        Some(mcp(1, "launch_template", json!({ "id": "orders", "version": 1 }))),
+        Some(mcp(
+            1,
+            "launch_template",
+            json!({ "id": "orders", "version": 1 }),
+        )),
     )
     .await;
     assert_eq!(r["result"]["isError"], true, "{r}");
@@ -841,7 +868,11 @@ async fn http_labels_need_passing_versions_and_runs_follow_labels() {
         "POST",
         "admin-tok",
         "/mcp",
-        Some(mcp(4, "test_template", json!({ "id": "orders", "version": 2 }))),
+        Some(mcp(
+            4,
+            "test_template",
+            json!({ "id": "orders", "version": 2 }),
+        )),
     )
     .await;
     assert_eq!(r["result"]["isError"], false, "{r}");
@@ -948,20 +979,25 @@ async fn a_server_on_a_new_release_line_revalidates_label_holders() {
     let dir = tempfile::tempdir().unwrap();
     let port_db = dir.path().join("pre.db");
     let url = format!("sqlite:{}", port_db.display());
-    let s = faucet_cli::templates::resolve_store_url(&url).await.unwrap();
+    let s = faucet_cli::templates::resolve_store_url(&url)
+        .await
+        .unwrap();
     let mut r = req(pipeline("orders", 2));
     r.launch = true;
     faucet_cli::templates::register_tested(&s, r).await.unwrap();
-    s.meta_put(
-        faucet_cli::templates::revalidate::META_KEY,
-        "0.0",
-    )
-    .await
-    .unwrap();
-    let before = s.template_test_results("orders", None, 50).await.unwrap().len();
+    s.meta_put(faucet_cli::templates::revalidate::META_KEY, "0.0")
+        .await
+        .unwrap();
+    let before = s
+        .template_test_results("orders", None, 50)
+        .await
+        .unwrap()
+        .len();
     drop(s);
     let base = serve_with_history(dir.path(), Vec::new(), Some(url.clone())).await;
-    let s = faucet_cli::templates::resolve_store_url(&url).await.unwrap();
+    let s = faucet_cli::templates::resolve_store_url(&url)
+        .await
+        .unwrap();
     for _ in 0..400 {
         if s.meta_get(faucet_cli::templates::revalidate::META_KEY)
             .await

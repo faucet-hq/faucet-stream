@@ -1093,16 +1093,16 @@ async fn execute(
                 .unwrap_or_else(crate::serve::history::templates::VersionSelector::newest);
             crate::templates::launch(&state.history(), &body.id, target, Some(&change.requester))
                 .await
-            .map(|o| {
-                (
-                    None,
-                    Some(TemplateOutcome {
-                        id: body.id.clone(),
-                        version: o.version,
-                    }),
-                )
-            })
-            .map_err(template_err)
+                .map(|o| {
+                    (
+                        None,
+                        Some(TemplateOutcome {
+                            id: body.id.clone(),
+                            version: o.version,
+                        }),
+                    )
+                })
+                .map_err(template_err)
         }
         #[cfg(not(feature = "templates"))]
         ChangeKind::TemplateRegister | ChangeKind::TemplateLaunch => {
@@ -1886,7 +1886,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let bare = approve(&state, &actor("alice"), &bare.id, None).await.unwrap();
+        let bare = approve(&state, &actor("alice"), &bare.id, None)
+            .await
+            .unwrap();
         assert_eq!(bare.status, ChangeStatus::Executed, "{:?}", bare.error);
         let refused = create(
             &state,

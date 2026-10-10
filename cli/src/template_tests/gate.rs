@@ -12,7 +12,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::result::{RESULT_SCHEMA, TemplateTestResult, faucet_version, release_line, running_line};
+use super::result::{
+    RESULT_SCHEMA, TemplateTestResult, faucet_version, release_line, running_line,
+};
 use crate::error::CliError;
 
 /// Where the rules for template tests and labels are explained.
@@ -165,7 +167,7 @@ impl VersionStatus {
         CliError::VersionNotPassing {
             id: id.to_string(),
             version,
-            status: self.status.as_str().to_string(),
+            status: self.status,
             action: action.to_string(),
             reason: self
                 .reason
@@ -256,7 +258,10 @@ mod tests {
         );
         assert_eq!(v.status, TestStatus::Untested);
         assert!(v.reason.unwrap().contains(&running_line()));
-        assert_eq!(status_of("t", 2, true, "h", &[]).status, TestStatus::Untested);
+        assert_eq!(
+            status_of("t", 2, true, "h", &[]).status,
+            TestStatus::Untested
+        );
         assert!(!evidence_counts(&result(true, "h", "garbage"), "h"));
     }
 
@@ -273,12 +278,21 @@ mod tests {
 
     #[test]
     fn a_stale_pass_keeps_a_version_eligible_for_newest() {
-        assert!(last_passed_any_release(&[result(true, "h", &other_minor())], "h"));
-        assert!(!last_passed_any_release(
-            &[result(false, "h", &other_minor()), result(true, "h", faucet_version())],
+        assert!(last_passed_any_release(
+            &[result(true, "h", &other_minor())],
             "h"
         ));
-        assert!(!last_passed_any_release(&[result(true, "x", faucet_version())], "h"));
+        assert!(!last_passed_any_release(
+            &[
+                result(false, "h", &other_minor()),
+                result(true, "h", faucet_version())
+            ],
+            "h"
+        ));
+        assert!(!last_passed_any_release(
+            &[result(true, "x", faucet_version())],
+            "h"
+        ));
     }
 
     #[test]

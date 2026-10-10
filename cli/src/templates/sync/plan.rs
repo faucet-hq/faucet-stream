@@ -429,7 +429,9 @@ mod tests {
         .unwrap();
         assert_eq!(a, inherited);
         let own = "version: 1\nname: a\ntests:\n  requires_suites: [{ name: s, version: '1' }]\n";
-        let locked = format!("{own}  locked_suites: [{{ name: s, range: '1', release: 1.0.0, suite: {{}} }}]\n");
+        let locked = format!(
+            "{own}  locked_suites: [{{ name: s, range: '1', release: 1.0.0, suite: {{}} }}]\n"
+        );
         assert_eq!(body_hash(own).unwrap(), body_hash(&locked).unwrap());
         assert_ne!(a, body_hash(own).unwrap());
         assert!(body_hash(": : :").is_err());

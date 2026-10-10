@@ -296,13 +296,19 @@ async fn postgres_template_test_results_and_launch_notes() {
     h.template_launch(&id, 1, Some("root"), Some(&claim))
         .await
         .unwrap();
-    h.template_set_tag(&id, "prod", 1, Some(&claim)).await.unwrap();
+    h.template_set_tag(&id, "prod", 1, Some(&claim))
+        .await
+        .unwrap();
     assert_eq!(
-        h.template_launches(&id).await.unwrap()[0].evidence.as_deref(),
+        h.template_launches(&id).await.unwrap()[0]
+            .evidence
+            .as_deref(),
         Some(pass.result_id.as_str())
     );
     assert_eq!(
-        h.template_tag_records(&id).await.unwrap()[0].evidence.as_deref(),
+        h.template_tag_records(&id).await.unwrap()[0]
+            .evidence
+            .as_deref(),
         Some(pass.result_id.as_str())
     );
     h.meta_put(&id, "1.13").await.unwrap();

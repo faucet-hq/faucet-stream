@@ -191,7 +191,10 @@ pub async fn with_run_limits<F: std::future::Future>(
     fut: F,
 ) -> F::Output {
     RUN_LIMITS
-        .scope((limits, tokio::time::Instant::now() + limits.run_budget), fut)
+        .scope(
+            (limits, tokio::time::Instant::now() + limits.run_budget),
+            fut,
+        )
         .await
 }
 
