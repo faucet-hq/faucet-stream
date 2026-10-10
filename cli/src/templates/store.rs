@@ -300,17 +300,6 @@ async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliRe
             "test-on-register was asked for, but the document has no `tests:` block".into(),
         ));
     }
-    if req.launch
-        && bundle.is_none()
-        && req.gate.require_tests
-        && req.gate.skip_tests_reason.is_none()
-    {
-        return Err(CliError::Config(format!(
-            "'{id}' cannot be registered and launched: this server requires a passing test \
-             bundle before a launch, and the document has no `tests:` block"
-        )));
-    }
-
     Ok(Prelude {
         doc,
         declared,

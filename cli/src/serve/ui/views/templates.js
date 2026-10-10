@@ -818,9 +818,7 @@ function testsBlock(t, requireTests) {
     lines.push(`<div class="tpl-tests-why"><b>Launch blocked</b> — failing cases:<ul>${t.gate.failing.map((f) => `<li class="mono">${escapeHtml(f)}</li>`).join("")}</ul></div>`);
   } else if (!t.gate.allowed && t.gate.reason) {
     lines.push(`<div class="tpl-tests-why"><b>Launch blocked</b> — ${mdInline(t.gate.reason)}</div>`);
-  } else if (!requireTests && t.gate.status === "no_tests") {
-    lines.push(`<div class="tpl-tests-why tpl-tests-warn">No <code>tests:</code> block — this version launches untested. A server with <code>--require-template-tests</code> would refuse it.</div>`);
-  } else if (!requireTests && t.gate.status !== "passed") {
+  } else if (!requireTests && !["passed", "no_tests"].includes(t.gate.status)) {
     lines.push(`<div class="tpl-tests-why tpl-tests-warn">${mdInline(t.gate.reason || "Tests have not passed.")} Launching is allowed only because this server does not require tests.</div>`);
   }
   if (t.results && t.results.length) {

@@ -484,34 +484,17 @@ tests:
     }
 
     #[tokio::test]
-    async fn a_version_without_tests_launches_only_while_tests_are_not_required() {
+    async fn a_version_without_tests_launches_even_when_tests_are_required() {
         let s = store().await;
         let body = pipeline("plain", 2);
         let body = body[..body.find("tests:").unwrap()].to_string();
         register(&s, req(body.clone())).await.unwrap();
         let v = version_tests(&s, "plain", 1, &required(), 5).await.unwrap();
         assert_eq!(v.gate.status, GateStatus::NoTests);
-        assert!(!v.gate.allowed);
-        assert!(
-            crate::templates::launch_gated(
-                &s,
-                "plain",
-                VersionSelector::Pinned(1),
-                None,
-                &required()
-            )
+        assert!(v.gate.allowed, "tests are optional");
+        crate::templates::launch_gated(&s, "plain", VersionSelector::Pinned(1), None, &required())
             .await
-            .is_err()
-        );
-        crate::templates::launch_gated(
-            &s,
-            "plain",
-            VersionSelector::Pinned(1),
-            None,
-            &LaunchGate::new(false),
-        )
-        .await
-        .unwrap();
+            .unwrap();
         assert!(
             test_version(&s, "plain", 1, None)
                 .await
@@ -531,14 +514,9 @@ tests:
         let mut r = req(body);
         r.launch = true;
         r.gate = required();
-        assert!(
-            register(&s, r)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("cannot be registered and launched")
-        );
-        assert_eq!(s.template_state("plain").await.unwrap().versions, vec![1]);
+        register(&s, r).await.unwrap();
+        let st = s.template_state("plain").await.unwrap();
+        assert_eq!((st.versions, st.stable), (vec![1, 2], Some(2)));
     }
 
     #[tokio::test]

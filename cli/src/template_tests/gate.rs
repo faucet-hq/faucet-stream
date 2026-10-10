@@ -59,7 +59,8 @@ pub enum GateStatus {
     Stale,
     /// The version has a bundle that has never run.
     NotRun,
-    /// The version carries no `tests:` block.
+    /// The version carries no `tests:` block. Tests are optional, so the gate
+    /// never refuses it.
     NoTests,
 }
 
@@ -98,15 +99,7 @@ pub fn evaluate(
     let major = major_of(faucet_version());
     let deciding = results.iter().find(|r| r.counts_for(body_sha256, major));
     let (status, reason, failing, result_at) = if !has_tests {
-        (
-            GateStatus::NoTests,
-            Some(format!(
-                "v{version} has no `tests:` block, and this server requires a passing test \
-                 bundle before a launch — register a version with tests"
-            )),
-            Vec::new(),
-            None,
-        )
+        (GateStatus::NoTests, None, Vec::new(), None)
     } else {
         match deciding {
             Some(r) if r.passed => (GateStatus::Passed, None, Vec::new(), Some(r.recorded_at)),
@@ -139,7 +132,8 @@ pub fn evaluate(
             ),
         }
     };
-    let blocked = gate.require_tests && status != GateStatus::Passed;
+    let blocked =
+        gate.require_tests && !matches!(status, GateStatus::Passed | GateStatus::NoTests);
     let skipped = (blocked && gate.skip_tests_reason.is_some())
         .then(|| gate.skip_tests_reason.clone())
         .flatten();
@@ -249,17 +243,22 @@ mod tests {
     }
 
     #[test]
-    fn never_run_and_no_tests_are_refused_only_when_required() {
+    fn a_never_run_bundle_is_refused_only_when_required() {
         let v = evaluate(&LaunchGate::new(true), "t", 2, true, "h", &[]);
         assert_eq!(v.status, GateStatus::NotRun);
         assert!(!v.allowed);
-        let v = evaluate(&LaunchGate::new(true), "t", 2, false, "h", &[]);
-        assert_eq!(v.status, GateStatus::NoTests);
-        assert!(!v.allowed);
-        let v = evaluate(&LaunchGate::new(false), "t", 2, false, "h", &[]);
+        let v = evaluate(&LaunchGate::new(false), "t", 2, true, "h", &[]);
         assert!(v.allowed, "require_tests off keeps today's behaviour");
-        assert_eq!(v.status, GateStatus::NoTests);
-        assert!(v.skipped.is_none());
+    }
+
+    #[test]
+    fn a_version_without_tests_is_never_refused() {
+        for require in [true, false] {
+            let v = evaluate(&LaunchGate::new(require), "t", 2, false, "h", &[]);
+            assert_eq!(v.status, GateStatus::NoTests);
+            assert!(v.allowed, "tests are optional (require_tests: {require})");
+            assert!(v.reason.is_none() && v.skipped.is_none());
+        }
     }
 
     #[test]

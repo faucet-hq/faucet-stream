@@ -681,7 +681,7 @@ whose `error.details.gate` lists the failing cases, and is audited
 | failing result | launches (console warns) | refused, failing cases listed |
 | results only from another major, or another body | launches | refused — rerun the bundle |
 | bundle never run | launches | refused |
-| no `tests:` block | launches (console warns) | refused |
+| no `tests:` block | launches | launches — tests are optional |
 
 An admin can launch past a refusal with a reason — `--skip-tests-reason "<why>"`
 on `faucet template launch|rollback|register`, `skip_tests_reason` in the HTTP
