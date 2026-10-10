@@ -11,7 +11,7 @@
 //! - [`combine`] — pure case generation: explicit, cartesian/all-pairs, and
 //!   cases derived from the template's own `params:`.
 //! - [`runner`] — materialize per combination, then validate or run fixtures.
-//! - [`run`] — a whole bundle, shared suites included.
+//! - [`run`](mod@run) — a whole bundle, shared suites included.
 //! - [`result`] / [`gate`] — what a run records and what a launch requires.
 //! - [`trust`] — the server's trust boundary and the limits of a run.
 //! - [`report`] — human checklist + `--json`.
