@@ -2235,7 +2235,7 @@ paths:
       summary: A template version's test status and results
       description: >
         Whether the version carries a `tests:` bundle, its status (`passing`,
-        `failing`, `untested`, `no_tests`) and its recent recorded runs, newest
+        `failing`, `untested`, `no_tests`, `unknown`) and its recent recorded runs, newest
         first (#856). Requires the `TemplateRead`
         permission (viewer) and the `templates` Cargo feature.
       operationId: templateVersionTests
