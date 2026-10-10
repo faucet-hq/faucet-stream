@@ -274,6 +274,7 @@ pub(crate) fn name_matches(name: &str, filter: Option<&str>) -> bool {
 /// params merged), because that is the surface a trigger binds.
 async fn declared_params(target: &Target<'_>) -> CliResult<crate::params::ParamsSpec> {
     let mut doc = effective_document(target).await?;
+    super::trust::screen(&doc)?;
     // Defaults like `${env:PORT}` resolve before binding, as a real run does.
     crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
     crate::params::declared(&doc)
