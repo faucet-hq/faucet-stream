@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.10.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.9.3...faucet-stream-v1.10.0) - 2026-10-10
+
+### Bug Fixes
+
+- Per-change mirror replay skip, duckdb 1.10506; agent skills with requires_faucet; Helm values for every serve feature ([#858](https://github.com/faucet-hq/faucet-stream/pull/858))
+
+### Documentation
+
+- Correct cdc_unwrap TOAST marker note and list keys_case `dot` mode ([#848](https://github.com/faucet-hq/faucet-stream/pull/848))
+
+### Features
+
+- Lossless incremental replication for postgres/mysql, and durable OTLP log shipping ([#852](https://github.com/faucet-hq/faucet-stream/pull/852))
+- *(image)* The full image carries every feature, plus an opt-in full-oracle tag ([#847](https://github.com/faucet-hq/faucet-stream/pull/847))
+
 ## [1.9.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.9.2...faucet-stream-v1.9.3) - 2026-10-08
 
 ### Bug Fixes

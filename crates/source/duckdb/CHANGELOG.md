@@ -7,6 +7,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.2.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-duckdb-v1.2.1...faucet-source-duckdb-v1.2.2) - 2026-10-10
+
+### Bug Fixes
+
+- Per-change mirror replay skip, duckdb 1.10506; agent skills with requires_faucet; Helm values for every serve feature ([#858](https://github.com/faucet-hq/faucet-stream/pull/858))
+
 ## [1.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-duckdb-v1.2.0...faucet-source-duckdb-v1.2.1) - 2026-10-08
 
 ### Bug Fixes

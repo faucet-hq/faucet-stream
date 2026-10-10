@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-postgres-cdc-v1.4.2...faucet-source-postgres-cdc-v1.4.3) - 2026-10-10
+
+### Bug Fixes
+
+- Per-change mirror replay skip, duckdb 1.10506; agent skills with requires_faucet; Helm values for every serve feature ([#858](https://github.com/faucet-hq/faucet-stream/pull/858))
+
+### Documentation
+
+- Correct cdc_unwrap TOAST marker note and list keys_case `dot` mode ([#848](https://github.com/faucet-hq/faucet-stream/pull/848))
+
 ## [1.4.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-postgres-cdc-v1.4.1...faucet-source-postgres-cdc-v1.4.2) - 2026-10-08
 
 ### Bug Fixes
