@@ -70,6 +70,25 @@ pub fn has_scoping_tokens(serialized_config: &str) -> bool {
         || crate::interpolate::contains_unescaped(serialized_config, "${now.")
 }
 
+/// The file or object destination every unit of a backfill of `node` would
+/// write, when it does not vary per unit (no `${backfill.*}` / `${now.*}`
+/// token). Units running at once would clobber each other's scratch files and
+/// published objects there (#862 M-096).
+pub fn shared_unit_destination(node: &crate::expand::ExpandedNode) -> Option<String> {
+    let dest = crate::registry::sink_shared_destination(&node.sink.kind, &node.sink.config)?;
+    (!has_scoping_tokens(&dest)).then_some(dest)
+}
+
+/// The refusal for [`shared_unit_destination`].
+pub fn shared_destination_error(row: &str, kind: &str, dest: &str) -> String {
+    format!(
+        "row '{row}': every backfill unit writes the {kind} sink destination '{dest}', so units \
+         running at once would overwrite each other's files — put a per-window token in the \
+         path (e.g. `out/${{backfill.unit}}.jsonl`) or run the units one at a time \
+         (`--concurrency 1`)"
+    )
+}
+
 /// Parse an IANA timezone name.
 pub fn parse_timezone(name: &str) -> CliResult<chrono_tz::Tz> {
     name.parse::<chrono_tz::Tz>().map_err(|_| {

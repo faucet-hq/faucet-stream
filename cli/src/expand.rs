@@ -1599,6 +1599,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
+    if cfg.shard.as_ref().is_some_and(|s| s.count >= 2) {
+        check_sharded_file_sinks(&out)?;
+    }
     for warning in out.iter().filter_map(rewritten_file_warning) {
         tracing::warn!("{warning}");
     }
@@ -1785,9 +1788,10 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
 /// A local file sink writing one unnumbered file in a format that can only be
 /// rewritten whole to continue it, under a source that bookmarks — so the
 /// pipeline flushes — every page: each flush rewrites the file, so the run's
-/// time and I/O grow with the square of its size (#789 FILE-19). JSON Lines
-/// and raw text extend in place unless the whole file is sealed (encrypted
-/// and compressed). The sink warns again, per file, when it happens.
+/// time and I/O grow with the square of its size (#789 FILE-19). Uncompressed
+/// JSON Lines and raw text extend in place; a compressed file is rewritten so a
+/// crash never leaves a torn member in it (#862 M-088). The sink warns again,
+/// per file, when it happens.
 fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
     if matches!(n.role, NodeRole::Discovery { .. })
         || !source_flushes_every_page(&n.source.kind, &n.source.config)
@@ -1833,13 +1837,13 @@ fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
             .any(|ext| path.to_ascii_lowercase().ends_with(ext)),
         other => other != "none",
     };
-    let sealed_whole = cfg.get("encryption").is_some_and(|v| !v.is_null()) && compressed;
-    if line && !sealed_whole {
+    if line && !compressed {
         return None;
     }
     Some(format!(
         "row '{}': the {} source bookmarks every page, so the {} sink flushes '{path}' once per \
-         page and must rewrite it whole each time (its format can not be appended to) — the \
+         page and must rewrite it whole each time (a compressed or non-line file can not be \
+         appended to in place) — the \
          run's time and I/O grow with the square of the file's size; add `{{part}}` to the path \
          or set max_records_per_file / max_bytes_per_file",
         n.id, n.source.kind, n.sink.kind
@@ -1868,6 +1872,26 @@ fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
 /// Covers the local `file` / `jsonl` / `csv` / `parquet` sinks and the
 /// object-store and SFTP sinks given a fixed `path` / `file_name`
 /// ([`crate::registry::sink_shared_destination`]).
+/// `shard:` runs every shard of a row at once with the same sink config, so a
+/// file or object destination would be written by several writers that
+/// clobber each other's scratch files and published objects (#862 M-096).
+fn check_sharded_file_sinks(nodes: &[ExpandedNode]) -> CliResult<()> {
+    for n in nodes
+        .iter()
+        .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
+    {
+        if let Some(dest) = crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config) {
+            return Err(CliError::Config(format!(
+                "row '{}': `shard:` runs several shards of this row at once, all writing the {} \
+                 sink destination '{dest}' — they would overwrite each other's files. Write to a \
+                 database or keyed sink, or remove `shard:`",
+                n.id, n.sink.kind
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
     let mut seen: HashMap<String, &str> = HashMap::new();
     // Discovery rows carry their source as a placeholder sink and write nothing
@@ -4363,6 +4387,28 @@ pipeline:
         );
     }
 
+    /// #862 M-096: shards run at once with one sink config, so a file or
+    /// object destination is refused under `shard:`.
+    #[test]
+    fn sharded_rows_may_not_share_a_file_destination() {
+        let run = |sink: &str| {
+            let yaml = format!(
+                "version: 1\nshard: {{ count: 2 }}\npipeline:\n  source: {{ type: sqlite, config: \
+                 {{ database_url: \"sqlite:/tmp/s.db\", query: \"SELECT 1\", shard: {{ key: id }} }} }}\n  \
+                 sink: {sink}\n"
+            );
+            expand(&parse_with_extension(&yaml, "yaml").unwrap())
+        };
+        let err = run(r#"{ type: file, config: { path: /tmp/m096/out.jsonl } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`shard:`") && err.contains("out.jsonl"),
+            "{err}"
+        );
+        assert!(run(r#"{ type: stdout, config: {} }"#).is_ok());
+    }
+
     /// #789 FILE-19: a per-page-bookmarking source writing one unnumbered
     /// file in a format that is rewritten whole on every flush is warned
     /// about at load time; line formats, numbered templates, rollover caps
@@ -4385,7 +4431,6 @@ pipeline:
 
         for quiet in [
             r#"{ type: file, config: { path: /tmp/f19/out.jsonl } }"#,
-            r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz } }"#,
             r#"{ type: file, config: { path: "/tmp/f19/out-{part}.csv" } }"#,
             r#"{ type: file, config: { path: /tmp/f19/out.csv, max_records_per_file: 1000 } }"#,
             r#"{ type: file, config: { path: /tmp/f19/dir/, format: csv } }"#,
@@ -4414,6 +4459,14 @@ pipeline:
             )
             .is_some(),
             "a compressed line file sealed whole is rewritten"
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz } }"#
+            )
+            .is_some(),
+            "a compressed line file is rewritten, never appended to in place"
         );
         assert_eq!(
             warn(

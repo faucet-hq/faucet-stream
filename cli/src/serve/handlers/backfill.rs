@@ -207,6 +207,17 @@ pub async fn submit_backfill(
     let to = parse_boundary(&req.to, tz).map_err(|e| ServeError::BadConfig(e.to_string()))?;
     let units = crate::backfill::plan::plan_windows(from, to, window, tz)
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+    if units.len() > 1
+        && let Some((node, dest)) = loaded
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
+            .find_map(|n| crate::backfill::spec::shared_unit_destination(n).map(|d| (n, d)))
+    {
+        return Err(ServeError::BadConfig(
+            crate::backfill::spec::shared_destination_error(&node.id, &node.sink.kind, &dest),
+        ));
+    }
 
     let base_name = req
         .name

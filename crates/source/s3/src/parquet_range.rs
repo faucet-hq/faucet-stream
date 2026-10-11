@@ -40,8 +40,10 @@ pub(crate) struct S3RangeReader {
 }
 
 /// What every range read is tied to, so all of them see the object as the
-/// `HeadObject` saw it: the version when the bucket is versioned, else the
-/// ETag as an `If-Match` precondition.
+/// `HeadObject` saw it: the ETag as an `If-Match` precondition (a replaced
+/// object gets a new ETag, versioned bucket or not), else the version. A
+/// `VersionId` read is authorized as `s3:GetObjectVersion`, which a
+/// least-privilege role often lacks, so it is only the fallback.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Pin {
     version_id: Option<String>,
@@ -53,9 +55,9 @@ impl Pin {
         &self,
         req: aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder,
     ) -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder {
-        match (&self.version_id, &self.etag) {
-            (Some(v), _) => req.version_id(v),
-            (None, Some(e)) => req.if_match(e),
+        match (&self.etag, &self.version_id) {
+            (Some(e), _) => req.if_match(e),
+            (None, Some(v)) => req.version_id(v),
             (None, None) => req,
         }
     }
@@ -253,15 +255,19 @@ mod tests {
             etag: Some("\"e\"".into()),
         };
         let req = versioned.apply(get());
-        assert_eq!(req.get_version_id().as_deref(), Some("v1"));
-        assert_eq!(req.get_if_match(), &None);
-        let etag_only = Pin {
-            version_id: None,
-            etag: Some("\"e\"".into()),
+        assert_eq!(req.get_if_match().as_deref(), Some("\"e\""));
+        assert_eq!(
+            req.get_version_id(),
+            &None,
+            "no s3:GetObjectVersion needed when an ETag pins the read"
+        );
+        let version_only = Pin {
+            version_id: Some("v1".into()),
+            etag: None,
         };
         assert_eq!(
-            etag_only.apply(get()).get_if_match().as_deref(),
-            Some("\"e\"")
+            version_only.apply(get()).get_version_id().as_deref(),
+            Some("v1")
         );
         let none = Pin::default().apply(get());
         assert!(none.get_if_match().is_none() && none.get_version_id().is_none());

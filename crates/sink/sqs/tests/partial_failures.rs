@@ -90,6 +90,7 @@ async fn a_failed_fifo_message_fails_the_later_messages_of_its_group() {
         .and(header("x-amz-target", TARGET))
         .and(body_string_contains(r#""Id":"1""#))
         .respond_with(reply(&["1"], json!([])))
+        .expect(0)
         .mount(&server)
         .await;
     let sink = SqsSink::new(config(&server.uri(), "orders.fifo", 1))
@@ -107,9 +108,10 @@ async fn a_failed_fifo_message_fails_the_later_messages_of_its_group() {
     );
     let second = out[1].as_ref().unwrap_err().to_string();
     assert!(
-        second.contains("sent after an earlier message of its FIFO group failed"),
+        second.contains("not sent — an earlier message of its FIFO group failed"),
         "{second}"
     );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

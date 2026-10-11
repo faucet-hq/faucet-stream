@@ -224,12 +224,19 @@ impl ObjectFilter {
 }
 
 /// Whether a path segment of `key` below `prefix` starts with `_` or `.`.
+/// Only what follows the whole prefix is judged, so `prefix: logs/_inbound`
+/// still reads `logs/_inbound-2026.jsonl` and `logs/_inbound/part-0.jsonl`.
 pub fn is_hidden_object(key: &str, prefix: &str) -> bool {
-    let dir = &prefix[..prefix.rfind('/').map_or(0, |i| i + 1)];
-    key.strip_prefix(dir)
-        .unwrap_or(key)
-        .split('/')
-        .any(|s| s.starts_with('_') || s.starts_with('.'))
+    let hidden = |s: &str| s.starts_with('_') || s.starts_with('.');
+    let Some(rest) = key.strip_prefix(prefix) else {
+        return key.split('/').any(hidden);
+    };
+    let mut segments = rest.split('/');
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        // The rest of a segment the prefix names in part is the caller's choice.
+        segments.next();
+    }
+    segments.any(hidden)
 }
 
 #[cfg(test)]
@@ -251,6 +258,11 @@ mod tests {
         );
         assert!(f.keep("_raw/part-1.json", Some(4), "_raw/part"));
         assert!(!f.keep("data/_x.json", Some(4), ""));
+        assert!(f.keep("exports/_daily-2026-10-01.jsonl", Some(4), "exports/_daily"));
+        assert!(f.keep("exports/_daily/part-0.jsonl", Some(4), "exports/_daily"));
+        assert!(!f.keep("exports/_daily/_tmp/x.jsonl", Some(4), "exports/_daily"));
+        assert!(!f.keep("out/pa_x/_SUCCESS", Some(4), "out/pa"));
+        assert!(!f.keep("elsewhere/_x.json", Some(4), "out/"));
         let inc = ObjectFilter::new(Some("out/_*")).unwrap();
         assert!(inc.keep("out/_metadata", Some(4), "out/"));
         assert!(!inc.keep("out/part-1.parquet", Some(4), "out/"));

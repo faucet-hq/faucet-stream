@@ -182,10 +182,12 @@ impl Ctx<'_> {
     }
 
     /// Whether a published file can be extended by appending each flush's
-    /// bytes: a line format (a compressed one gains a member) not sealed as
-    /// a whole file.
+    /// bytes: an uncompressed line format not sealed as a whole file. A torn
+    /// line is cut on continuation, but a torn gzip/zstd member would hide
+    /// every later member, so a compressed file is rewritten and renamed.
     pub(crate) fn appends_in_place(&self) -> bool {
         matches!(self.format, FileFormat::JsonLines | FileFormat::RawText)
+            && self.codec == Compression::None
             && (!self.encrypted() || self.seals_lines())
     }
 

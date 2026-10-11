@@ -632,4 +632,34 @@ async fn the_overwrite_commit_sends_no_empty_schema() {
         "{schemas:?}"
     );
     assert_eq!(fx.events("activate").len(), 1);
+    let log = read_jsonl(&fx.log());
+    let activate = log.iter().position(|e| e["event"] == "activate").unwrap();
+    let spawn = log[..activate]
+        .iter()
+        .rposition(|e| e["event"] == "spawn")
+        .unwrap();
+    let commit_schema = log[spawn..activate]
+        .iter()
+        .find(|e| e["event"] == "schema")
+        .expect("the commit process is sent the writers' SCHEMA before ACTIVATE_VERSION");
+    assert!(commit_schema["schema"]["properties"]["id"].is_object());
+}
+
+#[tokio::test]
+async fn an_aborted_overwrite_leaves_no_schema_for_a_later_commit() {
+    let fx = Fixture::new();
+    overwrite_run(&fx, 700, &[1], false).await;
+    let mut cfg = fx.config(json!({"mode": "echo"}));
+    cfg.write.write_mode = faucet_core::WriteMode::Overwrite;
+    cfg.activate_version = Some(700);
+    SingerSink::new(cfg)
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .unwrap();
+    assert!(
+        fx.events("schema").len() == 1,
+        "only the aborted writer's SCHEMA: {:?}",
+        fx.events("schema")
+    );
 }

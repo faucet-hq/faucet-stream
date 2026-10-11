@@ -65,10 +65,11 @@ pub struct RedisSourceConfig {
     /// request to many small ones.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-    /// Which values are parsed as JSON. `containers` (default) parses a value
-    /// only when it is a JSON object or array, so `"1.10"`, `"true"` and long
-    /// numeric ids stay the strings Redis holds; `all` also parses scalars;
-    /// `none` keeps every value a string.
+    /// Which values are parsed as JSON. `all` (default) parses any value that
+    /// is valid JSON, so `"42"` becomes `42` and `"true"` becomes `true`;
+    /// `containers` parses only objects and arrays, so `"1.10"`, `"true"` and
+    /// long numeric ids stay the strings Redis holds; `none` keeps every value
+    /// a string.
     #[serde(default)]
     pub parse_json: RedisJsonParsing,
     /// What to do with a value that is not valid UTF-8 (msgpack, gzip, …):
@@ -83,9 +84,9 @@ pub struct RedisSourceConfig {
 #[serde(rename_all = "snake_case")]
 pub enum RedisJsonParsing {
     /// Parse objects and arrays only; scalars stay strings.
-    #[default]
     Containers,
     /// Parse any value that is valid JSON.
+    #[default]
     All,
     /// Never parse; every value is a string.
     None,

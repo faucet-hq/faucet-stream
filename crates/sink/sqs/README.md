@@ -51,9 +51,10 @@ Only transient request failures (transport errors, 5xx/429, throttling) are
 retried; a missing queue or denied access fails at once. A request that fails
 for good is reported on each of its entries, so the outcomes of the requests
 that landed are kept. On a FIFO queue, an entry that fails is re-sent together
-with every later entry of its group from the same request, and the later
-entries of a group whose message failed for good are reported failed too, so a
-retry or DLQ replay can restore the group's order.
+with every later entry of its group from the same request, and once a message
+fails for good the later messages of its group are not sent at all — they are
+reported failed ("not sent"), so a retry or DLQ replay delivers them after the
+failed one and the group's order holds.
 
 ## Delivery semantics
 

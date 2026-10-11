@@ -9036,6 +9036,11 @@
           "description": "Confluent-wire-format Avro: magic byte + schema_id + Avro binary.",
           "type": "object",
           "properties": {
+            "bytes_encoding": {
+              "description": "How the sink reads a JSON string for an Avro `bytes` / `fixed`\nfield: `hex` (default — the shape the Kafka source decodes those\nfields to, so records round-trip) or `utf8` (the string's UTF-8\nbytes, the reading before faucet-common-kafka 1.1.1). A JSON array of byte\nnumbers is accepted either way. Ignored by the source.",
+              "$ref": "#/$defs/source_kafka__BytesText",
+              "default": "hex"
+            },
             "schema_registry": {
               "$ref": "#/$defs/source_kafka__SchemaRegistryConfig"
             },
@@ -9077,6 +9082,21 @@
               "const": "confluent_json_schema"
             }
           }
+        }
+      ]
+    },
+    "source_kafka__BytesText": {
+      "description": "How a JSON string is read for an Avro `bytes` / `fixed` value on encode.",
+      "oneOf": [
+        {
+          "description": "The string is lowercase hex, the shape [`datum_to_json`] produces.",
+          "type": "string",
+          "const": "hex"
+        },
+        {
+          "description": "The string's UTF-8 bytes are the value.",
+          "type": "string",
+          "const": "utf8"
         }
       ]
     },
@@ -12658,6 +12678,11 @@
           "description": "Confluent-wire-format Avro: magic byte + schema_id + Avro binary.",
           "type": "object",
           "properties": {
+            "bytes_encoding": {
+              "description": "How the sink reads a JSON string for an Avro `bytes` / `fixed`\nfield: `hex` (default — the shape the Kafka source decodes those\nfields to, so records round-trip) or `utf8` (the string's UTF-8\nbytes, the reading before faucet-common-kafka 1.1.1). A JSON array of byte\nnumbers is accepted either way. Ignored by the source.",
+              "$ref": "#/$defs/sink_kafka__BytesText",
+              "default": "hex"
+            },
             "schema_registry": {
               "$ref": "#/$defs/sink_kafka__SchemaRegistryConfig"
             },
@@ -12699,6 +12724,21 @@
               "const": "confluent_json_schema"
             }
           }
+        }
+      ]
+    },
+    "sink_kafka__BytesText": {
+      "description": "How a JSON string is read for an Avro `bytes` / `fixed` value on encode.",
+      "oneOf": [
+        {
+          "description": "The string is lowercase hex, the shape [`datum_to_json`] produces.",
+          "type": "string",
+          "const": "hex"
+        },
+        {
+          "description": "The string's UTF-8 bytes are the value.",
+          "type": "string",
+          "const": "utf8"
         }
       ]
     },
@@ -19250,9 +19290,9 @@
                       "default": 1000
                     },
                     "parse_json": {
-                      "description": "Which values are parsed as JSON. `containers` (default) parses a value\nonly when it is a JSON object or array, so `\"1.10\"`, `\"true\"` and long\nnumeric ids stay the strings Redis holds; `all` also parses scalars;\n`none` keeps every value a string.",
+                      "description": "Which values are parsed as JSON. `all` (default) parses any value that\nis valid JSON, so `\"42\"` becomes `42` and `\"true\"` becomes `true`;\n`containers` parses only objects and arrays, so `\"1.10\"`, `\"true\"` and\nlong numeric ids stay the strings Redis holds; `none` keeps every value\na string.",
                       "$ref": "#/$defs/source_redis__RedisJsonParsing",
-                      "default": "containers"
+                      "default": "all"
                     },
                     "binary": {
                       "description": "What to do with a value that is not valid UTF-8 (msgpack, gzip, …):\n`base64` (default) emits it base64-encoded, `lossy` replaces invalid\nsequences with U+FFFD, `error` fails the run naming the key.",

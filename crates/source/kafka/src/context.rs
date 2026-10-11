@@ -147,6 +147,37 @@ pub(crate) fn member_seeds(
     out
 }
 
+/// Member mode: partitions whose committed group offset fell below the log
+/// start, as `(topic, partition, low watermark, records lost)`. Only partitions
+/// without a bookmark seek are checked (a seek is clamped on its own); without
+/// this, librdkafka resets such a partition to `auto.offset.reset` and skips
+/// the still-retained backlog.
+/// `(topic, partition, low watermark, records lost)`.
+pub(crate) type Clamp = (String, i32, i64, u64);
+
+pub(crate) fn committed_clamps(
+    assigned: &[(String, i32)],
+    committed: &HashMap<(String, i32), Option<i64>>,
+    seeks: &HashMap<(String, i32), i64>,
+    lows: &HashMap<(String, i32), i64>,
+) -> Vec<Clamp> {
+    let mut out = Vec::new();
+    for tp in assigned {
+        if seeks.contains_key(tp) {
+            continue;
+        }
+        let Some(c) = committed.get(tp).copied().flatten() else {
+            continue;
+        };
+        let (start, lost) = clamp_to_log_start(c, lows.get(tp).copied());
+        if lost > 0 {
+            out.push((tp.0.clone(), tp.1, start, lost));
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Where a re-assigned partition resumes outside member mode: the start
 /// bookmark, advanced by what this run already delivered. `None` when neither
 /// knows any partition.
@@ -320,11 +351,22 @@ impl ConsumerContext for BookmarkContext {
                     applied = seeks;
                 }
 
-                let seeds = if self.member_mode.load(Ordering::Acquire) {
+                let (mut seeds, clamps) = if self.member_mode.load(Ordering::Acquire) {
                     self.member_seed_offsets(base_consumer, tpl, &applied)
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
+                for (topic, partition, start, lost) in clamps {
+                    tracing::warn!(
+                        topic = %topic,
+                        partition,
+                        log_start = start,
+                        lost,
+                        "kafka source: the group's committed offset fell out of topic \
+                         retention; resuming at the log start (the deleted records are gone)"
+                    );
+                    seeds.push((topic, partition, start));
+                }
                 for (topic, partition, offset) in &seeds {
                     let _ = tpl.set_partition_offset(topic, *partition, Offset::Offset(*offset));
                 }
@@ -397,14 +439,16 @@ impl ConsumerContext for BookmarkContext {
 
 impl BookmarkContext {
     /// Member mode: the starting offset of every assigned partition the group
-    /// has no committed offset for (see [`member_seeds`]). A lookup failure
-    /// seeds nothing, which leaves today's `auto.offset.reset` behaviour.
+    /// has no committed offset for (see [`member_seeds`]), and the partitions
+    /// whose committed offset fell below the log start (see
+    /// [`committed_clamps`]). A lookup failure seeds nothing, which leaves
+    /// today's `auto.offset.reset` behaviour.
     fn member_seed_offsets(
         &self,
         consumer: &BaseConsumer<BookmarkContext>,
         tpl: &TopicPartitionList,
         applied: &[(String, i32, i64)],
-    ) -> Vec<(String, i32, i64)> {
+    ) -> (Vec<(String, i32, i64)>, Vec<Clamp>) {
         let assigned: Vec<(String, i32)> = tpl
             .elements()
             .into_iter()
@@ -418,7 +462,7 @@ impl BookmarkContext {
             Ok(c) => committed_map(&c),
             Err(e) => {
                 tracing::warn!(error = %e, "kafka member mode: committed-offsets lookup failed; not seeding");
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
         };
         let seeks: HashMap<(String, i32), i64> = applied
@@ -427,19 +471,26 @@ impl BookmarkContext {
             .collect();
         let mut watermarks = HashMap::new();
         for tp in &assigned {
-            if committed.get(tp).copied().flatten().is_none()
-                && !seeks.contains_key(tp)
+            if !seeks.contains_key(tp)
                 && let Ok(w) = consumer.fetch_watermarks(&tp.0, tp.1, COMMITTED_LOOKUP_TIMEOUT)
             {
                 watermarks.insert(tp.clone(), w);
             }
         }
-        member_seeds(
+        let lows: HashMap<(String, i32), i64> = watermarks
+            .iter()
+            .map(|(tp, (low, _))| (tp.clone(), *low))
+            .collect();
+        let seeds = member_seeds(
             &assigned,
             &committed,
             &seeks,
             &watermarks,
             self.earliest.load(Ordering::Acquire),
+        );
+        (
+            seeds,
+            committed_clamps(&assigned, &committed, &seeks, &lows),
         )
     }
 }
@@ -606,6 +657,25 @@ mod tests {
         assert_eq!(clamp_to_log_start(25, Some(20)), (25, 0));
         assert_eq!(clamp_to_log_start(20, Some(20)), (20, 0));
         assert_eq!(clamp_to_log_start(5, None), (5, 0));
+    }
+
+    #[test]
+    fn committed_offsets_below_the_log_start_are_clamped() {
+        let tp = |p: i32| ("t".to_string(), p);
+        let assigned = vec![tp(0), tp(1), tp(2), tp(3), tp(4)];
+        let committed: HashMap<_, _> = [
+            (tp(0), Some(5)),
+            (tp(1), Some(50)),
+            (tp(2), Some(5)),
+            (tp(3), None),
+        ]
+        .into();
+        let seeks: HashMap<_, _> = [(tp(2), 5)].into();
+        let lows: HashMap<_, _> = [(tp(0), 20), (tp(1), 20), (tp(2), 20), (tp(3), 20)].into();
+        assert_eq!(
+            committed_clamps(&assigned, &committed, &seeks, &lows),
+            vec![("t".to_string(), 0, 20, 15)]
+        );
     }
 
     #[test]

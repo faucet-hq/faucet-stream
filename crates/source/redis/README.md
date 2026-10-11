@@ -15,7 +15,7 @@ Built on a lazily-opened, reused `MultiplexedConnection` and each mode's native 
 - **Native streaming in all three modes** — `stream_pages` walks the list, stream, or keyspace in pages so the sink writes as data arrives.
 - **Server-side cursoring** — `Keys` drives the `SCAN` cursor manually and `MGET`s a page at a time, so a million-key namespace never materializes in memory at once.
 - **Never touches consumer groups** — every read is `XRANGE`, so a preview or run never claims entries into a group's pending list.
-- **Faithful values** — JSON objects/arrays are parsed (`parse_json`), scalars stay the strings Redis holds, and binary values are base64-encoded (`binary`) instead of failing the read.
+- **Faithful values** — values that are valid JSON are parsed (`parse_json`; `containers` keeps scalars the strings Redis holds), and binary values are base64-encoded (`binary`) instead of failing the read.
 - **Connection reuse** — one multiplexed connection is opened on first use and cheaply cloned across every call (no per-call TCP/AUTH handshake).
 - **Secrets-safe** — the connection URL is masked in `Debug` output and credentials are stripped from the lineage dataset URI.
 
@@ -68,7 +68,7 @@ faucet run pipeline.yaml
 | `source_type` | `RedisSourceType` | — *(required)* | The Redis data structure to read from — `List`, `Stream`, or `Keys` (see below). |
 | `max_records` | int | *(unbounded)* | Optional cap on the total number of records returned. Honored by both `fetch_all` and streaming. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`, mapped onto each mode's native paging primitive. **`0` = no batching** (drain into one page). See [Streaming & batching](#streaming--batching). |
-| `parse_json` | `containers` \| `all` \| `none` | `containers` | Which values are parsed as JSON. `containers` parses only objects and arrays, so `"1.10"`, `"true"` and long numeric ids stay strings; `all` also parses scalars; `none` keeps every value a string. |
+| `parse_json` | `all` \| `containers` \| `none` | `all` | Which values are parsed as JSON. `all` parses any valid JSON value, so `"42"` becomes `42` and `"true"` becomes `true`; `containers` parses only objects and arrays, so `"1.10"`, `"true"` and long numeric ids stay strings (recommended when values are identifiers or decimal text whose exact spelling matters); `none` keeps every value a string. |
 | `binary` | `base64` \| `lossy` \| `error` | `base64` | A value that is not valid UTF-8 (msgpack, gzip, …): base64-encode it, replace invalid sequences with U+FFFD, or fail the run naming the key. |
 
 The connection reconnects on its own after the server drops it (a failover), with a short bounded retry when the server is unreachable.

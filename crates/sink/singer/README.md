@@ -83,8 +83,11 @@ run's `version` (a millisecond timestamp shared by every writer of a run — the
 run clock, but never earlier than the wall clock when the run starts, so a
 rerun with a past `--clock` still activates a newer version), and after a
 fully successful run the sink starts the target once more to send
-`ACTIVATE_VERSION` (preceded by `SCHEMA` when a schema is known — configured,
-from the contract, or inferred by that instance; never an empty one), telling the target to make that version live and
+`ACTIVATE_VERSION` preceded by `SCHEMA` — the configured schema (or the
+contract's), else the widest schema the run's writers sent, since targets
+refuse `ACTIVATE_VERSION` for a stream they were never sent a `SCHEMA` for (an
+empty `SCHEMA` is never sent: a run that wrote no record sends
+`ACTIVATE_VERSION` alone) — telling the target to make that version live and
 discard rows from earlier versions. A failed or cancelled run sends no
 `ACTIVATE_VERSION`, so the previous version stays live (and the next
 successful overwrite discards the failed run's rows). How a target applies

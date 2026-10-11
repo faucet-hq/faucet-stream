@@ -14,7 +14,12 @@ use faucet_core::{FaucetError, RowOutcome};
 use gcloud_pubsub::client::Client;
 use gcloud_pubsub::publisher::{Publisher, PublisherConfig};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+
+/// Bytes one publish chunk may hold. A `Publish` request is capped at 10 MB and
+/// the SDK bundles by message count only, so a chunk stays under it with room
+/// for the request framing.
+pub(crate) const MAX_CHUNK_BYTES: usize = 9_000_000;
 
 /// How long one message may wait for its publish confirmation.
 const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -92,6 +97,71 @@ pub(crate) fn fail_after_key_failure(
             )));
         }
     }
+}
+
+/// Bytes a prepared message adds to a `Publish` request.
+pub(crate) fn message_bytes(p: &Prepared) -> usize {
+    p.data.len()
+        + p.ordering_key.len()
+        + p.attributes
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+}
+
+/// Split prepared messages into publish chunks of at most `max_count`
+/// messages and `max_bytes` bytes (a message larger than `max_bytes` goes
+/// alone, for Pub/Sub to refuse on its own). Order is kept. Pure.
+pub(crate) fn chunk_prepared(
+    prepared: Vec<(usize, Prepared)>,
+    max_count: usize,
+    max_bytes: usize,
+) -> Vec<Vec<(usize, Prepared)>> {
+    let mut chunks = Vec::new();
+    let mut current: Vec<(usize, Prepared)> = Vec::new();
+    let mut bytes = 0usize;
+    for item in prepared {
+        let size = message_bytes(&item.1);
+        if !current.is_empty() && (current.len() >= max_count.max(1) || bytes + size > max_bytes) {
+            chunks.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        bytes += size;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Per-input-index publish outcomes.
+pub(crate) type Outcomes = BTreeMap<usize, Result<(), FaucetError>>;
+
+/// Hold back the messages whose ordering key already failed in an earlier
+/// chunk: they are reported failed without being published, so none reaches
+/// the topic ahead of the failed one (#862 M-083). Pure.
+pub(crate) fn hold_failed_keys(
+    chunk: Vec<(usize, Prepared)>,
+    failed_keys: &HashSet<String>,
+) -> (Vec<(usize, Prepared)>, Outcomes) {
+    let mut send = Vec::with_capacity(chunk.len());
+    let mut held = BTreeMap::new();
+    for (index, p) in chunk {
+        if !p.ordering_key.is_empty() && failed_keys.contains(&p.ordering_key) {
+            held.insert(
+                index,
+                Err(FaucetError::Sink(format!(
+                    "pubsub: not published — an earlier message with ordering key '{}' \
+                     failed; re-send it with that message to keep the key's order",
+                    p.ordering_key
+                ))),
+            );
+        } else {
+            send.push((index, p));
+        }
+    }
+    (send, held)
 }
 
 /// Merge encode failures + publish outcomes into input-ordered per-row
@@ -177,19 +247,35 @@ impl PubsubSink {
         outcomes
     }
 
-    /// Publish all prepared records in `batch_size` chunks, merging outcomes.
+    /// Publish all prepared records in chunks of at most `batch_size`
+    /// messages and [`MAX_CHUNK_BYTES`], merging outcomes. Once a message with
+    /// an ordering key fails, later messages with that key are not published.
     async fn publish_all(
         &self,
         prepared: Vec<(usize, Prepared)>,
     ) -> BTreeMap<usize, Result<(), FaucetError>> {
         let mut merged = BTreeMap::new();
-        let mut iter = prepared.into_iter();
-        loop {
-            let chunk: Vec<_> = iter.by_ref().take(self.config.batch_size).collect();
-            if chunk.is_empty() {
-                break;
+        let mut failed_keys: HashSet<String> = HashSet::new();
+        for chunk in chunk_prepared(prepared, self.config.batch_size, MAX_CHUNK_BYTES) {
+            let (send, held) = hold_failed_keys(chunk, &failed_keys);
+            merged.extend(held);
+            if send.is_empty() {
+                continue;
             }
-            merged.extend(self.publish_chunk(chunk).await);
+            let keys: BTreeMap<usize, String> = send
+                .iter()
+                .filter(|(_, p)| !p.ordering_key.is_empty())
+                .map(|(i, p)| (*i, p.ordering_key.clone()))
+                .collect();
+            let outcomes = self.publish_chunk(send).await;
+            for (index, outcome) in &outcomes {
+                if outcome.is_err()
+                    && let Some(key) = keys.get(index)
+                {
+                    failed_keys.insert(key.clone());
+                }
+            }
+            merged.extend(outcomes);
         }
         merged
     }
@@ -302,6 +388,53 @@ mod tests {
         cfg.concurrency = 8;
         let p = publisher_config(&cfg);
         assert_eq!((p.bundle_size, p.workers), (500, 8));
+    }
+
+    fn prepared(data: usize, key: &str) -> Prepared {
+        Prepared {
+            data: vec![b'x'; data],
+            attributes: [("a".to_string(), "bc".to_string())].into(),
+            ordering_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn chunks_are_cut_by_count_and_by_bytes() {
+        assert_eq!(message_bytes(&prepared(10, "kk")), 15);
+        let items: Vec<(usize, Prepared)> = (0..5).map(|i| (i, prepared(10, ""))).collect();
+        let sizes = |c: &Vec<Vec<(usize, Prepared)>>| c.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(
+            sizes(&chunk_prepared(items.clone(), 2, 1_000)),
+            vec![2, 2, 1]
+        );
+        assert_eq!(
+            sizes(&chunk_prepared(items.clone(), 100, 30)),
+            vec![2, 2, 1]
+        );
+        assert_eq!(sizes(&chunk_prepared(items, 0, 1_000)), vec![1, 1, 1, 1, 1]);
+        let big = vec![(0, prepared(100, "")), (1, prepared(1, ""))];
+        let chunks = chunk_prepared(big, 10, 50);
+        assert_eq!(sizes(&chunks), vec![1, 1]);
+        assert_eq!(chunks[1][0].0, 1);
+        assert!(chunk_prepared(Vec::new(), 10, 50).is_empty());
+    }
+
+    #[test]
+    fn messages_of_a_failed_key_are_held_back() {
+        let failed: HashSet<String> = ["a".to_string()].into();
+        let chunk = vec![
+            (0, prepared(1, "a")),
+            (1, prepared(1, "b")),
+            (2, prepared(1, "")),
+        ];
+        let (send, held) = hold_failed_keys(chunk, &failed);
+        assert_eq!(send.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 2]);
+        let err = held[&0].as_ref().unwrap_err().to_string();
+        assert!(
+            err.contains("not published") && err.contains("'a'"),
+            "{err}"
+        );
+        assert_eq!(held.len(), 1);
     }
 
     #[test]

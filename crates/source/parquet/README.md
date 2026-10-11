@@ -24,6 +24,7 @@ Built on the `parquet` + `arrow` crates wired through `object_store`, so local a
 - **Vectorized streaming** — one Arrow `RecordBatch` per row-group; memory is bounded by `batch_size`, not file size.
 - **Fail-fast schema validation** — multi-file scans validate every file's Arrow schema up front (cheap footer probe) and surface a mismatch naming both files and the first diverging field, *before* any rows are committed downstream.
 - **S3-compatible** — custom `endpoint_url` for MinIO / LocalStack; credentials from the standard AWS chain.
+- **Consistent S3 reads** — an S3 object is read over byte ranges, each carrying the object's ETag (as its first metadata read saw it) as an `If-Match` precondition, so an object replaced mid-read fails the run instead of mixing row groups from two versions.
 - **Arrow columnar fast path** (`arrow` feature, RFC 0002) — emits Arrow `RecordBatch`es natively (`stream_batches`), so a `parquet → parquet` pipeline moves data end-to-end without materializing `serde_json::Value` rows. Opt-in; off by default and inert unless the sink is also columnar.
 
 ## Installation

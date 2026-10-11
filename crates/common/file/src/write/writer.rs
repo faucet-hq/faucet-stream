@@ -592,6 +592,11 @@ impl FileWriter {
                     f.discard();
                 }
                 Err(e) => {
+                    // The error may be an earlier file's background upload,
+                    // reaped here; its records were already reported written.
+                    if st.pending_at_risk {
+                        st.poison("an earlier upload", &e);
+                    }
                     st.current = Some(f);
                     return Err(self.lose(st, call, e).await);
                 }
@@ -730,6 +735,9 @@ impl FileWriter {
             let published = self.publish_file(&mut f, keep).await;
             st.current = Some(f);
             if let Err(e) = published {
+                if st.pending_at_risk {
+                    st.poison("an earlier upload", &e);
+                }
                 return Err(self.lose(st, call, e).await);
             }
         }

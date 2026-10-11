@@ -62,13 +62,15 @@ only after that flush, so:
 File-system calls run on Tokio's blocking pool, so a hung disk (or a FIFO
 nobody writes) never blocks a caller's timeout or cancellation.
 A file that keeps growing across several flushes in one run stays complete at
-every flush. JSON Lines and raw text are renamed into place once and then
-extended in place: each later flush appends only its own lines (a compressed
-file gains a new gzip/zstd member, a per-line encrypted file a new trailer) and
-`fsync`s, so a flush costs its own size, not the file's. A run killed during
-that append can leave a torn last line; the next `append` run cuts it, and a
-`replace` run writes a new file anyway. The other formats are rewritten whole
-to continue a file, so a long run with frequent flushes into one file costs
+every flush. Uncompressed JSON Lines and raw text are renamed into place once
+and then extended in place: each later flush appends only its own lines (a
+per-line encrypted file a new trailer) and `fsync`s, so a flush costs its own
+size, not the file's. A run killed during that append can leave a torn last
+line; the next `append` run cuts it, and a `replace` run writes a new file
+anyway. A compressed (`.gz` / `.zst`) file is never appended to in place — a
+torn gzip/zstd member would hide every member after it — so, like the other
+formats, it is rewritten whole and renamed into place to continue it.
+Rewriting a file whole to continue it means a long run with frequent flushes into one file costs
 time and I/O that grow with the square of its size — the sink warns once per
 file, `faucet validate` / `run` warn at load when a source that bookmarks every
 page (CDC, a queue, an incremental file source) feeds such a file, and a
@@ -98,8 +100,10 @@ file is already in place).
   parts instead).
 - **Parquet** goes through the Arrow writer. The schema comes from the first
   page with every field nullable; a later page that adds a field widens the
-  file (earlier rows get null), and a field that changes type is an error
-  naming it. With the `arrow` feature an Arrow source writes Parquet without
+  file (earlier rows get null). A number column that holds whole numbers on
+  one page and fractions on another widens to `float64` (whichever page comes
+  first; rows already written are cast), and any other field that changes type
+  is an error naming it. With the `arrow` feature an Arrow source writes Parquet without
   building JSON values; Avro accepts the columnar path too.
 
 ### Explicit Parquet schema

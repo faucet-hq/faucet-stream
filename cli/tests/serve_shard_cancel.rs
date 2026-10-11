@@ -148,7 +148,7 @@ async fn cancel_stops_unstarted_shards_and_the_run_ends_cancelled() {
 
 /// A source-sharded run submitted to a cluster runs every shard and ends
 /// `completed`, its log stream closing once the last local shard finishes.
-#[cfg(all(feature = "source-sqlite", feature = "sink-jsonl"))]
+#[cfg(all(feature = "source-sqlite", feature = "sink-stdout"))]
 #[tokio::test]
 async fn a_sharded_run_completes_across_its_shards() {
     let dir = tempfile::tempdir().unwrap();
@@ -192,13 +192,11 @@ async fn a_sharded_run_completes_across_its_shards() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let out = dir.path().join("out-{shard}.jsonl");
     let yaml = format!(
         "version: 1\nname: sharded\nshard: {{ count: 2 }}\npipeline:\n  \
          source: {{ type: sqlite, config: {{ database_url: \"sqlite:{}\", query: \"SELECT id, v FROM t\", shard: {{ key: id }} }} }}\n  \
-         sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+         sink: {{ type: stdout, config: {{}} }}\n",
         db.display(),
-        out.display()
     );
     let resp: serde_json::Value = client
         .post(format!("{base}/v1/runs"))

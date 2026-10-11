@@ -5,7 +5,7 @@ use apache_avro::reader::datum::GenericDatumReader;
 use apache_avro::writer::datum::GenericDatumWriter;
 use apache_avro::{Schema, types::Value as AvroValue};
 use faucet_core::FaucetError;
-use faucet_core::file_format::avro::{datum_from_json, datum_to_json};
+use faucet_core::file_format::avro::{BytesText, datum_from_json_with, datum_to_json};
 use serde_json::Value;
 
 fn parse(client: &SchemaRegistryClient, text: &str) -> Result<std::sync::Arc<Schema>, FaucetError> {
@@ -40,9 +40,21 @@ pub async fn encode(
     schema_text: &str,
     value: &Value,
 ) -> Result<Vec<u8>, FaucetError> {
+    encode_with(client, subject, schema_text, value, BytesText::Hex).await
+}
+
+/// [`encode`] with an explicit reading of JSON strings for `bytes` / `fixed`
+/// fields.
+pub async fn encode_with(
+    client: &SchemaRegistryClient,
+    subject: &str,
+    schema_text: &str,
+    value: &Value,
+    bytes: BytesText,
+) -> Result<Vec<u8>, FaucetError> {
     let schema = parse(client, schema_text)?;
     let id = client.register_schema(subject, "AVRO", schema_text).await?;
-    let avro_value = json_to_avro(value, &schema)?;
+    let avro_value = json_to_avro(value, &schema, bytes)?;
     let payload = GenericDatumWriter::builder(&schema)
         .build()
         .and_then(|w| w.write_value_to_vec(avro_value))
@@ -62,8 +74,9 @@ fn avro_to_json(v: &AvroValue, schema: &Schema) -> Result<Value, FaucetError> {
 /// Convert a `serde_json::Value` to an `AvroValue` against the writer schema,
 /// accepting the shapes [`avro_to_json`] produces, so a decoded record encodes
 /// back unchanged.
-fn json_to_avro(v: &Value, schema: &Schema) -> Result<AvroValue, FaucetError> {
-    datum_from_json(v, schema).map_err(|e| FaucetError::Sink(format!("json->avro: {e}")))
+fn json_to_avro(v: &Value, schema: &Schema, bytes: BytesText) -> Result<AvroValue, FaucetError> {
+    datum_from_json_with(v, schema, bytes)
+        .map_err(|e| FaucetError::Sink(format!("json->avro: {e}")))
 }
 
 #[cfg(test)]
@@ -75,7 +88,8 @@ mod tests {
 
     #[test]
     fn json_without_an_avro_value_is_a_sink_error() {
-        let err = json_to_avro(&serde_json::json!(u64::MAX), &Schema::Long).expect_err("u64");
+        let err = json_to_avro(&serde_json::json!(u64::MAX), &Schema::Long, BytesText::Hex)
+            .expect_err("u64");
         assert!(err.to_string().contains("json->avro"), "{err}");
     }
 
@@ -116,6 +130,48 @@ mod tests {
             std::sync::Arc::ptr_eq(&a, &b),
             "the parsed schema is cached"
         );
+    }
+
+    #[tokio::test]
+    async fn utf8_bytes_encoding_writes_a_string_as_its_bytes() {
+        let server = MockServer::start().await;
+        let schema_text =
+            r#"{"type":"record","name":"R","fields":[{"name":"raw","type":"bytes"}]}"#;
+        Mock::given(method("POST"))
+            .and(path("/subjects/r-value/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 4})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": schema_text,
+                "schemaType": "AVRO",
+            })))
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        let record = serde_json::json!({"raw": "cafe"});
+        let utf8 = encode_with(&client, "r-value", schema_text, &record, BytesText::Utf8)
+            .await
+            .unwrap();
+        assert_eq!(
+            decode(&client, &utf8).await.unwrap(),
+            serde_json::json!({"raw": "63616665"})
+        );
+        let hex = encode(&client, "r-value", schema_text, &record)
+            .await
+            .unwrap();
+        assert_eq!(decode(&client, &hex).await.unwrap(), record);
+        let err = encode(
+            &client,
+            "r-value",
+            schema_text,
+            &serde_json::json!({"raw": "hello"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not hex"), "{err}");
     }
 
     #[tokio::test]

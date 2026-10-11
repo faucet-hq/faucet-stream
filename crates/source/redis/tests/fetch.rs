@@ -303,7 +303,20 @@ async fn binary_values_scalar_strings_and_non_string_keys() {
         list.fetch_all()
             .await
             .expect("a binary element no longer fails the read"),
-        vec![serde_json::json!("/wBh"), serde_json::json!("1.10")]
+        vec![serde_json::json!("/wBh"), serde_json::json!(1.1)],
+        "the default `parse_json: all` parses scalars"
+    );
+
+    let mut containers = RedisSourceConfig::new(&url, RedisSourceType::List { key: "bin".into() });
+    containers.parse_json = faucet_source_redis::RedisJsonParsing::Containers;
+    assert_eq!(
+        RedisSource::new(containers)
+            .unwrap()
+            .fetch_all()
+            .await
+            .unwrap(),
+        vec![serde_json::json!("/wBh"), serde_json::json!("1.10")],
+        "`parse_json: containers` keeps scalars the strings Redis holds"
     );
 
     let mut strict = RedisSourceConfig::new(&url, RedisSourceType::List { key: "bin".into() });
@@ -324,7 +337,7 @@ async fn binary_values_scalar_strings_and_non_string_keys() {
     .unwrap();
     assert_eq!(
         keys.fetch_all().await.unwrap(),
-        vec![serde_json::json!({"key": "obj:str", "value": "true"})],
+        vec![serde_json::json!({"key": "obj:str", "value": true})],
         "only the string key is read; the hash and set are skipped with a warning"
     );
 

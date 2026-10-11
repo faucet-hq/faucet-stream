@@ -8,6 +8,7 @@
 //! bookmark only after `flush` returns, so bookmarks never run ahead of what
 //! the target has persisted.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,24 @@ use tokio::sync::Mutex;
 use crate::config::{FlushOn, SingerSinkConfig};
 use crate::process::{TargetProcess, flush_marker};
 use crate::schema::widen;
+
+/// The schema each overwrite run's writers sent, keyed by target command,
+/// target config, stream and table version. The committing sink is a different instance that
+/// wrote nothing, and a target refuses `ACTIVATE_VERSION` for a stream it was
+/// never sent a `SCHEMA` for.
+type RunKey = (String, String, String, i64);
+static OVERWRITE_SCHEMAS: std::sync::LazyLock<std::sync::Mutex<HashMap<RunKey, Value>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn note_overwrite_schema(key: RunKey, schema: &Value) {
+    if let Ok(mut map) = OVERWRITE_SCHEMAS.lock() {
+        widen(map.entry(key).or_insert(Value::Null), schema);
+    }
+}
+
+fn take_overwrite_schema(key: &RunKey) -> Option<Value> {
+    OVERWRITE_SCHEMAS.lock().ok()?.remove(key)
+}
 
 /// Encoded lines are handed to the pipe in chunks of about this size.
 const WRITE_CHUNK: usize = 64 * 1024;
@@ -101,6 +120,15 @@ impl SingerSink {
         Duration::from_secs(self.config.flush_timeout_secs)
     }
 
+    fn run_key(&self) -> RunKey {
+        (
+            self.config.target_command.clone(),
+            self.config.target_config.to_string(),
+            self.config.stream_name().to_string(),
+            self.activate_version(),
+        )
+    }
+
     /// The configured schema, else the one inferred from written records.
     fn known_schema(&self, inner: &Inner) -> Option<Value> {
         self.config
@@ -131,6 +159,9 @@ impl SingerSink {
                 &schema,
                 &self.config.effective_key_properties(),
             );
+            if self.config.write.is_overwrite() && self.config.schema.is_none() {
+                note_overwrite_schema(self.run_key(), &schema);
+            }
             inner.sent_schema = Some(schema);
         }
         let version = self
@@ -288,10 +319,17 @@ impl Sink for SingerSink {
         let stream = self.config.stream_name();
         let mut process = TargetProcess::spawn(&self.config, &self.redactor)?;
         let mut buf = Vec::new();
-        // The committing sink is usually not one of the writers, so it has no
-        // inferred schema; sending an empty SCHEMA could reset the target's
-        // table, so it is sent only when a schema is actually known (API-60).
-        if let Some(schema) = self.known_schema(&inner) {
+        // The committing sink is usually not one of the writers: it sends the
+        // schema the run's writers sent. An empty SCHEMA could reset the
+        // target's table, so none is sent when no schema is known (API-60).
+        let written = take_overwrite_schema(&self.run_key());
+        if let Some(schema) = self
+            .config
+            .schema
+            .clone()
+            .or(written)
+            .or_else(|| self.known_schema(&inner))
+        {
             write_schema(
                 &mut buf,
                 stream,
@@ -311,6 +349,7 @@ impl Sink for SingerSink {
     /// Stop the target without activating: the previous version stays live,
     /// and a later successful overwrite discards this run's rows.
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+        take_overwrite_schema(&self.run_key());
         let mut inner = self.inner.lock().await;
         self.stop(&mut inner).await;
         Ok(())

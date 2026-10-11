@@ -42,7 +42,7 @@ pub async fn encode(
             )),
         },
         #[cfg(feature = "schema-registry")]
-        KafkaValueFormat::ConfluentAvro { .. } => {
+        KafkaValueFormat::ConfluentAvro { bytes_encoding, .. } => {
             let client = sr_client.ok_or_else(|| {
                 FaucetError::Config(
                     "value format 'confluent_avro' requires a Schema Registry client — set \
@@ -54,7 +54,14 @@ pub async fn encode(
                 .schema_text
                 .as_deref()
                 .ok_or_else(|| FaucetError::Config("ConfluentAvro requires schema_text".into()))?;
-            avro::encode(client, &schema_ctx.subject, schema_text, value).await
+            avro::encode_with(
+                client,
+                &schema_ctx.subject,
+                schema_text,
+                value,
+                *bytes_encoding,
+            )
+            .await
         }
         #[cfg(feature = "schema-registry")]
         KafkaValueFormat::ConfluentProtobuf { .. } => {
@@ -176,6 +183,7 @@ mod tests {
         fn avro_format() -> KafkaValueFormat {
             KafkaValueFormat::ConfluentAvro {
                 schema_registry: SchemaRegistryConfig::new("http://localhost:8081"),
+                bytes_encoding: Default::default(),
             }
         }
 

@@ -18,7 +18,7 @@ categories.workspace = true
 arrow = ["faucet-core/arrow"]
 
 [dependencies]
-faucet-core = { workspace = true, features = ["arrow"] }
+faucet-core = { workspace = true, features = ["arrow", "file-format-parquet"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

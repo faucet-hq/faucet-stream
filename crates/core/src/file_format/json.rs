@@ -92,13 +92,33 @@ fn check_literal(token: &str) -> Result<(), String> {
         return Ok(());
     };
     let back = parsed.to_string();
-    if canonical_decimal(token) == canonical_decimal(&back) {
+    if literal_is_faithful(token, &parsed) {
         Ok(())
     } else {
         Err(format!(
             "number {token} cannot be represented exactly (it would be read as {back}); \
              quote it as a string in the source data to keep every digit"
         ))
+    }
+}
+
+/// Whether `token` names the value it parsed to. An integer literal must stay
+/// an integer. A decimal literal of `n` significant digits is faithful when the
+/// parsed double, rounded to `n` significant digits, spells it again — so the
+/// `%.17g` rendering `0.10000000000000001` is accepted like `0.1`, while a
+/// literal whose digits the double cannot carry is refused.
+fn literal_is_faithful(token: &str, parsed: &serde_json::Number) -> bool {
+    let literal = canonical_decimal(token);
+    let is_integer = !token.contains(['.', 'e', 'E']);
+    match parsed.as_f64() {
+        Some(f) if parsed.is_f64() => {
+            if is_integer {
+                return false;
+            }
+            let digits = literal.as_ref().map_or(1, |(_, d, _)| d.len().max(1));
+            canonical_decimal(&format!("{:.*e}", digits - 1, f)) == literal
+        }
+        _ => canonical_decimal(&parsed.to_string()) == literal,
     }
 }
 
@@ -191,6 +211,22 @@ mod tests {
             err.contains("line 2") && err.contains("0.12345678901234567890"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn seventeen_digit_float_renderings_are_accepted() {
+        let ok = br#"[{"a": 0.10000000000000001, "b": 3.1415926535897931,
+            "c": 2.2250738585072014e-308, "d": -0.30000000000000004,
+            "e": 0.1000000000000000055511151231257827}]"#;
+        let rec = &decode_array(ok).unwrap()[0];
+        assert_eq!(rec["a"], json!(0.1));
+        assert_eq!(rec["b"], json!(std::f64::consts::PI));
+        let err = decode_array(br#"[{"amt": 1234567890123456.7}]"#).unwrap_err();
+        assert!(err.to_string().contains("1234567890123456.7"), "{err}");
+        assert!(!literal_is_faithful(
+            "18446744073709551616",
+            &serde_json::from_str("18446744073709551616").unwrap()
+        ));
     }
 
     #[test]

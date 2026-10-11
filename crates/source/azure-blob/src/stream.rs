@@ -53,10 +53,33 @@ enum Fetched {
 }
 
 /// Byte ranges of one blob, for the shared ranged Parquet reader (#783).
+/// Every read carries the ETag the `head` saw as `If-Match`, so a blob
+/// replaced mid-read fails instead of splicing two versions.
 #[cfg(feature = "arrow")]
 struct BlobRange {
     store: Arc<dyn ObjectStore>,
     path: ObjectPath,
+    etag: Option<String>,
+}
+
+#[cfg(feature = "arrow")]
+fn range_options(range: std::ops::Range<u64>, etag: Option<String>) -> object_store::GetOptions {
+    object_store::GetOptions {
+        if_match: etag,
+        range: Some(object_store::GetRange::Bounded(range)),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "arrow")]
+fn range_error(path: &ObjectPath, e: object_store::Error) -> FaucetError {
+    match e {
+        object_store::Error::Precondition { .. } => FaucetError::Source(format!(
+            "azure blob '{path}' was replaced while it was being read (its ETag no longer \
+             matches); rerun to read the new version"
+        )),
+        e => FaucetError::Source(format!("azure get range error: {e}")),
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -70,10 +93,13 @@ impl faucet_core::file_format::parquet_io::RangeRead for BlobRange {
     > {
         use futures::FutureExt as _;
         async move {
-            self.store
-                .get_range(&self.path, range)
+            let opts = range_options(range, self.etag.clone());
+            let got = self
+                .store
+                .get_opts(&self.path, opts)
                 .await
-                .map_err(|e| FaucetError::Source(format!("azure get range error: {e}")))
+                .map_err(|e| range_error(&self.path, e))?;
+            got.bytes().await.map_err(|e| range_error(&self.path, e))
         }
         .boxed()
     }
@@ -219,6 +245,7 @@ impl AzureBlobSource {
             BlobRange {
                 store: self.store.clone(),
                 path,
+                etag: meta.e_tag.clone(),
             },
             meta.size,
             key,
@@ -935,6 +962,38 @@ mod tests {
     use super::*;
     use faucet_core::Source as _;
     use serde_json::json;
+
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn ranged_reads_are_pinned_to_the_etag_the_head_saw() {
+        use faucet_core::file_format::parquet_io::RangeRead as _;
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjectPath::from("d/o.parquet");
+        store
+            .put(&path, b"0123456789".to_vec().into())
+            .await
+            .unwrap();
+        let etag = store.head(&path).await.unwrap().e_tag;
+        let mut pinned = BlobRange {
+            store: store.clone(),
+            path: path.clone(),
+            etag,
+        };
+        assert_eq!(&pinned.read_range(2..5).await.unwrap()[..], b"234");
+        store
+            .put(&path, b"abcdefghij".to_vec().into())
+            .await
+            .unwrap();
+        let err = pinned.read_range(2..5).await.unwrap_err().to_string();
+        assert!(err.contains("was replaced"), "{err}");
+        let mut missing = BlobRange {
+            store,
+            path: ObjectPath::from("d/missing"),
+            etag: None,
+        };
+        let err = missing.read_range(0..1).await.unwrap_err().to_string();
+        assert!(err.contains("azure get range error"), "{err}");
+    }
 
     #[test]
     fn value_type_name_covers_all_json_variants() {

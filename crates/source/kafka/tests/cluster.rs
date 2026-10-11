@@ -443,3 +443,41 @@ async fn first_member_seeds_group_offsets_for_a_later_member() {
         .collect();
     assert_eq!(got.iter().copied().collect::<HashSet<_>>(), expected);
 }
+
+/// A group committed offset that fell below the log start (retention deleted
+/// records while the members were down) resumes at the log start, not at
+/// `auto.offset.reset: latest`, so the still-retained backlog is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn committed_offset_below_the_log_start_resumes_at_the_log_start() {
+    let (_container, brokers) = start_kafka().await;
+    let topic = "cluster-retention";
+    let group = "g-cluster-retention";
+    create_topic(&brokers, topic, 1).await;
+    produce_across_partitions(&brokers, topic, 1, 6).await;
+
+    let mut first = member_config(&brokers, topic, group, Duration::from_secs(8), 0);
+    first.max_messages = Some(2);
+    let m0 = KafkaSource::new(first).await.unwrap();
+    m0.apply_shard(&member_shard(1, 0)).await.unwrap();
+    assert_eq!(drain(&m0).await.len(), 2);
+    drop(m0);
+
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .unwrap();
+    let mut tpl = rdkafka::TopicPartitionList::new();
+    tpl.add_partition_offset(topic, 0, rdkafka::Offset::Offset(4))
+        .unwrap();
+    admin
+        .delete_records(&tpl, &AdminOptions::new())
+        .await
+        .expect("delete_records");
+
+    let mut cfg = member_config(&brokers, topic, group, Duration::from_secs(8), 0);
+    cfg.auto_offset_reset = OffsetReset::Latest;
+    let m1 = KafkaSource::new(cfg).await.unwrap();
+    m1.apply_shard(&member_shard(1, 0)).await.unwrap();
+    let got = identities(&drain(&m1).await);
+    assert_eq!(got, vec![(0, 4), (0, 5)]);
+}

@@ -211,7 +211,7 @@ fn scan(raw: &[u8], enc: &CompiledEncryption, recover: bool) -> Result<Opened, F
     // The state at the last verifying trailer: (seal, plaintext length, offset).
     let mut settled: Option<(LineSeal, usize, usize)> = None;
     let mut ended_on_trailer = false;
-    for &(number, start, line) in lines.iter().skip(1) {
+    for (pos, &(number, start, line)) in lines.iter().enumerate().skip(1) {
         let opened = sealed_bytes(line, number).and_then(|b| enc.open_line(&b));
         let step = match opened {
             Ok(SealedLine::Data(body)) => {
@@ -231,8 +231,18 @@ fn scan(raw: &[u8], enc: &CompiledEncryption, recover: bool) -> Result<Opened, F
             Err(e) => Err(e),
         };
         if let Err(e) = step {
+            // Only a crash tail is dropped: a complete trailer after the
+            // damage means later flushes finished, so the file is damaged.
+            let later_trailer = || {
+                lines[pos + 1..].iter().any(|&(n, _, l)| {
+                    matches!(
+                        sealed_bytes(l, n).and_then(|b| enc.open_line(&b)),
+                        Ok(SealedLine::Trailer(_))
+                    )
+                })
+            };
             return match settled.take() {
-                Some(s) if recover => Ok(recovered(s, plain)),
+                Some(s) if recover && !later_trailer() => Ok(recovered(s, plain)),
                 _ => Err(e),
             };
         }
@@ -449,6 +459,29 @@ mod tests {
         no_trailer.extend(lone.seal(&enc, b"x"));
         assert!(open_for_append(&no_trailer, &enc).is_err());
         assert!(open_for_append(&[0xff, b'\n'], &enc).is_err());
+    }
+
+    #[test]
+    fn damage_before_a_later_trailer_is_refused_not_cut() {
+        let enc = enc();
+        let mut seal = LineSeal::new();
+        let mut lines = vec![seal.header(&enc)];
+        for row in [b"1", b"2", b"3"] {
+            lines.push(seal.seal(&enc, row));
+            lines.push(seal.trailer(&enc));
+        }
+        let mut damaged_line = lines[3].clone();
+        damaged_line[4] ^= 0x01;
+        let mut raw = lines.clone();
+        raw[3] = damaged_line;
+        assert!(
+            open_for_append(&raw.concat(), &enc).is_err(),
+            "damage followed by an intact trailer is not a crash tail"
+        );
+        let mut tail = lines[..5].to_vec();
+        tail.push(lines[5].clone());
+        tail.push(b"torn".to_vec());
+        assert!(open_for_append(&tail.concat(), &enc).is_ok());
     }
 
     #[test]

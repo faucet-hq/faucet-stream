@@ -266,8 +266,35 @@ pub fn datum_to_json(datum: &Av, schema: &Schema) -> Result<Value, FaucetError> 
 /// [`datum_to_json`] produces (the inverse mapping). The error names the path
 /// that did not fit.
 pub fn datum_from_json(value: &Value, schema: &Schema) -> Result<Av, String> {
+    datum_from_json_with(value, schema, BytesText::Hex)
+}
+
+/// How a JSON string is read for an Avro `bytes` / `fixed` value on encode.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BytesText {
+    /// The string is lowercase hex, the shape [`datum_to_json`] produces.
+    #[default]
+    Hex,
+    /// The string's UTF-8 bytes are the value.
+    Utf8,
+}
+
+/// [`datum_from_json`] with an explicit reading of JSON strings for
+/// `bytes` / `fixed` values. A JSON array of byte numbers is accepted either way.
+pub fn datum_from_json_with(value: &Value, schema: &Schema, text: BytesText) -> Result<Av, String> {
     let names = named(schema);
-    from_json(value, schema, &names, "")
+    from_json(value, schema, &names, text, "")
 }
 
 fn root_to_json(
@@ -668,10 +695,10 @@ pub fn encode(records: &[Value], opts: &AvroOptions) -> Result<Vec<u8>, FaucetEr
 fn root_from_json(v: &Value, schema: &Schema, names: &Names<'_>) -> Result<Av, String> {
     let resolved = resolve(schema, names).map_err(|e| e.to_string())?;
     match resolved {
-        Schema::Record(_) => from_json(v, schema, names, ""),
+        Schema::Record(_) => from_json(v, schema, names, BytesText::Hex, ""),
         _ => {
             let inner = v.get(VALUE_FIELD).unwrap_or(v);
-            from_json(inner, schema, names, "")
+            from_json(inner, schema, names, BytesText::Hex, "")
         }
     }
 }
@@ -684,7 +711,13 @@ fn at(path: &str) -> String {
     }
 }
 
-fn from_json(v: &Value, schema: &Schema, names: &Names<'_>, path: &str) -> Result<Av, String> {
+fn from_json(
+    v: &Value,
+    schema: &Schema,
+    names: &Names<'_>,
+    text: BytesText,
+    path: &str,
+) -> Result<Av, String> {
     let s = resolve(schema, names).map_err(|e| e.to_string())?;
     let want = |what: &str| format!("{}: expected {what}, got {}", at(path), short(v));
     Ok(match s {
@@ -703,7 +736,7 @@ fn from_json(v: &Value, schema: &Schema, names: &Names<'_>, path: &str) -> Resul
         Schema::Long => Av::Long(v.as_i64().ok_or_else(|| want("an integer"))?),
         Schema::Float => Av::Float(float_from(v).ok_or_else(|| want("a number"))? as f32),
         Schema::Double => Av::Double(float_from(v).ok_or_else(|| want("a number"))?),
-        Schema::Bytes => Av::Bytes(bytes_from(v).map_err(|e| format!("{}: {e}", at(path)))?),
+        Schema::Bytes => Av::Bytes(bytes_from(v, text).map_err(|e| format!("{}: {e}", at(path)))?),
         Schema::String => Av::String(match v {
             Value::String(t) => t.clone(),
             Value::Null => return Err(want("a string")),
@@ -715,7 +748,7 @@ fn from_json(v: &Value, schema: &Schema, names: &Names<'_>, path: &str) -> Resul
                 items
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| from_json(x, &a.items, names, &format!("{path}[{i}]")))
+                    .map(|(i, x)| from_json(x, &a.items, names, text, &format!("{path}[{i}]")))
                     .collect::<Result<_, _>>()?,
             )
         }
@@ -723,7 +756,12 @@ fn from_json(v: &Value, schema: &Schema, names: &Names<'_>, path: &str) -> Resul
             let obj = v.as_object().ok_or_else(|| want("an object"))?;
             Av::Map(
                 obj.iter()
-                    .map(|(k, x)| Ok((k.clone(), from_json(x, &m.types, names, &join(path, k))?)))
+                    .map(|(k, x)| {
+                        Ok((
+                            k.clone(),
+                            from_json(x, &m.types, names, text, &join(path, k))?,
+                        ))
+                    })
                     .collect::<Result<_, String>>()?,
             )
         }
@@ -735,7 +773,7 @@ fn from_json(v: &Value, schema: &Schema, names: &Names<'_>, path: &str) -> Resul
                 let fv = obj.get(key).unwrap_or(&Value::Null);
                 let datum = match (fv, accepts_null(&f.schema, names), &f.default) {
                     (Value::Null, false, Some(default)) => {
-                        from_json(default, &f.schema, names, &join(path, key))?
+                        from_json(default, &f.schema, names, text, &join(path, key))?
                     }
                     (Value::Null, false, None) => {
                         return Err(format!(
@@ -743,7 +781,7 @@ fn from_json(v: &Value, schema: &Schema, names: &Names<'_>, path: &str) -> Resul
                             at(&join(path, key))
                         ));
                     }
-                    _ => from_json(fv, &f.schema, names, &join(path, key))?,
+                    _ => from_json(fv, &f.schema, names, text, &join(path, key))?,
                 };
                 fields.push((f.name.clone(), datum));
             }
@@ -761,7 +799,7 @@ fn from_json(v: &Value, schema: &Schema, names: &Names<'_>, path: &str) -> Resul
                 if matches!(b, Schema::Null) {
                     continue;
                 }
-                match from_json(v, b, names, path) {
+                match from_json(v, b, names, text, path) {
                     Ok(d) => return Ok(Av::Union(i as u32, Box::new(d))),
                     Err(e) => last = Some(e),
                 }
@@ -777,7 +815,7 @@ fn from_json(v: &Value, schema: &Schema, names: &Names<'_>, path: &str) -> Resul
             Av::Enum(i as u32, sym.to_string())
         }
         Schema::Fixed(x) => {
-            let b = bytes_from(v).map_err(|e| format!("{}: {e}", at(path)))?;
+            let b = bytes_from(v, text).map_err(|e| format!("{}: {e}", at(path)))?;
             if b.len() != x.size {
                 return Err(format!(
                     "{}: fixed({}) got {} bytes",
@@ -919,8 +957,9 @@ fn float_from(v: &Value) -> Option<f64> {
     }
 }
 
-fn bytes_from(v: &Value) -> Result<Vec<u8>, String> {
+fn bytes_from(v: &Value, text: BytesText) -> Result<Vec<u8>, String> {
     match v {
+        Value::String(s) if text == BytesText::Utf8 => Ok(s.as_bytes().to_vec()),
         Value::String(s) => unhex(s),
         Value::Array(items) => items
             .iter()
@@ -1550,27 +1589,55 @@ mod tests {
     fn value_coercions_and_their_refusals() {
         let names = HashMap::new();
         assert!(
-            matches!(from_json(&json!(1), &Schema::String, &names, "s"), Ok(Av::String(s)) if s == "1")
+            matches!(from_json(&json!(1), &Schema::String, &names, BytesText::Hex, "s"), Ok(Av::String(s)) if s == "1")
         );
-        assert!(from_json(&Value::Null, &Schema::String, &names, "s").is_err());
-        assert!(from_json(&json!(1), &Schema::Null, &names, "s").is_err());
+        assert!(from_json(&Value::Null, &Schema::String, &names, BytesText::Hex, "s").is_err());
+        assert!(from_json(&json!(1), &Schema::Null, &names, BytesText::Hex, "s").is_err());
         assert!(
-            matches!(from_json(&json!([1, 2]), &Schema::Bytes, &names, "b"), Ok(Av::Bytes(b)) if b == vec![1, 2])
+            matches!(from_json(&json!([1, 2]), &Schema::Bytes, &names, BytesText::Hex, "b"), Ok(Av::Bytes(b)) if b == vec![1, 2])
         );
-        assert!(from_json(&json!("abc"), &Schema::Bytes, &names, "b").is_err());
-        assert!(from_json(&json!("zz"), &Schema::Bytes, &names, "b").is_err());
-        assert!(from_json(&json!([300]), &Schema::Bytes, &names, "b").is_err());
-        assert!(from_json(&json!(true), &Schema::Bytes, &names, "b").is_err());
-        assert!(from_json(&json!("Infinity"), &Schema::Double, &names, "d").is_ok());
-        assert!(from_json(&json!("-Infinity"), &Schema::Double, &names, "d").is_ok());
-        assert!(from_json(&json!("x"), &Schema::Double, &names, "d").is_err());
-        assert!(from_json(&json!("x"), &Schema::Date, &names, "d").is_err());
-        assert!(from_json(&json!("x"), &Schema::TimestampMicros, &names, "d").is_err());
+        assert!(from_json(&json!("abc"), &Schema::Bytes, &names, BytesText::Hex, "b").is_err());
+        assert!(from_json(&json!("zz"), &Schema::Bytes, &names, BytesText::Hex, "b").is_err());
+        assert!(from_json(&json!([300]), &Schema::Bytes, &names, BytesText::Hex, "b").is_err());
+        assert!(from_json(&json!(true), &Schema::Bytes, &names, BytesText::Hex, "b").is_err());
+        assert!(
+            from_json(
+                &json!("Infinity"),
+                &Schema::Double,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_ok()
+        );
+        assert!(
+            from_json(
+                &json!("-Infinity"),
+                &Schema::Double,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_ok()
+        );
+        assert!(from_json(&json!("x"), &Schema::Double, &names, BytesText::Hex, "d").is_err());
+        assert!(from_json(&json!("x"), &Schema::Date, &names, BytesText::Hex, "d").is_err());
+        assert!(
+            from_json(
+                &json!("x"),
+                &Schema::TimestampMicros,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_err()
+        );
         assert!(
             from_json(
                 &json!("2024-01-01 00:00:00"),
                 &Schema::TimestampMicros,
                 &names,
+                BytesText::Hex,
                 "d"
             )
             .is_ok()
@@ -1580,14 +1647,42 @@ mod tests {
                 &json!("2024-01-01T00:00:00+02:00"),
                 &Schema::LocalTimestampMicros,
                 &names,
+                BytesText::Hex,
                 "d"
             )
             .is_ok()
         );
-        assert!(from_json(&json!(true), &Schema::TimeMicros, &names, "d").is_err());
-        assert!(from_json(&json!("bad"), &Schema::TimeMicros, &names, "d").is_err());
-        assert!(from_json(&json!(5), &Schema::TimeMicros, &names, "d").is_ok());
-        assert!(from_json(&json!(true), &Schema::TimestampMicros, &names, "d").is_err());
+        assert!(
+            from_json(
+                &json!(true),
+                &Schema::TimeMicros,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_err()
+        );
+        assert!(
+            from_json(
+                &json!("bad"),
+                &Schema::TimeMicros,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_err()
+        );
+        assert!(from_json(&json!(5), &Schema::TimeMicros, &names, BytesText::Hex, "d").is_ok());
+        assert!(
+            from_json(
+                &json!(true),
+                &Schema::TimestampMicros,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_err()
+        );
         assert!(
             from_json(
                 &json!({"months": 1}),
@@ -1596,30 +1691,58 @@ mod tests {
                 )
                 .unwrap(),
                 &names,
+                BytesText::Hex,
                 "d"
             )
             .is_err()
         );
         let e = parse_schema(&json!({"type": "enum", "name": "e", "symbols": ["A"]})).unwrap();
-        assert!(from_json(&json!("Z"), &e, &named(&e), "e").is_err());
+        assert!(from_json(&json!("Z"), &e, &named(&e), BytesText::Hex, "e").is_err());
         let f = parse_schema(&json!({"type": "fixed", "name": "f", "size": 2})).unwrap();
-        assert!(from_json(&json!("00"), &f, &named(&f), "f").is_err());
+        assert!(from_json(&json!("00"), &f, &named(&f), BytesText::Hex, "f").is_err());
         let u = parse_schema(&json!({"type": "string", "logicalType": "uuid"})).unwrap();
-        assert!(from_json(&json!("nope"), &u, &names, "u").is_err());
+        assert!(from_json(&json!("nope"), &u, &names, BytesText::Hex, "u").is_err());
         let bd = parse_schema(&json!({"type": "bytes", "logicalType": "big-decimal"})).unwrap();
-        assert!(from_json(&json!(1.5), &bd, &names, "b").is_ok());
-        assert!(from_json(&json!("x"), &bd, &names, "b").is_err());
-        assert!(from_json(&json!(true), &bd, &names, "b").is_err());
+        assert!(from_json(&json!(1.5), &bd, &names, BytesText::Hex, "b").is_ok());
+        assert!(from_json(&json!("x"), &bd, &names, BytesText::Hex, "b").is_err());
+        assert!(from_json(&json!(true), &bd, &names, BytesText::Hex, "b").is_err());
         let dec = parse_schema(
             &json!({"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 1}),
         )
         .unwrap();
-        assert!(from_json(&json!(1.5), &dec, &names, "d").is_ok());
-        assert!(from_json(&json!(true), &dec, &names, "d").is_err());
+        assert!(from_json(&json!(1.5), &dec, &names, BytesText::Hex, "d").is_ok());
+        assert!(from_json(&json!(true), &dec, &names, BytesText::Hex, "d").is_err());
         let un = parse_schema(&json!(["long", "boolean"])).unwrap();
-        assert!(from_json(&json!("x"), &un, &names, "u").is_err());
-        assert!(from_json(&Value::Null, &un, &names, "u").is_err());
+        assert!(from_json(&json!("x"), &un, &names, BytesText::Hex, "u").is_err());
+        assert!(from_json(&Value::Null, &un, &names, BytesText::Hex, "u").is_err());
         assert!(short(&json!("x".repeat(100))).ends_with('…'));
+    }
+
+    #[test]
+    fn utf8_bytes_text_reads_strings_as_their_bytes() {
+        let schema = parse_schema(&json!({"type": "record", "name": "r", "fields": [
+            {"name": "raw", "type": "bytes"},
+            {"name": "tag", "type": {"type": "fixed", "name": "t", "size": 4}}
+        ]}))
+        .unwrap();
+        let v = json!({"raw": "cafe", "tag": "abcd"});
+        assert_eq!(
+            datum_from_json_with(&v, &schema, BytesText::Utf8).unwrap(),
+            Av::Record(vec![
+                ("raw".into(), Av::Bytes(b"cafe".to_vec())),
+                ("tag".into(), Av::Fixed(4, b"abcd".to_vec())),
+            ])
+        );
+        assert!(datum_from_json(&json!({"raw": "hello", "tag": "abcd"}), &schema).is_err());
+        assert!(
+            datum_from_json_with(
+                &json!({"raw": [1, 2], "tag": "abcd"}),
+                &schema,
+                BytesText::Utf8
+            )
+            .is_ok()
+        );
+        assert_eq!(BytesText::default(), BytesText::Hex);
     }
 
     #[test]
