@@ -313,6 +313,25 @@ async fn hub_templates_handed_to_run_or_validate_directly_are_redirected() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("is a hub source-template"), "{err}");
+    let suite = dir.path().join("suite.yaml");
+    std::fs::write(
+        &suite,
+        "kind: test-suite\nname: shared\nrelease: 1.0.0\nsuite:\n  auto: { defaults_baseline: true }\n",
+    )
+    .unwrap();
+    let err = run(&[
+        "validate",
+        suite.to_str().unwrap(),
+        "--no-env-file",
+        "--no-secrets",
+    ])
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("is a shared test suite") && err.contains("tests.requires_suites"),
+        "{err}"
+    );
     // Unknown ids name the catalog; an incompatible pairing fails at compose.
     let err = run(&[
         "run",

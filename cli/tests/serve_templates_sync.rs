@@ -420,3 +420,21 @@ async fn an_invalid_sync_file_fails_startup() {
         .expect_err("overlapping prefixes must refuse to start");
     assert!(err.to_string().contains("overlapping"), "{err}");
 }
+
+#[test]
+fn test_suites_publish_into_their_own_directory() {
+    use faucet_cli::hub::spec::TemplateKind;
+    use faucet_cli::templates::sync::fetch::dir_for_kind;
+    let dirs = ["source-templates", "test-suites"];
+    assert_eq!(
+        dir_for_kind(&dirs, TemplateKind::TestSuite),
+        Some("test-suites")
+    );
+    assert_eq!(
+        dir_for_kind(
+            &["source-templates", "sink-templates"],
+            TemplateKind::TestSuite
+        ),
+        None
+    );
+}
