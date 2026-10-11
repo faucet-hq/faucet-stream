@@ -495,7 +495,15 @@ impl PostgresCdcSource {
 
             let mut duplex = replication::retry_on_slot_active(
                 self.config.slot_acquire_retries,
-                || replication::start_replication(&client, &params),
+                || async {
+                    replication::ensure_slot_inactive(
+                        &self.config.connection_url,
+                        &self.config.slot_name,
+                        &self.config.tls,
+                    )
+                    .await?;
+                    replication::start_replication(&client, &params).await
+                },
             )
             .await?;
 

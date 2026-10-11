@@ -673,3 +673,34 @@ async fn a_change_to_a_leaf_partition_is_routed_to_its_partitioned_table() {
     assert!(plain.get("partition_root").is_none());
     assert_eq!(source.record_table(plain).as_deref(), Some("public.plain"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_waits_for_the_previous_connection_to_release_the_slot() {
+    let (_pg, url) = start_postgres().await;
+    ddl(
+        &url,
+        "CREATE TABLE public.users (id int4 PRIMARY KEY); \
+         CREATE PUBLICATION faucet_pub FOR TABLE public.users;",
+    )
+    .await;
+    let mut held = cfg(&url, "faucet_slot", "faucet_pub");
+    held.idle_timeout = Duration::from_secs(3);
+    let first = PostgresCdcSource::new(held).await.expect("source");
+    let _ = first.fetch_all_incremental().await.expect("warm-up");
+    let holder = tokio::spawn(async move { first.fetch_all_incremental().await });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    ddl(&url, "INSERT INTO public.users VALUES (1);").await;
+    let second = PostgresCdcSource::new(cfg(&url, "faucet_slot", "faucet_pub"))
+        .await
+        .expect("source");
+    let (records, _) = second
+        .fetch_all_incremental()
+        .await
+        .expect("waits for the slot instead of failing");
+    holder.await.expect("join").expect("holder run");
+    assert!(
+        records.iter().any(|r| r["op"] == "insert"),
+        "records: {records:?}"
+    );
+}
