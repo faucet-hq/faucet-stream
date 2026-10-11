@@ -126,12 +126,13 @@ pub struct RestStreamConfig {
     #[schemars(with = "std::collections::HashMap<String, String>")]
     pub headers: HashMap<String, String>,
     /// Extra hosts that may receive this source's credentials when a
-    /// server-given URL (a next-page link, an async-job URL) points at them.
-    /// Credentials — the `auth` block, a shared provider's placements and any
-    /// `Authorization` / `Cookie` header — are otherwise sent only to the
-    /// scheme, host and port of `base_url`; a link elsewhere is fetched without
-    /// them. An entry is a host (`files.example.com`) or a `*.example.com`
-    /// wildcard. An `https` base never follows a link to plain `http`.
+    /// server-given URL (a next-page link, an async-job URL, a discovery
+    /// listing's next link) points at them. Credentials — the `auth` block and
+    /// a shared provider's placements — are otherwise sent only to the scheme,
+    /// host and port of `base_url`; a link elsewhere is fetched without them
+    /// and with only non-credential static headers (`Accept`, `User-Agent`, …).
+    /// An entry is a host (`files.example.com`) or a `*.example.com` wildcard.
+    /// An `https` base never follows a link to plain `http`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_hosts: Vec<String>,
     /// Static query-string parameters, rendered as `?k=v`. Values honor
