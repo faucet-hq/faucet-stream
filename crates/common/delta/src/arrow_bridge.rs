@@ -79,13 +79,18 @@ pub fn batch_to_delta(
 
 const _: () = {
     use std::mem::{align_of, size_of};
-    assert!(size_of::<arrow::ffi::FFI_ArrowArray>() == size_of::<delta_arrow::ffi::FFI_ArrowArray>());
-    assert!(align_of::<arrow::ffi::FFI_ArrowArray>() == align_of::<delta_arrow::ffi::FFI_ArrowArray>());
+    assert!(
+        size_of::<arrow::ffi::FFI_ArrowArray>() == size_of::<delta_arrow::ffi::FFI_ArrowArray>()
+    );
+    assert!(
+        align_of::<arrow::ffi::FFI_ArrowArray>() == align_of::<delta_arrow::ffi::FFI_ArrowArray>()
+    );
     assert!(
         size_of::<arrow::ffi::FFI_ArrowSchema>() == size_of::<delta_arrow::ffi::FFI_ArrowSchema>()
     );
     assert!(
-        align_of::<arrow::ffi::FFI_ArrowSchema>() == align_of::<delta_arrow::ffi::FFI_ArrowSchema>()
+        align_of::<arrow::ffi::FFI_ArrowSchema>()
+            == align_of::<delta_arrow::ffi::FFI_ArrowSchema>()
     );
 };
 

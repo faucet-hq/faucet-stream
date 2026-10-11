@@ -1174,11 +1174,7 @@ mod tests {
             )
         );
         assert_eq!(
-            text_cast_query(
-                "SELECT n FROM t; \n",
-                &cols(&[("n", "NUMERIC")])
-            )
-            .as_deref(),
+            text_cast_query("SELECT n FROM t; \n", &cols(&[("n", "NUMERIC")])).as_deref(),
             Some(
                 "SELECT CASE WHEN q.\"n\" IS NULL THEN NULL ELSE format('%s', q.\"n\") END AS \"n\" \
                  FROM (SELECT n FROM t\n) AS q"

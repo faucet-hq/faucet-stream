@@ -1574,8 +1574,11 @@ impl faucet_core::Sink for SqliteSink {
         }
 
         let plan = faucet_core::plan_writes(records, &self.config.write);
-        self.apply_plans(&faucet_core::plan_writes_ordered(records, &self.config.write))
-            .await?;
+        self.apply_plans(&faucet_core::plan_writes_ordered(
+            records,
+            &self.config.write,
+        ))
+        .await?;
 
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {

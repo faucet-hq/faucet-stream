@@ -1035,7 +1035,10 @@ async fn jobs_query_requests_integer_microsecond_timestamps() {
         .await;
     let (src, _f) = build_source(&server, default_config()).await;
     let rows = src.fetch_all().await.unwrap();
-    assert_eq!(rows, vec![json!({"valid_to": "9999-12-31T23:59:59.999999Z"})]);
+    assert_eq!(
+        rows,
+        vec![json!({"valid_to": "9999-12-31T23:59:59.999999Z"})]
+    );
     let reqs = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(
         &reqs

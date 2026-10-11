@@ -388,8 +388,14 @@ async fn review_862_unmatched_fields_widening_and_nested_text() {
     let pool = build_pool(&cfg, 4).await.expect("pool");
 
     // M-044: fields match columns ignoring case; a record matching none fails.
-    exec(&pool, "CREATE TABLE dbo.ev (UserID INT NULL, kind NVARCHAR(10) NULL)").await;
-    let sink = MssqlSink::new(auto_cfg(&cfg, "dbo.ev")).await.expect("sink");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.ev (UserID INT NULL, kind NVARCHAR(10) NULL)",
+    )
+    .await;
+    let sink = MssqlSink::new(auto_cfg(&cfg, "dbo.ev"))
+        .await
+        .expect("sink");
     sink.write_batch(&[json!({"userid": 1, "KIND": "a"})])
         .await
         .expect("case-folded write");
@@ -436,13 +442,22 @@ async fn review_862_unmatched_fields_widening_and_nested_text() {
         .into_first_result()
         .await
         .unwrap();
-    assert_eq!(r[0].get::<&str, _>("v"), Some("9007199254740993.0000000000"));
+    assert_eq!(
+        r[0].get::<&str, _>("v"),
+        Some("9007199254740993.0000000000")
+    );
     assert_eq!(r[0].get::<i32, _>("n"), Some(0));
     drop(conn);
 
     // M-046: a nested field in an NVARCHAR(MAX) column is not drift.
-    exec(&pool, "CREATE TABLE dbo.docs (id INT NULL, meta NVARCHAR(MAX) NULL)").await;
-    let sink = MssqlSink::new(auto_cfg(&cfg, "dbo.docs")).await.expect("sink");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.docs (id INT NULL, meta NVARCHAR(MAX) NULL)",
+    )
+    .await;
+    let sink = MssqlSink::new(auto_cfg(&cfg, "dbo.docs"))
+        .await
+        .expect("sink");
     let dest = sink.current_schema().await.expect("schema").expect("some");
     let page = faucet_core::schema::infer_schema(&[json!({"id": 1, "meta": {"a": 1}})]);
     let diff = faucet_core::drift::diff_schema(&dest, &page, true);

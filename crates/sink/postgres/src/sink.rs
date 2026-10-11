@@ -383,8 +383,9 @@ pub(crate) async fn referencing_foreign_keys(
     conn: &mut sqlx::PgConnection,
     table_ref: &str,
 ) -> Result<Vec<ReferencingKey>, FaucetError> {
-    let err =
-        |e: sqlx::Error| FaucetError::Sink(format!("postgres: read foreign keys of {table_ref}: {e}"));
+    let err = |e: sqlx::Error| {
+        FaucetError::Sink(format!("postgres: read foreign keys of {table_ref}: {e}"))
+    };
     let rows = sqlx::query(
         "SELECT c.conname::text, c.conrelid::regclass::text, c.confdeltype::text, \
                 c.condeferrable, \
@@ -2101,10 +2102,10 @@ impl faucet_core::Sink for PostgresSink {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnRoles, PostgresSinkConfig, ReferencingKey, build_add_column_sql, build_alter_type_sql,
-        build_create_table_sql, build_drop_not_null_sql, clear_statements, derived_table_name,
-        on_conflict_clause, pg_bind_text, pg_udt_to_json_schema, qualified_table_ref,
-        split_unmatched, widened_keyword,
+        ColumnRoles, PostgresSinkConfig, ReferencingKey, build_add_column_sql,
+        build_alter_type_sql, build_create_table_sql, build_drop_not_null_sql, clear_statements,
+        derived_table_name, on_conflict_clause, pg_bind_text, pg_udt_to_json_schema,
+        qualified_table_ref, split_unmatched, widened_keyword,
     };
     use super::{
         FaucetError, bootstrap_lock_key, bounded, is_concurrent_ddl, is_concurrent_ddl_code,
@@ -2183,15 +2184,21 @@ mod tests {
             Some(r"\x48656c6c6f")
         );
         assert_eq!(
-            bind(&json!(r"\x0a"), BinaryEncoding::Auto).unwrap().as_deref(),
+            bind(&json!(r"\x0a"), BinaryEncoding::Auto)
+                .unwrap()
+                .as_deref(),
             Some(r"\x0a")
         );
         assert_eq!(
-            bind(&json!("plain text"), BinaryEncoding::Auto).unwrap().as_deref(),
+            bind(&json!("plain text"), BinaryEncoding::Auto)
+                .unwrap()
+                .as_deref(),
             Some("plain text")
         );
         assert_eq!(
-            bind(&json!("abcd"), BinaryEncoding::Text).unwrap().as_deref(),
+            bind(&json!("abcd"), BinaryEncoding::Text)
+                .unwrap()
+                .as_deref(),
             Some(r"\x61626364")
         );
         assert_eq!(

@@ -102,8 +102,10 @@ pub(crate) fn pg_value_to_json(
     // binary cell is only text for types whose binary form *is* their text;
     // anything else (an int array, EWKB) would decode as garbage that happens
     // to be valid UTF-8, so it is refused (#862 M-057).
-    if text_fallback_allowed(&type_name, raw.format() == sqlx::postgres::PgValueFormat::Text)
-        && let Ok(v) = row.try_get_unchecked::<String, _>(col_name)
+    if text_fallback_allowed(
+        &type_name,
+        raw.format() == sqlx::postgres::PgValueFormat::Text,
+    ) && let Ok(v) = row.try_get_unchecked::<String, _>(col_name)
     {
         return Ok(Value::String(v));
     }
@@ -117,8 +119,19 @@ pub(crate) fn pg_value_to_json(
 fn is_oid_family(type_name: &str) -> bool {
     matches!(
         type_name.to_ascii_uppercase().as_str(),
-        "OID" | "REGCLASS" | "REGPROC" | "REGPROCEDURE" | "REGTYPE" | "REGOPER" | "REGOPERATOR"
-            | "REGNAMESPACE" | "REGROLE" | "REGCONFIG" | "REGDICTIONARY" | "XID" | "CID"
+        "OID"
+            | "REGCLASS"
+            | "REGPROC"
+            | "REGPROCEDURE"
+            | "REGTYPE"
+            | "REGOPER"
+            | "REGOPERATOR"
+            | "REGNAMESPACE"
+            | "REGROLE"
+            | "REGCONFIG"
+            | "REGDICTIONARY"
+            | "XID"
+            | "CID"
     )
 }
 
@@ -129,8 +142,17 @@ fn text_fallback_allowed(type_name: &str, text_format: bool) -> bool {
     text_format
         || matches!(
             type_name.to_ascii_uppercase().as_str(),
-            "TEXT" | "VARCHAR" | "BPCHAR" | "CHAR" | "NAME" | "CITEXT" | "UNKNOWN" | "XML"
-                | "JSON" | "SUPER" | "\"CHAR\""
+            "TEXT"
+                | "VARCHAR"
+                | "BPCHAR"
+                | "CHAR"
+                | "NAME"
+                | "CITEXT"
+                | "UNKNOWN"
+                | "XML"
+                | "JSON"
+                | "SUPER"
+                | "\"CHAR\""
         )
 }
 

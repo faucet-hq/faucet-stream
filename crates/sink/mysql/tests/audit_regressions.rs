@@ -447,12 +447,20 @@ async fn mysql_review_862_regressions() {
         .await
         .unwrap();
     assert_eq!(
-        texts(&pool, "SELECT CONCAT(email, '/', name) FROM people ORDER BY email").await,
+        texts(
+            &pool,
+            "SELECT CONCAT(email, '/', name) FROM people ORDER BY email"
+        )
+        .await,
         vec!["bob@x.com/B", "carl@x.com/C", "dee@x.com/D"]
     );
 
     // M-064: `binary_encoding` makes binary columns deterministic.
-    exec(&pool, "CREATE TABLE tok (id INT PRIMARY KEY, t VARBINARY(64))").await;
+    exec(
+        &pool,
+        "CREATE TABLE tok (id INT PRIMARY KEY, t VARBINARY(64))",
+    )
+    .await;
     let text = MysqlSink::new(
         config(&url, "tok", WriteMode::Append, &[])
             .with_binary_encoding(faucet_sink_mysql::BinaryEncoding::Text),

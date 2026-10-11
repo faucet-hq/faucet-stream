@@ -1230,7 +1230,7 @@ impl MysqlSink {
                         conflict_key,
                         binary,
                     )
-                        .await?;
+                    .await?;
                 }
             }
             None => {
@@ -1750,8 +1750,11 @@ impl MysqlSink {
         }
 
         let plan = faucet_core::plan_writes(records, &self.config.write);
-        self.apply_plans(&faucet_core::plan_writes_ordered(records, &self.config.write))
-            .await?;
+        self.apply_plans(&faucet_core::plan_writes_ordered(
+            records,
+            &self.config.write,
+        ))
+        .await?;
 
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {
@@ -2353,7 +2356,10 @@ mod tests {
         let fk = ForeignKey {
             name: "fk_parent".into(),
             referenced_table: "cat".into(),
-            columns: vec![("parent_id".into(), "id".into()), ("org".into(), "org".into())],
+            columns: vec![
+                ("parent_id".into(), "id".into()),
+                ("org".into(), "org".into()),
+            ],
         };
         assert_eq!(
             fk_violation_sql("cat", &fk),
@@ -2368,7 +2374,10 @@ mod tests {
             column_type: "timestamp".into(),
             ..Default::default()
         };
-        assert_eq!(render_default("CURRENT_TIMESTAMP", &mysql57), "CURRENT_TIMESTAMP");
+        assert_eq!(
+            render_default("CURRENT_TIMESTAMP", &mysql57),
+            "CURRENT_TIMESTAMP"
+        );
         let maria = MysqlColumnDef {
             column_type: "varchar(10)".into(),
             mariadb: true,

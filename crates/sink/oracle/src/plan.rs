@@ -1311,7 +1311,11 @@ mod tests {
             s["properties"]["NAME"][faucet_core::DRIFT_ALSO_ACCEPTS],
             json!(["object", "array"])
         );
-        assert!(s["properties"]["AMT"].get(faucet_core::DRIFT_ALSO_ACCEPTS).is_none());
+        assert!(
+            s["properties"]["AMT"]
+                .get(faucet_core::DRIFT_ALSO_ACCEPTS)
+                .is_none()
+        );
         let doc = schema_from_columns(&[col("DOC", "CLOB", None, None)]);
         let page = faucet_core::schema::infer_schema(&[json!({"DOC": {"a": 1}})]);
         let diff = faucet_core::drift::diff_schema(&doc, &page, true);

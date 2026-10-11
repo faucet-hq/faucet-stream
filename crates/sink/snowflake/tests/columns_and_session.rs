@@ -268,14 +268,21 @@ async fn lower_case_fields_land_in_upper_case_columns_without_adding_any() {
     );
     let insert = bodies
         .iter()
-        .find(|b| b["statement"].as_str().is_some_and(|s| s.starts_with("INSERT")))
+        .find(|b| {
+            b["statement"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("INSERT"))
+        })
         .expect("an insert");
     let sql = insert["statement"].as_str().unwrap();
     assert!(
         sql.contains(r#"value:"ID"::string"#) && sql.contains(r#"value:"AMOUNT"::string"#),
         "{insert}"
     );
-    assert!(!sql.contains(r#""id""#) && !sql.contains(r#""amount""#), "{insert}");
+    assert!(
+        !sql.contains(r#""id""#) && !sql.contains(r#""amount""#),
+        "{insert}"
+    );
     assert!(
         insert["bindings"]["1"]["value"]
             .as_str()

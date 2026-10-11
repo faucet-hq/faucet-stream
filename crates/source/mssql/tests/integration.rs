@@ -135,7 +135,10 @@ async fn decodes_column_types_and_streams_pages() {
     assert_eq!(total, 5);
 
     // Duplicate (or two unaliased) column names are refused, not collapsed.
-    for query in ["SELECT 1 AS n, 2 AS n", "SELECT COUNT(*), MAX(n) FROM dbo.nums"] {
+    for query in [
+        "SELECT 1 AS n, 2 AS n",
+        "SELECT COUNT(*), MAX(n) FROM dbo.nums",
+    ] {
         let mut scfg = MssqlSourceConfig::new(cfg.connection_url.clone().unwrap(), query);
         scfg.connection.tls = cfg.tls.clone();
         let err = MssqlSource::new(scfg)

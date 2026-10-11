@@ -2154,8 +2154,9 @@ async fn append_uses_a_table_a_concurrent_writer_created_meanwhile() {
         .expect("write");
     let qs = queries(&server).await;
     assert!(
-        !qs.iter().any(|q| q.contains("CREATE OR REPLACE TABLE `p.d.t` (")
-            || q.contains("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
+        !qs.iter()
+            .any(|q| q.contains("CREATE OR REPLACE TABLE `p.d.t` (")
+                || q.contains("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
         "no table DDL once the table has a schema: {qs:?}"
     );
 }

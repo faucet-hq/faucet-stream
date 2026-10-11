@@ -501,7 +501,10 @@ mod binary_encoding_tests {
             BinaryEncoding::Auto.resolve("not base64!"),
             Ok(BinaryValue::Text("not base64!"))
         );
-        assert_eq!(BinaryEncoding::Text.resolve("abcd"), Ok(BinaryValue::Text("abcd")));
+        assert_eq!(
+            BinaryEncoding::Text.resolve("abcd"),
+            Ok(BinaryValue::Text("abcd"))
+        );
         assert_eq!(
             BinaryEncoding::Base64.resolve("SGVs\nbG8=\r\n"),
             Ok(BinaryValue::Bytes(b"Hello".to_vec()))

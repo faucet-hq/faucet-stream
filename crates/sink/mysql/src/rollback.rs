@@ -464,7 +464,7 @@ impl MysqlSink {
                 Some(key),
                 crate::config::BinaryEncoding::Base64,
             )
-                .await? as u64
+            .await? as u64
         };
         sqlx::query(&journal_sql().delete_table())
             .bind(run_id)

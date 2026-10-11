@@ -541,7 +541,10 @@ mod tests {
         assert_eq!(folded[0], json!({"UserID": 1, "Kind": "x"}));
         assert_eq!(folded[1], json!({"a": 1, "zz": 2}));
         assert_eq!(folded[3], json!({"userid": 1, "UserID": 2}));
-        assert_eq!(fold_to_columns(&cols, &[json!({"A": 1})])[0], json!({"A": 1}));
+        assert_eq!(
+            fold_to_columns(&cols, &[json!({"A": 1})])[0],
+            json!({"A": 1})
+        );
         assert_eq!(unmatched_rows(&cols, &folded), vec![2]);
         assert!(unmatched_row_error(2).to_string().contains("record 2"));
     }

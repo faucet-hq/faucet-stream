@@ -1148,7 +1148,10 @@ impl Sink for MssqlSink {
                 )));
             }
             let total = self
-                .apply_plans(&faucet_core::plan_writes_ordered(records, &self.config.write))
+                .apply_plans(&faucet_core::plan_writes_ordered(
+                    records,
+                    &self.config.write,
+                ))
                 .await?;
             tracing::info!(
                 table = %self.config.table,
@@ -1226,8 +1229,11 @@ impl Sink for MssqlSink {
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
             let plan = faucet_core::plan_writes(records, &self.config.write);
-            self.apply_plans(&faucet_core::plan_writes_ordered(records, &self.config.write))
-                .await?;
+            self.apply_plans(&faucet_core::plan_writes_ordered(
+                records,
+                &self.config.write,
+            ))
+            .await?;
 
             let mut outcomes: Vec<RowOutcome> = records.iter().map(|_| Ok(())).collect();
             for (idx, msg) in &plan.failed {
@@ -1540,8 +1546,12 @@ impl Sink for MssqlSink {
                 .iter()
                 .find(|i| i.name == c.name)
                 .map(|i| i.is_nullable);
-            let sql =
-                build_alter_type_sql(&self.table_quoted, &c.name, widened_keyword(from, t), nullable)?;
+            let sql = build_alter_type_sql(
+                &self.table_quoted,
+                &c.name,
+                widened_keyword(from, t),
+                nullable,
+            )?;
             control(&mut conn, &sql).await.map_err(|e| {
                 FaucetError::Sink(format!("MSSQL ALTER COLUMN {} failed: {e}", c.name))
             })?;
@@ -1893,7 +1903,10 @@ mod tests {
             Some(false),
         )
         .unwrap();
-        assert_eq!(sql, "ALTER TABLE [t] ALTER COLUMN [v] DECIMAL(38,10) NOT NULL");
+        assert_eq!(
+            sql,
+            "ALTER TABLE [t] ALTER COLUMN [v] DECIMAL(38,10) NOT NULL"
+        );
         let sql = build_alter_type_sql("[t]", "v", "BIGINT", Some(true)).unwrap();
         assert_eq!(sql, "ALTER TABLE [t] ALTER COLUMN [v] BIGINT NULL");
     }
@@ -1939,7 +1952,12 @@ mod tests {
             mssql_type_to_json_schema("NVARCHAR", 100, true),
             json!({"type":["string","null"]})
         );
-        for (ty, len) in [("nvarchar", -1), ("varchar", -1), ("ntext", 16), ("text", 16)] {
+        for (ty, len) in [
+            ("nvarchar", -1),
+            ("varchar", -1),
+            ("ntext", 16),
+            ("text", 16),
+        ] {
             assert_eq!(
                 mssql_type_to_json_schema(ty, len, false),
                 json!({"type": "string", "x-faucet-also-accepts": ["object", "array"]}),

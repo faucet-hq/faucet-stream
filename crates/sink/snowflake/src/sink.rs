@@ -1280,7 +1280,10 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("both map to column ID"), "{err}");
         let (sql, _) = sink.build_insert(&[json!({"id": 1})]).unwrap();
-        assert!(sql.contains("(\"ID\") SELECT value:\"ID\"::string"), "{sql}");
+        assert!(
+            sql.contains("(\"ID\") SELECT value:\"ID\"::string"),
+            "{sql}"
+        );
     }
 
     #[test]

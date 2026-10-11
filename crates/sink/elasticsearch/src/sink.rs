@@ -1701,9 +1701,11 @@ mod tests {
         let bad = json!({"index": {"status": 400, "error": {"type": "mapper_parsing_exception"}}});
         let conflict = json!({"create": {"status": 409, "error": {"type": "version_conflict"}}});
         let exists = json!({"create": {"status": 409, "error": {"type": "version_conflict_engine_exception"}}});
-        assert!(item_failure(&exists).is_none(), "create on an existing _id is idempotent");
-        let index_conflict =
-            json!({"index": {"status": 409, "error": {"type": "version_conflict_engine_exception"}}});
+        assert!(
+            item_failure(&exists).is_none(),
+            "create on an existing _id is idempotent"
+        );
+        let index_conflict = json!({"index": {"status": 409, "error": {"type": "version_conflict_engine_exception"}}});
         assert!(item_failure(&index_conflict).is_some());
         assert!(item_failure(&ok).is_none());
         assert!(

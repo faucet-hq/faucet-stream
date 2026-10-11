@@ -22,8 +22,8 @@ use serde_json::Value;
 use crate::config::{OracleReplication, OracleSourceConfig};
 use crate::query::{
     CatalogRow, OwnedBind, PlannedQuery, apply_incremental, default_state_key,
-    descriptors_from_catalog, is_datetime_conversion_error, owned_binds, plan_query,
-    resolve_binds, text_binds,
+    descriptors_from_catalog, is_datetime_conversion_error, owned_binds, plan_query, resolve_binds,
+    text_binds,
 };
 
 /// Oracle Database query source.
@@ -71,7 +71,10 @@ fn run_query(job: QueryJob, mut emit: impl FnMut(Vec<Value>) -> bool) -> Result<
     let conn = checkout(&job.pool, Side::Source, job.timeout)?;
     let mut emitted = false;
     match run_query_on(&conn, &job, BookmarkBind::Typed, &mut emit, &mut emitted) {
-        Err(Failure { message, retry_as_text: true }) if !emitted => {
+        Err(Failure {
+            message,
+            retry_as_text: true,
+        }) if !emitted => {
             tracing::debug!(error = %message, "oracle: retrying with the bookmark bound as text");
             run_query_on(&conn, &job, BookmarkBind::Text, &mut emit, &mut emitted)
                 .map_err(|f| f.into_error())

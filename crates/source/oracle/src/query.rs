@@ -143,8 +143,17 @@ pub(crate) fn text_binds(binds: Vec<(String, Value)>) -> Vec<(String, OwnedBind)
 /// format (ORA-01861 "literal does not match format string" and kin).
 pub(crate) fn is_datetime_conversion_error(message: &str) -> bool {
     const CODES: &[&str] = &[
-        "ORA-01830", "ORA-01839", "ORA-01840", "ORA-01841", "ORA-01843", "ORA-01847",
-        "ORA-01850", "ORA-01851", "ORA-01858", "ORA-01861", "ORA-01862",
+        "ORA-01830",
+        "ORA-01839",
+        "ORA-01840",
+        "ORA-01841",
+        "ORA-01843",
+        "ORA-01847",
+        "ORA-01850",
+        "ORA-01851",
+        "ORA-01858",
+        "ORA-01861",
+        "ORA-01862",
     ];
     CODES.iter().any(|c| message.contains(c))
 }
@@ -316,7 +325,9 @@ mod tests {
         assert!(super::is_datetime_conversion_error(
             "ORA-01861: literal does not match format string"
         ));
-        assert!(!super::is_datetime_conversion_error("ORA-00942: table or view does not exist"));
+        assert!(!super::is_datetime_conversion_error(
+            "ORA-00942: table or view does not exist"
+        ));
         let binds = vec![(
             "BOOKMARK".to_string(),
             serde_json::json!("2024-01-02T03:04:05Z"),

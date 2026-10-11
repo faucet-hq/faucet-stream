@@ -537,21 +537,34 @@ async fn oracle_review_862_overwrite_and_drift_paths() {
         ],
     )
     .await;
-    run(&overwrite("ALWAYS_ID"), &[json!({"NAME": "a"}), json!({"NAME": "b"})]).await;
+    run(
+        &overwrite("ALWAYS_ID"),
+        &[json!({"NAME": "a"}), json!({"NAME": "b"})],
+    )
+    .await;
     assert_eq!(
-        common::query_strings(&conn, "SELECT NAME || '/' || STATUS FROM ALWAYS_ID ORDER BY NAME")
-            .await,
+        common::query_strings(
+            &conn,
+            "SELECT NAME || '/' || STATUS FROM ALWAYS_ID ORDER BY NAME"
+        )
+        .await,
         vec![Some("a/new".into()), Some("b/new".into())]
     );
     assert_eq!(
-        common::query_strings(&conn, "SELECT TO_CHAR(COUNT(*)) FROM ALWAYS_ID WHERE ID IS NULL")
-            .await,
+        common::query_strings(
+            &conn,
+            "SELECT TO_CHAR(COUNT(*)) FROM ALWAYS_ID WHERE ID IS NULL"
+        )
+        .await,
         vec![Some("0".into())],
         "the target generated every ALWAYS identity"
     );
     run(
         &overwrite("DEFAULT_ID"),
-        &[json!({"ID": 100, "NAME": "kept"}), json!({"NAME": "generated"})],
+        &[
+            json!({"ID": 100, "NAME": "kept"}),
+            json!({"NAME": "generated"}),
+        ],
     )
     .await;
     assert_eq!(
@@ -568,7 +581,11 @@ async fn oracle_review_862_overwrite_and_drift_paths() {
     );
 
     // Offset timestamps land as UTC wall time in DATE / TIMESTAMP columns.
-    common::exec(&conn, &["CREATE TABLE TS_T (ID NUMBER, D DATE, T TIMESTAMP)"]).await;
+    common::exec(
+        &conn,
+        &["CREATE TABLE TS_T (ID NUMBER, D DATE, T TIMESTAMP)"],
+    )
+    .await;
     OracleSink::new(OracleSinkConfig::new(conn.clone(), "TS_T"))
         .await
         .unwrap()

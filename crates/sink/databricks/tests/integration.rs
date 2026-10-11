@@ -110,7 +110,10 @@ async fn unknown_columns_and_missing_table_are_typed_errors() {
     assert!(err.contains("extra") && err.contains("on_drift"), "{err}");
 
     let wh = Warehouse::start().await;
-    wh.on(DESCRIBE, columns(&[("id", "bigint"), ("payload", "struct<a:int>")]));
+    wh.on(
+        DESCRIBE,
+        columns(&[("id", "bigint"), ("payload", "struct<a:int>")]),
+    );
     let s = sink(&wh, |_| {});
     let err = s
         .write_batch(&[json!({"id": 1, "payload": {"a": 1, "b": 2}})])

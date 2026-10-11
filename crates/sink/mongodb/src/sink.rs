@@ -482,13 +482,12 @@ impl MongoSink {
                             .map(|we| (we.index, we.message.clone()))
                             .collect()
                     }
-                    mongodb::error::ErrorKind::InsertMany(ime) if ime.write_errors.is_some() => {
-                        ime.write_errors
-                            .iter()
-                            .flatten()
-                            .map(|we| (we.index, we.message.clone()))
-                            .collect()
-                    }
+                    mongodb::error::ErrorKind::InsertMany(ime) if ime.write_errors.is_some() => ime
+                        .write_errors
+                        .iter()
+                        .flatten()
+                        .map(|we| (we.index, we.message.clone()))
+                        .collect(),
                     _ if !inserted_any => {
                         return Err(FaucetError::Sink(format!(
                             "MongoDB insert_many failed: {e}"

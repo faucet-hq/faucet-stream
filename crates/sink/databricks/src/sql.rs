@@ -1296,10 +1296,15 @@ mod tests {
         assert_eq!(parse_nested_type("bigint"), Some(Scalar));
         assert_eq!(parse_nested_type("decimal(10,2)"), Some(Scalar));
         assert_eq!(
-            parse_nested_type("STRUCT<a: INT NOT NULL COMMENT 'x, y>', `b c`: ARRAY<STRUCT<x:STRING>>>"),
+            parse_nested_type(
+                "STRUCT<a: INT NOT NULL COMMENT 'x, y>', `b c`: ARRAY<STRUCT<x:STRING>>>"
+            ),
             Some(Struct(vec![
                 ("a".into(), Scalar),
-                ("b c".into(), Array(Box::new(Struct(vec![("x".into(), Scalar)])))),
+                (
+                    "b c".into(),
+                    Array(Box::new(Struct(vec![("x".into(), Scalar)])))
+                ),
             ]))
         );
         assert_eq!(
@@ -1309,7 +1314,10 @@ mod tests {
         assert_eq!(parse_nested_type("struct<>"), Some(Struct(vec![])));
         assert_eq!(parse_nested_type("struct<a:int"), None);
         assert_eq!(parse_nested_type("array<int> trailing"), None);
-        assert_eq!(parse_nested_type("struct<`a``b`:int>"), Some(Struct(vec![("a`b".into(), Scalar)])));
+        assert_eq!(
+            parse_nested_type("struct<`a``b`:int>"),
+            Some(Struct(vec![("a`b".into(), Scalar)]))
+        );
         assert_eq!(parse_nested_type(""), None);
     }
 
@@ -1317,7 +1325,10 @@ mod tests {
     fn unknown_nested_keys_are_reported_not_dropped() {
         let table = vec![
             TableColumn::new("id", "bigint"),
-            TableColumn::new("meta", "struct<a:int,tags:array<struct<k:string>>,m:map<string,struct<v:int>>>"),
+            TableColumn::new(
+                "meta",
+                "struct<a:int,tags:array<struct<k:string>>,m:map<string,struct<v:int>>>",
+            ),
         ];
         let err = build_matrix(
             &[json!({
@@ -1329,9 +1340,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("meta.b, meta.m{}.w, meta.tags[].z"), "{err}");
-        assert!(
-            build_matrix(&[json!({"id": 1, "meta": {"a": 1, "tags": null}})], &table).is_ok()
-        );
+        assert!(build_matrix(&[json!({"id": 1, "meta": {"a": 1, "tags": null}})], &table).is_ok());
     }
 
     #[test]

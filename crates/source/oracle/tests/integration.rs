@@ -144,7 +144,10 @@ async fn oracle_query_source_end_to_end() {
     };
     let source = OracleSource::new(iso).await.expect("source");
     let (rows, bm) = source.fetch_all_incremental().await.expect("text cursor");
-    assert_eq!(rows, vec![json!({"ID": 2, "STAMP": "2024-02-01T00:00:00Z"})]);
+    assert_eq!(
+        rows,
+        vec![json!({"ID": 2, "STAMP": "2024-02-01T00:00:00Z"})]
+    );
     assert_eq!(bm, Some(json!("2024-02-01T00:00:00Z")));
 
     // PK-range sharding covers every row exactly once.
