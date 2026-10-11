@@ -108,6 +108,28 @@ async fn run_ships_every_line_with_its_attributes_over_grpc() {
     assert_eq!(view.status, LogExportStatus::Exported);
 }
 
+/// #862 M-100: a run that stops with an error still closes and ships its log.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_run_that_fails_early_still_ends_and_ships_its_log() {
+    install_subscriber();
+    let (col, ep) = start_grpc().await;
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("spool");
+    let cfg = write_config(dir.path(), &ep, "grpc", &spool, "");
+    faucet(&["run", cfg.to_str().unwrap(), "--select", "no-such-row"])
+        .await
+        .expect_err("an unknown row stops the run");
+    let sp = Spool::open(&spool).unwrap();
+    let runs = sp.run_ids();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let meta = sp.read_meta(&runs[0]).unwrap();
+    assert!(meta.ended_at.is_some(), "the run was closed");
+    let view = faucet_cli::logship::spool::run_view(&sp, &runs[0]).unwrap();
+    assert_eq!(view.status, LogExportStatus::Exported);
+    assert_eq!(col.records().len() as u64, meta.last_seq);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn collector_down_then_logs_ship_delivers_each_line_once_over_http() {

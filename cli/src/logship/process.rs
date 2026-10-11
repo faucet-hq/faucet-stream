@@ -102,17 +102,18 @@ impl RunLogs {
 
     /// Close the run, ship what is pending within `flush_timeout_secs`, stop
     /// the shipper, and report the run's export status. `None` when shipping
-    /// is off.
-    pub async fn finish(self) -> Option<LogExportView> {
+    /// is off, or already finished.
+    pub async fn finish(&mut self) -> Option<LogExportView> {
         #[cfg(feature = "otel")]
         {
-            let (session, run_id) = self.session?;
+            let (session, run_id) = self.session.take()?;
             let view = session.finish_run(&run_id).await;
             session.shutdown().await;
             Some(view)
         }
         #[cfg(not(feature = "otel"))]
         {
+            let _ = self;
             None
         }
     }

@@ -260,7 +260,8 @@ pub(crate) async fn execute(
 
     // Run-log shipping (#806): every line this process logs is spooled
     // locally first and shipped over OTLP; flushed (bounded) before exit.
-    let run_logs = crate::logship::process::RunLogs::start(&cfg, &pipeline_name);
+    let mut run_logs = crate::logship::process::RunLogs::start(&cfg, &pipeline_name);
+    let result: CliResult<()> = async {
 
     // Topology mode (#71/#72): an explicit `pipeline.nodes` graph replaces the
     // matrix entirely. Run it directly and report through the same summary
@@ -650,6 +651,14 @@ pub(crate) async fn execute(
         Ok(())
     };
     stop.finish(outcome)
+    }
+    .await;
+    // A run that stopped early still flushes and ships its final lines,
+    // the ones that say why it stopped.
+    if result.is_err() {
+        run_logs.finish().await;
+    }
+    result
 }
 
 /// Whether this run may stand as the config's last successful run for
