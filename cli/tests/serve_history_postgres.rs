@@ -259,6 +259,7 @@ async fn postgres_template_test_results_and_launch_notes() {
     let base = TemplateTestResult::new(&id, 1, "sha".into(), Default::default(), None);
     for i in 0..(RESULTS_RETAIN + 2) {
         let mut r = base.clone();
+        r.result_id = format!("{}-{i}", base.result_id);
         r.recorded_at = base.recorded_at + chrono::Duration::seconds(i as i64);
         h.template_record_test(&r).await.unwrap();
     }
