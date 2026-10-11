@@ -237,8 +237,17 @@ impl russh::client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::PublicKey,
+        server_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        let server_public_key = match server_key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            russh::keys::PublicKeyOrCertificate::Certificate(_) => {
+                return Err(HandlerError::HostKey(format!(
+                    "{}:{} presented a host certificate; host certificates are not supported",
+                    self.host, self.port
+                )));
+            }
+        };
         match &self.policy {
             HostKeyPolicy::Insecure => {
                 tracing::warn!(
@@ -989,21 +998,38 @@ mod tests {
             port: 22,
         };
         let err = handler("sftp.example")
-            .check_server_key(&key(ED25519_A))
+            .check_server_key(&key(ED25519_A).into())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("@revoked"), "{err}");
         assert!(
             handler("a.wild")
-                .check_server_key(&key(ED25519_B))
+                .check_server_key(&key(ED25519_B).into())
                 .await
                 .unwrap()
         );
         let err = handler("ca.host")
-            .check_server_key(&key(ED25519_A))
+            .check_server_key(&key(ED25519_A).into())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cert-authority"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_host_certificate_is_refused_even_under_the_insecure_policy() {
+        use russh::client::Handler as _;
+        let cert = russh::keys::Certificate::from_openssh("ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIPPHg8GFbDtPpUu2SCXhgTm/VGQz8sHi9G5P/PxHP8IrAAAAIBBZHy7KX9Js/UVJnZI6Qq/2LZYr3QmsTnIgymh23IoZAAAAAAAAAAAAAAACAAAAC2ZhdWNldC10ZXN0AAAAEAAAAAxzZnRwLmV4YW1wbGUAAAAAAAAAAP//////////AAAAAAAAAAAAAAAAAAAAMwAAAAtzc2gtZWQyNTUxOQAAACDhCJxYDNpmpUchKQ9llIrqqP/aedWCKvssa3Yf/7rhJAAAAFMAAAALc3NoLWVkMjU1MTkAAABAO3iEpOQePt/XhpKxtojofp5jkeHS86KUN3YMBJ7tI066KJ7ylkthqVXez6Q7zp2mjBxqHQHPwz1uX4neP9kYBg==").unwrap();
+        let mut handler = ClientHandler {
+            policy: HostKeyPolicy::Insecure,
+            host: "sftp.example".into(),
+            port: 22,
+        };
+        let err = handler.check_server_key(&cert.into()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("host certificates are not supported"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
