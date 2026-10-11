@@ -21,7 +21,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 tracing.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 # Arrow columnar Storage Read API path (#380, `arrow` feature). The gcloud-*
 # stack (gRPC via tonic 0.14) is a separate family from the REST
