@@ -253,6 +253,11 @@ envelope is removed from the file itself (an atomic rewrite), with no archive.
 Run it while nothing writes the DLQ; a file that changes during the rewrite is
 refused rather than losing the new lines.
 
+A `file` DLQ that rolls over writes numbered parts. Its configured path reads
+every part — `failed-{part}.jsonl`, or `failed.jsonl` with
+`max_records_per_file` / `max_bytes_per_file` (written as `failed-00001.jsonl`,
+…) — in `inspect`, `replay`, `discard` and `faucet status`.
+
 ## Encryption at rest
 
 DLQ envelopes carry failed records **verbatim** — on a shared or
