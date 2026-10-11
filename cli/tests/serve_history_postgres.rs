@@ -1,11 +1,10 @@
 //! Postgres run-history backend integration test (Phase 5, #127).
 //!
-//! Requires a reachable Postgres: set `FAUCET_TEST_POSTGRES_URL` to a
-//! `postgres://…` URL (e.g. `docker run -e POSTGRES_PASSWORD=pw -p 5432:5432
-//! postgres:16`). The test **skips** (with a printed notice) when the variable
-//! is unset, so CI stays green without a database. It exercises the Postgres
-//! dialect of the shared `history::sql` machinery (`$n` placeholders + `::text`
-//! casts) that the SQLite tests cannot cover.
+//! Runs against `FAUCET_TEST_POSTGRES_URL` when set, otherwise against a
+//! Postgres test container. Without Docker it skips locally and fails where
+//! `FAUCET_REQUIRE_BACKENDS` is set (CI). It exercises the Postgres dialect of
+//! the shared `history::sql` machinery (`$n` placeholders + `::text` casts)
+//! that the SQLite tests cannot cover.
 #![cfg(feature = "serve-history-postgres")]
 
 use chrono::Utc;
@@ -15,6 +14,25 @@ use faucet_cli::serve::history::{
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
+use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres;
+
+/// `FAUCET_TEST_POSTGRES_URL` when set, else a fresh test container.
+async fn postgres() -> Option<(Option<ContainerAsync<Postgres>>, String)> {
+    if let Ok(url) = std::env::var("FAUCET_TEST_POSTGRES_URL") {
+        return Some((None, url));
+    }
+    let pg = faucet_conformance::containers::start_or_skip(
+        || Postgres::default().with_tag("16-alpine"),
+        &Default::default(),
+    )
+    .await?;
+    let port = pg.get_host_port_ipv4(5432).await.expect("postgres port");
+    Some((
+        Some(pg),
+        format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"),
+    ))
+}
 
 fn rec(id: &str, status: RunStatus) -> RunRecord {
     let now = Utc::now();
@@ -34,11 +52,7 @@ fn rec(id: &str, status: RunStatus) -> RunRecord {
 
 #[tokio::test]
 async fn postgres_backend_full_lifecycle() {
-    let Ok(url) = std::env::var("FAUCET_TEST_POSTGRES_URL") else {
-        eprintln!(
-            "SKIP postgres_backend_full_lifecycle: set FAUCET_TEST_POSTGRES_URL to a \
-             reachable postgres:// URL to run this test"
-        );
+    let Some((_pg, url)) = postgres().await else {
         return;
     };
 
@@ -160,8 +174,7 @@ async fn postgres_backend_full_lifecycle() {
 async fn postgres_version_deprecation_round_trips() {
     use faucet_cli::serve::history::templates::{DeprecationRecord, TemplateDraft, TemplateId};
     use faucet_cli::serve::load::ConfigFormat;
-    let Ok(url) = std::env::var("FAUCET_TEST_POSTGRES_URL") else {
-        eprintln!("SKIP postgres_version_deprecation_round_trips: FAUCET_TEST_POSTGRES_URL unset");
+    let Some((_pg, url)) = postgres().await else {
         return;
     };
     let h = PostgresHistory::connect(
@@ -219,10 +232,7 @@ async fn postgres_template_test_results_and_launch_notes() {
         RESULTS_RETAIN, TemplateDraft, TemplateId, TemplateTestResult,
     };
     use faucet_cli::serve::load::ConfigFormat;
-    let Ok(url) = std::env::var("FAUCET_TEST_POSTGRES_URL") else {
-        eprintln!(
-            "SKIP postgres_template_test_results_and_launch_notes: FAUCET_TEST_POSTGRES_URL unset"
-        );
+    let Some((_pg, url)) = postgres().await else {
         return;
     };
     let h = PostgresHistory::connect(
@@ -249,6 +259,7 @@ async fn postgres_template_test_results_and_launch_notes() {
     let base = TemplateTestResult::new(&id, 1, "sha".into(), Default::default(), None);
     for i in 0..(RESULTS_RETAIN + 2) {
         let mut r = base.clone();
+        r.result_id = format!("{}-{i}", base.result_id);
         r.recorded_at = base.recorded_at + chrono::Duration::seconds(i as i64);
         h.template_record_test(&r).await.unwrap();
     }

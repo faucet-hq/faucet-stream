@@ -40,7 +40,10 @@ A malformed requirement is a config error at validate time. Hub source and
 sink templates and deployment overlays accept the same key: `faucet run
 --source X --sink Y` refuses a template whose requirement the binary does not
 meet, and so does a server triggering a registered template another (newer)
-instance registered.
+instance registered. Browsing a catalog does not stop at such a template:
+`faucet hub list` and `faucet hub matrix` skip it with a warning (`hub list`
+names it under "not usable by this faucet"), while `faucet hub lint` refuses
+it, since a catalog is linted by the binary it ships for.
 
 Matching follows Cargo's rules, with one addition for pre-release binaries: a
 pre-release counts as the newest release before it. `1.15.0-rc.1` satisfies

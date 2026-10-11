@@ -170,7 +170,8 @@ pub struct ConnectProviders {
 
 impl ConnectProviders {
     /// Load and validate a `--connect-providers` file. `${env:…}`,
-    /// `${file:…}` and `${secret:…}` resolve against the server.
+    /// `${file:…}` and `${secret:…}` resolve against the server; the file and
+    /// what it reads are protected from every config the server loads.
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("reading --connect-providers {}: {e}", path.display()))?;
@@ -179,6 +180,7 @@ impl ConnectProviders {
         // must stay one string instead of reshaping the YAML around it.
         let mut doc: serde_json::Value = serde_yaml::from_str(&raw)
             .map_err(|e| format!("parsing --connect-providers {}: {e}", path.display()))?;
+        crate::serve::load::protect_input(path, &doc);
         crate::interpolate::interpolate_value(&mut doc)
             .map_err(|e| format!("--connect-providers {}: {e}", path.display()))?;
         crate::interpolate::unescape_value(&mut doc);

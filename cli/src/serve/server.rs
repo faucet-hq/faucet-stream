@@ -348,6 +348,7 @@ async fn load_default_base(config: &ServeConfig) -> CliResult<Option<Value>> {
     match &config.default_config_path {
         None => Ok(None),
         Some(path) => {
+            crate::serve::load::protect_file(path);
             // `serve` has no --profile flag; honour FAUCET_PROFILE from the environment directly.
             let profile = std::env::var("FAUCET_PROFILE").ok();
             let cfg =
@@ -686,6 +687,13 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         "faucet serve instance id"
     );
 
+    if let crate::serve::config::HistoryBackendSpec::Sqlite(url) = &config.history {
+        crate::serve::load::protect_sqlite_url(url);
+    }
+    #[cfg(feature = "catalog")]
+    if let Some(key) = crate::catalog::snapshot::key_file_path() {
+        crate::serve::load::protect_file(&key);
+    }
     let history = crate::serve::history::connect(
         &config.history,
         config.idempotency_retention,

@@ -164,7 +164,7 @@ async fn run_version_traced(
         )));
     }
     if bundle.is_structural(rec.kind) {
-        bundle.suite = structural_suite();
+        bundle.suite = crate::template_tests::bundle::structural_suite();
     }
     let (outcome, companions) = match prepare(store, &rec, &bundle).await {
         Ok((companions, shared)) => {
@@ -185,13 +185,6 @@ async fn run_version_traced(
         ),
     };
     Ok(Some((rec, outcome, companions)))
-}
-
-/// The case a deployment's structural bundle runs: compose with its source
-/// and sink and check the result validates and expands.
-fn structural_suite() -> crate::template_tests::spec::Suite {
-    serde_json::from_value(serde_json::json!({ "auto": { "defaults_baseline": true } }))
-        .expect("a valid constant suite")
 }
 
 /// The resolved companions of a registered subject.

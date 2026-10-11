@@ -370,6 +370,23 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     assert_eq!(code, 403, "{r}");
     assert!(r.to_string().contains("allow_untested"), "{r}");
 
+    // A tenant's callback stays off the server's own host and network (#862 M-002).
+    for url in [
+        "http://127.0.0.1:9/x",
+        "http://10.0.0.5/x",
+        "http://[::1]/x",
+    ] {
+        let (code, r) = api
+            .post(
+                "op-tok",
+                &format!("/v1/tenants/acme/templates/{id}/runs"),
+                json!({"callback": {"url": url, "method": "DELETE"}}),
+            )
+            .await;
+        assert_eq!(code, 422, "{url}: {r}");
+        assert!(r.to_string().contains("loopback / private"), "{r}");
+    }
+
     // ── Fan-out across every tenant ────────────────────────────────────────
     let (code, fan) = api
         .post(

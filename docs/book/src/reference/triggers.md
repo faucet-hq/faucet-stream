@@ -242,7 +242,12 @@ a rising crossing disarms it and takes the next ordinal, a drain below the
 threshold re-arms it. So a restart never reuses an ordinal (the next crossing
 always gets a new key) and, on a shared SQL history, exactly one instance fires
 each crossing. A fire that is dropped or fails gives its ordinal back so the
-next poll retries the same crossing. With the in-memory history the edge is
+next poll retries the same crossing. A crossing whose fire was never confirmed
+— the process stopped between disarming the edge and firing, or giving the
+ordinal back failed — is fired again under the same ordinal while the depth
+stays above the threshold; the stable key makes a fire that did start a run a
+replay. After the idempotency window has passed, that re-fire starts a second
+run for the crossing. With the in-memory history the edge is
 per-process, like the idempotency claims it pairs with.
 
 ### `schedule`

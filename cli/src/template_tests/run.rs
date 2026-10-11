@@ -100,6 +100,27 @@ pub async fn run_bundle(
         run_fixtures(&bundle.fixtures, target, filter, "").await,
         "bundle",
     );
+    // Inline-pipeline fixtures never touch the template, so a bundle made only
+    // of them still checks that the template itself loads.
+    let exercised = bundle.exercises_template()
+        || shared.iter().any(|s| {
+            !s.suite.suite.is_empty() || s.suite.fixtures.iter().any(|f| f.pipeline.is_none())
+        });
+    let nothing_to_run = bundle.fixtures.is_empty() && shared.is_empty();
+    if !exercised && !nothing_to_run {
+        match run_suite(
+            &super::bundle::structural_suite(),
+            target,
+            filter,
+            None,
+            "implicit:",
+        )
+        .await
+        {
+            Ok(part) => collect(&mut out, part, "implicit"),
+            Err(e) => errors.push(format!("implicit structural case: {e}")),
+        }
+    }
     for s in shared {
         let source = s.source();
         let prefix = format!("{}@{}:", s.suite.id(), s.suite.release);
@@ -247,6 +268,45 @@ fixtures:
         assert!(names.contains(&"conf@1.0.0:rows"), "{names:?}");
         assert!(out.cases.iter().any(|c| c.source == "suite:conf@1.0.0"));
         assert_eq!(out.suites[0].version, Some(7));
+    }
+
+    /// #862 M-029: a bundle of inline-pipeline fixtures still checks that the
+    /// template materializes, expands and compiles.
+    #[tokio::test]
+    async fn inline_only_fixtures_add_an_implicit_structural_case() {
+        let bundle: TestBundle = serde_yaml::from_str(
+            r#"
+fixtures:
+  - name: inline
+    pipeline: { transforms: [] }
+    input: [{ "id": 1 }]
+    expect: { records_written: 1 }
+"#,
+        )
+        .unwrap();
+        let out = run_bundle(&bundle, &doc_target(), &[], None).await;
+        assert!(out.passed(), "{out:#?}");
+        let names: Vec<&str> = out.cases.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"implicit:auto:defaults"), "{names:?}");
+        assert!(out.cases.iter().any(|c| c.source == "implicit"));
+
+        let broken = Target::Document {
+            body: pipeline_doc().replace("type: set", "type: no-such-transform"),
+            sink_body: None,
+            overlay: None,
+        };
+        let out = run_bundle(&bundle, &broken, &[], None).await;
+        assert!(
+            !out.passed(),
+            "a template that does not load fails: {out:#?}"
+        );
+
+        let through: TestBundle = serde_yaml::from_str(
+            "fixtures:\n  - name: t\n    input: [{ \"id\": 1 }]\n    expect: { records_written: 1 }\n",
+        )
+        .unwrap();
+        let out = run_bundle(&through, &doc_target(), &[], None).await;
+        assert!(out.cases.iter().all(|c| c.source != "implicit"), "{out:#?}");
     }
 
     #[tokio::test]

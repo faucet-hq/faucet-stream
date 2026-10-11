@@ -684,6 +684,7 @@ pub struct Stmts {
     pub trigger_edge_rise: String,
     pub trigger_edge_rearm: String,
     pub trigger_edge_retract: String,
+    pub trigger_edge_current: String,
     /// List run IDs owned by this instance that have a pending cancellation request.
     pub pending_cancellations: String,
     /// Upsert this instance's membership heartbeat into `faucet_serve_instances`.
@@ -713,6 +714,8 @@ pub struct Stmts {
     pub reclaim_shard_fail: String,
     /// Owner-fenced terminal write for one shard.
     pub finalize_shard: String,
+    /// Owner-fenced hand-back of a running shard to `pending` (shutdown).
+    pub release_shard: String,
     /// Status counts for a run's shards.
     pub shard_progress: String,
     /// Distinct run_ids for which THIS instance owns a `running` shard whose
@@ -1260,6 +1263,9 @@ impl Stmts {
                 SET ordinal = CAST(CAST(ordinal AS BIGINT) - 1 AS TEXT), armed = '1' \
                 WHERE trigger_name = $1 AND ordinal = $2 AND armed = '0'"
                 .into(),
+            trigger_edge_current: "SELECT ordinal FROM faucet_serve_trigger_edges \
+                WHERE trigger_name = $1 AND armed = '0'"
+                .into(),
             cancel_requeued_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = $1 \
                 WHERE status = 'pending' AND run_id IN \
@@ -1321,6 +1327,10 @@ impl Stmts {
             finalize_shard: "UPDATE faucet_serve_shards \
                 SET status = $1, finished_at = $2 \
                 WHERE run_id = $3 AND shard_id = $4 AND owner = $5 AND status = 'running'"
+                .into(),
+            release_shard: "UPDATE faucet_serve_shards \
+                SET status = 'pending', owner = NULL, lease_expires_at = NULL \
+                WHERE run_id = $1 AND shard_id = $2 AND owner = $3 AND status = 'running'"
                 .into(),
             shard_progress: "SELECT status, COUNT(*) AS n FROM faucet_serve_shards \
                 WHERE run_id = $1 GROUP BY status"
@@ -1783,6 +1793,9 @@ impl Stmts {
                 SET ordinal = CAST(CAST(ordinal AS INTEGER) - 1 AS TEXT), armed = '1' \
                 WHERE trigger_name = ? AND ordinal = ? AND armed = '0'"
                 .into(),
+            trigger_edge_current: "SELECT ordinal FROM faucet_serve_trigger_edges \
+                WHERE trigger_name = ? AND armed = '0'"
+                .into(),
             cancel_requeued_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = ? \
                 WHERE status = 'pending' AND run_id IN \
@@ -1843,6 +1856,10 @@ impl Stmts {
                 .into(),
             finalize_shard: "UPDATE faucet_serve_shards \
                 SET status = ?, finished_at = ? \
+                WHERE run_id = ? AND shard_id = ? AND owner = ? AND status = 'running'"
+                .into(),
+            release_shard: "UPDATE faucet_serve_shards \
+                SET status = 'pending', owner = NULL, lease_expires_at = NULL \
                 WHERE run_id = ? AND shard_id = ? AND owner = ? AND status = 'running'"
                 .into(),
             shard_progress: "SELECT status, COUNT(*) AS n FROM faucet_serve_shards \
@@ -3508,6 +3525,22 @@ macro_rules! impl_sql_history {
                 Ok(n == 1)
             }
 
+            async fn release_shard(
+                &self,
+                run_id: &str,
+                shard_id: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                let n = sqlx::query(&self.stmts.release_shard)
+                    .bind(run_id)
+                    .bind(shard_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?
+                    .rows_affected();
+                Ok(n == 1)
+            }
+
             async fn shard_progress(
                 &self,
                 run_id: &str,
@@ -3593,6 +3626,24 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
                 Ok(())
+            }
+
+            async fn trigger_edge_current(
+                &self,
+                trigger: &str,
+            ) -> Result<Option<u64>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.trigger_edge_current)
+                    .bind(trigger)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let ordinal: String = row.try_get("ordinal").map_err(backend)?;
+                $crate::serve::history::sql::parse_edge_ordinal(&ordinal).map(Some)
             }
 
             async fn trigger_edge_retract(

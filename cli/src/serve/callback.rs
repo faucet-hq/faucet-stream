@@ -28,9 +28,11 @@
 //! [`CallbackSpec::validate`] restricts the scheme to http/https and refuses
 //! link-local / cloud-metadata targets, which is the concrete SSRF risk called
 //! out in the serve cookbook. `--callback-allow-host` narrows it further to an
-//! explicit allowlist. Note the broader posture is unchanged: a caller who can
-//! submit a run can already point a `rest` source anywhere, so this guard closes
-//! the metadata hole rather than pretending to be a general egress control.
+//! explicit allowlist. A caller who can submit a run can already point a `rest`
+//! source anywhere, so for them this guard closes the metadata hole rather than
+//! pretending to be a general egress control. A tenant-scoped principal cannot
+//! submit a config, so its callbacks are also kept off the server's own host
+//! and network (loopback, private, unique-local).
 
 use crate::serve::history::{RunRecord, RunStatus};
 use schemars::JsonSchema;
@@ -104,6 +106,14 @@ impl CallbackSpec {
     /// `422` on the submission rather than a silent no-op an hour later when the
     /// run finishes.
     pub fn validate(&self, allow_hosts: &[String]) -> Result<(), String> {
+        self.validate_for(allow_hosts, false)
+    }
+
+    /// [`CallbackSpec::validate`] for a submitter that may not reach the
+    /// server's own network: `restricted` (a tenant-scoped principal) also
+    /// refuses loopback, private, unique-local and unspecified addresses
+    /// unless the host is allowlisted.
+    pub fn validate_for(&self, allow_hosts: &[String], restricted: bool) -> Result<(), String> {
         if self.url.trim().is_empty() {
             return Err("callback.url must be non-empty".into());
         }
@@ -165,6 +175,13 @@ impl CallbackSpec {
                  this is genuinely intended"
             ));
         }
+        if restricted && is_internal(host) {
+            return Err(format!(
+                "callback.url host `{host}` is a loopback / private address, which a \
+                 tenant's callback may not reach. Add it to --callback-allow-host if this \
+                 is genuinely intended"
+            ));
+        }
         Ok(())
     }
 
@@ -206,17 +223,66 @@ fn allowlisted(host: &str) -> bool {
         .is_some_and(|hosts| hosts.iter().any(|h| h == host))
 }
 
+/// Cloud instance-metadata addresses outside the link-local ranges: AWS's
+/// IPv6 IMDS endpoint and Alibaba Cloud's.
+const METADATA_IPS: &[std::net::IpAddr] = &[
+    std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)),
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 100, 100, 200)),
+];
+
 /// Whether an address is link-local (IPv4 `169.254.0.0/16`, IPv6
-/// `fe80::/10`) — the range cloud instance-metadata services live on —
-/// including an IPv4-mapped IPv6 form of one.
+/// `fe80::/10`) — the range cloud instance-metadata services live on — or
+/// another known metadata address, including an IPv4-mapped IPv6 form.
 fn is_link_local_ip(ip: std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    };
+    if METADATA_IPS.contains(&ip) {
+        return true;
+    }
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.is_link_local(),
-            // `Ipv6Addr::is_unicast_link_local` is unstable; check fe80::/10.
-            None => (v6.segments()[0] & 0xffc0) == 0xfe80,
-        },
+        // `Ipv6Addr::is_unicast_link_local` is unstable; check fe80::/10.
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Whether an address belongs to the server's own host or network: loopback,
+/// private (RFC 1918), shared (100.64/10), unique-local (fc00::/7) or
+/// unspecified — or link-local / metadata.
+fn is_internal_ip(ip: std::net::IpAddr) -> bool {
+    if is_link_local_ip(ip) {
+        return true;
+    }
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Whether `host` names the server's own host or network.
+fn is_internal(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => is_internal_ip(ip),
+        Err(_) => {
+            is_link_local(host)
+                || bare.eq_ignore_ascii_case("localhost")
+                || bare.to_ascii_lowercase().ends_with(".localhost")
+        }
     }
 }
 
@@ -280,7 +346,7 @@ pub async fn fire(rec: &RunRecord) {
         return;
     }
     let body = payload(rec, spec);
-    match deliver(spec, &body).await {
+    match deliver(spec, &body, rec.tenant.is_some()).await {
         Ok(()) => tracing::debug!(run_id = %rec.run_id, "callback delivered"),
         Err(e) => tracing::warn!(
             run_id = %rec.run_id,
@@ -297,7 +363,13 @@ pub async fn fire(rec: &RunRecord) {
 /// (#789 SERVE-41): a DNS name or a redirector can point anywhere, so the
 /// submit-time check of the host text is not enough. Returns the addresses
 /// to pin the connection to, so a second lookup cannot answer differently.
-async fn checked_addrs(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, String> {
+///
+/// `restricted` (a tenant's run) also refuses the server's own host and
+/// network, see [`CallbackSpec::validate_for`].
+async fn checked_addrs(
+    url: &reqwest::Url,
+    restricted: bool,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     let host = url.host_str().ok_or("callback.url has no host")?;
     let port = url.port_or_known_default().unwrap_or(443);
     if allowlisted(host) {
@@ -305,6 +377,11 @@ async fn checked_addrs(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, 
     }
     if is_link_local(host) {
         return Err(format!("callback host `{host}` is link-local; refused"));
+    }
+    if restricted && is_internal(host) {
+        return Err(format!(
+            "callback host `{host}` is a loopback / private address; refused"
+        ));
     }
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if bare.parse::<std::net::IpAddr>().is_ok() {
@@ -320,14 +397,20 @@ async fn checked_addrs(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, 
             bad.ip()
         ));
     }
+    if restricted && let Some(bad) = addrs.iter().find(|a| is_internal_ip(a.ip())) {
+        return Err(format!(
+            "callback host `{host}` resolves to the loopback / private address {}; refused",
+            bad.ip()
+        ));
+    }
     Ok(addrs)
 }
 
 /// One bounded, retried delivery attempt sequence.
-async fn deliver(spec: &CallbackSpec, body: &Value) -> Result<(), String> {
+async fn deliver(spec: &CallbackSpec, body: &Value, restricted: bool) -> Result<(), String> {
     let url =
         reqwest::Url::parse(&spec.url).map_err(|e| format!("callback.url is not valid: {e}"))?;
-    let pinned = checked_addrs(&url).await?;
+    let pinned = checked_addrs(&url, restricted).await?;
     let mut builder = reqwest::Client::builder()
         .timeout(ATTEMPT_TIMEOUT)
         // A redirect would leave the checked host.
@@ -403,23 +486,86 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_resolves_and_checks_every_address() {
-        let ok = checked_addrs(&reqwest::Url::parse("http://localhost:9/x").unwrap())
+        let ok = checked_addrs(&reqwest::Url::parse("http://localhost:9/x").unwrap(), false)
             .await
             .unwrap();
         assert!(!ok.is_empty());
         assert!(ok.iter().all(|a| a.port() == 9));
-        let literal = checked_addrs(&reqwest::Url::parse("http://127.0.0.1:9/").unwrap())
+        let literal = checked_addrs(&reqwest::Url::parse("http://127.0.0.1:9/").unwrap(), false)
             .await
             .unwrap();
         assert!(literal.is_empty(), "an IP literal needs no pinning");
-        let err = checked_addrs(&reqwest::Url::parse("http://169.254.169.254/").unwrap())
-            .await
-            .unwrap_err();
+        let err = checked_addrs(
+            &reqwest::Url::parse("http://169.254.169.254/").unwrap(),
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("link-local"), "{err}");
-        let err = checked_addrs(&reqwest::Url::parse("http://no-such-host.invalid/").unwrap())
-            .await
-            .unwrap_err();
+        let err = checked_addrs(
+            &reqwest::Url::parse("http://no-such-host.invalid/").unwrap(),
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("resolving"), "{err}");
+    }
+
+    #[test]
+    fn non_link_local_metadata_addresses_are_refused() {
+        for u in [
+            "http://[fd00:ec2::254]/latest/api/token",
+            "http://[::ffff:100.100.100.200]/x",
+            "http://100.100.100.200/latest/meta-data/",
+        ] {
+            let err = spec(u).validate(&[]).expect_err(u);
+            assert!(err.contains("link-local"), "{err}");
+        }
+        assert!(spec("http://[fd00:ec2::253]/x").validate(&[]).is_ok());
+    }
+
+    #[test]
+    fn a_tenant_callback_may_not_reach_the_servers_network() {
+        for u in [
+            "http://127.0.0.1:8080/v1/templates/crm",
+            "http://localhost/x",
+            "http://api.localhost/x",
+            "http://0.0.0.0/x",
+            "http://10.1.2.3/x",
+            "http://172.16.0.1/x",
+            "http://192.168.1.1/x",
+            "http://100.64.0.1/x",
+            "http://[::1]/x",
+            "http://[::]/x",
+            "http://[fd12::1]/x",
+            "http://[::ffff:10.0.0.1]/x",
+        ] {
+            let err = spec(u).validate_for(&[], true).expect_err(u);
+            assert!(err.contains("loopback / private"), "{u}: {err}");
+            assert!(
+                spec(u).validate(&[]).is_ok(),
+                "{u} stays allowed for operators"
+            );
+        }
+        assert!(
+            spec("https://caller.example/hook")
+                .validate_for(&[], true)
+                .is_ok()
+        );
+        assert!(spec("http://8.8.8.8/x").validate_for(&[], true).is_ok());
+        let allow = vec!["10.1.2.3".to_string()];
+        assert!(spec("http://10.1.2.3/x").validate_for(&allow, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_tenant_delivery_refuses_names_resolving_to_the_servers_network() {
+        let url = reqwest::Url::parse("http://localhost:9/x").unwrap();
+        let err = checked_addrs(&url, true).await.unwrap_err();
+        assert!(err.contains("loopback / private"), "{err}");
+        let url = reqwest::Url::parse("http://127.0.0.1:9/x").unwrap();
+        assert!(checked_addrs(&url, true).await.is_err());
+        let rec_url = reqwest::Url::parse("http://[fd00:ec2::254]/x").unwrap();
+        assert!(checked_addrs(&rec_url, false).await.is_err());
     }
 
     #[test]

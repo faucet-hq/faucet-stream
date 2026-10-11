@@ -14,6 +14,9 @@ pub async fn run(
     let env_path =
         crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
     crate::env_loader::load_env_file_if_present(env_path.as_deref())?;
+    if let Some(p) = &env_path {
+        crate::serve::load::protect_file(p);
+    }
 
     // Capture the MCP flags before `from_args` consumes `args`. (The `/mcp`
     // route is compiled only with the `mcp` feature; in a non-`mcp` build these

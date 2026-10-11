@@ -279,6 +279,12 @@ impl TestBundle {
     }
 
     /// Whether running it adds the implicit structural case.
+    /// Whether any case materializes the template: a suite case does, and
+    /// so does a fixture without an inline `pipeline:`.
+    pub fn exercises_template(&self) -> bool {
+        !self.suite.is_empty() || self.fixtures.iter().any(|f| f.pipeline.is_none())
+    }
+
     pub fn is_structural(&self, kind: TemplateKind) -> bool {
         kind == TemplateKind::Deployment && self.suite.is_empty() && self.fixtures.is_empty()
     }
@@ -439,6 +445,13 @@ pub fn bundle_of(doc: &Value, kind: TemplateKind) -> CliResult<Option<TestBundle
     }
     bundle.validate(kind)?;
     Ok(Some(bundle))
+}
+
+/// The implicit structural case: materialize the template with its param
+/// defaults, expand it and compile every row's transforms.
+pub fn structural_suite() -> crate::template_tests::spec::Suite {
+    serde_json::from_value(serde_json::json!({ "auto": { "defaults_baseline": true } }))
+        .expect("a valid constant suite")
 }
 
 #[cfg(test)]

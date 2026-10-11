@@ -379,6 +379,7 @@ pub async fn template_matrix(State(state): State<ServerState>) -> Result<Json<Va
         root: std::path::PathBuf::new(),
         sources,
         sinks,
+        incompatible: Vec::new(),
     };
     Ok(Json(crate::hub::catalog::index_json_with(
         &cat,
@@ -642,10 +643,24 @@ pub async fn delete_template(
                 .map_err(map_err)?,
         ),
     };
+    // Deleting a launched version drops its launch-log entries, which moves
+    // `stable`: a rollback, so it needs the launch approval when that is gated.
+    if state.requires_approval(crate::serve::changes::ChangeKind::TemplateLaunch) {
+        let launches = s
+            .template_launches(&id)
+            .await
+            .map_err(|e| ServeError::from_history("reading template launches", e))?;
+        if launches
+            .iter()
+            .any(|l| target.is_none_or(|v| v == l.version))
+        {
+            approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
+        }
+    }
     let removed = s
         .template_delete(&id, target)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(|e| ServeError::from_history("deleting template", e))?;
     if removed == 0 {
         return Err(ServeError::NotFound);
     }
@@ -925,6 +940,9 @@ pub async fn deprecate_version(
     Path((id, version)): Path<(String, String)>,
     Json(body): Json<DeprecateBody>,
 ) -> Result<Json<serde_json::Value>, ServeError> {
+    // Retiring (or reviving) a version moves `newest` for every caller that
+    // selects it, so it needs the launch approval when that is gated.
+    approval_gate(&state, &[crate::serve::changes::ChangeKind::TemplateLaunch])?;
     let s = store(&state);
     let selector = VersionSelector::parse(&version).map_err(map_err)?;
     let version = crate::templates::resolve_version(&s, &id, selector)
@@ -1966,6 +1984,64 @@ tests:
         .await
         .expect("trigger");
         assert_eq!(ok.status(), StatusCode::ACCEPTED);
+    }
+
+    /// #862 M-005: under `--require-approval template_launch`, deleting a
+    /// launched version or retiring any version (both move what an unpinned
+    /// request resolves to) needs a change request; an unlaunched version can
+    /// still be deleted.
+    #[tokio::test]
+    async fn deleting_a_launched_version_or_retiring_one_is_gated_like_a_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::serve::test_support::test_config();
+        cfg.require_approval = vec![crate::serve::changes::ChangeKind::TemplateLaunch];
+        let state = crate::serve::test_support::state_from(&cfg);
+        for _ in 0..3 {
+            register_demo_opts(&state, &dir.path().join("o.jsonl"), false).await;
+        }
+        let s = store(&state);
+        for v in [1, 2] {
+            crate::templates::launch(&s, "tpl-demo", VersionSelector::Pinned(v), None)
+                .await
+                .unwrap();
+        }
+        let delete = |version: Option<VersionSelector>| {
+            delete_template(
+                State(state.clone()),
+                Extension(actor()),
+                Path("tpl-demo".into()),
+                Query(VersionQuery {
+                    version,
+                    clean: false,
+                }),
+            )
+        };
+        for v in [
+            Some(VersionSelector::Channel(VersionChannel::Stable)),
+            Some(VersionSelector::Pinned(1)),
+            None,
+        ] {
+            let err = delete(v).await.unwrap_err();
+            assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+        }
+        let err = deprecate_version(
+            State(state.clone()),
+            Extension(actor()),
+            Path(("tpl-demo".into(), "3".into())),
+            Json(DeprecateBody {
+                reason: None,
+                undo: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            delete(Some(VersionSelector::Pinned(3))).await.unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let st = s.template_state("tpl-demo").await.unwrap();
+        assert_eq!(st.stable, Some(2), "stable never moved");
     }
 
     async fn test_state_with(dir: &tempfile::TempDir) -> ServerState {

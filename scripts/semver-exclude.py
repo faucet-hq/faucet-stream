@@ -14,14 +14,9 @@ import urllib.error
 import urllib.request
 
 # faucet-cli / faucet-stream: binary + umbrella, checked through their parts.
-# Delta: the published versions do not build under a fresh resolve, so there
-# is no baseline (#794); drop them once a deltalake-1.x release is out.
 ALWAYS = [
     "faucet-cli",
     "faucet-stream",
-    "faucet-common-delta",
-    "faucet-source-delta",
-    "faucet-sink-delta",
 ]
 
 

@@ -171,7 +171,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/backfill \
         '{config: $cfg, from: "2026-06-01", to: "2026-07-01", window: "1d"}')"
 ```
 
-Unit runs are named `{name}-backfill-{unit}` and labelled
+Unit runs are named `{name}-backfill-{range_hash}-{unit}` and labelled
 `backfill=<range-hash>` + `backfill_unit=<unit>`; the pipeline `name` is
 rewritten per unit so state keys stay namespaced, and delivery is forced to
 at-least-once. Deterministic idempotency keys (`backfill:{hash}:{unit}`) make

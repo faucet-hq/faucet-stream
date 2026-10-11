@@ -167,12 +167,13 @@ impl Notifier {
             }
             open
         };
+        let sends = open.iter().map(|(idx, key)| {
+            self.send_with_retry(&self.rules[*idx], event, PdAction::Resolve, key)
+        });
+        let results = futures::future::join_all(sends).await;
         let mut out = Vec::new();
-        for (idx, key) in open {
+        for ((idx, key), res) in open.into_iter().zip(results) {
             let rule = &self.rules[idx];
-            let res = self
-                .send_with_retry(rule, event, PdAction::Resolve, &key)
-                .await;
             match &res {
                 Ok(()) => {
                     let id = incident_id(&rule.name, event);
@@ -315,6 +316,18 @@ const TRIGGER_KINDS: [EventKind; 11] = [
     EventKind::LogExportFailed,
 ];
 
+/// Kinds whose incident a successful run closes: the failure class (one shared
+/// key per row) and an SLA breach. Others (drift, a pending change, a
+/// re-auth) are not answered by a success, so they are resolved only when
+/// this process opened them.
+const SUCCESS_CLOSES: [EventKind; 5] = [
+    EventKind::RunFailure,
+    EventKind::CircuitOpen,
+    EventKind::ContractAbort,
+    EventKind::BudgetExceeded,
+    EventKind::SlaBreach,
+];
+
 /// The PagerDuty dedup key of every incident `rule` could have opened for
 /// `event`'s (pipeline, row): one per kind its selector admits, failure-class
 /// kinds sharing the row's failure key.
@@ -322,14 +335,10 @@ fn stateless_resolve_keys(rule: &NotificationSpec, event: &NotifyEvent) -> Vec<S
     let kinds: Vec<EventKind> = if rule.on.is_empty() {
         TRIGGER_KINDS.to_vec()
     } else {
-        rule.on
-            .iter()
-            .copied()
-            .filter(|k| *k != EventKind::RunSuccess)
-            .collect()
+        rule.on.clone()
     };
+    let kinds = kinds.into_iter().filter(|k| SUCCESS_CLOSES.contains(k));
     let mut keys: Vec<String> = kinds
-        .into_iter()
         .map(|kind| {
             NotifyEvent {
                 kind,
@@ -614,13 +623,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unrestricted_rule_resolves_every_kind_key_once() {
+    fn a_success_resolves_only_the_incidents_a_success_closes() {
         let r = rule("pd", vec![], slack());
         let keys = stateless_resolve_keys(&r, &NotifyEvent::run_success("p", "r", 1));
-        assert_eq!(keys.len(), 8, "{keys:?}");
-        assert!(keys.contains(&"p:r".to_string()));
-        assert!(keys.contains(&"profile_drift:p:r".to_string()));
-        assert!(!keys.iter().any(|k| k.starts_with("run_success")));
+        assert_eq!(
+            keys,
+            vec!["p:r".to_string(), "sla_breach:p:r".to_string()],
+            "{keys:?}"
+        );
+        let drift_only = rule("pd", vec![EventKind::ProfileDrift], slack());
+        assert!(
+            stateless_resolve_keys(&drift_only, &NotifyEvent::run_success("p", "r", 1)).is_empty()
+        );
     }
 
     #[tokio::test]
@@ -660,7 +674,7 @@ mod tests {
             .iter()
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
-        let pairs: Vec<(String, String)> = bodies
+        let mut pairs: Vec<(String, String)> = bodies
             .iter()
             .map(|b| {
                 (
@@ -669,6 +683,7 @@ mod tests {
                 )
             })
             .collect();
+        pairs[2..].sort();
         assert_eq!(
             pairs,
             vec![

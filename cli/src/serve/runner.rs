@@ -668,7 +668,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             run_id: run_id.clone(),
             shard_id: shard_id.clone(),
         };
-        let outcome = execute_shard(
+        let (outcome, shutdown) = execute_shard(
             &state,
             loaded,
             &run_id,
@@ -681,6 +681,34 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             run.submitted_at,
         )
         .await;
+
+        // A clustered shutdown hands the shard back to the cluster instead of
+        // failing it, as it does a whole run (#789 SERVE-25): a peer resumes it
+        // from its per-shard bookmark.
+        if shutdown && state.cluster().enabled() {
+            match state.history().release_shard(&run_id, &shard_id).await {
+                Ok(true) => {
+                    tracing::info!(
+                        run_id,
+                        shard_id,
+                        "shutdown: shard handed back to the cluster as pending"
+                    );
+                    drop(_shard_guard);
+                    if !state.registry().has_run_shards(&run_id) {
+                        state.log_hub().finish(&run_id);
+                        schedule_log_drop(state.clone(), run_id.clone());
+                    }
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    run_id,
+                    shard_id,
+                    error = %e,
+                    "shutdown: could not requeue the shard"
+                ),
+            }
+        }
 
         match state
             .history()
@@ -709,7 +737,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 
 /// Run one shard's pipeline (single node, source narrowed via `opts.shard`).
 /// Does not touch the parent run record — the caller finalizes the shard and
-/// the parent.
+/// the parent. The flag is `true` when a server shutdown interrupted it.
 #[allow(clippy::too_many_arguments)]
 async fn execute_shard(
     state: &ServerState,
@@ -722,12 +750,12 @@ async fn execute_shard(
     clock_flag: Option<String>,
     concurrency: Option<usize>,
     submitted_at: DateTime<Utc>,
-) -> ShardOutcome {
+) -> (ShardOutcome, bool) {
     let auth = match loaded.auth_catalog() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard auth catalog: {e}");
-            return ShardOutcome::Failed;
+            return (ShardOutcome::Failed, false);
         }
     };
     let LoadedSubmission { cfg, nodes, tenant } = loaded;
@@ -743,7 +771,7 @@ async fn execute_shard(
                 "shard clock: {}",
                 e.api_error().error.message
             );
-            return ShardOutcome::Failed;
+            return (ShardOutcome::Failed, false);
         }
     };
     let resilience = match &cfg.resilience {
@@ -751,7 +779,7 @@ async fn execute_shard(
             Ok(p) => Some(p),
             Err(e) => {
                 tracing::error!(run_id, shard_id, "shard resilience: {e}");
-                return ShardOutcome::Failed;
+                return (ShardOutcome::Failed, false);
             }
         },
         None => None,
@@ -761,7 +789,7 @@ async fn execute_shard(
         Ok(l) => l,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard lineage: {e}");
-            return ShardOutcome::Failed;
+            return (ShardOutcome::Failed, false);
         }
     };
 
@@ -772,7 +800,7 @@ async fn execute_shard(
         Ok(u) => u,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard usage: {e}");
-            return ShardOutcome::Failed;
+            return (ShardOutcome::Failed, false);
         }
     };
     let opts = ExecuteOptions {
@@ -860,11 +888,13 @@ async fn execute_shard(
                 .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
     };
-    match terminal {
+    let shutdown = matches!(terminal, Terminal::ShutdownFailed { .. });
+    let outcome = match terminal {
         Terminal::Completed { .. } => ShardOutcome::Completed,
         Terminal::Cancelled { .. } => ShardOutcome::Cancelled,
         _ => ShardOutcome::Failed,
-    }
+    };
+    (outcome, shutdown)
 }
 
 /// Finalize a `Sharded` parent run once all its shards are terminal. The last
@@ -1061,7 +1091,7 @@ pub async fn submit(
     // malformed or refused destination costs nothing and surfaces as a 422 on
     // the submission rather than as a silent no-op when the run finishes.
     if let Some(cb) = req.callback.as_ref() {
-        cb.validate(state.callback_allow_hosts())
+        cb.validate_for(state.callback_allow_hosts(), actor.tenant.is_some())
             .map_err(|message| ServeError::Unprocessable {
                 message,
                 details: None,
@@ -3205,7 +3235,8 @@ mod tests {
                 None,
                 Utc::now(),
             )
-            .await;
+            .await
+            .0;
             assert_eq!(
                 ok,
                 ShardOutcome::Completed,
@@ -3311,10 +3342,10 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 fire.cancel();
             });
-            assert_ne!(run(coop, None).await, ShardOutcome::Failed);
+            assert_ne!(run(coop, None).await, (ShardOutcome::Failed, false));
             assert_eq!(
                 run(CancellationToken::new(), Some(1)).await,
-                ShardOutcome::Failed
+                (ShardOutcome::Failed, false)
             );
             let shutdown = state.shutdown_token();
             tokio::spawn(async move {
@@ -3323,8 +3354,49 @@ mod tests {
             });
             assert_eq!(
                 run(CancellationToken::new(), None).await,
-                ShardOutcome::Failed
+                (ShardOutcome::Failed, true)
             );
+        }
+
+        /// #862 M-003: a clustered shutdown hands a claimed shard back as
+        /// pending instead of failing it (and with it the parent run).
+        #[cfg(feature = "source-webhook")]
+        #[tokio::test]
+        async fn a_clustered_shutdown_hands_a_claimed_shard_back_as_pending() {
+            use crate::serve::history::ShardInsert;
+            let dir = tempfile::tempdir().unwrap();
+            let mut cluster = crate::serve::cluster::ClusterConfig::disabled();
+            cluster.enabled = true;
+            let state = sqlite_state_with(dir.path(), cluster).await;
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Sharded;
+            rec.config_body = Some(waiting_yaml(dir.path()));
+            state.history().upsert(&rec).await.unwrap();
+            let shards = ["0", "1"].map(|id| ShardInsert {
+                shard_id: id.into(),
+                descriptor: serde_json::Value::Null,
+                size_estimate: None,
+            });
+            state.history().insert_shards("r", &shards).await.unwrap();
+            let claimed = state.history().claim_shards(1).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            resume_claimed_shard(state.clone(), claimed.into_iter().next().unwrap());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            state.shutdown_token().cancel();
+            let mut progress = state.history().shard_progress("r").await.unwrap();
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                progress = state.history().shard_progress("r").await.unwrap();
+                if progress.running == 0 {
+                    break;
+                }
+            }
+            assert_eq!(progress.pending, 2, "{progress:?}");
+            assert_eq!(progress.failed, 0, "{progress:?}");
+            let parent = state.history().get("r").await.unwrap().unwrap();
+            assert_eq!(parent.status, RunStatus::Sharded, "the parent stays open");
+            assert_eq!(state.history().claim_shards(2).await.unwrap().len(), 2);
+            assert!(!state.history().release_shard("r", "nope").await.unwrap());
         }
 
         #[cfg(feature = "source-webhook")]
@@ -3441,7 +3513,8 @@ mod tests {
                 None,
                 Utc::now(),
             )
-            .await;
+            .await
+            .0;
             assert_eq!(
                 ok,
                 ShardOutcome::Failed,

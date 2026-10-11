@@ -686,7 +686,7 @@ paths:
         Plans the `[from, to)` range into window units (chunked by `window`)
         and submits one tracked run per unit through the standard run path —
         each with its `${backfill.*}` tokens substituted, its pipeline `name`
-        suffixed (`{name}-backfill-{unit}`, so unit state keys never touch the
+        suffixed (`{name}-backfill-{range_hash}-{unit}`, so unit state keys never touch the
         forward-sync bookmark), `delivery` forced to `at_least_once`, the
         `${now.*}` clock set to the unit's window start, and a deterministic
         idempotency key (`backfill:{hash}:{unit}`). Re-POSTing the same body

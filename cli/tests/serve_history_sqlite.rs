@@ -2022,3 +2022,62 @@ async fn connection_replace_is_a_compare_and_set() {
     ))
     .await;
 }
+
+/// #862 M-003: a running shard is handed back to `pending` only by its owner,
+/// with its attempt count unchanged, and is claimable again.
+#[tokio::test]
+async fn release_shard_is_owner_fenced_and_requeues() {
+    use faucet_cli::serve::history::ShardInsert;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store_with(&dir, "h.db", Duration::from_secs(3600), "a").await;
+    let b = store_with(&dir, "h.db", Duration::from_secs(3600), "b").await;
+    let mut parent = rec("r", RunStatus::Sharded, Utc::now());
+    parent.config_body = Some("version: 1".into());
+    a.upsert(&parent).await.unwrap();
+    let shard = ShardInsert {
+        shard_id: "0".into(),
+        descriptor: serde_json::Value::Null,
+        size_estimate: None,
+    };
+    a.insert_shards("r", &[shard]).await.unwrap();
+    assert_eq!(a.claim_shards(1).await.unwrap().len(), 1);
+    assert!(!b.release_shard("r", "0").await.unwrap(), "not b's shard");
+    assert!(a.release_shard("r", "0").await.unwrap());
+    assert!(
+        !a.release_shard("r", "0").await.unwrap(),
+        "no longer running"
+    );
+    let progress = a.shard_progress("r").await.unwrap();
+    assert_eq!((progress.pending, progress.running), (1, 0));
+    assert_eq!(
+        b.claim_shards(1).await.unwrap().len(),
+        1,
+        "a peer resumes it"
+    );
+}
+
+/// #862 M-004: a history that cannot be opened at startup is reconnected
+/// once it can be, and shared state waits for it instead of using memory.
+#[tokio::test]
+async fn a_history_unreachable_at_startup_is_reconnected() {
+    use faucet_cli::serve::config::HistoryBackendSpec;
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("later");
+    let url = format!("sqlite:{}/h.db", missing.display());
+    let h = faucet_cli::serve::history::connect(
+        &HistoryBackendSpec::Sqlite(url),
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        "i",
+    )
+    .await
+    .unwrap();
+    assert!(h.degraded());
+    assert!(h.trigger_edge_rise("q").await.is_err(), "no memory answer");
+    assert!(!h.recover_degraded().await);
+    std::fs::create_dir(&missing).unwrap();
+    assert!(h.recover_degraded().await);
+    assert!(!h.degraded());
+    assert!(h.trigger_edge_rise("q").await.unwrap().is_some());
+    assert!(missing.join("h.db").exists());
+}

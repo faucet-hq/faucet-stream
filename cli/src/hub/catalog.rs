@@ -24,6 +24,9 @@ pub struct Catalog {
     pub root: PathBuf,
     pub sources: Vec<(PathBuf, SourceTemplate)>,
     pub sinks: Vec<(PathBuf, SinkTemplate)>,
+    /// Templates whose `requires_faucet` excludes this binary, with why;
+    /// skipped by [`Catalog::load`], refused by [`Catalog::load_strict`].
+    pub incompatible: Vec<(PathBuf, String)>,
 }
 
 fn is_template_file(p: &Path) -> bool {
@@ -84,23 +87,36 @@ impl Catalog {
     /// Load every template under `root/source-templates` and
     /// `root/sink-templates`. Each file is parsed **and validated**; the first
     /// broken file fails the load with its path, because a catalog with one
-    /// bad template must not be published.
+    /// bad template must not be published. A template whose `requires_faucet`
+    /// excludes this binary is skipped with a warning and listed in
+    /// [`Catalog::incompatible`], so one newer template does not hide the
+    /// rest of a shared catalog from older binaries.
     pub fn load(root: &Path) -> CliResult<Self> {
         let mut cat = Self {
             root: root.to_path_buf(),
             ..Default::default()
         };
         for (p, owner) in list_dir(&root.join(SOURCE_DIR))? {
-            let t = super::parse_source_file(&p)?;
-            check_owner(&p, t.owner.as_deref(), owner.as_deref())?;
-            cat.sources.push((p, t));
+            match super::parse_source_file(&p) {
+                Ok(t) => {
+                    check_owner(&p, t.owner.as_deref(), owner.as_deref())?;
+                    cat.sources.push((p, t));
+                }
+                Err(e @ CliError::IncompatibleFaucet { .. }) => cat.skip(p, e),
+                Err(e) => return Err(e),
+            }
         }
         for (p, owner) in list_dir(&root.join(SINK_DIR))? {
-            let t = super::parse_sink_file(&p)?;
-            check_owner(&p, t.owner.as_deref(), owner.as_deref())?;
-            cat.sinks.push((p, t));
+            match super::parse_sink_file(&p) {
+                Ok(t) => {
+                    check_owner(&p, t.owner.as_deref(), owner.as_deref())?;
+                    cat.sinks.push((p, t));
+                }
+                Err(e @ CliError::IncompatibleFaucet { .. }) => cat.skip(p, e),
+                Err(e) => return Err(e),
+            }
         }
-        if cat.sources.is_empty() && cat.sinks.is_empty() {
+        if cat.sources.is_empty() && cat.sinks.is_empty() && cat.incompatible.is_empty() {
             return Err(CliError::Config(format!(
                 "no hub templates under {} (expected {SOURCE_DIR}/ and {SINK_DIR}/ with *.yaml files)",
                 root.display()
@@ -117,6 +133,21 @@ impl Catalog {
             check_stem(p, &t.name, &t.id(), &mut seen)?;
         }
         Ok(cat)
+    }
+
+    /// [`Catalog::load`], refusing a template this binary cannot use — for
+    /// `hub lint`, where a catalog is checked against the binary it ships for.
+    pub fn load_strict(root: &Path) -> CliResult<Self> {
+        let cat = Self::load(root)?;
+        match cat.incompatible.first() {
+            Some((p, why)) => Err(CliError::Config(format!("{}: {why}", p.display()))),
+            None => Ok(cat),
+        }
+    }
+
+    fn skip(&mut self, path: PathBuf, why: CliError) {
+        tracing::warn!(template = %path.display(), "skipping hub template: {why}");
+        self.incompatible.push((path, why.to_string()));
     }
 
     /// Look a source template up by hub id (`owner/name`, or `name`).
@@ -1245,6 +1276,27 @@ per_stream:
         )));
         assert!(is_template_file(Path::new("sink-templates/acme/x.yaml")));
         assert!(!is_template_file(Path::new("sink-templates/acme/OWNERS")));
+    }
+
+    /// #862 M-031: a template this binary cannot run is skipped, not fatal,
+    /// except under `load_strict`.
+    #[test]
+    fn a_template_for_a_newer_faucet_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(dir.path());
+        let newer = SRC.replace("name: acme", "name: future\nrequires_faucet: \">=999\"");
+        std::fs::write(dir.path().join(SOURCE_DIR).join("future.yaml"), newer).unwrap();
+        let cat = Catalog::load(dir.path()).unwrap();
+        assert!(cat.source("acme").is_some());
+        assert!(cat.source("future").is_none());
+        assert_eq!(cat.incompatible.len(), 1);
+        assert!(
+            cat.incompatible[0].1.contains("requires faucet"),
+            "{:?}",
+            cat.incompatible
+        );
+        let err = Catalog::load_strict(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("future.yaml"), "{err}");
     }
 
     #[test]

@@ -14,8 +14,9 @@
 //! change requests, trigger edges and lease heartbeats fail with
 //! [`HistoryError::Degraded`] (`503`) instead, because an empty store would
 //! answer them wrongly. [`FallbackHistory::try_recover`] probes the primary on
-//! every lease tick and leaves degraded mode when it answers. Data written to
-//! memory while degraded is not migrated back.
+//! every lease tick — connecting it first when it was unreachable at startup —
+//! and leaves degraded mode when it answers. Data written to memory while
+//! degraded is not migrated back.
 
 use super::memory::MemoryHistory;
 use super::{
@@ -34,9 +35,20 @@ const RETRY_BASE: Duration = Duration::from_millis(50);
 /// A run id no run can have — the recovery probe's read.
 const RECOVERY_PROBE_ID: &str = "__faucet_history_recovery_probe__";
 
+/// Opens the persistent backend; retried from the lease tick when it was
+/// unreachable at startup.
+pub type PrimaryConnector = Box<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<Box<dyn RunHistory>, HistoryError>>
+        + Send
+        + Sync,
+>;
+
 pub struct FallbackHistory {
-    /// Persistent backend; `None` when it was unreachable at startup.
-    primary: Option<Box<dyn RunHistory>>,
+    /// Persistent backend; unset while it has never been reached.
+    primary: std::sync::OnceLock<Box<dyn RunHistory>>,
+    /// Reconnects a primary that was unreachable at startup. Without one the
+    /// in-memory store is authoritative.
+    connector: Option<PrimaryConnector>,
     fallback: MemoryHistory,
     degraded: AtomicBool,
     /// `"postgres"` / `"sqlite"` — for log + metric context.
@@ -50,19 +62,43 @@ impl FallbackHistory {
         idem_retention: Duration,
         label: &'static str,
     ) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(primary);
         Self {
-            primary: Some(primary),
+            primary: cell,
+            connector: None,
             fallback: MemoryHistory::new(idem_retention),
             degraded: AtomicBool::new(false),
             label,
         }
     }
 
-    /// Start already degraded: the primary backend was unreachable at startup.
+    /// Start already degraded with no way back: the in-memory store is the
+    /// only, and authoritative, store.
     pub fn degraded_at_startup(idem_retention: Duration, label: &'static str) -> Self {
         crate::serve::metrics::set_history_degraded(true);
         Self {
-            primary: None,
+            primary: std::sync::OnceLock::new(),
+            connector: None,
+            fallback: MemoryHistory::new(idem_retention),
+            degraded: AtomicBool::new(true),
+            label,
+        }
+    }
+
+    /// Start degraded because the primary was unreachable at startup, and
+    /// keep trying `connector` from [`try_recover`](Self::try_recover). Until
+    /// it connects, shared state (templates, tenants, …) and idempotency fail
+    /// with `503` rather than being served from the empty memory store.
+    pub fn connecting(
+        connector: PrimaryConnector,
+        idem_retention: Duration,
+        label: &'static str,
+    ) -> Self {
+        crate::serve::metrics::set_history_degraded(true);
+        Self {
+            primary: std::sync::OnceLock::new(),
+            connector: Some(connector),
             fallback: MemoryHistory::new(idem_retention),
             degraded: AtomicBool::new(true),
             label,
@@ -70,7 +106,12 @@ impl FallbackHistory {
     }
 
     fn is_degraded(&self) -> bool {
-        self.primary.is_none() || self.degraded.load(Ordering::Acquire)
+        self.primary.get().is_none() || self.degraded.load(Ordering::Acquire)
+    }
+
+    /// Whether the in-memory store is the only store there will ever be.
+    fn memory_only(&self) -> bool {
+        self.primary.get().is_none() && self.connector.is_none()
     }
 
     fn unavailable(&self) -> HistoryError {
@@ -86,8 +127,16 @@ impl FallbackHistory {
         if !self.degraded.load(Ordering::Acquire) {
             return false;
         }
-        let Some(p) = self.primary.as_ref() else {
-            return false;
+        let p = match (self.primary.get(), &self.connector) {
+            (Some(p), _) => p,
+            (None, Some(connect)) => match connect().await {
+                Ok(p) => self.primary.get_or_init(|| p),
+                Err(e) => {
+                    tracing::debug!(backend = self.label, error = %e, "run-history backend still unreachable");
+                    return false;
+                }
+            },
+            (None, None) => return false,
         };
         if p.get(RECOVERY_PROBE_ID).await.is_err() {
             return false;
@@ -121,10 +170,7 @@ impl FallbackHistory {
 /// times with a short backoff. Any other failure is returned at once.
 macro_rules! primary {
     ($self:ident, $primary:ident => $pcall:expr) => {{
-        let $primary = $self
-            .primary
-            .as_ref()
-            .expect("primary checked by the caller");
+        let $primary = $self.primary.get().expect("primary checked by the caller");
         let mut attempt = 1u32;
         loop {
             match $pcall.await {
@@ -145,7 +191,7 @@ macro_rules! primary {
 /// the caller's.
 macro_rules! via {
     ($self:ident, $primary:ident => $pcall:expr, $fb:ident => $fcall:expr) => {{
-        if !$self.is_degraded() && $self.primary.is_some() {
+        if !$self.is_degraded() && $self.primary.get().is_some() {
             match primary!($self, $primary => $pcall) {
                 Ok(v) => return Ok(v),
                 Err(e) if e.is_unreachable() => $self.trip(&e),
@@ -161,11 +207,12 @@ macro_rules! via {
 /// templates, tenants, connections, change requests, trigger edges — and the
 /// lease heartbeats whose memory no-op would hide that this instance can no
 /// longer renew: these fail with [`HistoryError::Degraded`] while the primary
-/// is unreachable. A wrapper that started degraded has no primary, so the
-/// in-memory store is its only (and authoritative) store.
+/// is unreachable — including a primary that was unreachable at startup and
+/// is still being reconnected. Only a wrapper built without any primary uses
+/// the in-memory store as its (authoritative) store.
 macro_rules! strict {
     ($self:ident, $primary:ident => $pcall:expr, $fb:ident => $fcall:expr) => {{
-        if $self.primary.is_none() {
+        if $self.memory_only() {
             let $fb = &$self.fallback;
             return $fcall.await;
         }
@@ -195,7 +242,7 @@ impl RunHistory for FallbackHistory {
         // Idempotency is correctness-critical, so it does NOT use the generic
         // `via!` fall-through. While the primary is healthy it is the
         // authoritative claim store; its first error trips degraded.
-        if !self.is_degraded() && self.primary.is_some() {
+        if !self.is_degraded() && self.primary.get().is_some() {
             match primary!(self, p => p.claim_idempotency(key, fingerprint, run_id, window)) {
                 Ok(v) => return Ok(v),
                 Err(e) if e.is_unreachable() => self.trip(&e),
@@ -207,10 +254,10 @@ impl RunHistory for FallbackHistory {
         // from memory could duplicate a run the primary already claimed.
         // Fail closed — reject idempotent submissions while degraded rather than
         // risk a silent duplicate (#146 M5). A submission with no idempotency
-        // key never reaches here. When the wrapper *started* degraded (`primary`
-        // is `None` — no primary ever held a claim), the in-memory store is the
-        // sole authoritative store, so its claims are safe to serve.
-        if self.primary.is_some() {
+        // key never reaches here. A primary still being reconnected may hold
+        // claims from before this process started, so it fails closed too;
+        // only a wrapper with no primary at all serves claims from memory.
+        if !self.memory_only() {
             return Err(HistoryError::Degraded(
                 "idempotency unavailable: the run-history backend is degraded; retry once it \
                  recovers, or resubmit without an idempotency key"
@@ -324,6 +371,10 @@ impl RunHistory for FallbackHistory {
     ) -> Result<bool, HistoryError> {
         via!(self, p => p.finalize_shard(run_id, shard_id, outcome), f => f.finalize_shard(run_id, shard_id, outcome))
     }
+
+    async fn release_shard(&self, run_id: &str, shard_id: &str) -> Result<bool, HistoryError> {
+        via!(self, p => p.release_shard(run_id, shard_id), f => f.release_shard(run_id, shard_id))
+    }
     async fn shard_progress(
         &self,
         run_id: &str,
@@ -341,6 +392,9 @@ impl RunHistory for FallbackHistory {
     }
     async fn trigger_edge_rearm(&self, trigger: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.trigger_edge_rearm(trigger), f => f.trigger_edge_rearm(trigger))
+    }
+    async fn trigger_edge_current(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        strict!(self, p => p.trigger_edge_current(trigger), f => f.trigger_edge_current(trigger))
     }
     async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
         strict!(self, p => p.trigger_edge_retract(trigger, ordinal), f => f.trigger_edge_retract(trigger, ordinal))
@@ -901,7 +955,13 @@ mod tests {
         );
         assert!(!healthy.try_recover().await, "not degraded");
         let first = healthy.trigger_edge_rise("q").await.unwrap().unwrap();
+        assert_eq!(
+            healthy.trigger_edge_current("q").await.unwrap(),
+            Some(first)
+        );
         healthy.trigger_edge_retract("q", first).await.unwrap();
+        assert_eq!(healthy.trigger_edge_current("q").await.unwrap(), None);
+        assert_eq!(healthy.trigger_edge_current("never").await.unwrap(), None);
         healthy.trigger_edge_rearm("q").await.unwrap();
 
         healthy.degraded.store(true, Ordering::Release);
@@ -911,6 +971,67 @@ mod tests {
         let startup = FallbackHistory::degraded_at_startup(Duration::from_secs(60), "test");
         assert!(!startup.try_recover().await, "no primary to recover to");
         assert!(startup.trigger_edge_rise("q").await.unwrap().is_some());
+    }
+
+    /// #862 M-004: a primary unreachable at startup is reconnected from the
+    /// lease tick, and until then shared state and idempotency fail with 503
+    /// instead of being served from the empty memory store.
+    #[tokio::test]
+    async fn a_primary_unreachable_at_startup_is_reconnected_and_shared_state_waits_for_it() {
+        use std::sync::atomic::AtomicUsize;
+        let up = std::sync::Arc::new(AtomicBool::new(false));
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let (u, a) = (up.clone(), attempts.clone());
+        let connector: PrimaryConnector = Box::new(move || {
+            let (u, a) = (u.clone(), a.clone());
+            Box::pin(async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                if u.load(Ordering::SeqCst) {
+                    Ok(Box::new(MemoryHistory::new(Duration::from_secs(60)))
+                        as Box<dyn RunHistory>)
+                } else {
+                    Err(HistoryError::Backend("connection refused".into()))
+                }
+            })
+        });
+        let fb = FallbackHistory::connecting(connector, Duration::from_secs(60), "test");
+        assert!(fb.degraded());
+        assert!(matches!(
+            fb.trigger_edge_rise("q").await,
+            Err(HistoryError::Degraded(_))
+        ));
+        assert!(matches!(
+            fb.claim_idempotency("k", "fp", "r", Duration::from_secs(60))
+                .await,
+            Err(HistoryError::Degraded(_))
+        ));
+        let run = RunRecord::queued(
+            "r1".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        fb.upsert(&run).await.unwrap();
+        assert!(
+            fb.get("r1").await.unwrap().is_some(),
+            "runs keep going in memory"
+        );
+
+        assert!(!fb.try_recover().await, "still down");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        up.store(true, Ordering::SeqCst);
+        assert!(fb.try_recover().await, "reconnected");
+        assert!(!fb.degraded());
+        assert!(fb.trigger_edge_rise("q").await.unwrap().is_some());
+        assert_eq!(
+            fb.claim_idempotency("k", "fp", "r", Duration::from_secs(60))
+                .await
+                .unwrap(),
+            Claim::Fresh
+        );
+        assert!(!fb.try_recover().await, "nothing to recover");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

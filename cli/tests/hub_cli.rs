@@ -821,6 +821,64 @@ async fn a_community_template_may_not_read_operator_env_unless_trusted() {
     .expect("check");
 }
 
+/// #862 M-030: `owner: faucet-hq` is not official outside the faucet-hq
+/// catalog repository — a directory (or any other) hub claiming it still
+/// needs `--trust` to read the operator's environment.
+#[tokio::test]
+async fn a_faucet_hq_owner_on_another_hub_is_not_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _) = fixture(dir.path());
+    let ns = Path::new(&hub).join("source-templates/faucet-hq");
+    std::fs::create_dir_all(&ns).unwrap();
+    std::fs::write(
+        ns.join("crm.yaml"),
+        "kind: source-template\nname: crm\nowner: faucet-hq\ndescription: d\n\
+         source: { type: csv, config: { path: \"/tmp/${env:HOME}.csv\" } }\n\
+         streams: [ { name: s } ]\n",
+    )
+    .unwrap();
+    let base = [
+        "validate",
+        "--source",
+        "crm",
+        "--sink",
+        "files",
+        "--hub",
+        &hub,
+        "--no-env-file",
+    ];
+    let err = run(&base).await.unwrap_err().to_string();
+    assert!(
+        err.contains("${env:HOME}") && err.contains("--trust faucet-hq"),
+        "{err}"
+    );
+    let mut trusted = base.to_vec();
+    trusted.extend(["--trust", "faucet-hq"]);
+    run(&trusted).await.expect("trusted template validates");
+}
+
+/// #862 M-031: a catalog template for a newer faucet does not break browsing.
+#[tokio::test]
+async fn a_template_for_a_newer_faucet_does_not_break_hub_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _) = fixture(dir.path());
+    std::fs::write(
+        Path::new(&hub).join("source-templates/future.yaml"),
+        "kind: source-template\nname: future\nrequires_faucet: \">=999\"\ndescription: d\n\
+         source: { type: csv, config: { path: x.csv } }\nstreams: [ { name: s } ]\n",
+    )
+    .unwrap();
+    run(&["hub", "list", "--hub", &hub]).await.expect("list");
+    run(&["hub", "matrix", "--hub", &hub])
+        .await
+        .expect("matrix");
+    let err = run(&["hub", "lint", "--hub", &hub])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("future.yaml"), "{err}");
+}
+
 /// Linting one file never resolves a hub it does not need: a template with no
 /// `tests:` block lints even when `--hub` names nothing, and one outside any
 /// hub directory with a bundle uses the `--hub` it was given.

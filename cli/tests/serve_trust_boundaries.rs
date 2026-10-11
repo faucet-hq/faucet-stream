@@ -235,6 +235,92 @@ async fn auth_config_references_resolve_and_stay_out_of_reach() {
     }
 }
 
+/// #862 H-02/H-04/H-05: the server's own input files, its credential
+/// variables and the system trees are out of reach — through `${file:}` /
+/// `${env:}`, and as a connector's data path, even via a matrix row override.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_inputs_and_system_trees_are_out_of_reach_as_references_and_as_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_path = dir.path().join("auth.yaml");
+    let api = spawn(dir.path(), PRINCIPALS, |_| {}, true).await;
+    let out = dir.path().join("out.jsonl");
+    let config = |source: &str| {
+        format!(
+            "version: 1\nname: trust\npipeline:\n  source: {source}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+            out.display()
+        )
+    };
+    for source in [
+        format!(
+            "{{ type: csv, config: {{ path: \"${{file:{}}}\" }} }}",
+            auth_path.display()
+        ),
+        "{ type: csv, config: { path: \"${env:FAUCET_SERVE_HISTORY}\" } }".to_string(),
+        "{ type: csv, config: { path: \"${env:FAUCET_VAULT_PREVIOUS_KEYS}\" } }".to_string(),
+    ] {
+        let (code, err) = api
+            .post("admin-tok", "/v1/runs", json!({"config": config(&source)}))
+            .await;
+        assert_eq!(code, 403, "{source}: {err}");
+        assert!(message(&err).contains("server's own credentials"), "{err}");
+    }
+    for source in [
+        format!(
+            "{{ type: csv, config: {{ path: \"{}\" }} }}",
+            auth_path.display()
+        ),
+        format!(
+            "{{ type: csv, config: {{ path: \"{}/*.yaml\" }} }}",
+            dir.path().display()
+        ),
+        "{ type: file, config: { path: /proc/self/environ, format: raw_text } }".to_string(),
+    ] {
+        let (code, err) = api
+            .post("admin-tok", "/v1/runs", json!({"config": config(&source)}))
+            .await;
+        assert_eq!(code, 403, "{source}: {err}");
+        assert!(message(&err).contains("may not"), "{err}");
+    }
+    let via_row = format!(
+        "version: 1\npipeline:\n  sources:\n    x: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\nmatrix:\n  - id: r\n    source: {{ ref: x, config: {{ path: \"{}\" }} }}\n",
+        out.display(),
+        auth_path.display()
+    );
+    for route in ["/v1/runs", "/v1/plan"] {
+        let (code, err) = api
+            .post("admin-tok", route, json!({"config": via_row}))
+            .await;
+        assert_eq!(code, 403, "{route}: {err}");
+    }
+    let input = csv_input(dir.path());
+    let (code, r) = api
+        .post(
+            "op-tok",
+            "/v1/runs",
+            json!({"config": csv_config(dir.path(), &input.display().to_string())}),
+        )
+        .await;
+    assert_eq!(code, 202, "an ordinary local path still runs: {r}");
+
+    #[cfg(feature = "mcp")]
+    {
+        let smuggled = "version: 1\nparams: { k: { type: string, default: singer } }\npipeline:\n  source: { type: \"${param.k}\", config: { executable: /bin/sh, stream: x } }\n  sink: { type: stdout, config: {} }\n";
+        let (code, body) = api
+            .post(
+                "admin-tok",
+                "/mcp",
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "preview", "arguments": {"config": smuggled}}}),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert!(
+            body.to_string().contains("--allow-subprocess-connectors"),
+            "{body}"
+        );
+    }
+}
+
 #[test]
 fn an_unresolvable_auth_config_token_refuses_to_start() {
     let dir = tempfile::tempdir().unwrap();
@@ -404,6 +490,7 @@ async fn approval_gates_the_template_lifecycle_and_keeps_secrets_out_of_requests
             "/v1/templates",
             json!({"config": body, "id": "gated", "launch": true}),
         ),
+        ("/v1/templates/gated/versions/1/deprecate", json!({})),
     ] {
         let (code, err) = api.post("admin-tok", route, payload).await;
         assert_eq!(code, 409, "{route}: {err}");

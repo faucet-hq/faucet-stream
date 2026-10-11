@@ -652,6 +652,33 @@ async fn queue_depth_edges_survive_a_restart_and_fire_once_across_instances() {
         .await
         .unwrap();
     assert_eq!(page.runs.len(), 3, "one run per crossing");
+
+    // #862 M-006: a crossing that rose but never fired (the process died
+    // between the two) is fired by the next poll instead of wedging the edge.
+    let mut drain = watcher(vec![0]);
+    assert!(!drain.poll(&restarted).await.unwrap(), "drained: re-arm");
+    let lost = restarted
+        .history()
+        .trigger_edge_rise("drain")
+        .await
+        .unwrap();
+    assert!(lost.is_some());
+    let mut fresh = watcher(vec![9, 9]);
+    assert!(
+        !fresh.poll(&restarted).await.unwrap(),
+        "re-fire of the lost edge"
+    );
+    wait_for_runs(&restarted, 4).await;
+    assert!(!fresh.poll(&restarted).await.unwrap(), "fired once");
+    let page = restarted
+        .history()
+        .list(&ListFilter {
+            limit: 1_000,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.runs.len(), 4, "the lost crossing ran exactly once");
 }
 
 // ── HTTP-boundary tests ───────────────────────────────────────────────────────
@@ -990,6 +1017,61 @@ async fn a_bad_object_is_skipped_and_reported_instead_of_blocking_the_prefix() {
     assert!(err.contains("'bogus' skipped"), "{err}");
     wait_for_runs(&state, 1).await;
     assert!(out.exists(), "the object after the bad one still ran");
+    assert!(!watcher.poll(&state).await.unwrap(), "nothing left to fire");
+}
+
+/// #862 H-01: a `${file:}` reference that cannot be read right now is a
+/// transient failure — the object stays uncommitted and fires on the next
+/// poll once the file is readable, instead of being skipped for good.
+#[cfg(feature = "triggers-object-store")]
+#[tokio::test]
+async fn an_object_whose_reference_is_briefly_unreadable_is_retried() {
+    use faucet_cli::serve::triggers::object_arrival::ObjectArrivalWatcher;
+    use faucet_cli::serve::triggers::watcher::Watcher;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as OPath;
+    use object_store::{ObjectStore, ObjectStoreExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let pointer = dir.path().join("sink-path");
+    let mut inline = inline_pipeline(csv.to_str().unwrap(), "unused");
+    inline["pipeline"]["sink"]["config"]["path"] =
+        serde_json::json!(format!("${{file:{}}}", pointer.display()));
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b }}\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let store = InMemory::new();
+    store
+        .put(&OPath::from("a.csv"), b"{}".to_vec().into())
+        .await
+        .unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(store);
+    let mut watcher = ObjectArrivalWatcher::new(
+        Arc::new(compiled.triggers[0].clone()),
+        store,
+        "b".into(),
+        None,
+        faucet_cli::serve::triggers::spec::ArrivalMode::PerObject,
+        Duration::from_secs(30),
+        faucet_cli::serve::triggers::spec::StartAt::Beginning,
+        chrono::Utc::now(),
+    );
+    let err = watcher.poll(&state).await.unwrap_err();
+    assert!(!err.contains("skipped"), "{err}");
+    std::fs::write(&pointer, out.to_str().unwrap()).unwrap();
+    assert!(
+        watcher.poll(&state).await.unwrap(),
+        "the object fires once readable"
+    );
+    wait_for_runs(&state, 1).await;
+    assert!(out.exists());
     assert!(!watcher.poll(&state).await.unwrap(), "nothing left to fire");
 }
 
