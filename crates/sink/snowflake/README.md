@@ -87,7 +87,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `batch_size` | int | `1000` | Maximum records per SQL REST API request. The sink re-chunks each incoming slice into `batch_size` slices and issues one `INSERT` per chunk. **`0` = no batching**: the whole slice is sent in one `INSERT`, no matter how large. Values above `MAX_BATCH_SIZE` (1,000,000) are rejected by `faucet_core::validate_batch_size`. |
-| `poll_timeout` | int (seconds) | `300` | Max wall-clock time to wait for an asynchronously-executed `INSERT` (HTTP 202) to finish before failing with `FaucetError::Sink`; the statement is then cancelled server-side so it cannot commit after the run failed. **`0` = poll forever.** See [Asynchronous execution](#asynchronous-execution). |
+| `poll_timeout` | int (seconds) | `172800` | Max wall-clock time to wait for an asynchronously-executed `INSERT` (HTTP 202) to finish before failing with `FaucetError::Sink`; the statement is then cancelled server-side so it cannot commit after the run failed. **`0` = poll forever.** See [Asynchronous execution](#asynchronous-execution). |
 
 ## Authentication
 
@@ -199,7 +199,7 @@ sink:
 
 ### Asynchronous execution
 
-Snowflake's SQL REST API may answer a submitted `INSERT` with **HTTP 202 Accepted** — the statement was queued but has not yet executed. The sink does **not** count those rows as written at that point (that would report success before the data is durable). Instead it polls `GET /api/v2/statements/{handle}` until the statement reports success (code `090001`), then returns. The poll loop is bounded by `poll_timeout` (default 300 s): if the statement is still running after that budget, the write fails with `FaucetError::Sink` rather than hanging forever. Set `poll_timeout: 0` to poll indefinitely.
+Snowflake's SQL REST API may answer a submitted `INSERT` with **HTTP 202 Accepted** — the statement was queued but has not yet executed. The sink does **not** count those rows as written at that point (that would report success before the data is durable). Instead it polls `GET /api/v2/statements/{handle}` until the statement reports success (code `090001`), then returns. The poll loop is bounded by `poll_timeout` (default 172800 s — 48 hours, Snowflake's own maximum statement time, so a large commit group on a small warehouse is not cut short): if the statement is still running after that budget, the write fails with `FaucetError::Sink` and the statement is cancelled server-side. Set `poll_timeout: 0` to poll indefinitely.
 
 ## Effectively-once delivery
 

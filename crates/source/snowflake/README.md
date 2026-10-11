@@ -84,7 +84,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `statement_timeout` | int (seconds) | `0` | Server-side statement timeout, passed as the `timeout` field on the `POST /api/v2/statements` body. Snowflake **cancels** a statement that runs longer (error `000630`); `0` means Snowflake's maximum. It does not control when the submit goes async — use `poll_timeout` for a client-side cap. |
-| `poll_timeout` | int (seconds) | `300` | Max wall-clock time the source spends polling an asynchronous statement (one whose initial `POST` returned HTTP 202) before failing with `FaucetError::Source`. **`0` disables the cap** (poll forever). |
+| `poll_timeout` | int (seconds) | `172800` | Max wall-clock time the source spends polling an asynchronous statement (one whose initial `POST` returned HTTP 202) before failing with `FaucetError::Source` and cancelling the statement server-side. The default is 48 hours — Snowflake's own maximum statement time — so a long extract is never cut short by the client. **`0` disables the cap** (poll forever). |
 
 ### Batching
 
