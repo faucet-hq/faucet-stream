@@ -850,6 +850,23 @@ async fn a_faucet_hq_owner_on_another_hub_is_not_trusted() {
     run(&trusted).await.expect("trusted template validates");
 }
 
+/// #862 M-031: a catalog template for a newer faucet does not break browsing.
+#[tokio::test]
+async fn a_template_for_a_newer_faucet_does_not_break_hub_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _) = fixture(dir.path());
+    std::fs::write(
+        Path::new(&hub).join("source-templates/future.yaml"),
+        "kind: source-template\nname: future\nrequires_faucet: \">=999\"\ndescription: d\n\
+         source: { type: csv, config: { path: x.csv } }\nstreams: [ { name: s } ]\n",
+    )
+    .unwrap();
+    run(&["hub", "list", "--hub", &hub]).await.expect("list");
+    run(&["hub", "matrix", "--hub", &hub]).await.expect("matrix");
+    let err = run(&["hub", "lint", "--hub", &hub]).await.unwrap_err().to_string();
+    assert!(err.contains("future.yaml"), "{err}");
+}
+
 /// Linting one file never resolves a hub it does not need: a template with no
 /// `tests:` block lints even when `--hub` names nothing, and one outside any
 /// hub directory with a bundle uses the `--hub` it was given.
