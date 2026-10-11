@@ -35,6 +35,23 @@ pub fn row_to_json(row: &[Value], columns: &[ColumnInfo]) -> Value {
     Value::Object(obj)
 }
 
+/// Refuse a result with two columns of the same name — a join's `id`, say —
+/// whose later cell would otherwise replace the earlier in every record
+/// (#862 M-058).
+pub fn check_unique_columns(columns: &[ColumnInfo]) -> Result<(), faucet_core::FaucetError> {
+    let mut seen = std::collections::HashSet::new();
+    for col in columns {
+        if !seen.insert(col.name.as_str()) {
+            return Err(faucet_core::FaucetError::Source(format!(
+                "databricks: the query returns two columns named {:?}; alias them \
+                 (`SELECT o.id AS order_id, c.id AS customer_id …`) so neither is lost",
+                col.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Convert a single cell (a JSON string or null) to a typed value.
 fn cell_to_json(cell: Option<&Value>, type_name: &str) -> Value {
     let Some(cell) = cell else {
@@ -94,6 +111,15 @@ fn parse_float(s: &str) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn duplicate_column_names_are_refused() {
+        assert!(check_unique_columns(&cols()).is_ok());
+        let mut dup = cols();
+        dup.push(dup[0].clone());
+        let err = check_unique_columns(&dup).unwrap_err().to_string();
+        assert!(err.contains("two columns named \"id\""), "{err}");
+    }
 
     fn cols() -> Vec<ColumnInfo> {
         [

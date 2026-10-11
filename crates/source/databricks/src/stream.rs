@@ -258,6 +258,7 @@ impl DatabricksSource {
         let body = self.build_body(context, incr);
         let resp = self.statement_client().execute_body(&body).await?;
         let columns = resp.columns().to_vec();
+        crate::convert::check_unique_columns(&columns)?;
         let result = resp.result.map(decode_chunk).transpose()?;
         Ok(Executed { columns, result })
     }

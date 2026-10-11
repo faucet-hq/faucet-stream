@@ -461,3 +461,24 @@ async fn arrow_stream_external_links_row_and_columnar() {
     }
     assert_eq!(total, 2);
 }
+
+#[tokio::test]
+async fn duplicate_result_column_names_are_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "dup",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": manifest(&[("id", "LONG"), ("id", "LONG")]),
+            "result": { "data_array": [["1", "2"]] }
+        })))
+        .mount(&server)
+        .await;
+    let src = source(&server.uri(), "SELECT o.id, c.id FROM o JOIN c").await;
+    let err = src
+        .fetch_with_context(&HashMap::new())
+        .await
+        .expect_err("duplicate names");
+    assert!(err.to_string().contains("two columns named"), "{err}");
+}
