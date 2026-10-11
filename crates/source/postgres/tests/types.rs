@@ -88,6 +88,19 @@ async fn types_without_a_native_decode_are_read_as_text() {
     assert_eq!(row["t"], json!("12:30:00"));
     let n = row["n"].as_str().expect("numeric is a string");
     assert_eq!(n.parse::<f64>().unwrap(), 1.5, "{n}");
+
+    // #862 M-066: a trailing semicolon or line comment survives the text-cast
+    // wrapper a NUMERIC column triggers.
+    for query in [
+        "SELECT 2.25::numeric AS n;",
+        "SELECT 2.25::numeric AS n -- trailing note",
+    ] {
+        let source = PostgresSource::new(PostgresSourceConfig::new(&url, query))
+            .await
+            .expect("source");
+        let rows = source.fetch_all().await.expect(query);
+        assert_eq!(rows, vec![json!({"n": "2.25"})], "{query}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
