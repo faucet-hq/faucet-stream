@@ -2916,7 +2916,8 @@ impl faucet_core::Sink for BigQuerySink {
                 .await?;
         }
         for c in &evolution.widenings {
-            let bq = idempotent::base_to_bq(
+            let bq = idempotent::widened_bq_type(
+                c.from.as_ref().and_then(faucet_core::json_schema_base_type),
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text),
             );
             self.run_ddl(idempotent::build_alter_type_ddl(&table_ref, &c.name, bq))

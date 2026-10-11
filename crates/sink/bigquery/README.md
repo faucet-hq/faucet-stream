@@ -299,7 +299,7 @@ See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 Under `on_drift: evolve`, `BigQuerySink::evolve_schema()` applies `ALTER TABLE` DDL, each statement run as its own `jobs.query` job and verified to completion:
 
 - **New columns** → `ADD COLUMN IF NOT EXISTS <col> <type>` (idempotent).
-- **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN <col> SET DATA TYPE <type>` — gated on `allow_type_widening`.
+- **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN <col> SET DATA TYPE <type>` — gated on `allow_type_widening`. An `INT64` column that starts receiving fractions becomes `BIGNUMERIC`, which holds every `INT64` and the fraction exactly (`FLOAT64` would round stored values above 2^53).
 - **Nullability relaxations** → `ALTER COLUMN <col> DROP NOT NULL`.
 
 The cached schema is invalidated afterwards so the next page (and the next effectively-once / upsert page) reads the evolved table. Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
