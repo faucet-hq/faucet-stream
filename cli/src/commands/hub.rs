@@ -400,6 +400,15 @@ fn render_list(
             k.description.as_deref().unwrap_or("")
         ));
     }
+    if !cat.incompatible.is_empty() {
+        out.push_str(&format!(
+            "not usable by this faucet ({}):\n",
+            cat.incompatible.len()
+        ));
+        for (p, why) in &cat.incompatible {
+            out.push_str(&format!("  {}  {why}\n", p.display()));
+        }
+    }
     Ok(out)
 }
 
@@ -464,7 +473,7 @@ async fn matrix(a: HubMatrixArgs) -> CliResult<()> {
 async fn lint(a: HubLintArgs) -> CliResult<()> {
     let mut findings: Vec<(String, Vec<String>)> = Vec::new();
     if a.files.is_empty() {
-        let cat = load_catalog(a.hub.as_deref()).await?;
+        let cat = Catalog::load_strict(&hub::resolve_hub(a.hub.as_deref()).await?)?;
         findings = hub::catalog::lint_catalog(&cat);
         let suites = hub::catalog::load_test_suites(&cat.root)?;
         let mut files: Vec<std::path::PathBuf> = cat
@@ -893,6 +902,19 @@ mod tests {
         })
         .await
         .expect("one file lints clean");
+    }
+
+    #[test]
+    fn list_names_templates_this_faucet_cannot_use() {
+        let dir = std::path::Path::new(&repo_hub()).to_path_buf();
+        let mut cat = Catalog::load(&dir).unwrap();
+        cat.incompatible.push((
+            "source-templates/faucet-hq/future.yaml".into(),
+            "this source template requires faucet >=999".into(),
+        ));
+        let out = render_list(&cat, None, hub::trust::SortBy::Name, false).unwrap();
+        assert!(out.contains("not usable by this faucet (1)"), "{out}");
+        assert!(out.contains("future.yaml  this source template requires faucet >=999"));
     }
 
     #[test]

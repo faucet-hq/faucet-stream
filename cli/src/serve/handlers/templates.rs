@@ -379,6 +379,7 @@ pub async fn template_matrix(State(state): State<ServerState>) -> Result<Json<Va
         root: std::path::PathBuf::new(),
         sources,
         sinks,
+        incompatible: Vec::new(),
     };
     Ok(Json(crate::hub::catalog::index_json_with(
         &cat,
