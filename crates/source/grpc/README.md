@@ -106,7 +106,7 @@ faucet run pipeline.yaml
 | `terminate_on_error` | bool | `false` | Server-streaming only. `true` propagates a transient stream error on first failure; `false` reconnects with backoff. |
 | `reconnect_initial_backoff` | int (seconds) | `1` | Server-streaming only. Initial reconnect backoff; doubles each failure up to `reconnect_max_backoff`. Must be `> 0`. |
 | `reconnect_max_backoff` | int (seconds) | `30` | Server-streaming only. Upper bound on reconnect backoff. |
-| `reconnect_max_attempts` | int \| null | `10` | Server-streaming only. Max consecutive reconnect attempts before surfacing the error; the count resets whenever a message arrives. `null` = unlimited. |
+| `reconnect_max_attempts` | int \| null | `10` | Server-streaming only. Max consecutive reconnect attempts before surfacing the error; the count resets whenever a message arrives, and an idle reconnect (`idle_timeout`) never counts. `null` = unlimited. |
 | `reconnect_replay_from_start` | bool | `false` | Server-streaming only. `false` emits every message received after a reconnect (at-least-once). `true` skips as many messages as were already emitted — only for a server that re-streams the same messages in the same order from message 0; on a live feed it drops new messages. See [Reconnect](#reconnect-on-transient-errors). |
 | `connect_timeout` | int (seconds) \| null | `10` | Time allowed to open the connection. `null` waits indefinitely. |
 | `timeout` | int (seconds) \| null | `30` | Time allowed for a unary call, or for a server-streaming call to start. A timed-out stream start is retried. `null` waits indefinitely. |
@@ -265,7 +265,9 @@ When `rpc_kind: server_streaming`, the source calls `tonic::client::Grpc::server
 
 #### Reconnect on transient errors
 
-Transient stream errors trigger a reconnect with exponential backoff from `reconnect_initial_backoff`, doubling up to `reconnect_max_backoff`; after `reconnect_max_attempts` consecutive failures (10 by default) the error is surfaced. Transient means a failed connect, a stream start slower than `timeout`, no message within `idle_timeout`, or a status of `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`, `UNKNOWN` or `INTERNAL` (dropped connections surface as the last two). Every other status, an auth or metadata error, a protobuf decode error (`DATA_LOSS`), an oversized message (`OUT_OF_RANGE`) and a `records_path` error fail the run at once. Set `terminate_on_error: true` to fail on the first transient error too.
+Transient stream errors trigger a reconnect with exponential backoff from `reconnect_initial_backoff`, doubling up to `reconnect_max_backoff`; after `reconnect_max_attempts` consecutive failures (10 by default) the error is surfaced. Transient means a failed connect, a stream start slower than `timeout`, or a status of `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`, `UNKNOWN` or `INTERNAL` (dropped connections surface as the last two). Every other status, an auth or metadata error, a protobuf decode error (`DATA_LOSS`), an oversized message (`OUT_OF_RANGE`) and a `records_path` error fail the run at once. Set `terminate_on_error: true` to fail on the first transient error too.
+
+No message within `idle_timeout` also reopens the stream, but a quiet feed is not a failure: those reconnects are not counted against `reconnect_max_attempts`. Records that have not filled a page are sent after 5 seconds without a new message, and before any reconnect, so a sparse feed never holds them back. With `reconnect_replay_from_start: false` (the default), a server that re-streams from the start on every call delivers a duplicate burst after each idle reconnect — raise `idle_timeout` (or set it to `null`) for such feeds, or set `reconnect_replay_from_start: true`.
 
 `UNAUTHENTICATED` with a shared `auth: { ref }` provider invalidates the rejected token and reopens the call once with a fresh one (unary calls too); a second rejection fails the run.
 

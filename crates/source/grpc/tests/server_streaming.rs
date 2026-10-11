@@ -335,23 +335,39 @@ async fn pages_are_yielded_before_the_stream_ends() {
     }
 }
 
-/// #789 API-05: a stream that goes quiet is treated as stalled and the
-/// reconnect budget bounds the run.
+/// #789 API-05 / #862 M-078: a stream that goes quiet is reconnected, and a
+/// quiet feed is not a failure, so the idle reconnects do not spend the
+/// reconnect budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stalled_stream_hits_the_idle_timeout() {
+async fn a_quiet_stream_reconnects_without_spending_the_budget() {
     let server = common::start_server().await;
     let config = tail(&server, json!({ "count": 0, "hold_open": true }))
-        .idle_timeout(Some(std::time::Duration::from_millis(200)))
+        .idle_timeout(Some(std::time::Duration::from_millis(100)))
         .reconnect_max_attempts(1);
-    let err = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
         GrpcStream::new(config).unwrap().fetch_all(),
     )
-    .await
-    .expect("the idle timeout ends the run")
-    .expect_err("the stream never finishes");
-    assert!(err.to_string().contains("received no message"), "{err}");
-    assert_eq!(server.tail_attempts.load(Ordering::SeqCst), 2);
+    .await;
+    assert!(outcome.is_err(), "a quiet feed keeps running: {outcome:?}");
+    assert!(server.tail_attempts.load(Ordering::SeqCst) > 2);
+}
+
+/// #862 M-078: a record that does not fill a page is sent once the feed goes
+/// quiet rather than held until the page fills.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_page_is_flushed_while_the_feed_is_quiet() {
+    let server = common::start_server().await;
+    let config = tail(&server, json!({ "count": 1, "hold_open": true })).with_batch_size(10);
+    let stream = GrpcStream::new(config).unwrap();
+    let ctx = std::collections::HashMap::new();
+    let mut pages = stream.stream_pages(&ctx, 10);
+    let page = tokio::time::timeout(std::time::Duration::from_secs(15), pages.next())
+        .await
+        .expect("the buffered record is flushed")
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.records.len(), 1);
 }
 
 /// #789 API-05: a unary call slower than `timeout` fails instead of hanging.
