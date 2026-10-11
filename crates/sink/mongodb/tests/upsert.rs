@@ -213,3 +213,24 @@ async fn write_batch_partial_routes_missing_key_per_row() {
         "_id=1 must be present with name 'ok'"
     );
 }
+
+/// #862 M-018: `7` and `"7"` are two `_id`s in MongoDB, so one page holding
+/// both writes both documents.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_of_different_json_types_are_two_documents() {
+    let (_container, uri) = start_mongo().await;
+    let sink = MongoSink::new(upsert_config(&uri, None))
+        .await
+        .expect("sink new");
+    sink.write_batch(&[
+        serde_json::json!({"_id": 7, "v": "a"}),
+        serde_json::json!({"_id": "7", "v": "b"}),
+    ])
+    .await
+    .expect("write");
+    assert_eq!(count_docs(&uri, "testdb", "docs").await, 2);
+    let int_doc = find_one_by_id(&uri, "testdb", "docs", 7)
+        .await
+        .expect("the integer key's document");
+    assert_eq!(int_doc.get_str("v").unwrap(), "a");
+}
