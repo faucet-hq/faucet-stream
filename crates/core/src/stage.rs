@@ -722,6 +722,38 @@ pub struct CdcUnwrapSpec {
     /// under the old key. Empty (the default) disables the check.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key: Vec<String>,
+    /// What to do with an update whose `after` image is partial: the source
+    /// listed columns it did not re-send (Postgres unchanged-TOAST columns,
+    /// `__unchanged_toast__`). Each such column is first filled from the
+    /// `before` image when it carries one (`REPLICA IDENTITY FULL`). A column
+    /// still missing means the new row is unknown; an upsert sink would replace
+    /// or null it. Default `fail`.
+    #[serde(default)]
+    pub on_partial_row: CdcPartialRow,
+}
+
+/// [`CdcUnwrapSpec::on_partial_row`] policy.
+#[cfg(feature = "transform-cdc-unwrap")]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcPartialRow {
+    /// Fail the run with a typed error naming the table and the columns.
+    #[default]
+    Fail,
+    /// Emit the row without the missing columns. Safe only for a sink that
+    /// appends or merges column-wise; an upsert that replaces the row loses
+    /// those columns' values.
+    Pass,
 }
 
 /// [`CdcUnwrapSpec::on_missing_image`] policy.
@@ -788,6 +820,7 @@ impl Default for CdcUnwrapSpec {
             drop_ops: cdc_default_drop_ops(),
             on_missing_image: CdcMissingImage::Fail,
             key: Vec::new(),
+            on_partial_row: CdcPartialRow::Fail,
         }
     }
 }
@@ -853,14 +886,10 @@ impl CompiledCdcUnwrap {
                 }
             };
         };
-        // Drop the source's unchanged-TOAST marker (#670 L27). It is *envelope
-        // metadata* — postgres-cdc stamps it to say which columns the WAL did
-        // not carry — not a column of the row. Left in place it reaches an
-        // upsert sink as a literal `__unchanged_toast__` column, which either
-        // fails the write or creates a junk column nobody asked for. The
-        // columns it names still carry their (stale) values; handling that is
-        // the upsert key's job, not this stage's.
-        map.remove(CDC_UNCHANGED_TOAST_FIELD);
+        let elided = map.remove(CDC_UNCHANGED_TOAST_FIELD);
+        if !is_delete {
+            self.complete_partial_row(&rec, &mut map, elided, op)?;
+        }
         let marker = if is_delete { "d" } else { "u" };
         map.insert(s.marker_field.clone(), Value::String(marker.to_string()));
         let mut out = Vec::with_capacity(2);
@@ -869,6 +898,54 @@ impl CompiledCdcUnwrap {
         }
         out.push(Value::Object(map));
         Ok(out)
+    }
+
+    /// Fill the columns the source did not re-send from the `before` image, and
+    /// apply `on_partial_row` to any still missing.
+    fn complete_partial_row(
+        &self,
+        rec: &Value,
+        map: &mut serde_json::Map<String, Value>,
+        elided: Option<Value>,
+        op: &str,
+    ) -> Result<(), FaucetError> {
+        let Some(Value::Array(cols)) = elided else {
+            return Ok(());
+        };
+        let s = &self.spec;
+        let before = rec.get(&s.before_field).and_then(Value::as_object);
+        let mut missing = Vec::new();
+        for col in cols.iter().filter_map(Value::as_str) {
+            match before.and_then(|b| b.get(col)) {
+                Some(v) => {
+                    map.insert(col.to_owned(), v.clone());
+                }
+                None => missing.push(col.to_owned()),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let table = match (
+            rec.get("schema").and_then(Value::as_str),
+            rec.get("table").and_then(Value::as_str),
+        ) {
+            (Some(schema), Some(table)) => format!(" on {schema}.{table}"),
+            (None, Some(table)) => format!(" on {table}"),
+            _ => String::new(),
+        };
+        match s.on_partial_row {
+            CdcPartialRow::Fail => Err(FaucetError::Transform(format!(
+                "cdc_unwrap: a change event (op {op:?}){table} does not carry the current value \
+                 of {} — the source did not re-send it (an unchanged out-of-line value) and the \
+                 `{}` image has no copy, so an upsert would replace or null it. Set \
+                 `ALTER TABLE … REPLICA IDENTITY FULL` on the source table, or \
+                 `on_partial_row: pass` when the sink appends or merges column-wise",
+                missing.join(", "),
+                s.before_field
+            ))),
+            CdcPartialRow::Pass => Ok(()),
+        }
     }
 
     /// A delete row for the old key when an update changed the row's `key`
@@ -2191,8 +2268,11 @@ mod tests {
     #[cfg(feature = "transform-cdc-unwrap")]
     #[test]
     fn cdc_unwrap_strips_the_unchanged_toast_marker() {
-        let stages =
-            vec![compile_stage(&TransformStage::CdcUnwrap(CdcUnwrapSpec::default())).unwrap()];
+        let spec = CdcUnwrapSpec {
+            on_partial_row: CdcPartialRow::Pass,
+            ..CdcUnwrapSpec::default()
+        };
+        let stages = vec![compile_stage(&TransformStage::CdcUnwrap(spec)).unwrap()];
         let env = json!({
             "op": "update",
             "after": { "id": 1, "name": "a", CDC_UNCHANGED_TOAST_FIELD: ["blob"] },
@@ -2208,6 +2288,48 @@ mod tests {
         assert_eq!(row["id"], json!(1));
         assert_eq!(row["name"], json!("a"));
         assert_eq!(row[CDC_DEFAULT_MARKER_FIELD], json!("u"));
+    }
+
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_refuses_an_update_missing_an_unchanged_toast_value() {
+        let stages =
+            vec![compile_stage(&TransformStage::CdcUnwrap(CdcUnwrapSpec::default())).unwrap()];
+        let env = json!({
+            "op": "update", "schema": "public", "table": "docs", "before": null,
+            "after": { "id": 1, "title": "x", CDC_UNCHANGED_TOAST_FIELD: ["body"] },
+        });
+        let err = apply_stages(env, &stages).unwrap_err().to_string();
+        assert!(err.contains("public.docs"), "{err}");
+        assert!(err.contains("body"), "{err}");
+        assert!(err.contains("REPLICA IDENTITY FULL"), "{err}");
+
+        let bare = json!({
+            "op": "update", "table": "docs",
+            "after": { "id": 1, CDC_UNCHANGED_TOAST_FIELD: ["body"] },
+        });
+        let err = apply_stages(bare, &stages).unwrap_err().to_string();
+        assert!(err.contains(" on docs "), "{err}");
+        let nameless =
+            json!({"op": "update", "after": { "id": 1, CDC_UNCHANGED_TOAST_FIELD: ["body"] }});
+        assert!(apply_stages(nameless, &stages).is_err());
+    }
+
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_fills_unchanged_toast_values_from_the_before_image() {
+        let stages =
+            vec![compile_stage(&TransformStage::CdcUnwrap(CdcUnwrapSpec::default())).unwrap()];
+        let env = json!({
+            "op": "update",
+            "before": { "id": 1, "title": "old", "body": "big" },
+            "after": { "id": 1, "title": "new", CDC_UNCHANGED_TOAST_FIELD: ["body"] },
+        });
+        let out = apply_stages(env, &stages).unwrap();
+        assert_eq!(
+            out,
+            vec![json!({"id": 1, "title": "new", "body": "big", "__op": "u"})]
+        );
     }
 
     /// Deletes take the `before` image, which carries the marker too.

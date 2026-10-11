@@ -798,13 +798,23 @@ For each change event it:
 - **fails the run** on an event it cannot turn into a row (an update with no
   `after`, a delete with no key) unless `on_missing_image: drop`, because
   dropping it would leave the mirror silently out of date;
+- **completes a partial update**: postgres-cdc lists in `__unchanged_toast__` the
+  large out-of-line columns an update did not re-send. Each is filled from the
+  `before` image (present under `REPLICA IDENTITY FULL`); one still missing
+  **fails the run** (`on_partial_row: fail`), because an upsert would replace or
+  null the column. Set `REPLICA IDENTITY FULL` on such tables, or
+  `on_partial_row: pass` for a sink that appends or merges column-wise. The
+  marker itself never reaches the sink;
 - stamps every emitted row with a `marker_field` (`__op`) set to the normalized
   value **`"d"`** (delete) or **`"u"`** (upsert) — *not* the raw op code. A
   downstream sink's `delete_marker` should therefore match `"d"`;
-- with `key` set (the sink's upsert `key`), turns an update that **changed the
-  key** — `before` and `after` disagree on a key column — into a delete of the
-  old key followed by the upsert of the new row. Without it a mirror keeps the
-  row under its old key forever:
+- with `key` set, turns an update that **changed the key** — `before` and
+  `after` disagree on a key column — into a delete of the old key followed by
+  the upsert of the new row. Without it a mirror keeps the row under its old
+  key forever. When the sink is keyed (`write_mode: upsert` / `delete`) and the
+  transform sets no `key`, the sink's `key` is used — per table in a
+  multi-table mirror. Set it explicitly only when a later transform renames the
+  key columns:
 
   ```yaml
   transforms:
@@ -830,7 +840,8 @@ key-changing update) and runs in declaration order like any other transform.
 | `delete_ops` | `["d", "delete"]` | `op` values that mean delete |
 | `drop_ops` | `["ddl", "truncate"]` | `op` values dropped entirely |
 | `on_missing_image` | `fail` | `fail` or `drop` an event with no usable row image |
-| `key` | `[]` | Key columns; an update whose `before` key differs from its `after` key also deletes the old key |
+| `key` | the keyed sink's `key`, else `[]` | Key columns; an update whose `before` key differs from its `after` key also deletes the old key |
+| `on_partial_row` | `fail` | `fail` or `pass` an update whose `after` image lacks columns the source did not re-send and `before` cannot supply |
 
 The defaults span all three CDC vocabularies seen in the wild — `insert` /
 `update` / `delete` / `truncate`, `c` / `u` / `d` / `ddl`, and `c` / `u` / `r` /

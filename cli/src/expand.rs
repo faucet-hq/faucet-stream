@@ -876,6 +876,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             &mut transforms,
             row_id,
         )?;
+        apply_cdc_unwrap_key(&merged_sink.config, &mut transforms);
         let state = row.state.clone().or_else(|| cfg.pipeline.state.clone());
         // Row override wins; fall back to the top-level delivery mode.
         let delivery = row.delivery.unwrap_or(cfg.delivery);
@@ -1652,6 +1653,33 @@ fn apply_cdc_image_policy(
     Ok(())
 }
 
+/// Give a `cdc_unwrap` with no `key` the keyed sink's `key` (#862 M-033), so an
+/// update that changes the primary key also deletes the row under the old key.
+/// A mirror's per-table sink config carries that table's key, so each table
+/// gets its own.
+fn apply_cdc_unwrap_key(sink_config: &Value, transforms: &mut [TransformSpec]) {
+    let keyed = matches!(
+        sink_config.get("write_mode").and_then(Value::as_str),
+        Some("upsert" | "delete")
+    );
+    let Some(Value::Array(key)) = sink_config.get("key") else {
+        return;
+    };
+    if !keyed || key.is_empty() || !key.iter().all(Value::is_string) {
+        return;
+    }
+    for t in transforms.iter_mut().filter(|t| t.kind == "cdc_unwrap") {
+        if t.config.is_null() {
+            t.config = Value::Object(serde_json::Map::new());
+        }
+        if let Value::Object(map) = &mut t.config
+            && !map.contains_key("key")
+        {
+            map.insert("key".into(), Value::Array(key.clone()));
+        }
+    }
+}
+
 /// The single top-level `reconcile:` count describes one dataset, and each
 /// root invocation is compared with it on its own (#789 CLI-56): a config with
 /// several root invocations — two rows, or one partitioned row — would fail
@@ -2383,6 +2411,56 @@ mod tests {
             kind: "cdc_unwrap".into(),
             config,
         }]
+    }
+
+    #[test]
+    fn cdc_unwrap_takes_the_keyed_sink_key_unless_it_sets_one() {
+        let sink = serde_json::json!({"write_mode": "upsert", "key": ["id", "region"]});
+        let mut ts = cdc_unwrap(serde_json::json!({}));
+        apply_cdc_unwrap_key(&sink, &mut ts);
+        assert_eq!(ts[0].config["key"], serde_json::json!(["id", "region"]));
+
+        let mut ts = cdc_unwrap(serde_json::Value::Null);
+        apply_cdc_unwrap_key(&sink, &mut ts);
+        assert_eq!(ts[0].config["key"], serde_json::json!(["id", "region"]));
+
+        let mut ts = cdc_unwrap(serde_json::json!({"key": ["other"]}));
+        apply_cdc_unwrap_key(&sink, &mut ts);
+        assert_eq!(ts[0].config["key"], serde_json::json!(["other"]));
+
+        for sink in [
+            serde_json::json!({"write_mode": "append", "key": ["id"]}),
+            serde_json::json!({"key": ["id"]}),
+            serde_json::json!({"write_mode": "upsert", "key": []}),
+            serde_json::json!({"write_mode": "upsert"}),
+            serde_json::json!({"write_mode": "delete", "key": [1]}),
+        ] {
+            let mut ts = cdc_unwrap(serde_json::json!({}));
+            apply_cdc_unwrap_key(&sink, &mut ts);
+            assert!(ts[0].config.get("key").is_none(), "{sink}");
+        }
+    }
+
+    #[test]
+    fn expand_derives_the_cdc_unwrap_key_from_the_sink() {
+        let cfg = PipelineConfig::from_text(
+            r#"
+version: 1
+name: m
+pipeline:
+  source: { type: postgres-cdc, config: { connection_url: "postgres://u@h/db", slot_name: s, publication_name: p } }
+  transforms: [ { type: cdc_unwrap } ]
+  sink: { type: postgres, config: { connection_url: "postgres://u@h/db", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id], delete_marker: { field: __op, values: [d] } } }
+  state: { type: file, config: { path: ./state } }
+"#,
+            std::path::Path::new("test.yaml"),
+        )
+        .unwrap();
+        let nodes = expand(&cfg).unwrap();
+        assert_eq!(
+            nodes[0].transforms[0].config["key"],
+            serde_json::json!(["id"])
+        );
     }
 
     #[test]
