@@ -1821,7 +1821,16 @@ async fn connect_postgres(
     {
         return Err(crate::error::CliError::Serve(e.to_string()));
     }
-    Ok(into_history(result, idem, "postgres"))
+    let (url, instance_id) = (url.to_string(), instance_id.to_string());
+    let connector: fallback::PrimaryConnector = Box::new(move || {
+        let (url, instance_id) = (url.clone(), instance_id.clone());
+        Box::pin(async move {
+            postgres::PostgresHistory::connect(&url, idem, lease_ttl, instance_id)
+                .await
+                .map(|h| Box::new(h) as Box<dyn RunHistory>)
+        })
+    });
+    Ok(into_history(result, idem, "postgres", connector))
 }
 
 #[cfg(not(feature = "serve-history-postgres"))]
@@ -1854,7 +1863,16 @@ async fn connect_sqlite(
     {
         return Err(crate::error::CliError::Serve(e.to_string()));
     }
-    Ok(into_history(result, idem, "sqlite"))
+    let (url, instance_id) = (url.to_string(), instance_id.to_string());
+    let connector: fallback::PrimaryConnector = Box::new(move || {
+        let (url, instance_id) = (url.clone(), instance_id.clone());
+        Box::pin(async move {
+            sqlite::SqliteHistory::connect(&url, idem, lease_ttl, instance_id)
+                .await
+                .map(|h| Box::new(h) as Box<dyn RunHistory>)
+        })
+    });
+    Ok(into_history(result, idem, "sqlite", connector))
 }
 
 #[cfg(not(feature = "serve-history-sqlite"))]
@@ -1926,6 +1944,7 @@ fn into_history<H: RunHistory + 'static>(
     result: Result<H, HistoryError>,
     idem: Duration,
     label: &'static str,
+    connector: fallback::PrimaryConnector,
 ) -> Arc<dyn RunHistory> {
     match result {
         Ok(backend) => Arc::new(fallback::FallbackHistory::healthy(
@@ -1936,9 +1955,11 @@ fn into_history<H: RunHistory + 'static>(
         Err(e) => {
             tracing::error!(
                 backend = label, error = %e,
-                "run-history backend unavailable at startup; starting DEGRADED on in-memory store"
+                "run-history backend unavailable at startup; starting DEGRADED on in-memory \
+                 store and reconnecting (templates, tenants, change requests and idempotency \
+                 answer 503 until it is reached)"
             );
-            Arc::new(fallback::FallbackHistory::degraded_at_startup(idem, label))
+            Arc::new(fallback::FallbackHistory::connecting(connector, idem, label))
         }
     }
 }

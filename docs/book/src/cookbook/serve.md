@@ -213,8 +213,10 @@ returned to the request that hit it and never degrades the server.
 While degraded, run records, logs, audit, catalog and usage go to an in-memory
 store so runs keep going. Templates, tenants, connections, change requests and
 `queue_depth` trigger edges are **not** served from that empty store: those
-requests fail with `503` until the backend is back. Every lease tick probes the
-backend and leaves degraded mode as soon as it answers; records written to
+requests, and submissions with an idempotency key, fail with `503` until the
+backend is back. Every lease tick probes the backend — or, when it was
+unreachable at startup, tries to connect it again — and leaves degraded mode as
+soon as it answers; records written to
 memory meanwhile are not copied back. Terminal records are retained for
 `--retain-terminal-runs-secs` (default 7 days).
 

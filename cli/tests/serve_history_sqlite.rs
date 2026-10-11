@@ -2048,3 +2048,29 @@ async fn release_shard_is_owner_fenced_and_requeues() {
     assert_eq!((progress.pending, progress.running), (1, 0));
     assert_eq!(b.claim_shards(1).await.unwrap().len(), 1, "a peer resumes it");
 }
+
+/// #862 M-004: a history that cannot be opened at startup is reconnected
+/// once it can be, and shared state waits for it instead of using memory.
+#[tokio::test]
+async fn a_history_unreachable_at_startup_is_reconnected() {
+    use faucet_cli::serve::config::HistoryBackendSpec;
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("later");
+    let url = format!("sqlite:{}/h.db", missing.display());
+    let h = faucet_cli::serve::history::connect(
+        &HistoryBackendSpec::Sqlite(url),
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        "i",
+    )
+    .await
+    .unwrap();
+    assert!(h.degraded());
+    assert!(h.trigger_edge_rise("q").await.is_err(), "no memory answer");
+    assert!(!h.recover_degraded().await);
+    std::fs::create_dir(&missing).unwrap();
+    assert!(h.recover_degraded().await);
+    assert!(!h.degraded());
+    assert!(h.trigger_edge_rise("q").await.unwrap().is_some());
+    assert!(missing.join("h.db").exists());
+}
