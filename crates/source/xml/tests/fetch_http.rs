@@ -440,3 +440,19 @@ async fn no_records_path_returns_whole_document() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["root"]["name"], "Z");
 }
+
+#[tokio::test]
+async fn a_response_cut_off_mid_document_fails_the_fetch() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<root><item><id>1</id></item><item><id>2</id>"),
+        )
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/feed.xml").records_element_path("root.item");
+    let err = XmlStream::new(config).fetch_all().await.unwrap_err();
+    assert!(err.to_string().contains("truncated"), "{err}");
+}
