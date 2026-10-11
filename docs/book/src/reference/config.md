@@ -239,7 +239,11 @@ parameter**, never spliced into the SQL text, because its value comes from
 another system. A token may stand alone (`WHERE id = ${p.id}`) or be a whole
 quoted literal (`WHERE name = '${p.name}'`); a token embedded in a longer
 literal (`'x-${p.id}'`), inside a quoted identifier or inside a comment cannot
-be bound and is refused when the config loads. A token that fills a `table`,
+be bound and is refused when the config loads. The value binds with the type
+its text had in the SQL: a quoted literal binds as text (a number becomes its
+digits), and a bare token holding an integer as a string (`"42"`, the usual
+shape of an API id) binds as that integer; anything else keeps its JSON type,
+so compare a string value with a numeric column through a `CAST`. A token that fills a `table`,
 `table_name`, `table_id`, `collection`, `index`, `schema` or `dataset` field
 must resolve to a plain identifier (letters, digits, `_`, `.`, `-`, `$`).
 `${now.*}` is the run clock, not upstream data, and still substitutes as text.
