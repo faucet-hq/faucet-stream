@@ -232,8 +232,8 @@ $ faucet dlq discard ./dlq/contract_breaches.jsonl --reason contract --before 7d
 DLQ discard: archived 42 envelope(s) across 1 file(s) → ./dlq/contract_breaches.jsonl.archived
 ```
 
-The DLQ file itself is never rewritten — a running pipeline may be appending to
-it, and a rewrite would lose what it appends meanwhile. Instead each discarded
+By default the DLQ file itself is not rewritten — a running pipeline may be
+appending to it, and a rewrite would lose what it appends meanwhile. Instead each discarded
 envelope is recorded in a `<file>.discarded` sidecar, and `inspect`, `replay`,
 `discard` and `faucet status` skip the lines it lists. By default discarded
 envelopes are also copied to a `<file>.archived` sibling; `--delete` only
@@ -246,6 +246,12 @@ directory never brings discarded envelopes back. Name an archive file
 explicitly to read it. `--reason` and `--before` (an RFC3339 timestamp
 or a relative age like `7d` / `24h` / `30m`) select what to discard — everything
 else, including non-envelope lines, is left untouched.
+
+A discarded envelope's payload stays in the file. When it must not be kept — PII
+that reached the DLQ after a masking mistake, say — add `--purge`: every discarded
+envelope is removed from the file itself (an atomic rewrite), with no archive.
+Run it while nothing writes the DLQ; a file that changes during the rewrite is
+refused rather than losing the new lines.
 
 ## Encryption at rest
 

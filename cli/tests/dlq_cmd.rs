@@ -85,6 +85,7 @@ async fn discard_human_and_json_render() {
             reason: Some("quality".into()),
             before: Some("1s".into()),
             delete: false,
+            purge: false,
             json: false,
         }),
     };
@@ -97,6 +98,7 @@ async fn discard_human_and_json_render() {
             reason: None,
             before: None,
             delete: true,
+            purge: false,
             json: true,
         }),
     };
@@ -110,10 +112,38 @@ async fn discard_human_and_json_render() {
             reason: None,
             before: Some("soon".into()),
             delete: false,
+            purge: false,
             json: false,
         }),
     };
     assert!(dlq::run(bad).await.is_err());
+}
+
+/// #862 M-024: `--purge` removes discarded envelopes from the file itself.
+#[tokio::test]
+async fn discard_purge_removes_the_envelopes_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dlq_file(dir.path());
+    let lines_before = std::fs::read_to_string(&dlq).unwrap().lines().count();
+    for json in [false, true] {
+        let purge = DlqArgs {
+            command: DlqCommand::Discard(DlqDiscardArgs {
+                encryption_key: vec![],
+                encryption_key_file: vec![],
+                location: dlq.to_string_lossy().into_owned(),
+                reason: Some("quality".into()),
+                before: None,
+                delete: false,
+                purge: true,
+                json,
+            }),
+        };
+        dlq::run(purge).await.unwrap();
+    }
+    let after = std::fs::read_to_string(&dlq).unwrap();
+    assert!(after.lines().count() < lines_before, "{after}");
+    assert!(!after.contains("\"quality\""), "{after}");
+    assert!(!dir.path().join("dlq.jsonl.archived").exists());
 }
 
 fn replay_args(config: PathBuf, from: &Path, dry_run: bool, json: bool) -> DlqArgs {
