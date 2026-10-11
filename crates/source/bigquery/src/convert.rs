@@ -118,12 +118,21 @@ fn scalar_or_record(payload: &Value, field: &TableFieldSchema) -> Value {
     }
 }
 
-/// A REST-API TIMESTAMP cell — epoch seconds as decimal text, often in
-/// scientific notation (`"1.7019216E9"`) — as RFC 3339 UTC with the
-/// microseconds BigQuery stores. The text is shifted to microseconds
-/// digit by digit, never through `f64`. `None` when it is not a decimal.
+/// A REST-API TIMESTAMP cell as RFC 3339 UTC with the microseconds BigQuery
+/// stores. The source requests `useInt64Timestamp`, so a cell is normally an
+/// integer count of microseconds (`"253402300799999999"`), exact for every
+/// representable instant. The legacy float form — epoch seconds as decimal
+/// text, often in scientific notation (`"1.7019216E9"`) — is still accepted;
+/// it is shifted to microseconds digit by digit, never through `f64`. `None`
+/// when the text is neither.
 pub(crate) fn timestamp_to_rfc3339(s: &str) -> Option<String> {
     let s = s.trim();
+    let unsigned = s.strip_prefix('-').unwrap_or(s);
+    if !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit()) {
+        let micros: i64 = s.parse().ok()?;
+        let dt = chrono::DateTime::from_timestamp_micros(micros)?;
+        return Some(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+    }
     let (neg, body) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
@@ -271,7 +280,17 @@ mod tests {
             timestamp_to_rfc3339("+0").as_deref(),
             Some("1970-01-01T00:00:00Z")
         );
-        for bad in ["", ".", "x", "1e", "1.2.3", "1e999999"] {
+        assert_eq!(
+            timestamp_to_rfc3339("253402300799999999").as_deref(),
+            Some("9999-12-31T23:59:59.999999Z"),
+            "integer microseconds keep the open-ended sentinel exact"
+        );
+        assert_eq!(
+            timestamp_to_rfc3339("-1500000").as_deref(),
+            Some("1969-12-31T23:59:58.500Z")
+        );
+        assert_eq!(timestamp_to_rfc3339("99999999999999999999"), None);
+        for bad in ["", ".", "x", "1e", "1.2.3", "1e999999", "-"] {
             assert_eq!(timestamp_to_rfc3339(bad), None, "{bad}");
         }
         let row = cells(vec![json!("not-a-time")]);

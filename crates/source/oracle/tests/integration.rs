@@ -122,6 +122,34 @@ async fn oracle_query_source_end_to_end() {
         assert!(again.is_empty(), "{column} resumes past its bookmark");
     }
 
+    // #862 M-067: a VARCHAR2 cursor holding ISO-8601 text keeps working —
+    // the timestamp bind is refused by the column's NLS conversion, and the
+    // query runs again with the bookmark bound as text.
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE T_ISO (ID NUMBER, STAMP VARCHAR2(40))",
+            "INSERT INTO T_ISO VALUES (1, '2024-01-01T00:00:00Z')",
+            "INSERT INTO T_ISO VALUES (2, '2024-02-01T00:00:00Z')",
+        ],
+    )
+    .await;
+    let mut iso = OracleSourceConfig::new(
+        conn.clone(),
+        "SELECT ID, STAMP FROM T_ISO WHERE STAMP > :bookmark ORDER BY ID",
+    );
+    iso.replication = OracleReplication::Incremental {
+        column: "STAMP".into(),
+        initial_value: json!("2024-01-15T00:00:00Z"),
+    };
+    let source = OracleSource::new(iso).await.expect("source");
+    let (rows, bm) = source.fetch_all_incremental().await.expect("text cursor");
+    assert_eq!(
+        rows,
+        vec![json!({"ID": 2, "STAMP": "2024-02-01T00:00:00Z"})]
+    );
+    assert_eq!(bm, Some(json!("2024-02-01T00:00:00Z")));
+
     // PK-range sharding covers every row exactly once.
     let mut sharded = OracleSourceConfig::new(conn.clone(), "SELECT ID FROM T_TYPES");
     sharded.shard = Some(ShardConfig { key: "ID".into() });

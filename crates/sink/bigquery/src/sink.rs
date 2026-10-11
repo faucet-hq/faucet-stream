@@ -35,7 +35,13 @@ const TXN_CONFLICT_ATTEMPTS: u32 = 6;
 /// transaction or DML statement changed the same table. BigQuery reports this
 /// only through the message (its `reason` is the generic `invalidQuery`).
 fn is_concurrent_txn_abort(err: &gcp_bigquery_client::model::error_proto::ErrorProto) -> bool {
-    let msg = err.message.as_deref().unwrap_or("").to_ascii_lowercase();
+    is_concurrent_txn_abort_text(err.message.as_deref().unwrap_or(""))
+}
+
+/// [`is_concurrent_txn_abort`] over error text — the form a `jobs.query`
+/// call that fails synchronously (HTTP 400) reaches the sink in (#862 M-055).
+fn is_concurrent_txn_abort_text(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
     msg.contains("aborted due to concurrent update")
         || msg.contains("could not serialize access to table")
 }
@@ -1792,13 +1798,23 @@ impl BigQuerySink {
             ))
         })?;
         self.ensure_dataset().await?;
-        // Replace only a table verified to exist without a schema; a missing
-        // one is created IF NOT EXISTS, so a concurrent first writer's rows
-        // are never dropped by a second writer's late CREATE OR REPLACE.
-        let ddl = if self.table_exists(&self.config.table_id).await? {
-            ddl
-        } else {
-            idempotent::create_if_missing(&ddl)
+        // Re-probe right before the DDL (the dataset job above takes seconds):
+        // a concurrent first writer may have created the table — with a schema
+        // — and started streaming into it. Such a table is used as-is; only a
+        // table still without a schema is replaced, and a missing one is
+        // created IF NOT EXISTS (#862 M-053).
+        let ddl = match self.fetch_schema_fields().await {
+            Ok(fields) if !fields.is_empty() => {
+                *self.schema_cache.write().await = None;
+                return Ok(());
+            }
+            Ok(_) => ddl,
+            Err(e) if is_table_not_found(&e) => idempotent::create_if_missing(&ddl),
+            Err(e) => {
+                return Err(FaucetError::Sink(format!(
+                    "BigQuery tables.get (schema probe) failed: {e}"
+                )));
+            }
         };
         self.run_ddl(ddl).await?;
         *self.schema_cache.write().await = None;
@@ -1985,13 +2001,25 @@ impl BigQuerySink {
         let mut delay = Duration::from_millis(200);
         for attempt in 1..=TXN_CONFLICT_ATTEMPTS {
             self.roundtrips.record("query");
-            let resp = self
+            // A transaction that aborts inside `jobs.query`'s wait window comes
+            // back as an HTTP error rather than a failed job; it committed
+            // nothing either, so it is retried the same way.
+            let outcome = match self
                 .client
                 .job()
                 .query(&self.config.project_id, req.clone())
                 .await
-                .map_err(|e| FaucetError::Sink(format!("{what} failed: {e}")))?;
-            match self.await_query_job_classified(resp).await {
+            {
+                Ok(resp) => self.await_query_job_classified(resp).await,
+                Err(e) => {
+                    let text = e.to_string();
+                    Err((
+                        FaucetError::Sink(format!("{what} failed: {text}")),
+                        is_concurrent_txn_abort_text(&text),
+                    ))
+                }
+            };
+            match outcome {
                 Ok(job) => return Ok(job),
                 Err((e, true)) if attempt < TXN_CONFLICT_ATTEMPTS => {
                     tracing::warn!(
@@ -2916,7 +2944,8 @@ impl faucet_core::Sink for BigQuerySink {
                 .await?;
         }
         for c in &evolution.widenings {
-            let bq = idempotent::base_to_bq(
+            let bq = idempotent::widened_bq_type(
+                c.from.as_ref().and_then(faucet_core::json_schema_base_type),
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text),
             );
             self.run_ddl(idempotent::build_alter_type_ddl(&table_ref, &c.name, bq))

@@ -248,3 +248,46 @@ async fn an_oversized_exactly_once_page_stays_one_transaction() {
         (inserts + 3).to_string()
     );
 }
+
+#[tokio::test]
+async fn lower_case_fields_land_in_upper_case_columns_without_adding_any() {
+    let server = server_with_columns(json!([["ID", "NUMBER"], ["AMOUNT", "NUMBER"]])).await;
+    let s = sink(config(), &server);
+    s.write_batch(&[json!({"id": 1, "amount": "9.99"})])
+        .await
+        .unwrap();
+    s.flush().await.unwrap();
+    let bodies = bodies(&server).await;
+    let statements: Vec<&str> = bodies
+        .iter()
+        .filter_map(|b| b["statement"].as_str())
+        .collect();
+    assert!(
+        !statements.iter().any(|s| s.contains("ADD COLUMN")),
+        "{statements:?}"
+    );
+    let insert = bodies
+        .iter()
+        .find(|b| {
+            b["statement"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("INSERT"))
+        })
+        .expect("an insert");
+    let sql = insert["statement"].as_str().unwrap();
+    assert!(
+        sql.contains(r#"value:"ID"::string"#) && sql.contains(r#"value:"AMOUNT"::string"#),
+        "{insert}"
+    );
+    assert!(
+        !sql.contains(r#""id""#) && !sql.contains(r#""amount""#),
+        "{insert}"
+    );
+    assert!(
+        insert["bindings"]["1"]["value"]
+            .as_str()
+            .unwrap()
+            .contains(r#""AMOUNT":"9.99""#),
+        "{insert}"
+    );
+}

@@ -133,6 +133,22 @@ async fn decodes_column_types_and_streams_pages() {
     assert_eq!(sizes, vec![2, 2, 1], "batch_size=2 over 5 rows");
     let total: usize = pages.iter().map(|p| p.records.len()).sum();
     assert_eq!(total, 5);
+
+    // Duplicate (or two unaliased) column names are refused, not collapsed.
+    for query in [
+        "SELECT 1 AS n, 2 AS n",
+        "SELECT COUNT(*), MAX(n) FROM dbo.nums",
+    ] {
+        let mut scfg = MssqlSourceConfig::new(cfg.connection_url.clone().unwrap(), query);
+        scfg.connection.tls = cfg.tls.clone();
+        let err = MssqlSource::new(scfg)
+            .await
+            .expect("source")
+            .fetch_all()
+            .await
+            .expect_err("duplicate names");
+        assert!(err.to_string().contains("two columns named"), "{err}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -944,39 +944,51 @@ impl SqliteSink {
         Ok(total)
     }
 
-    /// Apply a planned upsert/delete batch inside one `BEGIN`/`COMMIT`
-    /// transaction. Upserts and deletes are wrapped together so they commit
-    /// atomically.
-    async fn apply_plan(&self, plan: &faucet_core::WritePlan) -> Result<usize, FaucetError> {
+    /// Apply planned upsert/delete groups inside one `BEGIN`/`COMMIT`
+    /// transaction, so they commit atomically.
+    async fn apply_plans(&self, plans: &[faucet_core::WritePlan]) -> Result<usize, FaucetError> {
         let mut tx = self
             .pool
             .begin_with(BEGIN_WRITE)
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
-
-        // `rollback.journal`: before-images commit with the writes (#706).
-        if self.config.write.journals()
-            && let Some(run_id) = self.config.write.rollback_run_id()
-        {
-            self.journal_plan(&mut tx, plan, run_id).await?;
-        }
-        let mut affected = 0usize;
-        if !plan.upserts.is_empty() {
-            affected += self
-                .insert_auto_map_with_conflict_tx(
-                    &mut tx,
-                    &plan.upserts,
-                    Some(&self.config.write.key),
-                )
-                .await?;
-        }
-        if !plan.deletes.is_empty() {
-            affected += self.delete_by_keys(&mut tx, &plan.deletes).await?;
-        }
-
+        let affected = self.apply_plans_in(&mut tx, plans).await?;
         tx.commit()
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite transaction commit failed: {e}")))?;
+        Ok(affected)
+    }
+
+    /// Each plan's upserts then deletes, in page order, on the caller's
+    /// transaction. Plans come from [`faucet_core::plan_writes_ordered`], so a
+    /// delete that precedes an upsert of a key equal under a `NOCASE` key
+    /// column runs before it rather than after.
+    async fn apply_plans_in(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        plans: &[faucet_core::WritePlan],
+    ) -> Result<usize, FaucetError> {
+        let mut affected = 0usize;
+        for plan in plans {
+            // `rollback.journal`: before-images commit with the writes (#706).
+            if self.config.write.journals()
+                && let Some(run_id) = self.config.write.rollback_run_id()
+            {
+                self.journal_plan(tx, plan, run_id).await?;
+            }
+            if !plan.upserts.is_empty() {
+                affected += self
+                    .insert_auto_map_with_conflict_tx(
+                        tx,
+                        &plan.upserts,
+                        Some(&self.config.write.key),
+                    )
+                    .await?;
+            }
+            if !plan.deletes.is_empty() {
+                affected += self.delete_by_keys(tx, &plan.deletes).await?;
+            }
+        }
         Ok(affected)
     }
 
@@ -1478,7 +1490,12 @@ impl faucet_core::Sink for SqliteSink {
                     self.config.write.write_mode.as_str()
                 )));
             }
-            return self.apply_plan(&plan).await;
+            return self
+                .apply_plans(&faucet_core::plan_writes_ordered(
+                    records,
+                    &self.config.write,
+                ))
+                .await;
         }
 
         // `batch_size = 0` is the "no batching" sentinel: write the entire
@@ -1557,7 +1574,11 @@ impl faucet_core::Sink for SqliteSink {
         }
 
         let plan = faucet_core::plan_writes(records, &self.config.write);
-        self.apply_plan(&plan).await?;
+        self.apply_plans(&faucet_core::plan_writes_ordered(
+            records,
+            &self.config.write,
+        ))
+        .await?;
 
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {
@@ -1625,28 +1646,14 @@ impl faucet_core::Sink for SqliteSink {
         // land or neither does, which is what makes a replay skip-on-resume
         // produce zero duplicates. For upsert/delete the planned upserts/deletes
         // commit together with the watermark in this same tx (no nested tx —
-        // we reuse `apply_plan`'s helpers directly on this transaction).
+        // we reuse `apply_plans_in` directly on this transaction).
         let written = match &plan {
-            Some(plan) => {
-                if self.config.write.journals()
-                    && let Some(run_id) = self.config.write.rollback_run_id()
-                {
-                    self.journal_plan(&mut tx, plan, run_id).await?;
-                }
-                let mut affected = 0usize;
-                if !plan.upserts.is_empty() {
-                    affected += self
-                        .insert_auto_map_with_conflict_tx(
-                            &mut tx,
-                            &plan.upserts,
-                            Some(&self.config.write.key),
-                        )
-                        .await?;
-                }
-                if !plan.deletes.is_empty() {
-                    affected += self.delete_by_keys(&mut tx, &plan.deletes).await?;
-                }
-                affected
+            Some(_) => {
+                self.apply_plans_in(
+                    &mut tx,
+                    &faucet_core::plan_writes_ordered(records, &self.config.write),
+                )
+                .await?
             }
             None => match &self.config.column_mapping {
                 SqliteColumnMapping::Json { column } => {

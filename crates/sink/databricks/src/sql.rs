@@ -381,6 +381,32 @@ pub fn build_matrix(records: &[Value], table: &[TableColumn]) -> Result<Matrix, 
         .filter(|(_, p)| **p)
         .map(|(c, _)| c.clone())
         .collect();
+    let nested: Vec<(&TableColumn, NestedType)> = columns
+        .iter()
+        .filter_map(|c| match parse_nested_type(&c.full_type) {
+            Some(NestedType::Scalar) | None => None,
+            Some(t) => Some((c, t)),
+        })
+        .collect();
+    if !nested.is_empty() {
+        let mut unknown_nested: Vec<String> = Vec::new();
+        for r in records {
+            let obj = r.as_object().expect("checked above");
+            for (c, t) in &nested {
+                if let Some((k, v)) = obj.iter().find(|(k, _)| k.eq_ignore_ascii_case(&c.name)) {
+                    unknown_nested_keys(v, t, k, &mut unknown_nested);
+                }
+            }
+        }
+        if !unknown_nested.is_empty() {
+            unknown_nested.sort();
+            return Err(FaucetError::Sink(format!(
+                "databricks sink: nested field(s) {} are not in the destination column's type \
+                 and would be dropped; add them to the column type or drop them with a transform",
+                unknown_nested.join(", ")
+            )));
+        }
+    }
     let rows = records
         .iter()
         .map(|r| {
@@ -396,6 +422,192 @@ pub fn build_matrix(records: &[Value], table: &[TableColumn]) -> Result<Matrix, 
         })
         .collect();
     Ok(Matrix { columns, rows })
+}
+
+/// A Databricks complex type, as far as nested-key checks need it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NestedType {
+    Struct(Vec<(String, NestedType)>),
+    Array(Box<NestedType>),
+    Map(Box<NestedType>),
+    Scalar,
+}
+
+/// Parse a `full_data_type` (`struct<a:int,b:array<struct<x:string>>>`, any
+/// case, spacing, backticked names, `NOT NULL` / `COMMENT '…'` field
+/// modifiers). `None` when the text is not understood — the check is then
+/// skipped rather than refusing a write it cannot judge.
+pub(crate) fn parse_nested_type(text: &str) -> Option<NestedType> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut pos = 0;
+    let t = parse_type(&chars, &mut pos)?;
+    skip_ws(&chars, &mut pos);
+    (pos == chars.len()).then_some(t)
+}
+
+fn skip_ws(c: &[char], pos: &mut usize) {
+    while *pos < c.len() && c[*pos].is_whitespace() {
+        *pos += 1;
+    }
+}
+
+fn word(c: &[char], pos: &mut usize) -> String {
+    let start = *pos;
+    while *pos < c.len() && (c[*pos].is_ascii_alphanumeric() || c[*pos] == '_') {
+        *pos += 1;
+    }
+    c[start..*pos].iter().collect()
+}
+
+fn expect(c: &[char], pos: &mut usize, ch: char) -> Option<()> {
+    skip_ws(c, pos);
+    (c.get(*pos) == Some(&ch)).then(|| *pos += 1)
+}
+
+fn field_name(c: &[char], pos: &mut usize) -> Option<String> {
+    skip_ws(c, pos);
+    if c.get(*pos) == Some(&'`') {
+        *pos += 1;
+        let mut name = String::new();
+        loop {
+            match c.get(*pos)? {
+                '`' if c.get(*pos + 1) == Some(&'`') => {
+                    name.push('`');
+                    *pos += 2;
+                }
+                '`' => {
+                    *pos += 1;
+                    return Some(name);
+                }
+                ch => {
+                    name.push(*ch);
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    let w = word(c, pos);
+    (!w.is_empty()).then_some(w)
+}
+
+/// Skip field modifiers (`NOT NULL`, `COMMENT '…'`) up to the next `,` / `>`.
+fn skip_modifiers(c: &[char], pos: &mut usize) -> Option<()> {
+    loop {
+        skip_ws(c, pos);
+        match c.get(*pos)? {
+            ',' | '>' => return Some(()),
+            '\'' | '"' => {
+                let q = c[*pos];
+                *pos += 1;
+                while *pos < c.len() {
+                    if c[*pos] == '\\' {
+                        *pos += 2;
+                        continue;
+                    }
+                    if c[*pos] == q {
+                        break;
+                    }
+                    *pos += 1;
+                }
+                *pos += 1;
+            }
+            ch if ch.is_ascii_alphanumeric() || *ch == '_' => {
+                word(c, pos);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn parse_type(c: &[char], pos: &mut usize) -> Option<NestedType> {
+    skip_ws(c, pos);
+    let w = word(c, pos);
+    match w.to_ascii_lowercase().as_str() {
+        "" => None,
+        "struct" => {
+            expect(c, pos, '<')?;
+            let mut fields = Vec::new();
+            skip_ws(c, pos);
+            if c.get(*pos) == Some(&'>') {
+                *pos += 1;
+                return Some(NestedType::Struct(fields));
+            }
+            loop {
+                let name = field_name(c, pos)?;
+                skip_ws(c, pos);
+                if c.get(*pos) == Some(&':') {
+                    *pos += 1;
+                }
+                let t = parse_type(c, pos)?;
+                skip_modifiers(c, pos)?;
+                fields.push((name, t));
+                match c.get(*pos)? {
+                    ',' => *pos += 1,
+                    _ => {
+                        *pos += 1;
+                        return Some(NestedType::Struct(fields));
+                    }
+                }
+            }
+        }
+        "array" => {
+            expect(c, pos, '<')?;
+            let t = parse_type(c, pos)?;
+            expect(c, pos, '>')?;
+            Some(NestedType::Array(Box::new(t)))
+        }
+        "map" => {
+            expect(c, pos, '<')?;
+            parse_type(c, pos)?;
+            expect(c, pos, ',')?;
+            let v = parse_type(c, pos)?;
+            expect(c, pos, '>')?;
+            Some(NestedType::Map(Box::new(v)))
+        }
+        _ => {
+            skip_ws(c, pos);
+            if c.get(*pos) == Some(&'(') {
+                while *pos < c.len() && c[*pos] != ')' {
+                    *pos += 1;
+                }
+                expect(c, pos, ')')?;
+            }
+            Some(NestedType::Scalar)
+        }
+    }
+}
+
+/// Dotted paths of the keys in `v` that `t` has no field for. Spark's JSON
+/// reader ignores such keys in every mode — even `FAILFAST` — so they would
+/// vanish silently (#862 M-059). Field names match ignoring case, as Spark's
+/// default resolution does.
+pub(crate) fn unknown_nested_keys(v: &Value, t: &NestedType, path: &str, out: &mut Vec<String>) {
+    match (t, v) {
+        (NestedType::Struct(fields), Value::Object(obj)) => {
+            for (k, child) in obj {
+                let sub = format!("{path}.{k}");
+                match fields.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)) {
+                    Some((_, ft)) => unknown_nested_keys(child, ft, &sub, out),
+                    None => {
+                        if !out.contains(&sub) {
+                            out.push(sub);
+                        }
+                    }
+                }
+            }
+        }
+        (NestedType::Array(inner), Value::Array(items)) => {
+            for item in items {
+                unknown_nested_keys(item, inner, &format!("{path}[]"), out);
+            }
+        }
+        (NestedType::Map(inner), Value::Object(obj)) => {
+            for child in obj.values() {
+                unknown_nested_keys(child, inner, &format!("{path}{{}}"), out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Where a statement reads the page's string cells from.
@@ -1076,6 +1288,59 @@ mod tests {
         );
         assert_eq!(m.row_sizes(), vec![5 + 5 + 4 + 4, 5 + 4 + 9 + 4]);
         assert_eq!(m.estimated_bytes(), 18 + 22);
+    }
+
+    #[test]
+    fn nested_types_parse_in_every_spelling() {
+        use super::{NestedType::*, parse_nested_type};
+        assert_eq!(parse_nested_type("bigint"), Some(Scalar));
+        assert_eq!(parse_nested_type("decimal(10,2)"), Some(Scalar));
+        assert_eq!(
+            parse_nested_type(
+                "STRUCT<a: INT NOT NULL COMMENT 'x, y>', `b c`: ARRAY<STRUCT<x:STRING>>>"
+            ),
+            Some(Struct(vec![
+                ("a".into(), Scalar),
+                (
+                    "b c".into(),
+                    Array(Box::new(Struct(vec![("x".into(), Scalar)])))
+                ),
+            ]))
+        );
+        assert_eq!(
+            parse_nested_type("map<string,struct<v:int>>"),
+            Some(Map(Box::new(Struct(vec![("v".into(), Scalar)]))))
+        );
+        assert_eq!(parse_nested_type("struct<>"), Some(Struct(vec![])));
+        assert_eq!(parse_nested_type("struct<a:int"), None);
+        assert_eq!(parse_nested_type("array<int> trailing"), None);
+        assert_eq!(
+            parse_nested_type("struct<`a``b`:int>"),
+            Some(Struct(vec![("a`b".into(), Scalar)]))
+        );
+        assert_eq!(parse_nested_type(""), None);
+    }
+
+    #[test]
+    fn unknown_nested_keys_are_reported_not_dropped() {
+        let table = vec![
+            TableColumn::new("id", "bigint"),
+            TableColumn::new(
+                "meta",
+                "struct<a:int,tags:array<struct<k:string>>,m:map<string,struct<v:int>>>",
+            ),
+        ];
+        let err = build_matrix(
+            &[json!({
+                "id": 1,
+                "meta": {"A": 1, "b": 2, "tags": [{"k": "x", "z": 1}], "m": {"q": {"v": 1, "w": 2}}}
+            })],
+            &table,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("meta.b, meta.m{}.w, meta.tags[].z"), "{err}");
+        assert!(build_matrix(&[json!({"id": 1, "meta": {"a": 1, "tags": null}})], &table).is_ok());
     }
 
     #[test]

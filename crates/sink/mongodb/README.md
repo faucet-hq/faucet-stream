@@ -327,7 +327,7 @@ This crate has no optional features of its own; enable it in the CLI / umbrella 
 
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **per-row** for `append` / `overwrite` — `write_batch_partial` maps `insert_many`'s write errors to the rejected documents (a duplicate `_id`, a validation failure, a non-object record), inserts every other document (under `ordered: true` it resumes after the rejected one), and fails outright only while nothing has been inserted. `upsert` / `delete` are **best-effort** — per-document upserts are not transactional. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **per-row** for `append` / `overwrite` — `write_batch_partial` maps `insert_many`'s write errors to the rejected documents (a duplicate `_id`, a validation failure, a non-object record), inserts every other document (under `ordered: true` it resumes after the rejected one), and fails outright only while nothing has been inserted. A write-concern error (`w: majority` timing out, say) means the server applied the inserts but could not confirm the concern, so those documents are reported as written (with a warning) and only their write errors fail. `upsert` / `delete` are **best-effort** — per-document upserts are not transactional. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

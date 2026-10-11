@@ -4,8 +4,9 @@
 //! (and than `faucet-core`'s columnar API), so a Delta schema or batch cannot be
 //! handed across as-is. Values cross through the Arrow IPC stream format, which
 //! is stable across Arrow versions: schema metadata, nested types, dictionaries
-//! and null buffers survive unchanged. A batch crossing costs one buffer copy;
-//! a schema crossing happens once per run.
+//! and null buffers survive unchanged. A batch crosses through the Arrow C Data
+//! Interface instead — the same ABI in every Arrow major — so its buffers are
+//! shared, not copied.
 
 use std::io::Cursor;
 
@@ -47,32 +48,72 @@ pub fn schema_to_delta(
 }
 
 /// A workspace Arrow batch as a batch `deltalake`'s writers accept.
+///
+/// The buffers cross through the Arrow C Data Interface, which is the same
+/// ABI in every Arrow major: the batch is exported as one struct array and
+/// imported on the other side without copying a buffer (#862 M-068). Only the
+/// schema (a few hundred bytes) is re-encoded, to keep its metadata.
 pub fn batch_to_delta(
     batch: &arrow::record_batch::RecordBatch,
 ) -> Result<delta_arrow::record_batch::RecordBatch, FaucetError> {
-    let mut buf = Vec::new();
-    {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
-            .map_err(|e| bridge_error("encode batch", &e))?;
-        writer
-            .write(batch)
-            .map_err(|e| bridge_error("encode batch", &e))?;
-        writer
-            .finish()
-            .map_err(|e| bridge_error("encode batch", &e))?;
-    }
-    let mut reader = delta_arrow::ipc::reader::StreamReader::try_new(Cursor::new(buf), None)
-        .map_err(|e| bridge_error("decode batch", &e))?;
-    first_batch(reader.next())
+    let exported = arrow::array::Array::into_data(arrow::array::StructArray::from(batch.clone()));
+    let (array, schema) =
+        arrow::ffi::to_ffi(&exported).map_err(|e| bridge_error("export batch", &e))?;
+    let (array, schema) = into_delta_ffi(array, schema);
+    // SAFETY: `array` / `schema` were produced by `to_ffi` just above, describe
+    // one valid struct array, and are consumed exactly once here.
+    let imported = unsafe { delta_arrow::ffi::from_ffi(array, &schema) }
+        .map_err(|e| bridge_error("import batch", &e))?;
+    let columns = delta_arrow::array::StructArray::from(imported)
+        .columns()
+        .to_vec();
+    let schema = schema_to_delta(&batch.schema())?;
+    delta_arrow::record_batch::RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &delta_arrow::record_batch::RecordBatchOptions::new()
+            .with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| bridge_error("import batch", &e))
 }
 
-/// The single batch a one-batch IPC stream decodes to.
-fn first_batch(
-    next: Option<Result<delta_arrow::record_batch::RecordBatch, delta_arrow::error::ArrowError>>,
-) -> Result<delta_arrow::record_batch::RecordBatch, FaucetError> {
-    match next {
-        Some(batch) => batch.map_err(|e| bridge_error("decode batch", &e)),
-        None => Err(bridge_error("decode batch", &"the stream held no batch")),
+const _: () = {
+    use std::mem::{align_of, size_of};
+    assert!(
+        size_of::<arrow::ffi::FFI_ArrowArray>() == size_of::<delta_arrow::ffi::FFI_ArrowArray>()
+    );
+    assert!(
+        align_of::<arrow::ffi::FFI_ArrowArray>() == align_of::<delta_arrow::ffi::FFI_ArrowArray>()
+    );
+    assert!(
+        size_of::<arrow::ffi::FFI_ArrowSchema>() == size_of::<delta_arrow::ffi::FFI_ArrowSchema>()
+    );
+    assert!(
+        align_of::<arrow::ffi::FFI_ArrowSchema>()
+            == align_of::<delta_arrow::ffi::FFI_ArrowSchema>()
+    );
+};
+
+/// Re-type the C Data Interface structs one Arrow major exported as the other
+/// major's. Both are `#[repr(C)]` renderings of the same C structs (sizes are
+/// checked at compile time above); ownership — the `release` callback — moves
+/// with the bits, so the originals are not dropped.
+fn into_delta_ffi(
+    array: arrow::ffi::FFI_ArrowArray,
+    schema: arrow::ffi::FFI_ArrowSchema,
+) -> (
+    delta_arrow::ffi::FFI_ArrowArray,
+    delta_arrow::ffi::FFI_ArrowSchema,
+) {
+    let array = std::mem::ManuallyDrop::new(array);
+    let schema = std::mem::ManuallyDrop::new(schema);
+    // SAFETY: identical `#[repr(C)]` layouts (asserted above); the sources are
+    // never used or dropped again, so the release callbacks run exactly once.
+    unsafe {
+        (
+            std::ptr::read(&*array as *const _ as *const delta_arrow::ffi::FFI_ArrowArray),
+            std::ptr::read(&*schema as *const _ as *const delta_arrow::ffi::FFI_ArrowSchema),
+        )
     }
 }
 
@@ -195,19 +236,37 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_without_a_batch_is_an_error() {
-        let err = first_batch(None).unwrap_err().to_string();
-        assert!(
-            err.contains("arrow bridge could not decode batch: the stream held no batch"),
-            "{err}"
-        );
+    fn batch_buffers_are_shared_not_copied() {
+        let batch = nested_batch();
+        let delta = batch_to_delta(&batch).unwrap();
+        let ours = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .as_ptr();
+        let theirs = delta
+            .column(0)
+            .as_any()
+            .downcast_ref::<delta_arrow::array::Int32Array>()
+            .unwrap()
+            .values()
+            .as_ptr();
+        assert_eq!(ours, theirs, "the value buffer crossed without a copy");
     }
 
     #[test]
-    fn a_batch_that_fails_to_decode_is_an_error() {
-        let decode = delta_arrow::error::ArrowError::IpcError("truncated".into());
-        let err = first_batch(Some(Err(decode))).unwrap_err().to_string();
-        assert!(err.contains("arrow bridge could not decode batch"), "{err}");
-        assert!(err.contains("truncated"), "{err}");
+    fn a_sliced_batch_keeps_its_offset() {
+        let batch = nested_batch().slice(1, 1);
+        let delta = batch_to_delta(&batch).unwrap();
+        assert_eq!(delta.num_rows(), 1);
+        let ids = delta
+            .column(0)
+            .as_any()
+            .downcast_ref::<delta_arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[2]);
+        assert!(delta.column(1).is_null(0));
     }
 }

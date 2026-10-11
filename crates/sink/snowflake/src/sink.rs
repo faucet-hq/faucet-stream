@@ -53,6 +53,26 @@ pub struct SnowflakeSink {
 /// escaping.
 pub const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
+/// Snowflake's recommended ceiling for one request's SQL text, literals
+/// included. A larger statement is truncated in query history (so it cannot
+/// be retried from there) and some deployments reject it with HTTP 413.
+pub const RECOMMENDED_STATEMENT_BYTES: usize = 1024 * 1024;
+
+/// Warn when an inlined multi-statement request exceeds
+/// [`RECOMMENDED_STATEMENT_BYTES`]; returns whether it did (#862 M-063).
+fn warn_if_oversized_statement(sql: &str) -> bool {
+    if sql.len() <= RECOMMENDED_STATEMENT_BYTES {
+        return false;
+    }
+    tracing::warn!(
+        bytes = sql.len(),
+        limit = RECOMMENDED_STATEMENT_BYTES,
+        "snowflake: an inlined transaction exceeds Snowflake's 1 MB recommended statement size; \
+         lower the source's batch_size if the request is rejected"
+    );
+    true
+}
+
 /// What the sink knows about the target's columns.
 #[derive(Debug, Default)]
 struct TableColumns {
@@ -123,6 +143,7 @@ impl SnowflakeSink {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| (done, e))?;
                 let sql = format!("BEGIN;\n{};\nCOMMIT;", inserts.join(";\n"));
+                warn_if_oversized_statement(&sql);
                 let parameters =
                     json!({ "MULTI_STATEMENT_COUNT": (inserts.len() + 2).to_string() });
                 self.execute_statement(&sql, None, Some(parameters))
@@ -210,7 +231,7 @@ impl SnowflakeSink {
                 return Ok(());
             };
             match slot.as_ref() {
-                Some(cols) if cols.known => missing_columns(records, &cols.names),
+                Some(cols) if cols.known => missing_columns(records, &cols.names)?,
                 _ => return Ok(()),
             }
         };
@@ -260,32 +281,52 @@ impl SnowflakeSink {
         Ok(table_columns(resp.data.unwrap_or_default()))
     }
 
-    /// `records` with offset-bearing ISO strings in `TIMESTAMP_NTZ` columns
-    /// converted to UTC wall time.
-    fn normalize_ntz(&self, records: &[Value]) -> Vec<Value> {
-        let ntz = self
+    /// `records` shaped for the target: a field with no exactly-named column
+    /// is renamed to the one column whose name matches it ignoring case — a
+    /// table created with unquoted identifiers stores `ID`, while most sources
+    /// emit `id` (#862 H-11) — and offset-bearing ISO strings in
+    /// `TIMESTAMP_NTZ` columns are converted to UTC wall time.
+    fn normalize_records(&self, records: &[Value]) -> Result<Vec<Value>, FaucetError> {
+        let (names, ntz) = self
             .columns
             .lock()
             .ok()
-            .and_then(|c| c.as_ref().map(|c| c.ntz.clone()))
+            .and_then(|c| {
+                c.as_ref()
+                    .filter(|c| c.known)
+                    .map(|c| (c.names.clone(), c.ntz.clone()))
+            })
             .unwrap_or_default();
-        if ntz.is_empty() {
-            return records.to_vec();
+        if names.is_empty() {
+            return Ok(records.to_vec());
         }
         records
             .iter()
             .map(|r| {
-                let mut r = r.clone();
-                if let Some(obj) = r.as_object_mut() {
-                    for col in &ntz {
-                        if let Some(Value::String(s)) = obj.get(col)
-                            && let Some(utc) = utc_wall_time(s)
-                        {
-                            obj.insert(col.clone(), Value::String(utc));
-                        }
+                let Some(obj) = r.as_object() else {
+                    return Ok(r.clone());
+                };
+                let mut out = serde_json::Map::with_capacity(obj.len());
+                for (key, value) in obj {
+                    let column = match resolve_column(key, &names) {
+                        ColumnMatch::Folded(column) => column,
+                        _ => key.clone(),
+                    };
+                    if out.contains_key(&column) {
+                        return Err(FaucetError::Sink(format!(
+                            "snowflake: a record has two fields that both map to column \
+                             {column} (names differ only in case)"
+                        )));
                     }
+                    let value = match value {
+                        Value::String(s) if ntz.contains(&column) => utc_wall_time(s)
+                            .map(Value::String)
+                            .unwrap_or_else(|| value.clone()),
+                        _ => value.clone(),
+                    };
+                    out.insert(column, value);
                 }
-                r
+                Ok(Value::Object(out))
             })
             .collect()
     }
@@ -614,16 +655,18 @@ impl SnowflakeSink {
     /// `OBJECT` / `ARRAY`) is stringified by the `::string` cast rather than
     /// stored as structured JSON; this sink maps records to scalar columns.
     fn build_insert(&self, records: &[Value]) -> Result<(String, String), FaucetError> {
-        let payload = Value::Array(self.normalize_ntz(records)).to_string();
-        Ok((self.insert_from(records, "?")?, payload))
+        let records = self.normalize_records(records)?;
+        let sql = self.insert_from(&records, "?")?;
+        Ok((sql, Value::Array(records).to_string()))
     }
 
     /// The page INSERT with its JSON payload inlined as an escaped string
     /// literal, for the multi-statement exactly-once request where the SQL API
     /// accepts no bindings (SQL-44).
     fn build_insert_inline(&self, records: &[Value]) -> Result<String, FaucetError> {
-        let payload = Value::Array(self.normalize_ntz(records)).to_string();
-        self.insert_from(records, &idempotent::sql_string_literal(&payload))
+        let records = self.normalize_records(records)?;
+        let payload = Value::Array(records.clone()).to_string();
+        self.insert_from(&records, &idempotent::sql_string_literal(&payload))
     }
 
     /// `INSERT … SELECT … FROM TABLE(FLATTEN(input => PARSE_JSON(<input>)))`.
@@ -675,19 +718,60 @@ fn size_chunks(rows: &[Value], max_bytes: usize) -> Vec<std::ops::Range<usize>> 
     out
 }
 
-/// Fields of `records` that are not columns of the table, in first-seen order.
-fn missing_columns(records: &[Value], names: &std::collections::HashSet<String>) -> Vec<String> {
+/// How a record field resolves against the table's column names.
+#[derive(Debug, PartialEq)]
+enum ColumnMatch {
+    Exact,
+    /// The one column matching ignoring case.
+    Folded(String),
+    /// Several columns match ignoring case and none exactly.
+    Ambiguous(Vec<String>),
+    Missing,
+}
+
+fn resolve_column(key: &str, names: &std::collections::HashSet<String>) -> ColumnMatch {
+    if names.contains(key) {
+        return ColumnMatch::Exact;
+    }
+    let mut folded: Vec<String> = names
+        .iter()
+        .filter(|n| n.eq_ignore_ascii_case(key))
+        .cloned()
+        .collect();
+    folded.sort();
+    match folded.len() {
+        0 => ColumnMatch::Missing,
+        1 => ColumnMatch::Folded(folded.remove(0)),
+        _ => ColumnMatch::Ambiguous(folded),
+    }
+}
+
+/// Fields of `records` that match no column of the table, exactly or ignoring
+/// case, in first-seen order. A field matching several columns only by case
+/// is an error: picking one would be a guess.
+fn missing_columns(
+    records: &[Value],
+    names: &std::collections::HashSet<String>,
+) -> Result<Vec<String>, FaucetError> {
     let mut missing: Vec<String> = Vec::new();
     for key in records
         .iter()
         .filter_map(Value::as_object)
         .flat_map(|o| o.keys())
     {
-        if !names.contains(key) && !missing.contains(key) {
-            missing.push(key.clone());
+        match resolve_column(key, names) {
+            ColumnMatch::Missing if !missing.contains(key) => missing.push(key.clone()),
+            ColumnMatch::Ambiguous(columns) => {
+                return Err(FaucetError::Sink(format!(
+                    "snowflake: field {key} matches columns {} only ignoring case; \
+                     rename the field to one of them",
+                    columns.join(", ")
+                )));
+            }
+            _ => {}
         }
     }
-    missing
+    Ok(missing)
 }
 
 /// Build [`TableColumns`] from `information_schema.columns` rows
@@ -941,6 +1025,7 @@ impl faucet_core::Sink for SnowflakeSink {
             (sql, idempotent::COMMIT_ONLY_STATEMENT_COUNT + inserts.len())
         };
 
+        warn_if_oversized_statement(&sql);
         let parameters = json!({ "MULTI_STATEMENT_COUNT": count.to_string() });
         self.execute_statement(&sql, None, Some(parameters)).await?;
 
@@ -1130,7 +1215,8 @@ mod tests {
         let missing = missing_columns(
             &[json!({"ID": 1, "A": 2}), json!({"B": 1, "A": 3}), json!(5)],
             &cols.names,
-        );
+        )
+        .unwrap();
         assert_eq!(missing, vec!["A", "B"]);
         assert_eq!(
             utc_wall_time("2024-01-02T03:04:05.25+05:30").as_deref(),
@@ -1138,6 +1224,74 @@ mod tests {
         );
         assert_eq!(utc_wall_time("2024-01-02T03:04:05").as_deref(), None);
         assert_eq!(utc_wall_time("plain"), None);
+    }
+
+    #[test]
+    fn fields_match_columns_ignoring_case_when_unambiguous() {
+        let cols = table_columns(vec![
+            vec![json!("ID"), json!("NUMBER")],
+            vec![json!("AMOUNT"), json!("NUMBER")],
+            vec![json!("Mixed"), json!("TEXT")],
+            vec![json!("MIXED"), json!("TEXT")],
+            vec![json!("CREATED"), json!("TIMESTAMP_NTZ")],
+        ]);
+        assert_eq!(resolve_column("ID", &cols.names), ColumnMatch::Exact);
+        assert_eq!(
+            resolve_column("amount", &cols.names),
+            ColumnMatch::Folded("AMOUNT".into())
+        );
+        assert_eq!(
+            resolve_column("mixed", &cols.names),
+            ColumnMatch::Ambiguous(vec!["MIXED".into(), "Mixed".into()])
+        );
+        assert_eq!(resolve_column("note", &cols.names), ColumnMatch::Missing);
+        assert_eq!(
+            missing_columns(&[json!({"id": 1, "amount": 2, "note": 3})], &cols.names).unwrap(),
+            vec!["note"]
+        );
+        let err = missing_columns(&[json!({"mixed": 1})], &cols.names).unwrap_err();
+        assert!(err.to_string().contains("only ignoring case"), "{err}");
+
+        let sink = SnowflakeSink::new(SnowflakeSinkConfig::new(
+            "acct",
+            "wh",
+            "db",
+            "schema",
+            "ORDERS",
+            SnowflakeAuth::OAuth { token: "t".into() },
+        ))
+        .unwrap();
+        *sink.columns.lock().unwrap() = Some(cols);
+        let out = sink
+            .normalize_records(&[
+                json!({"id": 1, "amount": "9.99", "created": "2024-01-02T03:04:05Z"}),
+                json!(7),
+            ])
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                json!({"ID": 1, "AMOUNT": "9.99", "CREATED": "2024-01-02T03:04:05"}),
+                json!(7)
+            ]
+        );
+        let err = sink
+            .normalize_records(&[json!({"id": 1, "ID": 2})])
+            .unwrap_err();
+        assert!(err.to_string().contains("both map to column ID"), "{err}");
+        let (sql, _) = sink.build_insert(&[json!({"id": 1})]).unwrap();
+        assert!(
+            sql.contains("(\"ID\") SELECT value:\"ID\"::string"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn oversized_inline_statements_are_flagged() {
+        assert!(!warn_if_oversized_statement("BEGIN; COMMIT;"));
+        assert!(warn_if_oversized_statement(
+            &"x".repeat(RECOMMENDED_STATEMENT_BYTES + 1)
+        ));
     }
 
     #[test]

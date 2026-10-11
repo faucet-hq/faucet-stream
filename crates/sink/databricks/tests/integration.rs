@@ -110,6 +110,20 @@ async fn unknown_columns_and_missing_table_are_typed_errors() {
     assert!(err.contains("extra") && err.contains("on_drift"), "{err}");
 
     let wh = Warehouse::start().await;
+    wh.on(
+        DESCRIBE,
+        columns(&[("id", "bigint"), ("payload", "struct<a:int>")]),
+    );
+    let s = sink(&wh, |_| {});
+    let err = s
+        .write_batch(&[json!({"id": 1, "payload": {"a": 1, "b": 2}})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("payload.b"), "{err}");
+    assert!(wh.writes().is_empty(), "nothing is written");
+
+    let wh = Warehouse::start().await;
     let s = sink(&wh, |c| c.create_table = false);
     let err = s.write_batch(&[json!({"id": 1})]).await.unwrap_err();
     assert!(err.to_string().contains("does not exist"), "{err}");

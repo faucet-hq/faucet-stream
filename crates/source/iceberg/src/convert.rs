@@ -27,9 +27,10 @@ pub fn type_to_json_schema(ty: &Type) -> Value {
         Type::Primitive(p) => match p {
             PrimitiveType::Boolean => json!({ "type": "boolean" }),
             PrimitiveType::Int | PrimitiveType::Long => json!({ "type": "integer" }),
-            PrimitiveType::Float | PrimitiveType::Double | PrimitiveType::Decimal { .. } => {
-                json!({ "type": "number" })
-            }
+            // Rows carry NaN / ±Infinity as strings and every digit of a
+            // decimal as a string, so the schema says so (#862 M-062).
+            PrimitiveType::Float | PrimitiveType::Double => json!({ "type": ["number", "string"] }),
+            PrimitiveType::Decimal { .. } => json!({ "type": "string", "format": "decimal" }),
             PrimitiveType::Date => json!({ "type": "string", "format": "date" }),
             PrimitiveType::Time => json!({ "type": "string", "format": "time" }),
             PrimitiveType::Timestamp
@@ -264,8 +265,9 @@ mod tests {
         assert_eq!(p["id"], json!({"type": "integer"}));
         assert_eq!(p["flag"]["type"], json!(["boolean", "null"]));
         assert_eq!(p["n"]["type"], json!(["integer", "null"]));
-        assert_eq!(p["x"]["type"], json!(["number", "null"]));
-        assert_eq!(p["dec"]["type"], json!(["number", "null"]));
+        assert_eq!(p["x"]["type"], json!(["number", "string", "null"]));
+        assert_eq!(p["dec"]["type"], json!(["string", "null"]));
+        assert_eq!(p["dec"]["format"], "decimal");
         assert_eq!(p["d"]["format"], "date");
         assert_eq!(p["t"]["format"], "time");
         assert_eq!(p["ts"]["format"], "date-time");

@@ -92,13 +92,68 @@ pub(crate) fn pg_value_to_json(
             base64::engine::general_purpose::STANDARD.encode(v),
         ));
     }
-    if let Ok(v) = row.try_get_unchecked::<String, _>(col_name) {
+    // `oid` and the `reg*` aliases are 4-byte unsigned integers on the wire.
+    if is_oid_family(&type_name)
+        && let Ok(v) = row.try_get_unchecked::<sqlx::postgres::types::Oid, _>(col_name)
+    {
+        return Ok(Value::Number(v.0.into()));
+    }
+    // Last resort: the cell's text form. sqlx asks for binary results, so a
+    // binary cell is only text for types whose binary form *is* their text;
+    // anything else (an int array, EWKB) would decode as garbage that happens
+    // to be valid UTF-8, so it is refused (#862 M-057).
+    if text_fallback_allowed(
+        &type_name,
+        raw.format() == sqlx::postgres::PgValueFormat::Text,
+    ) && let Ok(v) = row.try_get_unchecked::<String, _>(col_name)
+    {
         return Ok(Value::String(v));
     }
     Err(FaucetError::Source(format!(
         "redshift: cannot decode column `{col_name}` of type {type_name}; \
          cast it in the query (e.g. `{col_name}::varchar`)"
     )))
+}
+
+/// The `oid` type and its `reg*` aliases.
+fn is_oid_family(type_name: &str) -> bool {
+    matches!(
+        type_name.to_ascii_uppercase().as_str(),
+        "OID"
+            | "REGCLASS"
+            | "REGPROC"
+            | "REGPROCEDURE"
+            | "REGTYPE"
+            | "REGOPER"
+            | "REGOPERATOR"
+            | "REGNAMESPACE"
+            | "REGROLE"
+            | "REGCONFIG"
+            | "REGDICTIONARY"
+            | "XID"
+            | "CID"
+    )
+}
+
+/// Whether a cell of `type_name` may be read as its text form: always for a
+/// text-format cell, and for a binary one only where the binary form is the
+/// UTF-8 text (character types, XML, JSON, SUPER and unknown literals).
+fn text_fallback_allowed(type_name: &str, text_format: bool) -> bool {
+    text_format
+        || matches!(
+            type_name.to_ascii_uppercase().as_str(),
+            "TEXT"
+                | "VARCHAR"
+                | "BPCHAR"
+                | "CHAR"
+                | "NAME"
+                | "CITEXT"
+                | "UNKNOWN"
+                | "XML"
+                | "JSON"
+                | "SUPER"
+                | "\"CHAR\""
+        )
 }
 
 /// A float as a JSON number, or its text when it is not finite (JSON has no
@@ -217,6 +272,19 @@ pub(crate) fn bind_params<'q>(
 
 #[cfg(test)]
 mod tests {
+    use super::{is_oid_family, text_fallback_allowed};
+
+    #[test]
+    fn text_fallback_only_for_text_shaped_binary_cells() {
+        assert!(is_oid_family("regclass") && is_oid_family("OID"));
+        assert!(!is_oid_family("INT4"));
+        assert!(text_fallback_allowed("INT4[]", true));
+        assert!(text_fallback_allowed("SUPER", false));
+        assert!(text_fallback_allowed("xml", false));
+        assert!(!text_fallback_allowed("INT4[]", false));
+        assert!(!text_fallback_allowed("GEOMETRY", false));
+    }
+
     use super::*;
     use serde_json::json;
 

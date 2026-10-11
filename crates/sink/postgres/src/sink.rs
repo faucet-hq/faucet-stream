@@ -1,6 +1,8 @@
 //! PostgreSQL sink implementation.
 
-use crate::config::{PostgresColumnMapping, PostgresSinkConfig, PostgresWriteMethod};
+use crate::config::{
+    BinaryEncoding, BinaryValue, PostgresColumnMapping, PostgresSinkConfig, PostgresWriteMethod,
+};
 use crate::copy::{build_auto_map_payload, build_jsonb_payload, copy_statement};
 use async_trait::async_trait;
 use faucet_core::FaucetError;
@@ -64,13 +66,23 @@ pub(crate) fn split_unmatched(
 /// parses it. For every other type the scalar's plain text form is bound and
 /// the column's input function parses it via the cast.
 pub(crate) fn pg_bind_text(value: Option<&Value>, udt: &str) -> Option<String> {
-    match value {
+    pg_bind_text_with(value, udt, BinaryEncoding::Auto).unwrap_or_default()
+}
+
+/// [`pg_bind_text`] with an explicit [`BinaryEncoding`] for `bytea` columns.
+/// `Err` only under `binary_encoding: base64` for a string that is not base64.
+pub(crate) fn pg_bind_text_with(
+    value: Option<&Value>,
+    udt: &str,
+    binary: BinaryEncoding,
+) -> Result<Option<String>, String> {
+    Ok(match value {
         None | Some(Value::Null) => None,
         Some(v) => {
             if udt.eq_ignore_ascii_case("json") || udt.eq_ignore_ascii_case("jsonb") {
                 Some(v.to_string())
             } else if let (true, Value::String(s)) = (udt.eq_ignore_ascii_case("bytea"), v) {
-                Some(bytea_text(s))
+                Some(bytea_text(s, binary)?)
             } else {
                 match v {
                     Value::Bool(b) => Some(b.to_string()),
@@ -83,34 +95,37 @@ pub(crate) fn pg_bind_text(value: Option<&Value>, udt: &str) -> Option<String> {
                 }
             }
         }
-    }
+    })
 }
 
-/// The `bytea` input text for a string value (#789 SQL-02).
+/// The `bytea` input text for a string value (#789 SQL-02, #862 M-064).
 ///
 /// Every faucet source emits binary as base64 text, and `'SGVsbG8='::bytea`
 /// reads it as escape format — storing the eight ASCII bytes of the base64
-/// spelling. Valid base64 is decoded and rendered as the `\x…` hex input form;
-/// text already in hex form, or that is not base64, is passed through as
-/// before.
-fn bytea_text(s: &str) -> String {
-    use base64::Engine as _;
-    if s.starts_with("\\x") {
-        return s.to_string();
+/// spelling. Under `auto` valid base64 is decoded; text already in the `\x…`
+/// hex input form, or that is not base64, is passed through as before. Under
+/// `text` the string's own bytes are stored; under `base64` every value is
+/// decoded.
+fn bytea_text(s: &str, binary: BinaryEncoding) -> Result<String, String> {
+    if binary == BinaryEncoding::Auto && s.starts_with("\\x") {
+        return Ok(s.to_string());
     }
-    match base64::engine::general_purpose::STANDARD.decode(s) {
-        Ok(bytes) => {
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let mut out = String::with_capacity(2 + bytes.len() * 2);
-            out.push_str("\\x");
-            for b in bytes {
-                out.push(HEX[usize::from(b >> 4)] as char);
-                out.push(HEX[usize::from(b & 0x0f)] as char);
-            }
-            out
-        }
-        Err(_) => s.to_string(),
+    Ok(match binary.resolve(s)? {
+        BinaryValue::Bytes(bytes) => hex_bytea(&bytes),
+        BinaryValue::Text(t) if binary == BinaryEncoding::Text => hex_bytea(t.as_bytes()),
+        BinaryValue::Text(t) => t.to_string(),
+    })
+}
+
+fn hex_bytea(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for b in bytes {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 0x0f)] as char);
     }
+    out
 }
 
 /// Build the SQL relation reference for the configured table, optionally
@@ -349,14 +364,35 @@ pub(crate) async fn column_roles(
     Ok(roles)
 }
 
-/// Foreign keys of *other* tables that reference `table_ref`, as
-/// `(constraint, referencing table, ON DELETE action)`.
+/// A foreign key of another table that references the overwrite target.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReferencingKey {
+    pub(crate) name: String,
+    /// The referencing table, as `regclass` text.
+    pub(crate) child: String,
+    /// `pg_constraint.confdeltype`: `a` no action, `r` restrict, `c` cascade,
+    /// `n` set null, `d` set default.
+    pub(crate) on_delete: char,
+    pub(crate) deferrable: bool,
+    /// Whether any child row sets every column of the key.
+    pub(crate) has_references: bool,
+}
+
+/// Foreign keys of *other* tables that reference `table_ref`.
 pub(crate) async fn referencing_foreign_keys(
     conn: &mut sqlx::PgConnection,
     table_ref: &str,
-) -> Result<Vec<(String, String, char)>, FaucetError> {
+) -> Result<Vec<ReferencingKey>, FaucetError> {
+    let err = |e: sqlx::Error| {
+        FaucetError::Sink(format!("postgres: read foreign keys of {table_ref}: {e}"))
+    };
     let rows = sqlx::query(
-        "SELECT c.conname::text, c.conrelid::regclass::text, c.confdeltype::text \
+        "SELECT c.conname::text, c.conrelid::regclass::text, c.confdeltype::text, \
+                c.condeferrable, \
+                (SELECT string_agg(format('%I IS NOT NULL', a.attname), ' AND ') \
+                   FROM unnest(c.conkey) AS k(attnum) \
+                   JOIN pg_catalog.pg_attribute a \
+                     ON a.attrelid = c.conrelid AND a.attnum = k.attnum) \
          FROM pg_catalog.pg_constraint c \
          WHERE c.contype = 'f' AND c.confrelid = to_regclass($1)::oid \
            AND c.conrelid <> c.confrelid ORDER BY 1",
@@ -364,14 +400,28 @@ pub(crate) async fn referencing_foreign_keys(
     .bind(table_ref)
     .fetch_all(&mut *conn)
     .await
-    .map_err(|e| FaucetError::Sink(format!("postgres: read foreign keys of {table_ref}: {e}")))?;
-    Ok(rows
-        .iter()
-        .map(|r| {
-            let action: String = r.get(2);
-            (r.get(0), r.get(1), action.chars().next().unwrap_or('a'))
-        })
-        .collect())
+    .map_err(err)?;
+    let mut keys = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let action: String = r.get(2);
+        let child: String = r.get(1);
+        let set: Option<String> = r.get(4);
+        let has_references: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM {child} WHERE {})",
+            set.as_deref().unwrap_or("true")
+        ))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(err)?;
+        keys.push(ReferencingKey {
+            name: r.get(0),
+            child,
+            on_delete: action.chars().next().unwrap_or('a'),
+            deferrable: r.get(3),
+            has_references,
+        });
+    }
+    Ok(keys)
 }
 
 /// The statements that empty `target` before it is refilled. `TRUNCATE`
@@ -379,22 +429,43 @@ pub(crate) async fn referencing_foreign_keys(
 /// `DELETE` under deferred constraints — children referencing a key the
 /// refill brings back stay valid, any other reference fails the swap. A
 /// cascading reference is refused: the `DELETE` would remove the children's
-/// rows (#789 SQL-107).
+/// rows (#789 SQL-107). `SET CONSTRAINTS … DEFERRED` only reaches keys
+/// declared `DEFERRABLE`, and `ON DELETE RESTRICT` is always checked at once,
+/// so a non-deferrable or restricting key whose table holds references is
+/// refused too — the `DELETE` would fail at the swap, after the whole load
+/// (#862 M-041).
 pub(crate) fn clear_statements(
     target: &str,
-    referencing: &[(String, String, char)],
+    referencing: &[ReferencingKey],
 ) -> Result<Vec<String>, FaucetError> {
     if referencing.is_empty() {
         return Ok(vec![format!("TRUNCATE TABLE {target}")]);
     }
-    if let Some((name, child, _)) = referencing
+    if let Some(k) = referencing
         .iter()
-        .find(|(_, _, action)| matches!(action, 'c' | 'n' | 'd'))
+        .find(|k| matches!(k.on_delete, 'c' | 'n' | 'd'))
     {
         return Err(FaucetError::Config(format!(
-            "postgres overwrite: {target} is referenced by foreign key {name} on {child} with \
+            "postgres overwrite: {target} is referenced by foreign key {} on {} with \
              ON DELETE CASCADE / SET NULL / SET DEFAULT; replacing its rows would change that \
-             table. Use write_mode: upsert, or change the foreign key"
+             table. Use write_mode: upsert, or change the foreign key",
+            k.name, k.child
+        )));
+    }
+    if let Some(k) = referencing
+        .iter()
+        .find(|k| k.has_references && (k.on_delete == 'r' || !k.deferrable))
+    {
+        let why = if k.on_delete == 'r' {
+            "ON DELETE RESTRICT, which is checked immediately"
+        } else {
+            "not DEFERRABLE, so it is checked before the refill"
+        };
+        return Err(FaucetError::Config(format!(
+            "postgres overwrite: {target} is referenced by foreign key {} on {}, which is {why}; \
+             emptying {target} would fail while {} holds references. Declare the foreign key \
+             DEFERRABLE (ON DELETE NO ACTION), or use write_mode: upsert",
+            k.name, k.child, k.child
         )));
     }
     Ok(vec![
@@ -766,7 +837,8 @@ impl PostgresSink {
             PostgresColumnMapping::AutoMap => {
                 let columns = self.discover_columns(&mut *conn, &table_ref).await?;
                 let Some(payload) =
-                    build_auto_map_payload(records, &columns).map_err(FaucetError::Sink)?
+                    build_auto_map_payload(records, &columns, self.config.binary_encoding)
+                        .map_err(FaucetError::Sink)?
                 else {
                     return Ok(0);
                 };
@@ -1018,7 +1090,13 @@ impl PostgresSink {
                         .iter()
                         .find(|(c, _, _)| *c == col)
                         .map(|(_, _, v)| *v);
-                    q = q.bind(pg_bind_text(val, udt));
+                    q = q.bind(
+                        pg_bind_text_with(val, udt, self.config.binary_encoding).map_err(|e| {
+                            FaucetError::Sink(format!(
+                                "PostgreSQL insert failed: column {col}: {e}"
+                            ))
+                        })?,
+                    );
                 }
             }
 
@@ -1101,8 +1179,11 @@ impl PostgresSink {
             );
             let mut q = sqlx::query(&sql);
             for kt in chunk {
-                for ((_, v), udt) in kt.0.iter().zip(key_udts.iter()) {
-                    q = q.bind(pg_bind_text(Some(v), udt));
+                for ((col, v), udt) in kt.0.iter().zip(key_udts.iter()) {
+                    q = q.bind(
+                        pg_bind_text_with(Some(v), udt, self.config.binary_encoding)
+                            .map_err(|e| FaucetError::Sink(format!("key column {col}: {e}")))?,
+                    );
                 }
             }
             let res = q
@@ -1210,8 +1291,11 @@ impl PostgresSink {
             );
             let mut q = sqlx::query(&sql);
             for kt in chunk {
-                for ((_, v), udt) in kt.0.iter().zip(key_udts.iter()) {
-                    q = q.bind(pg_bind_text(Some(v), udt));
+                for ((col, v), udt) in kt.0.iter().zip(key_udts.iter()) {
+                    q = q.bind(
+                        pg_bind_text_with(Some(v), udt, self.config.binary_encoding)
+                            .map_err(|e| FaucetError::Sink(format!("key column {col}: {e}")))?,
+                    );
                 }
             }
             q.execute(&mut *tx)
@@ -1283,18 +1367,34 @@ impl PostgresSink {
         Ok(affected)
     }
 
-    /// Apply a plan outside an exactly-once transaction. A journaled write
-    /// opens its own transaction so the journal rows and the data commit
-    /// atomically; an unjournaled one keeps the autocommit statements.
-    async fn apply_plan_standalone(
+    /// Each plan in page order on one connection. Plans come from
+    /// [`faucet_core::plan_writes_ordered`], so a delete that precedes an
+    /// upsert of a key equal under a nondeterministic collation runs first.
+    async fn apply_plans(
         &self,
-        plan: &faucet_core::WritePlan,
+        conn: &mut sqlx::PgConnection,
+        plans: &[faucet_core::WritePlan],
     ) -> Result<usize, FaucetError> {
-        if self.config.write.journals() {
+        let mut affected = 0usize;
+        for plan in plans {
+            affected += self.apply_plan(&mut *conn, plan).await?;
+        }
+        Ok(affected)
+    }
+
+    /// Apply plans outside an exactly-once transaction. A journaled write or
+    /// more than one plan opens its own transaction so the groups (and the
+    /// journal rows) commit atomically; a single unjournaled plan keeps the
+    /// autocommit statements.
+    async fn apply_plans_standalone(
+        &self,
+        plans: &[faucet_core::WritePlan],
+    ) -> Result<usize, FaucetError> {
+        if self.config.write.journals() || plans.len() > 1 {
             let mut tx = self.pool.begin().await.map_err(|e| {
                 FaucetError::Sink(format!("PostgreSQL transaction begin failed: {e}"))
             })?;
-            let n = self.apply_plan(&mut tx, plan).await?;
+            let n = self.apply_plans(&mut tx, plans).await?;
             tx.commit().await.map_err(|e| {
                 FaucetError::Sink(format!("PostgreSQL transaction commit failed: {e}"))
             })?;
@@ -1305,7 +1405,7 @@ impl PostgresSink {
             .acquire()
             .await
             .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
-        self.apply_plan(&mut conn, plan).await
+        self.apply_plans(&mut conn, plans).await
     }
 
     /// Ensure the commit-token watermark table exists.
@@ -1358,7 +1458,12 @@ impl PostgresSink {
                     self.config.write.write_mode.as_str()
                 )));
             }
-            return self.apply_plan_standalone(&plan).await;
+            return self
+                .apply_plans_standalone(&faucet_core::plan_writes_ordered(
+                    records,
+                    &self.config.write,
+                ))
+                .await;
         }
         // Append and overwrite are insert-shaped; overwrite writes land in the
         // staging table via `effective_table_name`.
@@ -1434,7 +1539,11 @@ impl PostgresSink {
         }
 
         let plan = faucet_core::plan_writes(records, &self.config.write);
-        self.apply_plan_standalone(&plan).await?;
+        self.apply_plans_standalone(&faucet_core::plan_writes_ordered(
+            records,
+            &self.config.write,
+        ))
+        .await?;
 
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {
@@ -1482,7 +1591,13 @@ impl PostgresSink {
         // produce zero duplicates. For upsert/delete this means the planned
         // upserts/deletes commit together with the watermark in the same tx.
         let written = match &plan {
-            Some(plan) => self.apply_plan(&mut tx, plan).await?,
+            Some(_) => {
+                self.apply_plans(
+                    &mut tx,
+                    &faucet_core::plan_writes_ordered(records, &self.config.write),
+                )
+                .await?
+            }
             None => match &self.config.column_mapping {
                 PostgresColumnMapping::Jsonb { column } => {
                     self.insert_jsonb(&mut tx, records, column).await?
@@ -1987,10 +2102,10 @@ impl faucet_core::Sink for PostgresSink {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnRoles, PostgresSinkConfig, build_add_column_sql, build_alter_type_sql,
-        build_create_table_sql, build_drop_not_null_sql, clear_statements, derived_table_name,
-        on_conflict_clause, pg_bind_text, pg_udt_to_json_schema, qualified_table_ref,
-        split_unmatched, widened_keyword,
+        ColumnRoles, PostgresSinkConfig, ReferencingKey, build_add_column_sql,
+        build_alter_type_sql, build_create_table_sql, build_drop_not_null_sql, clear_statements,
+        derived_table_name, on_conflict_clause, pg_bind_text, pg_udt_to_json_schema,
+        qualified_table_ref, split_unmatched, widened_keyword,
     };
     use super::{
         FaucetError, bootstrap_lock_key, bounded, is_concurrent_ddl, is_concurrent_ddl_code,
@@ -2049,23 +2164,82 @@ mod tests {
         assert_eq!(writable, vec![json!({"id": 1}), json!([1])]);
     }
 
+    fn referencing(on_delete: char, deferrable: bool, has_references: bool) -> ReferencingKey {
+        ReferencingKey {
+            name: "fk".into(),
+            child: "child".into(),
+            on_delete,
+            deferrable,
+            has_references,
+        }
+    }
+
+    #[test]
+    fn bytea_follows_binary_encoding() {
+        use super::{BinaryEncoding, pg_bind_text_with};
+        let v = json!("SGVsbG8=");
+        let bind = |v: &serde_json::Value, e| pg_bind_text_with(Some(v), "bytea", e);
+        assert_eq!(
+            bind(&v, BinaryEncoding::Auto).unwrap().as_deref(),
+            Some(r"\x48656c6c6f")
+        );
+        assert_eq!(
+            bind(&json!(r"\x0a"), BinaryEncoding::Auto)
+                .unwrap()
+                .as_deref(),
+            Some(r"\x0a")
+        );
+        assert_eq!(
+            bind(&json!("plain text"), BinaryEncoding::Auto)
+                .unwrap()
+                .as_deref(),
+            Some("plain text")
+        );
+        assert_eq!(
+            bind(&json!("abcd"), BinaryEncoding::Text)
+                .unwrap()
+                .as_deref(),
+            Some(r"\x61626364")
+        );
+        assert_eq!(
+            bind(&v, BinaryEncoding::Base64).unwrap().as_deref(),
+            Some(r"\x48656c6c6f")
+        );
+        let err = bind(&json!("abc"), BinaryEncoding::Base64).unwrap_err();
+        assert!(err.contains("not base64"), "{err}");
+        assert_eq!(
+            bind(&json!(1), BinaryEncoding::Base64).unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
     #[test]
     fn clear_uses_truncate_unless_referenced() {
         assert_eq!(
             clear_statements("\"t\"", &[]).unwrap(),
             vec!["TRUNCATE TABLE \"t\"".to_string()]
         );
-        let restrict = vec![("fk".to_string(), "child".to_string(), 'a')];
+        let deferred = vec![
+            "SET CONSTRAINTS ALL DEFERRED".to_string(),
+            "DELETE FROM \"t\"".to_string(),
+        ];
         assert_eq!(
-            clear_statements("\"t\"", &restrict).unwrap(),
-            vec![
-                "SET CONSTRAINTS ALL DEFERRED".to_string(),
-                "DELETE FROM \"t\"".to_string()
-            ]
+            clear_statements("\"t\"", &[referencing('a', true, true)]).unwrap(),
+            deferred
         );
+        for (action, deferrable) in [('a', false), ('r', true), ('r', false)] {
+            assert_eq!(
+                clear_statements("\"t\"", &[referencing(action, deferrable, false)]).unwrap(),
+                deferred,
+                "no child row references the table"
+            );
+            let err = clear_statements("\"t\"", &[referencing(action, deferrable, true)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("DEFERRABLE"), "{err}");
+        }
         for action in ['c', 'n', 'd'] {
-            let fk = vec![("fk".to_string(), "child".to_string(), action)];
-            assert!(clear_statements("\"t\"", &fk).is_err());
+            assert!(clear_statements("\"t\"", &[referencing(action, true, false)]).is_err());
         }
     }
 

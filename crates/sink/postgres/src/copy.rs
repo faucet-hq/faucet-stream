@@ -10,7 +10,8 @@
 //! tab, newline, or backslash inside a value would corrupt row/field framing
 //! unless escaped. Everything in this module is pure and unit-tested.
 
-use crate::sink::pg_bind_text;
+use crate::config::BinaryEncoding;
+use crate::sink::{pg_bind_text, pg_bind_text_with};
 use faucet_core::util::quote_ident;
 use serde_json::Value;
 
@@ -67,6 +68,7 @@ pub(crate) struct CopyPayload {
 pub(crate) fn build_auto_map_payload(
     records: &[Value],
     table_columns: &[(String, String)],
+    binary: BinaryEncoding,
 ) -> Result<Option<CopyPayload>, String> {
     // Pass 1: validate + find which table columns any record uses.
     let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -109,7 +111,9 @@ pub(crate) fn build_auto_map_payload(
             if idx > 0 {
                 data.push('\t');
             }
-            match pg_bind_text(obj.get(col.as_str()), udt) {
+            match pg_bind_text_with(obj.get(col.as_str()), udt, binary)
+                .map_err(|e| format!("column {col}: {e}"))?
+            {
                 None => data.push_str("\\N"),
                 Some(text) => encode_copy_text_field(&mut data, &text),
             }
@@ -211,9 +215,13 @@ mod tests {
         let table = cols(&[("id", "int8"), ("name", "text"), ("ok", "bool")]);
         // Record key order differs from table order; encoding must follow
         // the table's declared order.
-        let payload = build_auto_map_payload(&[json!({"ok": true, "id": 7, "name": "a"})], &table)
-            .unwrap()
-            .unwrap();
+        let payload = build_auto_map_payload(
+            &[json!({"ok": true, "id": 7, "name": "a"})],
+            &table,
+            BinaryEncoding::Auto,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(payload.columns, vec!["id", "name", "ok"]);
         assert_eq!(payload.data, "7\ta\ttrue\n");
         assert_eq!(payload.rows, 1);
@@ -222,15 +230,22 @@ mod tests {
     #[test]
     fn auto_map_missing_field_ships_null_marker() {
         let table = cols(&[("id", "int8"), ("name", "text")]);
-        let payload =
-            build_auto_map_payload(&[json!({"id": 1, "name": "a"}), json!({"id": 2})], &table)
-                .unwrap()
-                .unwrap();
+        let payload = build_auto_map_payload(
+            &[json!({"id": 1, "name": "a"}), json!({"id": 2})],
+            &table,
+            BinaryEncoding::Auto,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(payload.data, "1\ta\n2\t\\N\n");
         // Explicit JSON null also ships NULL.
-        let payload = build_auto_map_payload(&[json!({"id": 3, "name": null})], &table)
-            .unwrap()
-            .unwrap();
+        let payload = build_auto_map_payload(
+            &[json!({"id": 3, "name": null})],
+            &table,
+            BinaryEncoding::Auto,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(payload.data, "3\t\\N\n");
     }
 
@@ -239,7 +254,7 @@ mod tests {
         // `created` appears in no record → omitted from the column list
         // (COPYing an explicit NULL would override a column DEFAULT).
         let table = cols(&[("id", "int8"), ("created", "timestamptz")]);
-        let payload = build_auto_map_payload(&[json!({"id": 1})], &table)
+        let payload = build_auto_map_payload(&[json!({"id": 1})], &table, BinaryEncoding::Auto)
             .unwrap()
             .unwrap();
         assert_eq!(payload.columns, vec!["id"]);
@@ -249,10 +264,13 @@ mod tests {
     #[test]
     fn auto_map_json_column_gets_json_text_and_scalars_stay_plain() {
         let table = cols(&[("meta", "jsonb"), ("note", "text")]);
-        let payload =
-            build_auto_map_payload(&[json!({"meta": {"a": "x\ty"}, "note": "plain"})], &table)
-                .unwrap()
-                .unwrap();
+        let payload = build_auto_map_payload(
+            &[json!({"meta": {"a": "x\ty"}, "note": "plain"})],
+            &table,
+            BinaryEncoding::Auto,
+        )
+        .unwrap()
+        .unwrap();
         // The tab inside the nested JSON string is escaped by serde_json to
         // \t (two chars: backslash + t), and COPY escaping doubles the
         // backslash so the server sees the JSON text {"a":"x\ty"} intact.
@@ -264,25 +282,35 @@ mod tests {
         // Same loud-failure semantics as the INSERT path: the int8 input
         // function will reject this text rather than silently coercing.
         let table = cols(&[("id", "int8")]);
-        let payload = build_auto_map_payload(&[json!({"id": {"a": 1}})], &table)
-            .unwrap()
-            .unwrap();
+        let payload =
+            build_auto_map_payload(&[json!({"id": {"a": 1}})], &table, BinaryEncoding::Auto)
+                .unwrap()
+                .unwrap();
         assert_eq!(payload.data, "{\"a\":1}\n");
     }
 
     #[test]
     fn auto_map_refuses_a_record_matching_no_column() {
         let table = cols(&[("id", "int8")]);
-        let err =
-            build_auto_map_payload(&[json!({"id": 1}), json!({"ID": true})], &table).unwrap_err();
+        let err = build_auto_map_payload(
+            &[json!({"id": 1}), json!({"ID": true})],
+            &table,
+            BinaryEncoding::Auto,
+        )
+        .unwrap_err();
         assert!(err.contains("record 1 has no field matching"), "{err}");
-        assert!(build_auto_map_payload(&[], &table).unwrap().is_none());
+        assert!(
+            build_auto_map_payload(&[], &table, BinaryEncoding::Auto)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn auto_map_rejects_non_object_records() {
         let table = cols(&[("id", "int8")]);
-        let err = build_auto_map_payload(&[json!([1, 2])], &table).unwrap_err();
+        let err =
+            build_auto_map_payload(&[json!([1, 2])], &table, BinaryEncoding::Auto).unwrap_err();
         assert!(err.contains("JSON object"));
     }
 

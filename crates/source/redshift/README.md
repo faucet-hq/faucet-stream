@@ -42,7 +42,10 @@ backwards even when the row that held the old maximum is gone.
 Integers, floats, booleans, JSON and text map to JSON natively; `NUMERIC` is an
 exact decimal string, timestamps/dates/times are ISO strings, `TIMETZ` keeps its
 offset, `INTERVAL` is an ISO 8601 duration (`P1Y2DT3H1.5S`) and `VARBYTE` is
-base64. Any other type (`SUPER`, `GEOMETRY`, …) is emitted as its text form. A
+base64, and `oid` / `reg*` values are numbers. Any other type is emitted as
+its text form when the server sends it as text, or when its wire form *is* its
+text (`SUPER`, `XML`, character types); a binary-encoded value of any other
+type (`GEOMETRY`'s EWKB, an `int[]`) is refused rather than garbled. A
 non-NULL value the source cannot decode fails the read naming the column — cast
 it in the query (`col::varchar`) — rather than becoming `null`.
 

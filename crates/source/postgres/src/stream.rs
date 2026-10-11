@@ -196,7 +196,7 @@ impl PostgresSource {
     /// Apply the currently-set shard (if any) to a resolved query string.
     fn shard_wrap(&self, query: String) -> String {
         match &*self.applied_shard.lock().expect("shard mutex poisoned") {
-            Some(bounds) => bounds.wrap(&query, quote_ident),
+            Some(bounds) => bounds.wrap(&for_subquery(&query), quote_ident),
             None => query,
         }
     }
@@ -241,6 +241,13 @@ fn text_cast_query(query: &str, columns: &[(String, String)]) -> Option<String> 
     if !columns.iter().all(|(n, _)| seen.insert(n.as_str())) {
         return None;
     }
+    // A trailing `;` or `--` comment is legal at top level but not inside the
+    // wrapper's parentheses, and a data-modifying `WITH` is legal only at top
+    // level (#862 M-066).
+    if is_data_modifying_with(query) {
+        return None;
+    }
+    let query = for_subquery(query);
     let select: Vec<String> = columns
         .iter()
         .map(|(n, t)| {
@@ -256,6 +263,25 @@ fn text_cast_query(query: &str, columns: &[(String, String)]) -> Option<String> 
         })
         .collect();
     Some(format!("SELECT {} FROM ({query}) AS q", select.join(", ")))
+}
+
+/// `query` made safe to nest inside `( … )`: a trailing `;` is dropped and a
+/// newline ends any trailing `--` comment before the closing parenthesis —
+/// both are legal at top level, a syntax error once wrapped (#862 M-066).
+fn for_subquery(query: &str) -> String {
+    format!("{}\n", query.trim_end().trim_end_matches(';').trim_end())
+}
+
+/// Whether `query` is a `WITH` whose CTEs modify data (`DELETE` / `INSERT` /
+/// `UPDATE` / `MERGE … RETURNING`), which Postgres accepts only at top level.
+fn is_data_modifying_with(query: &str) -> bool {
+    let upper = query.trim_start().to_ascii_uppercase();
+    if !upper.starts_with("WITH") {
+        return false;
+    }
+    upper
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| matches!(w, "DELETE" | "INSERT" | "UPDATE" | "MERGE"))
 }
 
 /// A float as JSON: a number when finite, else Postgres's own spelling.
@@ -539,6 +565,7 @@ fn bind_bookmark(
 fn cursor_filter(inner: &str, column: &str, index: usize, cast: &str) -> String {
     format!(
         "SELECT * FROM ({inner}) AS q WHERE q.{c} >= CAST(${index} AS {cast})",
+        inner = for_subquery(inner),
         c = quote_ident(column)
     )
 }
@@ -1059,6 +1086,7 @@ pub fn digest_query(inner: &str, key: &str, columns: &[String]) -> String {
         .collect();
     format!(
         "SELECT count(*)::bigint AS rows,          coalesce(sum(('x' || left(md5(concat_ws(chr(31), {cols})), 15))::bit(60)::bigint), 0)::text AS digest,          min({k})::bigint AS key_min, max({k})::bigint AS key_max          FROM ({inner}) AS _faucet_digest",
+        inner = for_subquery(inner),
         cols = rendered.join(", "),
         k = quote_ident(key),
     )
@@ -1142,8 +1170,37 @@ mod tests {
             .as_deref(),
             Some(
                 "SELECT q.\"id\", CASE WHEN q.\"tags\" IS NULL THEN NULL \
-                 ELSE format('%s', q.\"tags\") END AS \"tags\" FROM (SELECT * FROM t) AS q"
+                 ELSE format('%s', q.\"tags\") END AS \"tags\" FROM (SELECT * FROM t\n) AS q"
             )
+        );
+        assert_eq!(
+            text_cast_query("SELECT n FROM t; \n", &cols(&[("n", "NUMERIC")])).as_deref(),
+            Some(
+                "SELECT CASE WHEN q.\"n\" IS NULL THEN NULL ELSE format('%s', q.\"n\") END AS \"n\" \
+                 FROM (SELECT n FROM t\n) AS q"
+            ),
+            "a trailing semicolon is dropped"
+        );
+        assert!(
+            text_cast_query("SELECT n FROM t -- note", &cols(&[("n", "NUMERIC")]))
+                .unwrap()
+                .contains("-- note\n) AS q"),
+            "a trailing line comment cannot swallow the closing parenthesis"
+        );
+        assert_eq!(
+            text_cast_query(
+                "WITH d AS (DELETE FROM t RETURNING n) SELECT n FROM d",
+                &cols(&[("n", "NUMERIC")])
+            ),
+            None,
+            "a data-modifying WITH stays at top level"
+        );
+        assert!(
+            text_cast_query(
+                "WITH x AS (SELECT n FROM t) SELECT n FROM x",
+                &cols(&[("n", "NUMERIC")])
+            )
+            .is_some()
         );
         assert_eq!(
             text_cast_query("SELECT a, a", &cols(&[("a", "NUMERIC"), ("a", "NUMERIC")])),
@@ -1173,7 +1230,7 @@ mod tests {
             "key first, deduplicated: {sql}"
         );
         assert!(sql.contains("min(\"id\")::bigint AS key_min"));
-        assert!(sql.ends_with("FROM (SELECT * FROM t) AS _faucet_digest"));
+        assert!(sql.ends_with("FROM (SELECT * FROM t\n) AS _faucet_digest"));
     }
 
     /// The shard-bounds type moved to `faucet_core::shard` (#262) so the
@@ -1703,7 +1760,7 @@ mod bind_overflow_tests {
         assert_eq!(binds, vec![serde_json::json!("x"), serde_json::json!(5)]);
         assert_eq!(
             cursor_order(&cursor_filter("SELECT 1", "ts", 4, "INT8"), "ts"),
-            "SELECT * FROM (SELECT 1) AS q WHERE q.\"ts\" >= CAST($4 AS INT8) ORDER BY q.\"ts\""
+            "SELECT * FROM (SELECT 1\n) AS q WHERE q.\"ts\" >= CAST($4 AS INT8) ORDER BY q.\"ts\""
         );
     }
 

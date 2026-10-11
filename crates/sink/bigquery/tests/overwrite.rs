@@ -370,7 +370,7 @@ async fn overwrite_creates_dataset_table_and_staging_when_missing() {
     // tables.get on the target returns 404 for the two existence probes
     // (begin_overwrite + the write path's self-heal), then 200 once the write
     // path has created it (target_schema re-reads it to build the staging load).
-    mount_table_missing(&server, Some(2)).await;
+    mount_table_missing(&server, Some(3)).await;
     mount_table_schema(&server).await;
     mount_query_and_job(&server, "job-c").await;
     mount_staging_present(&server).await;
@@ -393,7 +393,7 @@ async fn overwrite_creates_dataset_table_and_staging_when_missing() {
     );
     assert!(
         qs.iter()
-            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS `p.d.t` (")
                 && q.contains("`id` INT64")
                 && q.contains("`name` STRING")),
         "target table create missing: {qs:?}"
@@ -428,7 +428,7 @@ async fn overwrite_creates_missing_target_across_sink_instances() {
     mount_token_endpoint(&server).await;
     // 404 for begin's probe + the write sink's self-heal probe, then 200 once
     // the write sink has created the target.
-    mount_table_missing(&server, Some(2)).await;
+    mount_table_missing(&server, Some(3)).await;
     mount_table_schema(&server).await;
     mount_query_and_job(&server, "job-xi").await;
     mount_staging_present(&server).await;
@@ -455,7 +455,7 @@ async fn overwrite_creates_missing_target_across_sink_instances() {
     );
     assert!(
         qs.iter()
-            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
         "write sink must create the missing target: {qs:?}"
     );
     assert!(
@@ -550,7 +550,7 @@ async fn overwrite_recreates_schemaless_target() {
             "tableReference": {"projectId": PROJECT_ID, "datasetId": DATASET_ID, "tableId": TABLE_ID},
             "schema": {"fields": []}
         })))
-        .up_to_n_times(2)
+        .up_to_n_times(3)
         .with_priority(1)
         .mount(&server)
         .await;
@@ -1611,7 +1611,7 @@ async fn multipart_load_http_error_surfaces() {
 async fn direct_overwrite_creates_missing_target_then_streams() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
-    mount_table_missing(&server, Some(1)).await; // one self-heal probe, then present
+    mount_table_missing(&server, Some(2)).await; // self-heal probe + the pre-DDL re-probe, then present
     mount_table_schema(&server).await;
     mount_query_and_job(&server, "job-dc").await;
     mount_resumable(&server, "/rz/dc", "load-dc").await;
@@ -1630,7 +1630,7 @@ async fn direct_overwrite_creates_missing_target_then_streams() {
     let qs = queries(&server).await;
     assert!(
         qs.iter()
-            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
         "direct overwrite must create the missing target: {qs:?}"
     );
     assert_eq!(
@@ -2122,4 +2122,41 @@ async fn new_builds_a_sink_from_service_account_key_json() {
     let config = with_sa_auth(config, &server);
     let sink = BigQuerySink::new(config).await.expect("sink");
     assert_eq!(sink.connector_name(), "bigquery");
+}
+
+#[tokio::test]
+async fn append_uses_a_table_a_concurrent_writer_created_meanwhile() {
+    // #862 M-053: the first probe sees no table; by the time the dataset DDL
+    // finished another writer created it with a schema. That table is used
+    // as-is — never CREATE OR REPLACE'd over the other writer's rows.
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_missing(&server, Some(1)).await;
+    mount_table_schema(&server).await;
+    mount_query_and_job(&server, "job-race").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}/insertAll"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let config = BigQuerySinkConfig::new(
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ApplicationDefault,
+    )
+    .with_media_load(false);
+    let (sink, _sa) = build_sink(&server, config).await;
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("write");
+    let qs = queries(&server).await;
+    assert!(
+        !qs.iter()
+            .any(|q| q.contains("CREATE OR REPLACE TABLE `p.d.t` (")
+                || q.contains("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
+        "no table DDL once the table has a schema: {qs:?}"
+    );
 }

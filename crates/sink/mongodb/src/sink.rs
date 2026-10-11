@@ -464,15 +464,30 @@ impl MongoSink {
             let rejected: Vec<(usize, String)> = match result {
                 Ok(_) => Vec::new(),
                 Err(e) => match e.kind.as_ref() {
+                    // A write-concern error means the server applied the inserts
+                    // but could not confirm the requested concern: the documents
+                    // landed, so only the write errors (if any) are failures —
+                    // an outer Err would tell the pipeline nothing committed and
+                    // a DLQ replay would insert them again (#862 M-060).
                     mongodb::error::ErrorKind::InsertMany(ime)
-                        if ime.write_concern_error.is_none() && ime.write_errors.is_some() =>
+                        if ime.write_concern_error.is_some() =>
                     {
+                        tracing::warn!(
+                            error = %e,
+                            "MongoDB applied the inserts but could not confirm the write concern"
+                        );
                         ime.write_errors
                             .iter()
                             .flatten()
                             .map(|we| (we.index, we.message.clone()))
                             .collect()
                     }
+                    mongodb::error::ErrorKind::InsertMany(ime) if ime.write_errors.is_some() => ime
+                        .write_errors
+                        .iter()
+                        .flatten()
+                        .map(|we| (we.index, we.message.clone()))
+                        .collect(),
                     _ if !inserted_any => {
                         return Err(FaucetError::Sink(format!(
                             "MongoDB insert_many failed: {e}"

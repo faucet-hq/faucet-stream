@@ -97,8 +97,11 @@ pub struct SnowflakeSinkConfig {
     /// the sink polls `GET /api/v2/statements/{handle}` until the statement
     /// reports success before counting the rows as written. Without this
     /// the sink would report success the moment Snowflake *accepted* the
-    /// statement, losing durability. Defaults to 300 seconds. Set to `0`
-    /// to poll indefinitely.
+    /// statement, losing durability. The statement is cancelled server-side
+    /// when the cap is reached. Defaults to 172800 seconds (48 hours,
+    /// Snowflake's own maximum statement time), so a large commit group on a
+    /// small warehouse is never cut short by the client. Set to `0` to poll
+    /// indefinitely.
     #[serde(
         default = "default_poll_timeout",
         with = "faucet_core::config::duration_secs"
@@ -180,8 +183,9 @@ fn default_match_by_column_name() -> String {
     "CASE_INSENSITIVE".to_string()
 }
 
+/// Snowflake's maximum `STATEMENT_TIMEOUT_IN_SECONDS` (#862 M-051).
 fn default_poll_timeout() -> Duration {
-    Duration::from_secs(300)
+    Duration::from_secs(172_800)
 }
 
 fn default_create_table() -> bool {
@@ -303,7 +307,7 @@ mod tests {
         assert_eq!(config.database, "MY_DB");
         assert_eq!(config.schema, "PUBLIC");
         assert_eq!(config.table, "events");
-        assert_eq!(config.poll_timeout, Duration::from_secs(300));
+        assert_eq!(config.poll_timeout, Duration::from_secs(172_800));
     }
 
     #[test]

@@ -611,7 +611,7 @@ impl MssqlSink {
     }
 
     /// Apply planned upsert/delete groups atomically, in page order, in a
-    /// single `BEGIN TRAN` / `COMMIT TRAN`. Groups come from [`ordered_plans`]
+    /// single `BEGIN TRAN` / `COMMIT TRAN`. Groups come from [`faucet_core::plan_writes_ordered`]
     /// so a delete that precedes an upsert of a key equal under the column
     /// collation (`"Bob"` / `"bob"`) cannot run after it and remove the row.
     async fn apply_plans(&self, plans: &[faucet_core::WritePlan]) -> Result<usize, FaucetError> {
@@ -893,17 +893,39 @@ fn build_add_column_sql(
     ))
 }
 
-/// `ALTER TABLE <ref> ALTER COLUMN <col> <kw>` — widen an existing column's
-/// type. Naturally idempotent (re-running the same type change is a no-op).
+/// The type an evolving column widens to. An integer column that starts
+/// receiving fractions becomes `DECIMAL(38,10)` — exact for every `BIGINT` —
+/// rather than `FLOAT`, which would round stored values above 2^53 in place
+/// (#862 M-045).
+fn widened_keyword(
+    from: Option<faucet_core::SqlBaseType>,
+    to: faucet_core::SqlBaseType,
+) -> &'static str {
+    use faucet_core::SqlBaseType::*;
+    match (from, to) {
+        (Some(Integer), Double) => "DECIMAL(38,10)",
+        (_, other) => mssql_keyword(other),
+    }
+}
+
+/// `ALTER TABLE <ref> ALTER COLUMN <col> <kw> [NULL|NOT NULL]` — widen an
+/// existing column's type. `ALTER COLUMN` without a nullability clause follows
+/// the session's `ANSI_NULL_DFLT` setting, so the column's current one is
+/// re-stated when known. Naturally idempotent.
 fn build_alter_type_sql(
     table_quoted: &str,
     col: &str,
-    t: faucet_core::SqlBaseType,
+    kw: &str,
+    nullable: Option<bool>,
 ) -> Result<String, FaucetError> {
     let qcol = quote_ident_mssql(col)?;
+    let null = match nullable {
+        Some(true) => " NULL",
+        Some(false) => " NOT NULL",
+        None => "",
+    };
     Ok(format!(
-        "ALTER TABLE {table_quoted} ALTER COLUMN {qcol} {}",
-        mssql_keyword(t),
+        "ALTER TABLE {table_quoted} ALTER COLUMN {qcol} {kw}{null}"
     ))
 }
 
@@ -922,18 +944,30 @@ fn build_alter_null_sql(table_quoted: &str, col: &str, kw: &str) -> Result<Strin
 /// `bit`, `nvarchar`) back to a JSON-Schema type fragment so
 /// [`MssqlSink::current_schema`] round-trips with [`faucet_core::diff_schema`].
 /// `nullable` reflects `sys.columns.is_nullable`.
-fn mssql_type_to_json_schema(type_name: &str, nullable: bool) -> Value {
-    let base = match type_name.to_ascii_lowercase().as_str() {
+///
+/// A `(max)` character or `text`/`ntext` column is where the sink stores
+/// nested objects and arrays as JSON text, so it also accepts those types
+/// (`x-faucet-also-accepts`) instead of reporting them as drift on every run
+/// after the first (#862 M-046).
+fn mssql_type_to_json_schema(type_name: &str, max_length: i16, nullable: bool) -> Value {
+    let lower = type_name.to_ascii_lowercase();
+    let base = match lower.as_str() {
         "bigint" | "int" | "smallint" | "tinyint" => "integer",
         "float" | "real" | "decimal" | "numeric" | "money" | "smallmoney" => "number",
         "bit" => "boolean",
         _ => "string",
     };
-    if nullable {
+    let mut fragment = if nullable {
         serde_json::json!({ "type": [base, "null"] })
     } else {
         serde_json::json!({ "type": base })
+    };
+    let holds_json = matches!(lower.as_str(), "text" | "ntext")
+        || (matches!(lower.as_str(), "nvarchar" | "varchar") && max_length == -1);
+    if holds_json {
+        fragment[faucet_core::DRIFT_ALSO_ACCEPTS] = serde_json::json!(["object", "array"]);
     }
+    fragment
 }
 
 /// Quote a (possibly schema-qualified) table name: `dbo.events` → `[dbo].[events]`.
@@ -994,37 +1028,6 @@ pub(crate) fn classify_server_code(code: u32) -> ChunkFailure {
         // the stream while the bookmark advances would hide an outage.
         _ => ChunkFailure::Infrastructure,
     }
-}
-
-/// Split a keyed page into runs of consecutive upserts or deletes and plan
-/// each run, so the runs apply in page order. One plan for the whole page
-/// would apply every upsert before every delete; when a delete and a later
-/// upsert address keys that differ in JSON but are equal under the column
-/// collation, that order deletes the row the page re-inserted. Rows with no
-/// usable key are left out (the caller reports them from its own plan).
-pub(crate) fn ordered_plans(
-    records: &[Value],
-    spec: &faucet_core::WriteSpec,
-) -> Vec<faucet_core::WritePlan> {
-    let mut plans = Vec::new();
-    let mut run: Vec<Value> = Vec::new();
-    let mut run_is_delete = None;
-    for rec in records {
-        let single = faucet_core::plan_writes(std::slice::from_ref(rec), spec);
-        if !single.failed.is_empty() {
-            continue;
-        }
-        let is_delete = !single.deletes.is_empty();
-        if run_is_delete.is_some_and(|d| d != is_delete) {
-            plans.push(faucet_core::plan_writes(&std::mem::take(&mut run), spec));
-        }
-        run_is_delete = Some(is_delete);
-        run.push(rec.clone());
-    }
-    if !run.is_empty() {
-        plans.push(faucet_core::plan_writes(&run, spec));
-    }
-    plans
 }
 
 /// SQL Server error numbers that are about the data of the rows being
@@ -1145,7 +1148,10 @@ impl Sink for MssqlSink {
                 )));
             }
             let total = self
-                .apply_plans(&ordered_plans(records, &self.config.write))
+                .apply_plans(&faucet_core::plan_writes_ordered(
+                    records,
+                    &self.config.write,
+                ))
                 .await?;
             tracing::info!(
                 table = %self.config.table,
@@ -1223,8 +1229,11 @@ impl Sink for MssqlSink {
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
             let plan = faucet_core::plan_writes(records, &self.config.write);
-            self.apply_plans(&ordered_plans(records, &self.config.write))
-                .await?;
+            self.apply_plans(&faucet_core::plan_writes_ordered(
+                records,
+                &self.config.write,
+            ))
+            .await?;
 
             let mut outcomes: Vec<RowOutcome> = records.iter().map(|_| Ok(())).collect();
             for (idx, msg) in &plan.failed {
@@ -1241,6 +1250,40 @@ impl Sink for MssqlSink {
         } else {
             records.chunks(self.config.batch_size).collect()
         };
+
+        // A record matching no writable column is that row's failure, not a
+        // silent skip or an all-NULL row (#862 M-044).
+        if let MssqlColumnMapping::AutoColumns { .. } = &self.config.column_mapping {
+            let writable_cols = crate::statements::insertable(&self.column_infos().await?);
+            let unmatched = crate::encode::unmatched_rows(
+                &writable_cols,
+                &crate::encode::fold_to_columns(&writable_cols, records),
+            );
+            if !unmatched.is_empty() {
+                let writable: Vec<Value> = records
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !unmatched.contains(i))
+                    .map(|(_, r)| r.clone())
+                    .collect();
+                let mut written = if writable.is_empty() {
+                    Vec::new().into_iter()
+                } else {
+                    self.write_batch_partial(&writable).await?.into_iter()
+                };
+                return Ok((0..records.len())
+                    .map(|i| {
+                        if unmatched.contains(&i) {
+                            Err(crate::encode::unmatched_row_error(i))
+                        } else {
+                            written.next().unwrap_or_else(|| {
+                                Err(FaucetError::Sink("mssql: missing row outcome".into()))
+                            })
+                        }
+                    })
+                    .collect());
+            }
+        }
 
         let mut outcomes: Vec<RowOutcome> = Vec::with_capacity(records.len());
         for chunk in chunks {
@@ -1464,7 +1507,7 @@ impl Sink for MssqlSink {
         for c in cols {
             props.insert(
                 c.name,
-                mssql_type_to_json_schema(&c.type_name, c.is_nullable),
+                mssql_type_to_json_schema(&c.type_name, c.max_length, c.is_nullable),
             );
         }
         Ok(Some(
@@ -1490,10 +1533,25 @@ impl Sink for MssqlSink {
                 FaucetError::Sink(format!("MSSQL ADD COLUMN {} failed: {e}", c.name))
             })?;
         }
+        let current = if evolution.widenings.is_empty() && evolution.relax_nullability.is_empty() {
+            Vec::new()
+        } else {
+            self.discover_column_types().await?
+        };
         for c in &evolution.widenings {
             let t =
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
-            let sql = build_alter_type_sql(&self.table_quoted, &c.name, t)?;
+            let from = c.from.as_ref().and_then(faucet_core::json_schema_base_type);
+            let nullable = current
+                .iter()
+                .find(|i| i.name == c.name)
+                .map(|i| i.is_nullable);
+            let sql = build_alter_type_sql(
+                &self.table_quoted,
+                &c.name,
+                widened_keyword(from, t),
+                nullable,
+            )?;
             control(&mut conn, &sql).await.map_err(|e| {
                 FaucetError::Sink(format!("MSSQL ALTER COLUMN {} failed: {e}", c.name))
             })?;
@@ -1502,7 +1560,6 @@ impl Sink for MssqlSink {
             // `ALTER COLUMN … NULL` must re-state the column's exact declared type
             // (length, precision, scale, collation); anything coarser rewrites the
             // column (SQL-34).
-            let current = self.discover_column_types().await?;
             for col in &evolution.relax_nullability {
                 let Some(info) = current.iter().find(|c| &c.name == col) else {
                     // Column not found in the live schema — nothing to relax.
@@ -1596,7 +1653,7 @@ impl Sink for MssqlSink {
         // the append path's INSERTs, inside this same BEGIN TRAN.
         let written = match &plan {
             Some(_) => {
-                let plans = ordered_plans(records, &self.config.write);
+                let plans = faucet_core::plan_writes_ordered(records, &self.config.write);
                 match self.apply_plans_no_txn(&mut conn, &plans).await {
                     Ok(n) => n,
                     Err((e, timed_out)) => {
@@ -1835,9 +1892,23 @@ mod tests {
 
     #[test]
     fn mssql_widen_column_ddl() {
-        let sql =
-            build_alter_type_sql("[dbo].[t]", "score", faucet_core::SqlBaseType::Double).unwrap();
+        use faucet_core::SqlBaseType::{Double, Integer};
+        let sql = build_alter_type_sql("[dbo].[t]", "score", widened_keyword(None, Double), None)
+            .unwrap();
         assert_eq!(sql, "ALTER TABLE [dbo].[t] ALTER COLUMN [score] FLOAT");
+        let sql = build_alter_type_sql(
+            "[t]",
+            "v",
+            widened_keyword(Some(Integer), Double),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "ALTER TABLE [t] ALTER COLUMN [v] DECIMAL(38,10) NOT NULL"
+        );
+        let sql = build_alter_type_sql("[t]", "v", "BIGINT", Some(true)).unwrap();
+        assert_eq!(sql, "ALTER TABLE [t] ALTER COLUMN [v] BIGINT NULL");
     }
 
     #[test]
@@ -1853,34 +1924,46 @@ mod tests {
     fn mssql_type_round_trips_to_json_schema() {
         use serde_json::json;
         assert_eq!(
-            mssql_type_to_json_schema("bigint", false),
+            mssql_type_to_json_schema("bigint", 100, false),
             json!({"type":"integer"})
         );
         assert_eq!(
-            mssql_type_to_json_schema("int", false),
+            mssql_type_to_json_schema("int", 100, false),
             json!({"type":"integer"})
         );
         assert_eq!(
-            mssql_type_to_json_schema("float", false),
+            mssql_type_to_json_schema("float", 100, false),
             json!({"type":"number"})
         );
         assert_eq!(
-            mssql_type_to_json_schema("decimal", false),
+            mssql_type_to_json_schema("decimal", 100, false),
             json!({"type":"number"})
         );
         assert_eq!(
-            mssql_type_to_json_schema("bit", false),
+            mssql_type_to_json_schema("bit", 100, false),
             json!({"type":"boolean"})
         );
         assert_eq!(
-            mssql_type_to_json_schema("nvarchar", false),
+            mssql_type_to_json_schema("nvarchar", 100, false),
             json!({"type":"string"})
         );
         // Case-insensitive; nullable widens to a type array.
         assert_eq!(
-            mssql_type_to_json_schema("NVARCHAR", true),
+            mssql_type_to_json_schema("NVARCHAR", 100, true),
             json!({"type":["string","null"]})
         );
+        for (ty, len) in [
+            ("nvarchar", -1),
+            ("varchar", -1),
+            ("ntext", 16),
+            ("text", 16),
+        ] {
+            assert_eq!(
+                mssql_type_to_json_schema(ty, len, false),
+                json!({"type": "string", "x-faucet-also-accepts": ["object", "array"]}),
+                "{ty}"
+            );
+        }
     }
 
     #[test]
@@ -1989,30 +2072,5 @@ mod tests {
                 "code {code}"
             );
         }
-    }
-
-    #[test]
-    fn keyed_pages_apply_in_page_order() {
-        use serde_json::json;
-        let spec: faucet_core::WriteSpec = serde_json::from_value(json!({
-            "write_mode": "upsert",
-            "key": ["name"],
-            "delete_marker": {"field": "op", "values": ["d"]}
-        }))
-        .unwrap();
-        let page = vec![
-            json!({"name": "Bob", "op": "d"}),
-            json!({"name": "bob", "v": 1}),
-            json!({"name": "carl", "v": 2}),
-            json!({"v": 3}),
-            json!({"name": "dee", "op": "d"}),
-        ];
-        let plans = super::ordered_plans(&page, &spec);
-        let shape: Vec<(usize, usize)> = plans
-            .iter()
-            .map(|p| (p.upserts.len(), p.deletes.len()))
-            .collect();
-        assert_eq!(shape, vec![(0, 1), (2, 0), (0, 1)]);
-        assert!(super::ordered_plans(&[], &spec).is_empty());
     }
 }

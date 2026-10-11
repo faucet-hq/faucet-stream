@@ -568,6 +568,57 @@ async fn a_transaction_aborted_by_a_concurrent_update_is_retried() {
     assert_eq!(ids[1], format!("{}-r1", ids[0]));
 }
 
+/// #862 M-055: an abort reported synchronously by `jobs.query` (HTTP 400) is
+/// retried like one reported through the polled job.
+#[tokio::test]
+async fn a_synchronous_concurrent_update_abort_is_retried() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("MERGE INTO"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": 400,
+                "message": "Transaction is aborted due to concurrent update against table p:d.t.",
+                "errors": [{
+                    "reason": "invalidQuery",
+                    "message": "Transaction is aborted due to concurrent update against table p:d.t."
+                }],
+                "status": "INVALID_ARGUMENT"
+            }
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("MERGE INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_query("job-b")))
+        .mount(&server)
+        .await;
+    mount_job_done(&server, "job-b").await;
+
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let n = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("the synchronously aborted transaction is retried");
+    assert_eq!(n, 1);
+    let merges = captured_query_bodies(&server)
+        .await
+        .into_iter()
+        .filter(|b| b["query"].as_str().unwrap_or("").contains("MERGE INTO"))
+        .count();
+    assert_eq!(merges, 2);
+}
+
 /// Any other job failure is not retried.
 #[tokio::test]
 async fn a_failed_transaction_that_was_not_a_conflict_is_not_retried() {

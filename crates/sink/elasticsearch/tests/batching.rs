@@ -120,3 +120,32 @@ async fn empty_input_makes_no_bulk_calls() {
     assert_eq!(written, 0);
     assert_eq!(bulk_call_count(&server).await, 0);
 }
+
+/// #862 M-061: a replayed `create` whose `_id` already exists is idempotent.
+#[tokio::test]
+async fn create_on_an_existing_id_counts_as_written() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1,
+            "errors": true,
+            "items": [
+                {"create": {"_id": "id-0", "status": 409, "error": {
+                    "type": "version_conflict_engine_exception",
+                    "reason": "[id-0]: version conflict, document already exists"
+                }}},
+                {"create": {"_id": "id-1", "status": 201}}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let mut config = ElasticsearchSinkConfig::new(server.uri(), INDEX);
+    config.op_type = faucet_sink_elasticsearch::ElasticsearchOpType::Create;
+    config.id_field = Some("doc_id".into());
+    let sink = ElasticsearchSink::new(config).unwrap();
+    let records = make_records(2);
+    assert_eq!(sink.write_batch(&records).await.expect("replay"), 2);
+    let out = sink.write_batch_partial(&records).await.expect("partial");
+    assert!(out.iter().all(Result::is_ok), "{out:?}");
+}

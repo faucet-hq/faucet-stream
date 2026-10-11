@@ -21590,14 +21590,14 @@
                       "default": 0
                     },
                     "poll_timeout": {
-                      "description": "Maximum wall-clock time the source will spend polling an asynchronous\nstatement (one for which the initial `POST /api/v2/statements`\nreturns HTTP 202) before giving up with\n[`FaucetError::Source`](faucet_core::FaucetError::Source).\nWithout this cap a statement that never finishes would loop forever.\nDefaults to 300 seconds. Set to `0` to disable the cap and poll\nindefinitely.",
+                      "description": "Maximum wall-clock time the source will spend polling an asynchronous\nstatement (one for which the initial `POST /api/v2/statements`\nreturns HTTP 202) before giving up with\n[`FaucetError::Source`](faucet_core::FaucetError::Source).\nWithout this cap a statement that never finishes would loop forever.\nThe statement is cancelled server-side when the cap is reached.\nDefaults to 172800 seconds (48 hours, Snowflake's own maximum statement\ntime), so a long extract is never cut short by the client. Set to `0`\nto disable the cap and poll indefinitely.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": 300
+                      "default": 172800
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage).\n\nSnowflake's SQL REST API splits large result sets into *partitions* (one\nchunk of rows per HTTP response). The source re-frames partitions into\n`batch_size`-sized pages: rows accumulate in a buffer and are yielded as\nsoon as the buffer reaches `batch_size`. Defaults to\n[`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the **\"no batching\" sentinel**: the entire result\nset is buffered and emitted in a single page. Useful for small lookup\ntables, or for sinks (e.g. SQL `COPY`, BigQuery load jobs) that prefer\none large request to many small ones.",
@@ -24033,6 +24033,11 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 3600
+                    },
+                    "binary_encoding": {
+                      "description": "How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)\nbecomes bytes: `auto` (default) decodes canonical base64 — the form\nevery faucet source emits — and stores any other string as text;\n`base64` decodes every value and fails the row when one is not base64;\n`text` stores every string as its text. `auto` decides per value, so a\ntext column whose values happen to be valid base64 (`\"user\"`, a hex\ndigest) is decoded; set `text` for such a column.",
+                      "$ref": "#/$defs/sink_postgres__BinaryEncoding",
+                      "default": "auto"
                     }
                   },
                   "title": "PostgresSinkConfig",
@@ -24315,14 +24320,14 @@
                       "default": 1000
                     },
                     "poll_timeout": {
-                      "description": "Maximum wall-clock time to wait for an asynchronously-executed\nINSERT to finish. Snowflake's SQL REST API answers an accepted but\nnot-yet-finished statement with HTTP 202 and a `statementHandle`;\nthe sink polls `GET /api/v2/statements/{handle}` until the statement\nreports success before counting the rows as written. Without this\nthe sink would report success the moment Snowflake *accepted* the\nstatement, losing durability. Defaults to 300 seconds. Set to `0`\nto poll indefinitely.",
+                      "description": "Maximum wall-clock time to wait for an asynchronously-executed\nINSERT to finish. Snowflake's SQL REST API answers an accepted but\nnot-yet-finished statement with HTTP 202 and a `statementHandle`;\nthe sink polls `GET /api/v2/statements/{handle}` until the statement\nreports success before counting the rows as written. Without this\nthe sink would report success the moment Snowflake *accepted* the\nstatement, losing durability. The statement is cancelled server-side\nwhen the cap is reached. Defaults to 172800 seconds (48 hours,\nSnowflake's own maximum statement time), so a large commit group on a\nsmall warehouse is never cut short by the client. Set to `0` to poll\nindefinitely.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": 300
+                      "default": 172800
                     },
                     "bulk_load": {
                       "description": "Arrow columnar **bulk-load** mode (#381): buffer Arrow `RecordBatch`es\nto Parquet, upload to an external cloud stage's backing storage, then\n`COPY INTO <table> FROM @stage FILE_FORMAT=(TYPE=PARQUET)` over the SQL\nREST API. Requires a binary built with this crate's `arrow` feature; a\nconfig that sets it on an `arrow`-off build is rejected at construction.\n\nThis only drives the Arrow fast path the pipeline negotiates when the\nsource *and* sink are both columnar and no `Value`-shaped stage\n(transforms, DLQ, exactly-once, masking, …) is configured. The regular\nrow path (`INSERT … PARSE_JSON`) and the exactly-once watermark MERGE\nare unaffected — bulk-load is append-only.",
@@ -24499,6 +24504,11 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 3600
+                    },
+                    "binary_encoding": {
+                      "description": "How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)\nbecomes bytes: `auto` (default) decodes canonical base64 — the form\nevery faucet source emits — and stores any other string as text;\n`base64` decodes every value and fails the row when one is not base64;\n`text` stores every string as its text. `auto` decides per value, so a\ntext column whose values happen to be valid base64 (`\"user\"`, a hex\ndigest) is decoded; set `text` for such a column.",
+                      "$ref": "#/$defs/sink_mysql__BinaryEncoding",
+                      "default": "auto"
                     }
                   },
                   "title": "MysqlSinkConfig",
@@ -26643,7 +26653,7 @@
                       "default": 300
                     },
                     "op_type": {
-                      "description": "The `_bulk` action for `append` writes: `index` (default; overwrites a\ndocument with the same `_id`) or `create` (required by data streams,\nwhich reject `index`; a document whose `_id` already exists is a\nper-row error). `upsert` / `delete` / `overwrite` always use `index`.",
+                      "description": "The `_bulk` action for `append` writes: `index` (default; overwrites a\ndocument with the same `_id`) or `create` (required by data streams,\nwhich reject `index`; a document whose `_id` already exists is left as\nit is and counted as written, so a replayed page stays idempotent).\n`upsert` / `delete` / `overwrite` always use `index`.",
                       "$ref": "#/$defs/sink_elasticsearch__ElasticsearchOpType",
                       "default": "index"
                     }
@@ -35845,6 +35855,46 @@
         "range",
         "release",
         "suite"
+      ]
+    },
+    "sink_mysql__BinaryEncoding": {
+      "description": "How a JSON string bound to a binary column becomes bytes (#862 M-064).\n\nEvery faucet source emits binary values as base64 text, but a string from\na text origin (a CSV token, a hex digest) can also happen to be valid\nbase64. `auto` cannot tell the two apart: it decodes any canonical, padded\nbase64 string and stores anything else as its text. Pick `base64` or `text`\nwhen the column's origin is known, so every value is treated the same way.",
+      "oneOf": [
+        {
+          "description": "Decode a string that is canonical padded base64; store any other\nstring as its text.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Every string is base64 (line breaks ignored); one that is not fails the\nrow instead of being stored as text.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "Every string is stored as its text, never decoded.",
+          "type": "string",
+          "const": "text"
+        }
+      ]
+    },
+    "sink_postgres__BinaryEncoding": {
+      "description": "How a JSON string bound to a binary column becomes bytes (#862 M-064).\n\nEvery faucet source emits binary values as base64 text, but a string from\na text origin (a CSV token, a hex digest) can also happen to be valid\nbase64. `auto` cannot tell the two apart: it decodes any canonical, padded\nbase64 string and stores anything else as its text. Pick `base64` or `text`\nwhen the column's origin is known, so every value is treated the same way.",
+      "oneOf": [
+        {
+          "description": "Decode a string that is canonical padded base64; store any other\nstring as its text.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Every string is base64 (line breaks ignored); one that is not fails the\nrow instead of being stored as text.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "Every string is stored as its text, never decoded.",
+          "type": "string",
+          "const": "text"
+        }
       ]
     }
   }

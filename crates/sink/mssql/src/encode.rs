@@ -123,6 +123,57 @@ pub(crate) fn build_insert_sql_cast(
     )
 }
 
+/// `records` with each field that has no exactly-named writable column renamed
+/// to the one column matching it ignoring case — SQL Server's default
+/// collation compares identifiers that way (#862 M-044). A field matching
+/// several columns only by case (a case-sensitive collation) is left as is.
+pub(crate) fn fold_to_columns(insertable: &[String], records: &[Value]) -> Vec<Value> {
+    records
+        .iter()
+        .map(|r| {
+            let Some(obj) = r.as_object() else {
+                return r.clone();
+            };
+            let mut out = serde_json::Map::with_capacity(obj.len());
+            for (key, value) in obj {
+                let column = if insertable.iter().any(|c| c == key) {
+                    key.clone()
+                } else {
+                    let mut folded = insertable.iter().filter(|c| c.eq_ignore_ascii_case(key));
+                    match (folded.next(), folded.next()) {
+                        (Some(c), None) if !obj.contains_key(c.as_str()) => c.clone(),
+                        _ => key.clone(),
+                    }
+                };
+                out.insert(column, value.clone());
+            }
+            Value::Object(out)
+        })
+        .collect()
+}
+
+/// Indices of the object records in `records` with no field naming a writable
+/// column: writing one would insert an all-`NULL` row, or nothing at all.
+pub(crate) fn unmatched_rows(insertable: &[String], records: &[Value]) -> Vec<usize> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.as_object()
+                .is_some_and(|o| !o.keys().any(|k| insertable.iter().any(|c| c == k)))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The error for a record matching no writable column.
+pub(crate) fn unmatched_row_error(index: usize) -> FaucetError {
+    FaucetError::Sink(format!(
+        "auto_columns: record {index} has no field matching a writable column; \
+         nothing of it would be written"
+    ))
+}
+
 /// Decide the fixed column list for an `auto_columns` batch.
 ///
 /// `insertable` is the set of writable table columns (IDENTITY columns already
@@ -473,6 +524,30 @@ pub(crate) fn auto_row_params_typed(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fields_fold_to_columns_and_unmatched_rows_are_named() {
+        let cols: Vec<String> = vec!["UserID".into(), "Kind".into(), "a".into(), "A".into()];
+        let folded = fold_to_columns(
+            &cols,
+            &[
+                json!({"userid": 1, "kind": "x"}),
+                json!({"a": 1, "zz": 2}),
+                json!({"Ux": 1}),
+                json!({"userid": 1, "UserID": 2}),
+                json!(3),
+            ],
+        );
+        assert_eq!(folded[0], json!({"UserID": 1, "Kind": "x"}));
+        assert_eq!(folded[1], json!({"a": 1, "zz": 2}));
+        assert_eq!(folded[3], json!({"userid": 1, "UserID": 2}));
+        assert_eq!(
+            fold_to_columns(&cols, &[json!({"A": 1})])[0],
+            json!({"A": 1})
+        );
+        assert_eq!(unmatched_rows(&cols, &folded), vec![2]);
+        assert!(unmatched_row_error(2).to_string().contains("record 2"));
+    }
 
     #[test]
     fn upsert_rows_group_by_the_columns_they_carry() {

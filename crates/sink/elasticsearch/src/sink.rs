@@ -954,9 +954,26 @@ fn item_failure(item: &Value) -> Option<String> {
     if item.is_null() {
         return Some("Elasticsearch bulk response truncated — item outcome missing".into());
     }
+    if create_already_exists(item) {
+        return None;
+    }
     item_action(item)
         .and_then(|a| a.get("error"))
         .map(|e| format!("Elasticsearch item rejected: {e}"))
+}
+
+/// A `create` whose `_id` already exists (`409 version_conflict_engine_exception`).
+/// `create` means "write if absent", so the document is already there: an
+/// at-least-once replay of a page that committed before its bookmark was saved
+/// is idempotent instead of failing every later run (#862 M-061).
+fn create_already_exists(item: &Value) -> bool {
+    item.get("create").is_some_and(|a| {
+        a.get("status").and_then(Value::as_u64) == Some(409)
+            && a.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                == Some("version_conflict_engine_exception")
+    })
 }
 
 /// The first failure among `items`, as the batch error.
@@ -1683,6 +1700,13 @@ mod tests {
         let ok = json!({"index": {"status": 201}});
         let bad = json!({"index": {"status": 400, "error": {"type": "mapper_parsing_exception"}}});
         let conflict = json!({"create": {"status": 409, "error": {"type": "version_conflict"}}});
+        let exists = json!({"create": {"status": 409, "error": {"type": "version_conflict_engine_exception"}}});
+        assert!(
+            item_failure(&exists).is_none(),
+            "create on an existing _id is idempotent"
+        );
+        let index_conflict = json!({"index": {"status": 409, "error": {"type": "version_conflict_engine_exception"}}});
+        assert!(item_failure(&index_conflict).is_some());
         assert!(item_failure(&ok).is_none());
         assert!(
             item_failure(&bad)

@@ -126,6 +126,38 @@ pub(crate) fn owned_binds(binds: Vec<(String, Value)>) -> Vec<(String, OwnedBind
         .collect()
 }
 
+/// [`owned_binds`] with `:bookmark` bound as plain text, for a cursor column
+/// that holds ISO-8601 strings rather than a date/time type (#862 M-067).
+pub(crate) fn text_binds(binds: Vec<(String, Value)>) -> Vec<(String, OwnedBind)> {
+    binds
+        .into_iter()
+        .map(|(n, v)| {
+            let bind = OwnedBind::from_value(&v);
+            (n, bind)
+        })
+        .collect()
+}
+
+/// Oracle's datetime-conversion errors: what comparing a text column holding
+/// `YYYY-MM-DDTHH:MI:SS` to a timestamp bind raises under the session's NLS
+/// format (ORA-01861 "literal does not match format string" and kin).
+pub(crate) fn is_datetime_conversion_error(message: &str) -> bool {
+    const CODES: &[&str] = &[
+        "ORA-01830",
+        "ORA-01839",
+        "ORA-01840",
+        "ORA-01841",
+        "ORA-01843",
+        "ORA-01847",
+        "ORA-01850",
+        "ORA-01851",
+        "ORA-01858",
+        "ORA-01861",
+        "ORA-01862",
+    ];
+    CODES.iter().any(|c| message.contains(c))
+}
+
 impl OwnedBind {
     pub fn from_value(v: &Value) -> Self {
         match v {
@@ -287,6 +319,28 @@ fn table_descriptor(cols: &[CatalogRow]) -> Result<DatasetDescriptor, FaucetErro
 mod tests {
     use super::*;
     use faucet_common_oracle::OracleConnectionConfig;
+
+    #[test]
+    fn text_cursor_conversion_errors_fall_back_to_a_text_bookmark() {
+        assert!(super::is_datetime_conversion_error(
+            "ORA-01861: literal does not match format string"
+        ));
+        assert!(!super::is_datetime_conversion_error(
+            "ORA-00942: table or view does not exist"
+        ));
+        let binds = vec![(
+            "BOOKMARK".to_string(),
+            serde_json::json!("2024-01-02T03:04:05Z"),
+        )];
+        assert!(matches!(
+            super::owned_binds(binds.clone())[0].1,
+            super::OwnedBind::TimestampTz(_)
+        ));
+        assert_eq!(
+            super::text_binds(binds)[0].1,
+            super::OwnedBind::Text("2024-01-02T03:04:05Z".into())
+        );
+    }
 
     #[test]
     fn temporal_bookmarks_bind_as_timestamps() {

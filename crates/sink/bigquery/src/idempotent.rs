@@ -451,8 +451,8 @@ pub fn fieldspecs_to_json_schema(fields: &[FieldSpec]) -> Value {
 /// Map a [`faucet_core::SqlBaseType`] (the type inferred for a drifted column)
 /// to the BigQuery type keyword used in `ADD COLUMN` / `SET DATA TYPE` DDL.
 ///
-/// Integers map to `INT64` and floats to `FLOAT64`; the drift engine only ever
-/// widens integer→number, and BigQuery permits `INT64 → FLOAT64`.
+/// Integers map to `INT64` and floats to `FLOAT64`; a widening goes through
+/// [`widened_bq_type`] instead.
 pub fn base_to_bq(t: faucet_core::SqlBaseType) -> &'static str {
     use faucet_core::SqlBaseType::*;
     match t {
@@ -461,6 +461,21 @@ pub fn base_to_bq(t: faucet_core::SqlBaseType) -> &'static str {
         Boolean => "BOOL",
         Text => "STRING",
         Json => "JSON",
+    }
+}
+
+/// The type a drifted column widens to. An `INT64` column that starts
+/// receiving fractions becomes `BIGNUMERIC` — exact for every `INT64` and for
+/// the fraction — rather than `FLOAT64`, which would round stored values above
+/// 2^53 in place (#862 M-056). BigQuery allows `INT64 → BIGNUMERIC` in place.
+pub fn widened_bq_type(
+    from: Option<faucet_core::SqlBaseType>,
+    to: faucet_core::SqlBaseType,
+) -> &'static str {
+    use faucet_core::SqlBaseType::*;
+    match (from, to) {
+        (Some(Integer), Double) => "BIGNUMERIC",
+        (_, other) => base_to_bq(other),
     }
 }
 
@@ -490,8 +505,7 @@ pub fn build_add_column_ddl(table_ref: &str, col: &str, bq_type: &str) -> String
 
 /// `ALTER TABLE <ref> ALTER COLUMN `<col>` SET DATA TYPE <bq_type>` — widen an
 /// existing column's type. Naturally idempotent (re-running the same widening
-/// is a no-op). BigQuery permits a lossless relaxation here (INT64→FLOAT64,
-/// NUMERIC→BIGNUMERIC/FLOAT64).
+/// is a no-op). The sink widens `INT64` to `BIGNUMERIC` ([`widened_bq_type`]).
 pub fn build_alter_type_ddl(table_ref: &str, col: &str, bq_type: &str) -> String {
     format!(
         "ALTER TABLE {table_ref} ALTER COLUMN {} SET DATA TYPE {bq_type}",
@@ -1010,6 +1024,9 @@ mod tests {
         assert_eq!(base_to_bq(Boolean), "BOOL");
         assert_eq!(base_to_bq(Text), "STRING");
         assert_eq!(base_to_bq(Json), "JSON");
+        assert_eq!(widened_bq_type(Some(Integer), Double), "BIGNUMERIC");
+        assert_eq!(widened_bq_type(None, Double), "FLOAT64");
+        assert_eq!(widened_bq_type(Some(Text), Text), "STRING");
     }
 
     #[test]

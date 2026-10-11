@@ -13,8 +13,9 @@ fn default_statement_timeout() -> Duration {
     Duration::ZERO
 }
 
+/// Snowflake's maximum `STATEMENT_TIMEOUT_IN_SECONDS` (#862 M-051).
 fn default_poll_timeout() -> Duration {
-    Duration::from_secs(300)
+    Duration::from_secs(172_800)
 }
 
 fn default_batch_size() -> usize {
@@ -68,8 +69,10 @@ pub struct SnowflakeSourceConfig {
     /// returns HTTP 202) before giving up with
     /// [`FaucetError::Source`](faucet_core::FaucetError::Source).
     /// Without this cap a statement that never finishes would loop forever.
-    /// Defaults to 300 seconds. Set to `0` to disable the cap and poll
-    /// indefinitely.
+    /// The statement is cancelled server-side when the cap is reached.
+    /// Defaults to 172800 seconds (48 hours, Snowflake's own maximum statement
+    /// time), so a long extract is never cut short by the client. Set to `0`
+    /// to disable the cap and poll indefinitely.
     #[serde(
         default = "default_poll_timeout",
         with = "faucet_core::config::duration_secs"
@@ -222,7 +225,7 @@ mod tests {
         assert!(cfg.role.is_none());
         assert!(cfg.params.is_empty());
         assert_eq!(cfg.statement_timeout, Duration::ZERO);
-        assert_eq!(cfg.poll_timeout, Duration::from_secs(300));
+        assert_eq!(cfg.poll_timeout, Duration::from_secs(172_800));
         assert_eq!(cfg.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
     }
 

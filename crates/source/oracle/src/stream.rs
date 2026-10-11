@@ -22,7 +22,8 @@ use serde_json::Value;
 use crate::config::{OracleReplication, OracleSourceConfig};
 use crate::query::{
     CatalogRow, OwnedBind, PlannedQuery, apply_incremental, default_state_key,
-    descriptors_from_catalog, owned_binds, plan_query, resolve_binds,
+    descriptors_from_catalog, is_datetime_conversion_error, owned_binds, plan_query, resolve_binds,
+    text_binds,
 };
 
 /// Oracle Database query source.
@@ -61,32 +62,100 @@ struct QueryJob {
 
 /// Run a query, handing each full page to `emit`; stops early when `emit`
 /// returns `false` (the consumer went away).
+///
+/// An ISO-shaped `:bookmark` binds as a timestamp first (SQL-41). When the
+/// cursor column is text holding ISO strings, Oracle converts the *column* to a
+/// timestamp and rejects the `T` before any row is returned; the query then
+/// runs once more with the bookmark bound as text (#862 M-067).
 fn run_query(job: QueryJob, mut emit: impl FnMut(Vec<Value>) -> bool) -> Result<(), FaucetError> {
     let conn = checkout(&job.pool, Side::Source, job.timeout)?;
+    let mut emitted = false;
+    match run_query_on(&conn, &job, BookmarkBind::Typed, &mut emit, &mut emitted) {
+        Err(Failure {
+            message,
+            retry_as_text: true,
+        }) if !emitted => {
+            tracing::debug!(error = %message, "oracle: retrying with the bookmark bound as text");
+            run_query_on(&conn, &job, BookmarkBind::Text, &mut emit, &mut emitted)
+                .map_err(|f| f.into_error())
+        }
+        other => other.map_err(|f| f.into_error()),
+    }
+}
+
+/// How `:bookmark` is bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BookmarkBind {
+    Typed,
+    Text,
+}
+
+/// A failed attempt, and whether it is the text-cursor conversion failure a
+/// text-bound bookmark avoids.
+struct Failure {
+    message: FaucetError,
+    retry_as_text: bool,
+}
+
+impl Failure {
+    fn into_error(self) -> FaucetError {
+        self.message
+    }
+}
+
+fn run_query_on(
+    conn: &faucet_common_oracle::oracle::Connection,
+    job: &QueryJob,
+    mode: BookmarkBind,
+    emit: &mut impl FnMut(Vec<Value>) -> bool,
+    emitted: &mut bool,
+) -> Result<(), Failure> {
+    let plain = |message: FaucetError| Failure {
+        message,
+        retry_as_text: false,
+    };
     let mut stmt = conn
         .statement(&job.sql)
         .fetch_array_size(job.array_size)
         .build()
-        .map_err(|e| ora_err(Side::Source, "prepare", &e))?;
+        .map_err(|e| plain(ora_err(Side::Source, "prepare", &e)))?;
     let names: Vec<String> = stmt.bind_names().iter().map(|s| s.to_string()).collect();
-    let binds = resolve_binds(&names, &job.params, job.bookmark.as_ref())?;
-    let owned = owned_binds(binds);
+    let binds = resolve_binds(&names, &job.params, job.bookmark.as_ref()).map_err(plain)?;
+    let owned = match mode {
+        BookmarkBind::Typed => owned_binds(binds),
+        BookmarkBind::Text => text_binds(binds),
+    };
+    let typed_bookmark = owned
+        .iter()
+        .any(|(_, b)| matches!(b, OwnedBind::Timestamp(_) | OwnedBind::TimestampTz(_)));
+    let classify = |message: FaucetError, raw: &str| Failure {
+        retry_as_text: typed_bookmark && is_datetime_conversion_error(raw),
+        message,
+    };
     let named: Vec<(&str, &dyn ToSql)> = owned
         .iter()
         .map(|(n, b)| (n.as_str(), as_tosql(b)))
         .collect();
-    let rows = stmt
-        .query_named(&named)
-        .map_err(|e| query_error(&e.to_string()))?;
+    let rows = stmt.query_named(&named).map_err(|e| {
+        let raw = e.to_string();
+        classify(query_error(&raw), &raw)
+    })?;
     let mut buf = Vec::with_capacity(job.chunk.min(job.array_size as usize));
     for row in rows {
-        let row = row.map_err(|e| ora_err(Side::Source, "fetch", &e))?;
-        buf.push(row_to_json(&row, &job.json_columns, Side::Source)?);
-        if buf.len() >= job.chunk && !emit(std::mem::take(&mut buf)) {
-            return Ok(());
+        let row = row.map_err(|e| {
+            let raw = e.to_string();
+            classify(ora_err(Side::Source, "fetch", &e), &raw)
+        })?;
+        buf.push(row_to_json(&row, &job.json_columns, Side::Source).map_err(plain)?);
+        if buf.len() >= job.chunk {
+            *emitted = true;
+            if !emit(std::mem::take(&mut buf)) {
+                return Ok(());
+            }
         }
     }
     if !buf.is_empty() {
+        *emitted = true;
         emit(buf);
     }
     Ok(())

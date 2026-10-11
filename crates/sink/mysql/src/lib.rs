@@ -13,5 +13,5 @@ pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};
 
-pub use config::{MysqlColumnMapping, MysqlSinkConfig};
+pub use config::{BinaryEncoding, MysqlColumnMapping, MysqlSinkConfig};
 pub use sink::MysqlSink;

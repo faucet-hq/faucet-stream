@@ -22,7 +22,9 @@ the Delta Lake connectors ([`faucet-source-delta`](https://crates.io/crates/fauc
   Databricks.
 - **Type-aware decode** from the response `manifest` column schema (every
   `JSON_ARRAY` cell is a string; decoded per `type_name` to typed JSON, with
-  `DECIMAL`/large `LONG` preserved losslessly as strings).
+  `DECIMAL`/large `LONG` preserved losslessly as strings). A result with two
+  columns of the same name (a join's `id`) fails with an error asking you to
+  alias them, rather than one silently replacing the other.
 - **Incremental replication** — a bookmark column + a `${bookmark}` token bound
   as a server-side named parameter, plus a client-side filter backstop.
 - **Bearer auth** (PAT / OAuth M2M), inline or via the shared `auth:` catalog.

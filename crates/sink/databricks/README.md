@@ -22,7 +22,10 @@ For landing files in object storage without a warehouse, use
 - **One typing rule on both paths** — every value travels as a string cell and
   is cast to the column's *declared* type on the server (`CAST(… AS <type>)`,
   `from_json(…, map('mode', 'FAILFAST'))` for `STRUCT`/`ARRAY`/`MAP` — a value
-  that does not fit fails the statement instead of being nulled field by field
+  that does not fit fails the statement instead of being nulled field by field;
+  Spark ignores keys the type has no field for in every mode, so the sink
+  checks nested keys against the declared type first and fails the page naming
+  any it would drop (`payload.b`)
   — and `parse_json` over the value's JSON text for `VARIANT`, so a JSON string
   stays a string), so the insert and staged paths can never land a value
   differently.

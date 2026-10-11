@@ -14,7 +14,7 @@ Reach for it when you want to land any faucet-stream source — a REST API, a CS
 - **Two column-mapping modes** — `json` packs each record into a single JSON column; `auto_map` maps top-level JSON keys directly onto table columns discovered from `INFORMATION_SCHEMA`.
 - **Multi-row `INSERT`** — every batch becomes a single `INSERT INTO t VALUES (...), (...), ...`, sub-chunked so `rows × columns` never exceeds MySQL's 65,535-placeholder limit.
 - **Connection pooling** — a `sqlx::MySqlPool` built once in `new()` and reused for every write; pool size is configurable.
-- **Write modes** — `append` (default), `upsert` (`INSERT … ON DUPLICATE KEY UPDATE`), and `delete` (delete by key), with last-write-wins de-duplication within a page and atomic per-page transactions.
+- **Write modes** — `append` (default), `upsert` (`INSERT … ON DUPLICATE KEY UPDATE`), and `delete` (delete by key), with last-write-wins de-duplication within a page and atomic per-page transactions. Runs of upserts and deletes apply in page order, so a delete of `"Bob"` followed by an upsert of `"bob"` (equal under the default `_ci` collation) keeps the re-inserted row.
 - **Effectively-once delivery** — pairs with a CDC source for at-most-once-effective writes; records and the commit-token watermark commit in one transaction.
 - **Dead-letter queue** — in upsert/delete mode, rows with a missing/null key are routed per-row to a configured DLQ instead of failing the whole batch.
 - **Native-typed binding** — in `auto_map` mode, values bind as native MySQL types (text, integer/double, `TINYINT` booleans, JSON for nested values).
@@ -73,6 +73,7 @@ faucet run pipeline.yaml
 | `table_name` | string | — *(required)* | Target table. Quoted with backticks (embedded backticks doubled). |
 | `column_mapping` | `MysqlColumnMapping` | `{ json: { column: "data" } }` | How JSON records map to columns — see [Column mapping](#column-mapping). |
 | `max_connections` | int | `5` | Maximum connections in the `sqlx` pool. |
+| `binary_encoding` | `"auto"` \| `"base64"` \| `"text"` | `"auto"` | How a string written to a `BINARY`/`VARBINARY`/`BLOB` column becomes bytes. `auto` decodes canonical base64 (how every faucet source emits binary) and stores any other string as text — so a text value that happens to be valid base64 (`"user"`, a hex digest) is decoded. `base64` decodes every value and fails the row when one is not base64; `text` stores every string as its text. Set it when the column's origin is known. |
 | `write_timeout_secs` | int | `3600` | Longest one page write may wait on the server before it fails. A server that vanishes without closing the connection (failover, NAT or load-balancer idle eviction) would otherwise hang the run forever. `0` waits forever. |
 
 ### Batching
@@ -96,7 +97,7 @@ faucet run pipeline.yaml
 | Variant | YAML | Description |
 |---------|------|-------------|
 | `Json { column }` | `column_mapping: { json: { column: data } }` | Insert each record as a serialized JSON string in one column (defaults to `data`). Uses `INSERT INTO t (col) VALUES (?), (?), ...`. |
-| `AutoMap` | `column_mapping: auto_map` | Map top-level JSON keys directly to table columns discovered from `INFORMATION_SCHEMA.COLUMNS`. The INSERT column set is the **union** of record keys across the batch (a field present only in a later record is still written; on an append a row missing a column binds SQL `NULL`, while an **upsert** writes each row's own columns only, so a column a row omits keeps its stored value). A base64 string bound to a `BINARY`/`VARBINARY`/`BLOB` column is stored as its decoded bytes — how every faucet source emits binary; other text is bound as is. Fields match columns exactly, else ignoring ASCII case (MySQL column names are case-insensitive). Extra keys with no matching column are not written — configure a `schema:` drift policy to add or quarantine them. A record matching **no** column is an error: `write_batch` fails, and `write_batch_partial` reports that row as failed so it reaches the DLQ. Integers above `i64::MAX` (`BIGINT UNSIGNED`) bind exactly. |
+| `AutoMap` | `column_mapping: auto_map` | Map top-level JSON keys directly to table columns discovered from `INFORMATION_SCHEMA.COLUMNS`. The INSERT column set is the **union** of record keys across the batch (a field present only in a later record is still written; on an append a row missing a column binds SQL `NULL`, while an **upsert** writes each row's own columns only, so a column a row omits keeps its stored value). A base64 string bound to a `BINARY`/`VARBINARY`/`BLOB` column is stored as its decoded bytes — how every faucet source emits binary; other text is bound as is (see `binary_encoding` to make this deterministic). Fields match columns exactly, else ignoring ASCII case (MySQL column names are case-insensitive). Extra keys with no matching column are not written — configure a `schema:` drift policy to add or quarantine them. A record matching **no** column is an error: `write_batch` fails, and `write_batch_partial` reports that row as failed so it reaches the DLQ. Integers above `i64::MAX` (`BIGINT UNSIGNED`) bind exactly. |
 
 ## Examples
 
@@ -288,7 +289,7 @@ Under `on_drift: evolve`, `MysqlSink::evolve_schema()` applies additive DDL:
 
 - **New columns** → `ADD COLUMN`. MySQL has no `ADD COLUMN IF NOT EXISTS`, so the current column set is read first and an `ADD COLUMN` is emitted only for names not already present (idempotent by pre-check).
 - **Lossless widenings** (e.g. integer → number) → `MODIFY COLUMN` — gated on `allow_type_widening`; re-running the same `MODIFY` is a no-op. An integer column that starts receiving fractions becomes `DECIMAL(65,30)` (exact — `DOUBLE` would round every stored value above 2^53), and the statement re-emits the rest of the definition — `NOT NULL`, default, `ON UPDATE`, comment — so it survives. An `AUTO_INCREMENT` column cannot become `DECIMAL`; widening one fails with a schema-drift error.
-- **Nullability relaxations** → `MODIFY COLUMN` re-emits the column's exact definition from `INFORMATION_SCHEMA.COLUMNS` — `COLUMN_TYPE` (so `DECIMAL(12,2)` stays `DECIMAL(12,2)`), character set and collation, default (an expression default stays an expression), `AUTO_INCREMENT`, `ON UPDATE` and comment — with `NOT NULL` replaced by `NULL`. A generated column is left as it is.
+- **Nullability relaxations** → `MODIFY COLUMN` re-emits the column's exact definition from `INFORMATION_SCHEMA.COLUMNS` — `COLUMN_TYPE` (so `DECIMAL(12,2)` stays `DECIMAL(12,2)`), character set and collation, default (an expression default stays an expression; MySQL 5.7's unmarked `CURRENT_TIMESTAMP`, MariaDB's already-quoted defaults and `BIT` literals such as `b'0'` are kept as they are), `AUTO_INCREMENT`, `ON UPDATE` and comment — with `NOT NULL` replaced by `NULL`. A generated column is left as it is.
 
 Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
 
@@ -442,6 +443,11 @@ A `RENAME` swap would publish a table without the target's foreign keys and
 triggers (they stay on the renamed-away table). So when the target has either,
 the commit instead replaces its rows in place — `DELETE` + `INSERT … SELECT` in
 one transaction — keeping its definition (its triggers fire for those rows). A
+self-referencing foreign key (`parent_id REFERENCES t(id)`) would fail InnoDB's
+row-by-row checks part-way through, so for such a table the replace runs with
+`FOREIGN_KEY_CHECKS = 0` and every one of the table's foreign keys is checked
+before the commit; a row that breaks one fails the swap and leaves the target as
+it was. A
 target that **other** tables reference by foreign key is refused before the run
 loads anything: InnoDB would re-point the children at the renamed-away table,
 and a `DELETE` would cascade into or be blocked by them.
@@ -468,7 +474,7 @@ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).
 The journal table is created on its own connection before the write
 transaction begins (MySQL commits an open transaction on any `CREATE TABLE`),
 so a journaled page stays one transaction. Before-images keep binary columns as
-base64, `BIT` as its integer and `DECIMAL` as exact text, and leave generated
+unwrapped base64 (any length), `BIT` as its integer and `DECIMAL` as exact text, and leave generated
 columns out, so a restore writes back exactly what was there. Rolling back an
 overwrite of a table with foreign keys or triggers puts the previous rows back
 in place rather than renaming.

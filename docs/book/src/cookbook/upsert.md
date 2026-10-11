@@ -366,7 +366,7 @@ types you add after the first run survive every refresh. With
 
 | Sink | Atomic swap |
 |---|---|
-| `postgres` | one transaction: `TRUNCATE` + `INSERT … SELECT` from a `LIKE` staging clone + `DROP`. Generated columns are recomputed, identity columns keep the staged values (`OVERRIDING SYSTEM VALUE`), and a target other tables reference by foreign key is emptied with `DELETE` under deferred constraints (a cascading reference is refused up front) |
+| `postgres` | one transaction: `TRUNCATE` + `INSERT … SELECT` from a `LIKE` staging clone + `DROP`. Generated columns are recomputed, identity columns keep the staged values (`OVERRIDING SYSTEM VALUE`), and a target other tables reference by foreign key is emptied with `DELETE` under deferred constraints (a cascading reference, or a non-`DEFERRABLE` / `RESTRICT` one whose table holds references, is refused up front) |
 | `sqlite` | one transaction: `DELETE` + `INSERT … SELECT` from a `SELECT … WHERE 0` clone + `DROP` |
 | `mysql` | `CREATE TABLE staging LIKE target`, then an atomic `RENAME TABLE` swap (MySQL auto-commits DDL, so a transaction can't span it). A target with foreign keys or triggers is instead refilled in place — `DELETE` + `INSERT … SELECT` in one transaction — so they survive (its triggers fire for those rows); a target **other** tables reference by foreign key is refused before the run |
 | `mssql` | one transaction: `DELETE` + `INSERT` (explicit non-IDENTITY column list) from a `SELECT … INTO … WHERE 1=0` clone + `DROP` |

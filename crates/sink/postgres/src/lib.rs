@@ -16,5 +16,5 @@ pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};
 
-pub use config::{PostgresColumnMapping, PostgresSinkConfig, PostgresWriteMethod};
+pub use config::{BinaryEncoding, PostgresColumnMapping, PostgresSinkConfig, PostgresWriteMethod};
 pub use sink::PostgresSink;

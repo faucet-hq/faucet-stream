@@ -237,7 +237,8 @@ Columns are converted to JSON values by probing the row's value with each candid
 
 Types without an exact native decode are read through their text output: the
 source describes the query first and wraps it, casting only those columns. A
-query with duplicate column names cannot be wrapped; there, a non-NULL value of
+trailing `;` or `--` comment is fine (the source strips the semicolon and ends the comment before wrapping); a
+query with duplicate column names, or a data-modifying `WITH` (legal only at top level), cannot be wrapped; there, a non-NULL value of
 such a type fails the run with an error naming the column instead of turning
 into `null` — alias the columns or cast the value in SQL.
 

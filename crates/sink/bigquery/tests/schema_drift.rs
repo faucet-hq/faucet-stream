@@ -297,7 +297,7 @@ async fn evolve_schema_issues_alter_table_ddl() {
     assert!(
         queries
             .iter()
-            .any(|q| q.contains("ALTER TABLE `p.d.t` ALTER COLUMN `id` SET DATA TYPE FLOAT64")),
+            .any(|q| q.contains("ALTER TABLE `p.d.t` ALTER COLUMN `id` SET DATA TYPE BIGNUMERIC")),
         "missing widening DDL; got {queries:?}"
     );
     assert!(

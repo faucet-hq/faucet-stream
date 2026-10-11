@@ -183,11 +183,16 @@ pub fn arrow_to_json_schema(schema: &Schema) -> Value {
     let mut props = serde_json::Map::new();
     for field in schema.fields() {
         let base = arrow_base_type(field.data_type());
-        let fragment = if field.is_nullable() {
+        let mut fragment = if field.is_nullable() {
             serde_json::json!({ "type": [base, "null"] })
         } else {
             serde_json::json!({ "type": base })
         };
+        // Decimal and float values arrive as strings too — exact decimal text
+        // and NaN / ±Infinity — and the sink parses them (#862 M-062).
+        if base == "number" {
+            fragment[faucet_core::DRIFT_ALSO_ACCEPTS] = serde_json::json!(["string"]);
+        }
         props.insert(field.name().clone(), fragment);
     }
     serde_json::json!({ "type": "object", "properties": Value::Object(props) })
@@ -274,7 +279,12 @@ mod tests {
         ]));
         assert_eq!(
             arrow_to_json_schema(&schema)["properties"]["amount"],
-            serde_json::json!({"type": ["number", "null"]})
+            serde_json::json!({"type": ["number", "null"], "x-faucet-also-accepts": ["string"]})
+        );
+        assert!(
+            arrow_to_json_schema(&schema)["properties"]["id"]
+                .get("x-faucet-also-accepts")
+                .is_none()
         );
         let records = [
             serde_json::json!({"id": 1, "extra": 1, "b": 2}),

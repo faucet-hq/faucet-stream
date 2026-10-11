@@ -288,7 +288,7 @@ See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 ## Schema inference
 
-When `create_if_missing: true` and the table is new, the Iceberg schema is inferred from the first Arrow batch: every JSON field becomes a nullable column, typed by its first non-null value. Subsequent batches use the table's existing schema so the writer and table stay in sync; a record field the table does not have is dropped with a one-time `WARN` naming it (add a `schema:` drift policy to fail or quarantine instead). A `decimal` column reports as `number` in `current_schema`. Iceberg assigns **field IDs** sequentially from `1`; IDs are stable once the table exists, so renaming or reordering JSON keys in later runs does not change them.
+When `create_if_missing: true` and the table is new, the Iceberg schema is inferred from the first Arrow batch: every JSON field becomes a nullable column, typed by its first non-null value. Subsequent batches use the table's existing schema so the writer and table stay in sync; a record field the table does not have is dropped with a one-time `WARN` naming it (add a `schema:` drift policy to fail or quarantine instead). A `decimal` (or float) column reports as `number` in `current_schema` and also accepts strings (`x-faucet-also-accepts`), since exact decimal text and `"NaN"` / `"Infinity"` arrive as strings — a drift policy does not flag them. Iceberg assigns **field IDs** sequentially from `1`; IDs are stable once the table exists, so renaming or reordering JSON keys in later runs does not change them.
 
 A fractional number bound for an integer column (`10.5` into a `long`) fails the write naming the column instead of being truncated.
 

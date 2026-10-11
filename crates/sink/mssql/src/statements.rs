@@ -13,8 +13,8 @@ use crate::coltype::{ColumnInfo, binary_flags, casts_for};
 use crate::config::{MssqlColumnMapping, OnUnknownField};
 use crate::encode::{
     BoundParam, auto_row_params_typed, build_cleanup_key_insert_sql, build_insert_sql_cast,
-    build_merge_cast, build_merge_delete_cast, group_by_present_columns, max_rows_per_insert,
-    resolve_insert_columns,
+    build_merge_cast, build_merge_delete_cast, fold_to_columns, group_by_present_columns,
+    max_rows_per_insert, resolve_insert_columns, unmatched_row_error, unmatched_rows,
 };
 
 /// One chunk ready to bind: the column list, each column's `CAST` target, and
@@ -188,7 +188,12 @@ pub(crate) fn prepare_rows(
             }))
         }
         MssqlColumnMapping::AutoColumns { on_unknown_field } => {
-            let cols = resolve_insert_columns(&insertable(infos), chunk, *on_unknown_field)?;
+            let writable = insertable(infos);
+            let chunk = fold_to_columns(&writable, chunk);
+            if let Some(&index) = unmatched_rows(&writable, &chunk).first() {
+                return Err(unmatched_row_error(index));
+            }
+            let cols = resolve_insert_columns(&writable, &chunk, *on_unknown_field)?;
             if cols.is_empty() {
                 return Ok(None);
             }
@@ -237,9 +242,11 @@ pub(crate) fn merge_statements(
     on_unknown: OnUnknownField,
     upserts: &[Value],
 ) -> Result<Vec<Statement>, FaucetError> {
-    let cols = resolve_insert_columns(&insertable(infos), upserts, on_unknown)?;
+    let writable = insertable(infos);
+    let upserts = fold_to_columns(&writable, upserts);
+    let cols = resolve_insert_columns(&writable, &upserts, on_unknown)?;
     let mut out = Vec::new();
-    for (cols, rows) in group_by_present_columns(upserts, &cols) {
+    for (cols, rows) in group_by_present_columns(&upserts, &cols) {
         if cols.is_empty() {
             continue;
         }
@@ -468,11 +475,14 @@ mod tests {
         assert_eq!(p.cols, vec!["id", "blob"]);
         assert_eq!(p.casts, vec![Some("int".to_string()), None]);
         assert!(matches!(p.rows[0][1], BoundParam::NullBinary(None)));
-        assert!(
-            prepare_rows(&auto, &table(), &[json!({"zz": 1})])
-                .unwrap()
-                .is_none()
-        );
+        let err = prepare_rows(&auto, &table(), &[json!({"id": 1}), json!({"zz": 1})])
+            .err()
+            .expect("a record matching no column is an error");
+        assert!(err.to_string().contains("record 1 has no field"), "{err}");
+        let p = prepare_rows(&auto, &table(), &[json!({"ID": 4})])
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.cols, vec!["id"], "fields match columns ignoring case");
         let strict = MssqlColumnMapping::AutoColumns {
             on_unknown_field: OnUnknownField::Error,
         };

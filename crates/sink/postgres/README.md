@@ -75,6 +75,7 @@ faucet run pipeline.yaml
 | `batch_size` | int | `1000` | Maximum rows per multi-row `INSERT` (or per `COPY` under `write_method: copy`). **`0` = no batching** — the whole page is sent in one statement. See [Streaming & batching](#streaming--batching). |
 | `max_connections` | int | `5` | Maximum connections in the `sqlx` pool. |
 | `write_method` | `"insert" \| "copy"` | `"insert"` | How append-mode rows are shipped. `copy` uses the `COPY … FROM STDIN` bulk-load fast-path — see [Bulk load](#bulk-load-write_method-copy). |
+| `binary_encoding` | `"auto"` \| `"base64"` \| `"text"` | `"auto"` | How a string written to a `bytea` column becomes bytes. `auto` decodes canonical base64 (how every faucet source emits binary), passes `\x…` hex through and stores any other string as text — so a text value that happens to be valid base64 (`"user"`, a hex digest) is decoded. `base64` decodes every value and fails the row when one is not base64; `text` stores every string's own bytes. Applies to the insert, `COPY` and key paths. |
 | `write_timeout_secs` | int | `3600` | Longest one page write may wait on the server before it fails. A server that vanishes without closing the connection (failover, NAT or load-balancer idle eviction) would otherwise hang the run forever. `0` waits forever. |
 
 ### Write mode
@@ -125,7 +126,7 @@ sink:
 
 Discovers column names and types from the table schema and maps matching JSON keys. A field present only in some records is still written; on an append, rows missing a column bind SQL `NULL`. An **upsert** writes each row's own columns only, so a column a row omits keeps its stored value (a postgres-cdc event leaves an unchanged TOAST column out of `after`, and the mirror keeps it).
 
-A `bytea` column takes a **base64** string — how every faucet source emits binary — as its decoded bytes. A string already in Postgres's `\x…` hex form, or one that is not valid base64, is bound as before.
+A `bytea` column takes a **base64** string — how every faucet source emits binary — as its decoded bytes. A string already in Postgres's `\x…` hex form, or one that is not valid base64, is bound as before. Because any string of the right length and alphabet is valid base64, set `binary_encoding: text` (or `base64`) when the column's origin is known.
 
 ```sql
 CREATE TABLE events (
@@ -489,7 +490,11 @@ carry (`OVERRIDING SYSTEM VALUE`), and records that omit them get values from
 the table's own sequence. A target other tables reference by foreign key is
 emptied with `DELETE` under deferred constraints instead of `TRUNCATE` (which
 PostgreSQL refuses): children that reference a key the run brings back stay
-valid, any other reference fails the swap. A reference with `ON DELETE CASCADE`,
+valid, any other reference fails the swap. Deferring only reaches a foreign key
+declared `DEFERRABLE` (with `ON DELETE NO ACTION`); a default (`NOT DEFERRABLE`)
+or `ON DELETE RESTRICT` key is checked the moment the rows are deleted, so a
+target referenced by one whose table holds references is refused before the run
+loads anything — declare the key `DEFERRABLE`, or use `write_mode: upsert`. A reference with `ON DELETE CASCADE`,
 `SET NULL` or `SET DEFAULT` is refused before the run loads anything, because
 replacing the rows would change the referencing table.
 
