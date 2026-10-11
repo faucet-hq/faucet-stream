@@ -215,6 +215,19 @@ pub fn refuse_subprocess(
     })
 }
 
+/// Map a failure to resolve a `${file:}` / secret-manager reference: an I/O,
+/// network or credential failure may pass on retry (`503`), anything else is
+/// the config's fault (`400`).
+fn resolution_error(e: crate::error::CliError) -> ServeError {
+    use crate::error::CliError;
+    match e {
+        CliError::ReadInterpolatedFile { .. }
+        | CliError::SecretFetchFailed { .. }
+        | CliError::SecretAuthFailed { .. } => ServeError::Unavailable(e.to_string()),
+        other => ServeError::BadConfig(other.to_string()),
+    }
+}
+
 /// Wire format of a submitted config body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -389,8 +402,7 @@ pub async fn load_submission_scoped(
     // 2. ${env}/${file}/${secret} interpolation against the server's env/fs,
     // resolved INTO the parsed tree (post-parse) so a resolved value can never
     // alter the submitted document's structure (F43).
-    crate::interpolate::interpolate_value(&mut submitted)
-        .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+    crate::interpolate::interpolate_value(&mut submitted).map_err(resolution_error)?;
 
     // 3. Merge onto the workspace default (submitted wins; see merge.rs semantics).
     let mut merged = match default_base {
@@ -460,7 +472,7 @@ pub async fn load_submission_scoped(
 
     crate::secrets::resolve_secrets(&mut cfg)
         .await
-        .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+        .map_err(resolution_error)?;
 
     // 5a. A tenant's connections join the auth catalog (#709), after secrets
     // resolution so an unsealed credential is never scanned for directives.
@@ -683,6 +695,37 @@ schedule:
         assert!(refuse_server_secrets(&json!({"x": "${env:HOME}"})).is_ok());
         let err = refuse_server_secrets(&doc).unwrap_err();
         assert!(matches!(err, ServeError::Forbidden(_)));
+    }
+
+    #[test]
+    fn resolution_failures_that_may_pass_on_retry_are_unavailable() {
+        use crate::error::CliError;
+        let io = CliError::ReadInterpolatedFile {
+            path: "/x".into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+        };
+        assert!(matches!(resolution_error(io), ServeError::Unavailable(_)));
+        let fetch = CliError::SecretFetchFailed {
+            scheme: "vault".into(),
+            reference: "kv/x".into(),
+            source: "503".into(),
+        };
+        assert!(matches!(resolution_error(fetch), ServeError::Unavailable(_)));
+        let auth = CliError::SecretAuthFailed {
+            scheme: "vault".into(),
+            hint: "token expired".into(),
+        };
+        assert!(matches!(resolution_error(auth), ServeError::Unavailable(_)));
+        let missing = CliError::MissingEnvVar {
+            var: "X".into(),
+            location: "a".into(),
+        };
+        assert!(matches!(resolution_error(missing), ServeError::BadConfig(_)));
+        let absent = CliError::SecretNotFound {
+            scheme: "vault".into(),
+            reference: "kv/x".into(),
+        };
+        assert!(matches!(resolution_error(absent), ServeError::BadConfig(_)));
     }
 
     #[test]
