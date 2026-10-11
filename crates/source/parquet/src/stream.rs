@@ -706,11 +706,21 @@ fn is_data_object(key: &str, size: u64, prefix: &str) -> bool {
     if size == 0 || key.ends_with('/') {
         return false;
     }
-    let dir = &prefix[..prefix.rfind('/').map_or(0, |i| i + 1)];
-    !key.strip_prefix(dir)
-        .unwrap_or(key)
-        .split('/')
-        .any(|s| s.starts_with('_') || s.starts_with('.'))
+    !is_hidden(key, prefix)
+}
+
+/// Whether a segment of `key` after the whole `prefix` starts with `_` or `.`.
+fn is_hidden(key: &str, prefix: &str) -> bool {
+    let hidden = |s: &str| s.starts_with('_') || s.starts_with('.');
+    let Some(rest) = key.strip_prefix(prefix) else {
+        return key.split('/').any(hidden);
+    };
+    let mut segments = rest.split('/');
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        // The rest of a segment the prefix names in part is the caller's choice.
+        segments.next();
+    }
+    segments.any(hidden)
 }
 
 /// Build an `AmazonS3` `object_store` client from a `ParquetS3Config`.
@@ -856,6 +866,10 @@ mod tests {
         use super::is_data_object;
         assert!(is_data_object("out/part-0.parquet", 10, "out/"));
         assert!(!is_data_object("out/_SUCCESS", 0, "out/"));
+        assert!(is_data_object("exports/_daily-1.parquet", 4, "exports/_daily"));
+        assert!(is_data_object("exports/_daily/p.parquet", 4, "exports/_daily"));
+        assert!(!is_data_object("exports/_daily/_t/p.parquet", 4, "exports/_daily"));
+        assert!(!is_data_object("other/_p.parquet", 4, "out/"));
         assert!(!is_data_object("out/_common_metadata", 10, "out/"));
         assert!(!is_data_object("out/.part-0.parquet.crc", 8, "out/"));
         assert!(!is_data_object("out/_temporary/0/part.parquet", 8, "out/"));
