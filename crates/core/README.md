@@ -447,7 +447,7 @@ Machine-readable exports for downstream consumers are plain functions:
 
 The `masking` feature adds a `MaskingSpec` policy that classifies sensitive
 fields — by field-name pattern (regex over the dot-path), by value detector
-(`email` / `credit_card` (Luhn) / `ssn` / `phone` / `ipv4`), or by explicit
+(`email` / `credit_card` (Luhn) / `ssn` / `phone` / `phone_loose` / `ipv4`), or by explicit
 field list — and rewrites them per action: `redact` (fixed mask), `hash`
 (HMAC-SHA256 keyed / SHA-256 unkeyed; deterministic, so masked values stay
 joinable), `tokenize` (short opaque token), or `partial` (reveal only the last N

@@ -136,6 +136,12 @@ data: a false positive is a data-quality bug, not just noise.
 | `ssn` | A US SSN `NNN-NN-NNNN`, excluding never-issued ranges (000/666/9xx area, 00 group, 0000 serial). |
 | `phone` | An E.164 number (`+` then 8–15 digits) or a North-American number written with separators (`415-555-2671`, `(415) 555-2671`). A bare run of digits never matches — ids and epoch timestamps look exactly like one. |
 | `ipv4` | An IPv4 dotted-quad address. |
+| `phone_loose` | Any 10–15 digit number with optional `+` and separators, as a string or a JSON integer — the `phone` matcher of releases before faucet-core 1.13. Catches bare (`4155552671`) and national (`020 7946 0958`) formats, but also ids and epoch timestamps. |
+
+**Upgrading:** faucet-core 1.13 narrowed `phone` to the two shapes above, so a
+policy that relied on it to catch bare digit runs or national formats now lets
+them through. A policy with a `phone` rule logs a warning when it compiles; switch
+the rule to `phone_loose` to keep the old coverage.
 
 ## Determinism & joinability
 

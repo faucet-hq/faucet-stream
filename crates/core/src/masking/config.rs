@@ -98,6 +98,7 @@ pub struct MatchSpec {
 /// false positive is a data-quality bug, not just noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Detector {
     /// RFC-5322-ish email address.
     Email,
@@ -111,6 +112,11 @@ pub enum Detector {
     Phone,
     /// IPv4 dotted-quad address.
     Ipv4,
+    /// Any 10–15 digit number, `+` and separators allowed, as a string or a
+    /// JSON integer: the broad `phone` matcher of releases before faucet-core
+    /// 1.13. Catches bare and national formats `phone` skips, at the cost of
+    /// matching ids and epoch timestamps.
+    PhoneLoose,
 }
 
 impl std::fmt::Display for Detector {
@@ -121,6 +127,7 @@ impl std::fmt::Display for Detector {
             Detector::Ssn => "ssn",
             Detector::Phone => "phone",
             Detector::Ipv4 => "ipv4",
+            Detector::PhoneLoose => "phone_loose",
         })
     }
 }

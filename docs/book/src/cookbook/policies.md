@@ -23,7 +23,7 @@ classifications:
   - label: pii
     fields: [email, phone, ssn, date_of_birth]     # full dot-path or leaf key
     field_pattern: "(?i)(^|[._])(first|last|full)_?name$"   # regex over the dot-path
-    value_detector: email                          # email|credit_card|ssn|phone|ipv4
+    value_detector: email                          # email|credit_card|ssn|phone|phone_loose|ipv4
   - label: pii
     value_detector: ssn
   - label: finance

@@ -10,6 +10,19 @@ use crate::error::FaucetError;
 use regex::Regex;
 use std::collections::HashSet;
 
+/// Once per process: `phone` stopped matching bare digit runs in faucet-core
+/// 1.13, so a policy relying on it may now pass phone numbers through (#862 M-019).
+fn warn_phone_narrowed() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "masking: `value_detector: phone` matches only E.164 (`+…`) and separated \
+             North-American numbers; bare digit runs and national formats such as \
+             `020 7946 0958` pass through. Use `phone_loose` for the broader matcher"
+        );
+    });
+}
+
 fn config_err(msg: impl Into<String>) -> FaucetError {
     FaucetError::Config(format!("masking: {}", msg.into()))
 }
@@ -76,6 +89,9 @@ impl CompiledMasking {
             if applies(rule, sink_ids) {
                 rules.push(compiled);
             }
+        }
+        if rules.iter().any(|r| r.value_detector == Some(Detector::Phone)) {
+            warn_phone_narrowed();
         }
         let needs_paths = rules
             .iter()
@@ -180,6 +196,13 @@ fn compile_rule(rule: &MaskRule, index: usize) -> Result<CompiledRule, FaucetErr
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_phone_rule_compiles_and_warns_once() {
+        let s = spec(json!({"rules": [{"match": {"value_detector": "phone"}, "action": {"type": "hash"}}]}));
+        assert_eq!(CompiledMasking::compile(&s).unwrap().rule_count(), 1);
+        assert_eq!(CompiledMasking::compile(&s).unwrap().rule_count(), 1);
+    }
 
     fn spec(v: serde_json::Value) -> MaskingSpec {
         serde_json::from_value(v).unwrap()

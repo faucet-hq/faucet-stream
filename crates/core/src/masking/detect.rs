@@ -15,11 +15,13 @@ pub fn detects(detector: Detector, value: &str) -> bool {
         Detector::Phone => is_phone(value),
         Detector::Ipv4 => is_ipv4(value),
         Detector::CreditCard => is_credit_card(value),
+        Detector::PhoneLoose => is_phone_loose(value),
     }
 }
 
 /// [`detects`] over a JSON scalar. Strings go through every detector; a JSON
 /// number only through the card detector (an integer can hold a card number,
+/// and through `phone_loose`, which opts into matching one,
 /// while ids, epoch timestamps and amounts are numbers that look like phone
 /// numbers); booleans and containers never match.
 pub fn detects_value(detector: Detector, value: &serde_json::Value) -> bool {
@@ -27,6 +29,9 @@ pub fn detects_value(detector: Detector, value: &serde_json::Value) -> bool {
         serde_json::Value::String(s) => detects(detector, s),
         serde_json::Value::Number(n) if detector == Detector::CreditCard => {
             n.as_u64().is_some_and(|u| is_credit_card(&u.to_string()))
+        }
+        serde_json::Value::Number(n) if detector == Detector::PhoneLoose => {
+            n.as_u64().is_some_and(|u| is_phone_loose(&u.to_string()))
         }
         _ => false,
     }
@@ -75,6 +80,21 @@ fn is_phone(value: &str) -> bool {
         Regex::new(r"^(?:1[ .-]?)?(?:\(\d{3}\) ?|\d{3}[ .-])\d{3}[ .-]\d{4}$").unwrap()
     })
     .is_match(value)
+}
+
+/// The pre-1.13 `phone` matcher: digits and the usual separators only, `+`
+/// only in front, 10–15 digits in all.
+fn is_phone_loose(value: &str) -> bool {
+    let mut digits = 0usize;
+    for (i, ch) in value.chars().enumerate() {
+        match ch {
+            '0'..='9' => digits += 1,
+            '+' if i == 0 => {}
+            ' ' | '.' | '-' | '(' | ')' => {}
+            _ => return false,
+        }
+    }
+    (10..=15).contains(&digits)
 }
 
 fn is_ipv4(value: &str) -> bool {
@@ -149,6 +169,24 @@ fn luhn_valid(digits: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phone_loose_keeps_the_broad_matcher() {
+        for v in ["4155552671", "14155552671", "020 7946 0958", "+44 20 7946 0958"] {
+            assert!(detects(Detector::PhoneLoose, v), "{v}");
+        }
+        assert!(!detects(Detector::Phone, "4155552671"));
+        assert!(!detects(Detector::PhoneLoose, "12345"));
+        assert!(!detects(Detector::PhoneLoose, "41a5552671"));
+        assert!(detects_value(
+            Detector::PhoneLoose,
+            &serde_json::json!(4155552671u64)
+        ));
+        assert!(!detects_value(Detector::Phone, &serde_json::json!(4155552671u64)));
+        assert_eq!(Detector::PhoneLoose.to_string(), "phone_loose");
+        let d: Detector = serde_json::from_value(serde_json::json!("phone_loose")).unwrap();
+        assert_eq!(d, Detector::PhoneLoose);
+    }
 
     #[test]
     fn email_detector() {
