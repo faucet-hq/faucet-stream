@@ -137,6 +137,15 @@ pub struct PostgresSinkConfig {
     /// waiting forever, and a scheduled or served run stuck in "running".
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
+    /// How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)
+    /// becomes bytes: `auto` (default) decodes canonical base64 — the form
+    /// every faucet source emits — and stores any other string as text;
+    /// `base64` decodes every value and fails the row when one is not base64;
+    /// `text` stores every string as its text. `auto` decides per value, so a
+    /// text column whose values happen to be valid base64 (`"user"`, a hex
+    /// digest) is decoded; set `text` for such a column.
+    #[serde(default)]
+    pub binary_encoding: BinaryEncoding,
 }
 
 fn default_write_timeout_secs() -> u64 {
@@ -166,6 +175,7 @@ impl std::fmt::Debug for PostgresSinkConfig {
             .field("max_connections", &self.max_connections)
             .field("write_method", &self.write_method)
             .field("write_timeout_secs", &self.write_timeout_secs)
+            .field("binary_encoding", &self.binary_encoding)
             .finish()
     }
 }
@@ -185,7 +195,14 @@ impl PostgresSinkConfig {
             write_method: PostgresWriteMethod::default(),
             scope: None,
             write_timeout_secs: default_write_timeout_secs(),
+            binary_encoding: BinaryEncoding::default(),
         }
+    }
+
+    /// How strings bound to binary columns become bytes (#862 M-064).
+    pub fn with_binary_encoding(mut self, encoding: BinaryEncoding) -> Self {
+        self.binary_encoding = encoding;
+        self
     }
 
     /// Opt out of auto-creating a missing target table (#580).
@@ -244,6 +261,59 @@ impl PostgresSinkConfig {
             faucet_core::BatchAtomicity::Atomic
         } else {
             faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
+/// How a JSON string bound to a binary column becomes bytes (#862 M-064).
+///
+/// Every faucet source emits binary values as base64 text, but a string from
+/// a text origin (a CSV token, a hex digest) can also happen to be valid
+/// base64. `auto` cannot tell the two apart: it decodes any canonical, padded
+/// base64 string and stores anything else as its text. Pick `base64` or `text`
+/// when the column's origin is known, so every value is treated the same way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryEncoding {
+    /// Decode a string that is canonical padded base64; store any other
+    /// string as its text.
+    #[default]
+    Auto,
+    /// Every string is base64 (line breaks ignored); one that is not fails the
+    /// row instead of being stored as text.
+    Base64,
+    /// Every string is stored as its text, never decoded.
+    Text,
+}
+
+/// What a binary-column string resolves to under a [`BinaryEncoding`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BinaryValue<'a> {
+    /// Decoded bytes.
+    Bytes(Vec<u8>),
+    /// The string itself, stored as text.
+    Text(&'a str),
+}
+
+impl BinaryEncoding {
+    /// Resolve `s` for a binary column. `Err` only under `base64`, naming why
+    /// the value is not base64.
+    pub(crate) fn resolve(self, s: &str) -> Result<BinaryValue<'_>, String> {
+        use base64::Engine as _;
+        let engine = &base64::engine::general_purpose::STANDARD;
+        match self {
+            Self::Text => Ok(BinaryValue::Text(s)),
+            Self::Auto => Ok(match engine.decode(s) {
+                Ok(bytes) => BinaryValue::Bytes(bytes),
+                Err(_) => BinaryValue::Text(s),
+            }),
+            Self::Base64 => {
+                let unwrapped: String = s.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                engine
+                    .decode(unwrapped)
+                    .map(BinaryValue::Bytes)
+                    .map_err(|e| format!("binary_encoding: base64 — value is not base64: {e}"))
+            }
         }
     }
 }
@@ -414,5 +484,32 @@ mod tests {
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
         let c: PostgresSinkConfig = serde_json::from_value(serde_json::json!({"connection_url": "postgres://localhost/test", "table_name": "events", "write_mode": "upsert", "key": ["id"]})).unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+    }
+}
+
+#[cfg(test)]
+mod binary_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn each_mode_resolves_deterministically() {
+        assert_eq!(
+            BinaryEncoding::Auto.resolve("SGVsbG8="),
+            Ok(BinaryValue::Bytes(b"Hello".to_vec()))
+        );
+        assert_eq!(
+            BinaryEncoding::Auto.resolve("not base64!"),
+            Ok(BinaryValue::Text("not base64!"))
+        );
+        assert_eq!(BinaryEncoding::Text.resolve("abcd"), Ok(BinaryValue::Text("abcd")));
+        assert_eq!(
+            BinaryEncoding::Base64.resolve("SGVs\nbG8=\r\n"),
+            Ok(BinaryValue::Bytes(b"Hello".to_vec()))
+        );
+        let err = BinaryEncoding::Base64.resolve("abc").unwrap_err();
+        assert!(err.contains("not base64"), "{err}");
+        assert_eq!(BinaryEncoding::default(), BinaryEncoding::Auto);
+        let parsed: BinaryEncoding = serde_json::from_str("\"text\"").unwrap();
+        assert_eq!(parsed, BinaryEncoding::Text);
     }
 }
