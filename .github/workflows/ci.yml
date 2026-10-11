@@ -706,7 +706,7 @@ jobs:
         run: |
           ./target/debug/faucet conformance --export --require-all > connectors.json
           jq -e '.format == "faucet-connector-export" and (.connectors | length) > 0 and all(.connectors[]; .compiled and .config_schema != null)' connectors.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ matrix.features == 'full' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
         with:
           name: connectors-export
