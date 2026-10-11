@@ -35,7 +35,13 @@ const TXN_CONFLICT_ATTEMPTS: u32 = 6;
 /// transaction or DML statement changed the same table. BigQuery reports this
 /// only through the message (its `reason` is the generic `invalidQuery`).
 fn is_concurrent_txn_abort(err: &gcp_bigquery_client::model::error_proto::ErrorProto) -> bool {
-    let msg = err.message.as_deref().unwrap_or("").to_ascii_lowercase();
+    is_concurrent_txn_abort_text(err.message.as_deref().unwrap_or(""))
+}
+
+/// [`is_concurrent_txn_abort`] over error text — the form a `jobs.query`
+/// call that fails synchronously (HTTP 400) reaches the sink in (#862 M-055).
+fn is_concurrent_txn_abort_text(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
     msg.contains("aborted due to concurrent update")
         || msg.contains("could not serialize access to table")
 }
@@ -1995,13 +2001,25 @@ impl BigQuerySink {
         let mut delay = Duration::from_millis(200);
         for attempt in 1..=TXN_CONFLICT_ATTEMPTS {
             self.roundtrips.record("query");
-            let resp = self
+            // A transaction that aborts inside `jobs.query`'s wait window comes
+            // back as an HTTP error rather than a failed job; it committed
+            // nothing either, so it is retried the same way.
+            let outcome = match self
                 .client
                 .job()
                 .query(&self.config.project_id, req.clone())
                 .await
-                .map_err(|e| FaucetError::Sink(format!("{what} failed: {e}")))?;
-            match self.await_query_job_classified(resp).await {
+            {
+                Ok(resp) => self.await_query_job_classified(resp).await,
+                Err(e) => {
+                    let text = e.to_string();
+                    Err((
+                        FaucetError::Sink(format!("{what} failed: {text}")),
+                        is_concurrent_txn_abort_text(&text),
+                    ))
+                }
+            };
+            match outcome {
                 Ok(job) => return Ok(job),
                 Err((e, true)) if attempt < TXN_CONFLICT_ATTEMPTS => {
                     tracing::warn!(
