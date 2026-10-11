@@ -81,14 +81,33 @@ async fn build_source(
     )
     .unwrap();
 
+    // One token provider shared by the typed client and the result-page
+    // reader, which sends `jobs.getQueryResults` to `{api_host}/bigquery/v2`.
+    let tokens =
+        faucet_common_bigquery::token_provider(&BigQueryCredentials::ServiceAccountKeyPath {
+            path: sa_file.path().to_str().unwrap().into(),
+        })
+        .await
+        .expect("token provider against mock");
     let client = ClientBuilder::new()
-        .with_auth_base_url(format!("{}{AUTH_SCOPE_BASE}", server.uri()))
         .with_v2_base_url(server.uri())
-        .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+        .build_from_authenticator(tokens.clone())
         .await
         .expect("build bigquery client against mock");
+    let mut config = config;
+    if config.api_host.is_none() {
+        config.api_host = Some(server.uri());
+    }
 
-    (BigQuerySource::from_parts(config, client), sa_file)
+    (
+        BigQuerySource::from_parts_with_tokens(config, client, tokens),
+        sa_file,
+    )
+}
+
+/// Path of a `jobs.getQueryResults` request for `job`.
+fn results_path(job: &str) -> String {
+    format!("/bigquery/v2/projects/{PROJECT_ID}/queries/{job}")
 }
 
 fn schema_one_col() -> Value {
@@ -127,7 +146,7 @@ async fn conformance_bounded_memory() {
 
     // getQueryResults page 2 (rows 2000..4000) + pageToken "tok-2".
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/{JOB_ID}")))
+        .and(path(results_path(JOB_ID)))
         .and(query_param("pageToken", "tok-1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
@@ -140,7 +159,7 @@ async fn conformance_bounded_memory() {
 
     // getQueryResults page 3 (rows 4000..6000) — final page, no further token.
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/{JOB_ID}")))
+        .and(path(results_path(JOB_ID)))
         .and(query_param("pageToken", "tok-2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,

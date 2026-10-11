@@ -72,14 +72,33 @@ async fn build_source(
     )
     .unwrap();
 
+    // One token provider shared by the typed client and the result-page
+    // reader, which sends `jobs.getQueryResults` to `{api_host}/bigquery/v2`.
+    let tokens =
+        faucet_common_bigquery::token_provider(&BigQueryCredentials::ServiceAccountKeyPath {
+            path: sa_file.path().to_str().unwrap().into(),
+        })
+        .await
+        .expect("token provider against mock");
     let client = ClientBuilder::new()
-        .with_auth_base_url(format!("{}{AUTH_SCOPE_BASE}", server.uri()))
         .with_v2_base_url(server.uri())
-        .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+        .build_from_authenticator(tokens.clone())
         .await
         .expect("build bigquery client against mock");
+    let mut config = config;
+    if config.api_host.is_none() {
+        config.api_host = Some(server.uri());
+    }
 
-    (BigQuerySource::from_parts(config, client), sa_file)
+    (
+        BigQuerySource::from_parts_with_tokens(config, client, tokens),
+        sa_file,
+    )
+}
+
+/// Path of a `jobs.getQueryResults` request for `job`.
+fn results_path(job: &str) -> String {
+    format!("/bigquery/v2/projects/{PROJECT_ID}/queries/{job}")
 }
 
 fn schema_two_cols() -> Value {
@@ -164,7 +183,7 @@ async fn fetch_all_paginates_via_page_token() {
 
     // getQueryResults: second page (rows 5..10) — final page (no further token).
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/job-page")))
+        .and(path(results_path("job-page")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "schema": schema_two_cols(),
@@ -247,7 +266,7 @@ async fn polls_until_job_complete_when_first_response_is_incomplete() {
 
     // First poll: still not complete.
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/job-poll")))
+        .and(path(results_path("job-poll")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": false,
         })))
@@ -256,7 +275,7 @@ async fn polls_until_job_complete_when_first_response_is_incomplete() {
         .await;
     // Subsequent poll: complete with rows.
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/job-poll")))
+        .and(path(results_path("job-poll")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "schema": schema_two_cols(),
@@ -402,7 +421,7 @@ async fn fetch_all_paginates_across_three_pages_via_get_query_results() {
 
     // Second page carries a further pageToken so the loop iterates again.
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/job-3pages")))
+        .and(path(results_path("job-3pages")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "schema": schema_two_cols(),
@@ -414,7 +433,7 @@ async fn fetch_all_paginates_across_three_pages_via_get_query_results() {
         .await;
     // Final page: no pageToken.
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/job-3pages")))
+        .and(path(results_path("job-3pages")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "schema": schema_two_cols(),
@@ -452,7 +471,7 @@ async fn stream_pages_initial_response_without_rows_then_paginates() {
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/job-norows")))
+        .and(path(results_path("job-norows")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "schema": schema_two_cols(),
@@ -508,7 +527,7 @@ async fn fetch_all_errors_when_get_query_results_returns_non_2xx() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries/job-getfail")))
+        .and(path(results_path("job-getfail")))
         .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
         .mount(&server)
         .await;
@@ -1049,4 +1068,179 @@ async fn jobs_query_requests_integer_microsecond_timestamps() {
     )
     .unwrap();
     assert_eq!(body["formatOptions"]["useInt64Timestamp"], json!(true));
+}
+
+const SENTINEL_MICROS: &str = "253402300799999999";
+const SENTINEL: &str = "9999-12-31T23:59:59.999999Z";
+
+async fn mount_sentinel_pages(server: &MockServer, job: &str, complete_first: bool) {
+    let schema = json!({"fields": [{"name": "valid_to", "type": "TIMESTAMP"}]});
+    let first = if complete_first {
+        json!({
+            "jobComplete": true,
+            "schema": schema,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": job},
+            "rows": [{"f": [{"v": SENTINEL_MICROS}]}],
+            "pageToken": "p2",
+        })
+    } else {
+        json!({
+            "jobComplete": false,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": job},
+        })
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(first))
+        .mount(server)
+        .await;
+    if !complete_first {
+        Mock::given(method("GET"))
+            .and(path(results_path(job)))
+            .and(wiremock::matchers::query_param_is_missing("pageToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jobComplete": true,
+                "schema": schema,
+                "rows": [{"f": [{"v": SENTINEL_MICROS}]}],
+                "pageToken": "p2",
+            })))
+            .mount(server)
+            .await;
+    }
+    for (token, next) in [("p2", Some("p3")), ("p3", None)] {
+        let mut body = json!({
+            "jobComplete": true,
+            "schema": schema,
+            "rows": [{"f": [{"v": SENTINEL_MICROS}]}],
+        });
+        if let Some(n) = next {
+            body["pageToken"] = json!(n);
+        }
+        Mock::given(method("GET"))
+            .and(path(results_path(job)))
+            .and(wiremock::matchers::query_param("pageToken", token))
+            .and(wiremock::matchers::query_param(
+                "formatOptions.useInt64Timestamp",
+                "true",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+}
+
+async fn assert_results_pages_use_int64_and_one_token(server: &MockServer, results_calls: usize) {
+    let reqs = server.received_requests().await.unwrap();
+    let results: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path().contains("/queries/"))
+        .collect();
+    assert_eq!(results.len(), results_calls);
+    for r in &results {
+        let pairs: Vec<(String, String)> = r.url.query_pairs().into_owned().collect();
+        assert!(
+            pairs.contains(&("formatOptions.useInt64Timestamp".into(), "true".into())),
+            "every getQueryResults page asks for integer microseconds: {}",
+            r.url
+        );
+        assert_eq!(
+            r.headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer fake-token"
+        );
+    }
+    let tokens = reqs
+        .iter()
+        .filter(|r| r.url.path() == AUTH_TOKEN_PATH)
+        .count();
+    assert_eq!(tokens, 1, "one cached token serves every page");
+}
+
+#[tokio::test]
+async fn every_result_page_keeps_microsecond_timestamps_exact() {
+    // #862 M-052: getQueryResults pages, not only jobs.query, are exact.
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_sentinel_pages(&server, "job-sentinel", true).await;
+    let (src, _f) = build_source(&server, default_config()).await;
+    let rows = src.fetch_all().await.unwrap();
+    assert_eq!(rows, vec![json!({"valid_to": SENTINEL}); 3]);
+    assert_results_pages_use_int64_and_one_token(&server, 2).await;
+}
+
+#[tokio::test]
+async fn streamed_result_pages_after_a_poll_keep_microsecond_timestamps_exact() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_sentinel_pages(&server, "job-sentinel-poll", false).await;
+    let (src, _f) = build_source(&server, default_config().with_batch_size(0)).await;
+    let ctx = HashMap::new();
+    let mut stream = src.stream_pages(&ctx, 0);
+    let mut rows = Vec::new();
+    while let Some(page) = stream.next().await {
+        rows.extend(page.unwrap().records);
+    }
+    assert_eq!(rows, vec![json!({"valid_to": SENTINEL}); 3]);
+    assert_results_pages_use_int64_and_one_token(&server, 3).await;
+}
+
+#[tokio::test]
+async fn from_parts_builds_its_result_reader_from_the_config_credentials() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_sentinel_pages(&server, "job-sentinel-parts", true).await;
+    let sa_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        sa_file.path(),
+        dummy_service_account_json(&server.uri()).to_string(),
+    )
+    .unwrap();
+    let creds = BigQueryCredentials::ServiceAccountKeyPath {
+        path: sa_file.path().to_str().unwrap().into(),
+    };
+    let tokens = faucet_common_bigquery::token_provider(&creds)
+        .await
+        .unwrap();
+    let client = ClientBuilder::new()
+        .with_v2_base_url(server.uri())
+        .build_from_authenticator(tokens)
+        .await
+        .unwrap();
+    let mut config = BigQuerySourceConfig::new(PROJECT_ID, creds, "SELECT valid_to FROM t");
+    config.api_host = Some(server.uri());
+    let src = BigQuerySource::from_parts(config, client);
+    let rows = src.fetch_all().await.unwrap();
+    assert_eq!(rows, vec![json!({"valid_to": SENTINEL}); 3]);
+}
+
+#[tokio::test]
+async fn result_reader_credential_failure_is_a_typed_auth_error() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_sentinel_pages(&server, "job-sentinel-bad", true).await;
+    let sa_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        sa_file.path(),
+        dummy_service_account_json(&server.uri()).to_string(),
+    )
+    .unwrap();
+    let client = ClientBuilder::new()
+        .with_auth_base_url(format!("{}{AUTH_SCOPE_BASE}", server.uri()))
+        .with_v2_base_url(server.uri())
+        .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let mut config = BigQuerySourceConfig::new(
+        PROJECT_ID,
+        BigQueryCredentials::ServiceAccountKey {
+            json: "{not json".into(),
+        },
+        "SELECT valid_to FROM t",
+    );
+    config.api_host = Some(server.uri());
+    let src = BigQuerySource::from_parts(config, client);
+    let err = src.fetch_all().await.unwrap_err();
+    assert!(
+        matches!(err, faucet_core::FaucetError::Auth(ref m) if m.contains("invalid service account JSON")),
+        "{err:?}"
+    );
 }

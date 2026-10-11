@@ -7,7 +7,7 @@
 //! repeat the same request raw, rewrite every unknown field type to `STRING`
 //! (BigQuery renders such values as strings in REST JSON) and decode again.
 
-use crate::{BigQueryCredentials, access_token_bq};
+use crate::{BigQueryCredentials, TokenProvider, access_token_bq};
 use gcp_bigquery_client::Client;
 use gcp_bigquery_client::error::BQError;
 use gcp_bigquery_client::model::get_query_results_parameters::GetQueryResultsParameters;
@@ -113,7 +113,11 @@ pub fn new_request_id() -> String {
 }
 
 fn url(target: RawTarget<'_>, segments: &[&str]) -> Result<reqwest_bq::Url, BQError> {
-    let host = target.host.unwrap_or(API_HOST).trim_end_matches('/');
+    url_at(target.host, segments)
+}
+
+fn url_at(host: Option<&str>, segments: &[&str]) -> Result<reqwest_bq::Url, BQError> {
+    let host = host.unwrap_or(API_HOST).trim_end_matches('/');
     let mut url = reqwest_bq::Url::parse(&format!("{host}/bigquery/v2"))
         .map_err(|e| BQError::ConnectionPoolError(format!("invalid BigQuery host {host}: {e}")))?;
     url.path_segments_mut()
@@ -225,6 +229,67 @@ pub async fn tolerant_get_query_results(
     }
 }
 
+/// `jobs.getQueryResults` with TIMESTAMP cells as integer microseconds.
+///
+/// The typed client serializes its parameters as a flat query string, which
+/// has no form for the nested `formatOptions`, so its pages carry BigQuery's
+/// float epoch seconds — a rounded double that cannot hold microseconds past
+/// year 2106. This reader sends `formatOptions.useInt64Timestamp=true` on every
+/// page, reuses one HTTP client and authenticates through a cached
+/// [`TokenProvider`]. Unknown column types decode as `STRING`, as in the
+/// `tolerant_*` calls.
+#[derive(Clone)]
+pub struct QueryResultsReader {
+    http: reqwest_bq::Client,
+    tokens: TokenProvider,
+    host: Option<String>,
+}
+
+impl std::fmt::Debug for QueryResultsReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryResultsReader")
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QueryResultsReader {
+    /// A reader authenticating with `tokens` against `host` (`None` =
+    /// [`API_HOST`]).
+    pub fn new(
+        tokens: TokenProvider,
+        host: Option<String>,
+    ) -> Result<Self, faucet_core::FaucetError> {
+        Ok(Self {
+            http: crate::http_client()?,
+            tokens,
+            host,
+        })
+    }
+
+    /// Fetch one page (or poll) of a query job's results. Any
+    /// `params.format_options` is replaced by integer-microsecond timestamps.
+    pub async fn get(
+        &self,
+        project_id: &str,
+        job_id: &str,
+        mut params: GetQueryResultsParameters,
+    ) -> Result<GetQueryResultsResponse, BQError> {
+        params.format_options = None;
+        let token = self.tokens.access_token().await?;
+        let req = self
+            .http
+            .get(url_at(
+                self.host.as_deref(),
+                &["projects", project_id, "queries", job_id],
+            )?)
+            .query(&params)
+            .query(&[("formatOptions.useInt64Timestamp", "true")])
+            .bearer_auth(token);
+        execute(req).await
+    }
+}
+
 /// `jobs.query`, tolerating unknown column types in the result schema. A
 /// `requestId` is set when the request has none, so the raw retry returns the
 /// same job instead of running the statement a second time.
@@ -283,6 +348,31 @@ mod tests {
         }))
         .expect("normalized schema decodes");
         assert_eq!(table.schema.fields.unwrap().len(), 3);
+    }
+
+    #[derive(Clone)]
+    struct NoToken;
+
+    #[faucet_core::async_trait]
+    impl gcp_bigquery_client::auth::Authenticator for NoToken {
+        async fn access_token(&self) -> Result<String, BQError> {
+            Err(BQError::NoToken)
+        }
+    }
+
+    #[tokio::test]
+    async fn result_reader_reports_a_token_failure_before_any_request() {
+        let reader = QueryResultsReader::new(
+            std::sync::Arc::new(NoToken),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .unwrap();
+        assert!(format!("{reader:?}").contains("127.0.0.1:1"));
+        let err = reader
+            .get("p", "j", GetQueryResultsParameters::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BQError::NoToken), "{err:?}");
     }
 
     #[test]

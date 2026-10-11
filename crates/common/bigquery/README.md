@@ -15,6 +15,9 @@ This is a small **internal/shared** crate: it holds the one credential enum and 
 |---|---|---|
 | `BigQueryCredentials` | `enum` | How to authenticate with BigQuery. Derives `Serialize`, `Deserialize`, `JsonSchema` so it round-trips through YAML/JSON configs and CLI schema introspection. Its `Debug` impl masks inline service-account JSON as `***` while leaving the key path visible. |
 | `build_client(&BigQueryCredentials)` | `async fn` | Turns a `BigQueryCredentials` into a ready-to-use [`gcp_bigquery_client::Client`]. Returns `FaucetError::Auth` on authentication failure or unparseable inline JSON. |
+| `build_client_with_tokens(&BigQueryCredentials)` | `async fn` | Like `build_client`, also returning the client's `TokenProvider` so requests the typed client cannot make reuse its cached token. |
+| `token_provider(&BigQueryCredentials)` | `async fn` | A `TokenProvider` (`Arc<dyn gcp_bigquery_client::auth::Authenticator>`) built once; it caches the access token and refreshes it before expiry. |
+| `raw::QueryResultsReader` | `struct` | `jobs.getQueryResults` with `formatOptions.useInt64Timestamp=true` on every page (integer-microsecond TIMESTAMP cells), one HTTP client, a cached token. |
 
 ### `BigQueryCredentials` variants
 

@@ -41,14 +41,27 @@ async fn mysql_group_c1_regressions() {
     let (_c, url) = start_mysql().await;
     let pool = sqlx::MySqlPool::connect(&url).await.expect("pool");
 
-    // SQL-02: base64 into BLOB / VARBINARY lands as bytes; other text as is.
+    // SQL-02: base64 into BLOB / VARBINARY lands as bytes; under `auto` other
+    // text as is, under the default `base64` it is refused (M-064).
     exec(
         &pool,
         "CREATE TABLE bin (id INT PRIMARY KEY, b BLOB, v VARBINARY(16), t TEXT)",
     )
     .await;
-    let sink = MysqlSink::new(
+    let strict = MysqlSink::new(
         MysqlSinkConfig::new(&url, "bin").column_mapping(MysqlColumnMapping::AutoMap),
+    )
+    .await
+    .expect("sink");
+    let err = strict
+        .write_batch(&[json!({"id": 9, "b": "not base64!"})])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not base64"), "{err}");
+    let sink = MysqlSink::new(
+        MysqlSinkConfig::new(&url, "bin")
+            .column_mapping(MysqlColumnMapping::AutoMap)
+            .with_binary_encoding(faucet_sink_mysql::BinaryEncoding::Auto),
     )
     .await
     .expect("sink");

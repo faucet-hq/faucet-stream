@@ -280,7 +280,8 @@ async fn upsert_rows_without_a_column_keep_its_stored_value() {
 
 /// #789 SQL-02: a base64 string (how every faucet source emits binary) lands
 /// in a `bytea` column as its bytes, through both INSERT and COPY; hex input
-/// and non-base64 text are passed through unchanged.
+/// and non-base64 text are passed through unchanged under `auto`, and refused
+/// under the default `base64` (M-064).
 #[tokio::test(flavor = "multi_thread")]
 async fn base64_strings_land_in_bytea_as_their_bytes() {
     let (_container, url) = start_postgres().await;
@@ -296,14 +297,30 @@ async fn base64_strings_land_in_bytea_as_their_bytes() {
         json!({"id": 3, "b": "not base64!"}),
         json!({"id": 4, "b": ""}),
     ];
-    let insert = PostgresSink::new(
+    let strict_cfg =
+        PostgresSinkConfig::new(&url, "bin").column_mapping(PostgresColumnMapping::AutoMap);
+    let mut strict_copy_cfg = strict_cfg.clone();
+    strict_copy_cfg.write_method = faucet_sink_postgres::PostgresWriteMethod::Copy;
+    for cfg in [strict_cfg, strict_copy_cfg] {
+        let strict = PostgresSink::new(cfg).await.expect("sink");
+        for bad in [&records[1], &records[2]] {
+            let err = strict
+                .write_batch(std::slice::from_ref(bad))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not base64"), "{err}");
+        }
+    }
+    let auto =
+        |c: PostgresSinkConfig| c.with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Auto);
+    let insert = PostgresSink::new(auto(
         PostgresSinkConfig::new(&url, "bin").column_mapping(PostgresColumnMapping::AutoMap),
-    )
+    ))
     .await
     .expect("sink");
     insert.write_batch(&records[..2]).await.expect("insert");
     let mut copy_cfg =
-        PostgresSinkConfig::new(&url, "bin").column_mapping(PostgresColumnMapping::AutoMap);
+        auto(PostgresSinkConfig::new(&url, "bin").column_mapping(PostgresColumnMapping::AutoMap));
     copy_cfg.write_method = faucet_sink_postgres::PostgresWriteMethod::Copy;
     let copy = PostgresSink::new(copy_cfg).await.expect("copy sink");
     copy.write_batch(&records[2..]).await.expect("copy");
