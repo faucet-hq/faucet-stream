@@ -24087,9 +24087,9 @@
                       "default": 3600
                     },
                     "binary_encoding": {
-                      "description": "How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)\nbecomes bytes: `auto` (default) decodes canonical base64 — the form\nevery faucet source emits — and stores any other string as text;\n`base64` decodes every value and fails the row when one is not base64;\n`text` stores every string as its text. `auto` decides per value, so a\ntext column whose values happen to be valid base64 (`\"user\"`, a hex\ndigest) is decoded; set `text` for such a column.",
+                      "description": "How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)\nbecomes bytes: `base64` (default) decodes every value — the form every\nfaucet source emits — and fails the row when one is not base64; `text`\nstores every string as its text; `auto` decodes canonical base64 and\nstores any other string as text, deciding per value, so a text value\nthat happens to be valid base64 (`\"user\"`, a hex digest) is decoded.\nSet `text` when the column is fed plain text.",
                       "$ref": "#/$defs/sink_postgres__BinaryEncoding",
-                      "default": "auto"
+                      "default": "base64"
                     }
                   },
                   "title": "PostgresSinkConfig",
@@ -24558,9 +24558,9 @@
                       "default": 3600
                     },
                     "binary_encoding": {
-                      "description": "How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)\nbecomes bytes: `auto` (default) decodes canonical base64 — the form\nevery faucet source emits — and stores any other string as text;\n`base64` decodes every value and fails the row when one is not base64;\n`text` stores every string as its text. `auto` decides per value, so a\ntext column whose values happen to be valid base64 (`\"user\"`, a hex\ndigest) is decoded; set `text` for such a column.",
+                      "description": "How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)\nbecomes bytes: `base64` (default) decodes every value — the form every\nfaucet source emits — and fails the row when one is not base64; `text`\nstores every string as its text; `auto` decodes canonical base64 and\nstores any other string as text, deciding per value, so a text value\nthat happens to be valid base64 (`\"user\"`, a hex digest) is decoded.\nSet `text` when the column is fed plain text.",
                       "$ref": "#/$defs/sink_mysql__BinaryEncoding",
-                      "default": "auto"
+                      "default": "base64"
                     }
                   },
                   "title": "MysqlSinkConfig",
@@ -35910,7 +35910,7 @@
       ]
     },
     "sink_mysql__BinaryEncoding": {
-      "description": "How a JSON string bound to a binary column becomes bytes (#862 M-064).\n\nEvery faucet source emits binary values as base64 text, but a string from\na text origin (a CSV token, a hex digest) can also happen to be valid\nbase64. `auto` cannot tell the two apart: it decodes any canonical, padded\nbase64 string and stores anything else as its text. Pick `base64` or `text`\nwhen the column's origin is known, so every value is treated the same way.",
+      "description": "How a JSON string bound to a binary column becomes bytes (#862 M-064).\n\nEvery faucet source emits binary values as base64 text, but a string from\na text origin (a CSV token, a hex digest) can also happen to be valid\nbase64. `auto` cannot tell the two apart: it decodes any canonical, padded\nbase64 string and stores anything else as its text. The default, `base64`,\ntreats every value the same way and refuses one that is not base64; pick\n`text` for a column fed plain text.",
       "oneOf": [
         {
           "description": "Decode a string that is canonical padded base64; store any other\nstring as its text.",
@@ -35918,7 +35918,7 @@
           "const": "auto"
         },
         {
-          "description": "Every string is base64 (line breaks ignored); one that is not fails the\nrow instead of being stored as text.",
+          "description": "Every string is base64 (line breaks ignored); one that is not fails the\nrow instead of being stored as text. The default.",
           "type": "string",
           "const": "base64"
         },
@@ -35930,7 +35930,7 @@
       ]
     },
     "sink_postgres__BinaryEncoding": {
-      "description": "How a JSON string bound to a binary column becomes bytes (#862 M-064).\n\nEvery faucet source emits binary values as base64 text, but a string from\na text origin (a CSV token, a hex digest) can also happen to be valid\nbase64. `auto` cannot tell the two apart: it decodes any canonical, padded\nbase64 string and stores anything else as its text. Pick `base64` or `text`\nwhen the column's origin is known, so every value is treated the same way.",
+      "description": "How a JSON string bound to a binary column becomes bytes (#862 M-064).\n\nEvery faucet source emits binary values as base64 text, but a string from\na text origin (a CSV token, a hex digest) can also happen to be valid\nbase64. `auto` cannot tell the two apart: it decodes any canonical, padded\nbase64 string and stores anything else as its text. The default, `base64`,\ntreats every value the same way and refuses one that is not base64; pick\n`text` for a column fed plain text.",
       "oneOf": [
         {
           "description": "Decode a string that is canonical padded base64; store any other\nstring as its text.",
@@ -35938,7 +35938,7 @@
           "const": "auto"
         },
         {
-          "description": "Every string is base64 (line breaks ignored); one that is not fails the\nrow instead of being stored as text.",
+          "description": "Every string is base64 (line breaks ignored); one that is not fails the\nrow instead of being stored as text. The default.",
           "type": "string",
           "const": "base64"
         },

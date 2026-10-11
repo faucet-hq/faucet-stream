@@ -138,12 +138,12 @@ pub struct PostgresSinkConfig {
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
     /// How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)
-    /// becomes bytes: `auto` (default) decodes canonical base64 — the form
-    /// every faucet source emits — and stores any other string as text;
-    /// `base64` decodes every value and fails the row when one is not base64;
-    /// `text` stores every string as its text. `auto` decides per value, so a
-    /// text column whose values happen to be valid base64 (`"user"`, a hex
-    /// digest) is decoded; set `text` for such a column.
+    /// becomes bytes: `base64` (default) decodes every value — the form every
+    /// faucet source emits — and fails the row when one is not base64; `text`
+    /// stores every string as its text; `auto` decodes canonical base64 and
+    /// stores any other string as text, deciding per value, so a text value
+    /// that happens to be valid base64 (`"user"`, a hex digest) is decoded.
+    /// Set `text` when the column is fed plain text.
     #[serde(default)]
     pub binary_encoding: BinaryEncoding,
 }
@@ -270,17 +270,18 @@ impl PostgresSinkConfig {
 /// Every faucet source emits binary values as base64 text, but a string from
 /// a text origin (a CSV token, a hex digest) can also happen to be valid
 /// base64. `auto` cannot tell the two apart: it decodes any canonical, padded
-/// base64 string and stores anything else as its text. Pick `base64` or `text`
-/// when the column's origin is known, so every value is treated the same way.
+/// base64 string and stores anything else as its text. The default, `base64`,
+/// treats every value the same way and refuses one that is not base64; pick
+/// `text` for a column fed plain text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BinaryEncoding {
     /// Decode a string that is canonical padded base64; store any other
     /// string as its text.
-    #[default]
     Auto,
     /// Every string is base64 (line breaks ignored); one that is not fails the
-    /// row instead of being stored as text.
+    /// row instead of being stored as text. The default.
+    #[default]
     Base64,
     /// Every string is stored as its text, never decoded.
     Text,
@@ -511,7 +512,7 @@ mod binary_encoding_tests {
         );
         let err = BinaryEncoding::Base64.resolve("abc").unwrap_err();
         assert!(err.contains("not base64"), "{err}");
-        assert_eq!(BinaryEncoding::default(), BinaryEncoding::Auto);
+        assert_eq!(BinaryEncoding::default(), BinaryEncoding::Base64);
         let parsed: BinaryEncoding = serde_json::from_str("\"text\"").unwrap();
         assert_eq!(parsed, BinaryEncoding::Text);
     }
