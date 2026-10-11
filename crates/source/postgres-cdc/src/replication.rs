@@ -619,6 +619,49 @@ pub async fn slot_positions(
     Ok(Some((crate::state::parse_lsn(&current)?, confirmed)))
 }
 
+/// The partitioned table (`schema.table`) each of `oids` is a leaf partition
+/// of. Oids that are not partitions are absent. pgoutput names a change after
+/// the leaf unless the publication sets `publish_via_partition_root`, while
+/// discovery lists only the root, so records are routed by this root.
+pub async fn partition_roots(
+    connection_url: &str,
+    tls: &crate::config::CdcTls,
+    oids: &[u32],
+) -> Result<std::collections::HashMap<u32, String>, FaucetError> {
+    if oids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let opts: PgConnectOptions = connection_url
+        .parse()
+        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = apply_cdc_tls(opts, tls);
+    use sqlx::ConnectOptions as _;
+    let mut conn: PgConnection = opts
+        .connect()
+        .await
+        .map_err(|e| pg_err("postgres-cdc partition lookup connect", e))?;
+    let ids: Vec<i64> = oids.iter().map(|o| i64::from(*o)).collect();
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT c.oid::int8, rn.nspname::text, r.relname::text \
+           FROM pg_class c \
+           JOIN pg_class r ON r.oid = pg_partition_root(c.oid) \
+           JOIN pg_namespace rn ON rn.oid = r.relnamespace \
+          WHERE c.oid::int8 = ANY($1) AND c.relispartition",
+    )
+    .bind(&ids)
+    .fetch_all(&mut conn)
+    .await
+    .map_err(|e| pg_err("postgres-cdc partition lookup", e))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(oid, schema, table)| {
+            u32::try_from(oid)
+                .ok()
+                .map(|oid| (oid, format!("{schema}.{table}")))
+        })
+        .collect())
+}
+
 /// Open a logical replication stream and return a [`Duplex`] handle.
 ///
 /// Internally this calls `pgwire_replication::ReplicationClient::connect`

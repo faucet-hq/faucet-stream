@@ -3,11 +3,14 @@
 
 use super::messages::Relation;
 use faucet_core::FaucetError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default)]
 pub struct RelationRegistry {
     by_oid: HashMap<u32, Relation>,
+    roots: HashMap<u32, String>,
+    resolved: HashSet<u32>,
+    unresolved: Vec<u32>,
 }
 
 impl RelationRegistry {
@@ -41,7 +44,27 @@ impl RelationRegistry {
                 );
             }
         }
+        if !self.resolved.contains(&rel.oid) && !self.unresolved.contains(&rel.oid) {
+            self.unresolved.push(rel.oid);
+        }
         self.by_oid.insert(rel.oid, rel);
+    }
+
+    /// Relation oids seen since the last call whose partition root is unknown.
+    pub fn take_unresolved(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.unresolved)
+    }
+
+    /// Record the partition roots (`schema.table`) of `oids`; an oid absent
+    /// from `roots` is not a partition.
+    pub fn set_roots(&mut self, oids: &[u32], roots: HashMap<u32, String>) {
+        self.resolved.extend(oids.iter().copied());
+        self.roots.extend(roots);
+    }
+
+    /// The `schema.table` of the partitioned table `oid` is a leaf of.
+    pub fn root(&self, oid: u32) -> Option<&str> {
+        self.roots.get(&oid).map(String::as_str)
     }
 
     pub fn get(&self, oid: u32) -> Result<&Relation, FaucetError> {
@@ -67,6 +90,21 @@ mod tests {
             replica_identity: ReplicaIdentity::Default,
             columns: vec![],
         }
+    }
+
+    #[test]
+    fn new_relations_are_queued_once_for_partition_resolution() {
+        let mut r = RelationRegistry::new();
+        r.insert(rel(1, "parted_eu"));
+        r.insert(rel(1, "parted_eu"));
+        r.insert(rel(2, "users"));
+        let pending = r.take_unresolved();
+        assert_eq!(pending, vec![1, 2]);
+        r.set_roots(&pending, HashMap::from([(1, "public.parted".to_string())]));
+        assert_eq!(r.root(1), Some("public.parted"));
+        assert_eq!(r.root(2), None);
+        r.insert(rel(1, "parted_eu"));
+        assert!(r.take_unresolved().is_empty());
     }
 
     #[test]

@@ -30,6 +30,11 @@ use tokio::sync::Mutex;
 /// concept), so it lives in this crate rather than `faucet-core`.
 pub const UNCHANGED_TOAST_FIELD: &str = "__unchanged_toast__";
 
+/// Envelope field naming the partitioned table (`schema.table`) a change to a
+/// leaf partition belongs to; present only for partition changes. Multi-table
+/// mirrors route by it, since discovery lists the root, not its partitions.
+pub const PARTITION_ROOT_FIELD: &str = "partition_root";
+
 pub struct PostgresCdcSource {
     config: PostgresCdcSourceConfig,
     state_key_value: String,
@@ -590,6 +595,16 @@ impl PostgresCdcSource {
                 if let Some(e) = fatal {
                     Err(e)?;
                 }
+                let unresolved = registry.take_unresolved();
+                if !unresolved.is_empty() {
+                    let roots = replication::partition_roots(
+                        &self.config.connection_url,
+                        &self.config.tls,
+                        &unresolved,
+                    )
+                    .await?;
+                    registry.set_roots(&unresolved, roots);
+                }
                 if unexpected_end {
                     Err(FaucetError::Source(
                         "postgres-cdc: replication stream ended unexpectedly".into(),
@@ -864,7 +879,14 @@ fn stage_insert(
 ) -> Result<(), FaucetError> {
     let rel = registry.get(i.relation_oid)?;
     let after = tuple_to_object(rel, &i.new)?;
-    let r = record(rel, "insert", state, None, Some(after));
+    let r = record(
+        rel,
+        registry.root(rel.oid),
+        "insert",
+        state,
+        None,
+        Some(after),
+    );
     state.push_staged(r)
 }
 
@@ -879,7 +901,14 @@ fn stage_update(
         None => None,
     };
     let after = tuple_to_object(rel, &u.new)?;
-    let r = record(rel, "update", state, before, Some(after));
+    let r = record(
+        rel,
+        registry.root(rel.oid),
+        "update",
+        state,
+        before,
+        Some(after),
+    );
     state.push_staged(r)
 }
 
@@ -890,7 +919,7 @@ fn stage_delete(
 ) -> Result<(), FaucetError> {
     let rel = registry.get(d.relation_oid)?;
     let before = Some(tuple_to_object(rel, &d.old)?);
-    let r = record(rel, "delete", state, before, None);
+    let r = record(rel, registry.root(rel.oid), "delete", state, before, None);
     state.push_staged(r)
 }
 
@@ -901,7 +930,7 @@ fn stage_truncate(
 ) -> Result<(), FaucetError> {
     for oid in &t.relation_oids {
         let rel = registry.get(*oid)?;
-        let r = record(rel, "truncate", state, None, None);
+        let r = record(rel, registry.root(rel.oid), "truncate", state, None, None);
         state.push_staged(r)?;
     }
     Ok(())
@@ -909,6 +938,7 @@ fn stage_truncate(
 
 fn record(
     rel: &Relation,
+    partition_root: Option<&str>,
     op: &str,
     state: &TxnState,
     before: Option<TupleRow>,
@@ -925,6 +955,9 @@ fn record(
     obj.insert("op".into(), json!(op));
     obj.insert("schema".into(), json!(rel.namespace));
     obj.insert("table".into(), json!(rel.name));
+    if let Some(root) = partition_root {
+        obj.insert(PARTITION_ROOT_FIELD.into(), json!(root));
+    }
     obj.insert("lsn".into(), json!(format_lsn(state.in_progress_lsn)));
     obj.insert(
         "ts_ms".into(),
@@ -970,6 +1003,9 @@ fn tuple_to_object(rel: &Relation, tup: &TupleData) -> Result<TupleRow, FaucetEr
 /// `schema.table` of a change envelope, the name the `postgres` source's
 /// discovery reports for the same table.
 fn schema_table(record: &Value) -> Option<String> {
+    if let Some(root) = record.get(PARTITION_ROOT_FIELD).and_then(Value::as_str) {
+        return Some(root.to_owned());
+    }
     let schema = record.get("schema")?.as_str()?;
     let table = record.get("table")?.as_str()?;
     Some(format!("{schema}.{table}"))
@@ -1024,6 +1060,14 @@ mod tests {
             Some("public.orders".into())
         );
         assert_eq!(src.record_table(&json!({"table": "orders"})), None);
+        assert_eq!(
+            src.record_table(&json!({
+                "schema": "public",
+                "table": "parted_eu",
+                "partition_root": "public.parted"
+            })),
+            Some("public.parted".into())
+        );
         let a = json!({"last_lsn": "0/16A4F88"});
         let b = json!({"last_lsn": "1/0"});
         assert_eq!(src.position_le(&a, &b), Some(true));
@@ -1231,6 +1275,31 @@ mod tests {
             end_lsn: Lsn::from_u64(lsn + 0x10),
             commit_time_micros: 0,
         }
+    }
+
+    #[test]
+    fn a_leaf_partition_change_names_its_root() {
+        let mut registry = RelationRegistry::new();
+        registry.insert(rel_users());
+        let pending = registry.take_unresolved();
+        registry.set_roots(
+            &pending,
+            HashMap::from([(16384, "public.parted".to_string())]),
+        );
+        let mut state = TxnState::default();
+        let mut out = vec![];
+        handle_event(begin_event(0x10), &mut registry, &mut state, &mut out).unwrap();
+        handle_event(
+            xlogdata(insert_payload(16384, &[("id", "1"), ("name", "a")])),
+            &mut registry,
+            &mut state,
+            &mut out,
+        )
+        .unwrap();
+        handle_event(commit_event(0x10), &mut registry, &mut state, &mut out).unwrap();
+        assert_eq!(out[0]["table"], "users");
+        assert_eq!(out[0][PARTITION_ROOT_FIELD], "public.parted");
+        assert_eq!(schema_table(&out[0]).as_deref(), Some("public.parted"));
     }
 
     #[test]

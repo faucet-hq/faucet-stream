@@ -634,3 +634,42 @@ async fn a_cycle_under_steady_writes_ends_at_its_bound() {
     assert!(!records.is_empty());
     assert!(bookmark.is_some());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_to_a_leaf_partition_is_routed_to_its_partitioned_table() {
+    let (_pg, url) = start_postgres().await;
+    ddl(
+        &url,
+        "CREATE TABLE public.parted (id int, region text, PRIMARY KEY (id, region)) \
+             PARTITION BY LIST (region); \
+         CREATE TABLE public.parted_eu PARTITION OF public.parted FOR VALUES IN ('eu'); \
+         CREATE TABLE public.plain (id int PRIMARY KEY); \
+         CREATE PUBLICATION faucet_pub FOR ALL TABLES;",
+    )
+    .await;
+    let source = PostgresCdcSource::new(cfg(&url, "faucet_slot", "faucet_pub"))
+        .await
+        .expect("source");
+    let _ = source.fetch_all_incremental().await.expect("warm-up");
+    ddl(
+        &url,
+        "INSERT INTO public.parted VALUES (2, 'eu'); INSERT INTO public.plain VALUES (1);",
+    )
+    .await;
+    let (records, _) = source.fetch_all_incremental().await.expect("fetch");
+    let parted = records
+        .iter()
+        .find(|r| r["table"] == "parted_eu")
+        .expect("partition change");
+    assert_eq!(parted["partition_root"], "public.parted");
+    assert_eq!(
+        source.record_table(parted).as_deref(),
+        Some("public.parted")
+    );
+    let plain = records
+        .iter()
+        .find(|r| r["table"] == "plain")
+        .expect("plain change");
+    assert!(plain.get("partition_root").is_none());
+    assert_eq!(source.record_table(plain).as_deref(), Some("public.plain"));
+}
