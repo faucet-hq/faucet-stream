@@ -324,6 +324,10 @@ impl RunHistory for FallbackHistory {
     ) -> Result<bool, HistoryError> {
         via!(self, p => p.finalize_shard(run_id, shard_id, outcome), f => f.finalize_shard(run_id, shard_id, outcome))
     }
+
+    async fn release_shard(&self, run_id: &str, shard_id: &str) -> Result<bool, HistoryError> {
+        via!(self, p => p.release_shard(run_id, shard_id), f => f.release_shard(run_id, shard_id))
+    }
     async fn shard_progress(
         &self,
         run_id: &str,

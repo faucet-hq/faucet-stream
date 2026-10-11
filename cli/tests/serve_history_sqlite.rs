@@ -2022,3 +2022,29 @@ async fn connection_replace_is_a_compare_and_set() {
     ))
     .await;
 }
+
+/// #862 M-003: a running shard is handed back to `pending` only by its owner,
+/// with its attempt count unchanged, and is claimable again.
+#[tokio::test]
+async fn release_shard_is_owner_fenced_and_requeues() {
+    use faucet_cli::serve::history::ShardInsert;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store_with(&dir, "h.db", Duration::from_secs(3600), "a").await;
+    let b = store_with(&dir, "h.db", Duration::from_secs(3600), "b").await;
+    let mut parent = rec("r", RunStatus::Sharded, Utc::now());
+    parent.config_body = Some("version: 1".into());
+    a.upsert(&parent).await.unwrap();
+    let shard = ShardInsert {
+        shard_id: "0".into(),
+        descriptor: serde_json::Value::Null,
+        size_estimate: None,
+    };
+    a.insert_shards("r", &[shard]).await.unwrap();
+    assert_eq!(a.claim_shards(1).await.unwrap().len(), 1);
+    assert!(!b.release_shard("r", "0").await.unwrap(), "not b's shard");
+    assert!(a.release_shard("r", "0").await.unwrap());
+    assert!(!a.release_shard("r", "0").await.unwrap(), "no longer running");
+    let progress = a.shard_progress("r").await.unwrap();
+    assert_eq!((progress.pending, progress.running), (1, 0));
+    assert_eq!(b.claim_shards(1).await.unwrap().len(), 1, "a peer resumes it");
+}

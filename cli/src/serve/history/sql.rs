@@ -713,6 +713,8 @@ pub struct Stmts {
     pub reclaim_shard_fail: String,
     /// Owner-fenced terminal write for one shard.
     pub finalize_shard: String,
+    /// Owner-fenced hand-back of a running shard to `pending` (shutdown).
+    pub release_shard: String,
     /// Status counts for a run's shards.
     pub shard_progress: String,
     /// Distinct run_ids for which THIS instance owns a `running` shard whose
@@ -1322,6 +1324,10 @@ impl Stmts {
                 SET status = $1, finished_at = $2 \
                 WHERE run_id = $3 AND shard_id = $4 AND owner = $5 AND status = 'running'"
                 .into(),
+            release_shard: "UPDATE faucet_serve_shards \
+                SET status = 'pending', owner = NULL, lease_expires_at = NULL \
+                WHERE run_id = $1 AND shard_id = $2 AND owner = $3 AND status = 'running'"
+                .into(),
             shard_progress: "SELECT status, COUNT(*) AS n FROM faucet_serve_shards \
                 WHERE run_id = $1 GROUP BY status"
                 .into(),
@@ -1843,6 +1849,10 @@ impl Stmts {
                 .into(),
             finalize_shard: "UPDATE faucet_serve_shards \
                 SET status = ?, finished_at = ? \
+                WHERE run_id = ? AND shard_id = ? AND owner = ? AND status = 'running'"
+                .into(),
+            release_shard: "UPDATE faucet_serve_shards \
+                SET status = 'pending', owner = NULL, lease_expires_at = NULL \
                 WHERE run_id = ? AND shard_id = ? AND owner = ? AND status = 'running'"
                 .into(),
             shard_progress: "SELECT status, COUNT(*) AS n FROM faucet_serve_shards \
@@ -3504,6 +3514,22 @@ macro_rules! impl_sql_history {
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?
+                    .rows_affected();
+                Ok(n == 1)
+            }
+
+            async fn release_shard(
+                &self,
+                run_id: &str,
+                shard_id: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                let n = sqlx::query(&self.stmts.release_shard)
+                    .bind(run_id)
+                    .bind(shard_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?
                     .rows_affected();
                 Ok(n == 1)
             }

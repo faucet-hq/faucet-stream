@@ -808,6 +808,15 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
+    /// Hand a running shard this instance owns back to `pending`, owner and
+    /// lease cleared and its attempt count unchanged, so a peer resumes it
+    /// from its bookmark (a clustered shutdown). `false` = not released (not
+    /// owned here, not running, or a backend without shards — the default).
+    async fn release_shard(&self, run_id: &str, shard_id: &str) -> Result<bool, HistoryError> {
+        let _ = (run_id, shard_id);
+        Ok(false)
+    }
+
     /// Aggregate shard status counts for a run (drives parent-run finalization).
     /// Default: empty.
     async fn shard_progress(&self, run_id: &str) -> Result<ShardProgress, HistoryError> {
