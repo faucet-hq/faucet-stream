@@ -278,7 +278,7 @@ observability:
 
 | Runtime | Buffer | Shipper |
 |---|---|---|
-| `faucet serve` | The run-history log store (`--history sqlite:…` / `postgres://…`). With `--history memory` it is an in-memory, non-durable buffer — the server warns at startup. | A background task. In `--cluster`, each run's delivery is leased (`faucet_serve_log_ship`), so one instance ships it; a peer resumes it once the lease lapses. |
+| `faucet serve` | The run-history log store (`--history sqlite:…` / `postgres://…`). With `--history memory` it is an in-memory, non-durable buffer — the server warns at startup. | A background task. In `--cluster`, each run's delivery is leased (`faucet_serve_log_ship`), so one instance ships it; a peer resumes it once the lease lapses. When several instances log one run (a sharded run), each records how far it has persisted (`faucet_serve_log_writers`) and delivery is acknowledged only up to the slowest live one, so a line one instance stores late is still shipped; an instance that stops reporting for two minutes no longer holds the run back. |
 | `faucet run` | A spool directory: `<run_id>.jsonl` (append-only, fsync'd every 1024 lines and at run end), `<run_id>.cursor.json` (the watermark, written temp + rename), `<run_id>.meta.json`, and an advisory `<run_id>.lock`. | Ships in the background while the run goes, then for at most `flush_timeout_secs` at exit. Anything left is shipped by the next faucet process using the spool, or by `faucet logs ship`. |
 | `faucet schedule` | The same spool; every tick is a run. | A background task for the process lifetime, draining between ticks. |
 

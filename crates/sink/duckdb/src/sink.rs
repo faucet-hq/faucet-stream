@@ -247,6 +247,34 @@ fn open(path: &str) -> Result<Connection, FaucetError> {
     conn.map_err(|e| FaucetError::Sink(format!("DuckDB open failed ({path}): {e}")))
 }
 
+/// Lock the database instance down to its own storage (#862 H-04).
+fn sandbox(conn: &Connection) -> Result<(), FaucetError> {
+    let setting = |name: &str| -> Result<bool, FaucetError> {
+        conn.query_row(
+            &format!("SELECT current_setting('{name}')::BOOLEAN"),
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(|e| FaucetError::Config(format!("duckdb sandbox: reading {name}: {e}")))
+    };
+    if setting("lock_configuration")? {
+        return if setting("enable_external_access")? {
+            Err(FaucetError::Config(
+                "duckdb sandbox: the database's configuration is locked with external access \
+                 enabled"
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    conn.execute_batch(
+        "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; \
+         SET enable_external_access=false; SET lock_configuration=true;",
+    )
+    .map_err(|e| FaucetError::Config(format!("duckdb sandbox: {e}")))
+}
+
 /// Convert a JSON value into an owned DuckDB parameter value.
 fn json_to_duck(v: &Value) -> DuckValue {
     match v {
@@ -547,9 +575,16 @@ impl DuckdbSink {
     pub async fn new(config: DuckdbSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         let path = config.resolved_path().to_string();
-        let (conn, instance) = tokio::task::spawn_blocking(move || connect(&path))
-            .await
-            .map_err(|e| FaucetError::Sink(format!("duckdb open task panicked: {e}")))??;
+        let confine = config.sandbox;
+        let (conn, instance) = tokio::task::spawn_blocking(move || {
+            let (conn, instance) = connect(&path)?;
+            if confine {
+                sandbox(&conn)?;
+            }
+            Ok::<_, FaucetError>((conn, instance))
+        })
+        .await
+        .map_err(|e| FaucetError::Sink(format!("duckdb open task panicked: {e}")))??;
         Ok(Self {
             config,
             conn: Arc::new(Mutex::new(conn)),

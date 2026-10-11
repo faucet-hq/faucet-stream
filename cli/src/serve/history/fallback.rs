@@ -472,6 +472,19 @@ impl RunHistory for FallbackHistory {
     async fn log_ship_forget(&self, run_id: &str) -> Result<(), HistoryError> {
         via!(self, p => p.log_ship_forget(run_id), f => f.log_ship_forget(run_id))
     }
+    async fn log_ship_writer_mark(&self, run_id: &str, through: u64) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_writer_mark(run_id, through), f => f.log_ship_writer_mark(run_id, through))
+    }
+    async fn log_ship_writer_done(&self, run_id: &str) -> Result<(), HistoryError> {
+        via!(self, p => p.log_ship_writer_done(run_id), f => f.log_ship_writer_done(run_id))
+    }
+    async fn log_ship_writer_floor(
+        &self,
+        run_id: &str,
+        stale_after: Duration,
+    ) -> Result<Option<u64>, HistoryError> {
+        via!(self, p => p.log_ship_writer_floor(run_id, stale_after), f => f.log_ship_writer_floor(run_id, stale_after))
+    }
     async fn run_log_stats(
         &self,
         run_id: &str,
@@ -1168,6 +1181,12 @@ mod tests {
         assert_eq!((row.dropped, row.notified_drop), (2, true));
         assert_eq!(fb.run_log_stats("r", None, None).await.unwrap().lines, 1);
         assert_eq!(fb.delete_run_logs_through("r", 10).await.unwrap(), 1);
+        let live = Duration::from_secs(60);
+        assert_eq!(fb.log_ship_writer_floor("r", live).await.unwrap(), Some(10));
+        fb.log_ship_writer_mark("r", 20).await.unwrap();
+        assert_eq!(fb.log_ship_writer_floor("r", live).await.unwrap(), Some(20));
+        fb.log_ship_writer_done("r").await.unwrap();
+        assert_eq!(fb.log_ship_writer_floor("r", live).await.unwrap(), None);
         fb.log_ship_forget("r").await.unwrap();
         assert!(fb.log_ship_row("r").await.unwrap().is_none());
     }

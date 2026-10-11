@@ -125,6 +125,22 @@ pub fn build_provider(spec: &Value) -> Result<SharedAuthProvider, FaucetError> {
     }
 }
 
+/// For an `oauth2_refresh` spec (`{ type, config }`) whose `persist:` block
+/// uses the default key: the pre-#789 shared key when a refresh token is still
+/// stored only there (#862 M-077). The provider no longer reads it, so the
+/// grant would refresh with its config seed — which a rotating IdP has already
+/// revoked. Set `persist.key` to the returned key to keep using it. `None` for
+/// every other provider type and when there is nothing to migrate.
+pub async fn legacy_persisted_refresh_key(spec: &Value) -> Result<Option<String>, FaucetError> {
+    if spec.get("type").and_then(Value::as_str) != Some("oauth2_refresh") {
+        return Ok(None);
+    }
+    let config = spec.get("config").cloned().unwrap_or(Value::Null);
+    Ok(OAuth2RefreshProvider::from_config(&config)?
+        .unadopted_legacy_key()
+        .await)
+}
+
 /// The `config` keys each provider type reads (`flow` checks its own).
 fn known_config_keys(kind: &str) -> Option<&'static [&'static str]> {
     Some(match kind {
@@ -372,5 +388,32 @@ mod tests {
             }
         });
         assert!(build_provider(&spec).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_legacy_persist_check_covers_only_oauth2_refresh() {
+        use faucet_core::StateStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let spec = serde_json::json!({ "type": "oauth2_refresh", "config": {
+            "token_url": "https://idp.example/token", "client_id": "app",
+            "client_secret": "s", "refresh_token": "seed",
+            "persist": { "path": dir.path().to_str().unwrap() } } });
+        assert_eq!(legacy_persisted_refresh_key(&spec).await.unwrap(), None);
+        let legacy = format!(
+            "oauth2_refresh_{:016x}",
+            oauth2::fnv1a_64("https://idp.example/token\u{0}app")
+        );
+        faucet_core::FileStateStore::new(dir.path())
+            .put(&legacy, &serde_json::json!({"refresh_token": "old"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy_persisted_refresh_key(&spec).await.unwrap(),
+            Some(legacy)
+        );
+        let other = serde_json::json!({ "type": "static", "config": { "token": "t" } });
+        assert_eq!(legacy_persisted_refresh_key(&other).await.unwrap(), None);
+        let broken = serde_json::json!({ "type": "oauth2_refresh", "config": {} });
+        assert!(legacy_persisted_refresh_key(&broken).await.is_err());
     }
 }

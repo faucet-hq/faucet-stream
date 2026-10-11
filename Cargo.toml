@@ -274,6 +274,8 @@ prost = "0.13"
 prost-reflect = { version = "0.15", features = ["serde"] }
 prost-types = "0.13"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "json"] }
+# The SQLite C library sqlx links; a direct dep only for connection limits (#862).
+libsqlite3-sys = { version = "0.30", default-features = false }
 # MSSQL stack. tiberius default features (native-tls, winauth) are off so the
 # tree stays on rustls; bb8-tiberius supplies the tokio runtime glue + the
 # `tls = ["tiberius/rustls"]` passthrough and never enables native-tls.

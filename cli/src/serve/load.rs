@@ -18,12 +18,164 @@ const SUBMIT_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Who wrote a config body the server is about to load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyOrigin {
-    /// The server's operator wrote it: a registered template, the triggers
-    /// file, or a run already admitted when it was submitted.
+    /// The server's operator or an admin wrote it: a registered template, or
+    /// a run already admitted when it was submitted.
     Trusted,
     /// The request carried it. Subprocess connectors run only when the server
     /// was started with `--allow-subprocess-connectors`.
     Caller { allow_subprocess: bool },
+    /// The server's operator wrote it in a file the server reads (the
+    /// triggers file): trusted, and its SQL connectors keep host access.
+    ServerFile,
+}
+
+impl BodyOrigin {
+    /// Whether SQL connectors in a body of this origin run sandboxed.
+    pub fn confines_sql(self) -> bool {
+        !matches!(self, BodyOrigin::ServerFile)
+    }
+}
+
+/// Source kinds whose query can reach host files; `faucet serve` sandboxes them.
+pub const SANDBOXED_SOURCE_KINDS: &[&str] = &["duckdb", "sqlite"];
+/// Sink kinds `faucet serve` sandboxes.
+pub const SANDBOXED_SINK_KINDS: &[&str] = &["duckdb"];
+
+fn force_sandbox(config: &mut Value) {
+    if let Value::Object(map) = config {
+        map.insert("sandbox".into(), Value::Bool(true));
+    }
+}
+
+fn force_sandbox_override(config: &mut Option<Value>) {
+    force_sandbox(config.get_or_insert_with(|| Value::Object(Default::default())));
+}
+
+fn template_kind<'a>(
+    templates: &'a std::collections::HashMap<String, crate::config::ConnectorSpec>,
+    legacy: &'a Option<crate::config::ConnectorSpec>,
+    name: Option<&str>,
+) -> Option<&'a str> {
+    let name = name.unwrap_or("default");
+    templates
+        .get(name)
+        .or(if name == "default" {
+            legacy.as_ref()
+        } else {
+            None
+        })
+        .map(|t| t.kind.as_str())
+}
+
+/// Force `sandbox: true` on every SQL connector the config can build, so a
+/// query loaded by `faucet serve` cannot read or attach host files (#862 H-04).
+/// Templates, row overrides, topology nodes, fan-out sources, the mirror
+/// snapshot and DLQ sinks are all covered; a submitted `sandbox: false` is
+/// overwritten.
+pub fn confine_sql(cfg: &mut PipelineConfig) {
+    let source_kind = |k: &str| SANDBOXED_SOURCE_KINDS.contains(&k);
+    let sink_kind = |k: &str| SANDBOXED_SINK_KINDS.contains(&k);
+    let p = &mut cfg.pipeline;
+    for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
+        if source_kind(&spec.kind) {
+            force_sandbox(&mut spec.config);
+        }
+    }
+    for spec in p.sink.iter_mut().chain(p.sinks.values_mut()) {
+        if sink_kind(&spec.kind) {
+            force_sandbox(&mut spec.config);
+        }
+    }
+    if let Some(d) = p.dlq.as_mut()
+        && sink_kind(&d.sink.kind)
+    {
+        force_sandbox(&mut d.sink.config);
+    }
+    let (sources, source, sinks, sink) = (&p.sources, &p.source, &p.sinks, &p.sink);
+    for node in p.nodes.values_mut() {
+        match node {
+            crate::config::NodeSpec::Source {
+                template,
+                kind,
+                config,
+            } => {
+                let k = kind
+                    .as_deref()
+                    .or_else(|| template_kind(sources, source, template.as_deref()));
+                if k.is_some_and(source_kind) {
+                    force_sandbox_override(config);
+                }
+            }
+            crate::config::NodeSpec::Sink {
+                template,
+                kind,
+                config,
+            } => {
+                let k = kind
+                    .as_deref()
+                    .or_else(|| template_kind(sinks, sink, template.as_deref()));
+                if k.is_some_and(sink_kind) {
+                    force_sandbox_override(config);
+                }
+            }
+            _ => {}
+        }
+    }
+    for row in &mut cfg.matrix {
+        let rows = [
+            (row.source.as_mut(), sources, source, true),
+            (
+                row.discover.as_mut().map(|d| &mut d.source),
+                sources,
+                source,
+                true,
+            ),
+            (row.sink.as_mut(), sinks, sink, false),
+        ];
+        for (over, templates, legacy, is_source) in rows {
+            let Some(over) = over else { continue };
+            let k = over
+                .kind
+                .as_deref()
+                .or_else(|| template_kind(templates, legacy, over.r#ref.as_deref()));
+            if k.is_some_and(|k| {
+                if is_source {
+                    source_kind(k)
+                } else {
+                    sink_kind(k)
+                }
+            }) {
+                force_sandbox_override(&mut over.config);
+            }
+        }
+        if let Some(Some(d)) = row.dlq.as_mut()
+            && sink_kind(&d.sink.kind)
+        {
+            force_sandbox(&mut d.sink.config);
+        }
+    }
+    if let Some(r) = cfg.replication.as_mut()
+        && source_kind(&r.snapshot.source.kind)
+    {
+        force_sandbox(&mut r.snapshot.source.config);
+    }
+}
+
+/// [`confine_sql`] over expanded rows: the merged configs each row builds.
+pub fn confine_sql_nodes(nodes: &mut [ExpandedNode]) {
+    for n in nodes {
+        if SANDBOXED_SOURCE_KINDS.contains(&n.source.kind.as_str()) {
+            force_sandbox(&mut n.source.config);
+        }
+        if SANDBOXED_SINK_KINDS.contains(&n.sink.kind.as_str()) {
+            force_sandbox(&mut n.sink.config);
+        }
+        if let Some(d) = n.dlq.as_mut()
+            && SANDBOXED_SINK_KINDS.contains(&d.sink.kind.as_str())
+        {
+            force_sandbox(&mut d.sink.config);
+        }
+    }
 }
 
 /// Connector kinds that spawn a program named in their config.
@@ -753,6 +905,10 @@ pub async fn load_submission_scoped(
         details: None,
     })?;
 
+    if origin.confines_sql() {
+        confine_sql(&mut cfg);
+    }
+
     // serve runs once per submission; a schedule: block is a category error.
     #[cfg(feature = "schedule")]
     if cfg.schedule.is_some() {
@@ -843,10 +999,13 @@ pub async fn load_submission_scoped(
     }
 
     // 6. Expand the matrix.
-    let nodes = expand(&cfg).map_err(|e| ServeError::Unprocessable {
+    let mut nodes = expand(&cfg).map_err(|e| ServeError::Unprocessable {
         message: e.to_string(),
         details: None,
     })?;
+    if origin.confines_sql() {
+        confine_sql_nodes(&mut nodes);
+    }
 
     refuse_server_paths(&cfg, &nodes, origin)?;
 
@@ -860,6 +1019,179 @@ pub async fn load_submission_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_sql_connector_position_is_sandboxed() {
+        let doc = json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "duckdb", "config": { "database": ":memory:", "query": "SELECT 1", "sandbox": false } },
+                "sources": {
+                    "lite": { "type": "sqlite", "config": { "database_url": "sqlite::memory:", "query": "SELECT 1" } },
+                    "csv": { "type": "csv", "config": { "path": "a.csv" } }
+                },
+                "sink": { "type": "duckdb", "config": { "database": ":memory:", "table_name": "t" } },
+                "sinks": { "lite": { "type": "sqlite", "config": { "database_url": "sqlite::memory:", "table": "t" } } },
+                "dlq": { "sink": { "type": "duckdb", "config": { "database": ":memory:", "table_name": "d" } } }
+            },
+            "matrix": [
+                { "id": "a", "source": { "ref": "lite", "config": { "sandbox": false } } },
+                { "id": "b", "source": { "ref": "csv" }, "sink": { "type": "duckdb", "config": { "database": ":memory:", "table_name": "u" } },
+                  "dlq": { "sink": { "type": "duckdb", "config": { "database": ":memory:", "table_name": "e" } } } },
+                { "id": "c", "source": { "ref": "csv" }, "sink": { "ref": "lite" } }
+            ]
+        });
+        let mut cfg = PipelineConfig::from_value(doc).unwrap();
+        confine_sql(&mut cfg);
+        let on = |v: &Value| v.get("sandbox") == Some(&Value::Bool(true));
+        let p = &cfg.pipeline;
+        assert!(on(&p.source.as_ref().unwrap().config));
+        assert!(on(&p.sources["lite"].config));
+        assert!(!on(&p.sources["csv"].config));
+        assert!(on(&p.sink.as_ref().unwrap().config));
+        assert!(
+            !on(&p.sinks["lite"].config),
+            "the sqlite sink runs no caller SQL"
+        );
+        assert!(on(&p.dlq.as_ref().unwrap().sink.config));
+        assert!(on(cfg.matrix[0]
+            .source
+            .as_ref()
+            .unwrap()
+            .config
+            .as_ref()
+            .unwrap()));
+        assert!(on(cfg.matrix[1]
+            .sink
+            .as_ref()
+            .unwrap()
+            .config
+            .as_ref()
+            .unwrap()));
+        assert!(on(&cfg.matrix[1]
+            .dlq
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sink
+            .config));
+        assert!(cfg.matrix[2].sink.as_ref().unwrap().config.is_none());
+
+        let mut nodes = expand(&cfg).unwrap();
+        for n in &mut nodes {
+            if let Some(m) = n.source.config.as_object_mut() {
+                m.insert("sandbox".into(), Value::Bool(false));
+            }
+        }
+        confine_sql_nodes(&mut nodes);
+        let a = nodes.iter().find(|n| n.id == "a").unwrap();
+        assert!(on(&a.source.config));
+        let b = nodes.iter().find(|n| n.id == "b").unwrap();
+        assert!(!on(&b.source.config));
+        assert!(on(&b.sink.config));
+        assert!(on(&b.dlq.as_ref().unwrap().sink.config));
+    }
+
+    #[test]
+    fn topology_nodes_fan_out_sources_and_the_mirror_snapshot_are_sandboxed() {
+        let topo = json!({
+            "version": 1,
+            "pipeline": {
+                "sources": { "d": { "type": "duckdb", "config": { "database": ":memory:", "query": "SELECT 1" } } },
+                "sinks": { "default": { "type": "duckdb", "config": { "database": ":memory:", "table_name": "t" } } },
+                "nodes": {
+                    "src": { "kind": "source", "ref": "d", "config": { "sandbox": false } },
+                    "lite": { "kind": "source", "type": "sqlite", "config": { "database_url": "sqlite::memory:", "query": "SELECT 1" } },
+                    "csv": { "kind": "source", "type": "csv", "config": { "path": "a.csv" } },
+                    "out": { "kind": "sink" },
+                    "m": { "kind": "merge" }
+                },
+                "edges": []
+            }
+        });
+        let mut cfg: PipelineConfig = serde_json::from_value(topo).unwrap();
+        confine_sql(&mut cfg);
+        let node_cfg = |id: &str| match &cfg.pipeline.nodes[id] {
+            crate::config::NodeSpec::Source { config, .. }
+            | crate::config::NodeSpec::Sink { config, .. } => config.clone(),
+            _ => None,
+        };
+        let on =
+            |v: Option<Value>| v.and_then(|v| v.get("sandbox").cloned()) == Some(Value::Bool(true));
+        assert!(on(node_cfg("src")));
+        assert!(on(node_cfg("lite")));
+        assert!(!on(node_cfg("csv")));
+        assert!(on(node_cfg("out")));
+
+        let fan = json!({
+            "version": 1,
+            "pipeline": {
+                "sources": { "lite": { "type": "sqlite", "config": { "database_url": "sqlite::memory:", "query": "SELECT 1" } } },
+                "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } }
+            },
+            "matrix": [ { "id": "r", "source": { "ref": "lite" },
+                "fan_out": { "source": { "type": "sqlite", "config": { "database_url": "sqlite::memory:", "query": "SELECT 1 AS id" } }, "select": "$.id", "as": "id" } } ]
+        });
+        let mut cfg: PipelineConfig = serde_json::from_value(fan).unwrap();
+        confine_sql(&mut cfg);
+        let d = cfg.matrix[0].discover.as_ref().unwrap();
+        assert_eq!(d.source.config.as_ref().unwrap()["sandbox"], true);
+
+        let mirror = json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "postgres-cdc", "config": {} },
+                "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } }
+            },
+            "mirror": { "mode": "snapshot_then_cdc",
+                "snapshot": { "source": { "type": "sqlite", "config": { "database_url": "sqlite::memory:", "query": "SELECT 1" } } } }
+        });
+        let mut cfg: PipelineConfig = serde_json::from_value(mirror).unwrap();
+        confine_sql(&mut cfg);
+        assert_eq!(
+            cfg.replication.as_ref().unwrap().snapshot.source.config["sandbox"],
+            true
+        );
+    }
+
+    #[test]
+    fn only_a_server_file_keeps_host_access() {
+        assert!(BodyOrigin::Trusted.confines_sql());
+        assert!(
+            BodyOrigin::Caller {
+                allow_subprocess: true
+            }
+            .confines_sql()
+        );
+        assert!(!BodyOrigin::ServerFile.confines_sql());
+    }
+
+    #[tokio::test]
+    async fn a_loaded_submission_is_sandboxed_unless_it_came_from_a_server_file() {
+        let body = json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "duckdb", "config": { "database": ":memory:", "query": "SELECT 1", "sandbox": false } },
+                "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } }
+            }
+        })
+        .to_string();
+        let caller = load_submission(&body, ConfigFormat::Json, None, None, BodyOrigin::Trusted)
+            .await
+            .unwrap();
+        assert_eq!(caller.nodes[0].source.config["sandbox"], true);
+        let file = load_submission(
+            &body,
+            ConfigFormat::Json,
+            None,
+            None,
+            BodyOrigin::ServerFile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file.nodes[0].source.config["sandbox"], false);
+    }
 
     #[test]
     fn a_path_that_normalizes_into_proc_is_protected() {

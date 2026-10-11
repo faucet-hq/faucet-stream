@@ -16567,6 +16567,14 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "sandbox": {
+                      "description": "Confine the query to the opened database: every connection refuses\n`ATTACH` (and `VACUUM INTO`, which attaches its target). Extension\nloading is always off. Defaults to `false`. `faucet serve` forces it\non for every config it did not load from its own triggers file.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
                     }
                   }
                 },
@@ -16671,6 +16679,14 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "sandbox": {
+                      "description": "Confine the query to the opened database: no file or network access\n(`read_text`, `read_csv`, `ATTACH`, `COPY`, httpfs), no extension\ninstall/autoload, and the configuration locked so the query cannot\n`SET` it back. Defaults to `false`. `faucet serve` forces it on for\nevery config it did not load from its own triggers file.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
                     }
                   }
                 },
@@ -25001,6 +25017,14 @@
                         "string"
                       ],
                       "default": true
+                    },
+                    "sandbox": {
+                      "description": "Confine the connection to the target database: no file or network\naccess, no extension install/autoload, and the configuration locked.\nThe setting applies to the whole database instance, which sinks on the\nsame file in one process share. Defaults to `false`. `faucet serve`\nforces it on for every config it did not load from its own triggers\nfile.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
                     }
                   }
                 },

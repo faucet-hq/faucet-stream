@@ -167,6 +167,10 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
         invocations.push(inv);
     }
 
+    if let Some(inv) = probe_auth_persist(cfg.auth.as_ref()).await {
+        invocations.push(inv);
+    }
+
     redact_invocations(&mut invocations);
     let (_passed, failed, _skipped) = tally(&invocations);
 
@@ -298,6 +302,42 @@ async fn stateful_probes(
         );
     }
     probes
+}
+
+/// One `persist` probe per `oauth2_refresh` provider with a `persist:` block:
+/// it fails when the provider's refresh token is still stored only under the
+/// shared key earlier versions used (#862 M-077). `None` when there is no such
+/// provider.
+pub async fn probe_auth_persist(
+    specs: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> Option<InvocationOut> {
+    let start = Instant::now();
+    let status = crate::auth_catalog::legacy_persist_status(specs).await;
+    if status.is_empty() {
+        return None;
+    }
+    let probes = status
+        .into_iter()
+        .map(|(name, legacy)| {
+            let probe = match legacy {
+                None => Probe::pass("persist", start.elapsed()),
+                Some(key) => Probe::fail_hint(
+                    "persist",
+                    start.elapsed(),
+                    crate::auth_catalog::legacy_persist_message(&name, &key),
+                    format!("persist: {{ path: …, key: {key} }}"),
+                ),
+            };
+            ProbeOut::from_probe("auth", name, probe)
+        })
+        .collect();
+    Some(InvocationOut {
+        id: "auth".to_string(),
+        delivery: None,
+        probes,
+        source_kind: "—".to_string(),
+        sink_kind: "—".to_string(),
+    })
 }
 
 /// Probe the pipeline-wide `lineage:` transport reachability, returning a

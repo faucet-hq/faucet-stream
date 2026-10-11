@@ -1414,6 +1414,7 @@ pub async fn trigger_template_outcome(
         approved_change: None,
         selection: materialized.selection.clone(),
         trusted_config: true,
+        server_file: false,
     };
     let run = if !gated {
         runner::submit(state.clone(), req, actor.clone()).await?

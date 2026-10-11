@@ -89,6 +89,8 @@ pub struct MemoryHistory {
     run_logs: Mutex<std::collections::HashMap<String, Vec<RunLogLine>>>,
     /// Log delivery rows (#806): run_id → watermark + export status.
     log_ship: Mutex<std::collections::HashMap<String, super::LogShipRow>>,
+    /// This process's persisted-line watermark per run (#862 M-099).
+    log_writers: Mutex<LogWriters>,
     /// Local sink output ledger (#587): output id → row. The provenance the
     /// retention GC deletes from; ephemeral like everything else here, so a
     /// restart simply forgets (and therefore never collects) earlier files.
@@ -107,6 +109,9 @@ pub struct MemoryHistory {
     idem_retention: Duration,
 }
 
+/// Run id → (persisted watermark, when it was last advanced).
+type LogWriters = std::collections::HashMap<String, (u64, DateTime<Utc>)>;
+
 /// The delivery-lease owner of the single-process memory backend.
 const MEMORY_OWNER: &str = "memory";
 
@@ -120,6 +125,20 @@ impl MemoryHistory {
         self.log_ship
             .lock()
             .map_err(|_| HistoryError::Backend("log_ship lock poisoned".into()))
+    }
+
+    fn writers(&self) -> Result<std::sync::MutexGuard<'_, LogWriters>, HistoryError> {
+        self.log_writers
+            .lock()
+            .map_err(|_| HistoryError::Backend("log_writers lock poisoned".into()))
+    }
+
+    fn mark_writer(&self, run_id: &str, through: u64) -> Result<(), HistoryError> {
+        let mut w = self.writers()?;
+        let now = Utc::now();
+        let e = w.entry(run_id.to_string()).or_insert((through, now));
+        *e = (e.0.max(through), now);
+        Ok(())
     }
 
     fn tenant_state(&self) -> Result<std::sync::MutexGuard<'_, TenantState>, HistoryError> {
@@ -144,6 +163,7 @@ impl MemoryHistory {
             meta: Mutex::new(std::collections::HashMap::new()),
             run_logs: Mutex::new(std::collections::HashMap::new()),
             log_ship: Mutex::new(std::collections::HashMap::new()),
+            log_writers: Mutex::new(std::collections::HashMap::new()),
             local_outputs: Mutex::new(BTreeMap::new()),
             usage: Mutex::new(VecDeque::new()),
             changes: Mutex::new(BTreeMap::new()),
@@ -366,6 +386,8 @@ impl RunHistory for MemoryHistory {
                     ..Default::default()
                 });
             row.total_seq = row.total_seq.max(max);
+            drop(ship);
+            self.mark_writer(run_id, max)?;
         }
         Ok(())
     }
@@ -466,7 +488,29 @@ impl RunHistory for MemoryHistory {
 
     async fn log_ship_forget(&self, run_id: &str) -> Result<(), HistoryError> {
         self.log_ship_guard()?.remove(run_id);
+        self.log_ship_writer_done(run_id).await
+    }
+
+    async fn log_ship_writer_mark(&self, run_id: &str, through: u64) -> Result<(), HistoryError> {
+        self.mark_writer(run_id, through)
+    }
+
+    async fn log_ship_writer_done(&self, run_id: &str) -> Result<(), HistoryError> {
+        self.writers()?.remove(run_id);
         Ok(())
+    }
+
+    async fn log_ship_writer_floor(
+        &self,
+        run_id: &str,
+        stale_after: Duration,
+    ) -> Result<Option<u64>, HistoryError> {
+        let live = Utc::now() - chrono::Duration::from_std(stale_after).unwrap_or_default();
+        Ok(self
+            .writers()?
+            .get(run_id)
+            .filter(|(_, at)| *at >= live)
+            .map(|(seq, _)| *seq))
     }
 
     async fn run_log_stats(

@@ -68,6 +68,7 @@ All fields live under `pipeline.source.config`.
 | `max_connections` | int (`u32`) | `10` | Maximum connections in the sqlx pool. SQLite is single-writer; a small pool (2–5) is usually plenty for a read-only source. |
 | `batch_size` | int (`usize`) | `1000` | Rows per emitted `StreamPage`. **`0` = no batching**: the cursor is fully drained and the entire result set is emitted in a single page. Values above `MAX_BATCH_SIZE` (1,000,000) are rejected at construction. |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
+| `sandbox` | bool | `false` | Every pooled connection allows no attached database, so the query cannot `ATTACH` (or `VACUUM INTO`) another file. Extension loading is always off. `faucet serve` forces it on for every config except those in its own `--triggers` file. |
 
 There is **no auth, TLS, or credential configuration** — SQLite is a local in-process engine.
 

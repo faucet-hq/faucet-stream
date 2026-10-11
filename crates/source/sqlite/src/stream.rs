@@ -36,13 +36,34 @@ fn quote_ident_sqlite(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+/// Lower the connection's attached-database limit to zero (#862 H-04), so
+/// `ATTACH` and `VACUUM INTO` cannot reach another file.
+async fn forbid_attach(conn: &mut sqlx::SqliteConnection) -> Result<(), sqlx::Error> {
+    let mut handle = conn.lock_handle().await?;
+    let db = handle.as_raw_handle().as_ptr();
+    // SAFETY: `db` is the live connection handle, held locked for the call.
+    unsafe {
+        libsqlite3_sys::sqlite3_limit(db, libsqlite3_sys::SQLITE_LIMIT_ATTACHED, 0);
+    }
+    Ok(())
+}
+
 impl SqliteSource {
     /// Create a new SQLite source. Establishes a connection pool.
     pub async fn new(config: SqliteSourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
 
+        let confine = config.sandbox;
         let pool = SqlitePoolOptions::new()
             .max_connections(config.max_connections)
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    if confine {
+                        forbid_attach(conn).await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect(&config.database_url)
             .await
             // Connect-time, so `Config` is deliberate and stays: this runs in
@@ -1063,5 +1084,95 @@ mod bind_overflow_tests {
                 "{v} must still bind"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use faucet_core::Source as _;
+
+    async fn other_db(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("other.db");
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE secret (v TEXT); INSERT INTO secret VALUES ('top-secret')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn an_unsandboxed_query_may_attach_another_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = other_db(&dir).await;
+        let source = SqliteSource::new(
+            SqliteSourceConfig::new("sqlite::memory:", format!("ATTACH '{other}' AS o"))
+                .with_max_connections(1),
+        )
+        .await
+        .unwrap();
+        source.fetch_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_query_cannot_attach_vacuum_into_or_load_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = other_db(&dir).await;
+        let copy = dir.path().join("copy.db");
+        for (query, expect) in [
+            (format!("ATTACH '{other}' AS o"), "too many attached"),
+            (
+                format!("VACUUM INTO '{}'", copy.display()),
+                "too many attached",
+            ),
+            (
+                "SELECT load_extension('/tmp/does-not-matter')".to_string(),
+                "not authorized",
+            ),
+        ] {
+            let source = SqliteSource::new(
+                SqliteSourceConfig::new("sqlite::memory:", query.clone())
+                    .with_max_connections(1)
+                    .with_sandbox(true),
+            )
+            .await
+            .unwrap();
+            let err = source.fetch_all().await.unwrap_err().to_string();
+            assert!(err.contains(expect), "{query}: {err}");
+        }
+        assert!(!copy.exists());
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_source_reads_its_own_database() {
+        let source = SqliteSource::new(
+            SqliteSourceConfig::new("sqlite::memory:", "SELECT 1 AS one")
+                .with_max_connections(1)
+                .with_sandbox(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            source.fetch_all().await.unwrap(),
+            vec![serde_json::json!({"one": 1})]
+        );
+    }
+
+    #[test]
+    fn the_sandbox_flag_defaults_off_and_is_not_serialized_when_off() {
+        let c: SqliteSourceConfig = serde_json::from_value(
+            serde_json::json!({"database_url": "sqlite::memory:", "query": "SELECT 1"}),
+        )
+        .unwrap();
+        assert!(!c.sandbox);
+        assert!(serde_json::to_value(&c).unwrap().get("sandbox").is_none());
+        assert!(c.with_sandbox(true).sandbox);
     }
 }

@@ -185,6 +185,12 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
     // Topology mode (#71/#72): build + validate the node graph instead of the
     // matrix. `build_topology` runs the core structural validator (arity,
     // fan-out, join edges, cycle, reachability).
+    let auth_warnings = crate::auth_catalog::legacy_persist_warnings(cfg.auth.as_ref()).await;
+    if !args.json {
+        for w in &auth_warnings {
+            println!("auth: WARNING — {w}");
+        }
+    }
     if crate::topology::is_topology(&cfg) {
         // Config-level checks only: building the connectors would connect to
         // databases and create files (#844).
@@ -224,6 +230,7 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
                         "block": block, "consequence": consequence,
                     }))
                     .collect::<Vec<_>>(),
+                "auth_warnings": auth_warnings,
             });
             println!(
                 "{}",
@@ -500,6 +507,7 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
             "selection_active": selection_active,
             "rows": rows,
             "policy": policy_json,
+            "auth_warnings": auth_warnings,
         });
         println!(
             "{}",

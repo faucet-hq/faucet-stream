@@ -109,6 +109,22 @@ auth:
         path: "./state/auth"      # rotated refresh_token survives across runs
 ```
 
+**Upgrading a `persist:` provider from an earlier release.** The default storage
+key now covers the grant (`token_url`, `client_id` and the seed `refresh_token`),
+where earlier releases keyed by `token_url` + `client_id` only. A token stored
+under the old key is **not** adopted — it could belong to another grant of the
+same app — so after upgrading, a provider whose IdP rotates refresh tokens would
+send the revoked config seed and fail with `invalid_grant`. `faucet validate`
+prints an `auth: WARNING` and `faucet doctor` fails a `persist` probe for such a
+provider, both naming the old key. When the provider is the only grant of its
+app, pin the old key and the stored token is used and upgraded in place:
+
+```yaml
+      persist:
+        path: "./state/auth"
+        key: oauth2_refresh_0123456789abcdef   # the key the warning names
+```
+
 ## Mutual TLS (client certificates)
 
 Some enterprise/gov APIs (payroll, banking) require the client to present a certificate

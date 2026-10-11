@@ -199,7 +199,26 @@ The same files and trees are refused as **data**: a `file`, `csv`, `jsonl`,
 or DLQ whose path (or directory, or glob) reaches one of them is a `403`. In
 a config the request carries, such a path may not take a value from records
 (`${parent.*}` and other runtime tokens other than `${now.*}`, `${backfill.*}`
-and `${partition.*}`). SQL a `duckdb` or `sqlite` query runs is not inspected.
+and `${partition.*}`).
+
+### SQL connectors run sandboxed
+
+A query can read files by itself — DuckDB's `read_text('/etc/passwd')` or
+`ATTACH`, SQLite's `ATTACH` — so every `duckdb` source and sink and every
+`sqlite` source in a config the server loads runs with `sandbox: true`: DuckDB
+gets `enable_external_access = false` with extension autoload off and the
+configuration locked (a query cannot `SET` it back), and each SQLite
+connection allows no attached database (which also stops `VACUUM INTO`;
+extension loading is always off). The server sets the flag on every template,
+row override, topology node, fan-out source and DLQ sink, overwriting a
+`sandbox: false`. Such a query still reads and writes its own database; it
+fails with a `Permission Error` / `too many attached databases` the moment it
+reaches past it. The `sql` transform is always sandboxed this way.
+
+The one exception is a config in the server's own `--triggers` file: its
+operator wrote it on the server, so its SQL keeps host access (the run record
+shows `host_access: true`, and a clustered claim of it keeps it too). A
+template a trigger runs is sandboxed like any other.
 
 ### Subprocess connectors
 

@@ -195,6 +195,85 @@ async fn delivery_contract(h: &dyn RunHistory) {
     assert!(h.log_ship_row("r").await.unwrap().is_none());
 }
 
+/// The per-instance persisted watermark (#862 M-099), shared by both backends.
+async fn writer_contract(h: &dyn RunHistory) {
+    let live = Duration::from_secs(60);
+    assert_eq!(h.log_ship_writer_floor("w", live).await.unwrap(), None);
+    h.log_ship_writer_mark("w", 10).await.unwrap();
+    h.log_ship_writer_mark("w", 5).await.unwrap();
+    assert_eq!(
+        h.log_ship_writer_floor("w", live).await.unwrap(),
+        Some(10),
+        "monotonic"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        h.log_ship_writer_floor("w", Duration::ZERO).await.unwrap(),
+        None,
+        "a writer that stopped marking no longer holds delivery back"
+    );
+    h.log_ship_writer_done("w").await.unwrap();
+    assert_eq!(h.log_ship_writer_floor("w", live).await.unwrap(), None);
+    let lines = lines_at(Duration::from_secs(5), 3, "w");
+    h.record_run_logs("w", &lines).await.unwrap();
+    assert_eq!(
+        h.log_ship_writer_floor("w", live).await.unwrap(),
+        Some(lines[2].seq),
+        "a persisted batch advances the watermark"
+    );
+    h.log_ship_forget("w").await.unwrap();
+    assert_eq!(h.log_ship_writer_floor("w", live).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn writer_contract_memory() {
+    writer_contract(&MemoryHistory::new(Duration::from_secs(60))).await;
+}
+
+#[tokio::test]
+async fn writer_contract_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    writer_contract(&sqlite(&dir.path().join("w.db"), "a", Duration::from_secs(30)).await).await;
+}
+
+/// #862 M-099: two instances log one run; B persists a line late, after A's
+/// later lines are already stored. Delivery stops at B's watermark, so the late
+/// line is shipped instead of being left below the acknowledged watermark.
+#[tokio::test]
+async fn a_line_persisted_late_by_another_instance_is_still_shipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("two.db");
+    let a = sqlite(&db, "instance-a", Duration::from_secs(30)).await;
+    let b = sqlite(&db, "instance-b", Duration::from_secs(30)).await;
+    let early = lines_at(Duration::from_secs(12), 1, "b-early");
+    let late = lines_at(Duration::from_secs(10), 1, "b-late");
+    let a_lines = lines_at(Duration::from_secs(8), 3, "a");
+    b.record_run_logs("run", &early).await.unwrap();
+    a.record_run_logs("run", &a_lines).await.unwrap();
+
+    let (col, ep) = start_grpc().await;
+    let ex = LogExport::from_config(&export_config(Some(otel(
+        &ep,
+        faucet_core::OtelProtocol::Grpc,
+    ))));
+    assert_eq!(
+        ex.ship_once(&a).await.unwrap().shipped,
+        1,
+        "only up to the slower instance's watermark"
+    );
+    b.record_run_logs("run", &late).await.unwrap();
+    assert_eq!(ex.ship_once(&a).await.unwrap().shipped, 1, "the late line");
+    b.log_ship_writer_done("run").await.unwrap();
+    assert_eq!(ex.ship_once(&a).await.unwrap().shipped, 3);
+    a.log_ship_writer_done("run").await.unwrap();
+    assert_eq!(ex.ship_once(&a).await.unwrap().shipped, 0);
+    let bodies: Vec<String> = col.records().iter().map(|r| r.body.clone()).collect();
+    assert_eq!(bodies.len(), 5, "{bodies:?}");
+    assert!(bodies.iter().any(|b| b.contains("b-late")), "{bodies:?}");
+    let row = a.log_ship_row("run").await.unwrap().unwrap();
+    assert!(!row.has_pending());
+}
+
 #[tokio::test]
 async fn delivery_contract_memory() {
     delivery_contract(&MemoryHistory::new(Duration::from_secs(60))).await;

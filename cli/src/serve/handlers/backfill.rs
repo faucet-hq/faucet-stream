@@ -292,6 +292,7 @@ pub async fn submit_backfill(
             approved_change: None,
             selection: None,
             trusted_config: false,
+            server_file: false,
         };
         match runner::submit(state.clone(), submit, actor.clone()).await {
             Ok(resp) => {

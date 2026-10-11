@@ -612,6 +612,11 @@ panics is reported as a failed probe.
   `PING`, `tables.get`, cluster health, `fetch_metadata`, or a directory-writable
   check for file sinks. Never a real write.
 - **State stores** do a sentinel `put`/`get`/`delete` that leaves no residue.
+- **Auth** (one `persist` probe per `oauth2_refresh` provider with a `persist:`
+  block) fails when the provider's rotated refresh token is stored only under
+  the key earlier releases used, which this version does not read; the message
+  names the key to set as `persist.key`. `faucet validate` prints the same as an
+  `auth: WARNING` (and `auth_warnings` under `--json`).
 - **SLA** (when a top-level [`sla:` block](config.md#sla) is configured) reads the
   persisted run history and reports staleness of the last successful run vs
   `max_staleness_secs` and volume-baseline warm-up state — read-only.

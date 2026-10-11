@@ -205,6 +205,7 @@ mod tests {
             callback: None,
             tenant: None,
             selection: None,
+            host_access: false,
         }
     }
 
