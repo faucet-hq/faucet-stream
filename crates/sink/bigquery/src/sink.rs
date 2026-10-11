@@ -1792,13 +1792,23 @@ impl BigQuerySink {
             ))
         })?;
         self.ensure_dataset().await?;
-        // Replace only a table verified to exist without a schema; a missing
-        // one is created IF NOT EXISTS, so a concurrent first writer's rows
-        // are never dropped by a second writer's late CREATE OR REPLACE.
-        let ddl = if self.table_exists(&self.config.table_id).await? {
-            ddl
-        } else {
-            idempotent::create_if_missing(&ddl)
+        // Re-probe right before the DDL (the dataset job above takes seconds):
+        // a concurrent first writer may have created the table — with a schema
+        // — and started streaming into it. Such a table is used as-is; only a
+        // table still without a schema is replaced, and a missing one is
+        // created IF NOT EXISTS (#862 M-053).
+        let ddl = match self.fetch_schema_fields().await {
+            Ok(fields) if !fields.is_empty() => {
+                *self.schema_cache.write().await = None;
+                return Ok(());
+            }
+            Ok(_) => ddl,
+            Err(e) if is_table_not_found(&e) => idempotent::create_if_missing(&ddl),
+            Err(e) => {
+                return Err(FaucetError::Sink(format!(
+                    "BigQuery tables.get (schema probe) failed: {e}"
+                )));
+            }
         };
         self.run_ddl(ddl).await?;
         *self.schema_cache.write().await = None;
