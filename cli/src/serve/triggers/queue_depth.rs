@@ -27,6 +27,9 @@ pub struct QueueDepthWatcher {
     probe: Box<dyn DepthProbe>,
     threshold: u64,
     known_armed: bool,
+    /// The latest crossing this watcher saw committed (its own fire, or a
+    /// replay of another instance's).
+    confirmed: Option<u64>,
     poll: Duration,
     compiled: std::sync::Arc<super::compiled::CompiledTrigger>,
 }
@@ -43,6 +46,7 @@ impl QueueDepthWatcher {
             probe,
             threshold,
             known_armed: false,
+            confirmed: None,
             poll,
             compiled,
         }
@@ -74,15 +78,26 @@ impl Watcher for QueueDepthWatcher {
             }
             return Ok(false);
         }
-        let Some(edge) = history
+        self.known_armed = false;
+        let (edge, refire) = match history
             .trigger_edge_rise(&self.name)
             .await
             .map_err(|e| e.to_string())?
-        else {
-            self.known_armed = false;
-            return Ok(false);
+        {
+            Some(edge) => (edge, false),
+            // Disarmed: a crossing already rose. Its fire may never have
+            // committed (a crash between the rise and the fire, or a failed
+            // retract), so re-fire it under the same ordinal until confirmed;
+            // the stable idempotency key makes a fire that did commit a replay.
+            None => match history
+                .trigger_edge_current(&self.name)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                Some(current) if self.confirmed != Some(current) => (current, true),
+                _ => return Ok(false),
+            },
         };
-        self.known_armed = false;
         let event = TriggerEvent::QueueDepth {
             queue: self.probe.queue_label(),
             depth,
@@ -90,13 +105,20 @@ impl Watcher for QueueDepthWatcher {
         };
         let fired_at = chrono::Utc::now().to_rfc3339();
         let outcome = enqueue::fire(state, &self.compiled, event, &fired_at).await;
-        if !outcome.committed() {
-            history
-                .trigger_edge_retract(&self.name, edge)
-                .await
-                .map_err(|e| e.to_string())?;
+        if outcome.committed() || outcome.edge_already_fired() {
+            self.confirmed = Some(edge);
+            // A re-fire mostly replays a run another poll already started.
+            return Ok(outcome.committed() && !refire);
         }
-        Ok(outcome.committed())
+        if let Err(e) = history.trigger_edge_retract(&self.name, edge).await {
+            tracing::warn!(
+                trigger = %self.name,
+                edge,
+                error = %e,
+                "could not retract an uncommitted edge; it is re-fired on the next poll"
+            );
+        }
+        Ok(false)
     }
 }
 

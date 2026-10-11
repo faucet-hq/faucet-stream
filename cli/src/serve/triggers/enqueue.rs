@@ -31,7 +31,15 @@ impl FireOutcome {
     pub fn committed(&self) -> bool {
         matches!(self, FireOutcome::Enqueued(_) | FireOutcome::Coalesced)
     }
+
+    /// Whether a `queue_depth` fire failed because its edge's idempotency key
+    /// already started a run — i.e. that crossing has fired.
+    pub fn edge_already_fired(&self) -> bool {
+        matches!(self, FireOutcome::Error(m) if m.starts_with(EDGE_KEY_USED))
+    }
 }
+
+const EDGE_KEY_USED: &str = "edge idempotency key already used";
 
 /// Resolve the pipeline ref to config text and substitute `${trigger.*}`.
 pub async fn resolve_config_text(
@@ -299,7 +307,7 @@ async fn fire_one(
         Err(crate::serve::error::ServeError::Conflict(m)) if kind == "queue_depth" => {
             metrics::error(compiled.name(), kind);
             FireOutcome::Error(format!(
-                "edge idempotency key already used for a different run, not committing: {m}"
+                "{EDGE_KEY_USED} for a different run, not committing: {m}"
             ))
         }
         Err(crate::serve::error::ServeError::Conflict(m)) => {
@@ -432,6 +440,9 @@ mod tests {
         assert!(!is_deterministic(&ServeError::Unavailable("x".into())));
         assert!(!is_deterministic(&ServeError::Internal("x".into())));
         assert!(!FireOutcome::Failed("x".into()).committed());
+        assert!(FireOutcome::Error(format!("{EDGE_KEY_USED} for a different run")).edge_already_fired());
+        assert!(!FireOutcome::Error("other".into()).edge_already_fired());
+        assert!(!FireOutcome::Coalesced.edge_already_fired());
     }
 
     #[test]

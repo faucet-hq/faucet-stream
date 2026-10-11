@@ -684,6 +684,7 @@ pub struct Stmts {
     pub trigger_edge_rise: String,
     pub trigger_edge_rearm: String,
     pub trigger_edge_retract: String,
+    pub trigger_edge_current: String,
     /// List run IDs owned by this instance that have a pending cancellation request.
     pub pending_cancellations: String,
     /// Upsert this instance's membership heartbeat into `faucet_serve_instances`.
@@ -1262,6 +1263,9 @@ impl Stmts {
                 SET ordinal = CAST(CAST(ordinal AS BIGINT) - 1 AS TEXT), armed = '1' \
                 WHERE trigger_name = $1 AND ordinal = $2 AND armed = '0'"
                 .into(),
+            trigger_edge_current: "SELECT ordinal FROM faucet_serve_trigger_edges \
+                WHERE trigger_name = $1 AND armed = '0'"
+                .into(),
             cancel_requeued_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = $1 \
                 WHERE status = 'pending' AND run_id IN \
@@ -1788,6 +1792,9 @@ impl Stmts {
             trigger_edge_retract: "UPDATE faucet_serve_trigger_edges \
                 SET ordinal = CAST(CAST(ordinal AS INTEGER) - 1 AS TEXT), armed = '1' \
                 WHERE trigger_name = ? AND ordinal = ? AND armed = '0'"
+                .into(),
+            trigger_edge_current: "SELECT ordinal FROM faucet_serve_trigger_edges \
+                WHERE trigger_name = ? AND armed = '0'"
                 .into(),
             cancel_requeued_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = ? \
@@ -3619,6 +3626,24 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
                 Ok(())
+            }
+
+            async fn trigger_edge_current(
+                &self,
+                trigger: &str,
+            ) -> Result<Option<u64>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.trigger_edge_current)
+                    .bind(trigger)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let ordinal: String = row.try_get("ordinal").map_err(backend)?;
+                $crate::serve::history::sql::parse_edge_ordinal(&ordinal).map(Some)
             }
 
             async fn trigger_edge_retract(

@@ -652,6 +652,26 @@ async fn queue_depth_edges_survive_a_restart_and_fire_once_across_instances() {
         .await
         .unwrap();
     assert_eq!(page.runs.len(), 3, "one run per crossing");
+
+    // #862 M-006: a crossing that rose but never fired (the process died
+    // between the two) is fired by the next poll instead of wedging the edge.
+    let mut drain = watcher(vec![0]);
+    assert!(!drain.poll(&restarted).await.unwrap(), "drained: re-arm");
+    let lost = restarted.history().trigger_edge_rise("drain").await.unwrap();
+    assert!(lost.is_some());
+    let mut fresh = watcher(vec![9, 9]);
+    assert!(!fresh.poll(&restarted).await.unwrap(), "re-fire of the lost edge");
+    wait_for_runs(&restarted, 4).await;
+    assert!(!fresh.poll(&restarted).await.unwrap(), "fired once");
+    let page = restarted
+        .history()
+        .list(&ListFilter {
+            limit: 1_000,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.runs.len(), 4, "the lost crossing ran exactly once");
 }
 
 // ── HTTP-boundary tests ───────────────────────────────────────────────────────

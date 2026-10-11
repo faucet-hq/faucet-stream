@@ -396,6 +396,9 @@ impl RunHistory for FallbackHistory {
     async fn trigger_edge_rearm(&self, trigger: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.trigger_edge_rearm(trigger), f => f.trigger_edge_rearm(trigger))
     }
+    async fn trigger_edge_current(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        strict!(self, p => p.trigger_edge_current(trigger), f => f.trigger_edge_current(trigger))
+    }
     async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
         strict!(self, p => p.trigger_edge_retract(trigger, ordinal), f => f.trigger_edge_retract(trigger, ordinal))
     }
@@ -955,7 +958,10 @@ mod tests {
         );
         assert!(!healthy.try_recover().await, "not degraded");
         let first = healthy.trigger_edge_rise("q").await.unwrap().unwrap();
+        assert_eq!(healthy.trigger_edge_current("q").await.unwrap(), Some(first));
         healthy.trigger_edge_retract("q", first).await.unwrap();
+        assert_eq!(healthy.trigger_edge_current("q").await.unwrap(), None);
+        assert_eq!(healthy.trigger_edge_current("never").await.unwrap(), None);
         healthy.trigger_edge_rearm("q").await.unwrap();
 
         healthy.degraded.store(true, Ordering::Release);

@@ -1204,6 +1204,16 @@ impl RunHistory for MemoryHistory {
         Ok(())
     }
 
+    async fn trigger_edge_current(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        let edges = self
+            .trigger_edges
+            .lock()
+            .map_err(|_| HistoryError::Backend("trigger edge lock poisoned".into()))?;
+        Ok(edges
+            .get(trigger)
+            .and_then(|(ordinal, armed)| (!*armed).then_some(*ordinal)))
+    }
+
     async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
         let mut edges = self
             .trigger_edges

@@ -877,6 +877,16 @@ pub trait RunHistory: Send + Sync {
         ))
     }
 
+    /// The ordinal of `trigger`'s latest crossing while its edge is disarmed
+    /// (`None` when armed or never seen), so a watcher can re-fire a crossing
+    /// whose fire was never confirmed. Default: unsupported.
+    async fn trigger_edge_current(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        let _ = trigger;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support queue_depth trigger edges".into(),
+        ))
+    }
+
     // ── Audit log (RBAC, #205) ───────────────────────────────────────────────
 
     /// Append one audit record. Best-effort but visible: the caller logs a
@@ -2042,6 +2052,7 @@ mod tests {
             h.trigger_edge_rise("q").await.unwrap_err(),
             h.trigger_edge_rearm("q").await.unwrap_err(),
             h.trigger_edge_retract("q", 1).await.unwrap_err(),
+            h.trigger_edge_current("q").await.unwrap_err(),
         ] {
             assert!(err.to_string().contains("queue_depth"), "{err}");
         }
