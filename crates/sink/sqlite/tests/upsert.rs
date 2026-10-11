@@ -295,3 +295,58 @@ async fn dlq_and_exactly_once_paths_create_a_fresh_keyed_table() {
         assert_eq!(fetch_name(&url, 1).await.as_deref(), Some("a2"));
     }
 }
+
+#[tokio::test]
+async fn nocase_key_delete_then_upsert_applies_in_page_order() {
+    let (_dir, url) =
+        fresh_db("CREATE TABLE people (email TEXT COLLATE NOCASE PRIMARY KEY, name TEXT)").await;
+    let mut config =
+        SqliteSinkConfig::new(&url, "people").column_mapping(SqliteColumnMapping::AutoMap);
+    config.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["email".into()],
+        delete_marker: Some(DeleteMarker {
+            field: "__op".into(),
+            values: vec!["d".into()],
+        }),
+        rollback: None,
+    };
+    let sink = SqliteSink::new(config).await.unwrap();
+    sink.write_batch(&[json!({"email": "Bob@x.com", "name": "old"})])
+        .await
+        .unwrap();
+    sink.write_batch(&[
+        json!({"email": "Bob@x.com", "__op": "d"}),
+        json!({"email": "bob@x.com", "name": "B"}),
+    ])
+    .await
+    .unwrap();
+    let out = sink
+        .write_batch_partial(&[
+            json!({"email": "bob@x.com", "__op": "d"}),
+            json!({"email": "BOB@x.com", "name": "C"}),
+        ])
+        .await
+        .unwrap();
+    assert!(out.iter().all(Result::is_ok));
+    sink.write_batch_idempotent(
+        &[
+            json!({"email": "BOB@x.com", "__op": "d"}),
+            json!({"email": "bob@X.com", "name": "D"}),
+        ],
+        "people",
+        &faucet_core::format_token(1),
+    )
+    .await
+    .unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT email, name FROM people")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![("bob@X.com".to_string(), "D".to_string())]);
+}

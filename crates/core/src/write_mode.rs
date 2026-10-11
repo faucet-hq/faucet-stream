@@ -301,6 +301,35 @@ pub fn plan_writes(page: &[Value], spec: &WriteSpec) -> WritePlan {
     plan
 }
 
+/// Split a keyed page into runs of consecutive upserts or deletes and plan
+/// each run, so the runs apply in page order. One [`plan_writes`] over the
+/// whole page applies every upsert before every delete; when a delete and a
+/// later upsert address keys that differ in JSON but are equal under the
+/// destination's collation (`"Bob"` / `"bob"`), that order deletes the row the
+/// page re-inserted. Rows with no usable key are left out — the caller reports
+/// them from its own [`plan_writes`] over the page.
+pub fn plan_writes_ordered(page: &[Value], spec: &WriteSpec) -> Vec<WritePlan> {
+    let mut plans = Vec::new();
+    let mut run: Vec<Value> = Vec::new();
+    let mut run_is_delete = None;
+    for rec in page {
+        let single = plan_writes(std::slice::from_ref(rec), spec);
+        if !single.failed.is_empty() {
+            continue;
+        }
+        let is_delete = !single.deletes.is_empty();
+        if run_is_delete.is_some_and(|d| d != is_delete) {
+            plans.push(plan_writes(&std::mem::take(&mut run), spec));
+        }
+        run_is_delete = Some(is_delete);
+        run.push(rec.clone());
+    }
+    if !run.is_empty() {
+        plans.push(plan_writes(&run, spec));
+    }
+    plans
+}
+
 /// The key tuple of a record in `key` order, or `None` when a key column is
 /// missing or null — the same rule [`plan_writes`] applies.
 pub fn record_key(rec: &Value, key: &[String]) -> Option<KeyTuple> {
@@ -425,6 +454,34 @@ mod tests {
             delete_marker: None,
             rollback: None,
         }
+    }
+
+    #[test]
+    fn ordered_plans_keep_page_order_across_upsert_delete_runs() {
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["name".into()],
+            delete_marker: Some(DeleteMarker {
+                field: "op".into(),
+                values: vec!["d".into()],
+            }),
+            rollback: None,
+        };
+        let page = vec![
+            json!({"name": "Bob", "op": "d"}),
+            json!({"name": "bob", "v": 1}),
+            json!({"name": "carl", "v": 2}),
+            json!({"v": 3}),
+            json!({"name": "dee", "op": "d"}),
+        ];
+        let plans = plan_writes_ordered(&page, &spec);
+        let shape: Vec<(usize, usize)> = plans
+            .iter()
+            .map(|p| (p.upserts.len(), p.deletes.len()))
+            .collect();
+        assert_eq!(shape, vec![(0, 1), (2, 0), (0, 1)]);
+        assert!(plans.iter().all(|p| p.failed.is_empty()));
+        assert!(plan_writes_ordered(&[], &spec).is_empty());
     }
 
     #[test]

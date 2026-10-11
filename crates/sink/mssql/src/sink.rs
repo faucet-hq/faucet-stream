@@ -611,7 +611,7 @@ impl MssqlSink {
     }
 
     /// Apply planned upsert/delete groups atomically, in page order, in a
-    /// single `BEGIN TRAN` / `COMMIT TRAN`. Groups come from [`ordered_plans`]
+    /// single `BEGIN TRAN` / `COMMIT TRAN`. Groups come from [`faucet_core::plan_writes_ordered`]
     /// so a delete that precedes an upsert of a key equal under the column
     /// collation (`"Bob"` / `"bob"`) cannot run after it and remove the row.
     async fn apply_plans(&self, plans: &[faucet_core::WritePlan]) -> Result<usize, FaucetError> {
@@ -996,37 +996,6 @@ pub(crate) fn classify_server_code(code: u32) -> ChunkFailure {
     }
 }
 
-/// Split a keyed page into runs of consecutive upserts or deletes and plan
-/// each run, so the runs apply in page order. One plan for the whole page
-/// would apply every upsert before every delete; when a delete and a later
-/// upsert address keys that differ in JSON but are equal under the column
-/// collation, that order deletes the row the page re-inserted. Rows with no
-/// usable key are left out (the caller reports them from its own plan).
-pub(crate) fn ordered_plans(
-    records: &[Value],
-    spec: &faucet_core::WriteSpec,
-) -> Vec<faucet_core::WritePlan> {
-    let mut plans = Vec::new();
-    let mut run: Vec<Value> = Vec::new();
-    let mut run_is_delete = None;
-    for rec in records {
-        let single = faucet_core::plan_writes(std::slice::from_ref(rec), spec);
-        if !single.failed.is_empty() {
-            continue;
-        }
-        let is_delete = !single.deletes.is_empty();
-        if run_is_delete.is_some_and(|d| d != is_delete) {
-            plans.push(faucet_core::plan_writes(&std::mem::take(&mut run), spec));
-        }
-        run_is_delete = Some(is_delete);
-        run.push(rec.clone());
-    }
-    if !run.is_empty() {
-        plans.push(faucet_core::plan_writes(&run, spec));
-    }
-    plans
-}
-
 /// SQL Server error numbers that are about the data of the rows being
 /// written: conversion and overflow (241, 242, 245, 220, 232, 517, 8114,
 /// 8115, 8169, 8134), truncation (8152, 2628), `NULL` into `NOT NULL` (515),
@@ -1145,7 +1114,7 @@ impl Sink for MssqlSink {
                 )));
             }
             let total = self
-                .apply_plans(&ordered_plans(records, &self.config.write))
+                .apply_plans(&faucet_core::plan_writes_ordered(records, &self.config.write))
                 .await?;
             tracing::info!(
                 table = %self.config.table,
@@ -1223,7 +1192,7 @@ impl Sink for MssqlSink {
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
             let plan = faucet_core::plan_writes(records, &self.config.write);
-            self.apply_plans(&ordered_plans(records, &self.config.write))
+            self.apply_plans(&faucet_core::plan_writes_ordered(records, &self.config.write))
                 .await?;
 
             let mut outcomes: Vec<RowOutcome> = records.iter().map(|_| Ok(())).collect();
@@ -1596,7 +1565,7 @@ impl Sink for MssqlSink {
         // the append path's INSERTs, inside this same BEGIN TRAN.
         let written = match &plan {
             Some(_) => {
-                let plans = ordered_plans(records, &self.config.write);
+                let plans = faucet_core::plan_writes_ordered(records, &self.config.write);
                 match self.apply_plans_no_txn(&mut conn, &plans).await {
                     Ok(n) => n,
                     Err((e, timed_out)) => {
@@ -1989,30 +1958,5 @@ mod tests {
                 "code {code}"
             );
         }
-    }
-
-    #[test]
-    fn keyed_pages_apply_in_page_order() {
-        use serde_json::json;
-        let spec: faucet_core::WriteSpec = serde_json::from_value(json!({
-            "write_mode": "upsert",
-            "key": ["name"],
-            "delete_marker": {"field": "op", "values": ["d"]}
-        }))
-        .unwrap();
-        let page = vec![
-            json!({"name": "Bob", "op": "d"}),
-            json!({"name": "bob", "v": 1}),
-            json!({"name": "carl", "v": 2}),
-            json!({"v": 3}),
-            json!({"name": "dee", "op": "d"}),
-        ];
-        let plans = super::ordered_plans(&page, &spec);
-        let shape: Vec<(usize, usize)> = plans
-            .iter()
-            .map(|p| (p.upserts.len(), p.deletes.len()))
-            .collect();
-        assert_eq!(shape, vec![(0, 1), (2, 0), (0, 1)]);
-        assert!(super::ordered_plans(&[], &spec).is_empty());
     }
 }
