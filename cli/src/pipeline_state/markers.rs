@@ -46,6 +46,39 @@ impl RunMarkers {
         })
     }
 
+    /// Cancelled when the run loses its lease mid-run (#862 M-012); `None`
+    /// when it runs unleased.
+    pub fn lease_lost(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.lease.as_ref().map(LeaseGuard::lost)
+    }
+
+    /// Stop `run` at its next page boundary once the lease is lost. The
+    /// returned guard ends the watch when dropped.
+    pub fn stop_on_lease_loss(
+        &self,
+        run: &tokio_util::sync::CancellationToken,
+    ) -> Option<tokio_util::sync::DropGuard> {
+        let lost = self.lease_lost()?;
+        let watch = tokio_util::sync::CancellationToken::new();
+        let (run, stop) = (run.clone(), watch.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = lost.cancelled() => run.cancel(),
+                _ = stop.cancelled() => {}
+            }
+        });
+        Some(watch.drop_guard())
+    }
+
+    /// The error a run that lost its lease ends with.
+    pub fn lease_lost_error(base: &str) -> crate::error::CliError {
+        crate::error::CliError::Faucet(faucet_core::FaucetError::State(format!(
+            "run lease for '{base}' was lost (taken by another run, or expired while it \
+             could not be renewed); this run stopped at a page boundary so two runs do not \
+             race one bookmark"
+        )))
+    }
+
     /// Close the bracket: record the outcome (unless `record` is false — a
     /// cancelled run) and release the lease. `outcome` is the records written
     /// or the failure's `(kind, message)`.
@@ -126,6 +159,53 @@ mod tests {
             "Sink"
         );
         assert_eq!(error_kind(&CliError::Config("x".into())), "Config");
+    }
+
+    #[tokio::test]
+    async fn a_lost_lease_stops_the_run() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        assert!(RunMarkers::default().lease_lost().is_none());
+        assert!(
+            RunMarkers::default()
+                .stop_on_lease_loss(&Default::default())
+                .is_none()
+        );
+        let guard = lease::acquire_every(
+            Arc::clone(&store),
+            "p::r",
+            "run-1",
+            std::time::Duration::from_millis(2),
+        )
+        .await
+        .unwrap();
+        let m = RunMarkers {
+            store: Some(Arc::clone(&store)),
+            lease: Some(guard),
+        };
+        let run = tokio_util::sync::CancellationToken::new();
+        let _watch = m.stop_on_lease_loss(&run).unwrap();
+        let other = lease::acquire(Arc::clone(&store), "p::r", "run-2")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run.cancelled())
+            .await
+            .expect("losing the lease cancels the run");
+        assert!(m.lease_lost().unwrap().is_cancelled());
+        let msg = RunMarkers::lease_lost_error("p::r").to_string();
+        assert!(msg.contains("run lease for 'p::r' was lost"), "{msg}");
+        other.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_ends_the_lease_watch() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::w", "r", true, false)
+            .await
+            .unwrap();
+        let run = tokio_util::sync::CancellationToken::new();
+        drop(m.stop_on_lease_loss(&run).unwrap());
+        tokio::task::yield_now().await;
+        assert!(!run.is_cancelled());
     }
 
     #[tokio::test]
