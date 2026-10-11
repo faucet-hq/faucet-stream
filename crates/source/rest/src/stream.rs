@@ -9,8 +9,8 @@ use crate::pagination::{PaginationState, PaginationStyle};
 use crate::retry;
 use async_trait::async_trait;
 use faucet_core::replication::{
-    BindTarget, OnMissingKey, ReplicationKey, ReplicationMethod, filter_incremental_path,
-    max_replication_value_path, max_value,
+    BindTarget, OnMissingKey, ReplicationKey, ReplicationMethod, max_replication_value_path,
+    max_value,
 };
 use faucet_core::schema;
 use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, SharedAuthProvider};
@@ -728,26 +728,14 @@ impl RestStream {
         };
         // Inclusive (`>=`): the bookmark is the previous run's max, and a row
         // sharing that value but written after the previous run read it would
-        // otherwise be skipped forever (API-19). Re-delivering the boundary
-        // rows is at-least-once, absorbed by a keyed upsert sink.
-        let mut kept = Vec::with_capacity(records.len());
-        let mut missing = 0;
-        for record in records {
-            let at_bookmark = key.resolve(&record).is_some_and(|v| {
-                !v.is_null()
-                    && std::mem::discriminant(v) == std::mem::discriminant(start)
-                    && !faucet_core::replication::json_gt(v, start)
-                    && !faucet_core::replication::json_gt(start, v)
-            });
-            if at_bookmark {
-                kept.push(record);
-                continue;
-            }
-            let out =
-                filter_incremental_path(vec![record], key, start, self.config.on_missing_key)?;
-            missing += out.missing;
-            kept.extend(out.records);
-        }
+        // otherwise be skipped forever (API-19).
+        let out = faucet_core::replication::filter_incremental_path_inclusive(
+            records,
+            key,
+            start,
+            self.config.on_missing_key,
+        )?;
+        let (kept, missing) = (out.records, out.missing);
         self.note_missing_key(missing);
         Ok(kept)
     }
@@ -1917,9 +1905,7 @@ impl RestStream {
                 hdrs.insert(k.clone(), v.clone());
             }
         } else {
-            for name in crate::url_util::CREDENTIAL_HEADERS {
-                hdrs.remove(name);
-            }
+            crate::url_util::retain_cross_origin_safe(&mut hdrs);
         }
         for (k, v) in headers {
             insert_header(&mut hdrs, k, v)?;
@@ -2598,9 +2584,7 @@ impl RestStream {
             h
         };
         if !send_credentials {
-            for name in crate::url_util::CREDENTIAL_HEADERS {
-                headers.remove(name);
-            }
+            crate::url_util::retain_cross_origin_safe(&mut headers);
         }
         if let Some(auth) = &resolved_auth {
             auth.apply(&mut headers)?;
@@ -3636,10 +3620,20 @@ impl RestStream {
     }
 
     async fn discover_get_text_once(&self, url: &str, what: &str) -> Result<String, FaucetError> {
-        // Static config headers (#539) form the base; auth is applied on top.
+        // Static config headers (#539) form the base; auth is applied on top —
+        // only within the credential boundary, since a listing's `next` link is
+        // server-given (#862 M-069).
         let mut headers = self.static_headers.clone();
-        for (k, v) in self.metadata_headers(url).await?.iter() {
-            headers.insert(k.clone(), v.clone());
+        if crate::url_util::credentials_allowed(
+            &self.config.base_url,
+            url,
+            &self.config.trusted_hosts,
+        )? {
+            for (k, v) in self.metadata_headers(url).await?.iter() {
+                headers.insert(k.clone(), v.clone());
+            }
+        } else {
+            crate::url_util::retain_cross_origin_safe(&mut headers);
         }
         self.roundtrip("discover");
         let resp = self
