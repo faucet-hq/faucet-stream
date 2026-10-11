@@ -229,6 +229,8 @@ fn is_column_resolution_error(msg: &str) -> bool {
     m.contains("referenced column")
         || m.contains("does not have a column named")
         || (m.contains("binder error") && m.contains("group by"))
+        // The placeholder's one column cannot match the page's column count.
+        || m.contains("set operations can only apply to expressions with the same number")
 }
 
 /// Validate the query at config-load time, binding it against a

@@ -5,7 +5,7 @@ use crate::config::SqlTransformConfig;
 use crate::shovel::{
     ABSENT_MARKER, infer_schema, json_to_record_batch, mark_absent_fields, record_batches_to_json,
     refuse_case_collisions, restore_empty_structs, schema_eq, stringify_empty_structs,
-    strip_absent_fields,
+    strip_absent_fields, unmark_absent_fields,
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -139,7 +139,9 @@ fn execute_page(st: &mut State, mut records: Vec<Value>) -> Result<Vec<Value>, F
     if let Some(rewritten) = stringify_empty_structs(&fresh, &mut records) {
         fresh = rewritten;
     }
-    if mark_absent_fields(&mut records, &fresh) {
+    let unmarked = fresh.clone();
+    let marked = mark_absent_fields(&mut records, &fresh);
+    if marked {
         let mut fields: Vec<_> = fresh.fields().iter().cloned().collect();
         fields.push(Arc::new(Field::new(ABSENT_MARKER, DataType::Utf8, true)));
         fresh = Arc::new(Schema::new(fields));
@@ -152,9 +154,23 @@ fn execute_page(st: &mut State, mut records: Vec<Value>) -> Result<Vec<Value>, F
         }
     };
     let batch = json_to_record_batch(&records, schema)?;
-    let batches = run_query_batches(st, batch)?;
+    let mut marked = marked;
+    let batches = match run_query_batches(st, batch) {
+        Ok(b) => b,
+        // The marker column changes `batch`'s shape, which a set operation
+        // against another relation refuses: run the page without it (#862 M-013).
+        Err(_) if marked => {
+            unmark_absent_fields(&mut records);
+            marked = false;
+            st.pages_seen = st.pages_seen.saturating_sub(1);
+            run_query_batches(st, json_to_record_batch(&records, unmarked)?)?
+        }
+        Err(e) => return Err(e),
+    };
     let mut rows = record_batches_to_json(&batches)?;
-    strip_absent_fields(&mut rows);
+    if marked {
+        strip_absent_fields(&mut rows);
+    }
     restore_empty_structs(&original, &mut rows);
     Ok(rows)
 }
