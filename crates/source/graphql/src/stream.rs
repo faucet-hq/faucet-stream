@@ -6,7 +6,9 @@ use crate::config::{
 };
 use async_trait::async_trait;
 use base64::Engine as _;
-use faucet_core::replication::{filter_incremental_path, max_replication_value_path, max_value};
+use faucet_core::replication::{
+    filter_incremental_path_inclusive, max_replication_value_path, max_value,
+};
 use faucet_core::util::{self, DEFAULT_ERROR_BODY_MAX_LEN};
 use faucet_core::{
     AuthSpec, Credential, FaucetError, ReplicationKey, ReplicationMethod, SharedAuthProvider,
@@ -554,7 +556,7 @@ impl GraphqlStream {
                 pages_fetched += 1;
                 if let Some(key) = &key {
                     if let Some(start) = &start {
-                        let filtered = filter_incremental_path(
+                        let filtered = filter_incremental_path_inclusive(
                             records,
                             key,
                             start,

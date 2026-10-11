@@ -132,6 +132,8 @@ faucet run pipeline.yaml
 | `replication_bind.format` | `raw` \| `iso8601` \| `epoch_s` \| `epoch_ms` \| `date` | `raw` | How the bookmark is formatted first. |
 | `replication_bind.value_type` | `string` \| `number` | `string` | JSON type of the variable. |
 
+The page filter keeps records whose key is **at or after** the bookmark (`>=`): a record written in the bookmark's second (or other unit) after the previous run read it would otherwise be lost. The boundary records are delivered again — at-least-once, absorbed by a keyed upsert sink. Bind with `>=` too (`updated_at:>=${bookmark}`) so the server returns them.
+
 ```yaml
 source:
   type: graphql
