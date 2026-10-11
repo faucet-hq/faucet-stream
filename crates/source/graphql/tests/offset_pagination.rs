@@ -316,3 +316,27 @@ async fn an_offset_ignoring_server_stops_on_the_repeated_page() {
     assert_eq!(records.len(), 2);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
+
+/// The guard compares records, so per-response `extensions` (query cost,
+/// request ids) cannot defeat it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_page_with_changing_extensions_still_stops() {
+    let server = MockServer::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_req: &Request| {
+            let n = h.fetch_add(1, Ordering::SeqCst);
+            let mut page = make_page(0, 2);
+            page["extensions"] = serde_json::json!({ "cost": { "requestId": n } });
+            ResponseTemplate::new(200).set_body_json(page)
+        })
+        .mount(&server)
+        .await;
+    let records = GraphqlStream::new(offset_config(&server, 2, false))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
