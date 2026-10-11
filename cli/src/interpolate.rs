@@ -302,12 +302,21 @@ pub fn contains_unescaped(s: &str, prefix: &str) -> bool {
 
 /// Unescape a raw config document everywhere except the connector, transform,
 /// state and DLQ configs — those are interpolated again at run time and are
-/// unescaped when built instead.
+/// unescaped when built instead — and the blocks later load passes still
+/// interpolate: `vars:` (substituted into those configs) and the typed blocks
+/// the secrets pass walks, which [`crate::secrets::unescape_typed_blocks`]
+/// unescapes once that pass is done (#862 M-023).
 pub(crate) fn unescape_document(doc: &mut Value) {
     fn deferred(path: &[&str]) -> bool {
         matches!(
             path,
-            ["pipeline", "source" | "sink", "config"]
+            ["vars"]
+                | ["observability" | "verify" | "reconcile" | "lineage" | "catalog"]
+                | ["notifications" | "notify"]
+                | ["pipeline", "masking"]
+                | ["pipeline", "nodes", _, "config"]
+                | ["pipeline", "nodes", _, "transforms", _, "config"]
+                | ["pipeline", "source" | "sink", "config"]
                 | ["pipeline", "sources" | "sinks", _, "config"]
                 | ["pipeline", "source", "transforms", _, "config"]
                 | ["pipeline", "sources", _, "transforms", _, "config"]
@@ -1146,11 +1155,25 @@ mod tests {
                 "state": { "type": "file", "config": { "path": "$${d}" } }
             },
             "matrix": [{ "id": "r", "source": { "config": { "q": "$${e}" } } }],
-            "notifications": [{ "text": "$${f}" }]
+            "notifications": [{ "text": "$${f}" }],
+            "vars": { "v": "$${g}" },
+            "execution": { "note": "$${h}" }
+        });
+        doc["pipeline"]["nodes"] = serde_json::json!({
+            "n": { "kind": "source", "config": { "q": "$${i}" } },
+            "t": { "kind": "transform", "transforms": [{ "type": "set", "config": { "v": "$${j}" } }] }
         });
         unescape_document(&mut doc);
         assert_eq!(doc["name"], "${x}");
-        assert_eq!(doc["notifications"][0]["text"], "${f}");
+        assert_eq!(doc["execution"]["note"], "${h}");
+        // Later load passes still read these; they are unescaped after them (#862 M-023).
+        assert_eq!(doc["notifications"][0]["text"], "$${f}");
+        assert_eq!(doc["vars"]["v"], "$${g}");
+        assert_eq!(doc["pipeline"]["nodes"]["n"]["config"]["q"], "$${i}");
+        assert_eq!(
+            doc["pipeline"]["nodes"]["t"]["transforms"][0]["config"]["v"],
+            "$${j}"
+        );
         assert_eq!(doc["pipeline"]["source"]["config"]["q"], "$${a}");
         assert_eq!(doc["pipeline"]["sinks"]["s"]["config"]["p"], "$${b}");
         assert_eq!(doc["pipeline"]["transforms"][0]["config"]["v"], "$${c}");

@@ -314,6 +314,29 @@ fn walk_typed<T: serde::Serialize + serde::de::DeserializeOwned>(
     Ok(())
 }
 
+/// Unescape `$${` in the typed blocks [`crate::interpolate::unescape_document`]
+/// leaves escaped so the load passes after it (`${vars.*}`, the secrets pass)
+/// keep an escaped token literal (#862 M-023). Run once the last such pass is
+/// done; idempotent.
+pub fn unescape_typed_blocks(cfg: &mut PipelineConfig) -> CliResult<()> {
+    let mut f = |v: &mut Value| {
+        crate::interpolate::unescape_value(v);
+        Ok(())
+    };
+    walk_typed(&mut cfg.observability, "observability", &mut f)?;
+    walk_typed(&mut cfg.verify, "verify", &mut f)?;
+    walk_typed(&mut cfg.reconcile, "reconcile", &mut f)?;
+    #[cfg(feature = "masking")]
+    walk_typed(&mut cfg.pipeline.masking, "pipeline.masking", &mut f)?;
+    #[cfg(feature = "lineage")]
+    walk_typed(&mut cfg.lineage, "lineage", &mut f)?;
+    #[cfg(feature = "catalog")]
+    walk_typed(&mut cfg.catalog, "catalog", &mut f)?;
+    #[cfg(feature = "notify")]
+    walk_typed(&mut cfg.notifications, "notifications", &mut f)?;
+    Ok(())
+}
+
 /// Apply a mutating, fallible closure to every config `Value` location.
 fn visit_config_values_mut<F: FnMut(&mut Value) -> CliResult<()>>(
     cfg: &mut PipelineConfig,
@@ -463,7 +486,8 @@ pub fn ensure_no_secret_directives(cfg: &PipelineConfig) -> CliResult<()> {
 pub async fn resolve_secrets(cfg: &mut PipelineConfig) -> CliResult<()> {
     let refs = scan_config(cfg);
     if refs.is_empty() {
-        return refuse_unresolved(cfg);
+        refuse_unresolved(cfg)?;
+        return unescape_typed_blocks(cfg);
     }
     let mut set = ResolverSet::default();
     let schemes: BTreeSet<&str> = refs.iter().map(|(s, _)| s.as_str()).collect();
@@ -478,11 +502,13 @@ pub async fn resolve_secrets(cfg: &mut PipelineConfig) -> CliResult<()> {
 pub async fn resolve_secrets_with(cfg: &mut PipelineConfig, set: &ResolverSet) -> CliResult<()> {
     let refs = scan_config(cfg);
     if refs.is_empty() {
-        return refuse_unresolved(cfg);
+        refuse_unresolved(cfg)?;
+        return unescape_typed_blocks(cfg);
     }
     let cache = fetch_all(&refs, set).await?;
     visit_config_values_mut(cfg, |v| substitute(v, &cache))?;
-    refuse_unresolved(cfg)
+    refuse_unresolved(cfg)?;
+    unescape_typed_blocks(cfg)
 }
 
 /// Resolve every secret directive in an arbitrary document in place — for

@@ -183,7 +183,9 @@ Reference cycles surface as a clear `InterpolationCycle` error.
 
 Write `$${` for a literal `${`. The escape holds through every stage — a
 `$${param.x}`, `$${now.date}` or `$${vault:…}` is never resolved — and becomes
-`${` only in the value the connector or transform finally receives.
+`${` only in the value the connector or transform finally receives — in a
+matrix row, a topology node, a `vars:` value, or a block such as `masking:`,
+`notifications:` or `observability:` alike.
 
 ### `${now.*}` — run-clock interpolation
 
