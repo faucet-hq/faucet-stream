@@ -151,8 +151,11 @@ renamed (`ssn` → `tax_id`) carries the labels of its original name there too.
   receives the whole record, so it is evaluated as a destination too (sink
   id `dlq`, with the `attributes:` of `dlq.sink`): when the rules would not
   let the record reach the DLQ either, the run fails instead of moving it
-  there. `faucet validate` / `faucet policy` report those violations against
-  sink `dlq`.
+  there. Every labelled column of the record is checked at the DLQ, not only
+  the one that broke the main sink's rule. `faucet validate` / `faucet policy`
+  report those violations against sink `dlq`. Rows that other passes send to
+  the DLQ (quality, contract, schema drift, per-row sink failures) are checked
+  only by the static pass, which evaluates sink `dlq` like any other sink.
 
 ```yaml
 pipeline:
