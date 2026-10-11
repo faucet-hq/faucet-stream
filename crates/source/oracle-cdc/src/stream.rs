@@ -289,12 +289,32 @@ impl Shared {
         let mut agg: Vec<Value> = Vec::new();
         let mut agg_since = Instant::now();
         let mut last_activity = Instant::now();
+        let mut clamped_since: Option<Instant> = None;
+        let mut clamp_warned = false;
         loop {
             let current = self.position_now(&conn)?.commit_scn;
             self.flush(&conn, current)?;
             let (threads, floor): (u64, Option<u64>) = conn
                 .query_row_as(THREADS_SQL, &[])
                 .map_err(|e| src_err("redo thread check", &e))?;
+            match rac_clamp_lag(current, threads, floor) {
+                Some(lag) if floor.is_some_and(|f| f <= from) => {
+                    let since = *clamped_since.get_or_insert_with(Instant::now);
+                    if !clamp_warned && since.elapsed() >= RAC_CLAMP_WARN_AFTER {
+                        clamp_warned = true;
+                        tracing::warn!(
+                            open_threads = threads,
+                            scns_held_back = lag,
+                            held_secs = since.elapsed().as_secs(),
+                            "oracle-cdc: capture is waiting for the lowest RAC thread checkpoint \
+                             (V$THREAD.CHECKPOINT_CHANGE#), which advances only on a log switch \
+                             or checkpoint — a quiet instance holds back every instance's \
+                             changes. Set ARCHIVE_LAG_TARGET (e.g. 60) to bound the delay"
+                        );
+                    }
+                }
+                _ => clamped_since = None,
+            }
             let to = window_end(current, from, self.config.max_scn_window, threads, floor);
             let reachable = window_end(current, from, u64::MAX, threads, floor);
             let mut captured = false;
@@ -408,6 +428,18 @@ pub(crate) fn window_end(
     match checkpoint_floor {
         Some(floor) if open_threads > 1 => end.min(floor),
         _ => end,
+    }
+}
+
+/// How long the RAC checkpoint floor may hold the window back before a warning.
+pub(crate) const RAC_CLAMP_WARN_AFTER: Duration = Duration::from_secs(60);
+
+/// The SCNs the RAC checkpoint floor is holding back from `current`, when it
+/// is the limit (several open threads and a floor below `current`).
+pub(crate) fn rac_clamp_lag(current: u64, open_threads: u64, floor: Option<u64>) -> Option<u64> {
+    match floor {
+        Some(f) if open_threads > 1 && f < current => Some(current - f),
+        _ => None,
     }
 }
 
@@ -753,6 +785,14 @@ mod tests {
         assert_eq!(window_end(1000, 100, 50, 2, Some(500)), 150);
         assert_eq!(window_end(1000, 100, 50, 2, None), 150);
         assert_eq!(window_end(1000, 100, u64::MAX, 3, Some(700)), 700);
+    }
+
+    #[test]
+    fn the_rac_floor_lag_is_reported_only_when_it_limits_the_window() {
+        assert_eq!(rac_clamp_lag(1000, 2, Some(400)), Some(600));
+        assert_eq!(rac_clamp_lag(1000, 1, Some(400)), None);
+        assert_eq!(rac_clamp_lag(1000, 2, Some(1000)), None);
+        assert_eq!(rac_clamp_lag(1000, 2, None), None);
     }
 
     #[test]
