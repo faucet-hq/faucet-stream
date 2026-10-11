@@ -244,11 +244,53 @@ fn project(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, Fauce
         .map_err(|e| FaucetError::Sink(format!("parquet: building a batch: {e}")))
 }
 
-/// `current` widened by `incoming`'s fields.
+/// The type both of two numeric types widen to without refusing a value:
+/// any integer with a float, or two floats, is `Float64`; two signed
+/// integers the wider one. `Int64` with `UInt64` has no common type.
+fn widened_number(a: &DataType, b: &DataType) -> Option<DataType> {
+    use DataType::*;
+    let signed = |t: &DataType| matches!(t, Int8 | Int16 | Int32 | Int64);
+    let unsigned = |t: &DataType| matches!(t, UInt8 | UInt16 | UInt32 | UInt64);
+    let float = |t: &DataType| matches!(t, Float16 | Float32 | Float64);
+    let int = |t: &DataType| signed(t) || unsigned(t);
+    match (a, b) {
+        _ if a == b => None,
+        (x, y) if (float(x) && (float(y) || int(y))) || (int(x) && float(y)) => Some(Float64),
+        (x, y) if signed(x) && signed(y) => Some(Int64),
+        _ => None,
+    }
+}
+
+/// `schema` with each field `other` holds as a different numeric type
+/// widened to their common type.
+fn unify_numbers(schema: &Schema, other: &Schema) -> Schema {
+    Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let common = other
+                    .field_with_name(f.name())
+                    .ok()
+                    .and_then(|o| widened_number(f.data_type(), o.data_type()));
+                match common {
+                    Some(dt) => Arc::new(f.as_ref().clone().with_data_type(dt)),
+                    None => f.clone(),
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .with_metadata(schema.metadata().clone())
+}
+
+/// `current` widened by `incoming`'s fields. A column that holds whole
+/// numbers on one page and fractions on another is widened to `Float64`, and
+/// the rows already written are cast to it.
 fn merge(current: &SchemaRef, incoming: &Schema) -> Result<SchemaRef, FaucetError> {
+    let incoming = nullable(incoming);
     let merged = Schema::try_merge([
-        current.as_ref().clone(),
-        nullable(incoming).as_ref().clone(),
+        unify_numbers(current, &incoming),
+        unify_numbers(&incoming, current),
     ])
     .map_err(|e| {
         FaucetError::Sink(format!(
@@ -346,6 +388,32 @@ mod tests {
         let c = faucet_core::columnar::infer_arrow_schema(&[json!({"a": "s"})]).unwrap();
         let e = merge(&nullable(&a), &c).unwrap_err();
         assert!(e.to_string().contains("changed type"), "{e}");
+    }
+
+    #[test]
+    fn a_number_column_widens_to_float_whichever_page_comes_first() {
+        let ints = faucet_core::columnar::infer_arrow_schema(&[json!({"amount": 10})]).unwrap();
+        let floats =
+            faucet_core::columnar::infer_arrow_schema(&[json!({"amount": 10.5})]).unwrap();
+        for (first, then) in [(&ints, &floats), (&floats, &ints)] {
+            let m = merge(&nullable(first), then).unwrap();
+            assert_eq!(
+                m.field_with_name("amount").unwrap().data_type(),
+                &DataType::Float64
+            );
+        }
+        assert_eq!(widened_number(&DataType::Int32, &DataType::Int64), Some(DataType::Int64));
+        assert_eq!(widened_number(&DataType::Int64, &DataType::UInt64), None);
+        assert_eq!(widened_number(&DataType::Utf8, &DataType::Int64), None);
+        assert_eq!(widened_number(&DataType::Int64, &DataType::Int64), None);
+        let wide = Arc::new(Schema::new(vec![Field::new("amount", DataType::Float64, true)]));
+        let batch = faucet_core::columnar::values_to_record_batch(
+            &[json!({"amount": 7})],
+            Arc::new(Schema::new(vec![Field::new("amount", DataType::Int64, true)])),
+        )
+        .unwrap();
+        let cast = project(&batch, &wide).unwrap();
+        assert_eq!(cast.column(0).data_type(), &DataType::Float64);
     }
 
     #[test]
