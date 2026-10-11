@@ -338,7 +338,7 @@ async fn masking_a_numeric_column_on_the_columnar_path_widens_it() {
                 ..Default::default()
             }),
             rule(MatchSpec {
-                value_detector: Some(faucet_core::masking::Detector::CreditCard),
+                field_pattern: Some("^acct$".into()),
                 ..Default::default()
             }),
         ],
@@ -355,6 +355,179 @@ async fn masking_a_numeric_column_on_the_columnar_path_widens_it() {
         assert!(r["acct"].is_string(), "{r}");
         assert!(r["n"].is_number(), "an unmasked column keeps its type: {r}");
     }
+}
+
+/// A string-only value detector cannot re-type a column, so the run stays on
+/// the columnar path (the columnar-only mocks would fail otherwise).
+#[cfg(feature = "masking")]
+#[tokio::test]
+async fn a_string_only_value_detector_keeps_the_columnar_path() {
+    use faucet_core::masking::{
+        CompiledMasking, Detector, MaskAction, MaskRule, MaskingSpec, MatchSpec,
+    };
+
+    let source = ColumnarOnlySource {
+        rows: vec![json!({"id": 1, "contact": "ada@example.com"})],
+    };
+    let sink = ColumnarOnlySink::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let seen = Arc::clone(&sink.seen);
+    let spec = MaskingSpec {
+        description: None,
+        key: None,
+        rules: vec![MaskRule {
+            name: None,
+            matcher: MatchSpec {
+                value_detector: Some(Detector::Email),
+                ..Default::default()
+            },
+            action: MaskAction::Hash,
+            applies_to: vec![],
+        }],
+    };
+    Pipeline::new(&source, &sink)
+        .with_masking(Arc::new(CompiledMasking::compile(&spec).unwrap()))
+        .run()
+        .await
+        .expect("an email detector must not disqualify the columnar path");
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got[0]["id"], json!(1));
+    assert_ne!(got[0]["contact"], json!("ada@example.com"));
+}
+
+/// A value detector that matches integers (`credit_card`) would widen a
+/// numeric column only from the first page holding a card number, so the
+/// sink would see Int64 on page 1 and Utf8 on page 2 (#862 M-016). Such a run
+/// takes the row path; both columnar entry points stay unused.
+#[cfg(feature = "masking")]
+#[tokio::test]
+async fn a_number_matching_value_detector_takes_the_row_path() {
+    use faucet_core::masking::{
+        CompiledMasking, Detector, MaskAction, MaskRule, MaskingSpec, MatchSpec,
+    };
+
+    struct DualSource {
+        batch_calls: Arc<AtomicUsize>,
+    }
+    fn pages() -> Vec<Vec<Value>> {
+        vec![
+            vec![json!({"id": 1, "acct": 12345u64})],
+            vec![json!({"id": 2, "acct": 4111111111111111u64})],
+        ]
+    }
+    #[async_trait]
+    impl Source for DualSource {
+        async fn fetch_with_context(
+            &self,
+            _c: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(pages().concat())
+        }
+        fn stream_pages<'a>(
+            &'a self,
+            _c: &'a HashMap<String, Value>,
+            _b: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+            let n = pages().len();
+            Box::pin(futures::stream::iter(pages().into_iter().enumerate().map(
+                move |(i, records)| {
+                    Ok(StreamPage {
+                        records,
+                        bookmark: (i + 1 == n).then(|| json!({"done": true})),
+                    })
+                },
+            )))
+        }
+        fn supports_columnar(&self) -> bool {
+            true
+        }
+        fn stream_batches<'a>(
+            &'a self,
+            _c: &'a HashMap<String, Value>,
+            _b: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<ColumnarPage, FaucetError>> + Send + 'a>> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures::stream::iter(pages().into_iter().map(|rows| {
+                Ok(ColumnarPage::new(
+                    values_to_record_batch_inferred(&rows).unwrap(),
+                    None,
+                ))
+            })))
+        }
+    }
+    struct DualSink {
+        columnar_calls: Arc<AtomicUsize>,
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    #[async_trait]
+    impl Sink for DualSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.seen.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        fn supports_columnar(&self) -> bool {
+            true
+        }
+        async fn write_batch_columnar(
+            &self,
+            batch: &arrow::array::RecordBatch,
+        ) -> Result<usize, FaucetError> {
+            self.columnar_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(batch.num_rows())
+        }
+    }
+
+    let batch_calls = Arc::new(AtomicUsize::new(0));
+    let columnar_calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = DualSource {
+        batch_calls: Arc::clone(&batch_calls),
+    };
+    let sink = DualSink {
+        columnar_calls: Arc::clone(&columnar_calls),
+        seen: Arc::clone(&seen),
+    };
+    let spec = MaskingSpec {
+        description: None,
+        key: None,
+        rules: vec![MaskRule {
+            name: None,
+            matcher: MatchSpec {
+                value_detector: Some(Detector::CreditCard),
+                ..Default::default()
+            },
+            action: MaskAction::Hash,
+            applies_to: vec![],
+        }],
+    };
+    let result = Pipeline::new(&source, &sink)
+        .with_masking(Arc::new(CompiledMasking::compile(&spec).unwrap()))
+        .run()
+        .await
+        .expect("row-path run");
+
+    assert_eq!(result.records_written, 2);
+    assert_eq!(
+        batch_calls.load(Ordering::SeqCst),
+        0,
+        "stream_batches unused"
+    );
+    assert_eq!(
+        columnar_calls.load(Ordering::SeqCst),
+        0,
+        "write_batch_columnar unused"
+    );
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(
+        got[0]["acct"],
+        json!(12345),
+        "a non-card value is untouched"
+    );
+    assert!(
+        got[1]["acct"].is_string(),
+        "the card number is masked: {}",
+        got[1]
+    );
+    assert_ne!(got[1]["acct"], json!("4111111111111111"));
 }
 
 /// A non-quarantining quality policy (`abort`) must run *on* the columnar path

@@ -317,6 +317,20 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// A masking rule that re-types values page by page would change a
+    /// column's Arrow type mid-run, so such a run takes the row path.
+    #[cfg(feature = "arrow")]
+    fn masking_retypes_by_value(&self) -> bool {
+        #[cfg(feature = "masking")]
+        {
+            self.masking.as_ref().is_some_and(|m| m.retypes_by_value())
+        }
+        #[cfg(not(feature = "masking"))]
+        {
+            false
+        }
+    }
+
     /// Attach an adaptive batch-size controller (opt-in). When `enabled`, the
     /// pipeline reslices each source page into sub-batches whose size the
     /// controller tunes from observed sink latency + error rate.
@@ -728,7 +742,8 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     // Overwrite (#492) needs the begin/commit staging lifecycle
                     // wired below; the columnar path would append straight to
                     // the destination and skip the atomic swap.
-                    && !wrapped_sink.is_overwrite();
+                    && !wrapped_sink.is_overwrite()
+                    && !self.masking_retypes_by_value();
                 // Governance no longer disqualifies the fast path (#636) — it
                 // runs *inside* the columnar loop via the same
                 // `apply_governance` the `Value` loop uses, including
@@ -1049,8 +1064,8 @@ where
     let mut last_bookmark: Option<Value> = None;
     let mut gov_state = GovernanceState::default();
     let mut dlq_stats = crate::dlq::DlqStats::default();
-    // Top-level columns masking turned into strings; sticky for the run so
-    // every page reaches the sink with the same schema.
+    // Top-level columns a name-based masking rule turns into strings; sticky
+    // for the run. Rules that re-type by value never reach this loop.
     #[cfg_attr(not(feature = "masking"), allow(unused_mut))]
     let mut widened: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
