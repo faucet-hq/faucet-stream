@@ -355,11 +355,13 @@ pub async fn compose_across(
     let (sink_file, sink_hub) = locate_in(sink, &sides.sink, catalog::SINK_DIR).await?;
     let s = parse_source_file(&source_file)?;
     let k = parse_sink_file(&sink_file)?;
-    if source_hub.is_some() {
-        refuse_untrusted_directives(&source_file, &s.id(), s.is_official(), &sides.trusted)?;
+    if let Some(hub) = &source_hub {
+        let official = s.is_official() && is_official_hub(hub);
+        refuse_untrusted_directives(&source_file, &s.id(), official, &sides.trusted)?;
     }
-    if sink_hub.is_some() {
-        refuse_untrusted_directives(&sink_file, &k.id(), k.is_official(), &sides.trusted)?;
+    if let Some(hub) = &sink_hub {
+        let official = k.is_official() && is_official_hub(hub);
+        refuse_untrusted_directives(&sink_file, &k.id(), official, &sides.trusted)?;
     }
     let mut c = compose(&s, &k)?;
     c.source_hub = source_hub;
@@ -367,8 +369,8 @@ pub async fn compose_across(
     if let Some(o) = overlay {
         let (file, hub) = locate_in(o, &sides.overlay, DEPLOYMENT_DIR).await?;
         let d = parse_deployment_file(&file)?;
-        if hub.is_some() {
-            let official = d.owner.as_deref() == Some(spec::OFFICIAL_OWNER);
+        if let Some(h) = &hub {
+            let official = d.owner.as_deref() == Some(spec::OFFICIAL_OWNER) && is_official_hub(h);
             refuse_untrusted_directives(&file, &d.id(), official, &sides.trusted)?;
         }
         c = c.apply_overlay(&d)?;
@@ -377,12 +379,26 @@ pub async fn compose_across(
     Ok(c)
 }
 
+/// Whether a hub (as [`HubLocation::describe`] names it) is the faucet-hq
+/// catalog repository. Only there does `owner: faucet-hq` mean the template
+/// is maintained by faucet-hq; any other hub can claim that owner.
+fn is_official_hub(hub: &str) -> bool {
+    let official = HubLocation::parse(DEFAULT_REMOTE_HUB);
+    match (HubLocation::parse(hub), official) {
+        (Ok(HubLocation::Github { repo, .. }), Ok(HubLocation::Github { repo: want, .. })) => {
+            repo.eq_ignore_ascii_case(&want)
+        }
+        _ => false,
+    }
+}
+
 /// Directive schemes that read the operator's environment, files or secrets.
 const OPERATOR_DIRECTIVES: &[&str] = &[
     "env", "file", "secret", "vault", "aws-sm", "gcp-sm", "azure-kv",
 ];
 
-/// A hub template not maintained by the hub itself (`faucet-hq`) may not read
+/// A hub template not maintained by faucet-hq (the `faucet-hq` namespace of
+/// the `faucet-hq/template-hub` repository) may not read
 /// the operator's environment, files or secrets — a community template could
 /// otherwise send `~/.aws/credentials` to a URL it controls. Credentials reach
 /// such a template through its params (`--param` / `--param-env`), or the
@@ -1100,6 +1116,14 @@ pub fn load_composed(c: &Composition, inputs: &RunInputs) -> CliResult<PipelineC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_faucet_hq_catalog_repo_is_official() {
+        assert!(is_official_hub("github:faucet-hq/template-hub@main"));
+        assert!(is_official_hub("github:Faucet-HQ/template-hub@v2/sub"));
+        assert!(!is_official_hub("github:evil/template-hub@main"));
+        assert!(!is_official_hub("/tmp/hub"));
+    }
 
     const SRC: &str = "kind: source-template\nname: acme\nsource: {type: rest, config: {base_url: \"https://a\", path: /}}\nstreams: [{name: t}]\n";
     const SINK: &str = "kind: sink-template\nname: files\nsink: {type: jsonl, config: {}}\nper_stream: {path: \"./out/${stream}.jsonl\"}\n";
