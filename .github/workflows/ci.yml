@@ -861,7 +861,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Excluded: faucet-cli / faucet-stream / the Delta trio (see
+      # Excluded: faucet-cli / faucet-stream (see
       # scripts/semver-exclude.py for why) plus any crate not yet on crates.io
       # — computed, so a crate is guarded from its first release on without
       # anyone pruning a hand-kept list (#789 SUPPLY-18).
