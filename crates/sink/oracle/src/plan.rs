@@ -473,6 +473,11 @@ pub(crate) fn token_merge_sql(token_table: &str) -> String {
     )
 }
 
+/// Remove a scope's token row (`:1` scope).
+pub(crate) fn token_delete_sql(token_table: &str) -> String {
+    format!("DELETE FROM {token_table} WHERE \"{COMMIT_TOKEN_SCOPE_COL}\" = :1")
+}
+
 /// Read a scope's token (`:1` scope).
 pub(crate) fn token_select_sql(token_table: &str) -> String {
     format!(
@@ -1264,6 +1269,10 @@ mod tests {
         assert_eq!(
             token_select_sql("\"W\""),
             "SELECT \"token\" FROM \"W\" WHERE \"scope\" = :1"
+        );
+        assert_eq!(
+            token_delete_sql("\"W\""),
+            "DELETE FROM \"W\" WHERE \"scope\" = :1"
         );
         assert_eq!(
             dictionary_binds("A.B").unwrap(),

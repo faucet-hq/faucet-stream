@@ -66,7 +66,7 @@ The run writes into `{table}__faucet_ovw`, created as `CREATE TABLE … AS SELEC
 
 ## Exactly-once delivery
 
-`write_batch_idempotent` writes the page and upserts `(scope, token)` into `_faucet_commit_token` (created beside the target, `scope VARCHAR2(1000 CHAR) PRIMARY KEY, token CLOB`) in the same transaction; `last_committed_token` reads it back. Composes with `write_mode: upsert`. Requires the CLI's exactly-once gate (a replayable source, durable state, no DLQ).
+`write_batch_idempotent` writes the page and upserts `(scope, token)` into `_faucet_commit_token` (created beside the target, `scope VARCHAR2(1000 CHAR) PRIMARY KEY, token CLOB`) in the same transaction; `last_committed_token` reads it back. A scope too long for the key column is stored as a shortened digest form; a watermark written under the form releases before faucet-core 1.13 used is still read, and the next commit moves it to the current form. Composes with `write_mode: upsert`. Requires the CLI's exactly-once gate (a replayable source, durable state, no DLQ).
 
 ## Schema evolution
 
