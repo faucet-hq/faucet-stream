@@ -314,7 +314,7 @@ fn walk_typed<T: serde::Serialize + serde::de::DeserializeOwned>(
     Ok(())
 }
 
-/// Unescape `$${` in the typed blocks [`crate::interpolate::unescape_document`]
+/// Unescape `$${` in the typed blocks `interpolate::unescape_document`
 /// leaves escaped so the load passes after it (`${vars.*}`, the secrets pass)
 /// keep an escaped token literal (#862 M-023). Run once the last such pass is
 /// done; idempotent.
