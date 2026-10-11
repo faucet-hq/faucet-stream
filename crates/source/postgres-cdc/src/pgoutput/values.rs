@@ -143,17 +143,27 @@ pub fn text_to_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
 /// sink would misread (#789 SQL-119). `infinity`, `-infinity` and BC dates
 /// pass through as the server spells them.
 fn temporal_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
-    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, Utc};
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
     if matches!(text, "infinity" | "-infinity") || text.ends_with(" BC") {
+        return Ok(Value::String(text.into()));
+    }
+    if type_oid == OID_TIME {
+        return if is_iso_time(text) {
+            Ok(Value::String(text.into()))
+        } else {
+            Err(FaucetError::Source(format!(
+                "pgoutput: time value {text:?} (oid={type_oid}) is not HH:MM:SS[.ffffff]"
+            )))
+        };
+    }
+    let year_digits = iso_year_digits(text);
+    if year_digits.is_some_and(|n| n > 4) {
         return Ok(Value::String(text.into()));
     }
     let rendered = match type_oid {
         OID_DATE => NaiveDate::parse_from_str(text, "%Y-%m-%d")
             .ok()
             .map(|d| d.to_string()),
-        OID_TIME => NaiveTime::parse_from_str(text, "%H:%M:%S%.f")
-            .ok()
-            .map(|t| t.to_string()),
         OID_TIMESTAMP => NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
             .ok()
             .map(|t| t.to_string()),
@@ -166,11 +176,7 @@ fn temporal_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
     };
     // Still ISO but outside these patterns (a seconds offset on a historic
     // timestamptz): keep the server's spelling.
-    let iso_like = text.len() >= 10
-        && text.as_bytes()[4] == b'-'
-        && text.as_bytes()[7] == b'-'
-        && text[..4].bytes().all(|b| b.is_ascii_digit());
-    if rendered.is_none() && iso_like {
+    if rendered.is_none() && year_digits.is_some() {
         return Ok(Value::String(text.into()));
     }
     rendered.map(Value::String).ok_or_else(|| {
@@ -180,6 +186,35 @@ fn temporal_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
              (ALTER ROLE … SET datestyle = 'ISO, MDY')"
         ))
     })
+}
+
+/// `HH:MM:SS[.f]` as the server renders `time` in every `DateStyle`, kept as
+/// text like the `postgres` query source does (`24:00:00` is a legal value).
+fn is_iso_time(text: &str) -> bool {
+    let (whole, frac) = match text.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (text, None),
+    };
+    let b = whole.as_bytes();
+    b.len() == 8
+        && b[2] == b':'
+        && b[5] == b':'
+        && [0, 1, 3, 4, 6, 7].iter().all(|&i| b[i].is_ascii_digit())
+        && frac.is_none_or(|f| !f.is_empty() && f.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// The number of year digits when `text` starts with an ISO date
+/// (`YYYY-MM-DD`, where PostgreSQL allows years past 9999).
+fn iso_year_digits(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    let n = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    let rest = &b[n..];
+    (n >= 4
+        && rest.len() >= 6
+        && rest[0] == b'-'
+        && rest[3] == b'-'
+        && [1, 2, 4, 5].iter().all(|&i| rest[i].is_ascii_digit()))
+    .then_some(n)
 }
 
 /// Parse a one-dimensional Postgres array literal (`{a,b,"c,d",NULL}`) into a
@@ -473,6 +508,28 @@ mod tests {
             let err = text_to_json(oid, raw).unwrap_err().to_string();
             assert!(err.contains("DateStyle"), "{err}");
         }
+    }
+
+    #[test]
+    fn time_keeps_the_server_text_and_extended_years_pass_through() {
+        for raw in ["24:00:00", "10:00:00.5", "00:00:00.000001"] {
+            assert_eq!(text_to_json(1083, raw).unwrap(), json!(raw));
+        }
+        for raw in ["1:00:00", "10:00", "10:00:00.", "10:00:0x", "ab:cd:ef"] {
+            let err = text_to_json(1083, raw).unwrap_err().to_string();
+            assert!(err.contains("HH:MM:SS"), "{raw}: {err}");
+        }
+        for (oid, raw) in [
+            (1082, "10000-01-01"),
+            (1114, "12345-06-07 08:09:10"),
+            (1184, "10000-01-01 00:00:00+00"),
+        ] {
+            assert_eq!(text_to_json(oid, raw).unwrap(), json!(raw));
+        }
+        assert_eq!(super::iso_year_digits("2026-03-04"), Some(4));
+        assert_eq!(super::iso_year_digits("226-03-04"), None);
+        assert_eq!(super::iso_year_digits("2026-3-04"), None);
+        assert_eq!(super::iso_year_digits("2026-03"), None);
     }
 
     #[test]

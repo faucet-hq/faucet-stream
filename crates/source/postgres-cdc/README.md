@@ -191,7 +191,9 @@ Values arrive in Postgres text form and are decoded by column type OID:
 | `bytea` | base64 string |
 | `json` / `jsonb` | parsed JSON value |
 | 1-D arrays of the above scalar types (`int4[]`, `text[]`, `uuid[]`, …) | JSON array, decoded element-by-element (`NULL` elements → `null`) |
-| `uuid`, `date`, `time`, `timestamp`, `timestamptz`, and anything else | string (raw Postgres text — stable under the default `DateStyle ISO`) |
+| `date`, `timestamp`, `timestamptz` | string, spelled as the `postgres` query source spells it (`timestamptz` as RFC 3339 in UTC); `infinity`, BC dates and years past 9999 keep the server's text. A non-ISO `DateStyle` fails the run |
+| `time` | string, the server's own text (`24:00:00` stays `24:00:00`, `10:00:00.5` stays `10:00:00.5`) |
+| `uuid` and anything else | string (raw Postgres text) |
 
 Multi-dimensional arrays, ranges, composites, and enums fall back to the raw Postgres array/text string.
 
