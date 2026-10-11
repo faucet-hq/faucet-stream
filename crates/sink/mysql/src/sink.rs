@@ -18,6 +18,11 @@ pub(crate) fn scope_key(scope: &str) -> String {
     faucet_core::idempotency::scope_key(scope, SCOPE_COL_WIDTH)
 }
 
+/// The pre-1.13 shortened form of a long scope, read once and retired (#862 M-017).
+pub(crate) fn legacy_scope_key(scope: &str) -> Option<String> {
+    faucet_core::idempotency::legacy_scope_key(scope, SCOPE_COL_WIDTH)
+}
+
 /// A sink that writes JSON records to a MySQL table.
 pub struct MysqlSink {
     pub(crate) config: MysqlSinkConfig,
@@ -1832,6 +1837,17 @@ impl MysqlSink {
             .execute(&mut *tx)
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL token upsert failed: {e}")))?;
+        if let Some(legacy) = legacy_scope_key(scope) {
+            sqlx::query(&format!(
+                "DELETE FROM {t} WHERE {s} = ?",
+                t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
+                s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
+            ))
+            .bind(legacy)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL legacy token delete failed: {e}")))?;
+        }
 
         tx.commit()
             .await
@@ -2305,12 +2321,17 @@ impl faucet_core::Sink for MysqlSink {
             k = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
             s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
         );
-        let row = sqlx::query(&sql)
-            .bind(scope_key(scope))
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL token read failed: {e}")))?;
-        Ok(row.map(|r| r.get::<String, _>(0)))
+        for key in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
+            let row = sqlx::query(&sql)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MySQL token read failed: {e}")))?;
+            if let Some(r) = row {
+                return Ok(Some(r.get::<String, _>(0)));
+            }
+        }
+        Ok(None)
     }
 
     async fn write_batch_idempotent(

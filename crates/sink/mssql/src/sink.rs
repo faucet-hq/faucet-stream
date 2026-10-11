@@ -24,6 +24,11 @@ fn scope_key(scope: &str) -> String {
     faucet_core::idempotency::scope_key(scope, SCOPE_COL_WIDTH)
 }
 
+/// The pre-1.13 shortened form of a long scope, read once and retired (#862 M-017).
+fn legacy_scope_key(scope: &str) -> Option<String> {
+    faucet_core::idempotency::legacy_scope_key(scope, SCOPE_COL_WIDTH)
+}
+
 use crate::coltype::{COLUMN_INFO_SQL, ColumnInfo};
 use crate::config::{MssqlColumnMapping, MssqlSinkConfig};
 use crate::encode::{
@@ -1587,24 +1592,25 @@ impl Sink for MssqlSink {
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         let mut conn = self.checkout().await?;
         self.ensure_commit_table(&mut conn).await?;
-        let scope_owned = scope_key(scope);
-        let rows = conn
-            .query(
-                &format!(
-                    "SELECT [token] FROM [{}] WHERE [scope] = @P1",
-                    faucet_core::idempotency::COMMIT_TOKEN_TABLE
-                ),
-                &[&scope_owned],
-            )
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL token read failed: {e}")))?
-            .into_first_result()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL token read failed: {e}")))?;
-        Ok(rows
-            .first()
-            .and_then(|r| r.get::<&str, _>("token"))
-            .map(str::to_string))
+        for scope_owned in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
+            let rows = conn
+                .query(
+                    &format!(
+                        "SELECT [token] FROM [{}] WHERE [scope] = @P1",
+                        faucet_core::idempotency::COMMIT_TOKEN_TABLE
+                    ),
+                    &[&scope_owned],
+                )
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MSSQL token read failed: {e}")))?
+                .into_first_result()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MSSQL token read failed: {e}")))?;
+            if let Some(token) = rows.first().and_then(|r| r.get::<&str, _>("token")) {
+                return Ok(Some(token.to_string()));
+            }
+        }
+        Ok(None)
     }
 
     async fn write_batch_idempotent(
@@ -1697,6 +1703,18 @@ impl Sink for MssqlSink {
         if let Err(e) = conn.execute(merge.as_str(), &refs).await {
             let _ = control(&mut conn, "ROLLBACK TRAN").await;
             return Err(FaucetError::Sink(format!("MSSQL token merge failed: {e}")));
+        }
+        if let Some(legacy) = legacy_scope_key(scope) {
+            let delete = format!(
+                "DELETE FROM [{}] WHERE [scope] = @P1",
+                faucet_core::idempotency::COMMIT_TOKEN_TABLE
+            );
+            if let Err(e) = conn.execute(delete.as_str(), &[&legacy]).await {
+                let _ = control(&mut conn, "ROLLBACK TRAN").await;
+                return Err(FaucetError::Sink(format!(
+                    "MSSQL legacy token delete failed: {e}"
+                )));
+            }
         }
 
         control(&mut conn, "COMMIT TRAN").await?;

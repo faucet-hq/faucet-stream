@@ -252,7 +252,29 @@ enum Action {
 /// Partition `page` into upserts + deletes per `spec`. The single place all six
 /// sinks share. `WriteMode::Append` should never reach here (callers route
 /// append separately); if it does, every row is treated as an upsert.
+///
+/// Keys deduplicate the way a typed SQL key column compares them: `7`, `7.0`
+/// and `"7"` are one key. A sink that keeps those apart (a document store
+/// matching on the JSON value) uses [`plan_writes_exact`].
 pub fn plan_writes(page: &[Value], spec: &WriteSpec) -> WritePlan {
+    plan_writes_by(page, spec, canonical)
+}
+
+/// [`plan_writes`] deduplicating only keys with equal JSON values, so `7` and
+/// `"7"` stay two rows — for a sink whose destination keeps them apart, such
+/// as a document store's `_id` (#862 M-018).
+pub fn plan_writes_exact(page: &[Value], spec: &WriteSpec) -> WritePlan {
+    plan_writes_by(page, spec, |k| {
+        let values: Vec<Value> = k.0.iter().map(|(_, v)| v.clone()).collect();
+        crate::util::canonical_json(&Value::Array(values))
+    })
+}
+
+fn plan_writes_by(
+    page: &[Value],
+    spec: &WriteSpec,
+    canonical: impl Fn(&KeyTuple) -> String,
+) -> WritePlan {
     debug_assert!(
         matches!(spec.write_mode, WriteMode::Upsert | WriteMode::Delete),
         "plan_writes is only for Upsert/Delete — Append and Overwrite are routed separately"
@@ -371,14 +393,13 @@ fn strip_marker(mut rec: Value, marker: Option<&DeleteMarker>) -> Value {
 
 /// Stable canonical string for a key tuple, for dedup. Scalars compare by
 /// their text, as a database compares a key column, so `7`, `7.0` and `"7"`
-/// are one key (the rule `rollback::canonical_key` applies, plus integral
-/// floats).
+/// are one key — the rule `rollback::canonical_key` applies too.
 fn canonical(k: &KeyTuple) -> String {
     let arr: Vec<String> = k.0.iter().map(|(_, v)| key_scalar_text(v)).collect();
     serde_json::to_string(&arr).expect("a Vec<String> always serializes")
 }
 
-fn key_scalar_text(v: &Value) -> String {
+pub(crate) fn key_scalar_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Number(n) => match n.as_f64() {
@@ -431,6 +452,29 @@ pub fn key_to_filter(k: &KeyTuple) -> Map<String, Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exact_planning_keeps_keys_of_different_json_types_apart() {
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".into()],
+            ..Default::default()
+        };
+        let page = vec![
+            json!({"id": 7, "v": "a"}),
+            json!({"id": "7", "v": "b"}),
+            json!({"id": 7, "v": "c"}),
+        ];
+        let exact = plan_writes_exact(&page, &spec);
+        assert_eq!(
+            exact.upserts,
+            vec![json!({"id": 7, "v": "c"}), json!({"id": "7", "v": "b"})]
+        );
+        assert_eq!(
+            plan_writes(&page, &spec).upserts,
+            vec![json!({"id": 7, "v": "c"})]
+        );
+    }
 
     /// An object inserted in reverse-sorted key order (#817).
     fn login_then_id() -> Value {

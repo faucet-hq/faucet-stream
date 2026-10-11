@@ -323,6 +323,36 @@ pub fn discarded_lines(file: &Path) -> Result<std::collections::HashSet<String>,
 /// signal the path is wrong), so callers never silently report an empty DLQ
 /// for a typo'd path.
 pub fn expand_location(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
+    // A file sink's `{part}` template, and the `-{part}` it inserts before the
+    // extension when a rollover cap is set, name numbered files (#862 M-026).
+    if location.contains("{part}") {
+        return expand_location(&location.replace("{part}", "*"));
+    }
+    match expand_plain(location) {
+        Err(e) if !location.contains(['*', '?', '[']) && !Path::new(location).exists() => {
+            match rolled_over_glob(location) {
+                Some(glob) => expand_plain(&glob).map_err(|_| e),
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
+}
+
+/// The glob matching the numbered parts a rollover cap splits `path` into:
+/// `dlq/failed.jsonl` → `dlq/failed-*.jsonl`.
+fn rolled_over_glob(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    let name = p.file_name()?.to_str()?;
+    let from = usize::from(name.starts_with('.'));
+    let rolled = match name[from..].find('.') {
+        Some(i) => format!("{}-*{}", &name[..i + from], &name[i + from..]),
+        None => format!("{name}-*"),
+    };
+    Some(p.with_file_name(rolled).to_string_lossy().into_owned())
+}
+
+fn expand_plain(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
     let has_glob = location.contains(['*', '?', '[']);
     let mut files: Vec<PathBuf> = if has_glob {
         glob::glob(location)
@@ -459,6 +489,29 @@ mod tests {
             "record_index": 0,
         })
         .to_string()
+    }
+
+    #[test]
+    fn numbered_locations_expand_to_their_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("f-00001.jsonl");
+        std::fs::write(&part, "x\n").unwrap();
+        let tpl = format!("{}/f-{{part}}.jsonl", dir.path().display());
+        assert_eq!(expand_location(&tpl).unwrap(), vec![part.clone()]);
+        let rolled = format!("{}/f.jsonl", dir.path().display());
+        assert_eq!(expand_location(&rolled).unwrap(), vec![part]);
+        let missing = format!("{}/g.jsonl", dir.path().display());
+        assert!(
+            expand_location(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("g.jsonl")
+        );
+        assert_eq!(
+            rolled_over_glob("d/.h.jsonl").as_deref(),
+            Some("d/.h-*.jsonl")
+        );
+        assert_eq!(rolled_over_glob("d/noext").as_deref(), Some("d/noext-*"));
     }
 
     #[test]

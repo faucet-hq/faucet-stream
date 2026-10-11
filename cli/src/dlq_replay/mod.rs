@@ -328,6 +328,84 @@ pub fn discard(
     })
 }
 
+/// What [`purge`] did.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PurgeOutcome {
+    /// Envelope lines physically removed.
+    pub purged: usize,
+    /// DLQ files rewritten.
+    pub files_rewritten: usize,
+}
+
+/// Physically remove every envelope a discard recorded (#862 M-024): each
+/// file at `location` is rewritten without the lines in its `.discarded`
+/// sidecar, atomically (temp file + rename), and the sidecar is removed. A
+/// discard alone only hides lines from readers; their payloads stay on disk.
+///
+/// Refuses a file that changed while it was being rewritten: a writer still
+/// appending to the DLQ would lose its new lines to the rename. Run it while
+/// nothing writes the DLQ.
+pub fn purge(location: &str) -> CliResult<PurgeOutcome> {
+    let files = expand_location(location)?;
+    let mut out = PurgeOutcome::default();
+    for file in &files {
+        let ids = reader::discarded_lines(file)?;
+        if ids.is_empty() {
+            continue;
+        }
+        let stamp = |f: &std::path::Path| -> CliResult<(u64, Option<std::time::SystemTime>)> {
+            let m = std::fs::metadata(f).map_err(|e| {
+                CliError::Internal(format!("reading DLQ file '{}': {e}", f.display()))
+            })?;
+            Ok((m.len(), m.modified().ok()))
+        };
+        let before = stamp(file)?;
+        let text = std::fs::read_to_string(file).map_err(|e| {
+            CliError::Internal(format!("reading DLQ file '{}': {e}", file.display()))
+        })?;
+        let mut kept = String::with_capacity(text.len());
+        let mut purged = 0usize;
+        for line in text.lines() {
+            if ids.contains(&reader::line_id(line)) {
+                purged += 1;
+            } else {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        let tmp = file.with_file_name(format!(
+            "{}.faucet-purge",
+            file.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("dlq.jsonl")
+        ));
+        std::fs::write(&tmp, &kept)
+            .map_err(|e| CliError::Internal(format!("writing '{}': {e}", tmp.display())))?;
+        if stamp(file)? != before {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CliError::Config(format!(
+                "DLQ file '{}' changed while it was being purged — a pipeline is still \
+                 writing to it; purge it once nothing writes the DLQ",
+                file.display()
+            )));
+        }
+        std::fs::rename(&tmp, file)
+            .map_err(|e| CliError::Internal(format!("replacing '{}': {e}", file.display())))?;
+        let sidecar = reader::discard_sidecar(file);
+        if let Err(e) = std::fs::remove_file(&sidecar)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(CliError::Internal(format!(
+                "removing '{}': {e}",
+                sidecar.display()
+            )));
+        }
+        out.purged += purged;
+        out.files_rewritten += 1;
+    }
+    Ok(out)
+}
+
 /// The archive sibling for a DLQ file: `dlq.jsonl` → `dlq.jsonl.archived`.
 /// Not a `.jsonl` name, and skipped by directory / glob locations
 /// ([`reader::is_archive`]), so a later replay never re-reads what was
@@ -358,6 +436,32 @@ fn append_to(path: &std::path::Path, body: &str) -> CliResult<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn purge_removes_discarded_lines_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        std::fs::write(&file, "secret-1\nkeep\nsecret-2\n").unwrap();
+        let sidecar = reader::discard_sidecar(&file);
+        assert_eq!(
+            purge(file.to_str().unwrap()).unwrap().purged,
+            0,
+            "nothing discarded yet"
+        );
+        std::fs::write(
+            &sidecar,
+            format!(
+                "{}\n{}\n",
+                reader::line_id("secret-1"),
+                reader::line_id("secret-2")
+            ),
+        )
+        .unwrap();
+        let out = purge(file.to_str().unwrap()).unwrap();
+        assert_eq!((out.purged, out.files_rewritten), (2, 1));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep\n");
+        assert!(!sidecar.exists());
+    }
     use std::io::Write;
 
     fn env_line(reason: &str, kind: &str, ts_ms: i64, payload: Value) -> String {

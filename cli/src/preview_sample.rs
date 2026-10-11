@@ -5,7 +5,7 @@
 
 use crate::error::CliResult;
 use faucet_core::Source;
-use faucet_core::stage::{CompiledStage, apply_stages_to_page};
+use faucet_core::stage::{CompiledStage, apply_stages_to_page_blocking};
 use futures::StreamExt as _;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -69,7 +69,7 @@ pub async fn sample(
             let Some(page) = pages.next().await else {
                 break;
             };
-            let mut out = apply_stages_to_page(page?.records, stages)?;
+            let mut out = apply_stages_to_page_blocking(page?.records, stages)?;
             out.truncate(limit - records.len());
             records.extend(out);
         }

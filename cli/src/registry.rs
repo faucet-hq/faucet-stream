@@ -1321,8 +1321,8 @@ pub fn source_kind_consumes_destructively(kind: &str, config: &Value) -> bool {
 /// run with `state:` reads only what changed since the last one: an
 /// incremental `replication_method`, a SQL source's `replication: { type:
 /// incremental }`, the file source's `incremental:` block,
-/// an incremental Iceberg / DynamoDB-streams read, or a change-stream / log
-/// source. A full refresh (`write_mode: overwrite`) from such a source would
+/// an incremental Iceberg / DynamoDB-streams read, a change-stream / log
+/// source, or a Singer tap (handed its stored STATE). A full refresh (`write_mode: overwrite`) from such a source would
 /// replace the destination with only the delta (#789 CLI-20).
 pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
     let incremental_method = match config.get("replication_method") {
@@ -1340,7 +1340,14 @@ pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
         || (kind == "iceberg" && mode == Some("incremental"))
         || (kind == "dynamodb" && mode == Some("streams"))
         || kind.ends_with("-cdc")
-        || matches!(kind, "kafka" | "kinesis")
+        || matches!(kind, "kafka" | "kinesis" | "singer")
+}
+
+/// Whether a source reads only what arrived since its last run whatever the
+/// config: a queue it consumes from, or a live subscription. Its read is never
+/// a complete fetch (#862 M-022).
+pub fn source_reads_a_delta(kind: &str, config: &Value) -> bool {
+    source_kind_consumes_destructively(kind, config) || kind == "nats"
 }
 
 /// Whether a SQL query source reads with `replication: { type: incremental }`.

@@ -431,6 +431,40 @@ fn reload_on_change_csv_picks_up_edits_between_pages() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// #862 M-014: a relative reference path still reloads once the connection
+/// is sandboxed.
+#[test]
+fn reload_on_change_follows_a_relative_path_under_the_sandbox() {
+    let name = format!("faucet_sql_reload_rel_{}.csv", std::process::id());
+    let abs = std::env::current_dir().unwrap().join(&name);
+    std::fs::write(&abs, "code,country\nUS,Before\n").unwrap();
+    let s = stage(SqlTransformConfig {
+        query: "SELECT b.id, c.country FROM batch b LEFT JOIN refs c ON b.code = c.code".into(),
+        relations: vec![RelationSpec {
+            name: "refs".into(),
+            source: RelationSource::Csv {
+                path: format!("./{name}"),
+                has_header: true,
+            },
+            reload_on_change: true,
+        }],
+        memory_limit: None,
+        threads: None,
+    });
+    let page = |id: i64| {
+        apply_stages_to_page(
+            vec![json!({"id": id, "code": "US"})],
+            std::slice::from_ref(&s),
+        )
+    };
+    assert_eq!(page(1).unwrap()[0]["country"], json!("Before"));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&abs, "code,country\nUS,After\n").unwrap();
+    let after = page(2);
+    let _ = std::fs::remove_file(&abs);
+    assert_eq!(after.unwrap()[0]["country"], json!("After"));
+}
+
 /// Same as above for a JSONL relation — exercises the non-CSV reload branch.
 #[test]
 fn reload_on_change_jsonl_picks_up_edits_between_pages() {
@@ -604,6 +638,54 @@ fn absent_keys_stay_absent_and_explicit_nulls_stay_null() {
         vec![json!({"id": 1, "v": 1}), json!({"id": 2})],
     );
     assert_eq!(out[1], json!({"id": 2, "tag": "x"}));
+}
+
+/// #862 M-013: the absence marker never fails a set operation, leaks into a
+/// nested row, or overwrites a record's own key of that name.
+#[test]
+fn the_absence_marker_stays_out_of_the_output() {
+    let s = stage(SqlTransformConfig {
+        query: "SELECT * FROM batch UNION ALL SELECT * FROM seed ORDER BY id".into(),
+        relations: vec![RelationSpec {
+            name: "seed".into(),
+            source: RelationSource::Values {
+                columns: vec!["id".into(), "email".into()],
+                rows: vec![vec![json!(9), json!("s@x")]],
+            },
+            reload_on_change: false,
+        }],
+        memory_limit: None,
+        threads: None,
+    });
+    let sparse = vec![json!({"id": 1, "email": "a@x"}), json!({"id": 2})];
+    let out = apply_stages_to_page(sparse, &[s]).unwrap();
+    assert_eq!(out.len(), 3, "a sparse page still unions: {out:?}");
+    assert_eq!(out[2], json!({"id": 9, "email": "s@x"}));
+    assert!(out.iter().all(|r| r.get("__faucet_absent").is_none()));
+
+    let out = run(
+        "SELECT id, b AS doc FROM batch b ORDER BY id",
+        vec![json!({"id": 1, "email": "a@x"}), json!({"id": 2})],
+    );
+    let doc = |v: &Value| match v {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap(),
+        other => other.clone(),
+    };
+    assert!(
+        out.iter()
+            .all(|r| !r["doc"].to_string().contains("__faucet_absent")),
+        "{out:?}"
+    );
+    assert_eq!(doc(&out[1]["doc"]), json!({"id": 2}));
+
+    let out = run(
+        "SELECT * FROM batch",
+        vec![
+            json!({"id": 1, "__faucet_absent": "mine"}),
+            json!({"id": 2, "v": 1}),
+        ],
+    );
+    assert_eq!(out[0]["__faucet_absent"], json!("mine"));
 }
 
 #[test]

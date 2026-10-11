@@ -119,6 +119,63 @@ impl Bookmark {
     }
 }
 
+/// Offsets by partition, or `None` for a value that is not a bookmark.
+fn offsets(v: &Value) -> Option<HashMap<(String, i32), i64>> {
+    let b = Bookmark::from_value(v.clone()).ok()?;
+    let mut map = HashMap::with_capacity(b.partition_offsets.len());
+    for p in b.partition_offsets {
+        map.insert((p.topic, p.partition), p.offset);
+    }
+    Some(map)
+}
+
+/// Whether bookmark `a` is at or before `b`: both cover the same partitions
+/// and every offset in `a` is at or below `b`'s. `None` when either is not a
+/// bookmark or they cover different partitions, since an absent partition
+/// resumes from `auto.offset.reset`, which has no place in the order.
+pub fn position_le(a: &Value, b: &Value) -> Option<bool> {
+    let (a, b) = (offsets(a)?, offsets(b)?);
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut le = true;
+    for (k, off) in &a {
+        le &= off <= b.get(k)?;
+    }
+    Some(le)
+}
+
+/// The per-partition minimum of `positions`, when they all cover the same
+/// partitions.
+pub fn position_min(positions: &[Value]) -> Option<Value> {
+    let mut iter = positions.iter();
+    let mut min = offsets(iter.next()?)?;
+    for v in iter {
+        let next = offsets(v)?;
+        if next.len() != min.len() {
+            return None;
+        }
+        for (k, off) in min.iter_mut() {
+            *off = (*off).min(*next.get(k)?);
+        }
+    }
+    Bookmark::from_map(min).to_value().ok()
+}
+
+/// Whether a record (`topic` / `partition` / `offset`) was delivered at
+/// `position`: its partition's next offset there is past the record's.
+pub fn record_covered(record: &Value, position: &Value) -> Option<bool> {
+    let topic = record.get("topic")?.as_str()?;
+    let partition = i32::try_from(record.get("partition")?.as_i64()?).ok()?;
+    let offset = record.get("offset")?.as_i64()?;
+    let positions = offsets(position)?;
+    Some(
+        positions
+            .get(&(topic.to_string(), partition))
+            .is_some_and(|next| offset < *next),
+    )
+}
+
 /// Generate the `state_key` for a `(group_id, topics)` pair.
 ///
 /// Topics are sorted before joining so the key is stable regardless of config
@@ -173,6 +230,53 @@ mod tests {
             .map(|p| (p.topic.as_str(), p.partition))
             .collect();
         assert_eq!(topics, vec![("a", 0), ("a", 1), ("z", 0)]);
+    }
+
+    fn bm(offsets: &[(i32, i64)]) -> Value {
+        json!({ "partition_offsets": offsets
+            .iter()
+            .map(|(p, o)| json!({ "topic": "t", "partition": p, "offset": o }))
+            .collect::<Vec<_>>() })
+    }
+
+    #[test]
+    fn positions_order_per_partition() {
+        let a = bm(&[(0, 5), (1, 5)]);
+        assert_eq!(position_le(&a, &bm(&[(0, 5), (1, 7)])), Some(true));
+        assert_eq!(position_le(&a, &bm(&[(0, 9), (1, 3)])), Some(false));
+        assert_eq!(position_le(&bm(&[(0, 9), (1, 3)]), &a), Some(false));
+        assert_eq!(
+            position_le(&a, &bm(&[(0, 5)])),
+            None,
+            "different partitions"
+        );
+        assert_eq!(position_le(&a, &bm(&[(0, 5), (2, 5)])), None);
+        assert_eq!(position_le(&a, &json!("x")), None);
+    }
+
+    #[test]
+    fn position_min_is_per_partition() {
+        let min = position_min(&[bm(&[(0, 5), (1, 9)]), bm(&[(0, 8), (1, 2)])]).unwrap();
+        assert_eq!(min, bm(&[(0, 5), (1, 2)]));
+        assert_eq!(position_min(&[bm(&[(0, 5)]), bm(&[(0, 5), (1, 2)])]), None);
+        assert_eq!(position_min(&[bm(&[(0, 5)]), bm(&[(1, 5)])]), None);
+        assert_eq!(position_min(&[]), None);
+        assert_eq!(position_min(&[json!(1)]), None);
+    }
+
+    #[test]
+    fn record_covered_compares_the_records_partition() {
+        let at = bm(&[(0, 5), (1, 9)]);
+        let rec = |p: i64, o: i64| json!({ "topic": "t", "partition": p, "offset": o });
+        assert_eq!(record_covered(&rec(0, 4), &at), Some(true));
+        assert_eq!(record_covered(&rec(0, 5), &at), Some(false));
+        assert_eq!(
+            record_covered(&rec(2, 0), &at),
+            Some(false),
+            "partition never read"
+        );
+        assert_eq!(record_covered(&json!({ "value": 1 }), &at), None);
+        assert_eq!(record_covered(&rec(0, 4), &json!(null)), None);
     }
 
     #[test]

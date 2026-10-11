@@ -359,3 +359,75 @@ partition:
         plain.name
     );
 }
+
+/// #862 M-025: chunk ids lost their zero padding in #840, so a bookmark a
+/// partitioned row with 10+ chunks stored under `…::partition::03` moves to
+/// `…::partition::3` on the first run instead of being orphaned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bookmark_under_a_padded_chunk_id_moves_to_the_current_key() {
+    use faucet_core::StateStore;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.jsonl");
+    seed(dir.path(), 12);
+    let state_dir = dir.path().join("state");
+    let yaml = config(dir.path(), &out, 11, 1).replacen(
+        "  sink:",
+        &format!(
+            "  state:\n    type: file\n    config:\n      path: \"{}\"\n  sink:",
+            state_dir.display()
+        ),
+        1,
+    );
+    let path = dir.path().join("p.yaml");
+    std::fs::write(&path, &yaml).unwrap();
+    let cfg = PipelineConfig::from_text(&yaml, &path).expect("config parses");
+    let nodes = expand(&cfg).expect("expand");
+    let chunk = nodes
+        .iter()
+        .find(|n| n.id.ends_with("::partition::3"))
+        .expect("chunk 3");
+    assert_eq!(
+        chunk.legacy_state_ids.len(),
+        1,
+        "{:?}",
+        chunk.legacy_state_ids
+    );
+    assert!(chunk.legacy_state_ids[0].ends_with("::partition::03"));
+    assert!(
+        nodes
+            .iter()
+            .find(|n| n.id.ends_with("::partition::11"))
+            .unwrap()
+            .legacy_state_ids
+            .is_empty()
+    );
+    let store = faucet_core::FileStateStore::new(&state_dir);
+    let legacy = format!("p::{}", chunk.legacy_state_ids[0]);
+    let current = format!("p::{}", chunk.id);
+
+    // A first run writes whatever bookmark the source keeps; park it under
+    // the legacy key, as an older release would have left it.
+    let first = run_expanded(nodes.clone(), opts("p", Some(4)))
+        .await
+        .expect("run");
+    assert!(!first.had_failures());
+    let parked = store
+        .get(&current)
+        .await
+        .unwrap()
+        .unwrap_or(serde_json::Value::Null);
+    store.delete(&current).await.unwrap();
+    store.put(&legacy, &parked).await.unwrap();
+
+    let summary = run_expanded(nodes, opts("p", Some(4))).await.expect("run");
+    assert!(!summary.had_failures());
+    assert_eq!(
+        store.get(&legacy).await.unwrap(),
+        None,
+        "the legacy key is retired"
+    );
+    assert!(
+        store.get(&current).await.unwrap().is_some(),
+        "its state moved over"
+    );
+}

@@ -178,6 +178,12 @@ fn reloadable_for(rel: &RelationSpec) -> Result<Option<Reloadable>, FaucetError>
         RelationSource::Values { .. } | RelationSource::Http { .. } => return Ok(None),
     };
     let last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    // The sandbox's `allowed_paths` and every reload must name the file the
+    // same way; a canonical path survives `./`, relative paths and symlinked
+    // directories (#862 M-014).
+    let path = std::fs::canonicalize(&path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(path);
     Ok(Some(Reloadable {
         name: rel.name.clone(),
         path,
@@ -223,6 +229,8 @@ fn is_column_resolution_error(msg: &str) -> bool {
     m.contains("referenced column")
         || m.contains("does not have a column named")
         || (m.contains("binder error") && m.contains("group by"))
+        // The placeholder's one column cannot match the page's column count.
+        || m.contains("set operations can only apply to expressions with the same number")
 }
 
 /// Validate the query at config-load time, binding it against a

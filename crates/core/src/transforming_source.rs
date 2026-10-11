@@ -117,30 +117,6 @@ impl TransformingSource {
     }
 }
 
-/// Run a CPU-bound page transform without pinning a runtime worker: on a
-/// multi-thread runtime the worker hands its other tasks off first
-/// (`block_in_place`); elsewhere (current-thread runtime, no runtime) it runs inline.
-fn run_blocking<T>(heavy: bool, f: impl FnOnce() -> T) -> T {
-    let multi_thread = tokio::runtime::Handle::try_current()
-        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
-    if heavy && multi_thread {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
-    }
-}
-
-impl TransformingSource {
-    /// Page-level stages (SQL, WASM, custom page fns) may run for seconds.
-    fn blocking<T>(&self, f: impl FnOnce() -> T) -> T {
-        let heavy = self
-            .stages
-            .iter()
-            .any(|s| matches!(s, CompiledStage::PageFn(_)));
-        run_blocking(heavy, f)
-    }
-}
-
 #[async_trait]
 impl Source for TransformingSource {
     async fn fetch_with_context(
@@ -148,7 +124,7 @@ impl Source for TransformingSource {
         ctx: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
         let records = self.inner.fetch_with_context(ctx).await?;
-        self.blocking(|| instrumented_apply_stages(records, &self.stages, &self.labels))
+        instrumented_apply_stages(records, &self.stages, &self.labels)
     }
 
     async fn fetch_with_context_incremental(
@@ -156,8 +132,7 @@ impl Source for TransformingSource {
         ctx: &HashMap<String, Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let (records, bookmark) = self.inner.fetch_with_context_incremental(ctx).await?;
-        let transformed =
-            self.blocking(|| instrumented_apply_stages(records, &self.stages, &self.labels))?;
+        let transformed = instrumented_apply_stages(records, &self.stages, &self.labels)?;
         Ok((transformed, bookmark))
     }
 
@@ -180,9 +155,7 @@ impl Source for TransformingSource {
                 // from a 1→N stage (explode) at that inner size.
                 let page_len = page.records.len();
                 let records = page.records;
-                let out = self.blocking(|| {
-                    instrumented_apply_stages(records, &self.stages, &self.labels)
-                })?;
+                let out = instrumented_apply_stages(records, &self.stages, &self.labels)?;
                 if out.is_empty() {
                     yield StreamPage { records: vec![], bookmark: page.bookmark };
                     continue;
@@ -250,7 +223,7 @@ impl Source for TransformingSource {
                 // both keeps a dashboard identical across the two paths.
                 let n_in = batch.num_rows();
                 for bf in self.batch_fns.iter().flatten() {
-                    batch = run_blocking(true, || bf(batch)).inspect_err(|_| {
+                    batch = crate::stage::run_blocking(true, || bf(batch)).inspect_err(|_| {
                         counter!("faucet_transform_errors_total", metric_labels.clone())
                             .increment(1);
                     })?;
@@ -425,7 +398,7 @@ mod tests {
             src.fetch_with_context(&HashMap::new()).await.unwrap().len(),
             1
         );
-        assert_eq!(run_blocking(true, || 7), 7);
+        assert_eq!(crate::stage::run_blocking(true, || 7), 7);
     }
 
     /// A change-stream double with its own multi-table hooks (#731).

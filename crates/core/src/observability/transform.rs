@@ -2,7 +2,7 @@
 
 use crate::observability::labels::Labels;
 use crate::observability::timer::DurationGuard;
-use crate::stage::{CompiledStage, apply_stages_to_page};
+use crate::stage::CompiledStage;
 use metrics::{Label, SharedString, counter};
 use serde_json::Value;
 use tracing::info_span;
@@ -37,7 +37,7 @@ pub fn instrumented_apply_stages(
         Label::new("row", SharedString::from(labels.row.to_string())),
     ];
     let _timer = DurationGuard::new("faucet_transform_duration_seconds", metric_labels.clone());
-    let out = match apply_stages_to_page(records, stages) {
+    let out = match crate::stage::apply_stages_to_page_blocking(records, stages) {
         Ok(o) => o,
         Err(e) => {
             counter!("faucet_transform_errors_total", metric_labels.clone()).increment(1);

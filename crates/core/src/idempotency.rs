@@ -322,6 +322,30 @@ pub fn scope_key(scope: &str, max: usize) -> String {
     shortened
 }
 
+/// The shortened form [`scope_key`] produced before faucet-core 1.13 (an
+/// FNV-1a digest), for a sink to read and retire a watermark written then
+/// (#862 M-017). `None` when `scope` fits in `max`: that form never changed.
+pub fn legacy_scope_key(scope: &str, max: usize) -> Option<String> {
+    const LEGACY_DIGEST_LEN: usize = 4 + 16;
+    if scope.len() <= max {
+        return None;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in scope.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    let room = max.saturating_sub(LEGACY_DIGEST_LEN);
+    let mut head = 0usize;
+    for (i, _) in scope.char_indices() {
+        if i > room {
+            break;
+        }
+        head = i;
+    }
+    Some(format!("{}__h:{h:016x}", &scope[..head]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +598,22 @@ mod scope_key_tests {
             &digest[..16],
             "4c5c3b297497a0a0",
             "pinned: a changed digest strands every shortened watermark"
+        );
+    }
+
+    #[test]
+    fn legacy_scope_key_reproduces_the_fnv_form() {
+        assert_eq!(legacy_scope_key("short", 64), None);
+        let long = "p::row::".to_string() + &"x".repeat(100);
+        let legacy = legacy_scope_key(&long, 64).unwrap();
+        assert!(legacy.len() <= 64, "{legacy}");
+        assert!(legacy.starts_with("p::row::"), "{legacy}");
+        let digest = legacy.rsplit_once("__h:").unwrap().1;
+        assert_eq!(digest.len(), 16);
+        assert_ne!(legacy, scope_key(&long, 64));
+        assert_eq!(
+            legacy_scope_key("é".repeat(40).as_str(), 30).unwrap().len(),
+            4 + 16 + 10
         );
     }
 

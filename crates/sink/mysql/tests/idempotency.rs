@@ -359,3 +359,50 @@ async fn check_passes_against_live_server_and_metadata_methods() {
 
     assert_eq!(sink.write_batch(&[]).await.expect("empty"), 0);
 }
+
+/// #862 M-017: a long scope's watermark written under the pre-1.13 FNV key is
+/// still found, and the next commit moves it to the current key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watermark_under_the_legacy_scope_key_is_read_and_retired() {
+    let (_container, url) = start_mysql().await;
+    create_json_table(&url).await;
+    let config = MysqlSinkConfig::new(&url, "events")
+        .column_mapping(MysqlColumnMapping::Json {
+            column: "data".into(),
+        })
+        .with_batch_size(0);
+    let sink = MysqlSink::new(config).await.expect("sink new");
+    let scope = format!("p::child::{}", "k".repeat(400));
+    let legacy = faucet_core::idempotency::legacy_scope_key(&scope, 255).unwrap();
+    assert_eq!(sink.last_committed_token(&scope).await.unwrap(), None);
+
+    let pool = sqlx::MySqlPool::connect(&url).await.expect("pool connect");
+    sqlx::query(&format!(
+        "INSERT INTO `{COMMIT_TOKEN_TABLE}` (`{COMMIT_TOKEN_SCOPE_COL}`, `{COMMIT_TOKEN_TOKEN_COL}`) \
+         VALUES (?, ?)"
+    ))
+    .bind(&legacy)
+    .bind(format_token(4))
+    .execute(&pool)
+    .await
+    .expect("seed legacy watermark");
+    pool.close().await;
+    assert_eq!(
+        sink.last_committed_token(&scope).await.unwrap(),
+        Some(format_token(4)),
+        "the legacy watermark still anchors the resume"
+    );
+
+    sink.write_batch_idempotent(&[json!({"n": 5})], &scope, &format_token(5))
+        .await
+        .expect("idempotent write");
+    assert_eq!(
+        stored_token(&url, &legacy).await,
+        None,
+        "legacy row retired"
+    );
+    assert_eq!(
+        sink.last_committed_token(&scope).await.unwrap(),
+        Some(format_token(5))
+    );
+}

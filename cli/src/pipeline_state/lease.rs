@@ -218,7 +218,40 @@ pub struct LeaseGuard {
     run_id: String,
     renew: Option<tokio::task::JoinHandle<()>>,
     stop: tokio_util::sync::CancellationToken,
+    lost: tokio_util::sync::CancellationToken,
     released: bool,
+}
+
+/// Marks `(key, run id)` as held by this process while a take is in flight,
+/// so a concurrent take in this process sees the holder as live from before
+/// the conditional write lands (#862 M-011). Unmarks on drop unless kept.
+struct HeldMark {
+    key: String,
+    run_id: String,
+    kept: bool,
+}
+
+impl HeldMark {
+    fn new(key: &str, run_id: &str) -> Self {
+        set_held_here(key, run_id, true);
+        Self {
+            key: key.to_string(),
+            run_id: run_id.to_string(),
+            kept: false,
+        }
+    }
+
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for HeldMark {
+    fn drop(&mut self) {
+        if !self.kept {
+            set_held_here(&self.key, &self.run_id, false);
+        }
+    }
 }
 
 /// Another run holds the row's live lease.
@@ -250,7 +283,7 @@ pub async fn acquire(store: Arc<dyn StateStore>, base: &str, run_id: &str) -> Op
     acquire_every(store, base, run_id, RENEW_EVERY).await
 }
 
-async fn acquire_every(
+pub(crate) async fn acquire_every(
     store: Arc<dyn StateStore>,
     base: &str,
     run_id: &str,
@@ -286,11 +319,13 @@ async fn try_acquire_every(
     let key = lease_key(base);
     let lease = RunLease::new(run_id, Utc::now());
     let value = serde_json::to_value(&lease).unwrap_or(Value::Null);
+    let mark = HeldMark::new(&key, run_id);
     if force {
         if let Err(e) = store.put(&key, &value).await {
             tracing::warn!(key, error = %e, "run lease could not be written; continuing unleased");
             return Ok(None);
         }
+        mark.keep();
         return Ok(Some(spawn_guard(store, key, run_id, lease, value, every)));
     }
     for _ in 0..TAKE_ATTEMPTS {
@@ -309,7 +344,10 @@ async fn try_acquire_every(
             return Err(LeaseHeld(held));
         }
         match store.compare_and_put(&key, current.as_ref(), &value).await {
-            Ok(true) => return Ok(Some(spawn_guard(store, key, run_id, lease, value, every))),
+            Ok(true) => {
+                mark.keep();
+                return Ok(Some(spawn_guard(store, key, run_id, lease, value, every)));
+            }
             Ok(false) => continue,
             Err(e) => {
                 tracing::warn!(key, error = %e, "run lease could not be written; continuing unleased");
@@ -365,13 +403,15 @@ fn spawn_guard(
     every: Duration,
 ) -> LeaseGuard {
     let stop = tokio_util::sync::CancellationToken::new();
+    let lost = tokio_util::sync::CancellationToken::new();
     let renew = {
         let store = Arc::clone(&store);
         let key = key.clone();
-        let stop = stop.clone();
+        let (stop, lost) = (stop.clone(), lost.clone());
         tokio::spawn(async move {
             let mut lease = lease;
             let mut last = value;
+            let mut held_until = lease.expires_at;
             loop {
                 tokio::select! {
                     biased;
@@ -381,9 +421,26 @@ fn spawn_guard(
                 lease.expires_at = expiry(Utc::now());
                 let next = serde_json::to_value(&lease).unwrap_or(Value::Null);
                 match store.compare_and_put(&key, Some(&last), &next).await {
-                    Ok(true) => last = next,
+                    Ok(true) => {
+                        last = next;
+                        held_until = lease.expires_at;
+                    }
                     Ok(false) => {
-                        tracing::warn!(key, "run lease was taken by another run; stopped renewing");
+                        tracing::warn!(
+                            key,
+                            "run lease was taken by another run; stopping this run"
+                        );
+                        lost.cancel();
+                        return;
+                    }
+                    Err(e) if Utc::now() >= held_until => {
+                        tracing::warn!(
+                            key,
+                            error = %e,
+                            "run lease expired while its renewals failed; another run may \
+                             take the row, so this run stops"
+                        );
+                        lost.cancel();
                         return;
                     }
                     Err(e) => tracing::warn!(key, error = %e, "run lease renewal failed"),
@@ -391,13 +448,13 @@ fn spawn_guard(
             }
         })
     };
-    set_held_here(&key, run_id, true);
     LeaseGuard {
         store,
         key,
         run_id: run_id.to_string(),
         renew: Some(renew),
         stop,
+        lost,
         released: false,
     }
 }
@@ -440,6 +497,12 @@ async fn release_lease(store: &dyn StateStore, key: &str, run_id: &str) {
 }
 
 impl LeaseGuard {
+    /// Cancelled when this run no longer holds the lease: another run took it,
+    /// or it expired while renewals failed. The run must stop (#862 M-012).
+    pub fn lost(&self) -> tokio_util::sync::CancellationToken {
+        self.lost.clone()
+    }
+
     /// Stop renewing and remove the lease, unless another run has taken it.
     /// The renewal is stopped between writes and awaited first, so an
     /// in-flight renewal can never re-create the lease after it is removed.
@@ -599,6 +662,107 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(read(store.as_ref(), "p::r").await.unwrap().is_some());
         g.release().await;
+    }
+
+    #[tokio::test]
+    async fn a_lease_taken_by_another_run_marks_this_one_lost() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let g = acquire_every(
+            Arc::clone(&store),
+            "p::r",
+            "run-1",
+            Duration::from_millis(2),
+        )
+        .await
+        .unwrap();
+        let lost = g.lost();
+        assert!(!lost.is_cancelled());
+        let other = acquire(Arc::clone(&store), "p::r", "run-2").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), lost.cancelled())
+            .await
+            .expect("the run learns it lost the lease");
+        assert_eq!(
+            read(store.as_ref(), "p::r").await.unwrap().unwrap().run_id,
+            "run-2"
+        );
+        g.release().await;
+        other.release().await;
+    }
+
+    #[tokio::test]
+    async fn renewals_failing_past_expiry_mark_the_run_lost() {
+        let store: Arc<dyn StateStore> = Arc::new(OneWrite {
+            inner: MemoryStateStore::new(),
+            writes: Default::default(),
+        });
+        let mut lease = RunLease::new("r", Utc::now());
+        lease.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        let value = serde_json::to_value(&lease).unwrap();
+        store.put("p::r::__lease__", &value).await.unwrap();
+        let g = spawn_guard(
+            Arc::clone(&store),
+            "p::r::__lease__".into(),
+            "r",
+            lease,
+            value,
+            Duration::from_millis(2),
+        );
+        tokio::time::timeout(Duration::from_secs(5), g.lost().cancelled())
+            .await
+            .expect("an expired, unrenewable lease stops the run");
+        g.release().await;
+    }
+
+    /// Delays its answer after a successful conditional write, the window a
+    /// network store's round trip opens.
+    struct SlowAck {
+        inner: MemoryStateStore,
+    }
+
+    #[faucet_core::async_trait]
+    impl StateStore for SlowAck {
+        async fn get(&self, k: &str) -> Result<Option<Value>, FaucetError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: &Value) -> Result<(), FaucetError> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), FaucetError> {
+            self.inner.delete(k).await
+        }
+        fn supports_compare_and_put(&self) -> bool {
+            true
+        }
+        async fn compare_and_put(
+            &self,
+            k: &str,
+            expected: Option<&Value>,
+            v: &Value,
+        ) -> Result<bool, FaucetError> {
+            let won = self.inner.compare_and_put(k, expected, v).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(won)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_takes_in_one_process_never_both_win() {
+        let store: Arc<dyn StateStore> = Arc::new(SlowAck {
+            inner: MemoryStateStore::new(),
+        });
+        let take = |run: &'static str| {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { try_acquire(store, "p::race", run, false).await })
+        };
+        let a = take("run-a");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let b = take("run-b");
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert!(matches!(a, Ok(Some(_))), "the first take wins");
+        assert!(matches!(b, Err(LeaseHeld(_))), "the second is refused");
+        if let Ok(Some(g)) = a {
+            g.release().await;
+        }
     }
 
     #[tokio::test]

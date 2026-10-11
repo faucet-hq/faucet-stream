@@ -156,7 +156,7 @@ MongoDB is schemaless, so unlike the SQL sinks there are no key *columns* — th
 - **`delete`** — each row is removed with `delete_one(filter)`, where the filter is built from the row's `key` fields.
 - **`delete_marker`** (upsert only) — mix upserts and deletes in one stream: rows whose `delete_marker.field` matches one of `delete_marker.values` are routed to `delete_one`; all others are upserted. The marker field is stripped from the upsert replacement so it never lands in the collection — ideal for CDC streams that carry an operation flag like `__op: "u" | "d"`.
 
-Within a single batch, repeated keys are deduped **last-write-wins** before any write is issued, so a page that touches the same `_id` twice results in a single `replace_one` / `delete_one` carrying the final value.
+Within a single batch, repeated keys are deduped **last-write-wins** before any write is issued, so a page that touches the same `_id` twice results in a single `replace_one` / `delete_one` carrying the final value. Keys compare by their JSON value, as MongoDB does: `7` and `"7"` are two documents.
 
 A document missing or null in a key field fails. When a `dlq:` block is configured the good documents are still written and only the missing/null-key documents are routed to the DLQ per-row; without a DLQ the whole batch fails.
 
@@ -289,7 +289,7 @@ println!("Transferred {} records", result.records_written);
 
 1. `MongoSink::new()` builds the client via `Client::with_uri_str()` — the connection is established and validated **once** and the pool is reused for every write.
 2. **Append:** `write_batch` splits records into `batch_size` chunks; each chunk is converted from `serde_json::Value` to `bson::Document` and inserted with `collection.insert_many()` (unordered unless `ordered: true`). With `batch_size = 0`, the whole slice goes in one call.
-3. **Upsert / delete:** `faucet_core::plan_writes` dedups the page last-write-wins, strips the delete marker, and partitions into upserts / deletes / failed rows; the sink issues per-document `replace_one(upsert)` / `delete_one` ops **concurrently**.
+3. **Upsert / delete:** `faucet_core::plan_writes_exact` dedups the page last-write-wins, strips the delete marker, and partitions into upserts / deletes / failed rows; the sink issues per-document `replace_one(upsert)` / `delete_one` ops **concurrently**.
 4. **Exactly-once (`delivery: exactly_once`):** `write_batch_idempotent` opens a `ClientSession` transaction, applies the page (whole-page `insert_many`, or the planned ops sequentially) plus a `replace_one(upsert)` of the `{ _id: scope, token }` watermark into `_faucet_commit_token`, then commits with the driver-recommended `UnknownTransactionCommitResult` retry loop. Requires a replica set.
 5. Every record must be a JSON object — non-object values produce an error during BSON conversion.
 6. The driver handles connection pooling and automatic reconnection internally.

@@ -340,8 +340,16 @@ fn rewrite_empty(dt: &DataType, v: &mut Value, restore: bool) {
 pub const ABSENT_MARKER: &str = "__faucet_absent";
 
 /// Mark each record with the schema fields it lacks. Returns `false` (and
-/// leaves the page untouched) when every record carries every field.
+/// leaves the page untouched) when every record carries every field, or when
+/// a record carries a key of the marker's name itself, which is never
+/// overwritten.
 pub fn mark_absent_fields(records: &mut [Value], schema: &Schema) -> bool {
+    if records
+        .iter()
+        .any(|r| r.as_object().is_some_and(|o| o.contains_key(ABSENT_MARKER)))
+    {
+        return false;
+    }
     let absent: Vec<Vec<&str>> = records
         .iter()
         .map(|r| match r.as_object() {
@@ -371,16 +379,39 @@ pub fn mark_absent_fields(records: &mut [Value], schema: &Schema) -> bool {
 }
 
 /// Remove the [`ABSENT_MARKER`] column from output rows, dropping each listed
-/// field that came back `null` (a value the query computed is kept).
+/// field that came back `null` (a value the query computed is kept). Nested
+/// objects are cleaned too: a query that embeds a whole `batch` row
+/// (`SELECT b FROM batch b`, `struct_pack(*)`) carries the marker inside it.
 pub fn strip_absent_fields(rows: &mut [Value]) {
     for r in rows {
-        let Some(o) = r.as_object_mut() else { continue };
-        if let Some(Value::String(list)) = o.remove(ABSENT_MARKER) {
-            for name in list.split('\u{1f}') {
-                if o.get(name).is_some_and(Value::is_null) {
-                    o.remove(name);
+        strip_absent(r);
+    }
+}
+
+fn strip_absent(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            if let Some(marker) = o.remove(ABSENT_MARKER)
+                && let Value::String(list) = marker
+            {
+                for name in list.split('\u{1f}') {
+                    if o.get(name).is_some_and(Value::is_null) {
+                        o.remove(name);
+                    }
                 }
             }
+            o.values_mut().for_each(strip_absent);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_absent),
+        _ => {}
+    }
+}
+
+/// Remove the [`ABSENT_MARKER`] key [`mark_absent_fields`] added.
+pub fn unmark_absent_fields(records: &mut [Value]) {
+    for r in records {
+        if let Some(o) = r.as_object_mut() {
+            o.remove(ABSENT_MARKER);
         }
     }
 }
@@ -434,6 +465,17 @@ pub fn schema_eq(a: &Schema, b: &Schema) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_absent_fields_cleans_nested_rows() {
+        let mut rows = vec![serde_json::json!({
+            "__faucet_absent": "a",
+            "a": null,
+            "list": [{ "__faucet_absent": "b", "b": null, "c": 1 }],
+        })];
+        strip_absent_fields(&mut rows);
+        assert_eq!(rows, vec![serde_json::json!({ "list": [{ "c": 1 }] })]);
+    }
     use serde_json::json;
 
     #[test]

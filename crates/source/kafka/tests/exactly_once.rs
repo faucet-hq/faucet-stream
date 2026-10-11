@@ -196,3 +196,52 @@ async fn crash_resume_anchors_at_sink_watermark_no_dup_no_loss() {
         faucet_core::unwrap_state(&store.get(&state_key).await.unwrap().expect("state present"));
     assert!(seq >= 3, "state sequence advanced past the anchored resume");
 }
+
+/// #862 H-07: the source orders the bookmarks it emits per partition, so a
+/// topology can resume diverged sinks by position instead of page count, and
+/// tells which delivered records a position covers.
+#[tokio::test(flavor = "multi_thread")]
+async fn emitted_bookmarks_are_ordered_and_cover_their_records() {
+    let (_container, brokers) = start_kafka().await;
+    let topic = "eo-order";
+    produce(
+        &brokers,
+        topic,
+        &[r#"{"id":1}"#, r#"{"id":2}"#, r#"{"id":3}"#],
+    )
+    .await;
+    let sink = IdempotentCaptureSink::default();
+    let source = KafkaSource::new(source_config(&brokers, topic, "g-order", 3))
+        .await
+        .unwrap();
+    Pipeline::new(&source, &sink)
+        .with_state_store(Arc::new(faucet_core::MemoryStateStore::new()))
+        .with_delivery(faucet_core::idempotency::DeliveryMode::ExactlyOnce)
+        .run()
+        .await
+        .unwrap();
+
+    let history = sink.history.lock().unwrap().clone();
+    let bm = |i: usize| {
+        faucet_core::parse_token_parts(&history[i])
+            .and_then(|(_, b)| b)
+            .expect("token embeds the page bookmark")
+    };
+    let (first, second) = (bm(0), bm(1));
+    assert_eq!(source.position_le(&first, &second), Some(true));
+    assert_eq!(source.position_le(&second, &first), Some(false));
+    assert_eq!(
+        source.position_min(&[second.clone(), first.clone()]),
+        Some(first.clone())
+    );
+    let rows = sink.rows.lock().unwrap().clone();
+    let by_id = |id: i64| {
+        rows.iter()
+            .find(|r| r["value"]["id"] == id)
+            .expect("row")
+            .clone()
+    };
+    assert_eq!(source.record_covered(&by_id(1), &first), Some(true));
+    assert_eq!(source.record_covered(&by_id(3), &first), Some(false));
+    assert_eq!(source.record_covered(&by_id(3), &second), Some(true));
+}

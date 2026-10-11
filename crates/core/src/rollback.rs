@@ -174,10 +174,7 @@ pub fn canonical_key(tuple: &crate::write_mode::KeyTuple) -> crate::write_mode::
             .map(|(k, v)| {
                 let v = match v {
                     serde_json::Value::Null => serde_json::Value::Null,
-                    serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
-                    serde_json::Value::Bool(b) => serde_json::Value::String(b.to_string()),
-                    serde_json::Value::Number(n) => serde_json::Value::String(n.to_string()),
-                    other => serde_json::Value::String(crate::util::canonical_json(other)),
+                    other => serde_json::Value::String(crate::write_mode::key_scalar_text(other)),
                 };
                 (k.clone(), v)
             })
@@ -556,6 +553,12 @@ mod tests {
         ]));
         assert_eq!(nested.0[0].1, serde_json::json!("[1]"));
         assert_eq!(nested.0[1].1, serde_json::Value::Null);
+        // An integral float journals as the planner deduplicates it (#862 M-018).
+        let float = canonical_key(&crate::write_mode::KeyTuple(vec![(
+            "id".into(),
+            serde_json::json!(7.0),
+        )]));
+        assert_eq!(float.0[0].1, serde_json::json!("7"));
         // Deletes are journaled too.
         let del = crate::write_mode::WriteSpec {
             write_mode: WriteMode::Delete,

@@ -1451,10 +1451,11 @@ impl PipelineConfig {
         let path = path.as_ref();
         let composed = crate::compose::compose(path, profile)?;
         let interpolated = resolve_document(&composed, path, inputs)?;
-        let cfg = Self::from_text(&interpolated, path)?;
+        let mut cfg = Self::from_text(&interpolated, path)?;
         // Secret directives need the async resolver path; never let them survive
         // into a connector config as literal `${vault:…}` text.
         crate::secrets::ensure_no_secret_directives(&cfg)?;
+        crate::secrets::unescape_typed_blocks(&mut cfg)?;
         Ok(cfg)
     }
 
@@ -1508,8 +1509,9 @@ impl PipelineConfig {
     /// on disk (a hub composition); `path` picks the parser and labels errors.
     pub fn from_text_with(text: &str, path: &Path, inputs: &RunInputs) -> CliResult<Self> {
         let interpolated = resolve_document(text, path, inputs)?;
-        let cfg = Self::from_text(&interpolated, path)?;
+        let mut cfg = Self::from_text(&interpolated, path)?;
         crate::secrets::ensure_no_secret_directives(&cfg)?;
+        crate::secrets::unescape_typed_blocks(&mut cfg)?;
         Ok(cfg)
     }
 

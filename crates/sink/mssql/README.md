@@ -255,7 +255,7 @@ With `isolate_row_failures: true` (default), a batch that fails is rolled back a
 
 `MssqlSink` implements `Sink::supports_idempotent_writes` (returns `true`) and the two companion hooks:
 
-- `write_batch_idempotent(records, scope, token)` — writes `records` and UPSERTs the `token` into a `_faucet_commit_token(scope NVARCHAR, token NVARCHAR)` watermark table inside the **same transaction** (respecting `transaction_per_batch`), so both commit together or neither does.
+- `write_batch_idempotent(records, scope, token)` — writes `records` and UPSERTs the `token` into a `_faucet_commit_token(scope NVARCHAR, token NVARCHAR)` watermark table inside the **same transaction** (respecting `transaction_per_batch`), so both commit together or neither does. A scope too long for the key column is stored as a shortened digest form; a watermark written under the form releases before faucet-core 1.13 used is still read, and the next commit moves it to the current form.
 - `last_committed_token(scope)` — reads the current watermark so the pipeline can skip already-committed pages on resume.
 
 To use effectively-once delivery, set `delivery: exactly_once` in the pipeline config and pair this sink with one of the CDC sources (`postgres-cdc`, `mysql-cdc`, `mongodb-cdc`) plus a `state:` block. A DLQ is not permitted in effectively-once mode. All four requirements are validated at config-load time (`faucet validate`) before any run starts. Effectively-once composes with `write_mode: upsert`.

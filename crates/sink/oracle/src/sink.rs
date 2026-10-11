@@ -23,8 +23,8 @@ use crate::plan::{
     create_table_sql, delete_sql, dictionary_binds, drop_table_sql, drops_unknown, fold_names,
     fold_page, ignoring, insert_sql, insertable_names, merge_sql, no_columns_error,
     overwrite_swap_sql, pick_table, prepare_rows, relax_null_sql, rename_sql, schema_from_columns,
-    staging_fixups_sql, token_merge_sql, token_select_sql, token_table, token_table_ddl,
-    upsert_groups, widen_column_sql,
+    staging_fixups_sql, token_delete_sql, token_merge_sql, token_select_sql, token_table,
+    token_table_ddl, upsert_groups, widen_column_sql,
 };
 
 /// Oracle Database sink.
@@ -403,17 +403,27 @@ impl Inner {
     }
 
     fn read_token(&self, conn: &Connection, scope: &str) -> Result<Option<String>, FaucetError> {
-        let scope = faucet_core::idempotency::scope_key(scope, crate::plan::SCOPE_COL_WIDTH);
-        let rows = conn
-            .query_as::<String>(&token_select_sql(&self.token_table), &[&scope])
-            .map_err(|e| sink_err("watermark read", &e))?;
-        rows.into_iter()
-            .next()
-            .transpose()
-            .map_err(|e| sink_err("watermark read", &e))
+        let width = crate::plan::SCOPE_COL_WIDTH;
+        let keys = std::iter::once(faucet_core::idempotency::scope_key(scope, width))
+            .chain(faucet_core::idempotency::legacy_scope_key(scope, width));
+        for key in keys {
+            let rows = conn
+                .query_as::<String>(&token_select_sql(&self.token_table), &[&key])
+                .map_err(|e| sink_err("watermark read", &e))?;
+            if let Some(token) = rows
+                .into_iter()
+                .next()
+                .transpose()
+                .map_err(|e| sink_err("watermark read", &e))?
+            {
+                return Ok(Some(token));
+            }
+        }
+        Ok(None)
     }
 
     fn write_token(&self, conn: &Connection, scope: &str, token: &str) -> Result<(), FaucetError> {
+        let scope_in = scope;
         let scope = faucet_core::idempotency::scope_key(scope, crate::plan::SCOPE_COL_WIDTH);
         let token = token.to_string();
         let clob = OracleType::CLOB;
@@ -422,6 +432,12 @@ impl Inner {
             &[&scope, &(&token, &clob)],
         )
         .map_err(|e| sink_err("watermark write", &e))?;
+        if let Some(legacy) =
+            faucet_core::idempotency::legacy_scope_key(scope_in, crate::plan::SCOPE_COL_WIDTH)
+        {
+            conn.execute(&token_delete_sql(&self.token_table), &[&legacy])
+                .map_err(|e| sink_err("watermark write", &e))?;
+        }
         Ok(())
     }
 }

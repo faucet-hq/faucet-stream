@@ -74,14 +74,15 @@ fn normalize(text: &str) -> Option<(bool, String, i64)> {
 
 /// Whether the number `text` survives conversion to a JSON `Value` exactly:
 /// an `i64` / `u64`, or an `f64` whose shortest form has the same value.
+///
+/// The value is the one `serde_json` itself produces, not `str::parse`'s:
+/// without its `float_roundtrip` feature serde_json rounds some 16–17 digit
+/// numbers one ULP away from the correctly rounded float (#862 M-008).
 pub fn is_exact(text: &str) -> bool {
     if text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok() {
         return true;
     }
-    let Ok(f) = text.parse::<f64>() else {
-        return false;
-    };
-    let Some(n) = serde_json::Number::from_f64(f) else {
+    let Ok(Value::Number(n)) = serde_json::from_str::<Value>(text) else {
         return false;
     };
     normalize(text).is_some() && normalize(text) == normalize(&n.to_string())
@@ -169,6 +170,31 @@ pub enum JsonNumberError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exactness_follows_the_float_serde_json_produces() {
+        for text in [
+            "1.0715660391465826e-75",
+            "-1.81996730402717e-179",
+            "-1.603964615428183e143",
+            "-9.643915712060552e-234",
+            "1.5860846119992697e-265",
+            "2.2250738585072011e-308",
+        ] {
+            let parsed = parse_json_exact(text, JsonBigNumbers::String).unwrap().0;
+            match &parsed {
+                Value::Number(n) => {
+                    assert!(is_exact(text), "{text}");
+                    assert_eq!(normalize(&n.to_string()), normalize(text), "{text}");
+                }
+                Value::String(s) => {
+                    assert!(!is_exact(text), "{text}");
+                    assert_eq!(s, text);
+                }
+                other => panic!("{text} parsed to {other}"),
+            }
+        }
+    }
 
     #[test]
     fn exactness_compares_decimal_values() {

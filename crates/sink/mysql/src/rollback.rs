@@ -7,7 +7,7 @@
 //! cannot span it — the rename itself is the atomic unit, as in the swap).
 
 use crate::config::MysqlColumnMapping;
-use crate::sink::{MysqlSink, bind_value, quote_ident_mysql, scope_key};
+use crate::sink::{MysqlSink, bind_value, legacy_scope_key, quote_ident_mysql, scope_key};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, key_json, plan_keys,
@@ -613,6 +613,13 @@ impl MysqlSink {
             }
         }
         .map_err(|e| sink_err("rewind commit token", e))?;
+        if let Some(legacy) = legacy_scope_key(scope) {
+            sqlx::query(&format!("DELETE FROM {t} WHERE {s} = ?"))
+                .bind(legacy)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| sink_err("rewind commit token", e))?;
+        }
         Ok(())
     }
 

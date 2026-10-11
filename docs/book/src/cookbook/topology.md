@@ -200,16 +200,21 @@ per sink node before it returns the error.
 commit watermark. On restart, each sink's committed position is read from its
 state — or from the position embedded in its own commit token, when the sink
 committed a page the state store never recorded. The source resumes from the
-position furthest behind, and every sink ahead of it skips the replayed pages it
-has already committed:
+position furthest behind, and every sink ahead of it skips the changes it has
+already committed, by **position**: the replay does not need to repeat the
+original page boundaries. A replayed page that straddles a sink's committed
+position keeps only the records past it, judged per record by the source (a
+record must still carry the source's position fields — `lsn` for postgres-cdc,
+`topic`/`partition`/`offset` for kafka — when it reaches the sink, or it is
+written again).
 
-- by **position**, when the source can order its positions (the CDC sources), so
-  the replay does not need to repeat the original page boundaries;
-- otherwise by its **commit sequence**, with every sink started at the
-  furthest-behind sink's sequence so the sequences keep counting the same pages.
+Every built-in exactly-once source orders its positions (the CDC sources, and
+`kafka` per partition). For a source that cannot, sinks that committed different
+positions make the run fail rather than skip replayed pages by count, which
+would lose records whenever the replay cuts its pages differently.
 
-No sink is resumed past its own progress, and no sink re-writes a page it already
-has.
+No sink is resumed past its own progress, and no sink re-writes a change it
+already has.
 
 Five requirements are checked at config-load time, so `faucet validate` catches
 a violation before anything runs:

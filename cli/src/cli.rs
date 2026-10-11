@@ -1773,10 +1773,16 @@ pub struct DlqDiscardArgs {
     /// (`2026-06-01T00:00:00Z`) or a relative age (`7d`, `24h`, `30m`).
     #[arg(long)]
     pub before: Option<String>,
-    /// Permanently delete matching envelopes instead of archiving them to a
-    /// `<file>.archived` sibling.
+    /// Do not copy matching envelopes to a `<file>.archived` sibling. The
+    /// envelopes are only marked discarded (hidden from readers); their
+    /// payloads stay in the DLQ file until `--purge`.
     #[arg(long)]
     pub delete: bool,
+    /// Physically remove every discarded envelope from the DLQ files
+    /// (implies `--delete`). Rewrites each file; run it while nothing writes
+    /// the DLQ.
+    #[arg(long)]
+    pub purge: bool,
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build

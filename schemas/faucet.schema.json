@@ -1607,6 +1607,11 @@
           "description": "IPv4 dotted-quad address.",
           "type": "string",
           "const": "ipv4"
+        },
+        {
+          "description": "Any 10–15 digit number, `+` and separators allowed, as a string or a\nJSON integer: the broad `phone` matcher of releases before faucet-core\n1.13. Catches bare and national formats `phone` skips, at the cost of\nmatching ids and epoch timestamps.",
+          "type": "string",
+          "const": "phone_loose"
         }
       ]
     },

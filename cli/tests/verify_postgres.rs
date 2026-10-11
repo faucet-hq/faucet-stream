@@ -168,3 +168,88 @@ pipeline:
         .unwrap();
     assert!(clean.report.equal(), "{clean:?}");
 }
+
+/// #862 M-028: a parent id carried as a string (`"42"`, the usual shape from an
+/// API) still filters an integer column, and a quoted token binds as text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_string_parent_id_filters_an_integer_column() {
+    let (_c, url) = start_postgres().await;
+    exec(&url, "CREATE TABLE items (id BIGINT, code TEXT)").await;
+    exec(&url, "INSERT INTO items VALUES (42, '7'), (43, '8')").await;
+    let dir = tempfile::tempdir().unwrap();
+    let parents = dir.path().join("parents.csv");
+    std::fs::write(&parents, "ix,id,code\na,42,7\n").unwrap();
+    let out = dir.path().join("out");
+    let yaml = format!(
+        r#"
+version: 1
+name: pgbind
+pipeline:
+  sources:
+    parents:
+      type: file
+      config: {{ path: "{parents}" }}
+    items:
+      type: postgres
+      config:
+        connection_url: "{url}"
+        query: "SELECT id, code FROM items WHERE id = ${{p.id}} AND code = '${{p.code}}'"
+  sinks:
+    trash: {{ type: jsonl, config: {{ path: "{trash}" }} }}
+    child: {{ type: jsonl, config: {{ path: "{out}/${{p.ix}}.jsonl" }} }}
+matrix:
+  - id: p
+    source: {{ ref: parents }}
+    sink: {{ ref: trash }}
+  - id: c
+    parent: p
+    parent_key: ix
+    source: {{ ref: items }}
+    sink: {{ ref: child }}
+"#,
+        parents = parents.display(),
+        trash = dir.path().join("trash.jsonl").display(),
+        out = out.display(),
+    );
+    let cfg = PipelineConfig::from_text(&yaml, Path::new("pg.yaml")).unwrap();
+    let summary = run_expanded(
+        expand(&cfg).unwrap(),
+        ExecuteOptions {
+            legacy_state_writes: false,
+            force_lease: false,
+            pipeline_name: "pgbind".into(),
+            run_id: None,
+            execution: None,
+            concurrency: None,
+            dry_run: false,
+            limit: None,
+            state_path_override: None,
+            state_scope: Default::default(),
+            shard: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+            cancel: None,
+            resilience: None,
+            sla: None,
+            reconcile: None,
+            verify: None,
+            rollback: None,
+            #[cfg(feature = "lineage")]
+            lineage: None,
+            #[cfg(feature = "lineage")]
+            lineage_cfg: None,
+            #[cfg(feature = "notify")]
+            notifier: None,
+            #[cfg(feature = "catalog")]
+            catalog: None,
+            usage: Default::default(),
+            budget: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    let body = std::fs::read_to_string(out.join("a.jsonl")).unwrap();
+    assert_eq!(body.lines().count(), 1, "{body}");
+    assert!(body.contains("42"), "{body}");
+}

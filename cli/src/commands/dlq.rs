@@ -166,16 +166,32 @@ fn discard(args: DlqDiscardArgs) -> CliResult<()> {
         &args.location,
         args.reason.as_deref(),
         before_ms,
-        args.delete,
+        args.delete || args.purge,
         &dec,
     )?;
+    if args.purge {
+        let purged = dlq_replay::purge(&args.location)?;
+        if args.json {
+            println!(
+                "{}",
+                to_json(&serde_json::json!({ "discard": outcome, "purge": purged }))?
+            );
+        } else {
+            println!(
+                "DLQ discard: purged {} envelope(s) from {} file(s).",
+                purged.purged, purged.files_rewritten
+            );
+        }
+        return Ok(());
+    }
     if args.json {
         println!("{}", to_json(&outcome)?);
         return Ok(());
     }
     if args.delete {
         println!(
-            "DLQ discard: deleted {} envelope(s) across {} file(s).",
+            "DLQ discard: marked {} envelope(s) discarded across {} file(s) (still on disk; \
+             --purge removes them).",
             outcome.discarded, outcome.files_rewritten
         );
     } else {

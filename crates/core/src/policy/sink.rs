@@ -718,6 +718,38 @@ mod tests {
         assert_eq!(cap.0.lock().unwrap().len(), 1);
     }
 
+    /// #862 M-020: the DLQ check covers every labelled column of the record,
+    /// not only the one that broke the main sink's rule.
+    #[tokio::test]
+    async fn the_dlq_check_covers_every_column_of_the_quarantined_record() {
+        let spec: PolicySpec = serde_json::from_value(json!({
+            "classifications": [
+                {"label": "email", "fields": ["email"]},
+                {"label": "ssn", "fields": ["ssn"]}
+            ],
+            "rules": [
+                {"name": "a", "when": {"label": "email"}, "require": {"residency": ["us"]}, "on_runtime": "quarantine"},
+                {"name": "b", "when": {"label": "ssn"}, "require": {"residency": ["eu"]}, "on_runtime": "quarantine"}
+            ]
+        }))
+        .unwrap();
+        let (s, cap) = sink(Arc::new(CompiledPolicy::compile(&spec).unwrap()), "eu");
+        let s = s.with_dlq_destination(SinkFacts {
+            id: "dlq".into(),
+            kind: "jsonl".into(),
+            attributes: [("residency".to_string(), "us".to_string())].into(),
+        });
+        let err = s
+            .write_batch_partial(&[json!({"email": "x@y.com", "ssn": "123-45-6789"})])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::PolicyViolation { rule, column, .. } if rule == "b" && column == "ssn"),
+            "{err}"
+        );
+        assert!(cap.0.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_card_number_stored_as_a_json_integer_is_classified() {
         let spec: PolicySpec = serde_json::from_value(json!({

@@ -539,7 +539,7 @@ impl MongoSink {
 
     /// Build the match-filter [`Document`] for an upsert row by pulling the
     /// configured `key` columns out of the row. The planner
-    /// ([`faucet_core::plan_writes`]) has already validated that every key
+    /// ([`faucet_core::plan_writes_exact`]) has already validated that every key
     /// column is present and non-null on each upsert row, so a missing column
     /// here is an internal invariant violation rather than user data error.
     fn filter_from_row(row: &Value, key: &[String]) -> Result<Document, FaucetError> {
@@ -1030,7 +1030,7 @@ impl faucet_core::Sink for MongoSink {
             self.config.write.write_mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
+            let plan = faucet_core::plan_writes_exact(records, &self.config.write);
             if let Some((idx, msg)) = plan.failed.first() {
                 return Err(FaucetError::Sink(format!(
                     "mongodb {}: row {idx}: {msg}",
@@ -1106,7 +1106,7 @@ impl faucet_core::Sink for MongoSink {
             return self.insert_partial(records).await;
         }
 
-        let plan = faucet_core::plan_writes(records, &self.config.write);
+        let plan = faucet_core::plan_writes_exact(records, &self.config.write);
         self.apply_plan(&plan).await?;
 
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
@@ -1174,7 +1174,7 @@ impl faucet_core::Sink for MongoSink {
                     .collect::<Result<Vec<_>, _>>()?,
             )
         } else {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
+            let plan = faucet_core::plan_writes_exact(records, &self.config.write);
             if let Some((idx, msg)) = plan.failed.first() {
                 return Err(FaucetError::Sink(format!(
                     "mongodb {}: row {idx}: {msg}",

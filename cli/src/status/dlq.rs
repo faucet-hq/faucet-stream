@@ -205,6 +205,33 @@ mod tests {
         assert_eq!(backlog(Some(&s), "orders", "a").count, 0);
     }
 
+    /// #862 M-026: a numbered (`{part}` or rolled-over) file DLQ is counted.
+    #[test]
+    fn counts_a_numbered_file_dlq() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("failed-00001.jsonl"),
+            envelope("orders", "a", 1_000),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("failed-00002.jsonl"),
+            envelope("orders", "a", 2_000),
+        )
+        .unwrap();
+        for config in [
+            json!({"path": format!("{}/failed-{{part}}.jsonl", dir.path().display())}),
+            json!({
+                "path": format!("{}/failed.jsonl", dir.path().display()),
+                "max_records_per_file": 1
+            }),
+        ] {
+            let st = backlog(Some(&spec("file", config)), "orders", "a");
+            assert!(st.readable, "{:?}", st.note);
+            assert_eq!(st.count, 2);
+        }
+    }
+
     #[test]
     fn counts_a_json_lines_file_dlq() {
         let dir = tempfile::tempdir().unwrap();

@@ -301,7 +301,8 @@ Cleanup deletes data, so it only runs when the written set is trustworthy:
 | Sharded run | Skipped — a shard reads a fraction, so the difference is other shards' rows |
 | Written rows exceed the key ceiling | **Run fails**, deleting nothing |
 | A record was quarantined by a quality / contract / drift policy | Rejected at load time — a quarantined record never reaches the sink, so cleanup could not tell it from a deleted one |
-| The source resumes from a bookmark (`replication_method: incremental`, the file source's `incremental:`, a CDC / log source) and the row has `state:` | Rejected at load time — run 2 reads only what changed, so cleanup would delete every unchanged row in scope |
+| The source resumes from a bookmark (`replication_method: incremental`, the file source's `incremental:`, a CDC / log source, a Singer tap) and the row has `state:` | Rejected at load time — run 2 reads only what changed, so cleanup would delete every unchanged row in scope |
+| The source is a queue or subscription (`sqs`, `pubsub`, `rabbitmq`, `nats`) | Rejected at load time — every run reads only the messages that arrived since the last one |
 | The row is partitioned (`partition:`) | Rejected at load time — each chunk reads one slice and would delete the other chunks' rows |
 | A `parent:` / `for_each:` row whose `scope` carries no token of its own parent record or tuple | Rejected at load time — every invocation would delete the rows its siblings wrote |
 
@@ -398,7 +399,7 @@ creates the alias); a concrete index of that name is rejected at `begin`.
 - `schema.on_drift: evolve` — the staging target is a pre-run clone, so evolving the live target mid-run would leave the staged data a column short at swap time.
 - Scoped cleanup (`complete_for`) — cleanup requires `write_mode: upsert`; a full overwrite already removes source-deleted rows wholesale.
 - `shard:` — each shard would swap in only its own slice, replacing the rest of the table.
-- A source that resumes from a bookmark (`replication_method: incremental`, the file source's `incremental:`, Iceberg `mode: incremental`, DynamoDB `mode: streams`, a CDC / Kafka / Kinesis source) on a row with `state:` — every run after the first would replace the table with only the rows changed since the last one. A scoped overwrite (`scope:`) is not affected. Library callers of `Pipeline::run` should not attach a state store to an unscoped overwrite of such a source for the same reason.
+- A source that resumes from a bookmark (`replication_method: incremental`, the file source's `incremental:`, Iceberg `mode: incremental`, DynamoDB `mode: streams`, a CDC / Kafka / Kinesis source, a Singer tap) on a row with `state:` — every run after the first would replace the table with only the rows changed since the last one. A scoped overwrite (`scope:`) is not affected. Library callers of `Pipeline::run` should not attach a state store to an unscoped overwrite of such a source for the same reason.
 - A source that acknowledges messages as it reads them (`rabbitmq`, `pubsub`, `sqs`, `nats` with `jetstream_stream`) — each page is acked once it lands in staging, and a failed or cancelled run discards staging, so those messages would be gone.
 - A post-run `verify:` check (`after_run`, the default) — the swap happens after the run, so the check would read the replaced table. Set `after_run: false` and run `faucet verify` afterwards.
 

@@ -1619,9 +1619,9 @@ fn reaches_any(start: &str, adj: &HashMap<&str, Vec<&str>>, targets: &HashSet<&s
 struct SinkResume {
     /// The commit-token sequence the node's next page follows.
     start_seq: u64,
-    /// Skip replayed pages whose position is at or before this one: the node
-    /// already committed them. Set only for a node ahead of the replay start,
-    /// and only when the source can order its positions.
+    /// Skip replayed changes at or before this position: the node already
+    /// committed them. Set only for a node ahead of the replay start, and only
+    /// when the source can order its positions.
     skip_through: Option<Value>,
 }
 
@@ -1677,14 +1677,15 @@ async fn compute_start_bookmark(
 ///   resume from the earliest; each sink ahead of it skips the replayed pages at
 ///   or before its own committed position and keeps its own sequence. Page
 ///   boundaries need not replay identically.
-/// - **Otherwise:** resume from the lowest sequence, and start **every** sink at
-///   that sequence, so a sink ahead skips by its committed token and every
-///   sink's sequence keeps counting the same pages. Starting each at its own
-///   sequence made a sink ahead re-write the replayed pages and left sequences
-///   that no longer compared across sinks (#789 CORE-01).
+///   A replayed page that straddles a sink's position keeps only the records
+///   [`Source::record_covered`] does not report as already delivered (#862 M-027).
+/// - **Otherwise** the run is refused: skipping replayed pages by count is sound
+///   only when the replay reproduces the original pages, which no source
+///   promises (a multi-partition log interleaves differently on every fetch),
+///   so it could skip records a sink never wrote (#862 H-07).
 ///
-/// A sink with no committed position forces a full replay, with every sink
-/// starting from zero (or skipping by position when the source can order them).
+/// A sink with no committed position forces a full replay, each sink ahead
+/// skipping by position; with no positions at all every sink starts from zero.
 async fn compute_resume(
     opts: &TopologyOptions,
     sinks: &[(String, Option<&dyn Sink>)],
@@ -1745,7 +1746,7 @@ async fn compute_resume(
         }
         positions.push((id.clone(), bm, seq));
     }
-    Ok(plan_exactly_once(&positions, source_count, source))
+    plan_exactly_once(&positions, source_count, source)
 }
 
 /// Pure exactly-once resume decision over each sink's `(id, position, seq)`.
@@ -1753,7 +1754,7 @@ fn plan_exactly_once(
     positions: &[(String, Option<Value>, u64)],
     source_count: usize,
     source: Option<&dyn Source>,
-) -> ResumePlan {
+) -> Result<ResumePlan, FaucetError> {
     let own = |skip: &dyn Fn(&Option<Value>) -> Option<Value>| -> HashMap<String, SinkResume> {
         positions
             .iter()
@@ -1776,10 +1777,10 @@ fn plan_exactly_once(
                  replaying every source in full"
             );
         }
-        return ResumePlan {
+        return Ok(ResumePlan {
             start: None,
             sinks: own(&|_| None),
-        };
+        });
     }
 
     let known: Vec<Value> = positions
@@ -1788,10 +1789,10 @@ fn plan_exactly_once(
         .collect();
     let all_known = known.len() == positions.len();
     if all_known && known.iter().all(|b| b == &known[0]) {
-        return ResumePlan {
+        return Ok(ResumePlan {
             start: known.first().cloned(),
             sinks: own(&|_| None),
-        };
+        });
     }
 
     let ordering = source.filter(|src| {
@@ -1807,37 +1808,37 @@ fn plan_exactly_once(
         };
         if start.is_some() || !all_known {
             let skip = |bm: &Option<Value>| bm.clone().filter(|b| Some(b) != start.as_ref());
-            return ResumePlan {
+            return Ok(ResumePlan {
                 start: start.clone(),
                 sinks: own(&skip),
-            };
+            });
         }
     }
 
-    let (start, base_seq) = if all_known {
-        positions
-            .iter()
-            .min_by_key(|(_, _, seq)| *seq)
-            .map(|(_, bm, seq)| (bm.clone(), *seq))
-            .unwrap_or((None, 0))
-    } else {
-        (None, 0)
-    };
-    ResumePlan {
-        start,
-        sinks: positions
-            .iter()
-            .map(|(id, _, _)| {
-                (
-                    id.clone(),
-                    SinkResume {
-                        start_seq: base_seq,
-                        skip_through: None,
-                    },
-                )
-            })
-            .collect(),
+    if positions
+        .iter()
+        .all(|(_, bm, seq)| bm.is_none() && *seq == 0)
+    {
+        return Ok(ResumePlan {
+            start: None,
+            sinks: own(&|_| None),
+        });
     }
+    let committed: Vec<String> = positions
+        .iter()
+        .map(|(id, bm, seq)| match bm {
+            Some(bm) => format!("'{id}' at seq {seq} ({bm})"),
+            None => format!("'{id}' with no committed position"),
+        })
+        .collect();
+    Err(FaucetError::State(format!(
+        "topology exactly-once: the sink nodes committed different positions ({}), and the \
+         source '{}' cannot order its positions (Source::position_le), so no resume point \
+         avoids both lost and duplicated records; resuming by page count is unsafe because \
+         a replay need not produce the same pages",
+        committed.join(", "),
+        source.map_or("unknown", |s| s.connector_name()),
+    )))
 }
 
 /// Exactly-once resume point: the bookmark of the lowest-`seq` sink.
@@ -2264,6 +2265,30 @@ fn failed_upstream(failed: &FailedNodes, upstream: &HashSet<String>) -> Option<(
         .map(|(id, (msg, _))| ((*id).clone(), msg.clone()))
 }
 
+/// Where a replayed page sits relative to a sink's committed position.
+#[derive(Debug, PartialEq)]
+enum PageCoverage {
+    /// Every change in the page was committed: skip it.
+    Committed,
+    /// The page may hold committed changes, and later pages may too.
+    Straddles,
+    /// The page reaches past the position: no later page holds a committed change.
+    Past,
+}
+
+fn covered_page(src: &dyn Source, page: &StreamPage, through: &Value) -> PageCoverage {
+    let Some(bm) = page.bookmark.as_ref() else {
+        return PageCoverage::Straddles;
+    };
+    if src.position_le(bm, through) == Some(true) {
+        PageCoverage::Committed
+    } else if src.position_le(through, bm) == Some(true) {
+        PageCoverage::Past
+    } else {
+        PageCoverage::Straddles
+    }
+}
+
 async fn run_sink_node(
     node_id: String,
     sink: Box<dyn Sink>,
@@ -2278,20 +2303,24 @@ async fn run_sink_node(
     let pages = Box::pin(async_stream::stream! {
         loop {
             match rx.recv().await {
-                Some(page) => {
-                    // Exactly-once: this node already committed every page at or
+                Some(mut page) => {
+                    // Exactly-once: this node already committed every change at or
                     // before `skip_through`, so a replay from an earlier sink's
-                    // position must not write them again (#789 CORE-01).
+                    // position must not write them again (#789 CORE-01). Replayed
+                    // pages need not break where the original ones did, so a page
+                    // that straddles the position keeps only the records the
+                    // source says were not yet delivered there (#862 M-027).
                     if let (Some(through), Some(src)) = (skip_through.as_ref(), position_source.as_ref()) {
-                        let committed = page
-                            .bookmark
-                            .as_ref()
-                            .and_then(|bm| src.position_le(bm, through))
-                            == Some(true);
-                        if committed {
-                            continue;
+                        match covered_page(src.as_ref(), &page, through) {
+                            PageCoverage::Committed => continue,
+                            PageCoverage::Straddles => {
+                                page.records.retain(|r| src.record_covered(r, through) != Some(true));
+                            }
+                            PageCoverage::Past => {
+                                page.records.retain(|r| src.record_covered(r, through) != Some(true));
+                                skip_through = None;
+                            }
                         }
-                        skip_through = None;
                     }
                     yield Ok::<StreamPage, FaucetError>(page);
                 }
@@ -3933,6 +3962,12 @@ mod graph_safety_tests {
             }
             Some(a["pos"].as_u64()? <= b["pos"].as_u64()?)
         }
+        fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+            if !self.ordered {
+                return None;
+            }
+            Some(record["n"].as_u64()? <= position["pos"].as_u64()?)
+        }
     }
 
     /// An idempotent sink keeping its rows and one commit token per scope.
@@ -4022,18 +4057,45 @@ mod graph_safety_tests {
             .unwrap()
     }
 
-    /// CORE-01: with diverged sinks and a source that cannot order positions,
-    /// the replay starts at the laggard and every sink starts at the laggard's
-    /// sequence, so the sink that is ahead skips what it committed instead of
-    /// writing it twice — and both end on the same, comparable sequence.
+    /// #862 H-07: with diverged sinks and a source that cannot order positions,
+    /// skipping replayed pages by count is unsafe (a replay need not produce
+    /// the same pages), so the run refuses instead of losing or duplicating.
     #[tokio::test]
-    async fn eo_diverged_sinks_never_rewrite_committed_pages() {
+    async fn eo_diverged_sinks_refuse_when_the_source_cannot_order_positions() {
         let store = Arc::new(MemoryStateStore::new());
         seed(&store, "p::ahead", 9, 9).await;
         seed(&store, "p::behind", 5, 5).await;
         let ahead = TokenSink::new().committed("p::ahead", 9, 9);
         let behind = TokenSink::new().committed("p::behind", 5, 5);
         let (source, applied) = LogSource::new(10, 1, false);
+        let topo = two_sink_graph(source, ahead.clone(), behind.clone());
+
+        let err = topo
+            .run_with(
+                TopologyOptions::new("p").with_state_store(store.clone()),
+                eo(),
+            )
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("cannot order its positions"), "{msg}");
+        assert!(msg.contains("'ahead' at seq 9"), "{msg}");
+        assert_eq!(*applied.lock().unwrap(), None, "nothing was replayed");
+        assert!(ahead.ns().is_empty() && behind.ns().is_empty());
+        assert_eq!(stored_seq(&store, "p::ahead").await, 9);
+    }
+
+    /// #862 M-027: a replayed page that straddles the position a sink ahead
+    /// committed keeps only the records past it.
+    #[tokio::test]
+    async fn eo_a_straddling_replayed_page_drops_the_committed_records() {
+        let store = Arc::new(MemoryStateStore::new());
+        seed(&store, "p::ahead", 6, 6).await;
+        seed(&store, "p::behind", 5, 5).await;
+        let ahead = TokenSink::new().committed("p::ahead", 6, 6);
+        let behind = TokenSink::new().committed("p::behind", 5, 5);
+        let (source, _) = LogSource::new(10, 2, true);
         let topo = two_sink_graph(source, ahead.clone(), behind.clone());
 
         topo.run_with(
@@ -4043,11 +4105,79 @@ mod graph_safety_tests {
         .await
         .unwrap();
 
-        assert_eq!(*applied.lock().unwrap(), Some(json!({ "pos": 5 })));
-        assert_eq!(ahead.ns(), vec![10], "pages 6..=9 were already committed");
+        assert_eq!(ahead.ns(), vec![7, 8, 9, 10], "record 6 was committed");
         assert_eq!(behind.ns(), vec![6, 7, 8, 9, 10]);
-        assert_eq!(stored_seq(&store, "p::ahead").await, 10);
-        assert_eq!(stored_seq(&store, "p::behind").await, 10);
+    }
+
+    /// #862 M-010: a page-level stage in a transform node runs off the worker,
+    /// so other tasks on a one-worker runtime keep running meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_page_stage_in_a_transform_node_does_not_pin_the_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slow: crate::stage::PageFnBox = Arc::new(|records: Vec<Value>| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(records)
+        });
+        let (source, _) = LogSource::new(1, 1, false);
+        let sink = TokenSink::new();
+        let topo = Topology::builder()
+            .source("s", Box::new(source))
+            .transform("x", vec![CompiledStage::PageFn(slow)])
+            .sink("k", Box::new(sink.clone()))
+            .edge("s", "x")
+            .edge("x", "k")
+            .build()
+            .unwrap();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                t.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let before = ticks.load(Ordering::SeqCst);
+        topo.run(TopologyOptions::new("p")).await.unwrap();
+        let during = ticks.load(Ordering::SeqCst) - before;
+        ticker.abort();
+        assert_eq!(sink.ns(), vec![1]);
+        assert!(during >= 20, "the ticker starved: {during} ticks");
+    }
+
+    /// Positions ordered per component (one offset per partition): a page
+    /// past the position in one component only still straddles it.
+    #[test]
+    fn covered_page_follows_a_partial_order() {
+        struct Pair;
+        #[async_trait]
+        impl Source for Pair {
+            async fn fetch_with_context(
+                &self,
+                _ctx: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(Vec::new())
+            }
+            fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+                Some(a["x"].as_u64()? <= b["x"].as_u64()? && a["y"].as_u64()? <= b["y"].as_u64()?)
+            }
+        }
+        let through = json!({ "x": 5, "y": 5 });
+        let page = |bm: Option<Value>| StreamPage {
+            records: Vec::new(),
+            bookmark: bm,
+        };
+        let cov = |bm| covered_page(&Pair, &page(bm), &through);
+        assert_eq!(
+            cov(Some(json!({ "x": 4, "y": 5 }))),
+            PageCoverage::Committed
+        );
+        assert_eq!(
+            cov(Some(json!({ "x": 9, "y": 3 }))),
+            PageCoverage::Straddles
+        );
+        assert_eq!(cov(Some(json!({ "x": 9, "y": 5 }))), PageCoverage::Past);
+        assert_eq!(cov(None), PageCoverage::Straddles);
     }
 
     /// CORE-01 with a source that orders its positions: replayed page boundaries
@@ -4107,14 +4237,25 @@ mod graph_safety_tests {
     #[test]
     fn eo_plan_without_a_committed_position_replays_from_zero() {
         let (src, _) = LogSource::new(1, 1, false);
-        let plan = plan_exactly_once(
+        let err = plan_exactly_once(
             &[
                 ("a".into(), Some(json!({ "pos": 3 })), 3),
                 ("b".into(), None, 0),
             ],
             1,
             Some(&src),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("'b' with no committed position"),
+            "an unordered source cannot skip by count (#862 H-07): {err}"
         );
+        let plan = plan_exactly_once(
+            &[("a".into(), None, 0), ("b".into(), None, 0)],
+            1,
+            Some(&src),
+        )
+        .unwrap();
         assert_eq!(plan.start, None);
         assert!(plan.sinks.values().all(|r| r.start_seq == 0));
 
@@ -4126,7 +4267,8 @@ mod graph_safety_tests {
             ],
             1,
             Some(&ordered),
-        );
+        )
+        .unwrap();
         assert_eq!(plan.start, None);
         assert_eq!(plan.sinks["a"].skip_through, Some(json!({ "pos": 3 })));
         assert_eq!(plan.sinks["a"].start_seq, 3);
@@ -4142,7 +4284,8 @@ mod graph_safety_tests {
             ],
             2,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(plan.start, None);
         assert_eq!(plan.sinks["a"].start_seq, 3);
         assert_eq!(plan.sinks["b"].start_seq, 4);
@@ -4157,7 +4300,8 @@ mod graph_safety_tests {
             ],
             1,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(plan.start, Some(json!({ "pos": 3 })));
         assert_eq!(plan.sinks["b"].start_seq, 6);
         assert!(plan.sinks.values().all(|r| r.skip_through.is_none()));

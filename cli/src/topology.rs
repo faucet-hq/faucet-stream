@@ -1327,7 +1327,7 @@ pub async fn run_topology(
 
     let mut opts = TopologyOptions::new(pipeline_name.clone())
         .with_on_error(on_error)
-        .with_cancel(token);
+        .with_cancel(token.clone());
     opts.run_id = run_id.clone();
 
     if let Some(state) = &cfg.pipeline.state {
@@ -1420,10 +1420,16 @@ pub async fn run_topology(
         }
     }
     let started = std::time::Instant::now();
+    // A sink node that loses its lease stops the graph (#862 M-012).
+    let lease_watches: Vec<_> = markers
+        .iter()
+        .filter_map(|(_, _, m)| m.stop_on_lease_loss(&token))
+        .collect();
     // `run_attributed`: the post-run pass below reports per **sink node**, which
     // needs to know which node failed — and needs that on a failed run too, where
     // `run_reported` would hand back only the error (#459, #789 CLI-18).
     let (mut reported, run_error) = topo.run_attributed(opts, governance).await;
+    drop(lease_watches);
     let cancelled = run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
 
     // Post-run verdicts that fail a sink node after it wrote: a run budget's
@@ -1431,6 +1437,14 @@ pub async fn run_topology(
     // CLI-16). Folded into the node's report so every pass below sees them.
     let mut verdicts = budgets.verdicts();
     drop(budgets);
+    for (id, base, m) in &markers {
+        if m.lease_lost().is_some_and(|l| l.is_cancelled()) {
+            verdicts.push((
+                id.clone(),
+                crate::pipeline_state::markers::RunMarkers::lease_lost_error(base).to_string(),
+            ));
+        }
+    }
     if let Some(spec) = &cfg.reconcile
         && run_error.is_none()
         && !run.is_preview()
