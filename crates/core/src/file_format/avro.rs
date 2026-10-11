@@ -756,7 +756,12 @@ fn from_json(
             let obj = v.as_object().ok_or_else(|| want("an object"))?;
             Av::Map(
                 obj.iter()
-                    .map(|(k, x)| Ok((k.clone(), from_json(x, &m.types, names, text, &join(path, k))?)))
+                    .map(|(k, x)| {
+                        Ok((
+                            k.clone(),
+                            from_json(x, &m.types, names, text, &join(path, k))?,
+                        ))
+                    })
                     .collect::<Result<_, String>>()?,
             )
         }
@@ -1595,25 +1600,89 @@ mod tests {
         assert!(from_json(&json!("zz"), &Schema::Bytes, &names, BytesText::Hex, "b").is_err());
         assert!(from_json(&json!([300]), &Schema::Bytes, &names, BytesText::Hex, "b").is_err());
         assert!(from_json(&json!(true), &Schema::Bytes, &names, BytesText::Hex, "b").is_err());
-        assert!(from_json(&json!("Infinity"), &Schema::Double, &names, BytesText::Hex, "d").is_ok());
-        assert!(from_json(&json!("-Infinity"), &Schema::Double, &names, BytesText::Hex, "d").is_ok());
+        assert!(
+            from_json(
+                &json!("Infinity"),
+                &Schema::Double,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_ok()
+        );
+        assert!(
+            from_json(
+                &json!("-Infinity"),
+                &Schema::Double,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_ok()
+        );
         assert!(from_json(&json!("x"), &Schema::Double, &names, BytesText::Hex, "d").is_err());
         assert!(from_json(&json!("x"), &Schema::Date, &names, BytesText::Hex, "d").is_err());
-        assert!(from_json(&json!("x"), &Schema::TimestampMicros, &names, BytesText::Hex, "d").is_err());
         assert!(
-            from_json(&json!("2024-01-01 00:00:00"), &Schema::TimestampMicros, &names, BytesText::Hex, "d"
+            from_json(
+                &json!("x"),
+                &Schema::TimestampMicros,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_err()
+        );
+        assert!(
+            from_json(
+                &json!("2024-01-01 00:00:00"),
+                &Schema::TimestampMicros,
+                &names,
+                BytesText::Hex,
+                "d"
             )
             .is_ok()
         );
         assert!(
-            from_json(&json!("2024-01-01T00:00:00+02:00"), &Schema::LocalTimestampMicros, &names, BytesText::Hex, "d"
+            from_json(
+                &json!("2024-01-01T00:00:00+02:00"),
+                &Schema::LocalTimestampMicros,
+                &names,
+                BytesText::Hex,
+                "d"
             )
             .is_ok()
         );
-        assert!(from_json(&json!(true), &Schema::TimeMicros, &names, BytesText::Hex, "d").is_err());
-        assert!(from_json(&json!("bad"), &Schema::TimeMicros, &names, BytesText::Hex, "d").is_err());
+        assert!(
+            from_json(
+                &json!(true),
+                &Schema::TimeMicros,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_err()
+        );
+        assert!(
+            from_json(
+                &json!("bad"),
+                &Schema::TimeMicros,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_err()
+        );
         assert!(from_json(&json!(5), &Schema::TimeMicros, &names, BytesText::Hex, "d").is_ok());
-        assert!(from_json(&json!(true), &Schema::TimestampMicros, &names, BytesText::Hex, "d").is_err());
+        assert!(
+            from_json(
+                &json!(true),
+                &Schema::TimestampMicros,
+                &names,
+                BytesText::Hex,
+                "d"
+            )
+            .is_err()
+        );
         assert!(
             from_json(
                 &json!({"months": 1}),
@@ -1666,8 +1735,12 @@ mod tests {
         );
         assert!(datum_from_json(&json!({"raw": "hello", "tag": "abcd"}), &schema).is_err());
         assert!(
-            datum_from_json_with(&json!({"raw": [1, 2], "tag": "abcd"}), &schema, BytesText::Utf8)
-                .is_ok()
+            datum_from_json_with(
+                &json!({"raw": [1, 2], "tag": "abcd"}),
+                &schema,
+                BytesText::Utf8
+            )
+            .is_ok()
         );
         assert_eq!(BytesText::default(), BytesText::Hex);
     }

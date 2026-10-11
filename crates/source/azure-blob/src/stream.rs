@@ -969,7 +969,10 @@ mod tests {
         use faucet_core::file_format::parquet_io::RangeRead as _;
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let path = ObjectPath::from("d/o.parquet");
-        store.put(&path, b"0123456789".to_vec().into()).await.unwrap();
+        store
+            .put(&path, b"0123456789".to_vec().into())
+            .await
+            .unwrap();
         let etag = store.head(&path).await.unwrap().e_tag;
         let mut pinned = BlobRange {
             store: store.clone(),
@@ -977,7 +980,10 @@ mod tests {
             etag,
         };
         assert_eq!(&pinned.read_range(2..5).await.unwrap()[..], b"234");
-        store.put(&path, b"abcdefghij".to_vec().into()).await.unwrap();
+        store
+            .put(&path, b"abcdefghij".to_vec().into())
+            .await
+            .unwrap();
         let err = pinned.read_range(2..5).await.unwrap_err().to_string();
         assert!(err.contains("was replaced"), "{err}");
         let mut missing = BlobRange {

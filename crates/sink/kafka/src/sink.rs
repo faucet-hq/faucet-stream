@@ -209,7 +209,9 @@ fn build_sr_client(
 ) -> Result<Option<SchemaRegistryClient>, FaucetError> {
     fn cfg(f: &KafkaValueFormat) -> Option<&faucet_common_kafka::SchemaRegistryConfig> {
         match f {
-            KafkaValueFormat::ConfluentAvro { schema_registry, .. }
+            KafkaValueFormat::ConfluentAvro {
+                schema_registry, ..
+            }
             | KafkaValueFormat::ConfluentProtobuf { schema_registry } => Some(schema_registry),
             KafkaValueFormat::ConfluentJsonSchema {
                 schema_registry, ..

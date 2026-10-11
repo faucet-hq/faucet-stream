@@ -323,7 +323,13 @@ impl Sink for SingerSink {
         // schema the run's writers sent. An empty SCHEMA could reset the
         // target's table, so none is sent when no schema is known (API-60).
         let written = take_overwrite_schema(&self.run_key());
-        if let Some(schema) = self.config.schema.clone().or(written).or_else(|| self.known_schema(&inner)) {
+        if let Some(schema) = self
+            .config
+            .schema
+            .clone()
+            .or(written)
+            .or_else(|| self.known_schema(&inner))
+        {
             write_schema(
                 &mut buf,
                 stream,

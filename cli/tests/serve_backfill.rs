@@ -345,7 +345,9 @@ pipeline:
     // Several windows into one fixed file destination → 400 (#862 M-096).
     let resp = client
         .post(format!("{url}/v1/backfill"))
-        .json(&json!({ "config": scoped, "from": "2026-06-01", "to": "2026-06-03", "window": "1d" }))
+        .json(
+            &json!({ "config": scoped, "from": "2026-06-01", "to": "2026-06-03", "window": "1d" }),
+        )
         .send()
         .await
         .unwrap();

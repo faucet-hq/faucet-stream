@@ -393,8 +393,7 @@ mod tests {
     #[test]
     fn a_number_column_widens_to_float_whichever_page_comes_first() {
         let ints = faucet_core::columnar::infer_arrow_schema(&[json!({"amount": 10})]).unwrap();
-        let floats =
-            faucet_core::columnar::infer_arrow_schema(&[json!({"amount": 10.5})]).unwrap();
+        let floats = faucet_core::columnar::infer_arrow_schema(&[json!({"amount": 10.5})]).unwrap();
         for (first, then) in [(&ints, &floats), (&floats, &ints)] {
             let m = merge(&nullable(first), then).unwrap();
             assert_eq!(
@@ -402,14 +401,25 @@ mod tests {
                 &DataType::Float64
             );
         }
-        assert_eq!(widened_number(&DataType::Int32, &DataType::Int64), Some(DataType::Int64));
+        assert_eq!(
+            widened_number(&DataType::Int32, &DataType::Int64),
+            Some(DataType::Int64)
+        );
         assert_eq!(widened_number(&DataType::Int64, &DataType::UInt64), None);
         assert_eq!(widened_number(&DataType::Utf8, &DataType::Int64), None);
         assert_eq!(widened_number(&DataType::Int64, &DataType::Int64), None);
-        let wide = Arc::new(Schema::new(vec![Field::new("amount", DataType::Float64, true)]));
+        let wide = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Float64,
+            true,
+        )]));
         let batch = faucet_core::columnar::values_to_record_batch(
             &[json!({"amount": 7})],
-            Arc::new(Schema::new(vec![Field::new("amount", DataType::Int64, true)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Int64,
+                true,
+            )])),
         )
         .unwrap();
         let cast = project(&batch, &wide).unwrap();

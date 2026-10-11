@@ -307,8 +307,7 @@ async fn binary_values_scalar_strings_and_non_string_keys() {
         "the default `parse_json: all` parses scalars"
     );
 
-    let mut containers =
-        RedisSourceConfig::new(&url, RedisSourceType::List { key: "bin".into() });
+    let mut containers = RedisSourceConfig::new(&url, RedisSourceType::List { key: "bin".into() });
     containers.parse_json = faucet_source_redis::RedisJsonParsing::Containers;
     assert_eq!(
         RedisSource::new(containers)

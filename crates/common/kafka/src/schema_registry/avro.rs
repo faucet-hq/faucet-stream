@@ -75,7 +75,8 @@ fn avro_to_json(v: &AvroValue, schema: &Schema) -> Result<Value, FaucetError> {
 /// accepting the shapes [`avro_to_json`] produces, so a decoded record encodes
 /// back unchanged.
 fn json_to_avro(v: &Value, schema: &Schema, bytes: BytesText) -> Result<AvroValue, FaucetError> {
-    datum_from_json_with(v, schema, bytes).map_err(|e| FaucetError::Sink(format!("json->avro: {e}")))
+    datum_from_json_with(v, schema, bytes)
+        .map_err(|e| FaucetError::Sink(format!("json->avro: {e}")))
 }
 
 #[cfg(test)]
@@ -87,7 +88,8 @@ mod tests {
 
     #[test]
     fn json_without_an_avro_value_is_a_sink_error() {
-        let err = json_to_avro(&serde_json::json!(u64::MAX), &Schema::Long, BytesText::Hex).expect_err("u64");
+        let err = json_to_avro(&serde_json::json!(u64::MAX), &Schema::Long, BytesText::Hex)
+            .expect_err("u64");
         assert!(err.to_string().contains("json->avro"), "{err}");
     }
 
@@ -133,7 +135,8 @@ mod tests {
     #[tokio::test]
     async fn utf8_bytes_encoding_writes_a_string_as_its_bytes() {
         let server = MockServer::start().await;
-        let schema_text = r#"{"type":"record","name":"R","fields":[{"name":"raw","type":"bytes"}]}"#;
+        let schema_text =
+            r#"{"type":"record","name":"R","fields":[{"name":"raw","type":"bytes"}]}"#;
         Mock::given(method("POST"))
             .and(path("/subjects/r-value/versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 4})))
@@ -156,11 +159,18 @@ mod tests {
             decode(&client, &utf8).await.unwrap(),
             serde_json::json!({"raw": "63616665"})
         );
-        let hex = encode(&client, "r-value", schema_text, &record).await.unwrap();
-        assert_eq!(decode(&client, &hex).await.unwrap(), record);
-        let err = encode(&client, "r-value", schema_text, &serde_json::json!({"raw": "hello"}))
+        let hex = encode(&client, "r-value", schema_text, &record)
             .await
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(decode(&client, &hex).await.unwrap(), record);
+        let err = encode(
+            &client,
+            "r-value",
+            schema_text,
+            &serde_json::json!({"raw": "hello"}),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("not hex"), "{err}");
     }
 

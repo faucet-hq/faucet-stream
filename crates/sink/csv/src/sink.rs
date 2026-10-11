@@ -774,7 +774,8 @@ mod tests {
     fn state_over(path: &std::path::Path) -> WriterState {
         let file = OpenOptions::new().append(true).open(path).unwrap();
         #[cfg(feature = "compression")]
-        let file = faucet_core::compression::sync_compress_writer(file, faucet_core::Compression::None);
+        let file =
+            faucet_core::compression::sync_compress_writer(file, faucet_core::Compression::None);
         WriterState {
             writer: csv::WriterBuilder::new().from_writer(file),
             columns: vec!["a".into()],

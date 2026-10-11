@@ -474,8 +474,10 @@ impl BookmarkContext {
                 watermarks.insert(tp.clone(), w);
             }
         }
-        let lows: HashMap<(String, i32), i64> =
-            watermarks.iter().map(|(tp, (low, _))| (tp.clone(), *low)).collect();
+        let lows: HashMap<(String, i32), i64> = watermarks
+            .iter()
+            .map(|(tp, (low, _))| (tp.clone(), *low))
+            .collect();
         let seeds = member_seeds(
             &assigned,
             &committed,
@@ -483,7 +485,10 @@ impl BookmarkContext {
             &watermarks,
             self.earliest.load(Ordering::Acquire),
         );
-        (seeds, committed_clamps(&assigned, &committed, &seeks, &lows))
+        (
+            seeds,
+            committed_clamps(&assigned, &committed, &seeks, &lows),
+        )
     }
 }
 

@@ -652,7 +652,11 @@ async fn an_aborted_overwrite_leaves_no_schema_for_a_later_commit() {
     let mut cfg = fx.config(json!({"mode": "echo"}));
     cfg.write.write_mode = faucet_core::WriteMode::Overwrite;
     cfg.activate_version = Some(700);
-    SingerSink::new(cfg).unwrap().commit_overwrite().await.unwrap();
+    SingerSink::new(cfg)
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .unwrap();
     assert!(
         fx.events("schema").len() == 1,
         "only the aborted writer's SCHEMA: {:?}",

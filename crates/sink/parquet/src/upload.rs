@@ -11,9 +11,9 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use object_store::path::Path as ObjPath;
 use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt as _};
-use tokio::task::JoinSet;
 use parquet::arrow::async_writer::AsyncFileWriter;
 use parquet::errors::ParquetError;
+use tokio::task::JoinSet;
 
 /// Bytes buffered before a multipart upload starts (smaller files go up as one
 /// `put`), and the size of each part after that.

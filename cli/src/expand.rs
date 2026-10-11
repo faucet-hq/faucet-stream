@@ -1827,9 +1827,11 @@ fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
 /// file or object destination would be written by several writers that
 /// clobber each other's scratch files and published objects (#862 M-096).
 fn check_sharded_file_sinks(nodes: &[ExpandedNode]) -> CliResult<()> {
-    for n in nodes.iter().filter(|n| !matches!(n.role, NodeRole::Discovery { .. })) {
-        if let Some(dest) = crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config)
-        {
+    for n in nodes
+        .iter()
+        .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
+    {
+        if let Some(dest) = crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config) {
             return Err(CliError::Config(format!(
                 "row '{}': `shard:` runs several shards of this row at once, all writing the {} \
                  sink destination '{dest}' — they would overwrite each other's files. Write to a \
@@ -4265,7 +4267,10 @@ pipeline:
         let err = run(r#"{ type: file, config: { path: /tmp/m096/out.jsonl } }"#)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("`shard:`") && err.contains("out.jsonl"), "{err}");
+        assert!(
+            err.contains("`shard:`") && err.contains("out.jsonl"),
+            "{err}"
+        );
         assert!(run(r#"{ type: stdout, config: {} }"#).is_ok());
     }
 

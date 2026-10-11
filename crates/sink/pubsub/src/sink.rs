@@ -103,8 +103,7 @@ pub(crate) fn fail_after_key_failure(
 pub(crate) fn message_bytes(p: &Prepared) -> usize {
     p.data.len()
         + p.ordering_key.len()
-        + p
-            .attributes
+        + p.attributes
             .iter()
             .map(|(k, v)| k.len() + v.len())
             .sum::<usize>()
@@ -123,8 +122,7 @@ pub(crate) fn chunk_prepared(
     let mut bytes = 0usize;
     for item in prepared {
         let size = message_bytes(&item.1);
-        if !current.is_empty() && (current.len() >= max_count.max(1) || bytes + size > max_bytes)
-        {
+        if !current.is_empty() && (current.len() >= max_count.max(1) || bytes + size > max_bytes) {
             chunks.push(std::mem::take(&mut current));
             bytes = 0;
         }
@@ -143,7 +141,10 @@ pub(crate) fn chunk_prepared(
 pub(crate) fn hold_failed_keys(
     chunk: Vec<(usize, Prepared)>,
     failed_keys: &HashSet<String>,
-) -> (Vec<(usize, Prepared)>, BTreeMap<usize, Result<(), FaucetError>>) {
+) -> (
+    Vec<(usize, Prepared)>,
+    BTreeMap<usize, Result<(), FaucetError>>,
+) {
     let mut send = Vec::with_capacity(chunk.len());
     let mut held = BTreeMap::new();
     for (index, p) in chunk {
@@ -402,8 +403,14 @@ mod tests {
         assert_eq!(message_bytes(&prepared(10, "kk")), 15);
         let items: Vec<(usize, Prepared)> = (0..5).map(|i| (i, prepared(10, ""))).collect();
         let sizes = |c: &Vec<Vec<(usize, Prepared)>>| c.iter().map(Vec::len).collect::<Vec<_>>();
-        assert_eq!(sizes(&chunk_prepared(items.clone(), 2, 1_000)), vec![2, 2, 1]);
-        assert_eq!(sizes(&chunk_prepared(items.clone(), 100, 30)), vec![2, 2, 1]);
+        assert_eq!(
+            sizes(&chunk_prepared(items.clone(), 2, 1_000)),
+            vec![2, 2, 1]
+        );
+        assert_eq!(
+            sizes(&chunk_prepared(items.clone(), 100, 30)),
+            vec![2, 2, 1]
+        );
         assert_eq!(sizes(&chunk_prepared(items, 0, 1_000)), vec![1, 1, 1, 1, 1]);
         let big = vec![(0, prepared(100, "")), (1, prepared(1, ""))];
         let chunks = chunk_prepared(big, 10, 50);
@@ -415,11 +422,18 @@ mod tests {
     #[test]
     fn messages_of_a_failed_key_are_held_back() {
         let failed: HashSet<String> = ["a".to_string()].into();
-        let chunk = vec![(0, prepared(1, "a")), (1, prepared(1, "b")), (2, prepared(1, ""))];
+        let chunk = vec![
+            (0, prepared(1, "a")),
+            (1, prepared(1, "b")),
+            (2, prepared(1, "")),
+        ];
         let (send, held) = hold_failed_keys(chunk, &failed);
         assert_eq!(send.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 2]);
         let err = held[&0].as_ref().unwrap_err().to_string();
-        assert!(err.contains("not published") && err.contains("'a'"), "{err}");
+        assert!(
+            err.contains("not published") && err.contains("'a'"),
+            "{err}"
+        );
         assert_eq!(held.len(), 1);
     }
 

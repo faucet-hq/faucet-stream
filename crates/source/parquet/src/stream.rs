@@ -10,13 +10,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use faucet_core::file_format::parquet_io::{RangeRead, RangedParquetReader};
 use faucet_core::shard::{HashShard, ShardSpec, parse_hash_shard, plan_hash_shards};
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::aws::AmazonS3Builder;
-use object_store::{ObjectStore, ObjectStoreExt as _};
 use object_store::path::Path as ObjectPath;
-use faucet_core::file_format::parquet_io::{RangeRead, RangedParquetReader};
+use object_store::{ObjectStore, ObjectStoreExt as _};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use serde_json::Value;
@@ -292,8 +292,10 @@ impl RangeRead for PinnedRange {
     fn read_range(
         &mut self,
         range: std::ops::Range<u64>,
-    ) -> futures::future::BoxFuture<'_, Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>>
-    {
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>,
+    > {
         use futures::FutureExt as _;
         async move {
             let opts = object_store::GetOptions {
@@ -841,7 +843,10 @@ mod tests {
         use super::*;
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let path = ObjectPath::from("d/o.parquet");
-        store.put(&path, b"0123456789".to_vec().into()).await.unwrap();
+        store
+            .put(&path, b"0123456789".to_vec().into())
+            .await
+            .unwrap();
         let etag = store.head(&path).await.unwrap().e_tag;
         let mut pinned = PinnedRange {
             store: store.clone(),
@@ -849,7 +854,10 @@ mod tests {
             etag,
         };
         assert_eq!(&pinned.read_range(2..5).await.unwrap()[..], b"234");
-        store.put(&path, b"abcdefghij".to_vec().into()).await.unwrap();
+        store
+            .put(&path, b"abcdefghij".to_vec().into())
+            .await
+            .unwrap();
         let err = pinned.read_range(2..5).await.unwrap_err().to_string();
         assert!(err.contains("was replaced"), "{err}");
         let mut missing = PinnedRange {
@@ -866,9 +874,21 @@ mod tests {
         use super::is_data_object;
         assert!(is_data_object("out/part-0.parquet", 10, "out/"));
         assert!(!is_data_object("out/_SUCCESS", 0, "out/"));
-        assert!(is_data_object("exports/_daily-1.parquet", 4, "exports/_daily"));
-        assert!(is_data_object("exports/_daily/p.parquet", 4, "exports/_daily"));
-        assert!(!is_data_object("exports/_daily/_t/p.parquet", 4, "exports/_daily"));
+        assert!(is_data_object(
+            "exports/_daily-1.parquet",
+            4,
+            "exports/_daily"
+        ));
+        assert!(is_data_object(
+            "exports/_daily/p.parquet",
+            4,
+            "exports/_daily"
+        ));
+        assert!(!is_data_object(
+            "exports/_daily/_t/p.parquet",
+            4,
+            "exports/_daily"
+        ));
         assert!(!is_data_object("other/_p.parquet", 4, "out/"));
         assert!(!is_data_object("out/_common_metadata", 10, "out/"));
         assert!(!is_data_object("out/.part-0.parquet.crc", 8, "out/"));
