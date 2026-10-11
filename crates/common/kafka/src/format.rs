@@ -21,6 +21,13 @@ pub enum KafkaValueFormat {
     #[cfg(feature = "schema-registry")]
     ConfluentAvro {
         schema_registry: crate::SchemaRegistryConfig,
+        /// How the sink reads a JSON string for an Avro `bytes` / `fixed`
+        /// field: `hex` (default — the shape the Kafka source decodes those
+        /// fields to, so records round-trip) or `utf8` (the string's UTF-8
+        /// bytes, the reading before faucet-common-kafka 1.1.1). A JSON array of byte
+        /// numbers is accepted either way. Ignored by the source.
+        #[serde(default)]
+        bytes_encoding: faucet_core::file_format::avro::BytesText,
     },
 
     /// Confluent-wire-format Protobuf: magic byte + schema_id + protobuf binary.
@@ -178,6 +185,7 @@ mod tests {
         let cfg = crate::SchemaRegistryConfig::new("http://localhost:8081");
         let format = KafkaValueFormat::ConfluentAvro {
             schema_registry: cfg,
+            bytes_encoding: Default::default(),
         };
         let s = serde_json::to_value(&format).unwrap();
         assert_eq!(s["type"], "confluent_avro");

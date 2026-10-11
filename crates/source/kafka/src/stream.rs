@@ -538,7 +538,7 @@ fn build_sr_client(
 ) -> Result<Option<SchemaRegistryClient>, FaucetError> {
     fn extract_cfg(f: &KafkaValueFormat) -> Option<&faucet_common_kafka::SchemaRegistryConfig> {
         match f {
-            KafkaValueFormat::ConfluentAvro { schema_registry }
+            KafkaValueFormat::ConfluentAvro { schema_registry, .. }
             | KafkaValueFormat::ConfluentProtobuf { schema_registry } => Some(schema_registry),
             KafkaValueFormat::ConfluentJsonSchema {
                 schema_registry, ..
@@ -1297,6 +1297,7 @@ mod tests {
         fn build_sr_client_some_for_confluent_avro_value() {
             let format = KafkaValueFormat::ConfluentAvro {
                 schema_registry: SchemaRegistryConfig::new("http://localhost:8081"),
+                bytes_encoding: Default::default(),
             };
             assert!(build_sr_client(&format, None).unwrap().is_some());
         }
@@ -1322,6 +1323,7 @@ mod tests {
         fn build_sr_client_falls_back_to_key_format() {
             let key = KafkaValueFormat::ConfluentAvro {
                 schema_registry: SchemaRegistryConfig::new("http://localhost:8081"),
+                bytes_encoding: Default::default(),
             };
             assert!(
                 build_sr_client(&KafkaValueFormat::Json, Some(&key))
@@ -1334,6 +1336,7 @@ mod tests {
         fn build_sr_client_propagates_invalid_url() {
             let format = KafkaValueFormat::ConfluentAvro {
                 schema_registry: SchemaRegistryConfig::new("not-a-url"),
+                bytes_encoding: Default::default(),
             };
             assert!(build_sr_client(&format, None).is_err());
         }

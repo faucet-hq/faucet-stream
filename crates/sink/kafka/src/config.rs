@@ -530,6 +530,7 @@ mod tests {
         let mut c = minimal();
         c.value_format = KafkaValueFormat::ConfluentAvro {
             schema_registry: SchemaRegistryConfig::new("http://localhost:8081"),
+            bytes_encoding: Default::default(),
         };
         c.value_schema = None;
         let err = c.validate().unwrap_err();

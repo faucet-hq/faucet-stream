@@ -156,6 +156,7 @@ mod tests {
         use faucet_common_kafka::SchemaRegistryConfig;
         let format = KafkaValueFormat::ConfluentAvro {
             schema_registry: SchemaRegistryConfig::new("http://localhost:8081"),
+            bytes_encoding: Default::default(),
         };
         let err = decode(Some(b"\x00\x00\x00\x00\x01"), &format, None)
             .await
