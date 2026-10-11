@@ -162,6 +162,12 @@ pub fn sql_type_to_json_schema(data_type: &str) -> Value {
 /// Wrap a type fragment as nullable (`{"type": ["T", "null"]}`), matching the
 /// nullable shape [`infer_schema`](crate::schema::infer_schema) emits.
 pub fn nullable_type(mut fragment: Value) -> Value {
+    if let Some(Value::Array(types)) = fragment.get_mut("type") {
+        if !types.iter().any(|t| t == "null") {
+            types.push(json!("null"));
+        }
+        return fragment;
+    }
     let single = match fragment.get("type") {
         Some(Value::String(t)) => t.clone(),
         _ => return fragment,
@@ -292,6 +298,11 @@ mod tests {
         // Already-complex fragments pass through untouched.
         let complex = json!({"type": ["string", "null"]});
         assert_eq!(nullable_type(complex.clone()), complex);
+        assert_eq!(
+            nullable_type(json!({"type": ["number", "string"]})),
+            json!({"type": ["number", "string", "null"]}),
+            "a type union gains null"
+        );
         // Sibling keys survive the wrap — a temporal `format` hint must not be
         // lost when the column is nullable (a typed sink maps it to TIMESTAMP).
         assert_eq!(

@@ -54,7 +54,7 @@ filter: "status = 'active' and (amount >= 10.5 or vip is not null) and region in
 
 ## Record shape
 
-Rows come out with every column present (a null is `null`); a `decimal` column keeps every digit as a string, and a non-finite float is the string `"NaN"` / `"Infinity"` / `"-Infinity"`.
+Rows come out with every column present (a null is `null`); a `decimal` column keeps every digit as a string, and a non-finite float is the string `"NaN"` / `"Infinity"` / `"-Infinity"`. `discover()` reports the same shapes: a decimal column as `{"type": "string", "format": "decimal"}` and a float column as `["number", "string"]`, so a contract or drift baseline built from it accepts real rows.
 
 ## Incremental reads
 
