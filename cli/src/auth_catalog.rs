@@ -71,6 +71,55 @@ fn register_key_material(spec: &Value) {
     }
 }
 
+/// The remedy for a refresh token left under the shared persist key earlier
+/// versions used (#862 M-077).
+pub fn legacy_persist_message(name: &str, key: &str) -> String {
+    format!(
+        "auth provider `{name}` (oauth2_refresh): its rotated refresh token is persisted under \
+         `{key}`, the shared key earlier faucet versions used, which this version no longer \
+         reads — the next refresh would send the config's seed token, which a rotating IdP has \
+         already revoked. If `{name}` is the only grant of its app, add `key: {key}` to its \
+         `persist:` block"
+    )
+}
+
+/// `oauth2_refresh` providers in the `auth:` catalog that use a `persist:`
+/// block, each with the legacy key its token still sits under (`None` when
+/// nothing needs migrating). Read-only; a provider that does not build is left
+/// to the catalog build to report.
+pub async fn legacy_persist_status(
+    specs: Option<&HashMap<String, Value>>,
+) -> Vec<(String, Option<String>)> {
+    let Some(specs) = specs else {
+        return Vec::new();
+    };
+    let mut names: Vec<&String> = specs
+        .iter()
+        .filter(|(_, s)| {
+            s.get("type").and_then(Value::as_str) == Some("oauth2_refresh")
+                && s.pointer("/config/persist").is_some_and(|p| !p.is_null())
+        })
+        .map(|(n, _)| n)
+        .collect();
+    names.sort();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if let Ok(key) = faucet_auth::legacy_persisted_refresh_key(&specs[name]).await {
+            out.push((name.clone(), key));
+        }
+    }
+    out
+}
+
+/// The `faucet validate` warnings for [`legacy_persist_status`].
+pub async fn legacy_persist_warnings(specs: Option<&HashMap<String, Value>>) -> Vec<String> {
+    legacy_persist_status(specs)
+        .await
+        .into_iter()
+        .filter_map(|(name, key)| key.map(|k| legacy_persist_message(&name, &k)))
+        .collect()
+}
+
 /// Extract a connector config's `auth: { ref: <name> }` reference, if present.
 /// Returns `None` for inline auth or no auth.
 pub fn auth_ref(config: &Value) -> Option<String> {
@@ -99,6 +148,58 @@ pub fn resolve(catalog: &AuthCatalog, name: &str) -> CliResult<SharedAuthProvide
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_persist_status_covers_only_persisting_refresh_providers() {
+        use faucet_core::StateStore as _;
+        assert!(legacy_persist_status(None).await.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let refresh = |persist: Value| {
+            serde_json::json!({ "type": "oauth2_refresh", "config": {
+                "token_url": "https://idp/token", "client_id": "app",
+                "client_secret": "s", "refresh_token": "seed", "persist": persist } })
+        };
+        let mut specs = HashMap::new();
+        specs.insert(
+            "b".to_string(),
+            refresh(serde_json::json!({ "path": path })),
+        );
+        specs.insert(
+            "a".to_string(),
+            refresh(serde_json::json!({ "path": path, "key": "k" })),
+        );
+        specs.insert("mem".to_string(), refresh(Value::Null));
+        specs.insert(
+            "broken".to_string(),
+            refresh(serde_json::json!({ "path": "" })),
+        );
+        specs.insert(
+            "static".to_string(),
+            serde_json::json!({ "type": "static", "config": { "token": "t" } }),
+        );
+        assert_eq!(
+            legacy_persist_status(Some(&specs)).await,
+            vec![("a".to_string(), None), ("b".to_string(), None)]
+        );
+        assert!(legacy_persist_warnings(Some(&specs)).await.is_empty());
+
+        let legacy = faucet_auth::legacy_persisted_refresh_key(&specs["b"]).await;
+        assert_eq!(legacy.unwrap(), None);
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in "https://idp/token\u{0}app".as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let key = format!("oauth2_refresh_{hash:016x}");
+        faucet_core::FileStateStore::new(path)
+            .put(&key, &serde_json::json!({ "refresh_token": "old" }))
+            .await
+            .unwrap();
+        let warnings = legacy_persist_warnings(Some(&specs)).await;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`b`") && warnings[0].contains(&format!("key: {key}")));
+    }
 
     #[test]
     fn empty_block_yields_empty_catalog() {

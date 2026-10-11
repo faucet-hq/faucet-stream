@@ -227,6 +227,20 @@ impl OAuth2RefreshProvider {
         self
     }
 
+    /// The pre-#789 shared persist key, when this provider uses the default key,
+    /// nothing is stored under that key yet, and an entry exists under the old
+    /// one (#862 M-077). Such an entry is never adopted — it may belong to
+    /// another grant of the same app — so a deployment that relied on it must
+    /// set `persist.key` to this value. `None` when nothing needs doing or the
+    /// store cannot be read.
+    pub async fn unadopted_legacy_key(&self) -> Option<String> {
+        let (store, legacy) = (self.store.as_ref()?, self.legacy_key.as_ref()?);
+        if !matches!(store.get(&self.store_key).await, Ok(None)) {
+            return None;
+        }
+        matches!(store.get(legacy).await, Ok(Some(_))).then(|| legacy.clone())
+    }
+
     /// Re-read the persisted refresh token before a refresh (#789 SERVE-16):
     /// another holder of this grant — an overlapping run, another instance —
     /// may have rotated it since this provider last looked. Returns what the
@@ -463,7 +477,7 @@ fn persisted_token(entry: &Value, seed: &str) -> PersistedToken {
 /// FNV-1a 64-bit — a tiny, dependency-free, cross-version-stable hash for the
 /// default persist key (unlike `DefaultHasher`, whose value is not contractually
 /// stable across std releases).
-fn fnv1a_64(s: &str) -> u64 {
+pub(crate) fn fnv1a_64(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         hash ^= *b as u64;
@@ -1230,6 +1244,66 @@ mod tests {
             stored["seed"],
             seed_fingerprint("seed"),
             "upgraded with its grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_left_under_the_legacy_key_is_reported_until_the_default_key_holds_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let base = serde_json::json!({
+            "token_url": "https://idp.example/token",
+            "client_id": "app",
+            "client_secret": "secret",
+            "refresh_token": "seed",
+        });
+        let with = |persist: Value| {
+            let mut c = base.clone();
+            c["persist"] = persist;
+            OAuth2RefreshProvider::from_config(&c).unwrap()
+        };
+        let legacy_key = format!(
+            "oauth2_refresh_{:016x}",
+            fnv1a_64("https://idp.example/token\u{0}app")
+        );
+        let default = with(serde_json::json!({"path": path}));
+        assert_eq!(default.unadopted_legacy_key().await, None, "nothing stored");
+
+        let store = faucet_core::FileStateStore::new(&path);
+        store
+            .put(&legacy_key, &serde_json::json!({"refresh_token": "old"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            default.unadopted_legacy_key().await,
+            Some(legacy_key.clone())
+        );
+        assert_eq!(
+            with(serde_json::json!({"path": path, "key": legacy_key}))
+                .unadopted_legacy_key()
+                .await,
+            None,
+            "an explicit key is the fix"
+        );
+        assert_eq!(
+            OAuth2RefreshProvider::from_config(&base)
+                .unwrap()
+                .unadopted_legacy_key()
+                .await,
+            None,
+            "no persist block"
+        );
+        store
+            .put(
+                &default.store_key,
+                &serde_json::json!({"refresh_token": "new"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            default.unadopted_legacy_key().await,
+            None,
+            "already persisting under its own key"
         );
     }
 
