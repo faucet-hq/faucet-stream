@@ -650,6 +650,9 @@ mod tests {
     #[test]
     fn values_parse_as_json_only_as_configured() {
         let mut c = cfg();
+        assert_eq!(c.parse_json, RedisJsonParsing::All);
+        assert_eq!(Decoding::of(&c).value(b"42", "k").unwrap(), json!(42));
+        c.parse_json = RedisJsonParsing::Containers;
         let d = Decoding::of(&c);
         assert_eq!(d.value(b"1.10", "k").unwrap(), json!("1.10"));
         assert_eq!(d.value(b"true", "k").unwrap(), json!("true"));

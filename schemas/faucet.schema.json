@@ -19243,9 +19243,9 @@
                       "default": 1000
                     },
                     "parse_json": {
-                      "description": "Which values are parsed as JSON. `containers` (default) parses a value\nonly when it is a JSON object or array, so `\"1.10\"`, `\"true\"` and long\nnumeric ids stay the strings Redis holds; `all` also parses scalars;\n`none` keeps every value a string.",
+                      "description": "Which values are parsed as JSON. `all` (default) parses any value that\nis valid JSON, so `\"42\"` becomes `42` and `\"true\"` becomes `true`;\n`containers` parses only objects and arrays, so `\"1.10\"`, `\"true\"` and\nlong numeric ids stay the strings Redis holds; `none` keeps every value\na string.",
                       "$ref": "#/$defs/source_redis__RedisJsonParsing",
-                      "default": "containers"
+                      "default": "all"
                     },
                     "binary": {
                       "description": "What to do with a value that is not valid UTF-8 (msgpack, gzip, …):\n`base64` (default) emits it base64-encoded, `lossy` replaces invalid\nsequences with U+FFFD, `error` fails the run naming the key.",
