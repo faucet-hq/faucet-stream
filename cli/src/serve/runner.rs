@@ -1061,7 +1061,7 @@ pub async fn submit(
     // malformed or refused destination costs nothing and surfaces as a 422 on
     // the submission rather than as a silent no-op when the run finishes.
     if let Some(cb) = req.callback.as_ref() {
-        cb.validate(state.callback_allow_hosts())
+        cb.validate_for(state.callback_allow_hosts(), actor.tenant.is_some())
             .map_err(|message| ServeError::Unprocessable {
                 message,
                 details: None,

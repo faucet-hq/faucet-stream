@@ -1129,22 +1129,24 @@ no-op an hour later):
 | Condition | Why |
 |---|---|
 | Scheme is not `http`/`https` | |
-| Host is link-local / cloud-metadata (`169.254.0.0/16`, `fe80::/10`, `metadata.google.internal`, …) | Closes the instance-metadata SSRF hole. Override by naming the host in `--callback-allow-host`. |
+| Host is link-local / cloud-metadata (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`, `metadata.google.internal`, …) | Closes the instance-metadata SSRF hole. Override by naming the host in `--callback-allow-host`. |
+| A **tenant-scoped** principal names a loopback, private, shared (`100.64.0.0/10`), unique-local (`fc00::/7`) or unspecified address, or `localhost` | A tenant cannot submit a config, so its callback must not reach the server's own host or network. Override by naming the host in `--callback-allow-host`. |
 | `--callback-allow-host` is set and the host is not in it | Explicit allowlist mode. |
 | `headers` supplied on a **clustered** server | A clustered submit persists the run record — including these values — into the shared run-history database for a peer to execute, which would store them in clear text. Authenticate without a request header (e.g. a capability token in a single-use URL path), or submit to a non-clustered server. |
 | `extra_fields` key collides with a faucet-emitted field | Would let a submission spoof the `status`/`event` a receiver keys off. |
 | `on` contains a non-terminal status | |
 | Supplied on `POST /v1/backfill` | One backfill POST fans out into N unit runs, so a single callback has no single run to describe. Poll the unit runs by their `backfill` label instead. |
 
-The link-local check holds at delivery too: an IPv4-mapped IPv6 literal
+The link-local check (and, for a tenant's run, the loopback / private one)
+holds at delivery too: an IPv4-mapped IPv6 literal
 (`[::ffff:169.254.169.254]`) is refused, a host name is resolved and refused
-when any address it resolves to is link-local (the connection is then pinned
+when any address it resolves to is refused (the connection is then pinned
 to the checked addresses, so a second DNS answer cannot redirect it), and a
 redirect response is never followed — a `3xx` counts as a failed delivery.
 
-**Egress posture.** This guard closes the metadata hole; it is not a general
-egress control. A caller who can submit a run can already point a `rest` source
-at an arbitrary address, so the deployment-level mitigations in the
+**Egress posture.** For a caller who can submit a config this guard closes the
+metadata hole; it is not a general egress control. Such a caller can already
+point a `rest` source at an arbitrary address, so the deployment-level mitigations in the
 [serve cookbook](../cookbook/serve.md) still apply. Use `--callback-allow-host`
 (repeatable) when you want callbacks restricted to known receivers.
 

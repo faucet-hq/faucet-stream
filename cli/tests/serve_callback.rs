@@ -289,6 +289,20 @@ async fn refuses_link_local_callback_target_at_submit_time() {
         err.to_string().contains("link-local"),
         "error should explain why: {err}"
     );
+
+    // Metadata endpoints outside the link-local ranges (#862 M-001).
+    for url in [
+        "http://[fd00:ec2::254]/latest/api/token",
+        "http://100.100.100.200/latest/meta-data/",
+    ] {
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/v1/runs"))
+            .json(&json!({"config": ok_yaml(&input, &output), "callback": { "url": url }}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "{url}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
