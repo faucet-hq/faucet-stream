@@ -1067,6 +1067,30 @@ pub fn apply_stages(rec: Value, stages: &[CompiledStage]) -> Result<Vec<Value>, 
     Ok(acc)
 }
 
+/// Run a CPU-bound page transform without pinning a runtime worker: on a
+/// multi-thread runtime the worker hands its other tasks off first
+/// (`block_in_place`); elsewhere (current-thread runtime, no runtime) it runs inline.
+pub(crate) fn run_blocking<T>(heavy: bool, f: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if heavy && multi_thread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+/// [`apply_stages_to_page`] for async callers: when a stage is page-level
+/// (SQL, WASM, a custom page fn — any may run for seconds), the page runs
+/// without pinning the runtime worker, so other tasks on it keep running.
+pub fn apply_stages_to_page_blocking(
+    records: Vec<Value>,
+    stages: &[CompiledStage],
+) -> Result<Vec<Value>, FaucetError> {
+    let heavy = stages.iter().any(|s| matches!(s, CompiledStage::PageFn(_)));
+    run_blocking(heavy, || apply_stages_to_page(records, stages))
+}
+
 /// Page-granular stage runner. Per-record stages (`Map`/`Filter`/`Explode`/
 /// `Custom`) flat-map over the current page; `PageFn` stages transform the whole
 /// page at once. Preserves declared order, so `filter → sql → select` works.
