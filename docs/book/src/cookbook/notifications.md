@@ -104,11 +104,13 @@ pipeline/row (dedup key `<pipeline>:<row>`); any other kind (`sla_breach`,
 `dlq_threshold`, `profile_drift`, …) opens its own incident, keyed by kind
 (`<kind>:<pipeline>:<row>`), so a warning never merges into a failure. The next
 `run_success` on the same pipeline/row sends a matching **resolve** for each of
-them, so incidents self-close. The resolve does not depend on the process that
-saw the failure: a success resolves the key of every kind the rule's `on:`
-admits (all kinds when `on:` is empty; PagerDuty ignores a resolve with nothing
-open), so incidents opened by an earlier `faucet run` or another serve run
-close too. `dedupe_window_secs` coalesces within one process only — PagerDuty
+them this process opened, so incidents self-close. For the incidents a success
+actually answers — the failure-class one and `sla_breach` — the resolve does not
+depend on the process that saw the failure: a success resolves those keys when
+the rule's `on:` admits them (PagerDuty ignores a resolve with nothing open), so
+incidents opened by an earlier `faucet run` or another serve run close too.
+Other kinds (`profile_drift`, `change_requested`, …) are closed by the process
+that opened them or by hand. The resolves for one success go out in parallel. `dedupe_window_secs` coalesces within one process only — PagerDuty
 itself folds repeats on the dedup key into the open incident.
 
 ```yaml
