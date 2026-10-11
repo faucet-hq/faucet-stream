@@ -385,9 +385,34 @@ impl SqsSink {
             crate::config::MAX_BATCH_BYTES,
         );
         let mut merged: BTreeMap<usize, Result<(), FaucetError>> = BTreeMap::new();
+        if faucet_common_sqs::is_fifo(&self.config.queue_url) {
+            // Requests go one at a time; a group whose message failed for good
+            // sends nothing more, so no later message overtakes it (#862 M-082).
+            let mut failed_groups: HashSet<Option<String>> = HashSet::new();
+            for chunk in chunks {
+                let (send, held): (Vec<Encoded>, Vec<Encoded>) = chunk
+                    .into_iter()
+                    .partition(|e| !failed_groups.contains(&e.group_id));
+                for e in held {
+                    merged.insert(
+                        e.index,
+                        Err(FaucetError::Sink(
+                            "sqs: not sent — an earlier message of its FIFO group failed".into(),
+                        )),
+                    );
+                }
+                if send.is_empty() {
+                    continue;
+                }
+                let indices: Vec<usize> = send.iter().map(|e| e.index).collect();
+                let groups: Vec<Option<String>> = send.iter().map(|e| e.group_id.clone()).collect();
+                let result = self.put_chunk_sized(send).await;
+                merge_chunk(&mut merged, &mut failed_groups, indices, groups, result);
+            }
+            return Ok(merged);
+        }
         // A chunk whose whole request failed reports that error on each of its
         // entries, so the other chunks' outcomes are kept (#789 MSG-93).
-        let fifo = faucet_common_sqs::is_fifo(&self.config.queue_url);
         let mut stream = futures::stream::iter(chunks.into_iter().map(|chunk| async move {
             let indices: Vec<usize> = chunk.iter().map(|e| e.index).collect();
             let groups: Vec<Option<String>> = chunk.iter().map(|e| e.group_id.clone()).collect();
@@ -396,35 +421,38 @@ impl SqsSink {
         .buffered(self.config.effective_concurrency());
         let mut failed_groups: HashSet<Option<String>> = HashSet::new();
         while let Some((indices, groups, result)) = stream.next().await {
-            match result {
-                Ok(outcomes) => {
-                    for (idx, group) in indices.iter().zip(&groups) {
-                        if fifo && failed_groups.contains(group) {
-                            merged.insert(
-                                *idx,
-                                Err(FaucetError::Sink(
-                                    "sqs: sent after an earlier message of its FIFO group failed"
-                                        .into(),
-                                )),
-                            );
-                        } else if let Some(o) = outcomes.get(idx) {
-                            if o.is_err() {
-                                failed_groups.insert(group.clone());
-                            }
-                            merged.insert(*idx, clone_outcome(o));
-                        }
-                    }
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    for (idx, group) in indices.into_iter().zip(groups) {
+            merge_chunk(&mut merged, &mut failed_groups, indices, groups, result);
+        }
+        Ok(merged)
+    }
+}
+
+/// Fold one request's outcomes into `merged`, noting the groups that failed.
+fn merge_chunk(
+    merged: &mut BTreeMap<usize, Result<(), FaucetError>>,
+    failed_groups: &mut HashSet<Option<String>>,
+    indices: Vec<usize>,
+    groups: Vec<Option<String>>,
+    result: Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError>,
+) {
+    match result {
+        Ok(outcomes) => {
+            for (idx, group) in indices.iter().zip(groups) {
+                if let Some(o) = outcomes.get(idx) {
+                    if o.is_err() {
                         failed_groups.insert(group);
-                        merged.insert(idx, Err(FaucetError::Sink(msg.clone())));
                     }
+                    merged.insert(*idx, clone_outcome(o));
                 }
             }
         }
-        Ok(merged)
+        Err(e) => {
+            let msg = e.to_string();
+            for (idx, group) in indices.into_iter().zip(groups) {
+                failed_groups.insert(group);
+                merged.insert(idx, Err(FaucetError::Sink(msg.clone())));
+            }
+        }
     }
 }
 
