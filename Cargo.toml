@@ -383,7 +383,7 @@ metrics-util = "0.20"
 # 0.31-compatible release — 0.33 targets opentelemetry 0.32). Before bumping any of
 # these, confirm metrics-exporter-opentelemetry supports the newer line first.
 opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "grpc-tonic", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.32.1"
 metrics-exporter-opentelemetry = "0.2.1"
