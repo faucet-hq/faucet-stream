@@ -189,6 +189,32 @@ pub struct PaginationState {
     /// Injected into the next request; `None` until the first page is processed.
     #[doc(hidden)]
     pub record_field_cursor: Option<Value>,
+    /// Fingerprint of the page's extracted records (before any filter), set
+    /// by the caller before [`PaginationStyle::advance`]; the content-stagnation
+    /// guards compare it instead of the whole body, whose per-response metadata
+    /// (request ids, timestamps) would never repeat. Consumed per page.
+    #[doc(hidden)]
+    pub current_records_fingerprint: Option<u64>,
+}
+
+/// Fingerprint of a page's extracted records for
+/// [`PaginationState::current_records_fingerprint`].
+pub fn records_fingerprint(records: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for r in records {
+        r.to_string().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// The page fingerprint the stagnation guards compare: the records when the
+/// caller supplied them, else the body.
+fn page_fingerprint(state: &mut PaginationState, body: &Value) -> u64 {
+    state
+        .current_records_fingerprint
+        .take()
+        .unwrap_or_else(|| body_fingerprint(body))
 }
 
 /// Cheap, stable fingerprint of a response body for content-stagnation
@@ -370,7 +396,7 @@ impl PaginationStyle {
                 // page to the last page and return it again (non-empty), which
                 // would loop until `max_pages` and duplicate records. Stop if
                 // this page's body is identical to the previous one (#78/#15).
-                let fp = body_fingerprint(body);
+                let fp = page_fingerprint(state, body);
                 if state.previous_page_fingerprint == Some(fp) {
                     tracing::warn!(
                         "pagination loop detected: PageNumber returned an identical page — stopping"
@@ -416,7 +442,7 @@ impl PaginationStyle {
                 // repeats (e.g. `{"total": N}` echoed on every page) must not
                 // be mistaken for stagnation.
                 if has_next && total_path.is_none() {
-                    let fp = body_fingerprint(body);
+                    let fp = page_fingerprint(state, body);
                     if state.previous_page_fingerprint == Some(fp) {
                         tracing::warn!(
                             "pagination loop detected: Offset returned an identical page \
@@ -461,7 +487,7 @@ impl PaginationStyle {
                 }
                 // Content-stagnation guard: a server ignoring the body offset
                 // would re-return the identical page forever.
-                let fp = body_fingerprint(body);
+                let fp = page_fingerprint(state, body);
                 if state.previous_page_fingerprint == Some(fp) {
                     tracing::warn!(
                         "pagination loop detected: OffsetInBody returned an identical page \

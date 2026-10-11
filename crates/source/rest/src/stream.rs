@@ -1469,6 +1469,8 @@ impl RestStream {
 
                     let raw_records = self.extract_page(&body)?;
                     let raw_count = raw_records.len();
+                    state.current_records_fingerprint =
+                        Some(crate::pagination::records_fingerprint(&raw_records));
 
                     // #554: derive this page's keyset cursor (max/min of the
                     // configured field) from every record the page returned, before

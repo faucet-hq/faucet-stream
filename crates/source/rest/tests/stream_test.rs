@@ -150,6 +150,43 @@ async fn test_cursor_pagination() {
 }
 
 #[tokio::test]
+async fn an_offset_ignoring_server_with_changing_metadata_still_stops() {
+    let server = MockServer::start().await;
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = n.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/items"))
+        .respond_with(move |_: &wiremock::Request| {
+            let i = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"id": 1}, {"id": 2}],
+                "meta": { "request_id": i }
+            }))
+        })
+        .mount(&server)
+        .await;
+    let stream = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/api/items")
+            .records_path("$.items[*]")
+            .max_pages(1000)
+            .pagination(PaginationStyle::Offset {
+                offset_param: "offset".into(),
+                limit_param: "limit".into(),
+                limit: 100,
+                total_path: None,
+                rows_path: None,
+            }),
+    )
+    .unwrap();
+    let records = tokio::time::timeout(std::time::Duration::from_secs(30), stream.fetch_all())
+        .await
+        .expect("must terminate")
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn test_offset_pagination_terminates_when_server_ignores_offset() {
     // Regression for #264 F18: an Offset-paginated endpoint with no
     // `total_path` that IGNORES the offset parameter and returns the same full
