@@ -4204,8 +4204,15 @@ impl Sink for LimitedSink {
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.begin_overwrite().await
     }
+    // A capped sample must never replace the destination, whoever drives the
+    // overwrite lifecycle (#862 H-06): the swap becomes a discard.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
+        tracing::warn!(
+            connector = self.inner.connector_name(),
+            "--limit on a `write_mode: overwrite` sink: the staged sample is discarded \
+             and the destination is left unchanged"
+        );
+        self.inner.abort_overwrite().await
     }
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await

@@ -890,6 +890,55 @@ pipeline:
     );
 }
 
+/// #862 H-06: `--limit` on a topology with a `write_mode: overwrite` sink is a
+/// sample — it must discard the staged rows, never swap the destination for
+/// them.
+#[test]
+#[cfg(feature = "sink-file")]
+fn limit_never_commits_an_overwrite_sink_in_topology_mode() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let out = dir.path().join("out.jsonl");
+    let cfg_path = dir.path().join("faucet.yaml");
+    write(
+        &cfg_path,
+        &format!(
+            r#"version: 1
+name: sample
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: file, config: {{ path: {out}, write_mode: overwrite }} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+            csv = csv.display(),
+            out = out.display()
+        ),
+    );
+    let lines = |p: &Path| fs::read_to_string(p).unwrap().lines().count();
+    Command::cargo_bin("faucet")
+        .unwrap()
+        .args(["run", cfg_path.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(lines(&out), 4, "a full run replaces the destination");
+    Command::cargo_bin("faucet")
+        .unwrap()
+        .args(["run", cfg_path.to_str().unwrap(), "--limit", "1"])
+        .assert()
+        .success();
+    assert_eq!(
+        lines(&out),
+        4,
+        "a --limit sample must leave the overwrite destination unchanged"
+    );
+}
+
 /// #456 C3: a topology declaring `masking:` must actually mask. Before the fix
 /// the block parsed, validated, ran — and PII reached the sink in the clear.
 #[test]
