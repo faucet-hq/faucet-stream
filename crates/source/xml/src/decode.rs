@@ -495,6 +495,9 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
             }
         }
     }
+    if stack.len() != 1 {
+        return Err(FaucetError::Source("decode `parse` xml: the document ended inside an open element — the body is truncated or not closed".into()));
+    }
     let (root, _) = stack.pop().unwrap_or_default();
     Ok(Value::Object(root))
 }
@@ -503,6 +506,13 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_truncated_xml_body_fails_to_parse() {
+        let err = xml_to_json(b"<a><b><c>1</c>").unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
+        assert!(xml_to_json(b"<a><b>1</b></a>").is_ok());
+    }
 
     fn parse_json() -> ParseSpec {
         ParseSpec {

@@ -146,6 +146,44 @@ pub fn interpolate_record(input: &str, ctx: &HashMap<String, Value>) -> CliResul
     })
 }
 
+/// [`interpolate_record`] for a field holding XML text: every substituted
+/// value is XML-escaped, so a value such as `A&B` or one carrying markup
+/// cannot break or change the document (#862 M-071).
+pub fn interpolate_record_xml(input: &str, ctx: &HashMap<String, Value>) -> CliResult<String> {
+    rewrite(input, |body| match classify_directive(body) {
+        Directive::LoadTime { .. } => Ok(None),
+        Directive::Deferred { id, path } => {
+            let record = ctx
+                .get(id)
+                .ok_or_else(|| CliError::UnknownInterpolationId {
+                    id: id.to_owned(),
+                    token: format!("${{{body}}}"),
+                })?;
+            let resolved =
+                resolve_dotted(record, path).ok_or_else(|| CliError::MissingRecordField {
+                    id: id.to_owned(),
+                    path: path.to_owned(),
+                })?;
+            Ok(Some(escape_xml_text(&value_to_string_record(&resolved))))
+        }
+    })
+}
+
+fn escape_xml_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Render a resolved runtime value for substitution into a config field.
 ///
 /// Like [`value_to_string`], but a JSON **array** renders as its scalar elements

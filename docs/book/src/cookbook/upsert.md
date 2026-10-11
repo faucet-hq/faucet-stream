@@ -155,6 +155,14 @@ Validate it offline (no database connection required):
 faucet validate cli/examples/postgres_cdc_to_postgres_upsert.yaml
 ```
 
+**Large columns.** Under the default `REPLICA IDENTITY`, Postgres does not
+re-send a large out-of-line (TOAST) value an update left unchanged, so the
+`after` image is partial. Written as-is, an upsert would replace the document
+(MongoDB, Elasticsearch) or bind `NULL` for that column, so `cdc_unwrap` fills
+it from the `before` image and otherwise fails the run naming the table and
+columns. Give tables with large `text` / `jsonb` / `bytea` columns
+`ALTER TABLE … REPLICA IDENTITY FULL` before mirroring them.
+
 ## Composing with effectively-once delivery
 
 A keyed upsert **is** an effectively-once mechanism in its own right: any

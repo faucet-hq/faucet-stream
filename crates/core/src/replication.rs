@@ -152,6 +152,29 @@ pub fn filter_incremental_path(
     start: &Value,
     on_missing: OnMissingKey,
 ) -> Result<IncrementalFilter, FaucetError> {
+    filter_path(records, key, start, on_missing, false)
+}
+
+/// [`filter_incremental_path`] keeping `key >= start`: records sharing the
+/// bookmark value are re-delivered rather than lost when written after the
+/// previous run read that value (at-least-once at the boundary; a keyed upsert
+/// sink absorbs the repeat).
+pub fn filter_incremental_path_inclusive(
+    records: Vec<Value>,
+    key: &ReplicationKey,
+    start: &Value,
+    on_missing: OnMissingKey,
+) -> Result<IncrementalFilter, FaucetError> {
+    filter_path(records, key, start, on_missing, true)
+}
+
+fn filter_path(
+    records: Vec<Value>,
+    key: &ReplicationKey,
+    start: &Value,
+    on_missing: OnMissingKey,
+    inclusive: bool,
+) -> Result<IncrementalFilter, FaucetError> {
     let mut missing = 0usize;
     let mut kept = Vec::with_capacity(records.len());
     for r in records {
@@ -178,6 +201,7 @@ pub fn filter_incremental_path(
                 );
                 true
             }
+            Some(v) if inclusive => !json_gt(start, v),
             Some(v) => json_gt(v, start),
         };
         if keep {
@@ -814,6 +838,39 @@ fn epoch_number(value: &Value) -> String {
             Some(u) => u.to_string(),
             None => (value.as_f64().unwrap_or(0.0).trunc() as i64).to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod inclusive_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_inclusive_filter_keeps_rows_at_the_bookmark() {
+        let key = ReplicationKey::top_level("ts");
+        let rows = vec![
+            json!({"ts": 4}),
+            json!({"ts": 5}),
+            json!({"ts": 6}),
+            json!({"ts": "x"}),
+            json!({"id": 1}),
+        ];
+        let kept =
+            filter_incremental_path_inclusive(rows.clone(), &key, &json!(5), OnMissingKey::Keep)
+                .unwrap();
+        assert_eq!(
+            kept.records,
+            vec![
+                json!({"ts": 5}),
+                json!({"ts": 6}),
+                json!({"ts": "x"}),
+                json!({"id": 1})
+            ]
+        );
+        assert_eq!(kept.missing, 1);
+        let strict = filter_incremental_path(rows, &key, &json!(5), OnMissingKey::Drop).unwrap();
+        assert_eq!(strict.records, vec![json!({"ts": 6}), json!({"ts": "x"})]);
     }
 }
 

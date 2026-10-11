@@ -304,7 +304,7 @@ pipeline:
 
 `max_pages` caps the total number of pages for all styles. With no `pagination` block, exactly one request is made. Every style — including `BodyCursor` and a `decode:` pipeline — emits each HTTP response's records as it arrives, so memory stays bounded by one response plus `batch_size`.
 
-Values substituted into a request body — `{field}` parent-record values, `${name}` captured login values and `${next_token}` — are XML-escaped (`A&B Ltd` is sent as `A&amp;B Ltd`) and never re-scanned for placeholders.
+Values substituted into a request body — `{field}` parent-record values, `${name}` captured login values, `${next_token}`, and the CLI's fan-out tokens (`${parent.field}` in `body` / `soap.body_inner`) — are XML-escaped (`A&B Ltd` is sent as `A&amp;B Ltd`) and never re-scanned for placeholders.
 
 ### Body-cursor pagination (`BodyCursor`, #544)
 

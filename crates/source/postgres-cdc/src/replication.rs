@@ -493,6 +493,50 @@ pub async fn advance_slot(
     Ok(())
 }
 
+/// Fail with the slot-active SQLSTATE while another walsender still holds the
+/// slot. `START_REPLICATION`'s own refusal only surfaces from the stream's first
+/// `recv`, past [`retry_on_slot_active`], so callers check here first and the
+/// retry waits out a previous run's connection on a rapid restart.
+pub async fn ensure_slot_inactive(
+    connection_url: &str,
+    slot_name: &str,
+    tls: &crate::config::CdcTls,
+) -> Result<(), FaucetError> {
+    let opts: PgConnectOptions = connection_url
+        .parse()
+        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = apply_cdc_tls(opts, tls);
+    use sqlx::ConnectOptions as _;
+    let mut conn: PgConnection = opts
+        .connect()
+        .await
+        .map_err(|e| pg_err("postgres-cdc slot activity connect", e))?;
+    let row: Option<(bool, Option<i32>)> =
+        sqlx::query_as("SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = $1")
+            .bind(slot_name)
+            .fetch_optional(&mut conn)
+            .await
+            .map_err(|e| pg_err("postgres-cdc slot activity lookup", e))?;
+    slot_activity_result(slot_name, row)
+}
+
+fn slot_activity_result(
+    slot_name: &str,
+    row: Option<(bool, Option<i32>)>,
+) -> Result<(), FaucetError> {
+    match row {
+        Some((true, pid)) => Err(FaucetError::Custom(Box::new(PostgresError::new(
+            Some(SQLSTATE_OBJECT_IN_USE.to_string()),
+            "postgres-cdc start_replication",
+            format!(
+                "replication slot \"{slot_name}\" is active for PID {}",
+                pid.map_or_else(|| "?".to_string(), |p| p.to_string())
+            ),
+        )))),
+        _ => Ok(()),
+    }
+}
+
 /// What [`advance_slot`] does for a resume `lsn` against the slot's
 /// `confirmed_flush_lsn`.
 #[derive(Debug, PartialEq, Eq)]
@@ -617,6 +661,49 @@ pub async fn slot_positions(
         .map(crate::state::parse_lsn)
         .transpose()?;
     Ok(Some((crate::state::parse_lsn(&current)?, confirmed)))
+}
+
+/// The partitioned table (`schema.table`) each of `oids` is a leaf partition
+/// of. Oids that are not partitions are absent. pgoutput names a change after
+/// the leaf unless the publication sets `publish_via_partition_root`, while
+/// discovery lists only the root, so records are routed by this root.
+pub async fn partition_roots(
+    connection_url: &str,
+    tls: &crate::config::CdcTls,
+    oids: &[u32],
+) -> Result<std::collections::HashMap<u32, String>, FaucetError> {
+    if oids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let opts: PgConnectOptions = connection_url
+        .parse()
+        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = apply_cdc_tls(opts, tls);
+    use sqlx::ConnectOptions as _;
+    let mut conn: PgConnection = opts
+        .connect()
+        .await
+        .map_err(|e| pg_err("postgres-cdc partition lookup connect", e))?;
+    let ids: Vec<i64> = oids.iter().map(|o| i64::from(*o)).collect();
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT c.oid::int8, rn.nspname::text, r.relname::text \
+           FROM pg_class c \
+           JOIN pg_class r ON r.oid = pg_partition_root(c.oid) \
+           JOIN pg_namespace rn ON rn.oid = r.relnamespace \
+          WHERE c.oid::int8 = ANY($1) AND c.relispartition",
+    )
+    .bind(&ids)
+    .fetch_all(&mut conn)
+    .await
+    .map_err(|e| pg_err("postgres-cdc partition lookup", e))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(oid, schema, table)| {
+            u32::try_from(oid)
+                .ok()
+                .map(|oid| (oid, format!("{schema}.{table}")))
+        })
+        .collect())
 }
 
 /// Open a logical replication stream and return a [`Duplex`] handle.
@@ -922,6 +1009,17 @@ mod tests {
     /// hop into `FaucetError`, because once the error is stringified the code
     /// cannot be recovered. A non-database `sqlx::Error` has no code, and must
     /// therefore carry `None` rather than a guess.
+    #[test]
+    fn an_active_slot_reports_the_retryable_sqlstate() {
+        let err = slot_activity_result("s", Some((true, Some(7)))).unwrap_err();
+        assert!(is_slot_active_error(&err));
+        assert!(err.to_string().contains("PID 7"), "{err}");
+        let err = slot_activity_result("s", Some((true, None))).unwrap_err();
+        assert!(err.to_string().contains("PID ?"), "{err}");
+        assert!(slot_activity_result("s", Some((false, None))).is_ok());
+        assert!(slot_activity_result("s", None).is_ok());
+    }
+
     #[test]
     fn advance_skips_positions_at_or_behind_the_slot() {
         assert_eq!(advance_decision(10, Some(10)), AdvanceDecision::AtSlot);

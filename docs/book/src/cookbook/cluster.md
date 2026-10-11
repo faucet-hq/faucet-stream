@@ -390,6 +390,12 @@ How it differs from the other sharders:
 - **Per-shard bookmarks:** each shard has its own state key (`{run}::{shard}`),
   so a reassigned shard resumes where its dead owner left off, independent of its
   siblings.
+- **No incremental replication on key-range shards:** the ranges of a
+  `postgres` / `mysql` / `mssql` / `sqlite` source are re-planned from the
+  current `MIN`/`MAX` every run, so a key range can move to a shard whose cursor
+  bookmark is already past a late row. `faucet validate` refuses `shard:` with
+  `replication: { type: incremental }` on those sources while a `state:` block
+  is set.
 - **Rebalancing:** a shard whose owning instance's lease expires is reclaimed by
   the lease loop — requeued to another worker, or poisoned (failed) past
   `--cluster-max-attempts`. New members pick up unassigned/reclaimed shards on

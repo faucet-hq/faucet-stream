@@ -240,6 +240,7 @@ impl GrpcStream {
                     };
                     let skip = if self.config.reconnect_replay_from_start { emitted } else { 0 };
                     let mut position: usize = 0;
+                    let mut last_message = std::time::Instant::now();
                     loop {
                         if emitted >= max_messages {
                             if !buffer.is_empty() {
@@ -248,14 +249,24 @@ impl GrpcStream {
                             tracing::info!(messages = emitted, "gRPC server-streaming complete (max_messages reached)");
                             return;
                         }
-                        let Some(next) = with_timeout(self.config.idle_timeout, streaming.message()).await else {
-                            break 'attempt Failure::Retry(FaucetError::Source(format!(
-                                "gRPC server-streaming received no message for {}s",
-                                secs(self.config.idle_timeout)
-                            )));
+                        let idle_left = self
+                            .config
+                            .idle_timeout
+                            .map(|t| t.saturating_sub(last_message.elapsed()));
+                        let wait = next_wait(idle_left, !buffer.is_empty());
+                        let Some(next) = with_timeout(wait, streaming.message()).await else {
+                            if wait == idle_left {
+                                break 'attempt Failure::Idle(FaucetError::Source(format!(
+                                    "gRPC server-streaming received no message for {}s",
+                                    secs(self.config.idle_timeout)
+                                )));
+                            }
+                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                            continue;
                         };
                         match next {
                             Ok(Some(msg)) => {
+                                last_message = std::time::Instant::now();
                                 position += 1;
                                 if position <= skip {
                                     continue;
@@ -285,7 +296,22 @@ impl GrpcStream {
                         }
                     }
                 };
+                if !matches!(failure, Failure::Fatal(_)) && !buffer.is_empty() {
+                    yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                }
                 match failure {
+                    Failure::Idle(error) => {
+                        if self.config.terminate_on_error {
+                            Err(error)?;
+                            return;
+                        }
+                        tracing::info!(
+                            error = %error,
+                            "gRPC server-streaming idle; reconnecting (not counted against \
+                             reconnect_max_attempts)"
+                        );
+                        tokio::time::sleep(self.config.reconnect_initial_backoff).await;
+                    }
                     Failure::Unauthenticated { error, sent } => {
                         if !reauthed
                             && let (Some(provider), Some(cred)) = (&self.auth_provider, sent)
@@ -736,9 +762,12 @@ fn reconnect_delay(base: Duration, cap: Duration, attempt: u32) -> Duration {
 
 /// Why a server-streaming attempt ended without finishing the stream.
 enum Failure {
-    /// Worth reconnecting: a dropped connection, a stall, or a status the
-    /// server uses for temporary conditions.
+    /// Worth reconnecting: a dropped connection or a status the server uses
+    /// for temporary conditions.
     Retry(FaucetError),
+    /// No message within `idle_timeout`: a quiet feed is not a failure, so the
+    /// reconnect is not counted against `reconnect_max_attempts`.
+    Idle(FaucetError),
     /// The shared provider's credential was rejected; `sent` is the
     /// credential to invalidate before one retry.
     Unauthenticated {
@@ -780,6 +809,20 @@ fn is_transient(code: tonic::Code) -> bool {
             | tonic::Code::Unknown
             | tonic::Code::Internal
     )
+}
+
+/// How long a buffered record may wait for its page to fill before it is
+/// sent on its own.
+const BUFFER_FLUSH_AFTER: Duration = Duration::from_secs(5);
+
+/// How long to wait for the next message: the rest of `idle_timeout`, cut to
+/// [`BUFFER_FLUSH_AFTER`] while records are buffered.
+fn next_wait(idle_left: Option<Duration>, buffered: bool) -> Option<Duration> {
+    match (idle_left, buffered) {
+        (Some(left), true) => Some(left.min(BUFFER_FLUSH_AFTER)),
+        (None, true) => Some(BUFFER_FLUSH_AFTER),
+        (left, false) => left,
+    }
 }
 
 async fn with_timeout<F: std::future::Future>(
@@ -1086,6 +1129,16 @@ mod tests {
             stream.dataset_uri(),
             "http://localhost:50051/dummy.Svc/Call"
         );
+    }
+
+    #[test]
+    fn the_wait_is_cut_to_the_flush_interval_only_while_records_are_buffered() {
+        let d = Duration::from_secs;
+        assert_eq!(next_wait(Some(d(300)), false), Some(d(300)));
+        assert_eq!(next_wait(Some(d(300)), true), Some(BUFFER_FLUSH_AFTER));
+        assert_eq!(next_wait(Some(d(1)), true), Some(d(1)));
+        assert_eq!(next_wait(None, true), Some(BUFFER_FLUSH_AFTER));
+        assert_eq!(next_wait(None, false), None);
     }
 
     #[test]

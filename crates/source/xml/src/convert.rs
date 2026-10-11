@@ -193,6 +193,11 @@ pub fn stream_extract<F: FnMut(Value)>(
         }
     }
 
+    if let Some(open) = path.last() {
+        return Err(FaucetError::Transform(format!(
+            "XML document ended inside <{open}> — the response is truncated or not closed"
+        )));
+    }
     if full_doc {
         let root = frames
             .pop()
@@ -348,6 +353,18 @@ pub fn detect_soap_fault(doc: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_truncated_document_is_an_error_not_a_short_page() {
+        let cut = "<Root><Items><Item><id>1</id></Item><Item><id>2</id>";
+        let mut seen = 0;
+        let err = stream_extract(cut, Some("Root.Items.Item"), |_| seen += 1).unwrap_err();
+        assert!(err.to_string().contains("ended inside <Item>"), "{err}");
+        assert_eq!(seen, 1);
+        let err = stream_extract("<a><b><c>1</c>", None, |_| {}).unwrap_err();
+        assert!(err.to_string().contains("ended inside <b>"), "{err}");
+        assert!(stream_extract("<a><b>1</b></a>", None, |_| {}).is_ok());
+    }
 
     #[test]
     fn simple_xml_to_json() {

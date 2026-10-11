@@ -2,9 +2,11 @@
 //!
 //! A pass that `max_pages` cuts short has not read the rest of the feed, so it
 //! must not persist a bookmark that claims those pages: a record-derived
-//! (`running_max`) or window bookmark would skip them for good. Only a
-//! persisted cursor names the next unread page and is kept. With no explicit
-//! cap a feed is read to its natural end.
+//! (`running_max`) or window bookmark would skip them for good, and keeping
+//! none re-reads the same pages every run (#862 M-079), so such a pass fails
+//! unless the feed is `assume_ordered`. A persisted cursor names the next
+//! unread page and is kept. With no explicit cap a feed is read to its natural
+//! end.
 
 use faucet_core::{ReplicationMethod, Source};
 use faucet_source_rest::{PaginationStyle, RestStream, RestStreamConfig, WindowSpec};
@@ -38,8 +40,26 @@ fn cursor() -> PaginationStyle {
     }
 }
 
-#[tokio::test]
-async fn a_truncated_incremental_pass_persists_no_bookmark() {
+async fn drain_result(stream: &RestStream) -> (Vec<Value>, Result<Option<Value>, String>) {
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = <RestStream as Source>::stream_pages(stream, &ctx, 1000);
+    let mut records = Vec::new();
+    let mut bookmark = None;
+    while let Some(page) = pages.next().await {
+        match page {
+            Ok(page) => {
+                records.extend(page.records);
+                if let Some(bm) = page.bookmark {
+                    bookmark = Some(bm);
+                }
+            }
+            Err(e) => return (records, Err(e.to_string())),
+        }
+    }
+    (records, Ok(bookmark))
+}
+
+async fn two_page_feed() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/items"))
@@ -52,20 +72,38 @@ async fn a_truncated_incremental_pass_persists_no_bookmark() {
         })))
         .mount(&server)
         .await;
+    server
+}
 
+#[tokio::test]
+async fn a_truncated_incremental_pass_fails_instead_of_stalling() {
+    let server = two_page_feed().await;
     let config = RestStreamConfig::new(&server.uri(), "/items")
         .records_path("$.data[*]")
         .replication_method(ReplicationMethod::Incremental)
         .replication_key("updated_at")
         .pagination(cursor())
         .max_pages(1);
-    let (records, bookmark) = drain(&RestStream::new(config).unwrap()).await;
+    let (records, outcome) = drain_result(&RestStream::new(config).unwrap()).await;
 
     assert_eq!(records.len(), 2, "the fetched page is still delivered");
-    assert_eq!(
-        bookmark, None,
-        "page 2 was never read, so no bookmark may claim it"
-    );
+    let err = outcome.expect_err("no bookmark may claim page 2, and none is a silent stall");
+    assert!(err.contains("max_pages (1)"), "{err}");
+}
+
+#[tokio::test]
+async fn an_ordered_truncated_pass_persists_the_largest_key_read() {
+    let server = two_page_feed().await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .replication_method(ReplicationMethod::Incremental)
+        .replication_key("updated_at")
+        .pagination(cursor())
+        .max_pages(1)
+        .assume_ordered(true);
+    let (records, bookmark) = drain(&RestStream::new(config).unwrap()).await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(bookmark, Some(json!("2026-01-02T00:00:00Z")));
 }
 
 #[tokio::test]
@@ -96,7 +134,7 @@ async fn a_truncated_pass_keeps_a_persisted_cursor() {
 }
 
 #[tokio::test]
-async fn a_truncated_window_stops_the_sweep_without_a_bookmark() {
+async fn a_truncated_window_fails_the_sweep() {
     let server = MockServer::start().await;
     let later_windows = Arc::new(AtomicUsize::new(0));
     Mock::given(method("GET"))
@@ -133,10 +171,10 @@ async fn a_truncated_window_stops_the_sweep_without_a_bookmark() {
     .unwrap()
     .with_now_override_rfc3339("2024-01-04T00:00:00Z");
 
-    let (records, bookmark) = drain(&stream).await;
+    let (records, outcome) = drain_result(&stream).await;
     assert_eq!(records.len(), 1);
-    assert_eq!(
-        bookmark, None,
+    assert!(
+        outcome.is_err(),
         "the first window is unfinished, so neither its end nor a later window's may persist"
     );
     assert_eq!(

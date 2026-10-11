@@ -607,6 +607,12 @@ impl FileStateStore {
         self.root.join(format!("{}.json", safe_filename(key)))
     }
 
+    /// The file `key` is stored in, so a store that writes the same layout
+    /// another way (with tighter permissions, say) reads back through this one.
+    pub fn path_for(&self, key: &str) -> PathBuf {
+        self.entry_path(key)
+    }
+
     fn temp_path(&self, key: &str) -> PathBuf {
         // Unique per write: a per-process random token + a monotonic counter, so
         // two writers (different processes sharing the directory, or two store

@@ -79,6 +79,32 @@ pub fn credentials_allowed(
 /// headers; dropped from a request to a host that may not receive them.
 pub const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
 
+/// Static headers still sent to a host that may not receive credentials. Any
+/// other configured header may hold an API key (`X-API-Key`, `Api-Token`, …),
+/// so it is dropped.
+pub const CROSS_ORIGIN_SAFE_HEADERS: [&str; 7] = [
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "content-type",
+    "user-agent",
+];
+
+/// Drop every header a host outside the credential boundary may not receive,
+/// keeping only [`CROSS_ORIGIN_SAFE_HEADERS`].
+pub fn retain_cross_origin_safe(headers: &mut reqwest::header::HeaderMap) {
+    let drop: Vec<reqwest::header::HeaderName> = headers
+        .keys()
+        .filter(|k| !CROSS_ORIGIN_SAFE_HEADERS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for name in drop {
+        headers.remove(&name);
+    }
+}
+
 /// Resolve an async-job URL against the configured `base_url`: absolute URLs
 /// pass through; a root-relative URL whose path already starts with the
 /// base's path prefix is resolved at the origin (so
@@ -105,6 +131,33 @@ pub fn resolve_job_url(base_url: &str, url: &str) -> String {
         base_url.trim_end_matches('/'),
         url.trim_start_matches('/')
     )
+}
+
+#[cfg(test)]
+mod cross_origin_tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn only_non_credential_headers_cross_origins() {
+        let mut h = HeaderMap::new();
+        for (k, v) in [
+            ("x-api-key", "secret"),
+            ("authorization", "Bearer t"),
+            ("ocp-apim-subscription-key", "k"),
+            ("accept", "application/json"),
+            ("user-agent", "faucet"),
+        ] {
+            h.insert(
+                reqwest::header::HeaderName::from_static(k),
+                HeaderValue::from_static(v),
+            );
+        }
+        retain_cross_origin_safe(&mut h);
+        let mut names: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["accept", "user-agent"]);
+    }
 }
 
 #[cfg(test)]

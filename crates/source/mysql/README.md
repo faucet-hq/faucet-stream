@@ -220,6 +220,8 @@ pipeline:
 
 - a row committed late at the boundary value is emitted;
 - a boundary row updated in place without its cursor moving is emitted again (its fingerprint changed);
+- identical rows at that value are counted (the fingerprint repeats once per copy), so a late copy of a row already emitted is still delivered;
+- every row the server returns past the bookmark is kept — the server compared and ordered it by the column's own type and collation (a text column holding numbers or mixed-offset timestamps included);
 - nothing already written is emitted twice.
 
 The fingerprint covers the whole row, so no key column is needed. When more than 10,000 rows share one cursor value the set is dropped (`"boundary": null`) and the next read re-emits every row at that value — duplicates, never loss (a warning names the column). A bare value written with `faucet state set` reads as that value with an empty boundary.
@@ -401,6 +403,8 @@ This crate has no optional Cargo features of its own. Enable it in the CLI / umb
 - Related crates: [faucet-source-mysql-cdc](https://crates.io/crates/faucet-source-mysql-cdc) · [faucet-sink-mysql](https://crates.io/crates/faucet-sink-mysql) · [faucet-source-postgres](https://crates.io/crates/faucet-source-postgres)
 
 ## Sharded execution (cluster Mode B)
+
+Key ranges are re-planned every run, so `shard:` cannot be combined with incremental replication (`faucet validate` refuses it when a `state:` block is set): a range could move to a shard whose cursor is already past a late row.
 
 Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
 a top-level `shard: { count: N }` block splits this source into contiguous

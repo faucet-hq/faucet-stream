@@ -121,7 +121,7 @@ Each fetch cycle drains pending changes and stops once the stream has been idle 
 | `status_update_interval` | seconds | `10` | Standby Status Update (keepalive) cadence. Must be **strictly less than** `idle_timeout` and well under the server's `wal_sender_timeout` (default 60 s). |
 | `tcp_keepalive` | seconds | `60` | Accepted for compatibility and **ignored**: the replication client sets no socket keepalive (a non-default value logs a warning). A dead replication connection is detected through `status_update_interval` and the server's `wal_sender_timeout`. |
 | `max_buffered_events` | usize | `100000` | Replication events read ahead while the pipeline writes a page, so status updates keep flowing and a long sink write does not hit `wal_sender_timeout`. Past this many buffered events reading pauses until the pipeline catches up. |
-| `slot_acquire_retries` | u32 | `10` | Retries when the slot is still **active** (held by a not-yet-released prior connection) on a rapid restart. Both the pre-stream slot advance and `START_REPLICATION` retry with exponential backoff (250 ms, doubling, capped at 4 s). `0` = fail fast. |
+| `slot_acquire_retries` | u32 | `10` | Retries when the slot is still **active** (held by a not-yet-released prior connection) on a rapid restart. The pre-stream slot advance retries, and `START_REPLICATION` is held until `pg_replication_slots.active` is false, with exponential backoff (250 ms, doubling, capped at 4 s). `0` = fail fast. |
 | `batch_size` | usize | `1000` | Records per page. Committed transactions are coalesced into one page until it holds `batch_size` records or `status_update_interval` passes; a transaction is never split, so one larger than `batch_size` still emits as one page. A commit with no captured rows only moves the bookmark. **`0` = no batching**: accumulate every transaction in the run window into a single trailing page (for tests/snapshot-style runs only). |
 
 ### TLS (`tls`)
@@ -163,7 +163,8 @@ Every change event is one JSON object:
 |-------|-------------|
 | `op` | One of `insert` / `update` / `delete` / `truncate`. |
 | `schema` | Source schema name (e.g. `public`). |
-| `table` | Source table name. |
+| `table` | Source table name. For a change to a partitioned table this is the **leaf partition** pgoutput reports (unless the publication sets `publish_via_partition_root = true`). |
+| `partition_root` | Present only on a change to a leaf partition: the partitioned table it belongs to, as `schema.table` (e.g. `public.parted`). A multi-table `faucet mirror` routes the change by it, because discovery lists the partitioned table rather than its partitions. |
 | `lsn` | The `commit_lsn` of the enclosing transaction. |
 | `ts_ms` | Unix-epoch milliseconds, derived from the COMMIT timestamp. |
 | `before` | Row image **before** the change. Always present on `delete`; present on `update` only when the table is `REPLICA IDENTITY FULL`; otherwise `null`. |
@@ -172,7 +173,9 @@ Every change event is one JSON object:
 - A `truncate` emits one record per truncated relation with `before = after = null`.
 - **Unchanged TOAST:** Postgres elides large out-of-line values whose stored copy wasn't rewritten. Such columns are dropped from `before`/`after` and their names are recorded in `before.__unchanged_toast__` / `after.__unchanged_toast__` (a JSON array of column names) — meaning "this row image is partial: these columns still hold their previous value at the source."
 
-  `__unchanged_toast__` is a **reserved key that is part of the emitted record**: it is an ordinary field in the row image of the raw envelope, so a consumer reading the envelope sees it. The `cdc_unwrap` transform is the exception: it strips the marker from the flat row (for both updates and deletes), because it is envelope metadata rather than a column and would otherwise reach an upsert sink as a literal `__unchanged_toast__` column. You therefore don't need a `drop` transform after `cdc_unwrap`. To detect partial rows, read the envelope without `cdc_unwrap`. The name is exported as `faucet_source_postgres_cdc::stream::UNCHANGED_TOAST_FIELD` for programmatic consumers.
+  `__unchanged_toast__` is a **reserved key that is part of the emitted record**: it is an ordinary field in the row image of the raw envelope, so a consumer reading the envelope sees it. The `cdc_unwrap` transform is the exception: it strips the marker from the flat row (for both updates and deletes), because it is envelope metadata rather than a column and would otherwise reach an upsert sink as a literal `__unchanged_toast__` column. You therefore don't need a `drop` transform after `cdc_unwrap`.
+
+  **A partial update row must not reach an upsert sink as-is**: MongoDB / Elasticsearch replace the whole document, and the SQL sinks bind `NULL` for a column another row in the page carries — either way the elided value is lost. So `cdc_unwrap` fills each elided column from the `before` image (which carries it under `REPLICA IDENTITY FULL`) and, when the `before` image has no copy (the default replica identity), **fails the run** naming the table and columns (`on_partial_row: fail`, the default). Mirror a table with large `text`/`jsonb`/`bytea` columns with `ALTER TABLE … REPLICA IDENTITY FULL`; set `on_partial_row: pass` only when the sink appends (a change log) or merges column-wise. To inspect partial rows, read the envelope without `cdc_unwrap`. The name is exported as `faucet_source_postgres_cdc::stream::UNCHANGED_TOAST_FIELD` for programmatic consumers.
 
 ### Column type mapping
 
@@ -188,7 +191,9 @@ Values arrive in Postgres text form and are decoded by column type OID:
 | `bytea` | base64 string |
 | `json` / `jsonb` | parsed JSON value |
 | 1-D arrays of the above scalar types (`int4[]`, `text[]`, `uuid[]`, …) | JSON array, decoded element-by-element (`NULL` elements → `null`) |
-| `uuid`, `date`, `time`, `timestamp`, `timestamptz`, and anything else | string (raw Postgres text — stable under the default `DateStyle ISO`) |
+| `date`, `timestamp`, `timestamptz` | string, spelled as the `postgres` query source spells it (`timestamptz` as RFC 3339 in UTC); `infinity`, BC dates and years past 9999 keep the server's text. A non-ISO `DateStyle` fails the run |
+| `time` | string, the server's own text (`24:00:00` stays `24:00:00`, `10:00:00.5` stays `10:00:00.5`) |
+| `uuid` and anything else | string (raw Postgres text) |
 
 Multi-dimensional arrays, ranges, composites, and enums fall back to the raw Postgres array/text string.
 

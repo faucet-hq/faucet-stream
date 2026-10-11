@@ -27,6 +27,9 @@ pub struct Lease {
     /// the first record, the shard is re-read from its trim horizon, keeping
     /// records created since about then, instead of skipping to a new `Latest`.
     pub latest_since_ms: Option<i64>,
+    /// Set while such a lease re-reads from the trim horizon; only then are
+    /// records older than `latest_since_ms` filtered out.
+    pub replaying_from_trim: bool,
 }
 
 impl Lease {
@@ -38,6 +41,7 @@ impl Lease {
             position,
             throttles: 0,
             latest_since_ms: None,
+            replaying_from_trim: false,
         }
     }
 }

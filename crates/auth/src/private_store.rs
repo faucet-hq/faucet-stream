@@ -24,10 +24,7 @@ impl PrivateFileStore {
     }
 
     fn entry_path(&self, key: &str) -> PathBuf {
-        self.root.join(format!(
-            "{}.json",
-            key.replace(':', "%3A").replace('/', "%2F")
-        ))
+        self.reader.path_for(key)
     }
 
     async fn ensure_root(&self) -> Result<(), FaucetError> {
@@ -153,5 +150,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cannot write"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn uppercase_and_long_keys_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PrivateFileStore::new(dir.path().join("auth"));
+        let long = "k".repeat(200);
+        for key in ["CrmProd", long.as_str(), "oauth2_refresh_abc"] {
+            store.put(key, &json!({"t": key})).await.unwrap();
+            assert_eq!(
+                store.get(key).await.unwrap(),
+                Some(json!({"t": key})),
+                "{key}"
+            );
+            assert!(store.entry_path(key).exists(), "{key}");
+        }
     }
 }

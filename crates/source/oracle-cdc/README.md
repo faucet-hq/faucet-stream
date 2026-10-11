@@ -99,7 +99,7 @@ Transactions committed below `commit_scn`, or at it and listed in `committed_xid
 - **Partial LOB writes** — an append, a write at an offset above 1, or a trim on a LOB whose current value is not part of the same transaction cannot be reassembled (LogMiner logs only the piece). It is treated as an unsupported change rather than emitted as a padded or truncated value. CLOB offsets are applied in UTF-16 code units, as Oracle counts them.
 - **DDL** — column metadata is reloaded at the DDL row, so later changes in the same mining window are typed by the new columns.
 - **RESETLOGS** — the bookmark records the database incarnation (`resetlogs_scn`); only archived logs of the current incarnation are mined, and resuming a bookmark from another incarnation (after a point-in-time recovery or flashback) fails instead of mining an abandoned branch.
-- **RAC** — the redo flush reaches only the connected instance, so with several open redo threads the mining window never passes the lowest thread checkpoint SCN (`V$THREAD`). Changes from other instances therefore arrive once their thread checkpoints past them.
+- **RAC** — the redo flush reaches only the connected instance, so with several open redo threads the mining window never passes the lowest thread checkpoint SCN (`V$THREAD`). Changes from every instance therefore arrive once the slowest thread checkpoints past them. A thread checkpoints on a log switch or a full checkpoint, so a quiet instance can hold capture back for as long as it goes without a log switch; a warning names the delay after a minute. Set `ARCHIVE_LAG_TARGET` (for example `ALTER SYSTEM SET ARCHIVE_LAG_TARGET = 60 SCOPE=BOTH`) to force a switch on every thread at that interval, which bounds the latency.
 
 ## Source lag
 

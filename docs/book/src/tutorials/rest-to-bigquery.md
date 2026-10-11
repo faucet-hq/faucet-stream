@@ -75,7 +75,7 @@ pipeline:
   source:
     type: rest
     config:
-      # … as above …
+      # … as above, without max_pages …
       replication_method:
         type: Incremental
         cursor_field: updated_at
@@ -89,7 +89,11 @@ pipeline:
 ```
 
 Now each run records the maximum `updated_at` it saw; the next run resumes from
-that bookmark. Swap the `file` state store for `redis` or `postgres` for shared,
+that bookmark. Drop `max_pages` here: a pass the cap cuts short has not seen the
+rest of the feed, so it cannot record a bookmark and the run fails rather than
+re-reading the same pages forever. Keep it only with `assume_ordered: true`, for a
+feed sorted by `updated_at`, where the largest value read is a safe place to
+resume. Swap the `file` state store for `redis` or `postgres` for shared,
 durable state across machines — see [state](../cookbook/state.md).
 
 > **Tip:** run `faucet schema source rest` and `faucet schema sink bigquery` to

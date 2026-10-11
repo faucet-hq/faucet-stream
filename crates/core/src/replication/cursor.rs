@@ -15,15 +15,18 @@
 //!   replays at most the page that was being written.
 //!
 //! A fingerprint covers the whole row (sorted field names, 128-bit FNV-1a), so
-//! no key column is needed. When more than [`MAX_BOUNDARY_ROWS`] rows share the
-//! boundary value the set is dropped and the next read re-emits every row at
-//! that value: duplicates, never loss.
+//! no key column is needed. Identical rows at the boundary are counted (the
+//! fingerprint repeats in the bookmark), so a late copy of an emitted row is
+//! still delivered. Every row the server returns past the boundary is kept:
+//! the server filtered and ordered it by the column's own type and collation.
+//! When more than [`MAX_BOUNDARY_ROWS`] rows share the boundary value the set
+//! is dropped and the next read re-emits every row at that value: duplicates,
+//! never loss.
 
-use super::{Decimal, Instant, numeric_text};
 use crate::diff::{FNV_BASIS_A, FNV_BASIS_B, fnv1a_64};
 use crate::error::FaucetError;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// The most row fingerprints a bookmark keeps for its boundary value.
 pub const MAX_BOUNDARY_ROWS: usize = 10_000;
@@ -31,8 +34,8 @@ pub const MAX_BOUNDARY_ROWS: usize = 10_000;
 /// A cursor position: the last cursor value emitted and the rows already
 /// emitted at it.
 ///
-/// Stored as `{"value": <cursor>, "boundary": ["<fingerprint>", …]}`;
-/// `"boundary": null` means the set overflowed and every row at `value` is
+/// Stored as `{"value": <cursor>, "boundary": ["<fingerprint>", …]}`, a
+/// fingerprint repeated once per identical row; `"boundary": null` means the set overflowed and every row at `value` is
 /// read again. A bare value (an older or hand-set bookmark) reads as that
 /// value with an empty boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,19 +115,32 @@ impl CursorBookmark {
 pub struct CursorTracker {
     column: String,
     start: Value,
-    start_boundary: Option<HashSet<String>>,
+    /// Copies of each row still to refuse at the starting value.
+    start_boundary: Option<HashMap<String, usize>>,
     value: Value,
-    boundary: Option<HashSet<String>>,
+    boundary: Option<HashMap<String, usize>>,
+    boundary_rows: usize,
     missing: usize,
     overflow_warned: bool,
+}
+
+fn count(items: Vec<String>) -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    for fp in items {
+        *m.entry(fp).or_insert(0) += 1;
+    }
+    m
 }
 
 impl CursorTracker {
     /// Track `column` from `start`.
     pub fn new(column: impl Into<String>, start: CursorBookmark) -> Self {
-        let start_boundary: Option<HashSet<String>> =
-            start.boundary.map(|b| b.into_iter().collect());
+        let start_boundary = start.boundary.map(count);
+        let boundary_rows = start_boundary
+            .as_ref()
+            .map_or(0, |b| b.values().sum::<usize>());
         Self {
+            boundary_rows,
             column: column.into(),
             value: start.value.clone(),
             boundary: start_boundary.clone(),
@@ -135,30 +151,30 @@ impl CursorTracker {
         }
     }
 
-    /// Whether `row` is new. Rows already emitted at the starting value and
-    /// rows provably before it are refused; a row without a cursor value is
-    /// kept (and counted) without moving the position.
+    /// Whether `row` is new. Copies of rows already emitted at the starting
+    /// value are refused, up to the number emitted; a row without a cursor
+    /// value is kept (and counted) without moving the position.
     pub fn admit(&mut self, row: &Value) -> bool {
         let Some(v) = row.get(&self.column).filter(|v| !v.is_null()) else {
             self.missing += 1;
             return true;
         };
         let fingerprint = row_fingerprint(row);
-        if *v == self.start {
-            if self
+        if *v == self.start
+            && let Some(left) = self
                 .start_boundary
-                .as_ref()
-                .is_some_and(|b| b.contains(&fingerprint))
-            {
-                return false;
-            }
-        } else if before(v, &self.start) {
+                .as_mut()
+                .and_then(|b| b.get_mut(&fingerprint))
+                .filter(|n| **n > 0)
+        {
+            *left -= 1;
             return false;
         }
         if *v == self.value {
             if let Some(b) = self.boundary.as_mut() {
-                b.insert(fingerprint);
-                if b.len() > MAX_BOUNDARY_ROWS {
+                *b.entry(fingerprint).or_insert(0) += 1;
+                self.boundary_rows += 1;
+                if self.boundary_rows > MAX_BOUNDARY_ROWS {
                     self.boundary = None;
                     if !self.overflow_warned {
                         self.overflow_warned = true;
@@ -173,7 +189,8 @@ impl CursorTracker {
             }
         } else {
             self.value = v.clone();
-            self.boundary = Some(HashSet::from([fingerprint]));
+            self.boundary = Some(HashMap::from([(fingerprint, 1)]));
+            self.boundary_rows = 1;
         }
         true
     }
@@ -183,7 +200,10 @@ impl CursorTracker {
         CursorBookmark {
             value: self.value.clone(),
             boundary: self.boundary.as_ref().map(|b| {
-                let mut v: Vec<String> = b.iter().cloned().collect();
+                let mut v: Vec<String> = b
+                    .iter()
+                    .flat_map(|(fp, n)| std::iter::repeat_n(fp.clone(), *n))
+                    .collect();
                 v.sort_unstable();
                 v
             }),
@@ -194,27 +214,6 @@ impl CursorTracker {
     pub fn missing(&self) -> usize {
         self.missing
     }
-}
-
-/// Whether `v` orders strictly before `start` by what both hold (numbers or
-/// decimal strings, instants of the same kind, ISO dates). Other values are
-/// left to the server's ordering, whose collation the client cannot see.
-fn before(v: &Value, start: &Value) -> bool {
-    if let (Some(a), Some(b)) = (numeric_text(v), numeric_text(start))
-        && let (Some(a), Some(b)) = (Decimal::parse(&a), Decimal::parse(&b))
-    {
-        return a < b;
-    }
-    let (Value::String(a), Value::String(b)) = (v, start) else {
-        return false;
-    };
-    match (Instant::parse(a), Instant::parse(b)) {
-        (Some(x @ Instant::Zoned(_)), Some(y @ Instant::Zoned(_)))
-        | (Some(x @ Instant::Naive(_)), Some(y @ Instant::Naive(_))) => return x < y,
-        _ => {}
-    }
-    let date = |s: &str| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok();
-    matches!((date(a), date(b)), (Some(x), Some(y)) if x < y)
 }
 
 /// A 128-bit fingerprint of a whole row, independent of field order.
@@ -352,29 +351,40 @@ mod tests {
     }
 
     #[test]
-    fn rows_before_the_start_are_refused_only_when_comparable() {
-        let mut t = tracker(json!("2024-01-02T00:00:00Z"));
-        assert!(!t.admit(&json!({"ts": "2024-01-01T23:00:00+00:00"})));
+    fn rows_the_server_returns_past_the_start_are_kept_whatever_they_look_like() {
+        let mut t = tracker(json!("10"));
         assert!(
-            t.admit(&json!({"ts": "2024-01-02T01:00:00+01:00"})),
-            "same instant"
+            t.admit(&json!({"ts": "9"})),
+            "text order puts '9' after '10'"
         );
-        let mut t = tracker(json!("12.5"));
-        assert!(!t.admit(&json!({"ts": 12})));
-        assert!(t.admit(&json!({"ts": "12.50"})));
-        let mut t = tracker(json!("2024-01-02 00:00:00"));
-        assert!(!t.admit(&json!({"ts": "2024-01-01 10:00:00"})));
-        let mut t = tracker(json!("2024-01-02"));
-        assert!(!t.admit(&json!({"ts": "2024-01-01"})));
+        let mut t = tracker(json!("2024-01-01T20:00:00Z"));
+        assert!(t.admit(&json!({"ts": "2024-01-02T00:00:00+05:00"})));
         let mut t = tracker(json!("b"));
-        assert!(
-            t.admit(&json!({"ts": "A"})),
-            "collation is the server's call"
-        );
-        let mut t = tracker(json!("2024-01-02T00:00:00Z"));
-        assert!(
-            t.admit(&json!({"ts": "2024-01-01 00:00:00"})),
-            "naive vs zoned"
+        assert!(t.admit(&json!({"ts": "A"})));
+    }
+
+    #[test]
+    fn identical_rows_at_the_boundary_are_counted_not_collapsed() {
+        let click = json!({"ts": 10, "kind": "click"});
+        let mut t = tracker(json!(0));
+        assert!(t.admit(&click));
+        let saved = t.bookmark();
+        assert_eq!(saved.boundary.as_ref().unwrap().len(), 1);
+
+        let mut t = CursorTracker::new("ts", saved);
+        assert!(!t.admit(&click), "the copy already emitted");
+        assert!(t.admit(&click), "a second copy committed late");
+        let next = t.bookmark();
+        assert_eq!(next.boundary.as_ref().unwrap().len(), 2);
+
+        let mut t = CursorTracker::new("ts", next.clone());
+        assert!(!t.admit(&click));
+        assert!(!t.admit(&click));
+        assert!(t.admit(&click), "a third copy");
+        assert_eq!(
+            CursorBookmark::from_state(next.to_value()).unwrap(),
+            next,
+            "repeated fingerprints round-trip"
         );
     }
 

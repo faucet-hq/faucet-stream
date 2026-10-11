@@ -192,3 +192,53 @@ async fn an_https_base_never_follows_an_http_job_url() {
     assert!(err.contains("downgrade"), "{err}");
     assert!(plain.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_static_api_key_header_stays_on_the_base_origin() {
+    let (api, other) = two_origins().await;
+    let cfg = next_link_config(&api, Auth::None).header("X-API-Key", "k-secret");
+    assert_eq!(drain(&RestStream::new(cfg).unwrap()).await.len(), 2);
+    let first = &api.received_requests().await.unwrap()[0];
+    assert_eq!(first.headers.get("x-api-key").unwrap(), "k-secret");
+    let foreign = &other.received_requests().await.unwrap()[0];
+    assert!(foreign.headers.get("x-api-key").is_none());
+    assert_eq!(foreign.headers.get("accept").unwrap(), "application/json");
+}
+
+#[tokio::test]
+async fn a_discovery_listing_next_link_to_another_origin_gets_no_credentials() {
+    let api = MockServer::start().await;
+    let other = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/objects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"name": "a"}],
+            "next": format!("{}/objects2", other.uri()),
+        })))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/objects2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"name": "b"}]})))
+        .mount(&other)
+        .await;
+    let mut cfg = RestStreamConfig::new(&api.uri(), "/x")
+        .auth(Auth::Bearer {
+            token: "tok-123".into(),
+        })
+        .header("X-API-Key", "k-secret");
+    cfg.discovery = Some(
+        serde_json::from_value(json!({
+            "list": { "get": "/objects", "items": "$.items[*]", "name": "$.name", "next": "$.next" },
+            "emit": { "config": { "path": "/${name}" } }
+        }))
+        .unwrap(),
+    );
+    let found = RestStream::new(cfg).unwrap().discover().await.unwrap();
+    assert_eq!(found.len(), 2);
+    let first = &api.received_requests().await.unwrap()[0];
+    assert!(first.headers.get("authorization").is_some());
+    let foreign = &other.received_requests().await.unwrap()[0];
+    assert!(foreign.headers.get("authorization").is_none());
+    assert!(foreign.headers.get("x-api-key").is_none());
+}

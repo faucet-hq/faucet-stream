@@ -126,12 +126,13 @@ pub struct RestStreamConfig {
     #[schemars(with = "std::collections::HashMap<String, String>")]
     pub headers: HashMap<String, String>,
     /// Extra hosts that may receive this source's credentials when a
-    /// server-given URL (a next-page link, an async-job URL) points at them.
-    /// Credentials — the `auth` block, a shared provider's placements and any
-    /// `Authorization` / `Cookie` header — are otherwise sent only to the
-    /// scheme, host and port of `base_url`; a link elsewhere is fetched without
-    /// them. An entry is a host (`files.example.com`) or a `*.example.com`
-    /// wildcard. An `https` base never follows a link to plain `http`.
+    /// server-given URL (a next-page link, an async-job URL, a discovery
+    /// listing's next link) points at them. Credentials — the `auth` block and
+    /// a shared provider's placements — are otherwise sent only to the scheme,
+    /// host and port of `base_url`; a link elsewhere is fetched without them
+    /// and with only non-credential static headers (`Accept`, `User-Agent`, …).
+    /// An entry is a host (`files.example.com`) or a `*.example.com` wildcard.
+    /// An `https` base never follows a link to plain `http`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_hosts: Vec<String>,
     /// Static query-string parameters, rendered as `?k=v`. Values honor
@@ -183,10 +184,18 @@ pub struct RestStreamConfig {
     /// Optional cap on pages fetched per pass, across every pagination style.
     /// Unset by default: each pagination style already stops on its own end
     /// signal and loop guards. When the cap cuts a pass short, only a persisted
-    /// cursor bookmark (`persist_cursor`) is kept — a record-derived or window
-    /// bookmark would skip the unread pages, so none is written.
+    /// cursor bookmark (`persist_cursor`) is kept. An incremental or windowed
+    /// pass the cap cuts short fails the run instead — its record-derived or
+    /// window bookmark would skip the unread pages, and keeping none would
+    /// re-read the same pages forever — unless `assume_ordered` is set.
     #[serde(default = "default_max_pages")]
     pub max_pages: Option<usize>,
+    /// The feed returns records in ascending `replication_key` order, so an
+    /// incremental pass that `max_pages` cuts short may persist the largest key
+    /// it read and resume after it next run. Without it such a pass fails the
+    /// run. Ignored for windowed passes and with `persist_cursor`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assume_ordered: bool,
     /// Fixed delay between page requests, in seconds — a politeness knob for
     /// APIs that rate-limit by request frequency. Applied *in addition* to any
     /// `Retry-After` honoured by the retry path.
@@ -766,6 +775,7 @@ impl Default for RestStreamConfig {
             pagination: PaginationStyle::None,
             records_path: None,
             max_pages: None,
+            assume_ordered: false,
             request_delay: None,
             timeout: Some(Duration::from_secs(30)),
             max_retries: 3,
@@ -1293,6 +1303,13 @@ impl RestStreamConfig {
 
     pub fn max_pages(mut self, n: usize) -> Self {
         self.max_pages = Some(n);
+        self
+    }
+
+    /// Declare the feed sorted by `replication_key`; see
+    /// [`RestStreamConfig::assume_ordered`](Self#structfield.assume_ordered).
+    pub fn assume_ordered(mut self, ordered: bool) -> Self {
+        self.assume_ordered = ordered;
         self
     }
 

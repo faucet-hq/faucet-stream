@@ -2455,6 +2455,7 @@ async fn run_one_invocation(
         sql_binds =
             crate::sql_bind::bind_source_query(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
         let (source_before, sink_before) = (source_cfg.clone(), sink_cfg.clone());
+        resolve_xml_body_fields(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut sink_cfg, &fanout_ctx)?;
         let is_fanout = |id: &str| fanout_ctx.contains_key(id);
@@ -3629,6 +3630,25 @@ pub(crate) fn resolve_now_inplace(
     }
 }
 
+/// Resolve fan-out tokens in an `xml` source's request-body fields with
+/// XML-escaped values (#862 M-071); the generic pass then finds no token left
+/// in them.
+fn resolve_xml_body_fields(
+    kind: &str,
+    cfg: &mut Value,
+    ctx: &HashMap<String, Value>,
+) -> CliResult<()> {
+    if kind != "xml" {
+        return Ok(());
+    }
+    for pointer in ["/body", "/soap/body_inner"] {
+        if let Some(Value::String(s)) = cfg.pointer_mut(pointer) {
+            *s = crate::interpolate::interpolate_record_xml(s, ctx)?;
+        }
+    }
+    Ok(())
+}
+
 /// In-place runtime interpolation against a parent-record context. Walks every
 /// string leaf in `value` and replaces `${id.path}` tokens with stringified
 /// values from `ctx`.
@@ -3642,6 +3662,41 @@ fn resolve_inplace(value: &mut Value, ctx: &HashMap<String, Value>) -> CliResult
         Value::Array(a) => a.iter_mut().try_for_each(|v| resolve_inplace(v, ctx)),
         Value::Object(m) => m.values_mut().try_for_each(|v| resolve_inplace(v, ctx)),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod xml_body_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn xml_body_fan_out_values_are_escaped() {
+        let ctx: HashMap<String, Value> =
+            HashMap::from([("customers".into(), json!({"company": "A&B </C><F>"}))]);
+        let mut cfg = json!({
+            "url": "https://x/${customers.company}",
+            "body": "<Q>${customers.company}</Q>",
+            "soap": {"body_inner": "<C>${customers.company}</C>"}
+        });
+        resolve_xml_body_fields("xml", &mut cfg, &ctx).unwrap();
+        assert_eq!(cfg["body"], "<Q>A&amp;B &lt;/C&gt;&lt;F&gt;</Q>");
+        assert_eq!(
+            cfg["soap"]["body_inner"],
+            "<C>A&amp;B &lt;/C&gt;&lt;F&gt;</C>"
+        );
+        assert_eq!(cfg["url"], "https://x/${customers.company}");
+
+        let mut rest = json!({"body": "${customers.company}"});
+        resolve_xml_body_fields("rest", &mut rest, &ctx).unwrap();
+        assert_eq!(rest["body"], "${customers.company}");
+
+        let mut quotes = json!({"body": "<a q=\"${c.v}\"/>"});
+        let ctx = HashMap::from([("c".into(), json!({"v": "x\"'y"}))]);
+        resolve_xml_body_fields("xml", &mut quotes, &ctx).unwrap();
+        assert_eq!(quotes["body"], "<a q=\"x&quot;&apos;y\"/>");
+        let mut missing = json!({"body": "${c.nope}"});
+        assert!(resolve_xml_body_fields("xml", &mut missing, &ctx).is_err());
     }
 }
 

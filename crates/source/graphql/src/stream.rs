@@ -6,7 +6,9 @@ use crate::config::{
 };
 use async_trait::async_trait;
 use base64::Engine as _;
-use faucet_core::replication::{filter_incremental_path, max_replication_value_path, max_value};
+use faucet_core::replication::{
+    filter_incremental_path_inclusive, max_replication_value_path, max_value,
+};
 use faucet_core::util::{self, DEFAULT_ERROR_BODY_MAX_LEN};
 use faucet_core::{
     AuthSpec, Credential, FaucetError, ReplicationKey, ReplicationMethod, SharedAuthProvider,
@@ -551,10 +553,11 @@ impl GraphqlStream {
                     .await?;
                 let mut records = self.extract_records(&body)?;
                 let records_in_page = records.len();
+                let fingerprint = page_fingerprint(&records);
                 pages_fetched += 1;
                 if let Some(key) = &key {
                     if let Some(start) = &start {
-                        let filtered = filter_incremental_path(
+                        let filtered = filter_incremental_path_inclusive(
                             records,
                             key,
                             start,
@@ -623,7 +626,6 @@ impl GraphqlStream {
                         // Advance by the rows the server returned, not the
                         // requested size: a server that clamps the page would
                         // otherwise have rows skipped on every page (API-15).
-                        let fingerprint = page_fingerprint(&body);
                         let repeated = prev_fingerprint == Some(fingerprint);
                         prev_fingerprint = Some(fingerprint);
                         if repeated && records_in_page > 0 {
@@ -955,12 +957,16 @@ fn extract_cursor(body: &Value, path: &str) -> Option<String> {
     }
 }
 
-/// Content fingerprint of a response body, the offset-pagination loop guard
-/// for a server that ignores the offset.
-fn page_fingerprint(body: &Value) -> u64 {
+/// Content fingerprint of a page's extracted records, the offset-pagination
+/// loop guard for a server that ignores the offset. The records, not the body:
+/// an envelope's `extensions` (query cost, request ids) differ on every
+/// response and would never repeat.
+fn page_fingerprint(records: &[Value]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    body.to_string().hash(&mut hasher);
+    for r in records {
+        r.to_string().hash(&mut hasher);
+    }
     hasher.finish()
 }
 

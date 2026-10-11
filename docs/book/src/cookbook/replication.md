@@ -351,7 +351,10 @@ Per-source notes:
 
 - **Postgres** — the publication decides what the slot streams; use
   `FOR TABLES IN SCHEMA …` or `FOR ALL TABLES` so `new_tables: follow` sees new
-  tables.
+  tables. A partitioned table is mirrored as one table: discovery lists the
+  partitioned table, not its partitions, and a change to a partition is routed
+  to it through the record's `partition_root` (with or without
+  `publish_via_partition_root`).
 - **MySQL** — discovery names tables without the database; the binlog's
   `database.table` names are matched to the snapshot connection's database.
   Scope the binlog reader with `include_tables` when the server hosts others.

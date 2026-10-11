@@ -515,6 +515,11 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
             .1
             .push_str(&text);
     }
+    if stack.len() != 1 {
+        return Err(bad(
+            "the document ended inside an open element — the body is truncated or not closed",
+        ));
+    }
     let (root, _) = stack.pop().unwrap_or_default();
     Ok(Value::Object(root))
 }
@@ -528,6 +533,13 @@ mod tests {
     /// needs the whole body would mis-decode silently, so each "no" is pinned.
     mod stream_plan {
         use super::*;
+
+        #[test]
+        fn a_truncated_xml_body_fails_to_parse() {
+            let err = xml_to_json(b"<a><b><c>1</c>").unwrap_err();
+            assert!(err.to_string().contains("truncated"), "{err}");
+            assert!(xml_to_json(b"<a><b>1</b></a>").is_ok());
+        }
 
         fn parse(format: ParseFormat) -> DecodeStep {
             DecodeStep::Parse {

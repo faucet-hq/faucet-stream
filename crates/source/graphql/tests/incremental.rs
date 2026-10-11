@@ -171,7 +171,7 @@ async fn the_client_side_filter_catches_a_server_that_ignores_the_bind() {
     let source = GraphqlStream::new(cfg);
     let records = source.fetch_all().await.unwrap();
     let ids: Vec<u64> = records.iter().map(|r| r["id"].as_u64().unwrap()).collect();
-    assert_eq!(ids, vec![3, 4]);
+    assert_eq!(ids, vec![2, 3, 4], "the row at the bookmark is kept (>=)");
     assert!(
         api.filters
             .lock()

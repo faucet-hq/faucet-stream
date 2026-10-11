@@ -82,7 +82,7 @@ faucet run pipeline.yaml
 | `method` | string | `GET` | HTTP method for the request. |
 | `auth` | `Auth` / `{ ref }` | `none` | Inline `{ type, config }` auth, or a `{ ref: <name> }` pointer to a shared provider. See [Authentication](#authentication). |
 | `headers` | map<string,string> | empty | Static HTTP headers sent on **every** request (data pages, async-job requests, and OData `$metadata` probes). Applied *before* auth, so an auth header of the same name wins on a clash. Values honor `${env:}` / `${param.*}` interpolation and pass through the secrets/redaction boundary. An invalid header name/value is rejected at config load. See [Custom request headers](#custom-request-headers). |
-| `trusted_hosts` | list<string> | empty | Extra hosts (`files.example.com`, or a `*.example.com` wildcard) allowed to receive this source's credentials when a server-given URL — a next-page link or an async-job URL — points at them. Credentials (the `auth` block, a shared provider's placements, an `api_key_query` parameter, and any `Authorization` / `Cookie` / `Proxy-Authorization` header) otherwise go only to the scheme, host and port of `base_url`; a link to any other origin is fetched without them. An `https` base never follows a link to plain `http` (the run fails). |
+| `trusted_hosts` | list<string> | empty | Extra hosts (`files.example.com`, or a `*.example.com` wildcard) allowed to receive this source's credentials when a server-given URL — a next-page link, an async-job URL, or a `discovery.list` next link — points at them. Credentials (the `auth` block, a shared provider's placements and an `api_key_query` parameter) otherwise go only to the scheme, host and port of `base_url`; a link to any other origin is fetched without them, and of the static `headers:` only `Accept`, `Accept-Charset`, `Accept-Encoding`, `Accept-Language`, `Cache-Control`, `Content-Type` and `User-Agent` are sent (an `X-API-Key`-style header may hold a secret). An `https` base never follows a link to plain `http` (the run fails). |
 | `query_params` | map<string,string> | empty | Query parameters added to every request. |
 | `query_params_multi` | map<string,list<string>> | empty | Repeated / array-valued query params, rendered as repeated keys — e.g. `{ "group_by[]": ["api_key_id", "model"] }` → `?group_by[]=api_key_id&group_by[]=model`. Applied alongside `query_params`. |
 | `body` | JSON / null | `null` | JSON request body (sent with `Content-Type: application/json`). |
@@ -120,7 +120,8 @@ the secrets/redaction boundary like any other config string.
 | `records_path` | string / null | `null` | JSONPath expression to extract the record array from each response body (e.g. `$.data[*]`). When unset, the whole body is treated as the record set. |
 | `allow_missing_records_path` | bool | `false` | By default a response in which `records_path` resolves to nothing — the key is absent, not an empty array — fails the run (it is usually an error body served with HTTP 200, or a renamed field) instead of ending pagination green. Set `true` for APIs that omit the records key on an empty result. |
 | `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
-| `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short persists no record-derived or window bookmark (it would skip the unread pages); only a `persist_cursor` bookmark is kept, and a windowed sweep stops at that window. |
+| `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short keeps only a `persist_cursor` bookmark; an incremental or windowed pass it cuts short **fails the run** (a record-derived or window bookmark would skip the unread pages, and keeping none would re-read them every run), unless `assume_ordered` is set. |
+| `assume_ordered` | bool | `false` | The feed returns records in ascending `replication_key` order: an incremental pass `max_pages` cuts short persists the largest key it read and resumes after it next run. Ignored for windowed passes and with `persist_cursor`. |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
 
 **Body & keyset pagination.** Two styles page without a query param or a response token:
@@ -946,7 +947,7 @@ source:
 
 ## Pagination
 
-The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_pages` is an optional cap across all styles; a capped pass persists no bookmark that would skip unread pages.
+The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_pages` is an optional cap across all styles; a capped pass persists no bookmark that would skip unread pages, and an incremental pass it cuts short fails unless `assume_ordered` is set.
 
 | Style (`type`) | Fields | Stops when |
 |----------------|--------|------------|
