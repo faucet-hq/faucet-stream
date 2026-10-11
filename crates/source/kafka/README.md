@@ -329,6 +329,15 @@ embeds the page's offsets bookmark; on resume the pipeline recovers that exact
 position from the sink's watermark and re-anchors the consumer there — nothing
 is re-written, nothing is skipped.
 
+In a [topology](https://faucet-hq.github.io/faucet-stream/cookbook/topology.html#exactly-once-delivery)
+with several sinks, the source orders its bookmarks per partition (a bookmark
+is at or before another when every partition's offset is), so sinks that
+committed different positions resume by position: the source restarts from the
+per-partition minimum and each sink ahead drops, record by record, what its own
+position already covers (by the record's `topic` / `partition` / `offset`). Two
+bookmarks over different partition sets cannot be ordered, and such a resume
+fails rather than guess.
+
 Pair with any idempotent sink (`postgres`, `mysql`, `mssql`, `sqlite`,
 `bigquery`, `iceberg`, `kafka`, `snowflake`, `redis`, `mongodb`) and a durable
 state store:

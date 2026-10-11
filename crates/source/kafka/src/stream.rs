@@ -958,6 +958,18 @@ impl Source for KafkaSource {
         true
     }
 
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        crate::state::position_le(a, b)
+    }
+
+    fn position_min(&self, positions: &[Value]) -> Option<Value> {
+        crate::state::position_min(positions)
+    }
+
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        crate::state::record_covered(record, position)
+    }
+
     fn connector_name(&self) -> &'static str {
         "kafka"
     }
