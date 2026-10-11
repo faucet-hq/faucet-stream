@@ -976,7 +976,7 @@ cookbook](../cookbook/backfill.md) for the model.
 - **`from`** / **`to`** (required) — RFC3339 or `YYYY-MM-DD` (midnight in
   `timezone`), half-open.
 - **`window`** / **`timezone`** — default to the config's `backfill:` block.
-- **`name`** — base run name; unit runs are `{name}-backfill-{unit}` (the
+- **`name`** — base run name; unit runs are `{name}-backfill-{range_hash}-{unit}` (the
   pipeline `name` is rewritten per unit so state keys never touch the live
   bookmark). `delivery` is forced to `at_least_once`; `timeout_secs` applies
   per unit.

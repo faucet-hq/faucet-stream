@@ -7,7 +7,7 @@
 //! `shard_progress` (a single wide window becomes one sharded run).
 //!
 //! Per unit, the submitted document is rewritten: `${backfill.*}` tokens are
-//! substituted, the pipeline `name` is suffixed (`{name}-backfill-{unit}`) so
+//! substituted, the pipeline `name` is suffixed (`{name}-backfill-{range_hash}-{unit}`) so
 //! unit state keys never touch the forward-sync bookmark, and `delivery` is
 //! forced to `at_least_once` (pair with `write_mode: upsert` for idempotent
 //! replays). Deterministic idempotency keys (`backfill:{hash}:{unit}`) make
@@ -54,7 +54,7 @@ pub struct BackfillSubmitRequest {
     /// the config's `backfill.timezone`, else UTC.
     #[serde(default)]
     pub timezone: Option<String>,
-    /// Base run name; unit runs are named `{name}-backfill-{unit}`. Defaults
+    /// Base run name; unit runs are named `{name}-backfill-{range_hash}-{unit}`. Defaults
     /// to the config's `name`.
     #[serde(default)]
     pub name: Option<String>,
@@ -258,7 +258,7 @@ pub async fn submit_backfill(
             });
             continue;
         }
-        let unit_name = format!("{base_name}-backfill-{}", unit.id);
+        let unit_name = unit_run_name(&base_name, &hash, &unit.id);
         let unit_doc = rewrite_unit_doc(&doc, &unit, &unit_name)
             .map_err(|e| ServeError::BadConfig(e.to_string()))?;
         let mut labels = req.labels.clone();
@@ -374,7 +374,7 @@ async fn guard_prior_range(
                     .await
                     .map_err(internal)?;
                 for unit in units {
-                    let unit_name = format!("{base_name}-backfill-{}", unit.id);
+                    let unit_name = unit_run_name(base_name, hash, &unit.id);
                     node_store
                         .delete(&crate::executor::build_state_key(
                             &unit_name, &node.id, None,
@@ -408,9 +408,15 @@ async fn guard_prior_range(
     Ok(generation)
 }
 
+/// The run (and pipeline) name of one unit: the range hash keeps the units of
+/// two overlapping ranges apart, so neither resumes the other's bookmark.
+fn unit_run_name(base: &str, range_hash: &str, unit: &str) -> String {
+    format!("{base}-backfill-{range_hash}-{unit}")
+}
+
 /// Rewrite the submitted document for one unit: substitute `${backfill.*}`
 /// tokens across the whole document, namespace the pipeline `name` (so unit
-/// state keys are `{name}-backfill-{unit}::…`, never the live keys), and
+/// state keys are `{name}-backfill-{range_hash}-{unit}::…`, never the live keys), and
 /// force `delivery: at_least_once`. Pure.
 fn rewrite_unit_doc(
     doc: &Value,
@@ -431,6 +437,14 @@ fn rewrite_unit_doc(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unit_names_differ_between_ranges() {
+        let a = unit_run_name("orders", &range_hash("a"), "20260615T000000Z");
+        let b = unit_run_name("orders", &range_hash("b"), "20260615T000000Z");
+        assert_ne!(a, b);
+        assert!(a.starts_with("orders-backfill-") && a.ends_with("-20260615T000000Z"));
+    }
 
     #[test]
     fn rewrite_substitutes_namespaces_and_forces_at_least_once() {
