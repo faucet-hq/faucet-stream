@@ -13,11 +13,12 @@ use async_trait::async_trait;
 use faucet_core::shard::{HashShard, ShardSpec, parse_hash_shard, plan_hash_shards};
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::{StreamExt, TryStreamExt, stream};
-use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
+use object_store::{ObjectStore, ObjectStoreExt as _};
 use object_store::path::Path as ObjectPath;
+use faucet_core::file_format::parquet_io::{RangeRead, RangedParquetReader};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use serde_json::Value;
 
 use crate::config::{ParquetLocation, ParquetS3Config, ParquetSourceConfig};
@@ -150,13 +151,35 @@ impl ParquetSource {
                 self.decode(file, &display).await
             }
             FileTarget::S3(path) => {
-                let store = self.s3_store.as_ref().ok_or_else(|| {
-                    FaucetError::Source("parquet source: S3 store not initialised".into())
-                })?;
-                let reader = ParquetObjectReader::new(store.clone(), path.clone());
+                let reader = self.s3_reader(path, &display).await?;
                 self.decode(reader, &display).await
             }
         }
+    }
+
+    /// A ranged reader over an S3 object, every read pinned to the ETag the
+    /// `head` saw, so an object replaced mid-read fails instead of mixing row
+    /// groups from two versions.
+    async fn s3_reader(
+        &self,
+        path: &object_store::path::Path,
+        display: &str,
+    ) -> Result<RangedParquetReader<PinnedRange>, FaucetError> {
+        let store = self.s3_store.as_ref().ok_or_else(|| {
+            FaucetError::Source("parquet source: S3 store not initialised".into())
+        })?;
+        let meta = store.head(path).await.map_err(|e| {
+            FaucetError::Source(format!("failed to stat parquet object '{display}': {e}"))
+        })?;
+        Ok(RangedParquetReader::new(
+            PinnedRange {
+                store: store.clone(),
+                path: path.clone(),
+                etag: meta.e_tag,
+            },
+            meta.size,
+            display,
+        ))
     }
 
     async fn decode<R>(&self, reader: R, display: &str) -> Result<FileOutput, FaucetError>
@@ -249,14 +272,47 @@ impl ParquetSource {
                 Ok((stream, schema, display))
             }
             FileTarget::S3(path) => {
-                let store = self.s3_store.as_ref().ok_or_else(|| {
-                    FaucetError::Source("parquet source: S3 store not initialised".into())
-                })?;
-                let reader = ParquetObjectReader::new(store.clone(), path.clone());
+                let reader = self.s3_reader(path, &display).await?;
                 let (stream, schema) = self.build_batch_stream(reader, &display).await?;
                 Ok((stream, schema, display))
             }
         }
+    }
+}
+
+/// Byte ranges of one object, each read carrying the ETag the `head` saw as
+/// `If-Match`.
+struct PinnedRange {
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+    etag: Option<String>,
+}
+
+impl RangeRead for PinnedRange {
+    fn read_range(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'_, Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>>
+    {
+        use futures::FutureExt as _;
+        async move {
+            let opts = object_store::GetOptions {
+                if_match: self.etag.clone(),
+                range: Some(object_store::GetRange::Bounded(range)),
+                ..Default::default()
+            };
+            let err = |e: object_store::Error| match e {
+                object_store::Error::Precondition { .. } => FaucetError::Source(format!(
+                    "parquet object '{}' was replaced while it was being read (its ETag no \
+                     longer matches); rerun to read the new version",
+                    self.path
+                )),
+                e => FaucetError::Source(format!("parquet object '{}': {e}", self.path)),
+            };
+            let got = self.store.get_opts(&self.path, opts).await.map_err(err)?;
+            got.bytes().await.map_err(err)
+        }
+        .boxed()
     }
 }
 
@@ -770,6 +826,31 @@ fn schema_mismatch_message_pair(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ranged_reads_are_pinned_to_the_etag_the_head_saw() {
+        use super::*;
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjectPath::from("d/o.parquet");
+        store.put(&path, b"0123456789".to_vec().into()).await.unwrap();
+        let etag = store.head(&path).await.unwrap().e_tag;
+        let mut pinned = PinnedRange {
+            store: store.clone(),
+            path: path.clone(),
+            etag,
+        };
+        assert_eq!(&pinned.read_range(2..5).await.unwrap()[..], b"234");
+        store.put(&path, b"abcdefghij".to_vec().into()).await.unwrap();
+        let err = pinned.read_range(2..5).await.unwrap_err().to_string();
+        assert!(err.contains("was replaced"), "{err}");
+        let mut missing = PinnedRange {
+            store,
+            path: ObjectPath::from("d/missing"),
+            etag: None,
+        };
+        let err = missing.read_range(0..1).await.unwrap_err().to_string();
+        assert!(err.contains("d/missing"), "{err}");
+    }
+
     #[test]
     fn markers_and_hidden_objects_are_not_data() {
         use super::is_data_object;

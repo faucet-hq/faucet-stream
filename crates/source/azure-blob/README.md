@@ -151,7 +151,9 @@ blob — a 213 MiB blob streams in under 10 MiB on the row path and the columnar
 path alike. A blob whose resolved `compression` is a codec is not randomly
 addressable, so it is the one case still fetched whole and decoded on a
 blocking thread. A short range read is an error naming the blob, never a
-truncated decode.
+truncated decode, and every range read carries the blob's ETag (as the first
+metadata read saw it) as an `If-Match` precondition, so a blob overwritten
+mid-read fails the run instead of decoding a splice of two versions.
 
 `parquet.columns` projects top-level columns before any row group is read, so
 unread columns are never transferred; an empty list is refused at
