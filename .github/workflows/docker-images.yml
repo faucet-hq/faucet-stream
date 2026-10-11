@@ -14,8 +14,9 @@ name: Docker images
 #   - manual with `release: X.Y.Z`: publishes THIS commit's build under that
 #     release's tags (`:<X.Y.Z>-<profile>`, and `:latest` / `:<X.Y.Z>` for
 #     full), so a release can be re-imaged after an image-only fix (#845). It
-#     refuses unless this commit's faucet-cli version is X.Y.Z, so a tag never
-#     names a binary of another version.
+#     refuses unless this commit's faucet-cli version is X.Y.Z and it differs
+#     from the `faucet-cli-vX.Y.Z` tag only in image-build files (Dockerfile,
+#     .github, scripts, deploy, docs), so a tag never names another binary.
 #
 # Every image is built and smoke-tested locally first (it starts; `full`
 # carries its features and loads the Oracle client);
@@ -30,7 +31,7 @@ on:
         type: boolean
         default: false
       release:
-        description: "Publish this commit under release X.Y.Z's tags (its faucet-cli version must be X.Y.Z); empty = no version tags"
+        description: "Publish this commit under release X.Y.Z's tags (it may differ from faucet-cli-vX.Y.Z only in image-build files); empty = no version tags"
         type: string
         default: ""
   release:
@@ -96,6 +97,18 @@ jobs:
           v="$(sed -n 's/^version = "\(.*\)"$/\1/p' cli/Cargo.toml | head -1)"
           if [ "$v" != "$RELEASE" ]; then
             echo "::error::this commit's faucet-cli is $v, not $RELEASE; run the workflow on a commit of that version"
+            exit 1
+          fi
+          tag="faucet-cli-v$RELEASE"
+          if ! git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; then
+            echo "::error::release tag $tag does not exist"
+            exit 1
+          fi
+          changed="$(git diff --name-only "$tag" HEAD -- . \
+            ':!Dockerfile' ':!.dockerignore' ':!.github' ':!scripts' ':!deploy' ':!docs')"
+          if [ -n "$changed" ]; then
+            echo "::error::this commit changes more than image-build files since $tag, so its binary is not release $RELEASE:"
+            echo "$changed"
             exit 1
           fi
 
