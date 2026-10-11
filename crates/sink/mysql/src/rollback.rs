@@ -59,7 +59,8 @@ impl JournalColumn {
     }
 
     /// The value as it goes into the before-image, typed so the restore binds
-    /// it back exactly: binary as base64 (the form every faucet source emits,
+    /// it back exactly: binary as unwrapped base64 (`TO_BASE64` breaks lines
+    /// every 76 characters; the form every faucet source emits,
     /// decoded by the insert path for binary columns), BIT as its unsigned
     /// integer, DECIMAL as its exact text — `JSON_OBJECT` alone renders binary
     /// as `"base64:typeNN:…"` text and DECIMAL as a JSON number that is parsed
@@ -68,7 +69,7 @@ impl JournalColumn {
         let q = quote_ident_mysql(&self.name);
         match self.data_type.as_str() {
             "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => {
-                format!("TO_BASE64({q})")
+                format!("REPLACE(TO_BASE64({q}), CHAR(10 USING ascii), '')")
             }
             "bit" => format!("CAST({q} AS UNSIGNED)"),
             "decimal" => format!("CAST({q} AS CHAR)"),
@@ -457,7 +458,12 @@ impl MysqlSink {
         let restored = if restores.is_empty() {
             0
         } else {
-            self.insert_auto_map_with_conflict(&mut *conn, &restores, Some(key))
+            self.insert_auto_map_with_conflict(
+                &mut *conn,
+                &restores,
+                Some(key),
+                crate::config::BinaryEncoding::Base64,
+            )
                 .await? as u64
         };
         sqlx::query(&journal_sql().delete_table())
@@ -674,7 +680,8 @@ mod tests {
                 col("g", "int", "STORED GENERATED"),
                 col("ts", "timestamp", "DEFAULT_GENERATED"),
             ]),
-            "CAST(JSON_OBJECT('b', TO_BASE64(`b`), 'f', CAST(`f` AS UNSIGNED), \
+            "CAST(JSON_OBJECT('b', REPLACE(TO_BASE64(`b`), CHAR(10 USING ascii), ''), \
+             'f', CAST(`f` AS UNSIGNED), \
              'd', CAST(`d` AS CHAR), 'ts', `ts`) AS CHAR)"
         );
     }

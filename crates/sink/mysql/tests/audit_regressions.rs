@@ -372,3 +372,188 @@ async fn keyed_and_json_column_paths_of_every_write_entry_point() {
         vec!["2"]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_review_862_regressions() {
+    let (_c, url) = start_mysql().await;
+    let pool = sqlx::MySqlPool::connect(&url).await.expect("pool");
+
+    // H-10: a blob longer than 57 bytes (TO_BASE64 wraps at 76 characters)
+    // comes back byte-for-byte from a rollback.
+    exec(
+        &pool,
+        "CREATE TABLE blobs (id INT PRIMARY KEY, b BLOB, _faucet_run_id VARCHAR(64))",
+    )
+    .await;
+    exec(
+        &pool,
+        "INSERT INTO blobs VALUES (1, REPEAT(X'00FF7A', 40), 'r0')",
+    )
+    .await;
+    let original = texts(&pool, "SELECT HEX(b) FROM blobs").await;
+    let sink = MysqlSink::new(journaled(
+        config(&url, "blobs", WriteMode::Upsert, &["id"]),
+        "rb",
+        false,
+    ))
+    .await
+    .unwrap();
+    sink.write_batch(&[json!({"id": 1, "b": "AQ==", "_faucet_run_id": "rb"})])
+        .await
+        .unwrap();
+    let out = sink
+        .rollback_run("rb", &force(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert!(out.applied);
+    assert_eq!(texts(&pool, "SELECT HEX(b) FROM blobs").await, original);
+
+    // M-047: a delete of "Bob" followed by an upsert of "bob" (equal under the
+    // default collation) keeps the re-inserted row.
+    exec(
+        &pool,
+        "CREATE TABLE people (email VARCHAR(191) PRIMARY KEY, name VARCHAR(20))",
+    )
+    .await;
+    exec(&pool, "INSERT INTO people VALUES ('Bob@x.com', 'old')").await;
+    let mut c = config(&url, "people", WriteMode::Upsert, &["email"]);
+    c.write.delete_marker = Some(faucet_core::DeleteMarker {
+        field: "__op".into(),
+        values: vec!["d".into()],
+    });
+    let sink = MysqlSink::new(c).await.unwrap();
+    let page = [
+        json!({"email": "Bob@x.com", "__op": "d"}),
+        json!({"email": "bob@x.com", "__op": "u", "name": "B"}),
+    ];
+    sink.write_batch(&page).await.unwrap();
+    assert_eq!(
+        texts(&pool, "SELECT CONCAT(email, '/', name) FROM people").await,
+        vec!["bob@x.com/B"]
+    );
+    exec(&pool, "INSERT INTO people VALUES ('Carl@x.com', 'old')").await;
+    let page = [
+        json!({"email": "Carl@x.com", "__op": "d"}),
+        json!({"email": "carl@x.com", "__op": "u", "name": "C"}),
+    ];
+    let out = sink.write_batch_partial(&page).await.unwrap();
+    assert!(out.iter().all(Result::is_ok));
+    exec(&pool, "INSERT INTO people VALUES ('Dee@x.com', 'old')").await;
+    let page = [
+        json!({"email": "Dee@x.com", "__op": "d"}),
+        json!({"email": "dee@x.com", "__op": "u", "name": "D"}),
+    ];
+    sink.write_batch_idempotent(&page, "people", &faucet_core::format_token(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        texts(&pool, "SELECT CONCAT(email, '/', name) FROM people ORDER BY email").await,
+        vec!["bob@x.com/B", "carl@x.com/C", "dee@x.com/D"]
+    );
+
+    // M-064: `binary_encoding` makes binary columns deterministic.
+    exec(&pool, "CREATE TABLE tok (id INT PRIMARY KEY, t VARBINARY(64))").await;
+    let text = MysqlSink::new(
+        config(&url, "tok", WriteMode::Append, &[])
+            .with_binary_encoding(faucet_sink_mysql::BinaryEncoding::Text),
+    )
+    .await
+    .unwrap();
+    text.write_batch(&[json!({"id": 1, "t": "abcd"})])
+        .await
+        .unwrap();
+    let strict = MysqlSink::new(
+        config(&url, "tok", WriteMode::Append, &[])
+            .with_binary_encoding(faucet_sink_mysql::BinaryEncoding::Base64),
+    )
+    .await
+    .unwrap();
+    strict
+        .write_batch(&[json!({"id": 2, "t": "AQ=="})])
+        .await
+        .unwrap();
+    let err = strict
+        .write_batch(&[json!({"id": 3, "t": "abc"})])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not base64"), "{err}");
+    assert_eq!(
+        texts(&pool, "SELECT HEX(t) FROM tok ORDER BY id").await,
+        vec!["61626364", "01"]
+    );
+
+    // M-042: overwriting a self-referencing table, children before parents.
+    exec(
+        &pool,
+        "CREATE TABLE cat (id INT PRIMARY KEY, parent_id INT, \
+         CONSTRAINT fk_cat_parent FOREIGN KEY (parent_id) REFERENCES cat(id))",
+    )
+    .await;
+    exec(&pool, "INSERT INTO cat VALUES (1, NULL), (2, 1)").await;
+    let ovw = || config(&url, "cat", WriteMode::Overwrite, &[]);
+    let sink = MysqlSink::new(ovw()).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[
+        json!({"id": 10, "parent_id": 11}),
+        json!({"id": 11, "parent_id": null}),
+    ])
+    .await
+    .unwrap();
+    MysqlSink::new(ovw())
+        .await
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .unwrap();
+    assert_eq!(
+        texts(&pool, "SELECT CAST(id AS CHAR) FROM cat ORDER BY id").await,
+        vec!["10", "11"]
+    );
+    let sink = MysqlSink::new(ovw()).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[json!({"id": 20, "parent_id": 99})])
+        .await
+        .unwrap();
+    let err = MysqlSink::new(ovw())
+        .await
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("fk_cat_parent"), "{err}");
+    assert_eq!(
+        texts(&pool, "SELECT CAST(id AS CHAR) FROM cat ORDER BY id").await,
+        vec!["10", "11"],
+        "a broken key leaves the target as it was"
+    );
+    let checks: i64 = sqlx::query_scalar("SELECT @@SESSION.foreign_key_checks")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(checks, 1);
+
+    // M-065: relaxing NOT NULL keeps a BIT literal default.
+    exec(
+        &pool,
+        "CREATE TABLE flags (id INT, flag BIT(1) NOT NULL DEFAULT b'1')",
+    )
+    .await;
+    let sink = MysqlSink::new(config(&url, "flags", WriteMode::Append, &[]))
+        .await
+        .unwrap();
+    sink.evolve_schema(&SchemaEvolution {
+        relax_nullability: vec!["flag".into()],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        texts(
+            &pool,
+            "SELECT CONCAT(CAST(IS_NULLABLE AS CHAR), '/', CAST(COLUMN_DEFAULT AS CHAR)) \
+             FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'flags' AND COLUMN_NAME = 'flag'"
+        )
+        .await,
+        vec!["YES/b'1'"]
+    );
+}
