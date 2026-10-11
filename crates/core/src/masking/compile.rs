@@ -44,6 +44,15 @@ impl CompiledMasking {
             r.fields.contains(name) || r.field_pattern.as_ref().is_some_and(|p| p.is_match(name))
         })
     }
+
+    /// Whether a value-detector rule can match a non-string value (a card
+    /// number held as an integer), so the pass may re-type a column only on
+    /// the pages where such a value happens to appear.
+    pub(crate) fn retypes_by_value(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.value_detector.is_some_and(super::detect::matches_numbers))
+    }
 }
 
 /// One compiled rule: its matchers plus the action to apply.
@@ -199,6 +208,30 @@ fn compile_rule(rule: &MaskRule, index: usize) -> Result<CompiledRule, FaucetErr
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retypes_by_value_only_for_number_matching_detectors() {
+        let with = |det: &str| {
+            let s = spec(json!({"rules": [
+                {"match": {"fields": ["id"]}, "action": {"type": "hash"}},
+                {"match": {"value_detector": det}, "action": {"type": "hash"}}
+            ]}));
+            CompiledMasking::compile(&s).unwrap().retypes_by_value()
+        };
+        assert!(with("credit_card"));
+        assert!(with("phone_loose"));
+        for det in ["email", "ssn", "phone", "ipv4"] {
+            assert!(!with(det), "{det}");
+        }
+        let name_only = spec(json!({"rules": [
+            {"match": {"field_pattern": "card"}, "action": {"type": "hash"}}
+        ]}));
+        assert!(
+            !CompiledMasking::compile(&name_only)
+                .unwrap()
+                .retypes_by_value()
+        );
+    }
 
     #[test]
     fn a_phone_rule_compiles_and_warns_once() {

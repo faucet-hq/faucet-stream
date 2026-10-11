@@ -126,7 +126,7 @@ The `action` block is tagged by `type`:
 
 All detectors are **conservative** — fully anchored full-string regexes — so
 false positives stay rare. They run on string values; a JSON number is only
-checked by `credit_card`, and booleans never match. This matters because masking silently rewrites
+checked by `credit_card` and `phone_loose`, and booleans never match. This matters because masking silently rewrites
 data: a false positive is a data-quality bug, not just noise.
 
 | `value_detector` | Matches |
@@ -142,6 +142,15 @@ data: a false positive is a data-quality bug, not just noise.
 policy that relied on it to catch bare digit runs or national formats now lets
 them through. A policy with a `phone` rule logs a warning when it compiles; switch
 the rule to `phone_loose` to keep the old coverage.
+
+**Arrow (columnar) runs:** when the source and sink both move Arrow batches,
+masking runs on the batch and a column a name-based rule rewrites is widened to
+a string column from the first page. A `credit_card` or `phone_loose` rule can
+instead turn an integer column into strings only on the pages that happen to
+hold a matching number, which would change the column's type partway through
+the run. A policy with either rule (for that sink) therefore makes the run take
+the row path: the output is the same, without the columnar speed-up. To keep a
+columnar run, match the column by name (`fields` / `field_pattern`) instead.
 
 ## Determinism & joinability
 

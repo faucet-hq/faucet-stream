@@ -27,14 +27,17 @@ pub fn detects(detector: Detector, value: &str) -> bool {
 pub fn detects_value(detector: Detector, value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(s) => detects(detector, s),
-        serde_json::Value::Number(n) if detector == Detector::CreditCard => {
-            n.as_u64().is_some_and(|u| is_credit_card(&u.to_string()))
-        }
-        serde_json::Value::Number(n) if detector == Detector::PhoneLoose => {
-            n.as_u64().is_some_and(|u| is_phone_loose(&u.to_string()))
-        }
+        serde_json::Value::Number(n) if matches_numbers(detector) => n
+            .as_u64()
+            .is_some_and(|u| detects(detector, &u.to_string())),
         _ => false,
     }
+}
+
+/// Whether `detector` can match a JSON number, so a rule using it may turn a
+/// numeric value into a string.
+pub(crate) fn matches_numbers(detector: Detector) -> bool {
+    matches!(detector, Detector::CreditCard | Detector::PhoneLoose)
 }
 
 fn email_re() -> &'static Regex {
@@ -169,6 +172,30 @@ fn luhn_valid(digits: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_number_matching_detectors_match_numbers() {
+        let numbers = [
+            serde_json::json!(4111111111111111u64),
+            serde_json::json!(4155552671u64),
+        ];
+        for det in [
+            Detector::Email,
+            Detector::CreditCard,
+            Detector::Ssn,
+            Detector::Phone,
+            Detector::Ipv4,
+            Detector::PhoneLoose,
+        ] {
+            let hit = numbers.iter().any(|n| detects_value(det, n));
+            assert_eq!(hit, matches_numbers(det), "{det}");
+        }
+        assert!(!detects_value(Detector::CreditCard, &serde_json::json!(-4)));
+        assert!(!detects_value(
+            Detector::CreditCard,
+            &serde_json::json!(1.5)
+        ));
+    }
 
     #[test]
     fn phone_loose_keeps_the_broad_matcher() {
