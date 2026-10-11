@@ -14,6 +14,20 @@ pub(crate) struct XaId {
     pub bqual: Vec<u8>,
 }
 
+impl std::fmt::Display for XaId {
+    /// The form `XA COMMIT` / `XA ROLLBACK` accept: `X'gtrid',X'bqual',formatID`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        write!(
+            f,
+            "X'{}',X'{}',{}",
+            hex(&self.gtrid),
+            hex(&self.bqual),
+            self.format_id
+        )
+    }
+}
+
 /// What a `QueryEvent` statement means for the transaction stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QueryKind {

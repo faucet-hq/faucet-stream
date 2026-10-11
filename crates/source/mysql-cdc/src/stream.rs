@@ -322,7 +322,13 @@ impl MysqlCdcSource {
             let mut payload_end: Option<u64> = None;
             let mut txid: u64 = 0;
             // Committed transactions waiting to become pages (#789 SQL-118).
-            let mut pages = PageBuilder::new(batch_size, PAGE_MAX_AGE, self.config.max_staged_records);
+            let mut pages = PageBuilder::new(
+                batch_size,
+                PAGE_MAX_AGE,
+                Some(self.config.max_staged_records.unwrap_or(DEFAULT_XA_HELD_RECORDS)),
+            );
+            let mut xa_warned: std::collections::BTreeSet<crate::query::XaId> =
+                std::collections::BTreeSet::new();
             let mut last_event = std::time::Instant::now();
 
             // emit!(ready) — yield each finished page with its bookmark.
@@ -482,7 +488,11 @@ impl MysqlCdcSource {
                                     // XA ROLLBACK; until then nothing after it
                                     // may be bookmarked (#789 SQL-59).
                                     pages
-                                        .prepare(xid, std::mem::take(&mut buffer))
+                                        .prepare(
+                                            xid,
+                                            std::mem::take(&mut buffer),
+                                            std::time::Instant::now(),
+                                        )
                                         .map_err(FaucetError::Source)?;
                                     txid = txid.wrapping_add(1);
                                 }
@@ -567,6 +577,12 @@ impl MysqlCdcSource {
                         if let Some(e) = pages.take_error() {
                             Err(FaucetError::Source(e))?;
                         }
+                        if let Some((xid, age)) = pages.undecided(std::time::Instant::now())
+                            && let Some(msg) = xa_hold_warning(xid, age)
+                            && xa_warned.insert(xid.clone())
+                        {
+                            tracing::warn!("{msg}");
+                        }
                         if pages.due(std::time::Instant::now()) {
                             emit!(pages.take());
                         }
@@ -582,6 +598,16 @@ impl MysqlCdcSource {
                     // redelivers it from the last persisted bookmark next run.
                     Ok(None) | Err(_) => {
                         emit!(pages.take());
+                        if let Some((xid, age)) = pages.undecided(std::time::Instant::now()) {
+                            tracing::warn!(
+                                xid = %xid,
+                                undecided_secs = age.as_secs(),
+                                "mysql-cdc: cycle ended with an undecided XA transaction; the \
+                                 transactions after its prepare are re-read next cycle. If it \
+                                 stays prepared, decide it (XA RECOVER, then XA COMMIT / XA \
+                                 ROLLBACK)"
+                            );
+                        }
                         break;
                     }
                 }
@@ -825,6 +851,28 @@ fn build_request<'r>(
 
 /// How long a committed transaction may wait for its page to fill.
 const PAGE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Records held behind an undecided XA transaction when `max_staged_records`
+/// is unset: an orphaned prepared transaction must not grow memory forever.
+const DEFAULT_XA_HELD_RECORDS: usize = 1_000_000;
+
+/// How long an undecided XA transaction may hold the stream back before a
+/// warning names it.
+const XA_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The warning for an XA transaction undecided for `age`, once past
+/// [`XA_WARN_AFTER`].
+fn xa_hold_warning(xid: &crate::query::XaId, age: std::time::Duration) -> Option<String> {
+    (age >= XA_WARN_AFTER).then(|| {
+        format!(
+            "mysql-cdc: XA transaction {xid} has been prepared but undecided for {}s; every \
+             later transaction is held back and the bookmark cannot move past it. If its \
+             coordinator is gone, find it with XA RECOVER and run XA COMMIT {xid} or XA \
+             ROLLBACK {xid}",
+            age.as_secs()
+        )
+    })
+}
 
 /// The key columns of a delete's before-image, for `include_columns: false`
 /// (the whole image when the table declares no primary key).
@@ -1186,6 +1234,20 @@ fn interval_covered(have: &[(u64, u64)], lo: u64, hi: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_undecided_xa_is_named_once_it_has_held_the_stream_for_a_minute() {
+        let xid = crate::query::XaId {
+            format_id: 1,
+            gtrid: b"g".to_vec(),
+            bqual: Vec::new(),
+        };
+        assert!(super::xa_hold_warning(&xid, std::time::Duration::from_secs(59)).is_none());
+        let msg = super::xa_hold_warning(&xid, std::time::Duration::from_secs(61)).unwrap();
+        assert!(msg.contains("X'67',X'',1"), "{msg}");
+        assert!(msg.contains("61s"), "{msg}");
+        assert!(msg.contains("XA RECOVER"), "{msg}");
+    }
 
     #[test]
     fn routes_by_schema_table() {

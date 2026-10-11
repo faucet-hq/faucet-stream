@@ -86,7 +86,8 @@ pub struct MysqlCdcSourceConfig {
     #[schemars(with = "u64")]
     pub idle_timeout: Duration,
     /// Max records buffered for a single in-progress transaction before abort.
-    /// `None` = unbounded.
+    /// `None` = unbounded. Also caps the rows held behind an undecided XA
+    /// transaction, which default to 1,000,000 when this is unset.
     #[serde(default)]
     pub max_staged_records: Option<usize>,
     /// Advisory per-page record count. `0` = accumulate all txns into one page.
