@@ -152,12 +152,15 @@ pub(crate) fn member_seeds(
 /// without a bookmark seek are checked (a seek is clamped on its own); without
 /// this, librdkafka resets such a partition to `auto.offset.reset` and skips
 /// the still-retained backlog.
+/// `(topic, partition, low watermark, records lost)`.
+pub(crate) type Clamp = (String, i32, i64, u64);
+
 pub(crate) fn committed_clamps(
     assigned: &[(String, i32)],
     committed: &HashMap<(String, i32), Option<i64>>,
     seeks: &HashMap<(String, i32), i64>,
     lows: &HashMap<(String, i32), i64>,
-) -> Vec<(String, i32, i64, u64)> {
+) -> Vec<Clamp> {
     let mut out = Vec::new();
     for tp in assigned {
         if seeks.contains_key(tp) {
@@ -445,7 +448,7 @@ impl BookmarkContext {
         consumer: &BaseConsumer<BookmarkContext>,
         tpl: &TopicPartitionList,
         applied: &[(String, i32, i64)],
-    ) -> (Vec<(String, i32, i64)>, Vec<(String, i32, i64, u64)>) {
+    ) -> (Vec<(String, i32, i64)>, Vec<Clamp>) {
         let assigned: Vec<(String, i32)> = tpl
             .elements()
             .into_iter()

@@ -135,16 +135,16 @@ pub(crate) fn chunk_prepared(
     chunks
 }
 
+/// Per-input-index publish outcomes.
+pub(crate) type Outcomes = BTreeMap<usize, Result<(), FaucetError>>;
+
 /// Hold back the messages whose ordering key already failed in an earlier
 /// chunk: they are reported failed without being published, so none reaches
 /// the topic ahead of the failed one (#862 M-083). Pure.
 pub(crate) fn hold_failed_keys(
     chunk: Vec<(usize, Prepared)>,
     failed_keys: &HashSet<String>,
-) -> (
-    Vec<(usize, Prepared)>,
-    BTreeMap<usize, Result<(), FaucetError>>,
-) {
+) -> (Vec<(usize, Prepared)>, Outcomes) {
     let mut send = Vec::with_capacity(chunk.len());
     let mut held = BTreeMap::new();
     for (index, p) in chunk {
