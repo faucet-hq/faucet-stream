@@ -1017,3 +1017,33 @@ async fn a_range_column_is_read_as_a_string() {
     assert!(ids[0].is_string());
     assert_eq!(ids[0], ids[1], "the fallback reuses the requestId");
 }
+
+#[tokio::test]
+async fn jobs_query_requests_integer_microsecond_timestamps() {
+    // #862 M-052: the open-ended SCD2 sentinel survives exactly.
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "schema": {"fields": [{"name": "valid_to", "type": "TIMESTAMP"}]},
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-ts"},
+            "rows": [{"f": [{"v": "253402300799999999"}]}],
+        })))
+        .mount(&server)
+        .await;
+    let (src, _f) = build_source(&server, default_config()).await;
+    let rows = src.fetch_all().await.unwrap();
+    assert_eq!(rows, vec![json!({"valid_to": "9999-12-31T23:59:59.999999Z"})]);
+    let reqs = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(
+        &reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/queries"))
+            .expect("jobs.query")
+            .body,
+    )
+    .unwrap();
+    assert_eq!(body["formatOptions"]["useInt64Timestamp"], json!(true));
+}

@@ -445,6 +445,18 @@ fn table_descriptor(
     descriptor
 }
 
+/// Ask `jobs.query` for TIMESTAMP cells as integer microseconds: the default
+/// float-seconds text is already a rounded double, which cannot hold
+/// microseconds past year 2106 and turns `9999-12-31 23:59:59.999999` into
+/// year 10000 (#862 M-052). `getQueryResults` pages cannot carry the option —
+/// the client serializes its parameters as a flat query string, which has no
+/// form for the nested `formatOptions` — so later pages keep the float form.
+fn int64_timestamps() -> gcp_bigquery_client::model::data_format_options::DataFormatOptions {
+    gcp_bigquery_client::model::data_format_options::DataFormatOptions {
+        use_int64_timestamp: Some(true),
+    }
+}
+
 /// Free-standing version of [`BigQuerySource::build_query_request`] — kept
 /// separate so unit tests can exercise it without spinning up a real
 /// `gcp_bigquery_client::Client`.
@@ -455,6 +467,7 @@ fn build_query_request(
 ) -> QueryRequest {
     let mut req = QueryRequest::new(query);
     req.use_legacy_sql = cfg.use_legacy_sql;
+    req.format_options = Some(int64_timestamps());
     req.timeout_ms = Some(clamp_timeout_ms(cfg.statement_timeout));
     req.max_results = Some(cfg.max_results_per_page);
     if let Some(location) = &cfg.location {
