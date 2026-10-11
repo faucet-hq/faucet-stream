@@ -497,6 +497,24 @@ pipeline:
 }
 
 #[test]
+fn cleanup_on_a_queue_source_is_rejected() {
+    // #862 M-022: every run reads only what arrived since the last one.
+    let err = expand_err(&format!(
+        r#"
+version: 1
+pipeline:
+  source:
+    type: sqs
+    config: {{ queue_url: "https://sqs.us-east-1.amazonaws.com/1/q", max_messages: 10 }}
+    complete_for:
+      scope: {{ group_id: 1 }}
+      on_missing: delete
+{SQLITE_UPSERT}"#
+    ));
+    assert!(err.contains("arrived since its last run"), "{err}");
+}
+
+#[test]
 fn a_child_cleanup_scope_needs_its_parents_token() {
     // #789 CLI-25: a static scope on a fan-out row deletes the siblings' rows.
     let yaml = |scope: &str| {

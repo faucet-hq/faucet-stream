@@ -2209,6 +2209,14 @@ fn check_cleanup_completeness(
              rows the other chunks wrote"
         )));
     }
+    if crate::registry::source_reads_a_delta(&source.kind, &source.config) {
+        return Err(CliError::Config(format!(
+            "row '{row_id}': `complete_for.on_missing: delete` needs a complete fetch every run, \
+             but source '{}' reads only the messages that arrived since its last run, so its \
+             cleanup would delete every row in scope that did not arrive again",
+            source.kind
+        )));
+    }
     if has_state && crate::registry::source_resumes_from_bookmark(&source.kind, &source.config) {
         return Err(CliError::Config(format!(
             "row '{row_id}': `complete_for.on_missing: delete` needs a complete fetch every run, \
@@ -4348,6 +4356,20 @@ pipeline:
             &incremental
         ));
         assert!(!crate::registry::source_resumes_from_bookmark(
+            "postgres",
+            &serde_json::json!({})
+        ));
+        assert!(crate::registry::source_resumes_from_bookmark(
+            "singer",
+            &serde_json::json!({})
+        ));
+        for kind in ["sqs", "pubsub", "rabbitmq", "nats"] {
+            assert!(
+                crate::registry::source_reads_a_delta(kind, &serde_json::json!({})),
+                "{kind}"
+            );
+        }
+        assert!(!crate::registry::source_reads_a_delta(
             "postgres",
             &serde_json::json!({})
         ));
