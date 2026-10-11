@@ -39,6 +39,12 @@ pub(crate) fn reacquire_position(lease: &Lease) -> StartAt {
     }
 }
 
+/// Whether acquiring at `start` re-reads a `Latest` lease from its trim
+/// horizon — the only case whose records are filtered by creation time. Pure.
+pub(crate) fn replays_from_trim(lease: &Lease, start: &StartAt) -> bool {
+    lease.position == StartAt::Latest && *start == StartAt::TrimHorizon
+}
+
 /// Whether a record created at `created_ms` is new enough for a `Latest`
 /// lease re-read from the trim horizon. Records with no creation time are kept. Pure.
 pub(crate) fn keep_after_latest(since_ms: Option<i64>, created_ms: Option<i64>) -> bool {
@@ -180,6 +186,7 @@ pub(crate) async fn read_slice(
     let fail = |shard_id: String, error: FaucetError| ShardEvent::Failed { shard_id, error };
     if lease.iterator.is_none() {
         let start = reacquire_position(&lease);
+        lease.replaying_from_trim = replays_from_trim(&lease, &start);
         if lease.position == StartAt::Latest && lease.latest_since_ms.is_none() {
             lease.latest_since_ms = Some(unix_now_ms());
         }
@@ -224,13 +231,15 @@ pub(crate) async fn read_slice(
                 lease.throttles = 0;
                 batches += 1;
                 let mut decoded = Vec::with_capacity(out.records().len());
+                let mut filtered = 0usize;
                 for r in out.records() {
-                    if lease.position == StartAt::Latest {
+                    if lease.replaying_from_trim && lease.position == StartAt::Latest {
                         let created = r
                             .dynamodb()
                             .and_then(|sr| sr.approximate_creation_date_time())
                             .and_then(|t| t.to_millis().ok());
                         if !keep_after_latest(lease.latest_since_ms, created) {
+                            filtered += 1;
                             continue;
                         }
                     }
@@ -241,6 +250,14 @@ pub(crate) async fn read_slice(
                             return;
                         }
                     }
+                }
+                if filtered > 0 {
+                    tracing::debug!(
+                        shard = %shard_id,
+                        filtered,
+                        "dynamodb: skipped records older than the expired LATEST iterator \
+                         while re-reading the shard from its trim horizon"
+                    );
                 }
                 let empty = decoded.is_empty();
                 if let Some((seq, _)) = decoded.last() {
@@ -274,14 +291,9 @@ pub(crate) async fn read_slice(
                 let (code, message) = sdk_error_parts(&e);
                 match code.as_deref() {
                     Some("ExpiredIteratorException") => {
-                        match acquire_iterator(
-                            &client,
-                            &stream_arn,
-                            &shard_id,
-                            &reacquire_position(&lease),
-                        )
-                        .await
-                        {
+                        let start = reacquire_position(&lease);
+                        lease.replaying_from_trim = replays_from_trim(&lease, &start);
+                        match acquire_iterator(&client, &stream_arn, &shard_id, &start).await {
                             Ok(IteratorOutcome::Ready(it)) => {
                                 lease.iterator = it;
                                 continue;
@@ -791,6 +803,16 @@ mod tests {
     }
 
     #[test]
+    fn only_a_trim_horizon_replay_of_a_latest_lease_is_filtered() {
+        let mut lease = Lease::new("s1", StartAt::Latest);
+        assert!(!replays_from_trim(&lease, &reacquire_position(&lease)));
+        lease.latest_since_ms = Some(1);
+        assert!(replays_from_trim(&lease, &reacquire_position(&lease)));
+        let lease = Lease::new("s1", StartAt::TrimHorizon);
+        assert!(!replays_from_trim(&lease, &reacquire_position(&lease)));
+    }
+
+    #[test]
     fn latest_leases_reacquire_at_the_trim_horizon_with_a_floor() {
         let mut lease = Lease::new("s1", StartAt::Latest);
         assert_eq!(reacquire_position(&lease), StartAt::Latest);
@@ -869,5 +891,30 @@ mod tests {
         }
         assert_eq!(seqs, vec!["2".to_string()]);
         assert!(done);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_latest_iterator_keeps_records_whatever_their_creation_time() {
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        let mut skewed = record("7");
+        skewed["dynamodb"]["ApproximateCreationDateTime"] = json!(1_000_000_000);
+        on(&server, RECORDS, ok(json!({"Records": [skewed]})), 1).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        read_slice(
+            streams(&server.uri()),
+            cfg(),
+            "arn".into(),
+            Lease::new("s1", StartAt::Latest),
+            tx,
+        )
+        .await;
+        let mut seqs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ShardEvent::Records { records, .. } = ev {
+                seqs.extend(records.into_iter().map(|(s, _)| s));
+            }
+        }
+        assert_eq!(seqs, vec!["7".to_string()]);
     }
 }
