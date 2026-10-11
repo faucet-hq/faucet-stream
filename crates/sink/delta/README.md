@@ -39,7 +39,7 @@ the source is also Arrow-capable (e.g. `faucet-source-parquet` /
 `faucet-source-delta`), batches are written straight through delta-rs's
 `RecordBatchWriter` with no `serde_json::Value` materialization. delta-rs uses a
 newer Arrow major than the rest of faucet-stream, so each incoming batch is
-converted once through the Arrow IPC format (one buffer copy) on its way in.
+handed across through the Arrow C Data Interface on its way in, sharing its buffers rather than copying them.
 
 ```yaml
 pipeline:

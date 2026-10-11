@@ -17,9 +17,9 @@ Provides:
   `deltalake` writes with) reused by the source (read) and sink (write).
 - **`arrow_bridge`** — `deltalake` 1.x is built on a newer Arrow major than the
   rest of faucet-stream. `schema_from_delta`, `schema_to_delta` and
-  `batch_to_delta` carry schemas and batches across through the Arrow IPC
+  `schema_to_delta` carry schemas across through the Arrow IPC
   format, which preserves nested types, dictionaries, timezones, metadata and
-  nulls. A batch crossing costs one buffer copy.
+  nulls. A batch crosses through the Arrow C Data Interface (the same ABI in every Arrow major), so its buffers are shared, not copied; only its schema is re-encoded.
 
 Cloud object-store backends are opt-in cargo features (`s3`, `azure`, `gcs`)
 that forward to the matching delta-rs feature; the default build supports the

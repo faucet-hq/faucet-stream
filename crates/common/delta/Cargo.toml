@@ -25,7 +25,10 @@ serde_json.workspace = true
 schemars.workspace = true
 tracing.workspace = true
 deltalake.workspace = true
-arrow.workspace = true
+arrow = { workspace = true, features = ["ffi"] }
+# The Arrow major deltalake is built on, only to enable its C Data Interface
+# (`deltalake::arrow::ffi`) for the zero-copy batch bridge.
+arrow-delta = { package = "arrow", version = "59", default-features = false, features = ["ffi"] }
 arrow-json.workspace = true
 chrono.workspace = true
 url.workspace = true

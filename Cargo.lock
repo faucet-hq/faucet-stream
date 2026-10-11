@@ -5038,6 +5038,7 @@ name = "faucet-common-delta"
 version = "1.2.1"
 dependencies = [
  "arrow 58.3.0",
+ "arrow 59.3.0",
  "arrow-json 58.3.0",
  "chrono",
  "deltalake",
