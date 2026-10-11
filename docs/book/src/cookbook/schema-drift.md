@@ -151,6 +151,10 @@ Not every sink can evolve, and a schemaless sink has no schema to diverge from.
 - **Schemaless sinks** report no destination schema, so *any* `schema:` policy is
   **inert** against them (a one-shot log notes this). `on_drift: evolve` against
   a schemaless sink is rejected at config-load (there is nothing to evolve).
+- **A target the run creates** (`create_table` on a first run) has no schema
+  until the sink writes the first page. The pass asks the sink again on every
+  page until it reports one, so from the second page on a field the first page
+  lacked is handled by the policy (`evolve` adds it) on that same run.
 
 ### Per-sink `evolve` nuances
 

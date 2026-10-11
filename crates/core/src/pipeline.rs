@@ -2680,7 +2680,11 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     let mut drift_envelopes: Vec<Value> = Vec::new();
     let (records, drift_abort): (Vec<Value>, Option<FaucetError>) =
         if let Some(policy) = specs.schema_drift.filter(|_| !records.is_empty()) {
-            if state.dest_schema_cache.is_none() {
+            // Re-ask while the sink reports none: a target the sink creates on
+            // the first page has a schema from the second page on, and a
+            // cached `None` would leave drift inert for the rest of a first
+            // run (#862 M-054).
+            if !matches!(state.dest_schema_cache, Some(Some(_))) {
                 state.dest_schema_cache = Some(sink.current_schema().await?);
             }
             let dest = state.dest_schema_cache.as_ref().and_then(|o| o.as_ref());
@@ -2689,8 +2693,8 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                     if !state.warned_drift_inert {
                         tracing::info!(
                             connector = sink_name,
-                            "schema-drift: sink reports no destination schema; \
-                             drift handling is inert this run"
+                            "schema-drift: sink reports no destination schema yet; \
+                             drift handling is inert until it does"
                         );
                         state.warned_drift_inert = true;
                     }
@@ -7105,6 +7109,66 @@ mod tests {
         let evos = sink.evolutions.lock().unwrap();
         assert_eq!(evos.len(), 1);
         assert_eq!(evos[0].relax_nullability, vec!["legacy".to_string()]);
+    }
+
+    /// A sink that has no schema until its first write creates the target.
+    struct CreatingSink {
+        created: std::sync::atomic::AtomicBool,
+        evolutions: std::sync::Mutex<Vec<crate::drift::SchemaEvolution>>,
+    }
+    #[async_trait]
+    impl Sink for CreatingSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.created
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(records.len())
+        }
+        async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+            Ok(self
+                .created
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| json!({"type":"object","properties":{"id":{"type":"integer"}}})))
+        }
+        fn supports_schema_evolution(&self) -> bool {
+            true
+        }
+        async fn evolve_schema(
+            &self,
+            evo: &crate::drift::SchemaEvolution,
+        ) -> Result<(), FaucetError> {
+            self.evolutions.lock().unwrap().push(evo.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn drift_baseline_is_fetched_once_the_sink_created_the_target() {
+        // #862 M-054: page 1 creates the table; page 2's new field evolves it.
+        let sink = CreatingSink {
+            created: std::sync::atomic::AtomicBool::new(false),
+            evolutions: std::sync::Mutex::new(Vec::new()),
+        };
+        let policy = crate::drift::SchemaDriftPolicy {
+            on_drift: crate::drift::OnDrift::Evolve,
+            allow_widening: true,
+            on_incompatible: crate::drift::OnIncompatible::Fail,
+            relax_nullability_on_missing: false,
+        };
+        let pages = Box::pin(futures::stream::iter(vec![
+            Ok(StreamPage {
+                records: vec![json!({"id": 1})],
+                bookmark: None,
+            }),
+            Ok(StreamPage {
+                records: vec![json!({"id": 2, "email": "a@x.com"})],
+                bookmark: None,
+            }),
+        ]));
+        let res = run_stream(pages, &sink, drift_opts(policy)).await.unwrap();
+        assert_eq!(res.records_written, 2);
+        let evos = sink.evolutions.lock().unwrap();
+        assert_eq!(evos.len(), 1);
+        assert_eq!(evos[0].additions[0].name, "email");
     }
 
     #[tokio::test]
