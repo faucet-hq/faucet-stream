@@ -711,6 +711,44 @@ mod tests {
         assert_eq!(out, vec![json!({}), long, json!({})]);
     }
 
+    /// #862 M-015: a trap in `free` or `error_ptr` / `error_len` leaves the
+    /// guest heap as suspect as a trap in `transform`, so the instance is
+    /// marked and replaced before the next record.
+    #[test]
+    fn a_trap_in_a_helper_export_marks_the_instance() {
+        let free_traps = format!(
+            r#"(module {PREAMBLE}
+            (func (export "free") (param i32) (param i32) unreachable)
+            (func (export "transform") (param $ptr i32) (param $len i32) (result i64)
+                (i64.or
+                    (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
+                    (i64.extend_i32_u (local.get $len)))))"#
+        );
+        let (t, _f) = build(&free_traps, |_| {});
+        {
+            let eng = t.engine.lock().unwrap();
+            let mut inst = eng.new_page_instance().unwrap();
+            let r = inst.run(br#"{"a":1}"#).unwrap();
+            assert!(matches!(r.outcome, Outcome::Emit(_)));
+            assert!(inst.trapped(), "a trap in free marks the instance");
+        }
+        let out = t.run_page(vec![json!({"a": 1}), json!({"b": 2})]).unwrap();
+        assert_eq!(out, vec![json!({"a": 1}), json!({"b": 2})]);
+
+        let error_ptr_traps = format!(
+            r#"(module {PREAMBLE}
+            (func (export "error_ptr") (result i32) unreachable)
+            (func (export "error_len") (result i32) (i32.const 0))
+            (func (export "transform") (param i32) (param i32) (result i64) (i64.const -1)))"#
+        );
+        let (t, _f) = build(&error_ptr_traps, |_| {});
+        let eng = t.engine.lock().unwrap();
+        let mut inst = eng.new_page_instance().unwrap();
+        let r = inst.run(br#"{"a":1}"#).unwrap();
+        assert!(matches!(r.outcome, Outcome::Error(_)));
+        assert!(inst.trapped(), "a trap in error_ptr marks the instance");
+    }
+
     #[test]
     fn a_module_with_two_memories_is_refused() {
         let f = write_wasm(

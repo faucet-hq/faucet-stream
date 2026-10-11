@@ -211,8 +211,14 @@ impl WasmInstance {
         if let Some(msg) = out_of_fuel_message(self.store.get_fuel().ok(), self.fuel_limit) {
             return msg;
         }
-        let ptr = ep.call(&mut self.store, ()).unwrap_or(0);
-        let len = el.call(&mut self.store, ()).unwrap_or(0);
+        let ptr = ep.call(&mut self.store, ()).unwrap_or_else(|_| {
+            self.trapped = true;
+            0
+        });
+        let len = el.call(&mut self.store, ()).unwrap_or_else(|_| {
+            self.trapped = true;
+            0
+        });
         let data = self.memory.data(&self.store);
         let start = ptr as usize;
         let end = start.saturating_add(len as usize);
@@ -229,15 +235,19 @@ impl WasmInstance {
 
     /// Free a host-allocated input buffer if the module exports `free`.
     fn free_buf(&mut self, ptr: i32, len: i32) {
-        if let Some(free) = &self.free {
-            let _ = free.call(&mut self.store, (ptr, len));
+        if let Some(free) = &self.free
+            && free.call(&mut self.store, (ptr, len)).is_err()
+        {
+            self.trapped = true;
         }
     }
 
     /// Free a module-allocated output buffer (u32 offsets) if `free` is present.
     fn free_out(&mut self, ptr: u32, len: u32) {
-        if let (Some(free), Ok(p), Ok(l)) = (&self.free, i32::try_from(ptr), i32::try_from(len)) {
-            let _ = free.call(&mut self.store, (p, l));
+        if let (Some(free), Ok(p), Ok(l)) = (&self.free, i32::try_from(ptr), i32::try_from(len))
+            && free.call(&mut self.store, (p, l)).is_err()
+        {
+            self.trapped = true;
         }
     }
 }
