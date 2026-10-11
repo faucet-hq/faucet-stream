@@ -6,7 +6,7 @@
 use crate::error::FaucetError;
 use crate::observability::{Labels, instrumented_apply_stages};
 use crate::pipeline::StreamPage;
-use crate::stage::{CompiledStage, TransformStage, compile_stage, run_blocking};
+use crate::stage::{CompiledStage, TransformStage, compile_stage};
 use crate::traits::Source;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -224,7 +224,7 @@ impl Source for TransformingSource {
                 // both keeps a dashboard identical across the two paths.
                 let n_in = batch.num_rows();
                 for bf in self.batch_fns.iter().flatten() {
-                    batch = run_blocking(true, || bf(batch)).inspect_err(|_| {
+                    batch = crate::stage::run_blocking(true, || bf(batch)).inspect_err(|_| {
                         counter!("faucet_transform_errors_total", metric_labels.clone())
                             .increment(1);
                     })?;
@@ -399,7 +399,7 @@ mod tests {
             src.fetch_with_context(&HashMap::new()).await.unwrap().len(),
             1
         );
-        assert_eq!(run_blocking(true, || 7), 7);
+        assert_eq!(crate::stage::run_blocking(true, || 7), 7);
     }
 
     /// A change-stream double with its own multi-table hooks (#731).
