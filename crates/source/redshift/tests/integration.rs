@@ -388,6 +388,25 @@ async fn unmapped_types_never_become_null() {
         .await
         .expect_err("binary point cannot be decoded");
     assert!(err.to_string().contains("`p`"), "{err}");
+
+    // #862 M-057: oid-family values decode as their number, and a binary
+    // array whose bytes happen to be valid UTF-8 is refused, not garbled.
+    let source = RedshiftSource::new(full_config(
+        port,
+        "SELECT 23::oid AS o, 'pg_class'::regclass AS c",
+        1000,
+    ))
+    .expect("source");
+    let rows = source.fetch_all().await.expect("oids decode");
+    assert_eq!(rows[0]["o"], json!(23));
+    assert_eq!(rows[0]["c"], json!(1259));
+    let source = RedshiftSource::new(full_config(port, "SELECT ARRAY[1, 2]::int4[] AS a", 1000))
+        .expect("source");
+    let err = source
+        .fetch_all()
+        .await
+        .expect_err("a binary int array is not text");
+    assert!(err.to_string().contains("`a`"), "{err}");
 }
 
 /// The bookmark never moves backwards (SQL-162): when the row that held the
