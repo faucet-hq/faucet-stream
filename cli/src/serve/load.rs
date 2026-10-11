@@ -33,16 +33,29 @@ pub const SUBPROCESS_CONNECTOR_KINDS: &[&str] = &["singer"];
 /// loaded config can never resolve them through `${env:}` / `${secret:}`.
 pub const SERVER_SECRET_ENV: &[&str] = &[
     "FAUCET_VAULT_KEY",
+    "FAUCET_VAULT_PREVIOUS_KEYS",
     "FAUCET_SERVE_AUTH_TOKEN",
     "FAUCET_SERVE_READ_TOKEN",
     "FAUCET_SERVE_WRITE_TOKEN",
     "FAUCET_SERVE_ADMIN_TOKEN",
+    "FAUCET_SERVE_HISTORY",
+    "FAUCET_TEMPLATE_STORE",
+    "FAUCET_SNAPSHOT_KEY",
+];
+
+/// System trees no config loaded by `faucet serve` may read or write.
+const SYSTEM_DIRS: &[&str] = &["/proc", "/sys", "/dev"];
+
+/// Connector / state / transport kinds whose config names local files.
+pub const LOCAL_PATH_KINDS: &[&str] = &[
+    "file", "csv", "jsonl", "parquet", "sqlite", "duckdb", "delta", "iceberg",
 ];
 
 #[derive(Default)]
 struct Protected {
     env: std::collections::BTreeSet<String>,
     files: std::collections::BTreeSet<std::path::PathBuf>,
+    secrets: std::collections::BTreeSet<(String, String)>,
 }
 
 fn protected() -> &'static std::sync::RwLock<Protected> {
@@ -65,8 +78,95 @@ pub fn protect_file(path: &std::path::Path) {
     }
 }
 
+/// Mark a secret-manager reference (`${vault:…}`, …) the server resolved for
+/// its own use, so no loaded config can resolve it (or another `#field` of the
+/// same secret).
+pub fn protect_secret_ref(scheme: &str, reference: &str) {
+    if let Ok(mut p) = protected().write() {
+        p.secrets
+            .insert((scheme.to_string(), secret_base(reference).to_string()));
+    }
+}
+
+/// Protect every environment variable, file and secret-manager reference a
+/// server input file (`--auth-config`, `--connect-providers`, …) reads.
+pub fn protect_references(doc: &Value) {
+    use crate::interpolate::{Directive, iter_directives};
+    for_each_string(doc, &mut |s| {
+        for (_, dir) in iter_directives(s) {
+            if let Directive::LoadTime { prefix, body } = dir {
+                match prefix {
+                    "env" | "secret" => protect_env(body),
+                    "file" => protect_file(std::path::Path::new(body)),
+                    p if crate::secrets::SECRET_SCHEMES.contains(&p) => protect_secret_ref(p, body),
+                    _ => {}
+                }
+            }
+        }
+    });
+}
+
+/// Protect a server input file and everything it reads.
+pub fn protect_input(path: &std::path::Path, doc: &Value) {
+    protect_file(path);
+    protect_references(doc);
+}
+
+/// Protect a SQLite database the server keeps (run history), with its
+/// journal files.
+pub fn protect_sqlite_url(url: &str) {
+    if let Some(path) = sqlite_path(url) {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            protect_file(std::path::Path::new(&format!("{path}{suffix}")));
+        }
+    }
+}
+
+fn sqlite_path(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("sqlite:")?;
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let rest = rest.split('?').next().unwrap_or(rest);
+    (!rest.is_empty() && rest != ":memory:").then_some(rest)
+}
+
+fn secret_base(reference: &str) -> &str {
+    reference.split('#').next().unwrap_or(reference)
+}
+
+fn secret_is_protected(scheme: &str, reference: &str) -> bool {
+    protected()
+        .read()
+        .map(|p| {
+            p.secrets
+                .contains(&(scheme.to_string(), secret_base(reference).to_string()))
+        })
+        .unwrap_or(true)
+}
+
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+    let absolute;
+    let path = if path.is_relative() {
+        absolute = std::env::current_dir()
+            .map(|d| d.join(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        absolute.as_path()
+    } else {
+        path
+    };
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return lexical_normalize(&rest.iter().rev().fold(real, |p, c| p.join(c)));
+        }
+        match (existing.parent(), existing.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last.as_os_str().to_os_string());
+                existing = parent;
+            }
+            _ => return lexical_normalize(path),
+        }
+    }
 }
 
 /// Resolve `.` and `..` without touching the filesystem, for a path that does
@@ -94,18 +194,83 @@ fn env_is_protected(name: &str) -> bool {
             .unwrap_or(true)
 }
 
+/// Whether `p` lies in a system tree, read either the way the OS resolves it
+/// or lexically (the two differ when a `..` follows a symlink).
+fn in_system_dir(p: &std::path::Path) -> bool {
+    let lexical = lexical_normalize(p);
+    [p, lexical.as_path()].iter().any(|p| {
+        *p != std::path::Path::new("/dev/null") && SYSTEM_DIRS.iter().any(|d| p.starts_with(d))
+    })
+}
+
 fn file_is_protected(path: &str) -> bool {
     let p = std::path::Path::new(path);
-    if p.starts_with("/proc") {
+    if in_system_dir(p) {
         return true;
     }
     let normalized = normalize_path(p);
-    if normalized.starts_with("/proc") {
+    if in_system_dir(&normalized) {
         return true;
     }
     protected()
         .read()
         .map(|g| g.files.contains(&normalized))
+        .unwrap_or(true)
+}
+
+/// Whether reading `path` as data — a file, a directory read recursively, or
+/// a glob (a `${…}` token counts as `*`) — would reach a system tree or a
+/// protected file.
+fn data_path_is_protected(path: &str) -> bool {
+    let pattern = replace_tokens(path);
+    let Some(glob_at) = pattern.find(['*', '?', '[']) else {
+        let normalized = normalize_path(std::path::Path::new(path));
+        return in_system_dir(std::path::Path::new(path))
+            || in_system_dir(&normalized)
+            || protected_files(|f| f.starts_with(&normalized));
+    };
+    let (dir, rest) = match pattern[..glob_at].rfind('/') {
+        Some(slash) => (&pattern[..slash.max(1)], &pattern[slash + 1..]),
+        None => (".", pattern.as_str()),
+    };
+    if rest.split('/').any(|c| c == "..") {
+        return true;
+    }
+    let dir = normalize_path(std::path::Path::new(dir));
+    if in_system_dir(&dir) {
+        return true;
+    }
+    let full = format!("{}/{rest}", dir.display().to_string().trim_end_matches('/'));
+    match glob::Pattern::new(&full) {
+        Ok(p) => protected_files(|f| p.matches_path(f)),
+        Err(_) => protected_files(|f| f.starts_with(&dir)),
+    }
+}
+
+fn replace_tokens(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find('}') {
+            Some(end) => {
+                out.push('*');
+                rest = &rest[start + end + 1..];
+            }
+            None => {
+                out.push('*');
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn protected_files(pred: impl Fn(&std::path::Path) -> bool) -> bool {
+    protected()
+        .read()
+        .map(|g| g.files.iter().any(|f| pred(f)))
         .unwrap_or(true)
 }
 
@@ -134,6 +299,9 @@ pub fn server_secret_refs(doc: &Value) -> Vec<String> {
                 let hit = match prefix {
                     "env" | "secret" => env_is_protected(body),
                     "file" => file_is_protected(body),
+                    p if crate::secrets::SECRET_SCHEMES.contains(&p) => {
+                        secret_is_protected(p, body)
+                    }
                     _ => false,
                 };
                 if hit {
@@ -143,6 +311,145 @@ pub fn server_secret_refs(doc: &Value) -> Vec<String> {
         }
     });
     found
+}
+
+fn is_path_key(key: &str) -> bool {
+    matches!(
+        key,
+        "path"
+            | "paths"
+            | "dir"
+            | "directory"
+            | "file"
+            | "files"
+            | "database"
+            | "database_url"
+            | "table_uri"
+            | "warehouse"
+            | "location"
+    ) || key.ends_with("_path")
+        || key.ends_with("_dir")
+        || key.ends_with("_file")
+}
+
+/// The local filesystem path a config value names, if it names one.
+fn local_path(value: &str) -> Option<&str> {
+    if let Some(p) = sqlite_path(value) {
+        return Some(p);
+    }
+    if let Some(p) = value.strip_prefix("file://") {
+        return Some(p);
+    }
+    if value.contains("://") {
+        return None;
+    }
+    let p = value.strip_prefix("file:").unwrap_or(value);
+    (!p.is_empty() && p != ":memory:").then_some(p)
+}
+
+/// Runtime tokens a local path may carry in a caller-supplied config: their
+/// values come from the clock or the config itself, never from records.
+const STATIC_PATH_TOKENS: &[&str] = &["now", "backfill", "partition"];
+
+fn check_local_paths(config: &Value, caller: bool, found: &mut Vec<String>) {
+    fn walk(v: &Value, under_path_key: bool, caller: bool, found: &mut Vec<String>) {
+        match v {
+            Value::String(s) if under_path_key => {
+                let Some(path) = local_path(s) else {
+                    return;
+                };
+                if caller {
+                    use crate::interpolate::{Directive, iter_directives};
+                    let dynamic = iter_directives(path).any(|(_, d)| match d {
+                        Directive::Deferred { id, .. } => !STATIC_PATH_TOKENS.contains(&id),
+                        Directive::LoadTime { .. } => false,
+                    });
+                    if dynamic {
+                        found.push(format!(
+                            "{s} (a local path in a submitted config may not take a value \
+                             from records)"
+                        ));
+                        return;
+                    }
+                }
+                if data_path_is_protected(path) {
+                    found.push(s.clone());
+                }
+            }
+            Value::Array(items) => items
+                .iter()
+                .for_each(|i| walk(i, under_path_key, caller, found)),
+            Value::Object(map) => {
+                for (k, child) in map {
+                    walk(child, is_path_key(k), caller, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(config, false, caller, found);
+}
+
+/// Local paths in `doc` (any `{type, config}` of a [`LOCAL_PATH_KINDS`] kind)
+/// that would read or write a system tree or a server credential file.
+pub fn server_data_paths(doc: &Value, caller: bool) -> Vec<String> {
+    fn walk(v: &Value, caller: bool, found: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                if let (Some(Value::String(t)), Some(cfg)) = (map.get("type"), map.get("config"))
+                    && LOCAL_PATH_KINDS.contains(&t.as_str())
+                {
+                    check_local_paths(cfg, caller, found);
+                }
+                map.values().for_each(|c| walk(c, caller, found));
+            }
+            Value::Array(items) => items.iter().for_each(|c| walk(c, caller, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    walk(doc, caller, &mut found);
+    found
+}
+
+/// Refuse a config whose local-file connectors, state store or DLQ point at
+/// a system tree or a file the server keeps its credentials in.
+pub fn refuse_server_paths(
+    cfg: &PipelineConfig,
+    nodes: &[ExpandedNode],
+    origin: BodyOrigin,
+) -> Result<(), ServeError> {
+    let caller = matches!(origin, BodyOrigin::Caller { .. });
+    let mut found = match serde_json::to_value(cfg) {
+        Ok(doc) => server_data_paths(&doc, caller),
+        Err(e) => return Err(ServeError::Internal(format!("serializing config: {e}"))),
+    };
+    let mut check = |kind: &str, config: &Value| {
+        if LOCAL_PATH_KINDS.contains(&kind) {
+            check_local_paths(config, caller, &mut found);
+        }
+    };
+    for n in nodes {
+        check(&n.source.kind, &n.source.config);
+        check(&n.sink.kind, &n.sink.config);
+        if let Some(st) = &n.state {
+            check(&st.kind, &st.config);
+        }
+        if let Some(d) = &n.dlq {
+            check(&d.sink.kind, &d.sink.config);
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    found.sort();
+    found.dedup();
+    Err(ServeError::Forbidden(format!(
+        "the config reads or writes local paths a config loaded by `faucet serve` may not \
+         touch — system trees ({}) or files holding the server's own credentials: {}",
+        SYSTEM_DIRS.join(", "),
+        found.join(", ")
+    )))
 }
 
 /// The subprocess connector kinds `doc` names anywhere as a `type:`.
@@ -438,6 +745,7 @@ pub async fn load_submission_scoped(
     })?;
 
     refuse_subprocess(&merged, origin, tenant.is_some())?;
+    refuse_server_secrets(&merged)?;
 
     // 4. Version gate + structural-ref resolution.
     let mut cfg = PipelineConfig::from_value(merged).map_err(|e| ServeError::Unprocessable {
@@ -526,6 +834,7 @@ pub async fn load_submission_scoped(
             message: e.to_string(),
             details: None,
         })?;
+        refuse_server_paths(&cfg, &[], origin)?;
         return Ok(LoadedSubmission {
             cfg,
             nodes: Vec::new(),
@@ -538,6 +847,8 @@ pub async fn load_submission_scoped(
         message: e.to_string(),
         details: None,
     })?;
+
+    refuse_server_paths(&cfg, &nodes, origin)?;
 
     if let Some(t) = &tenant {
         t.check_refs(&cfg, &nodes)?;
@@ -695,6 +1006,155 @@ schedule:
         assert!(refuse_server_secrets(&json!({"x": "${env:HOME}"})).is_ok());
         let err = refuse_server_secrets(&doc).unwrap_err();
         assert!(matches!(err, ServeError::Forbidden(_)));
+    }
+
+    #[test]
+    fn secret_manager_references_the_server_resolved_are_protected() {
+        protect_secret_ref("vault", "secret/load-test#admin");
+        let refs = server_secret_refs(&json!([
+            "${vault:secret/load-test}",
+            "${vault:secret/load-test#other}",
+            "${aws-sm:secret/load-test}",
+            "${vault:secret/load-test-2}",
+        ]));
+        assert_eq!(
+            refs,
+            vec![
+                "${vault:secret/load-test}".to_string(),
+                "${vault:secret/load-test#other}".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn protect_input_covers_the_file_and_everything_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("providers.yaml");
+        std::fs::write(&input, "x").unwrap();
+        let read = dir.path().join("client-secret");
+        protect_input(
+            &input,
+            &json!({"a": "${env:LOAD_TEST_INPUT_VAR}", "b": format!("${{file:{}}}", read.display()),
+                    "c": "${gcp-sm:projects/p/secrets/load-test/versions/1}"}),
+        );
+        let refs = server_secret_refs(&json!([
+            format!("${{file:{}}}", input.display()),
+            format!("${{file:{}}}", read.display()),
+            "${env:LOAD_TEST_INPUT_VAR}",
+            "${secret:LOAD_TEST_INPUT_VAR}",
+            "${gcp-sm:projects/p/secrets/load-test/versions/1}",
+        ]));
+        assert_eq!(refs.len(), 5, "{refs:?}");
+        for name in ["FAUCET_SERVE_HISTORY", "FAUCET_VAULT_PREVIOUS_KEYS", "FAUCET_SNAPSHOT_KEY"] {
+            assert!(env_is_protected(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn sqlite_urls_name_their_file() {
+        assert_eq!(sqlite_path("sqlite:/var/h.db"), Some("/var/h.db"));
+        assert_eq!(sqlite_path("sqlite:///var/h.db?mode=rwc"), Some("/var/h.db"));
+        assert_eq!(sqlite_path("sqlite::memory:"), None);
+        assert_eq!(sqlite_path("postgres://x"), None);
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        protect_sqlite_url(&format!("sqlite:{}", db.display()));
+        assert!(file_is_protected(db.to_str().unwrap()));
+        assert!(file_is_protected(&format!("{}-wal", db.display())));
+    }
+
+    #[test]
+    fn local_paths_and_globs_that_reach_protected_files_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("etc");
+        std::fs::create_dir(&secrets).unwrap();
+        let auth = secrets.join("auth.yaml");
+        std::fs::write(&auth, "x").unwrap();
+        protect_file(&auth);
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let d = dir.path().display();
+
+        assert!(data_path_is_protected("/proc/self/environ"));
+        assert!(data_path_is_protected("/sys/kernel"));
+        assert!(data_path_is_protected("/dev/stdin"));
+        assert!(!data_path_is_protected("/dev/null"));
+        assert!(data_path_is_protected(&auth.display().to_string()));
+        assert!(data_path_is_protected(&format!("{d}/data/../etc/auth.yaml")));
+        assert!(data_path_is_protected(&format!("{d}/etc")), "a directory holding one");
+        assert!(data_path_is_protected(&format!("{d}/etc/*.yaml")));
+        assert!(data_path_is_protected(&format!("{d}/*")), "a glob that recurses into it");
+        assert!(data_path_is_protected(&format!("{d}/data/*/../../etc/auth.yaml")));
+        assert!(data_path_is_protected(&format!("{d}/etc/${{now.date}}.yaml")));
+        assert!(!data_path_is_protected(&format!("{d}/data/in.csv")));
+        assert!(!data_path_is_protected(&format!("{d}/data/*.csv")));
+        assert!(!data_path_is_protected(&format!("{d}/etc/*.csv")));
+        assert!(!data_path_is_protected(&format!("{d}/data/dt=${{now.date}}/x.jsonl")));
+
+        assert_eq!(local_path("sqlite:/x.db"), Some("/x.db"));
+        assert_eq!(local_path("file:///x"), Some("/x"));
+        assert_eq!(local_path("file:./x"), Some("./x"));
+        assert_eq!(local_path("s3://b/k"), None);
+        assert_eq!(local_path(":memory:"), None);
+        assert_eq!(replace_tokens("a/${now.date}/b${x"), "a/*/b*");
+    }
+
+    #[test]
+    fn data_paths_are_checked_only_in_local_kinds_and_path_keys() {
+        let doc = json!({
+            "pipeline": {
+                "source": {"type": "file", "config": {"path": "/proc/self/environ", "format": "raw_text"}},
+                "sink": {"type": "rest", "config": {"path": "/proc/x"}},
+                "sources": {"q": {"type": "duckdb", "config": {"database": "/dev/zero", "query": "/proc"}}}
+            },
+            "state": {"type": "file", "config": {"dir": "/sys/x"}},
+            "lineage": {"transport": {"type": "file", "config": {"path": "out.jsonl"}}}
+        });
+        let found = server_data_paths(&doc, false);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found.iter().all(|f| !f.contains("/proc/x")));
+
+        let caller = json!({"type": "jsonl", "config": {"path": "out/${parent.name}.jsonl"}});
+        assert_eq!(server_data_paths(&caller, true).len(), 1);
+        assert!(server_data_paths(&caller, false).is_empty());
+        let clock = json!({"type": "jsonl", "config": {"path": "out/${now.date}.jsonl"}});
+        assert!(server_data_paths(&clock, true).is_empty());
+    }
+
+    #[tokio::test]
+    async fn loading_refuses_local_paths_to_server_files_even_through_a_row_override() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let direct = "version: 1\npipeline:\n  source: { type: file, config: { path: /proc/self/environ, format: raw_text } }\n  sink: { type: stdout, config: {} }\n";
+        let err = load_submission(direct, ConfigFormat::Yaml, None, None, caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Forbidden(_)), "{err:?}");
+        assert!(message(&err).contains("/proc/self/environ"));
+
+        let via_row = "version: 1\npipeline:\n  sources:\n    x: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout, config: {} }\nmatrix:\n  - id: r\n    source: { ref: x, config: { path: /proc/self/environ } }\n";
+        let err = load_submission(via_row, ConfigFormat::Yaml, None, None, caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServeError::Forbidden(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_secret_reference_arriving_through_an_env_value_is_refused() {
+        protect_secret_ref("vault", "secret/load-test-env");
+        // SAFETY: test-only variable, read by this test alone.
+        unsafe { std::env::set_var("LOAD_TEST_INDIRECT", "${vault:secret/load-test-env}") };
+        let err = load_submission(
+            &csv_body("${env:LOAD_TEST_INDIRECT}"),
+            ConfigFormat::Yaml,
+            None,
+            None,
+            BodyOrigin::Trusted,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Forbidden(_)), "{err:?}");
     }
 
     #[test]

@@ -616,11 +616,38 @@ fn scaffold_config(args: &Value) -> Result<String, String> {
 /// `mode` decides what an unsupplied `required` param means: `Placeholder` for
 /// the read-only introspection tools (a parameterized config still validates),
 /// `Strict` where the config is about to actually run.
-fn parse_config_with(text: &str, mode: crate::params::BindMode) -> Result<PipelineConfig, String> {
+///
+/// `screen` (a caller-supplied config on a server) re-screens the document
+/// after binding, since a param default can name a subprocess connector or a
+/// protected secret that the raw document only holds as `${param.*}`.
+fn parse_config_with(
+    text: &str,
+    mode: crate::params::BindMode,
+    screen: Option<crate::serve::load::BodyOrigin>,
+) -> Result<PipelineConfig, String> {
     let mut doc: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
     crate::interpolate::interpolate_value(&mut doc).map_err(|e| e.to_string())?;
     crate::params::bind_document(&mut doc, &Default::default(), mode).map_err(|e| e.to_string())?;
+    if let Some(origin) = screen {
+        crate::serve::load::refuse_subprocess(&doc, origin, false)
+            .and_then(|()| crate::serve::load::refuse_server_secrets(&doc))
+            .map_err(|e| e.api_error().error.message)?;
+    }
     PipelineConfig::from_value(doc).map_err(|e| e.to_string())
+}
+
+/// Refuse a caller-supplied config whose expanded rows point a local-file
+/// connector at a system tree or a server credential file.
+fn screen_paths(
+    ctx: &McpContext,
+    cfg: &PipelineConfig,
+    nodes: &[crate::expand::ExpandedNode],
+) -> Result<(), String> {
+    match ctx.submitted {
+        Some(origin) => crate::serve::load::refuse_server_paths(cfg, nodes, origin)
+            .map_err(|e| e.api_error().error.message),
+        None => Ok(()),
+    }
 }
 
 /// Refuse a caller-supplied config the server would refuse on `POST /v1/runs`:
@@ -638,16 +665,17 @@ fn screen_config(ctx: &McpContext, text: &str) -> Result<(), String> {
 
 /// Read-only introspection: a config whose required params arrive later still
 /// validates, against type-shaped placeholders.
-fn parse_config(text: &str) -> Result<PipelineConfig, String> {
-    parse_config_with(text, crate::params::BindMode::Placeholder)
+fn parse_config(ctx: &McpContext, text: &str) -> Result<PipelineConfig, String> {
+    parse_config_with(text, crate::params::BindMode::Placeholder, ctx.submitted)
 }
 
 async fn validate_config(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let text = str_arg(args, "config")?;
     screen_config(ctx, text)?;
-    let cfg = parse_config(text)?;
+    let cfg = parse_config(ctx, text)?;
 
     if crate::topology::is_topology(&cfg) {
+        screen_paths(ctx, &cfg, &[])?;
         // Offline: building the connectors would connect and create files (#844).
         let topo = crate::topology::validate_topology(&cfg)
             .await
@@ -661,6 +689,7 @@ async fn validate_config(ctx: &McpContext, args: &Value) -> Result<String, Strin
     }
 
     let nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
+    screen_paths(ctx, &cfg, &nodes)?;
     let rows: Vec<Value> = nodes
         .iter()
         .map(|n| {
@@ -691,14 +720,16 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
         .unwrap_or(10);
 
     screen_config(ctx, text)?;
-    let cfg = parse_config(text)?;
+    let cfg = parse_config(ctx, text)?;
     if crate::topology::is_topology(&cfg) {
+        screen_paths(ctx, &cfg, &[])?;
         return crate::topology::preview_to_string(&cfg, &ctx.auth, limit)
             .await
             .map_err(|e| e.to_string());
     }
 
     let nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
+    screen_paths(ctx, &cfg, &nodes)?;
     let first_root = nodes
         .iter()
         .find(|n| matches!(n.role, crate::expand::NodeRole::Root))
@@ -1178,7 +1209,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
     if dry_run {
         // Validate the materialized config without touching a sink, and never
         // echo the body — a secret param value would be in it.
-        let cfg = parse_config_with(&materialized.body, crate::params::BindMode::Strict)?;
+        let cfg = parse_config_with(&materialized.body, crate::params::BindMode::Strict, None)?;
         let mut nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
         if let Some(sel) = &materialized.selection {
             nodes = sel.apply(&cfg, nodes).map_err(|e| e.to_string())?;
@@ -1493,6 +1524,29 @@ mod tests {
         );
         assert!(screen_config(&c, "{[bad").is_err());
         assert!(screen_config(&ctx(true), singer).is_ok());
+    }
+
+    /// #862 H-03: a param default that binds a connector `type` to `singer`
+    /// is screened after binding, so it cannot spawn a program.
+    #[tokio::test]
+    async fn a_param_default_cannot_smuggle_in_a_subprocess_connector() {
+        let c = ctx(true).with_submitted_origin(crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: false,
+        });
+        let smuggled = "version: 1\nparams: { k: { type: string, default: singer } }\npipeline:\n  source: { type: \"${param.k}\", config: { executable: /bin/sh, stream: x } }\n  sink: { type: stdout, config: {} }\n";
+        for tool in ["validate_config", "preview", "run_pipeline"] {
+            let args = json!({"config": smuggled, "dry_run": true});
+            let out = call_tool(&c, tool, &args).await;
+            assert!(
+                out.to_string().contains("--allow-subprocess-connectors"),
+                "{tool}: {out}"
+            );
+        }
+        let via_row = "version: 1\npipeline:\n  sources: { x: { type: csv, config: { path: in.csv } } }\n  sink: { type: stdout, config: {} }\nmatrix:\n  - id: r\n    source: { ref: x, config: { path: /proc/self/environ } }\n";
+        for tool in ["validate_config", "preview"] {
+            let out = call_tool(&c, tool, &json!({"config": via_row})).await;
+            assert!(out.to_string().contains("/proc/self/environ"), "{tool}: {out}");
+        }
     }
 
     #[tokio::test]

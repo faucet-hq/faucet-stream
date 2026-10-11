@@ -347,9 +347,9 @@ impl RbacConfig {
     /// Load + validate an `--auth-config` file (YAML or JSON).
     ///
     /// `${env:}` / `${file:}` / `${secret:}` and secret-manager references
-    /// (`${vault:…}`, …) resolve before the file is read, and the variables and
-    /// files they name are protected from every config the server loads. A
-    /// token that still contains `${` is refused.
+    /// (`${vault:…}`, …) resolve before the file is read. The file itself and
+    /// the variables, files and secrets it names are protected from every
+    /// config the server loads. A token that still contains `${` is refused.
     pub fn from_file(path: &Path) -> CliResult<Self> {
         let at = |e: &dyn std::fmt::Display| {
             CliError::Serve(format!("--auth-config {}: {e}", path.display()))
@@ -360,7 +360,7 @@ impl RbacConfig {
         let mut doc: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| {
             CliError::Serve(format!("parsing --auth-config {}: {e}", path.display()))
         })?;
-        protect_references(&doc);
+        crate::serve::load::protect_input(path, &doc);
         crate::interpolate::interpolate_value(&mut doc).map_err(|e| at(&e))?;
         resolve_secret_refs(&mut doc).map_err(|e| at(&e))?;
         crate::interpolate::unescape_value(&mut doc);
@@ -505,31 +505,6 @@ impl RbacConfig {
     pub fn tokens(&self) -> impl Iterator<Item = &str> {
         self.principals.iter().map(|p| p.token.as_str())
     }
-}
-
-/// Protect every environment variable and file an auth config reads from, so
-/// no loaded pipeline config can read a principal's token.
-fn protect_references(doc: &serde_json::Value) {
-    use crate::interpolate::{Directive, iter_directives};
-    fn walk(v: &serde_json::Value) {
-        match v {
-            serde_json::Value::String(s) => {
-                for (_, dir) in iter_directives(s) {
-                    if let Directive::LoadTime { prefix, body } = dir {
-                        match prefix {
-                            "env" | "secret" => crate::serve::load::protect_env(body),
-                            "file" => crate::serve::load::protect_file(Path::new(body)),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(walk),
-            serde_json::Value::Object(map) => map.values().for_each(walk),
-            _ => {}
-        }
-    }
-    walk(doc);
 }
 
 /// Resolve secret-manager references in an auth config. Runs on its own

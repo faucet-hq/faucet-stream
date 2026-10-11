@@ -235,6 +235,8 @@ fn parse_sync_file(text: &str, path: &Path) -> CliResult<SyncFile> {
         serde_yaml::from_str(text)
             .map_err(|e| CliError::Config(format!("parsing templates-sync YAML: {e}")))?
     };
+    #[cfg(feature = "serve")]
+    crate::serve::load::protect_input(path, &doc);
     interpolate_scalars(&mut doc)?;
     serde_json::from_value(doc).map_err(|e| {
         CliError::Config(format!(

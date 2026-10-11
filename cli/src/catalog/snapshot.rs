@@ -186,13 +186,7 @@ fn snapshot_key() -> &'static [u8] {
         {
             return k.into_bytes();
         }
-        let dir = std::env::var_os("XDG_STATE_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/state"))
-            })
-            .map(|d| d.join("faucet"));
-        match dir.map(|d| load_or_create_key(&d.join("snapshot.key"))) {
+        match key_file_path().map(|p| load_or_create_key(&p)) {
             Some(Ok(key)) => key,
             other => {
                 if let Some(Err(e)) = other {
@@ -202,6 +196,14 @@ fn snapshot_key() -> &'static [u8] {
             }
         }
     })
+}
+
+/// Where the persistent snapshot key lives when `FAUCET_SNAPSHOT_KEY` is unset.
+pub fn key_file_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/state")))
+        .map(|d| d.join("faucet").join("snapshot.key"))
 }
 
 fn random_key() -> Vec<u8> {

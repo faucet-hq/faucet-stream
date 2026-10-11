@@ -51,6 +51,7 @@ pub async fn load_triggers(path: &std::path::Path) -> CliResult<CompiledTriggers
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| CliError::Serve(format!("reading triggers file {}: {e}", path.display())))?;
+    crate::serve::load::protect_file(path);
     let is_json = path
         .extension()
         .map(|e| e.eq_ignore_ascii_case("json"))

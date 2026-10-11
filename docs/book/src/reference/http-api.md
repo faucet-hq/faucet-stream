@@ -179,11 +179,27 @@ same rule.
 ### Server credentials
 
 A config the server loads — submitted, planned, probed, or a template — can
-never read the server's own credentials. `${env:}` / `${secret:}` of
-`FAUCET_VAULT_KEY`, `FAUCET_SERVE_AUTH_TOKEN` and the
-`FAUCET_SERVE_{READ,WRITE,ADMIN}_TOKEN` trio, of any variable an
-`--auth-config` token is read from, `${file:}` of a file an auth-config token
-is read from, and `${file:}` of anything under `/proc` are refused with `403`.
+never read the server's own credentials. Refused with `403`:
+
+- `${env:}` / `${secret:}` of `FAUCET_VAULT_KEY`, `FAUCET_VAULT_PREVIOUS_KEYS`,
+  `FAUCET_SERVE_AUTH_TOKEN`, the `FAUCET_SERVE_{READ,WRITE,ADMIN}_TOKEN` trio,
+  `FAUCET_SERVE_HISTORY`, `FAUCET_TEMPLATE_STORE` and `FAUCET_SNAPSHOT_KEY`;
+- the server's own input files — `--auth-config`, `--connect-providers`,
+  `--templates-sync`, `--otel-config`, `--triggers`, `--default-config`, the
+  startup `.env`, a SQLite `--history` database and the snapshot key file —
+  through `${file:}`;
+- every variable, file and secret-manager reference (`${vault:…}`, …, any
+  `#field` of the same secret) that `--auth-config`, `--connect-providers`,
+  `--templates-sync` or `--otel-config` reads;
+- anything under `/proc`, `/sys` or `/dev` (except `/dev/null`) through
+  `${file:}`.
+
+The same files and trees are refused as **data**: a `file`, `csv`, `jsonl`,
+`parquet`, `sqlite`, `duckdb`, `delta` or `iceberg` source, sink, state store
+or DLQ whose path (or directory, or glob) reaches one of them is a `403`. In
+a config the request carries, such a path may not take a value from records
+(`${parent.*}` and other runtime tokens other than `${now.*}`, `${backfill.*}`
+and `${partition.*}`). SQL a `duckdb` or `sqlite` query runs is not inspected.
 
 ### Subprocess connectors
 
