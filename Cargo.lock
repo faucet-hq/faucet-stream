@@ -4624,7 +4624,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4805,7 +4805,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "jsonpath-rust",
- "jsonwebtoken 9.3.1",
+ "jsonwebtoken",
  "percent-encoding",
  "reqwest 0.13.3",
  "serde",
@@ -5298,7 +5298,7 @@ version = "1.1.1"
 dependencies = [
  "base64 0.22.1",
  "faucet-core",
- "jsonwebtoken 9.3.1",
+ "jsonwebtoken",
  "reqwest 0.13.3",
  "rsa 0.9.10",
  "schemars 1.2.1",
@@ -7762,7 +7762,7 @@ dependencies = [
  "base64 0.22.1",
  "gcloud-metadata",
  "home",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -8066,7 +8066,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http 1.4.0",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken",
  "reqwest 0.13.3",
  "rustc_version",
  "rustls 0.23.45",
@@ -9485,21 +9485,6 @@ dependencies = [
  "serde_json",
  "unicode-general-category",
  "uuid-simd",
-]
-
-[[package]]
-name = "jsonwebtoken"
-version = "9.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
-dependencies = [
- "base64 0.22.1",
- "js-sys",
- "pem",
- "ring",
- "serde",
- "serde_json",
- "simple_asn1",
 ]
 
 [[package]]
@@ -13889,7 +13874,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -13996,7 +13981,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -15406,10 +15391,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.4.1",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

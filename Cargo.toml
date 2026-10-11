@@ -286,7 +286,7 @@ byteorder = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = "0.10"
 croner = "3"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 base64 = "0.22"
 rsa = "0.9"
 sha2 = "0.10"
