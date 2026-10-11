@@ -1132,6 +1132,20 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             }
         }
 
+        if cfg.shard.is_some()
+            && state.is_some()
+            && pk_range_bookmarked(&merged_source.kind, &merged_source.config)
+        {
+            return Err(CliError::Config(format!(
+                "row '{}': `shard:` cannot be combined with incremental replication on source \
+                 '{}' — key ranges are re-planned every run while each shard keeps its own \
+                 cursor, so a key range can move to a shard whose cursor is already past a \
+                 late row and that row is never read. Remove `shard:` or the incremental \
+                 replication setting",
+                ids[i], merged_source.kind
+            )));
+        }
+
         // ── Overwrite gates (load-time, #492) ───────────────────────────
         // Overwrite replaces the whole destination via an atomic begin/commit
         // staging swap. It has no per-page watermark, and its staging table is
@@ -1651,6 +1665,13 @@ fn apply_cdc_image_policy(
         }
     }
     Ok(())
+}
+
+/// A primary-key-range sharded SQL source that resumes from a cursor
+/// bookmark (#862 M-040).
+fn pk_range_bookmarked(kind: &str, config: &Value) -> bool {
+    matches!(kind, "postgres" | "mysql" | "mssql" | "sqlite")
+        && crate::registry::source_resumes_from_bookmark(kind, config)
 }
 
 /// Give a `cdc_unwrap` with no `key` the keyed sink's `key` (#862 M-033), so an
@@ -2411,6 +2432,42 @@ mod tests {
             kind: "cdc_unwrap".into(),
             config,
         }]
+    }
+
+    #[test]
+    fn sharding_an_incrementally_replicated_sql_source_is_refused() {
+        let yaml = |source: &str, shard: &str| {
+            format!(
+                r#"
+version: 1
+name: s
+{shard}
+pipeline:
+  source: {{ type: {source}, config: {{ connection_url: "postgres://u@h/db", query: "SELECT * FROM t WHERE ts >= ${{bookmark}} ORDER BY ts", shard: {{ key: id }}, replication: {{ type: incremental, column: ts, initial_value: 0 }} }} }}
+  sink: {{ type: postgres, config: {{ connection_url: "postgres://u@h/db", table_name: t2, column_mapping: auto_map, write_mode: upsert, key: [id] }} }}
+  state: {{ type: file, config: {{ path: ./state }} }}
+"#
+            )
+        };
+        let cfg = PipelineConfig::from_text(
+            &yaml("postgres", "shard: { count: 2 }"),
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        let err = expand(&cfg).unwrap_err().to_string();
+        assert!(err.contains("`shard:` cannot be combined"), "{err}");
+        let cfg = PipelineConfig::from_text(&yaml("postgres", ""), std::path::Path::new("t.yaml"))
+            .unwrap();
+        assert!(expand(&cfg).is_ok());
+        assert!(pk_range_bookmarked(
+            "mysql",
+            &serde_json::json!({"replication": {"type": "incremental"}})
+        ));
+        assert!(!pk_range_bookmarked("mysql", &serde_json::json!({})));
+        assert!(!pk_range_bookmarked(
+            "s3",
+            &serde_json::json!({"replication_method": "incremental"})
+        ));
     }
 
     #[test]

@@ -404,6 +404,8 @@ This crate has no optional Cargo features of its own. Enable it in the CLI / umb
 
 ## Sharded execution (cluster Mode B)
 
+Key ranges are re-planned every run, so `shard:` cannot be combined with incremental replication (`faucet validate` refuses it when a `state:` block is set): a range could move to a shard whose cursor is already past a late row.
+
 Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
 a top-level `shard: { count: N }` block splits this source into contiguous
 primary-key ranges that different cluster workers process concurrently. Opt in
