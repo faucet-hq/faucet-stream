@@ -621,7 +621,7 @@ tests:
 | Field | Meaning |
 |---|---|
 | `suite` | Parameter-space cases (`cases`, `combine`, `auto`, `behavioral`), as in a suite file. |
-| `fixtures` | `faucet test` cases. Without `pipeline:` a fixture runs the template's own materialized config (`params:` bind it, `row:` picks a row); with `pipeline:` it runs that inline logic. |
+| `fixtures` | `faucet test` cases. Without `pipeline:` a fixture runs the template's own materialized config (`params:` bind it, `row:` picks a row); with `pipeline:` it runs that inline logic. When no case touches the template — only inline-`pipeline:` fixtures, here and in the shared suites — the run adds an implicit `implicit:auto:defaults` case that materializes it with its defaults, expands it and compiles its transforms. |
 | `requires_suites` | Shared `kind: test-suite` documents, by `name` and semver `version` range over their `release:`. |
 | `sink` / `source` / `overlay` (+ `*_select`) | The companions a hub kind composes with: a source template names its `sink` (and optionally an `overlay`); a sink template names its `source`; a deployment overlay names both. Selectors default to `stable`. A `pipeline` takes none. |
 | `retries` (on any case) | Extra attempts, at most 5. A case that passed on a retry says so (`attempts`). |
