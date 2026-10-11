@@ -70,8 +70,9 @@ pub struct ElasticsearchSinkConfig {
     pub request_timeout_secs: u64,
     /// The `_bulk` action for `append` writes: `index` (default; overwrites a
     /// document with the same `_id`) or `create` (required by data streams,
-    /// which reject `index`; a document whose `_id` already exists is a
-    /// per-row error). `upsert` / `delete` / `overwrite` always use `index`.
+    /// which reject `index`; a document whose `_id` already exists is left as
+    /// it is and counted as written, so a replayed page stays idempotent).
+    /// `upsert` / `delete` / `overwrite` always use `index`.
     #[serde(default)]
     pub op_type: ElasticsearchOpType,
 }

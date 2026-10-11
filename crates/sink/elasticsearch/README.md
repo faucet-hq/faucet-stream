@@ -66,7 +66,7 @@ faucet run pipeline.yaml
 | `index` | string | — *(required)* | Target index name. |
 | `auth` | `AuthSpec<ElasticsearchAuth>` | `{ type: none }` | Authentication — inline `{ type, config }` or `{ ref: <name> }`. See [Authentication](#authentication). |
 | `id_field` | string | *(unset)* | JSON field name used as the document `_id` in `append` mode. If unset, Elasticsearch auto-generates IDs. **Superseded by `key` in `upsert`/`delete` modes.** See [Document ID extraction](#document-id-extraction). |
-| `op_type` | `index` \| `create` | `index` | The `_bulk` action for `append` writes. Data streams accept only `create`; with `create`, a document whose `_id` already exists is a per-row error. Refused with any other `write_mode`. |
+| `op_type` | `index` \| `create` | `index` | The `_bulk` action for `append` writes. Data streams accept only `create`; with `create`, a document whose `_id` already exists is left as it is and counted as written (`409 version_conflict_engine_exception` is "already there"), so an at-least-once replay of a page with `id_field` is idempotent instead of failing every later run. Refused with any other `write_mode`. |
 | `connect_timeout_secs` | int | `10` | Seconds to wait for a connection to the cluster. |
 | `request_timeout_secs` | int | `300` | Seconds one HTTP request may take end to end; a half-open connection or wedged node fails the request (retriable) instead of hanging the run. |
 
