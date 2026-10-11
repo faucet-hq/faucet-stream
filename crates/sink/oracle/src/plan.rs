@@ -550,7 +550,16 @@ pub(crate) fn schema_from_columns(cols: &[ColumnInfo]) -> Value {
         } else {
             json!(types)
         };
-        props.insert(c.name.clone(), json!({ "type": ty }));
+        let mut fragment = json!({ "type": ty });
+        // Objects and arrays land in text, CLOB and JSON columns as JSON text,
+        // so they are not drift there (#862 M-049).
+        if matches!(
+            family,
+            TypeFamily::Text | TypeFamily::NationalText | TypeFamily::Clob | TypeFamily::Json
+        ) {
+            fragment[faucet_core::DRIFT_ALSO_ACCEPTS] = json!(["object", "array"]);
+        }
+        props.insert(c.name.clone(), fragment);
     }
     json!({ "type": "object", "properties": props })
 }
@@ -604,18 +613,20 @@ pub(crate) fn clone_table_sql(staging: &str, target: &str) -> String {
     format!("CREATE TABLE {staging} AS SELECT * FROM {target} WHERE 1 = 0")
 }
 
-/// What `CREATE TABLE … AS SELECT` drops from the clone, put back: a
-/// writable identity column becomes nullable (the writer never supplies it,
-/// and the clone kept its `NOT NULL`), and each column `DEFAULT` is copied so
-/// a record that omits the column gets the target's default, not `NULL`.
+/// What `CREATE TABLE … AS SELECT` drops from the clone, put back: every
+/// identity column — `BY DEFAULT` and `GENERATED ALWAYS` alike (#862 M-048) —
+/// and every other column the writer cannot supply becomes nullable (the
+/// clone kept its `NOT NULL`; the swap leaves those columns to the target),
+/// and each column `DEFAULT` is copied so a record that omits the column gets
+/// the target's default, not `NULL`.
 pub(crate) fn staging_fixups_sql(
     staging: &str,
     target_cols: &[ColumnInfo],
 ) -> Result<Vec<String>, FaucetError> {
     let mut out = Vec::new();
-    for c in target_cols.iter().filter(|c| c.insertable) {
+    for c in target_cols {
         let col = quote_ident_oracle(&c.name)?;
-        if c.identity {
+        if c.identity || !c.insertable {
             out.push(ignoring(
                 &format!("ALTER TABLE {staging} MODIFY ({col} NULL)"),
                 &[ORA_ALREADY_NULL],
@@ -1206,14 +1217,19 @@ mod tests {
         let doc = col("DOC", "CLOB", None, None);
         let cols = vec![id.clone(), gen_always, def, doc];
         let fix = staging_fixups_sql("\"S\"", &cols).unwrap();
-        assert_eq!(fix.len(), 2);
+        assert_eq!(fix.len(), 3);
         assert!(
             fix[0].contains("ALTER TABLE \"S\" MODIFY (\"ID\" NULL)"),
             "{}",
             fix[0]
         );
+        assert!(
+            fix[1].contains("ALTER TABLE \"S\" MODIFY (\"G\" NULL)"),
+            "a GENERATED ALWAYS identity is relaxed too: {}",
+            fix[1]
+        );
         assert_eq!(
-            fix[1],
+            fix[2],
             "ALTER TABLE \"S\" MODIFY (\"STATUS\" DEFAULT 'new')"
         );
 
@@ -1291,6 +1307,15 @@ mod tests {
         assert_eq!(s["properties"]["AMT"]["type"], json!(["number", "null"]));
         assert_eq!(s["properties"]["B"]["type"], json!(["boolean", "null"]));
         assert_eq!(s["properties"]["NAME"]["type"], json!(["string", "null"]));
+        assert_eq!(
+            s["properties"]["NAME"][faucet_core::DRIFT_ALSO_ACCEPTS],
+            json!(["object", "array"])
+        );
+        assert!(s["properties"]["AMT"].get(faucet_core::DRIFT_ALSO_ACCEPTS).is_none());
+        let doc = schema_from_columns(&[col("DOC", "CLOB", None, None)]);
+        let page = faucet_core::schema::infer_schema(&[json!({"DOC": {"a": 1}})]);
+        let diff = faucet_core::drift::diff_schema(&doc, &page, true);
+        assert!(diff.incompatible.is_empty(), "{diff:?}");
 
         assert!(
             add_column_sql("\"T\"", "X", SqlBaseType::Text)
