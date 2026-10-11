@@ -122,6 +122,10 @@ pub struct ExpandedNode {
     /// executor runs it through the normal pipeline path. `None` for every
     /// config-driven node (the executor builds the source from `source.kind`).
     pub source_override: Option<crate::dlq_replay::reader::SourceOverride>,
+    /// Node ids an earlier release keyed this node's state under — a
+    /// partition chunk's zero-padded id before #840 (#862 M-025). The executor
+    /// moves a bookmark found under one of them to the current key.
+    pub legacy_state_ids: Vec<String>,
     /// Scoped-cleanup claim (#478): the source's `complete_for` scope, still
     /// carrying any `${parent.*}` / `${now.*}` tokens — the executor resolves
     /// them per invocation, like the connector configs. `Some` only when the
@@ -797,6 +801,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 tags: Vec::new(),
                 deferred_refs: Vec::new(),
                 source_override: None,
+                legacy_state_ids: Vec::new(),
                 cleanup_scope: None,
                 metadata_columns: None,
                 #[cfg(feature = "catalog")]
@@ -1559,6 +1564,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             tags,
             deferred_refs: deferred,
             source_override: None,
+            legacy_state_ids: Vec::new(),
             cleanup_scope,
             metadata_columns: effective_metadata_columns(cfg),
             #[cfg(feature = "catalog")]
@@ -1572,9 +1578,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             // (`{name}::{row}::partition::{chunk}`) and log lines stay distinct,
             // and `row_index` is kept identical so partitions of one row sort
             // together ahead of the next row.
+            let width = chunks.len().saturating_sub(1).to_string().len();
             for chunk in &chunks {
                 let mut n = base.clone();
                 n.id = format!("{}::partition::{}", base.id, chunk.id);
+                n.legacy_state_ids = legacy_partition_id(&base.id, &chunk.id, width)
+                    .into_iter()
+                    .collect();
                 crate::partition::substitute(&mut n.source.config, chunk)
                     .map_err(|e| CliError::Config(format!("row '{}': {e}", ids[i])))?;
                 crate::partition::substitute(&mut n.sink.config, chunk)
@@ -1819,6 +1829,14 @@ fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
 /// Covers the local `file` / `jsonl` / `csv` / `parquet` sinks and the
 /// object-store and SFTP sinks given a fixed `path` / `file_name`
 /// ([`crate::registry::sink_shared_destination`]).
+/// The id a partition chunk had before #840 zero-padded chunk ids to the
+/// width of the largest one, or `None` when it is the same as today's.
+fn legacy_partition_id(base: &str, chunk_id: &str, width: usize) -> Option<String> {
+    let index: usize = chunk_id.parse().ok()?;
+    let padded = format!("{index:0width$}");
+    (padded != chunk_id).then(|| format!("{base}::partition::{padded}"))
+}
+
 fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
     let mut seen: HashMap<String, &str> = HashMap::new();
     // Discovery rows carry their source as a placeholder sink and write nothing
@@ -5022,6 +5040,17 @@ mod partition_tests {
         assert!(urls[0].contains("id_from=0&id_to=9"), "{:?}", urls[0]);
         assert!(urls[1].contains("id_from=10&id_to=19"), "{:?}", urls[1]);
         assert!(urls[2].contains("id_from=20&id_to=24"), "{:?}", urls[2]);
+    }
+
+    #[test]
+    fn legacy_partition_ids_restore_the_padding() {
+        assert_eq!(
+            legacy_partition_id("a", "3", 2).as_deref(),
+            Some("a::partition::03")
+        );
+        assert_eq!(legacy_partition_id("a", "12", 2), None);
+        assert_eq!(legacy_partition_id("a", "3", 1), None);
+        assert_eq!(legacy_partition_id("a", "2026-01", 2), None);
     }
 
     #[test]

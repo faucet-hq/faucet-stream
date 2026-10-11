@@ -295,6 +295,7 @@ mod tests {
             local_outputs: None,
             deferred_refs: Vec::new(),
             source_override: None,
+            legacy_state_ids: Vec::new(),
         }
     }
 
