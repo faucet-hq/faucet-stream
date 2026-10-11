@@ -1018,6 +1018,34 @@ pub trait RunHistory: Send + Sync {
         Ok(())
     }
 
+    /// Record that this instance has persisted every line it captured for
+    /// `run_id` with a key up to `through` (#862 M-099). `record_run_logs`
+    /// advances it with each batch; the log writer also advances it while the
+    /// run is quiet, so a run another instance logs to keeps shipping.
+    async fn log_ship_writer_mark(&self, run_id: &str, through: u64) -> Result<(), HistoryError> {
+        let _ = (run_id, through);
+        Ok(())
+    }
+
+    /// This instance has nothing more to persist for `run_id`.
+    async fn log_ship_writer_done(&self, run_id: &str) -> Result<(), HistoryError> {
+        let _ = run_id;
+        Ok(())
+    }
+
+    /// The lowest persisted watermark among the instances still writing
+    /// `run_id` (marked within `stale_after`). Delivery is acknowledged only up
+    /// to it, so a line another instance persists late is never below the
+    /// delivered watermark. `None`: no instance is writing.
+    async fn log_ship_writer_floor(
+        &self,
+        run_id: &str,
+        stale_after: Duration,
+    ) -> Result<Option<u64>, HistoryError> {
+        let _ = (run_id, stale_after);
+        Ok(None)
+    }
+
     /// Count and size of a run's persisted lines with `after < seq <= through`.
     async fn run_log_stats(
         &self,

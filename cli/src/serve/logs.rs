@@ -307,11 +307,24 @@ struct RunPersistState {
     truncated: bool,
     /// Lines dropped by the per-run cap, not yet counted on the run's delivery row.
     capped: u64,
+    /// When this instance last advanced its persisted watermark while quiet.
+    marked_at: Option<std::time::Instant>,
 }
 
 /// How often the writer flushes every run's pending lines, so a long run's
 /// lines reach the durable store (and the log shipper) while it runs.
 const PERSIST_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often a quiet run's persisted watermark is advanced (#862 M-099).
+const WRITER_MARK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The watermark an idle writer may claim at `now`: every line captured a
+/// second or more before it has reached the store (the queue is empty), and a
+/// line being enqueued right now carries a later key.
+fn idle_watermark(now: chrono::DateTime<chrono::Utc>) -> u64 {
+    let at = now - chrono::Duration::seconds(1);
+    ((at.timestamp_micros().max(0) as u64) << 12) | 0xFFF
+}
 
 /// Background task draining the persistence channel (#529): batches captured
 /// lines per run into `history`, enforces the per-run cap, and flushes at run
@@ -361,6 +374,27 @@ async fn persist_writer(
         }
     }
 
+    /// Advance the watermark of each run this instance writes, so peers'
+    /// lines keep shipping while it has nothing to log.
+    async fn mark_quiet(
+        history: &Arc<dyn RunHistory>,
+        runs: &mut HashMap<String, RunPersistState>,
+    ) {
+        let through = idle_watermark(chrono::Utc::now());
+        for (run_id, st) in runs.iter_mut() {
+            if st
+                .marked_at
+                .is_some_and(|t| t.elapsed() < WRITER_MARK_EVERY)
+            {
+                continue;
+            }
+            st.marked_at = Some(std::time::Instant::now());
+            if let Err(e) = history.log_ship_writer_mark(run_id, through).await {
+                tracing::warn!(run_id, error = %e, "advancing the run-log watermark failed");
+            }
+        }
+    }
+
     let mut tick = tokio::time::interval(PERSIST_FLUSH_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -372,6 +406,9 @@ async fn persist_writer(
             _ = tick.tick() => {
                 for (run_id, st) in runs.iter_mut() {
                     flush(&history, run_id, st).await;
+                }
+                if rx.is_empty() {
+                    mark_quiet(&history, &mut runs).await;
                 }
                 fold_queue_drops(&history, &queue_dropped).await;
                 continue;
@@ -450,6 +487,9 @@ async fn persist_writer(
                 tracing::warn!(run_id, error = %e, "recording capped run-log lines failed");
             }
             st.capped = 0;
+        }
+        if let Err(e) = history.log_ship_writer_done(run_id).await {
+            tracing::warn!(run_id, error = %e, "releasing the run-log watermark failed");
         }
     }
 }
@@ -706,6 +746,60 @@ mod tests {
         fn degraded(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn the_idle_watermark_trails_now_by_a_second() {
+        let now = chrono::Utc::now();
+        let w = idle_watermark(now);
+        let behind = ((now - chrono::Duration::seconds(1)).timestamp_micros() as u64) << 12;
+        assert_eq!(w & !0xFFF, behind);
+        assert!(w < (now.timestamp_micros() as u64) << 12);
+    }
+
+    /// #862 M-099: the writer advances a quiet run's watermark and releases it
+    /// when the run ends here, so the shipper is held back only while this
+    /// instance may still persist a line.
+    #[tokio::test]
+    async fn the_writer_advances_a_quiet_runs_watermark_and_releases_it_at_the_end() {
+        let history = Arc::new(crate::serve::history::memory::MemoryHistory::new(
+            std::time::Duration::from_secs(60),
+        ));
+        let hub = LogHub::new();
+        hub.enable_persistence(history.clone(), 100);
+        let before = idle_watermark(chrono::Utc::now());
+        hub.capture("r1", "INFO", "t".into(), "a".into());
+        let stale = std::time::Duration::from_secs(60);
+        let mut floor = None;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            floor = history.log_ship_writer_floor("r1", stale).await.unwrap();
+            if floor.is_some_and(|f| f > before) {
+                break;
+            }
+        }
+        assert!(
+            floor.is_some_and(|f| f > before),
+            "the quiet run's watermark moved past its last line: {floor:?}"
+        );
+        hub.finish("r1");
+        for _ in 0..50 {
+            if history
+                .log_ship_writer_floor("r1", stale)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            history.log_ship_writer_floor("r1", stale).await.unwrap(),
+            None
+        );
+        hub.shutdown_persistence(std::time::Duration::from_secs(5))
+            .await;
     }
 
     /// #862 M-099: lines lost before the store — a full persistence queue or

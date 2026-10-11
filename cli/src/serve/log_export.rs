@@ -27,6 +27,9 @@ const MAX_BATCHES_PER_RUN: usize = 16;
 /// Lines younger than this are left for the next pass, so a line another
 /// instance captured a moment earlier (and is still flushing) is not skipped.
 pub const SETTLE: Duration = Duration::from_secs(2);
+/// An instance that has not advanced its persisted watermark for this long is
+/// treated as gone: its lines no longer hold back delivery (#862 M-099).
+pub const WRITER_STALE: Duration = Duration::from_secs(120);
 /// Shipping cadence while exports succeed.
 const SHIP_EVERY: Duration = Duration::from_secs(2);
 /// How often retention + bounds run.
@@ -275,7 +278,13 @@ impl LogExport {
     ) -> Result<(), HistoryError> {
         let rec = history.get(&row.run_id).await?;
         let run_attrs = run_attrs(&row.run_id, rec.as_ref());
-        let cap = seq_at(Utc::now() - chrono::Duration::from_std(settle).unwrap_or_default());
+        let mut cap = seq_at(Utc::now() - chrono::Duration::from_std(settle).unwrap_or_default());
+        if let Some(floor) = history
+            .log_ship_writer_floor(&row.run_id, WRITER_STALE)
+            .await?
+        {
+            cap = cap.min(floor);
+        }
         let mut after = row.delivered_seq;
         for _ in 0..MAX_BATCHES_PER_RUN {
             let page = history

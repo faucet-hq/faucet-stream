@@ -389,6 +389,14 @@ pub const DDL: &[&str] = &[
         owner TEXT,\
         lease_expires_at TEXT,\
         notified TEXT)",
+    // The persisted-line watermark of each instance writing a run (#862
+    // M-099): delivery is acknowledged only up to the lowest live one.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_log_writers (\
+        run_id TEXT NOT NULL,\
+        instance TEXT NOT NULL,\
+        persisted_seq TEXT NOT NULL,\
+        updated_at TEXT NOT NULL,\
+        PRIMARY KEY (run_id, instance))",
     // Data Movement Catalog (#279). Accumulating cross-run state, deliberately
     // NOT covered by `purge_expired` (the history is the value). Same
     // TEXT-columns + JSON `body` convention as the run tables: the dedicated
@@ -777,6 +785,14 @@ pub struct Stmts {
     pub log_ship_notified: String,
     /// Param: run_id.
     pub log_ship_delete: String,
+    /// Params: run_id, instance, persisted_seq, updated_at.
+    pub log_writer_mark: String,
+    /// Params: run_id, instance.
+    pub log_writer_done: String,
+    /// Param: run_id.
+    pub log_writer_delete: String,
+    /// Params: run_id, live-after timestamp.
+    pub log_writer_floor: String,
     /// Params: run_id, sentinel, after, after, through, through.
     pub run_log_stats: String,
     /// Params: run_id, through, sentinel.
@@ -1418,6 +1434,20 @@ impl Stmts {
             log_ship_notified: "UPDATE faucet_serve_log_ship SET notified = $1 WHERE run_id = $2"
                 .into(),
             log_ship_delete: "DELETE FROM faucet_serve_log_ship WHERE run_id = $1".into(),
+            log_writer_mark: "INSERT INTO faucet_serve_log_writers \
+                (run_id, instance, persisted_seq, updated_at) VALUES ($1,$2,$3,$4) \
+                ON CONFLICT (run_id, instance) DO UPDATE SET persisted_seq = \
+                CASE WHEN excluded.persisted_seq > faucet_serve_log_writers.persisted_seq \
+                THEN excluded.persisted_seq ELSE faucet_serve_log_writers.persisted_seq END, \
+                updated_at = excluded.updated_at"
+                .into(),
+            log_writer_done: "DELETE FROM faucet_serve_log_writers \
+                WHERE run_id = $1 AND instance = $2"
+                .into(),
+            log_writer_delete: "DELETE FROM faucet_serve_log_writers WHERE run_id = $1".into(),
+            log_writer_floor: "SELECT MIN(persisted_seq) AS floor FROM faucet_serve_log_writers \
+                WHERE run_id = $1 AND updated_at >= $2"
+                .into(),
             run_log_stats: "SELECT COUNT(*) AS n, \
                 CAST(COALESCE(SUM(OCTET_LENGTH(line)), 0) AS BIGINT) AS b, \
                 MIN(seq) AS lo, MAX(seq) AS hi FROM faucet_serve_run_logs \
@@ -1948,6 +1978,20 @@ impl Stmts {
             log_ship_notified: "UPDATE faucet_serve_log_ship SET notified = ? WHERE run_id = ?"
                 .into(),
             log_ship_delete: "DELETE FROM faucet_serve_log_ship WHERE run_id = ?".into(),
+            log_writer_mark: "INSERT INTO faucet_serve_log_writers \
+                (run_id, instance, persisted_seq, updated_at) VALUES (?,?,?,?) \
+                ON CONFLICT (run_id, instance) DO UPDATE SET persisted_seq = \
+                CASE WHEN excluded.persisted_seq > faucet_serve_log_writers.persisted_seq \
+                THEN excluded.persisted_seq ELSE faucet_serve_log_writers.persisted_seq END, \
+                updated_at = excluded.updated_at"
+                .into(),
+            log_writer_done: "DELETE FROM faucet_serve_log_writers \
+                WHERE run_id = ? AND instance = ?"
+                .into(),
+            log_writer_delete: "DELETE FROM faucet_serve_log_writers WHERE run_id = ?".into(),
+            log_writer_floor: "SELECT MIN(persisted_seq) AS floor FROM faucet_serve_log_writers \
+                WHERE run_id = ? AND updated_at >= ?"
+                .into(),
             run_log_stats: "SELECT COUNT(*) AS n, \
                 CAST(COALESCE(SUM(LENGTH(CAST(line AS BLOB))), 0) AS INTEGER) AS b, \
                 MIN(seq) AS lo, MAX(seq) AS hi FROM faucet_serve_run_logs \
@@ -3875,6 +3919,14 @@ macro_rules! impl_sql_history {
                         .execute(&mut *tx)
                         .await
                         .map_err(backend)?;
+                    sqlx::query(&self.stmts.log_writer_mark)
+                        .bind(run_id)
+                        .bind(&self.instance_id)
+                        .bind(sql::pad_seq(max))
+                        .bind(sql::fmt_ts(chrono::Utc::now()))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
                 }
                 tx.commit().await.map_err(backend)?;
                 Ok(())
@@ -4089,7 +4141,62 @@ macro_rules! impl_sql_history {
                     .execute(&self.pool)
                     .await
                     .map_err($crate::serve::history::sql::classify_backend_error)?;
+                sqlx::query(&self.stmts.log_writer_delete)
+                    .bind(run_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
                 Ok(())
+            }
+
+            async fn log_ship_writer_mark(
+                &self,
+                run_id: &str,
+                through: u64,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                sqlx::query(&self.stmts.log_writer_mark)
+                    .bind(run_id)
+                    .bind(&self.instance_id)
+                    .bind(sql::pad_seq(through))
+                    .bind(sql::fmt_ts(chrono::Utc::now()))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(sql::classify_backend_error)?;
+                Ok(())
+            }
+
+            async fn log_ship_writer_done(
+                &self,
+                run_id: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                sqlx::query(&self.stmts.log_writer_done)
+                    .bind(run_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                Ok(())
+            }
+
+            async fn log_ship_writer_floor(
+                &self,
+                run_id: &str,
+                stale_after: std::time::Duration,
+            ) -> Result<Option<u64>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let live = chrono::Utc::now()
+                    - chrono::Duration::from_std(stale_after).unwrap_or_default();
+                let r = sqlx::query(&self.stmts.log_writer_floor)
+                    .bind(run_id)
+                    .bind(sql::fmt_ts(live))
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(sql::classify_backend_error)?;
+                let floor: Option<String> =
+                    r.try_get("floor").map_err(sql::classify_backend_error)?;
+                Ok(floor.as_deref().map(sql::unpad_seq))
             }
 
             async fn run_log_stats(
