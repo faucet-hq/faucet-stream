@@ -329,41 +329,40 @@ pub fn validate_state_key(key: &str) -> Result<(), FaucetError> {
     Ok(())
 }
 
-/// A lock file older than this belongs to a writer that died holding it.
-const STALE_LOCK: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a compare-and-put waits for another writer's lock.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Removes the lock file when dropped.
-struct LockFile(PathBuf);
-
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// An exclusive OS lock (`flock` / `LockFileEx`) on a lock file, released
+/// when dropped or when the holding process dies.
+///
+/// The file itself is never removed: deleting it while another writer has it
+/// open would let a third writer lock a fresh file at the same path, and a
+/// crashed writer's lock is released by the OS, so no staleness rule is needed
+/// (#862 M-009).
+struct LockFile {
+    _file: std::fs::File,
 }
 
 async fn acquire_lock_file(path: &Path) -> Result<LockFile, FaucetError> {
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|e| {
+            FaucetError::State(format!(
+                "failed to create state lock {}: {e}",
+                path.display()
+            ))
+        })?
+        .into_std()
+        .await;
     let started = tokio::time::Instant::now();
     loop {
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .await
-        {
-            Ok(_) => return Ok(LockFile(path.to_path_buf())),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = tokio::fs::metadata(path)
-                    .await
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age > STALE_LOCK);
-                if stale {
-                    let _ = tokio::fs::remove_file(path).await;
-                    continue;
-                }
+        match file.try_lock() {
+            Ok(()) => return Ok(LockFile { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
                 if started.elapsed() > LOCK_WAIT {
                     return Err(FaucetError::State(format!(
                         "state lock {} is held by another writer",
@@ -372,9 +371,9 @@ async fn acquire_lock_file(path: &Path) -> Result<LockFile, FaucetError> {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            Err(e) => {
+            Err(std::fs::TryLockError::Error(e)) => {
                 return Err(FaucetError::State(format!(
-                    "failed to create state lock {}: {e}",
+                    "failed to lock state lock {}: {e}",
                     path.display()
                 )));
             }
@@ -912,8 +911,8 @@ impl StateStore for FileStateStore {
     }
 
     /// Atomic across processes sharing the directory: the read-compare-write
-    /// runs while holding `<key>.json.lock`, created with `O_EXCL`. A lock
-    /// left by a crashed writer is broken after 30 seconds.
+    /// runs while holding an exclusive OS lock on `<key>.json.lock`, which the
+    /// OS releases if the writer dies.
     async fn compare_and_put(
         &self,
         key: &str,
@@ -1111,56 +1110,66 @@ mod tests {
         assert_eq!(file.get("k").await.unwrap(), Some(b));
     }
 
-    #[tokio::test]
-    async fn file_compare_and_put_is_exclusive_and_breaks_stale_locks() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_compare_and_put_is_exclusive() {
         let dir = tempfile::tempdir().unwrap();
         let stores: Vec<std::sync::Arc<FileStateStore>> = (0..8)
             .map(|_| std::sync::Arc::new(FileStateStore::new(dir.path())))
             .collect();
-        let tasks: Vec<_> = stores
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let s = std::sync::Arc::clone(s);
-                tokio::spawn(async move {
-                    s.compare_and_put("lease", None, &json!({"by": i}))
-                        .await
-                        .unwrap()
+        for round in 0..20 {
+            let key = format!("lease{round}");
+            let tasks: Vec<_> = stores
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let (s, key) = (std::sync::Arc::clone(s), key.clone());
+                    tokio::spawn(async move {
+                        s.compare_and_put(&key, None, &json!({"by": i})).await.unwrap()
+                    })
                 })
-            })
-            .collect();
-        let mut wins = 0;
-        for t in tasks {
-            wins += usize::from(t.await.unwrap());
+                .collect();
+            let mut wins = 0;
+            for t in tasks {
+                wins += usize::from(t.await.unwrap());
+            }
+            assert_eq!(wins, 1, "exactly one writer takes an absent key");
         }
-        assert_eq!(wins, 1, "exactly one writer takes an absent key");
-        let lock = dir.path().join("lease.json.lock");
-        assert!(!lock.exists(), "the lock is released");
+    }
 
-        let f = std::fs::File::create(&lock).unwrap();
-        f.set_modified(std::time::SystemTime::now() - STALE_LOCK * 2)
-            .unwrap();
-        let held = stores[0].get("lease").await.unwrap();
+    /// #862 M-009: a lock file a crashed writer left behind holds no OS lock,
+    /// so the next writer takes it at once instead of waiting it out.
+    #[tokio::test]
+    async fn file_compare_and_put_takes_a_lock_left_by_a_dead_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(dir.path());
+        std::fs::write(dir.path().join("lease.json.lock"), b"").unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(store.compare_and_put("lease", None, &json!(1)).await.unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(
-            stores[0]
-                .compare_and_put("lease", held.as_ref(), &json!({"by": "late"}))
+            store
+                .compare_and_put("lease", Some(&json!(1)), &json!(2))
                 .await
-                .unwrap()
+                .unwrap(),
+            "the lock is released after each compare-and-put"
         );
-        assert_eq!(stores[0].list("").await.unwrap(), vec!["lease".to_string()]);
+        assert_eq!(store.list("").await.unwrap(), vec!["lease".to_string()]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn file_compare_and_put_gives_up_on_a_live_lock() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileStateStore::new(dir.path());
-        std::fs::write(dir.path().join("k.json.lock"), b"").unwrap();
+        let held = std::fs::File::create(dir.path().join("k.json.lock")).unwrap();
+        held.lock().unwrap();
         let err = store
             .compare_and_put("k", None, &json!(1))
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("held by another writer"), "{err}");
+        drop(held);
+        assert!(store.compare_and_put("k", None, &json!(1)).await.unwrap());
     }
 
     #[tokio::test]
