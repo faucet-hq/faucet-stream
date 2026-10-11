@@ -31,19 +31,34 @@
 #   3. otherwise               -> EXTRAS + source-<each SOURCES> + sink-<each SINKS>.
 #
 # ORACLE_CLIENT=auto (default) installs Oracle Instant Client exactly when the
-# binary has an Oracle connector compiled in; `true` / `false` force it.
+# binary has an Oracle connector compiled in, and downloads it only when the
+# selected features can contain one (`full` or a name with `oracle`); `true` /
+# `false` force it.
 
 ARG RUST_VERSION=1.96.0
 ARG DEBIAN_RELEASE=bookworm
 ARG ORACLE_CLIENT=auto
 
-########################  builder  ########################
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
-
 # --- feature selection knobs (see header) ---
+# Declared before the first stage so the oracle-client stage resolves the same
+# feature set as the builder.
 # Comma-separated *short* connector names, e.g. SOURCES="rest,postgres,s3".
 ARG SOURCES=""
 ARG SINKS=""
+# The complete set used when neither SOURCES nor SINKS is given: the CLI's
+# `full` feature, which enables every feature in its manifest. Keep it exactly
+# `full` — scripts/full-feature-coverage.py fails CI otherwise (#845).
+ARG DEFAULT_FEATURES="full"
+# Raw override — when set, wins over everything above.
+ARG FEATURES=""
+
+########################  builder  ########################
+FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
+
+ARG SOURCES
+ARG SINKS
+ARG DEFAULT_FEATURES
+ARG FEATURES
 # Non-connector features always compiled in for a selective (SOURCES/SINKS) build.
 # Deliberately excludes the `source`/`sink`/`default` aggregates so a lean build
 # stays lean. `state` = all state backends (memory+file are free; redis/postgres
@@ -55,12 +70,6 @@ ARG SINKS=""
 # dependency trees — add them explicitly when a lean image needs them. The
 # complete image below includes all three.
 ARG EXTRAS="observability,state,transforms,compression,quality,contract,masking,cli-progress,serve,serve-ui,schedule,catalog,serve-history-postgres,serve-history-sqlite,notify,lineage,templates,mcp,triggers"
-# The complete set used when neither SOURCES nor SINKS is given: the CLI's
-# `full` feature, which enables every feature in its manifest. Keep it exactly
-# `full` — scripts/full-feature-coverage.py fails CI otherwise (#845).
-ARG DEFAULT_FEATURES="full"
-# Raw override — when set, wins over everything above.
-ARG FEATURES=""
 
 # Native build prerequisites: cmake + a C/C++ toolchain (bundled DuckDB, some
 # -sys crates), OpenSSL/SASL/curl headers (librdkafka for the kafka feature).
@@ -103,13 +112,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 ####################  oracle-client  ####################
 # Oracle Instant Client (Basic Light), which the Oracle connectors load at run
 # time through ODPI-C. Downloaded once per architecture, checksum-pinned, and
-# pruned to the four libraries ODPI-C loads (~40 MiB compressed). Skipped
-# only with ORACLE_CLIENT=false; under `auto` the runtime stage installs it when
-# the binary has an Oracle connector. Instant Client is redistributable under
-# the Oracle Free Use Terms and Conditions license.
+# pruned to the four libraries ODPI-C loads (~40 MiB compressed). Skipped with
+# ORACLE_CLIENT=false, and under `auto` when the selected features cannot
+# contain an Oracle connector (so a lean build never downloads it); the runtime
+# stage then installs it when the binary has an Oracle connector. Instant
+# Client is redistributable under the Oracle Free Use Terms and Conditions
+# license.
 FROM debian:${DEBIAN_RELEASE}-slim AS oracle-client
 ARG TARGETARCH
 ARG ORACLE_CLIENT
+ARG SOURCES
+ARG SINKS
+ARG DEFAULT_FEATURES
+ARG FEATURES
 ARG ORACLE_CLIENT_VERSION=23.26.2.0.0
 ARG ORACLE_CLIENT_DIR=2326200
 ARG ORACLE_CLIENT_SHA256_AMD64=c5e97765e633ad02597b8274c35efe5c10bd249a3285e34ee58fa7b318243225
@@ -117,10 +132,23 @@ ARG ORACLE_CLIENT_SHA256_ARM64=1de02a6d7a56cbbd5f6a4f6ddfc5b66340dc0cbf42b1e2ea8
 RUN set -eu; \
     mkdir -p /opt/oracle/instantclient; \
     if [ "${ORACLE_CLIENT}" = "false" ]; then exit 0; fi; \
+    if [ "${ORACLE_CLIENT}" != "true" ]; then \
+        if [ -n "${FEATURES}" ]; then feats="${FEATURES}"; \
+        elif [ -z "${SOURCES}" ] && [ -z "${SINKS}" ]; then feats="${DEFAULT_FEATURES}"; \
+        else feats="${SOURCES},${SINKS}"; fi; \
+        case ",${feats}," in \
+            *,full,*|*oracle*) ;; \
+            *) echo "==> no Oracle connector selected; skipping Oracle Instant Client"; exit 0 ;; \
+        esac; \
+    fi; \
     case "${TARGETARCH}" in \
         amd64) arch=x64;   sum="${ORACLE_CLIENT_SHA256_AMD64}" ;; \
         arm64) arch=arm64; sum="${ORACLE_CLIENT_SHA256_ARM64}" ;; \
-        *) echo "no Oracle Instant Client for ${TARGETARCH}" >&2; exit 1 ;; \
+        *) if [ "${ORACLE_CLIENT}" = "true" ]; then \
+               echo "no Oracle Instant Client for ${TARGETARCH}" >&2; exit 1; \
+           fi; \
+           echo "warning: no Oracle Instant Client for ${TARGETARCH}; Oracle connectors will not load" >&2; \
+           exit 0 ;; \
     esac; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl unzip; \
@@ -159,6 +187,10 @@ RUN --mount=type=bind,from=oracle-client,source=/opt/oracle/instantclient,target
         auto|"") [ -f /mnt/faucet-meta/has-oracle-connector ] && oracle=true ;; \
         *) echo "ORACLE_CLIENT must be auto, true or false, got '${ORACLE_CLIENT}'" >&2; exit 1 ;; \
     esac; \
+    if [ "${oracle}" = true ] && [ ! -e /mnt/instantclient/libclntsh.so ]; then \
+        echo "warning: the binary has an Oracle connector but no Oracle Instant Client was fetched" >&2; \
+        oracle=false; \
+    fi; \
     if [ "${oracle}" = true ]; then pkgs="${pkgs} libaio1"; fi; \
     apt-get update && apt-get install -y --no-install-recommends ${pkgs} \
     && rm -rf /var/lib/apt/lists/*; \
